@@ -42,6 +42,19 @@ icons! {
     GAUGE = "gauge", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 18a9 9 0 1 1 15 0"/><path d="m12 13 4-5"/><circle cx="12" cy="13" r="1.2" fill="currentColor"/></g>"#;
     SPEAKER_OFF = "speaker-off", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="m16 9.5 5 5M21 9.5l-5 5"/></g>"#;
     RECORD = "record", r#"<g fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="3.5" fill="currentColor"/></g>"#;
+    BACK = "back", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="m11 6-6 6 6 6"/></g>"#;
+    RECENTS = "recents", r#"<rect x="5" y="5" width="14" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/>"#;
+    ROTATE = "rotate", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.3-5.7L20 8.5"/><path d="M20 3.5v5h-5"/></g>"#;
+    FOLD_CLOSED = "fold-closed", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="7" y="3" width="10" height="18" rx="2"/><path d="M10 3v18"/></g>"#;
+    FOLD_HALF = "fold-half", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 19h9l9-9"/><path d="M12 19V5a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v14"/></g>"#;
+    FOLD_OPEN = "fold-open", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16" stroke-dasharray="2 2"/></g>"#;
+    CROWN_UP = "crown-up", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 14a6 6 0 0 1 12 0"/><path d="m15 6 3 2-3 2"/><path d="M12 14v6"/></g>"#;
+    CROWN_DOWN = "crown-down", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 10a6 6 0 0 0 12 0"/><path d="m15 18 3-2-3-2"/><path d="M12 10V4"/></g>"#;
+    CHEVRON_UP = "chevron-up", r#"<path d="m6 15 6-6 6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#;
+    CHEVRON_DOWN = "chevron-down", r#"<path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#;
+    CHEVRON_LEFT = "chevron-left", r#"<path d="m15 6-6 6 6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#;
+    CHEVRON_RIGHT = "chevron-right", r#"<path d="m9 6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#;
+    SELECT = "select", r#"<g fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="3" fill="currentColor"/></g>"#;
     ISLAND = "island", r#"<g fill="none" stroke="currentColor" stroke-width="1.8"><rect x="6" y="2.5" width="12" height="19" rx="3"/><rect x="9.5" y="4.8" width="5" height="1.8" rx="0.9" fill="currentColor"/></g>"#;
 }
 
@@ -77,4 +90,17 @@ pub static ALL: &[&Icon] = &[
     &KEYBOARD,
     &LAYERS,
     &ISLAND,
+    &BACK,
+    &RECENTS,
+    &ROTATE,
+    &FOLD_CLOSED,
+    &FOLD_HALF,
+    &FOLD_OPEN,
+    &CROWN_UP,
+    &CROWN_DOWN,
+    &CHEVRON_UP,
+    &CHEVRON_DOWN,
+    &CHEVRON_LEFT,
+    &CHEVRON_RIGHT,
+    &SELECT,
 ];
