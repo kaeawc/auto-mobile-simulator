@@ -2,14 +2,25 @@
 //! backend (`ios.rs`), which exists only on macOS hosts.
 
 use serde_json::{Value, json};
+use sim_core::device::DeviceInfo;
+use sim_core::form_factor::{Kind, matrix};
+use sim_core::platform::Platform;
 
-/// (method, parameters, description). `device` is a UDID, a name, or `booted`.
+use crate::params::{opt_form_factor, opt_platform};
+
+/// (method, parameters, description). `device` is a UDID, a name, or `booted`. [`platforms`]
+/// says which platforms' devices each method works on.
 pub const METHODS: &[(&str, &str, &str)] = &[
-    ("help", "", "List methods"),
-    ("devices", "booted?", "List devices"),
+    ("help", "", "List methods with the platforms each supports"),
+    (
+        "form_factors",
+        "platform?, form_factor?",
+        "Every form factor on every platform: sub-platform, inputs and reference profile, or why it's unsupported",
+    ),
+    ("devices", "booted?, platform?(android|ios), form_factor?", "List devices with their platform, form factor and sub-platform"),
     ("runtimes", "", "List installed runtimes"),
     ("device_types", "", "List device types"),
-    ("create", "name, device_type, runtime", "Create a device"),
+    ("create", "name, device_type, runtime, form_factor?", "Create a device (form_factor: checked against the device type)"),
     ("delete", "device", "Delete a device"),
     (
         "boot",
@@ -106,12 +117,88 @@ pub struct Session {
     pub(crate) ios: crate::ios::Session,
 }
 
+/// Methods that work on every platform's devices (or need no device).
+const ALL_PLATFORMS: &[&str] = &["help", "form_factors", "devices"];
+
+/// The platforms whose devices `method` works on.
+pub fn platforms(method: &str) -> &'static [Platform] {
+    if ALL_PLATFORMS.contains(&method) { &Platform::ALL } else { &[Platform::Ios] }
+}
+
 /// Dispatches one method.
 pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     let p = if p.is_null() { &Value::Object(Default::default()) } else { p };
     match method {
-        "help" => Ok(METHODS.iter().map(|(m, params, doc)| json!({"method": m, "params": params, "doc": doc})).collect()),
+        "help" => Ok(METHODS
+            .iter()
+            .map(|(m, params, doc)| {
+                let platforms: Vec<&str> = platforms(m).iter().map(|p| p.as_str()).collect();
+                json!({"method": m, "params": params, "doc": doc, "platforms": platforms})
+            })
+            .collect()),
+        "form_factors" => {
+            let (platform, form_factor) = (opt_platform(p)?, opt_form_factor(p)?);
+            Ok(matrix()
+                .into_iter()
+                .filter(|(f, pl, _)| platform.is_none_or(|x| x == *pl) && form_factor.is_none_or(|x| x == *f))
+                .map(|(f, pl, kind)| match kind {
+                    Ok(k) => {
+                        let inputs: Vec<Value> = k.inputs().iter().map(|i| json!({"input": i, "label": i.label(pl)})).collect();
+                        json!({"form_factor": f, "platform": pl, "supported": true, "sub_platform": k.sub_platform, "label": k.label(),
+                            "inputs": inputs, "profile": k.profile()})
+                    }
+                    Err(e) => json!({"form_factor": f, "platform": pl, "supported": false, "reason": e.reason}),
+                })
+                .collect())
+        }
+        "devices" => {
+            let (platform, form_factor) = (opt_platform(p)?, opt_form_factor(p)?);
+            let list: Vec<DeviceInfo> = serde_json::from_value(crate::ios::call(&mut s.ios, method, p)?).map_err(|e| e.to_string())?;
+            let keep = |d: &DeviceInfo| platform.is_none_or(|x| x == d.platform) && form_factor.is_none_or(|x| d.form_factor == Some(x));
+            serde_json::to_value(list.into_iter().filter(keep).collect::<Vec<_>>()).map_err(|e| e.to_string())
+        }
+        "create" => {
+            // Unsupported pairs are rejected before any backend runs. Devices are created on iOS.
+            if let Some(form_factor) = opt_form_factor(p)? {
+                Kind::new(Platform::Ios, form_factor).map_err(|e| e.to_string())?;
+            }
+            crate::ios::call(&mut s.ios, method, p)
+        }
         m if METHODS.iter().any(|(name, ..)| *name == m) => crate::ios::call(&mut s.ios, m, p),
         other => Err(format!("unknown method `{other}`; call `help`")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_labels_every_method_with_platforms() {
+        let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
+        let find = |m: &str| help.as_array().and_then(|a| a.iter().find(|x| x["method"] == m)).cloned().expect(m);
+        assert_eq!(find("devices")["platforms"], json!(["android", "ios"]));
+        assert_eq!(find("status_bar")["platforms"], json!(["ios"]));
+        assert!(help.as_array().expect("array").iter().all(|m| m["platforms"].as_array().is_some_and(|p| !p.is_empty())));
+    }
+
+    #[test]
+    fn form_factors_lists_the_matrix_with_reasons() {
+        let mut s = Session::default();
+        let all = call(&mut s, "form_factors", &Value::Null).expect("matrix");
+        assert_eq!(all.as_array().map(Vec::len), Some(14));
+        let fold = call(&mut s, "form_factors", &json!({"form_factor": "foldable"})).expect("foldable");
+        let ios = fold.as_array().and_then(|a| a.iter().find(|x| x["platform"] == "ios")).expect("ios row");
+        assert_eq!(ios["supported"], false);
+        assert!(ios["reason"].as_str().is_some_and(|r| r.contains("Android-only")));
+        let watch = call(&mut s, "form_factors", &json!({"form_factor": "watch", "platform": "ios"})).expect("watch");
+        assert_eq!(watch[0]["sub_platform"], "watchos");
+        assert_eq!(watch[0]["inputs"][1]["label"], "Digital Crown");
+        assert_eq!(watch[0]["profile"]["shape"], "rounded");
+        let err = call(&mut s, "form_factors", &json!({"form_factor": "laptop"})).expect_err("unknown");
+        assert!(err.contains("phone, tablet, foldable, watch, tv, auto, vision"), "{err}");
+        assert!(call(&mut s, "devices", &json!({"platform": "windows"})).expect_err("unknown").contains("android or ios"));
+        let err = call(&mut s, "create", &json!({"name": "x", "device_type": "y", "runtime": "z", "form_factor": "foldable"}));
+        assert!(err.expect_err("no foldable iPhone").starts_with("foldable is not supported on iOS"));
     }
 }

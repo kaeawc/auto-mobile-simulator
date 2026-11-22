@@ -8,13 +8,14 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use sim_core::debug;
 use sim_core::device::{DeviceState, privacy_service};
+use sim_core::form_factor::FormFactor;
 use sim_core::geometry::{Point, Size};
 use sim_core::gesture::{self, Phase, Sample};
 use sim_core::hid::{Button, KEY_LEFT_SHIFT, keystroke};
 use sim_coresim::{Appearance, Context, Device, Direction, Hid, StatusBar};
 
 use crate::encode_png;
-use crate::params::{err, need_bool, need_f64, need_str, opt_u64, pairs, str_param, strings};
+use crate::params::{err, need_bool, need_f64, need_str, opt_form_factor, opt_u64, pairs, str_param, strings};
 
 /// Shaping proxies, one per device, owned by this (long-running) process.
 static PROXIES: std::sync::Mutex<Option<std::collections::HashMap<String, sim_netshape::proxy::Proxy>>> = std::sync::Mutex::new(None);
@@ -213,6 +214,24 @@ fn pids(udid: &str) -> Result<Vec<i32>, String> {
     Ok(sim_debug::process::collect(udid)?.iter().map(|p| p.pid).collect())
 }
 
+/// Rejects a `create` whose device type isn't the requested form factor. CarPlay (auto) is valid
+/// for iOS but isn't a device type of its own.
+fn check_form_factor(ctx: &Context, device_type: &str, form_factor: FormFactor) -> Result<(), String> {
+    if form_factor == FormFactor::Auto {
+        return Err("CarPlay is a display attached to an iPhone simulator, not a device type: create an iPhone (attaching the CarPlay \
+                    display isn't implemented yet)"
+            .into());
+    }
+    let types = ctx.device_types().map_err(err)?;
+    let actual = types.iter().find(|t| t.name == device_type || t.identifier == device_type).and_then(|t| t.form_factor);
+    match actual {
+        Some(actual) if actual != form_factor => {
+            Err(format!("device type `{device_type}` is a {}, not a {}", actual.as_str(), form_factor.as_str()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Dispatches one device method.
 pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     let ok = |r: sim_coresim::Result<()>| r.map(|()| Value::Null).map_err(err);
@@ -226,7 +245,11 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "runtimes" => serde_json::to_value(s.ctx()?.runtimes().map_err(err)?).map_err(err),
         "device_types" => serde_json::to_value(s.ctx()?.device_types().map_err(err)?).map_err(err),
         "create" => {
-            let d = s.ctx()?.create(need_str(p, "name")?, need_str(p, "device_type")?, need_str(p, "runtime")?).map_err(err)?;
+            let device_type = need_str(p, "device_type")?;
+            if let Some(form_factor) = opt_form_factor(p)? {
+                check_form_factor(s.ctx()?, device_type, form_factor)?;
+            }
+            let d = s.ctx()?.create(need_str(p, "name")?, device_type, need_str(p, "runtime")?).map_err(err)?;
             serde_json::to_value(d.info()).map_err(err)
         }
         "delete" => {

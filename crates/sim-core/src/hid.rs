@@ -35,6 +35,13 @@ impl Button {
     }
 }
 
+/// Key or button direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Down,
+    Up,
+}
+
 /// Left shift usage.
 pub const KEY_LEFT_SHIFT: u32 = 0xe1;
 /// Return usage.

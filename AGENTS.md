@@ -28,6 +28,9 @@ app. The goal is to match its behavior exactly and then exceed it.
   Callers gate their use the same way (`sim-api`'s `ios.rs` vs `ios_unavailable.rs`).
 - The CLI is a thin front over `sim-api`'s method table: a new device command is an API method
   first, then a CLI subcommand that calls it.
+- Every device, API method and UI element says which platform it belongs to: devices carry
+  `platform`, `form_factor` and `sub_platform`; `help` lists each method's platforms. Validate a
+  (platform, form factor) pair with `Kind::new`, which explains unsupported combinations.
 - Doctests are disabled; don't rely on them for coverage.
 - `desktop/` is a separate workspace (Rune is a large git dependency). Bump the Rune `rev` and every
   `[patch.crates-io]` entry together, and commit `desktop/Cargo.lock`.
@@ -56,7 +59,11 @@ scripts/automobile-harness.sh <udid>     # auto-mobile drives a sim-rs device
 
 ## Map
 
-- `crates/sim-core` — device/runtime models and selection, privacy service names, geometry,
+- `crates/sim-core` — `platform.rs` (Android vs iOS, Apple and Android sub-platforms),
+  `form_factor.rs` (phone…vision, the support matrix and its reasons, reference profiles with
+  screen, density, shape, fold and inputs, inference from Apple device types and Android AVD
+  configs), device/runtime models (labelled with platform and form factor) and selection,
+  privacy service names, geometry,
   gesture planning, HID usages and buttons, BGRA→RGBA conversion, `Frame` and PNG encoding.
   No FFI.
 - `crates/sim-coresim` — the service boundary: `Context` (service + device set), `Device`
@@ -76,8 +83,9 @@ scripts/automobile-harness.sh <udid>     # auto-mobile drives a sim-rs device
   desktop panel all go through it; add a capability here once and every surface gets it.
 - `apps/sim-rs` — CLI: argument parsing and output formatting over `sim-api`'s methods;
   `tests/e2e.rs` runs against a booted device when `SIM_RS_E2E_UDID` is set.
-- `desktop/` — Rune app: `device.rs` (live device, capture thread), `surface.rs` (zero-copy
-  IOSurface bridge), `debug.rs` (debug panel: tabs, API worker thread, views), `icons.rs` (SVG
+- `desktop/` — Rune app: `device.rs` (the live device facade; a stub where there's no simulator
+  service, so the window builds and tests on Linux), `ios.rs` (live iOS device, capture thread;
+  macOS), `surface.rs` (zero-copy IOSurface bridge; macOS), `debug.rs` (debug panel: tabs, API worker thread, views), `icons.rs` (SVG
   icons), `keys.rs` (host keys → HID), `view.rs`, `main.rs` (state, actions, poll, tests).
   Headless `--snap` needs a debug build (release builds lack Rune's tooling feature).
 - `scripts/` — `parity.sh`, `automobile-harness.sh`, `pf-shape.sh` (pf/dummynet, needs sudo).

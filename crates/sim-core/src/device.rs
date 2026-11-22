@@ -1,6 +1,9 @@
-//! Device, runtime and device-type models as reported by the simulator service.
+//! Device, runtime and device-type models, labelled with the platform that runs them.
 
 use serde::{Deserialize, Serialize};
+
+use crate::form_factor::{FormFactor, Kind};
+use crate::platform::{Platform, SubPlatform};
 
 /// Lifecycle state of a simulated device. Values match the service's raw state numbers.
 /// Serialized with the same names `simctl list -j` uses.
@@ -41,7 +44,7 @@ impl DeviceState {
     }
 }
 
-/// One simulated device in a device set.
+/// One device: an Apple simulator device or an Android virtual device.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub udid: String,
@@ -50,6 +53,31 @@ pub struct DeviceInfo {
     pub runtime_id: String,
     pub device_type_id: String,
     pub available: bool,
+    /// Which backend runs the device.
+    pub platform: Platform,
+    /// Phone, tablet, watch, ...; `None` when the device type isn't recognized.
+    pub form_factor: Option<FormFactor>,
+    /// iPadOS, watchOS, Wear OS, ...; `None` when the device type isn't recognized.
+    pub sub_platform: Option<SubPlatform>,
+}
+
+impl DeviceInfo {
+    /// The validated platform and form factor, when known.
+    pub fn kind(&self) -> Option<Kind> {
+        Some(Kind { platform: self.platform, form_factor: self.form_factor?, sub_platform: self.sub_platform? })
+    }
+
+    /// Sets the form factor and sub-platform from `kind` (the platform stays).
+    pub fn with_kind(mut self, kind: Option<Kind>) -> Self {
+        self.form_factor = kind.map(|k| k.form_factor);
+        self.sub_platform = kind.map(|k| k.sub_platform);
+        self
+    }
+
+    /// `iPadOS · Tablet`, or just the platform when the form factor is unknown.
+    pub fn label(&self) -> String {
+        self.kind().map_or_else(|| self.platform.label().to_owned(), |k| k.label())
+    }
 }
 
 /// An installed OS runtime.
@@ -60,6 +88,7 @@ pub struct RuntimeInfo {
     pub version: String,
     pub build: String,
     pub available: bool,
+    pub platform: Platform,
 }
 
 /// A device model (hardware profile).
@@ -73,6 +102,9 @@ pub struct DeviceTypeInfo {
     pub screen_width: f64,
     pub screen_height: f64,
     pub screen_scale: f64,
+    pub platform: Platform,
+    /// From the product family; `None` for families this crate doesn't know.
+    pub form_factor: Option<FormFactor>,
 }
 
 /// Maps a short privacy service name (`photos`, `camera`, ...) to its TCC service identifier.
@@ -145,7 +177,31 @@ mod tests {
     use super::*;
 
     fn dev(udid: &str, name: &str, state: DeviceState) -> DeviceInfo {
-        DeviceInfo { udid: udid.into(), name: name.into(), state, runtime_id: "r".into(), device_type_id: "t".into(), available: true }
+        DeviceInfo {
+            udid: udid.into(),
+            name: name.into(),
+            state,
+            runtime_id: "r".into(),
+            device_type_id: "t".into(),
+            available: true,
+            platform: Platform::Ios,
+            form_factor: None,
+            sub_platform: None,
+        }
+    }
+
+    #[test]
+    fn devices_carry_platform_labels() {
+        let d = dev("A", "iPad", DeviceState::Booted);
+        assert_eq!((d.kind(), d.label()), (None, "iOS".to_owned()));
+        let d = d.with_kind(Kind::new(Platform::Ios, FormFactor::Tablet).ok());
+        assert_eq!(d.label(), "iPadOS · Tablet");
+        let json = serde_json::to_value(&d).expect("json");
+        assert_eq!(
+            (json["platform"].as_str(), json["form_factor"].as_str(), json["sub_platform"].as_str()),
+            (Some("ios"), Some("tablet"), Some("ipados"))
+        );
+        assert_eq!(serde_json::from_value::<DeviceInfo>(json).expect("parse"), d);
     }
 
     #[test]

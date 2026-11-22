@@ -2,7 +2,7 @@
 
 use rune::tok::{self, Theme, radius, type_};
 use rune::{Color, Cx, Drag, El, Icon, KeyEvent, Phase, ScrollSpec, SurfaceFit, Tx, col, el, row, text};
-use sim_core::device::DeviceState;
+use sim_core::device::{DeviceInfo, DeviceState};
 
 use crate::{Action, Input, State, icons};
 
@@ -50,7 +50,7 @@ fn sidebar(s: &State, t: Theme) -> El {
         let mut item = row()
             .key(format!("device-{i}"))
             .role("button")
-            .label(d.name.clone())
+            .label(format!("{}, {}", d.name, d.label()))
             .w_full()
             .h(30.0)
             .px(8.0)
@@ -59,7 +59,8 @@ fn sidebar(s: &State, t: Theme) -> El {
             .radius(radius::SM)
             .on_press(move |s: &mut State| s.actions.push(Action::Select(udid.clone())))
             .child(el().size(8.0, 8.0).radius(4.0).fill(color))
-            .child(text(d.name.clone()).font(type_::BODY).color(t.text).grow(1.0).truncate());
+            .child(text(d.name.clone()).font(type_::BODY).color(t.text).grow(1.0).truncate())
+            .child(platform_badge(d, t).key(format!("device-{i}-platform")));
         if selected {
             item = item.fill(t.card);
         }
@@ -85,6 +86,12 @@ fn sidebar(s: &State, t: Theme) -> El {
         .child(list.scroll(ScrollSpec { stick_bottom: false }).shrink().min_h(0.0))
 }
 
+/// The device's sub-platform (`iPadOS`, `watchOS`, `Wear OS`), else its platform.
+pub fn platform_badge(d: &DeviceInfo, t: Theme) -> El {
+    let name = d.sub_platform.map_or_else(|| d.platform.label(), |s| s.label());
+    text(name).font(type_::MONO_CAPTION).color(t.text_secondary)
+}
+
 /// `com.apple.CoreSimulator.SimRuntime.iOS-26-5` → `iOS 26.5`.
 pub fn runtime_label(id: &str) -> String {
     let tail = id.rsplit('.').next().unwrap_or(id);
@@ -96,7 +103,8 @@ pub fn runtime_label(id: &str) -> String {
 
 fn stage(s: &State, t: Theme) -> El {
     let mut controls = row().key("controls").w_full().gap(8.0).center_y();
-    let title = s.selected_info().map_or_else(|| "Select a device".to_string(), |d| format!("{} · {}", d.name, d.state.as_str()));
+    let title =
+        s.selected_info().map_or_else(|| "Select a device".to_string(), |d| format!("{} · {} · {}", d.name, d.label(), d.state.as_str()));
     controls = controls.child(text(title).key("device-title").font(type_::SECTION).color(t.text).grow(1.0).truncate());
     let booted = s.selected_info().is_some_and(|d| d.state == DeviceState::Booted);
     if s.booting {

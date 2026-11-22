@@ -8,6 +8,8 @@ use objc2::runtime::AnyObject;
 use objc2::{msg_send, sel};
 use objc2_foundation::{NSError, NSString};
 use sim_core::device::{DeviceInfo, DeviceState, DeviceTypeInfo, RuntimeInfo, Selection, select};
+use sim_core::form_factor::{apple_family_form_factor, apple_kind};
+use sim_core::platform::Platform;
 
 use crate::display::Display;
 use crate::error::{Error, Result};
@@ -157,6 +159,7 @@ fn runtime_info(r: &AnyObject) -> RuntimeInfo {
         build: rt::string_prop(r, sel!(buildVersionString)),
         // SAFETY: `available` is a BOOL getter on SimRuntime (guarded by the responds check).
         available: rt::responds(r, sel!(available)) && unsafe { msg_send![r, available] },
+        platform: Platform::Ios,
     }
 }
 
@@ -173,14 +176,17 @@ fn device_type_info(t: &AnyObject) -> DeviceTypeInfo {
     } else {
         0.0
     };
+    let product_family = rt::string_prop(t, sel!(productFamily));
     DeviceTypeInfo {
         identifier: rt::string_prop(t, sel!(identifier)),
         name: rt::string_prop(t, sel!(name)),
         model: rt::string_prop(t, sel!(modelIdentifier)),
-        product_family: rt::string_prop(t, sel!(productFamily)),
+        product_family: product_family.clone(),
         screen_width: size.width,
         screen_height: size.height,
         screen_scale: f64::from(scale),
+        platform: Platform::Ios,
+        form_factor: apple_family_form_factor(&product_family),
     }
 }
 
@@ -207,15 +213,22 @@ impl Device {
         let d = &*self.obj;
         // SAFETY: `UDID` returns an NSUUID and `UUIDString` its string form.
         let udid = rt::object_prop(d, sel!(UDID)).map(|u| rt::string_prop(&u, sel!(UUIDString))).unwrap_or_default();
+        let runtime_id = rt::string_prop(d, sel!(runtimeIdentifier));
+        let device_type_id = rt::string_prop(d, sel!(deviceTypeIdentifier));
+        let kind = apple_kind(&device_type_id, &runtime_id);
         DeviceInfo {
             udid,
             name: rt::string_prop(d, sel!(name)),
             state: self.state(),
-            runtime_id: rt::string_prop(d, sel!(runtimeIdentifier)),
-            device_type_id: rt::string_prop(d, sel!(deviceTypeIdentifier)),
+            runtime_id,
+            device_type_id,
             // SAFETY: `available` is a BOOL getter on SimDevice (guarded by the responds check).
             available: rt::responds(d, sel!(available)) && unsafe { msg_send![d, available] },
+            platform: Platform::Ios,
+            form_factor: None,
+            sub_platform: None,
         }
+        .with_kind(kind)
     }
 
     /// Current lifecycle state.

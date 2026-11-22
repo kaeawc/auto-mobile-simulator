@@ -83,3 +83,23 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cd desktop && cargo clippy --locked --all-targets --profile ci -- -D warnings
       - run: cd desktop && cargo test --locked --profile ci
+
+  # The window and its headless view tests also run on Linux: the iOS side compiles to a stub
+  # there (desktop/src/device.rs), so labels, scenes and input mapping are checked without a Mac.
+  desktop-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: desktop
+          shared-key: desktop-linux
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cd desktop && cargo clippy --locked --all-targets --profile ci -- -D warnings
+      - run: cd desktop && cargo test --locked --profile ci

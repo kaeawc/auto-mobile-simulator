@@ -13,7 +13,10 @@
 mod debug;
 mod device;
 mod icons;
+#[cfg(target_os = "macos")]
+mod ios;
 mod keys;
+#[cfg(target_os = "macos")]
 mod surface;
 mod view;
 
@@ -25,10 +28,9 @@ use std::time::Duration;
 use rune::{AppSpec, NativeSurface, Pixels, Tx, Waker};
 use sim_core::device::{DeviceInfo, DeviceState};
 use sim_core::gesture::Phase;
-use sim_core::hid::Button;
-use sim_coresim::{Context, Direction};
+use sim_core::hid::{Button, Direction};
 
-use device::Live;
+use device::{Context, Live};
 use keys::KeyAction;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,15 +147,22 @@ fn init() -> State {
     }
 }
 
-fn info(udid: &str, name: &str, runtime: &str, state: DeviceState) -> DeviceInfo {
+fn info(udid: &str, name: &str, device_type: &str, runtime: &str, state: DeviceState) -> DeviceInfo {
+    let runtime_id = format!("com.apple.CoreSimulator.SimRuntime.{runtime}");
+    let device_type_id = format!("com.apple.CoreSimulator.SimDeviceType.{device_type}");
+    let kind = sim_core::form_factor::apple_kind(&device_type_id, &runtime_id);
     DeviceInfo {
         udid: udid.into(),
         name: name.into(),
         state,
-        runtime_id: format!("com.apple.CoreSimulator.SimRuntime.{runtime}"),
-        device_type_id: "com.apple.CoreSimulator.SimDeviceType.iPhone-17".into(),
+        runtime_id,
+        device_type_id,
         available: true,
+        platform: sim_core::platform::Platform::Ios,
+        form_factor: None,
+        sub_platform: None,
     }
+    .with_kind(kind)
 }
 
 /// Fixed data and a synthetic screen for snapshots and tests.
@@ -162,9 +171,11 @@ fn demo(s: &mut State) {
     s.offline_screen = true;
     s.actions.clear();
     s.devices = vec![
-        info("A1", "iPhone 17", "iOS-26-5", DeviceState::Booted),
-        info("B2", "iPhone 17 Pro Max", "iOS-26-5", DeviceState::Shutdown),
-        info("C3", "iPhone 18 Pro", "iOS-27-0", DeviceState::Shutdown),
+        info("A1", "iPhone 17", "iPhone-17", "iOS-26-5", DeviceState::Booted),
+        info("B2", "iPhone 17 Pro Max", "iPhone-17-Pro-Max", "iOS-26-5", DeviceState::Shutdown),
+        info("D4", "iPad Pro 11-inch (M4)", "iPad-Pro-11-inch-M4", "iOS-26-5", DeviceState::Shutdown),
+        info("C3", "iPhone 18 Pro", "iPhone-18-Pro", "iOS-27-0", DeviceState::Shutdown),
+        info("E5", "Apple Watch Series 10 (46mm)", "Apple-Watch-Series-10-46mm", "watchOS-26-0", DeviceState::Shutdown),
     ];
     s.selected = Some("A1".into());
     let (w, h) = (402u32, 874u32);
@@ -448,6 +459,22 @@ mod tests {
             assert!(rt.find(key).is_some(), "{key} rendered");
         }
         assert!(rt.find("placeholder").is_none());
+    }
+
+    fn text_of(rt: &Runtime<State>, key: &str) -> String {
+        let e = rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key)).unwrap_or_else(|| panic!("{key} rendered"));
+        e.text.or(e.label).unwrap_or_default()
+    }
+
+    #[test]
+    fn devices_and_title_carry_platform_labels() {
+        let rt = runtime(demo);
+        assert_eq!(text_of(&rt, "device-0-platform"), "iOS");
+        assert_eq!(text_of(&rt, "device-2-platform"), "iPadOS");
+        assert_eq!(text_of(&rt, "device-4-platform"), "watchOS");
+        assert_eq!(text_of(&rt, "device-title"), "iPhone 17 · iOS · Phone · Booted");
+        let row = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("device-2")).and_then(|e| e.label);
+        assert_eq!(row.as_deref(), Some("iPad Pro 11-inch (M4), iPadOS · Tablet"));
     }
 
     #[test]
