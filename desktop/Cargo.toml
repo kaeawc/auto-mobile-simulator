@@ -1,0 +1,68 @@
+[package]
+name = "sim-rs-desktop"
+description = "sim-rs desktop app: a live, interactive device window rendered with Rune."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+
+# A workspace of its own: Rune is a large git dependency with a GPU stack. Keeping it out of the
+# root workspace means `cargo check`/`test` at the root never fetch, resolve, or feature-unify it.
+[workspace]
+
+[[bin]]
+name = "sim-rs-desktop"
+path = "src/main.rs"
+
+[dependencies]
+sim-core = { path = "../crates/sim-core" }
+sim-coresim = { path = "../crates/sim-coresim" }
+sim-debug = { path = "../crates/sim-debug" }
+sim-api = { path = "../crates/sim-api" }
+sim-netshape = { path = "../crates/sim-netshape" }
+serde = "1"
+serde_json = "1"
+png = { version = "0.18", default-features = false }
+rune = { git = "https://github.com/anomalyco/rune", rev = "7a707454fbfb8d3fd200723c65778fb7b98fd31e" }
+
+[features]
+# Live Rust editing through Rune's devserver (`scripts/rune-dev` in the Rune repo).
+hot = ["rune/hot"]
+
+# Rune doesn't propagate its patches; apps must repeat them at the same rev. Bump all of these
+# together with `rune` above.
+[patch.crates-io]
+winit = { git = "https://github.com/anomalyco/rune", rev = "7a707454fbfb8d3fd200723c65778fb7b98fd31e" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "7a707454fbfb8d3fd200723c65778fb7b98fd31e" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "7a707454fbfb8d3fd200723c65778fb7b98fd31e" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "7a707454fbfb8d3fd200723c65778fb7b98fd31e" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "7a707454fbfb8d3fd200723c65778fb7b98fd31e" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "7a707454fbfb8d3fd200723c65778fb7b98fd31e" }
+
+# `deny`, not `forbid`: only `src/surface.rs` (the zero-copy IOSurface bridge) opts back in.
+[lints.rust]
+unsafe_code = "deny"
+
+[profile.dev]
+debug = "line-tables-only"
+
+# Rune's renderer and our pixel conversion run every frame: optimize dependencies and the core
+# crates so a debug window stays smooth.
+[profile.dev.package."*"]
+debug = false
+opt-level = 2
+
+[profile.release]
+codegen-units = 16
+incremental = true
+
+[profile.rune-hot]
+inherits = "dev"
+debug = 0
+incremental = true
+
+[profile.ci]
+inherits = "dev"
+debug = false
+incremental = false

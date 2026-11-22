@@ -1,0 +1,78 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/sim-rs"]
+# The Rune desktop app is its own workspace: a large git dependency and a GPU stack stay out of
+# `cargo check`/`test` here.
+exclude = ["desktop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+
+# Every crate inherits deps from here, so each dependency is built with one feature set no matter
+# which `-p` subset you build.
+[workspace.dependencies]
+sim-core = { path = "crates/sim-core" }
+sim-coresim = { path = "crates/sim-coresim" }
+sim-debug = { path = "crates/sim-debug" }
+sim-api = { path = "crates/sim-api" }
+sim-netshape = { path = "crates/sim-netshape" }
+sim-audio = { path = "crates/sim-audio" }
+
+anyhow = "1"
+base64 = "0.23"
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
+png = { version = "0.18", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# Objective-C runtime bindings. Only sim-coresim may depend on these.
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# PNG encoding of full-resolution framebuffers is the hot path of `screenshot` in debug builds.
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.build-override]
+opt-level = 0
+debug = false
+
+[profile.release]
+codegen-units = 16
+incremental = true
+strip = "debuginfo"
+
+[profile.dist]
+inherits = "release"
+codegen-units = 1
+incremental = false
+lto = "thin"
+strip = true
+
+[profile.ci]
+inherits = "dev"
+debug = false
+incremental = false

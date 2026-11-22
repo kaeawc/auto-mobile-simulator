@@ -1,0 +1,17 @@
+[package]
+name = "sim-debug"
+description = "Host-side introspection of a simulated device: processes, network, storage, crash reports."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true
