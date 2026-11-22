@@ -30,7 +30,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     (
         "boot",
         "device, timeout_s?, env?, shaped?",
-        "Boot and wait until finished (env: the device launchd's environment; shaped: inject the network shaper)",
+        "Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; Android: starts emu)",
     ),
     ("shutdown", "device", "Shut down"),
     ("erase", "device", "Erase content and settings (shut down first)"),
@@ -39,7 +39,11 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("tap", "device, x, y, hold_ms?", "Tap at pixels"),
     ("swipe", "device, x1, y1, x2, y2, duration_ms?, settle?", "Swipe between pixels"),
     ("touch", "device, x, y, phase(down|move|up)", "One raw touch sample"),
-    ("button", "device, button(home|lock|side|siri|apple-pay), hold_ms?", "Press a hardware button"),
+    (
+        "button",
+        "device, button(home|lock|side|siri|apple-pay | back|volume-up|volume-down|recents|menu|up|down|left|right|select), hold_ms?",
+        "Press a hardware button (the first group are iOS's, the second Android's; home and lock are both)",
+    ),
     ("type", "device, text", "Type on the hardware keyboard"),
     ("key", "device, usage", "Press a key by HID usage"),
     ("open_url", "device, url", "Open a URL"),

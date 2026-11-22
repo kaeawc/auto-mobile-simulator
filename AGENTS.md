@@ -140,5 +140,7 @@ scripts/automobile-harness-android.sh emulator-5554
   Android: `sign-run.sh` (the cargo runner: hypervisor entitlement), `sdk-shim.sh` (SDK overlay
   whose `emulator` is emu-rs), `automobile-harness-android.sh`, `android-bench.sh`.
 - `docs/research/` — `network-shaping.md`, `audio-camera.md`; `docs/automobile-tool-matrix.md`.
+  `docs/architecture.md` (layers, process model, shared logic, the conflict decisions),
+  `docs/form-factors.md` (support matrix, profiles, inference, launching each kind, known gaps).
   Android: `docs/android.md` (status, provisioning, benchmarks, performance notes),
   `docs/reference/stock-board.md`, `docs/design/desktop-and-display.md`, `docs/roadmap-android.md`.
