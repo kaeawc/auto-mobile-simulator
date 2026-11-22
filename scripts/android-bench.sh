@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Boot one AVD and measure it, the same way for emu-rs and the stock emulator, so results compare.
 #
-#   scripts/bench.sh <label> <avd> [emu|stock] [extra args...]   -> one key=value line, also in bench/<label>.result
+#   scripts/android-bench.sh <label> <avd> [emu|stock] [extra args...]   -> one key=value line, also in bench/<label>.result
 #
 # Metrics: seconds to `adb device` and to sys.boot_completed; median-of-3 latency of common adb
 # shell calls; guest CPU microbenchmarks; the emulator process's peak RSS. Runs with a stripped
 # environment (no Java on PATH). Stops the instance it started, by PID.
 set -uo pipefail
-label=${1:?usage: scripts/bench.sh <label> <avd> [emu|stock] [args...]}
+label=${1:?usage: scripts/android-bench.sh <label> <avd> [emu|stock] [args...]}
 avd=${2:?avd}; kind=${3:-emu}; shift $(( $# >= 3 ? 3 : $# ))
 repo=$(cd "$(dirname "$0")/.." && pwd)
 sdk=${ANDROID_HOME:-$HOME/Library/Android/sdk}

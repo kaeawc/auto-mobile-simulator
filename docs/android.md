@@ -56,12 +56,12 @@ ignored for now.
 | `crates/emu-fdt` | Flattened device tree writer |
 | `apps/emu` | The `emu` CLI: SDK-emulator-compatible flags, per-AVD instance state, console server |
 | `desktop/` | Rune desktop app, its own workspace |
-| `docs/` | [Stock board reference](docs/reference/stock-board.md), [desktop and display design](docs/design/desktop-and-display.md), [roadmap](docs/roadmap.md) |
-| `scripts/` | Cargo runner that signs with the hypervisor entitlement, SDK overlay (`make shim`), AutoMobile harness (`make harness DEVICE=emulator-5554`) |
+| `docs/` | [Stock board reference](docs/reference/stock-board.md), [desktop and display design](docs/design/desktop-and-display.md), [roadmap](docs/roadmap-android.md) |
+| `scripts/` | Cargo runner that signs with the hypervisor entitlement, SDK overlay (`make shim`), AutoMobile harness (`make harness-android DEVICE=emulator-5554`) |
 
 ## Benchmarks
 
-`scripts/bench.sh` boots an AVD the same way under either emulator and measures it. Results
+`scripts/android-bench.sh` boots an AVD the same way under either emulator and measures it. Results
 below are from one API 36 `google_apis` AVD (4 vCPU, 2 GB) on an M-series Mac, 2026-11-22. Stock
 was cold-booted (`-no-snapshot-load`).
 

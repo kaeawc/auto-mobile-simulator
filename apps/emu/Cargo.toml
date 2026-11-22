@@ -23,5 +23,13 @@ flate2.workspace = true
 crc32fast.workspace = true
 rustix.workspace = true
 
-[lints]
-workspace = true
+# `deny`, not the workspace's `forbid`: `shutdown_signals` (signal masks) opts back in, and is the
+# only unsafe code in this crate.
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"

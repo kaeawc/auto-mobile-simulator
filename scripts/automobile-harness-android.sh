@@ -3,13 +3,13 @@
 # state directories), so no other AutoMobile daemon on the machine is touched. Prints a
 # pass/fail line per tool and writes the matrix to <logs>/coverage.tsv.
 #
-#   scripts/automobile-harness.sh emulator-5554 [auto-mobile checkout]   # attach to a running emu-rs
-#   scripts/automobile-harness.sh @<avd> [auto-mobile checkout]          # AutoMobile boots it (via `make shim`)
+#   scripts/automobile-harness-android.sh emulator-5554 [auto-mobile checkout]   # attach to a running emu-rs
+#   scripts/automobile-harness-android.sh @<avd> [auto-mobile checkout]          # AutoMobile boots it (via `make shim`)
 #
 # The checkout defaults to ../auto-mobile and runs from source (bun src/index.ts).
 # HARNESS_ONLY=<regex> limits the run to matching tool lines.
 set -euo pipefail
-target=${1:?usage: scripts/automobile-harness.sh <emulator-PORT|@avd> [auto-mobile checkout]}
+target=${1:?usage: scripts/automobile-harness-android.sh <emulator-PORT|@avd> [auto-mobile checkout]}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 am_dir=$(cd "${2:-$repo/../auto-mobile}" && pwd)
 entry="$am_dir/src/index.ts"

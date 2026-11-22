@@ -5,16 +5,21 @@
 //! reported once with `-verbose`.
 
 mod args;
+// The VMM, the renderer and everything that drives them exist only on Apple silicon Macs (the
+// Hypervisor.framework); elsewhere `emu` still lists, creates and provisions AVDs.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod console;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod display_server;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod instance;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod png;
 mod provision;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vkprobe;
 
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -99,10 +104,13 @@ fn real_main() -> Result<ExitCode> {
     // First, before any thread exists.
     let signals = shutdown_signals();
     // Internal: `emu -probe-vulkan <lib64>` (see vkprobe.rs).
-    let raw: Vec<String> = std::env::args().collect();
-    if raw.get(1).map(String::as_str) == Some("-probe-vulkan") {
-        let ok = raw.get(2).is_some_and(|p| vkprobe::probe(std::path::Path::new(p)));
-        return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let raw: Vec<String> = std::env::args().collect();
+        if raw.get(1).map(String::as_str) == Some("-probe-vulkan") {
+            let ok = raw.get(2).is_some_and(|p| vkprobe::probe(std::path::Path::new(p)));
+            return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+        }
     }
     let opts = args::parse(std::env::args().skip(1))?;
     let env = emu_avd::Env::from_env();
@@ -139,10 +147,28 @@ fn real_main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if opts.accel_check {
-        println!("accel:\n0\nHypervisor.framework (arm64) is usable\naccel");
-        return Ok(ExitCode::SUCCESS);
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            println!("accel:\n0\nHypervisor.framework (arm64) is usable\naccel");
+            return Ok(ExitCode::SUCCESS);
+        }
+        println!("accel:\n1\nemu-rs needs Hypervisor.framework on an Apple silicon Mac\naccel");
+        return Ok(ExitCode::FAILURE);
     }
     let name = opts.avd.clone().context("no AVD given (use -avd NAME, or -list-avds)")?;
+    boot(&env, &name, &opts, signals)
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn boot(_: &emu_avd::Env, name: &str, _: &args::Opts, _: std::sync::mpsc::Receiver<i32>) -> Result<ExitCode> {
+    anyhow::bail!("cannot boot {name}: emu-rs needs Hypervisor.framework on an Apple silicon Mac")
+}
+
+/// Boots the AVD and runs it until the guest powers off or a signal arrives.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn boot(env: &emu_avd::Env, name: &str, opts: &args::Opts, signals: std::sync::mpsc::Receiver<i32>) -> Result<ExitCode> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     if opts.verbose && !opts.ignored.is_empty() {
         eprintln!("emu: accepted but not implemented yet: {}", opts.ignored.join(" "));
     }
@@ -162,8 +188,8 @@ fn real_main() -> Result<ExitCode> {
         });
     }
 
-    let avd = env.load(&name)?;
-    let inst = instance::Instance::prepare(&avd, &opts)?;
+    let avd = env.load(name)?;
+    let inst = instance::Instance::prepare(&avd, opts)?;
     console::serve(
         inst.console_port,
         console::ConsoleInfo {
@@ -185,7 +211,7 @@ fn real_main() -> Result<ExitCode> {
     // On stdout: launchers watch for the first line and the `emulator-<port>` serial.
     println!("emu: {} on emulator-{} (adb port {})", avd.name, inst.console_port, inst.console_port + 1);
     loop {
-        let cfg = inst.machine_config(&opts)?;
+        let cfg = inst.machine_config(opts)?;
         let out = emu_vmm::run(cfg, stop.clone())?;
         if opts.verbose {
             eprintln!("emu: stopped after {:.1}s: {:?}", out.uptime.as_secs_f64(), out.reason);
