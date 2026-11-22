@@ -1,0 +1,482 @@
+//! vCPU threads: entering the guest and handling its exits (MMIO, PSCI, WFI, sysreg traps).
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
+
+use emu_hvf::{Exit, Reg, SysReg, Vcpu, VcpuHandle};
+
+use crate::bus::{Bus, le_value};
+
+const EC_WFX: u64 = 0x01;
+const EC_HVC64: u64 = 0x16;
+const EC_SMC64: u64 = 0x17;
+const EC_SYSREG: u64 = 0x18;
+const EC_IABT_LOWER: u64 = 0x20;
+const EC_DABT_LOWER: u64 = 0x24;
+
+/// EL1h with D, A, I and F masked: the state the arm64 boot protocol requires.
+const CPSR_EL1H_DAIF: u64 = 0x3c5;
+const VTIMER_PPI: u32 = 27;
+/// Upper bound on a host-side WFI sleep when no timer deadline is armed.
+const WFI_MAX_SLEEP: Duration = Duration::from_millis(1);
+
+mod psci {
+    pub const VERSION: u32 = 0x8400_0000;
+    pub const CPU_SUSPEND_32: u32 = 0x8400_0001;
+    pub const CPU_SUSPEND_64: u32 = 0xc400_0001;
+    pub const CPU_OFF: u32 = 0x8400_0002;
+    pub const CPU_ON_32: u32 = 0x8400_0003;
+    pub const CPU_ON_64: u32 = 0xc400_0003;
+    pub const AFFINITY_INFO_32: u32 = 0x8400_0004;
+    pub const AFFINITY_INFO_64: u32 = 0xc400_0004;
+    pub const MIGRATE_INFO_TYPE: u32 = 0x8400_0006;
+    pub const SYSTEM_OFF: u32 = 0x8400_0008;
+    pub const SYSTEM_RESET: u32 = 0x8400_0009;
+
+    pub const SUCCESS: i64 = 0;
+    pub const NOT_SUPPORTED: i64 = -1;
+    pub const INVALID_PARAMS: i64 = -2;
+    pub const ALREADY_ON: i64 = -4;
+    pub const ON_PENDING: i64 = -5;
+}
+
+/// Why the machine stopped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StopReason {
+    PowerOff,
+    Reset,
+    /// Host asked (signal, console `kill`).
+    Requested,
+    Fault(String),
+}
+
+/// Wakes a vCPU sleeping in a host-side WFI wait.
+#[derive(Default)]
+pub struct Parker {
+    pending: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Parker {
+    pub fn unpark(&self) {
+        let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        *p = true;
+        self.cv.notify_one();
+    }
+
+    fn park_timeout(&self, d: Duration) {
+        let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if !*p {
+            p = self.cv.wait_timeout(p, d).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        *p = false;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Power {
+    Off,
+    Pending { entry: u64, ctx: u64 },
+    On,
+}
+
+struct CpuSlot {
+    power: Mutex<Power>,
+    cv: Condvar,
+}
+
+/// What a device thread uses to rouse vCPUs after raising an interrupt.
+///
+/// An idle vCPU sits inside `hv_vcpu_run` (the framework handles WFI itself when the GIC is
+/// in-kernel) and doesn't notice a newly pending SPI until its own timer fires. Kicking it out
+/// of the run loop makes it re-enter with the interrupt visible.
+#[derive(Default)]
+pub struct Wakers {
+    parkers: Vec<Parker>,
+    handles: Vec<OnceLock<VcpuHandle>>,
+}
+
+impl Wakers {
+    pub fn new(cpus: usize) -> Wakers {
+        Wakers { parkers: (0..cpus).map(|_| Parker::default()).collect(), handles: (0..cpus).map(|_| OnceLock::new()).collect() }
+    }
+
+    pub fn len(&self) -> usize {
+        self.parkers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.parkers.is_empty()
+    }
+
+    pub fn wake_all(&self) {
+        for (p, h) in self.parkers.iter().zip(&self.handles) {
+            p.unpark();
+            if let Some(h) = h.get() {
+                h.kick();
+            }
+        }
+    }
+}
+
+/// Per-vCPU exit counters.
+#[derive(Default)]
+pub struct ExitStats {
+    pub mmio_read: AtomicU64,
+    pub mmio_write: AtomicU64,
+    pub wfi: AtomicU64,
+    pub hvc: AtomicU64,
+    pub sysreg: AtomicU64,
+    pub canceled: AtomicU64,
+    pub vtimer: AtomicU64,
+}
+
+impl ExitStats {
+    pub fn snapshot(&self) -> [(&'static str, u64); 7] {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        [
+            ("mmio_read", l(&self.mmio_read)),
+            ("mmio_write", l(&self.mmio_write)),
+            ("wfi", l(&self.wfi)),
+            ("hvc", l(&self.hvc)),
+            ("sysreg", l(&self.sysreg)),
+            ("canceled", l(&self.canceled)),
+            ("vtimer", l(&self.vtimer)),
+        ]
+    }
+}
+
+pub struct Cpus {
+    pub bus: Bus,
+    slots: Vec<CpuSlot>,
+    wakers: Arc<Wakers>,
+    pub stats: Vec<ExitStats>,
+    vtimer_offset: u64,
+    stopping: AtomicBool,
+    stop: Mutex<Option<StopReason>>,
+    stop_cv: Condvar,
+    unmapped_logged: AtomicU64,
+    sysreg_logged: Mutex<Vec<u64>>,
+}
+
+impl Cpus {
+    pub fn new(bus: Bus, wakers: Arc<Wakers>, vtimer_offset: u64) -> Cpus {
+        let n = wakers.len();
+        Cpus {
+            bus,
+            slots: (0..n).map(|_| CpuSlot { power: Mutex::new(Power::Off), cv: Condvar::new() }).collect(),
+            wakers,
+            stats: (0..n).map(|_| ExitStats::default()).collect(),
+            vtimer_offset,
+            stopping: AtomicBool::new(false),
+            stop: Mutex::new(None),
+            stop_cv: Condvar::new(),
+            unmapped_logged: AtomicU64::new(0),
+            sysreg_logged: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Records the first stop reason and forces every vCPU out of the guest.
+    pub fn request_stop(&self, reason: StopReason) {
+        {
+            let mut s = self.stop.lock().unwrap_or_else(|e| e.into_inner());
+            if s.is_none() {
+                *s = Some(reason);
+            }
+            self.stopping.store(true, Ordering::SeqCst);
+            self.stop_cv.notify_all();
+        }
+        self.wakers.wake_all();
+        for slot in &self.slots {
+            let _g = slot.power.lock().unwrap_or_else(|e| e.into_inner());
+            slot.cv.notify_all();
+        }
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    /// Blocks until a stop is requested or `timeout` passes.
+    pub fn wait_stop(&self, timeout: Duration) -> Option<StopReason> {
+        let s = self.stop.lock().unwrap_or_else(|e| e.into_inner());
+        let s = self.stop_cv.wait_timeout_while(s, timeout, |s| s.is_none()).unwrap_or_else(|e| e.into_inner()).0;
+        s.clone()
+    }
+
+    /// Body of vCPU thread `idx`. The boot CPU starts at `boot`; the rest wait for PSCI CPU_ON.
+    pub fn thread_main(&self, idx: usize, boot: Option<(u64, u64)>) {
+        if let Err(e) = self.thread_inner(idx, boot) {
+            self.request_stop(StopReason::Fault(format!("vcpu{idx}: {e}")));
+        }
+    }
+
+    fn thread_inner(&self, idx: usize, boot: Option<(u64, u64)>) -> Result<(), emu_hvf::Error> {
+        let vcpu = Vcpu::new()?;
+        vcpu.set_sys_reg(SysReg::MPIDR_EL1, idx as u64)?;
+        vcpu.set_vtimer_offset(self.vtimer_offset)?;
+        let sctlr_reset = vcpu.sys_reg(SysReg::SCTLR_EL1)?;
+        let slot = &self.slots[idx];
+        let _ = self.wakers.handles[idx].set(vcpu.handle());
+        if let Some((entry, x0)) = boot {
+            *slot.power.lock().unwrap_or_else(|e| e.into_inner()) = Power::Pending { entry, ctx: x0 };
+        }
+        loop {
+            let (entry, ctx) = {
+                let mut p = slot.power.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if self.is_stopping() {
+                        return Ok(());
+                    }
+                    if let Power::Pending { entry, ctx } = *p {
+                        *p = Power::On;
+                        break (entry, ctx);
+                    }
+                    p = slot.cv.wait(p).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            // Architectural reset state, then the PSCI/boot entry contract: x0 = context.
+            for r in 0..=30 {
+                vcpu.set_reg(Reg::x(r), 0)?;
+            }
+            vcpu.set_sys_reg(SysReg::SCTLR_EL1, sctlr_reset)?;
+            vcpu.set_reg(Reg::x(0), ctx)?;
+            vcpu.set_reg(Reg::PC, entry)?;
+            vcpu.set_reg(Reg::CPSR, CPSR_EL1H_DAIF)?;
+            match self.run(idx, &vcpu)? {
+                Flow::CpuOff => *slot.power.lock().unwrap_or_else(|e| e.into_inner()) = Power::Off,
+                Flow::Stop => return Ok(()),
+            }
+        }
+    }
+
+    fn run(&self, idx: usize, vcpu: &Vcpu) -> Result<Flow, emu_hvf::Error> {
+        let stats = &self.stats[idx];
+        let mut vtimer_masked = false;
+        loop {
+            if self.is_stopping() {
+                return Ok(Flow::Stop);
+            }
+            if vtimer_masked {
+                // Unmask once the guest has handled the tick (timer no longer asserting).
+                let ctl = vcpu.sys_reg(SysReg::CNTV_CTL_EL0)?;
+                if ctl & 0b111 != 0b101 {
+                    vcpu.set_vtimer_mask(false)?;
+                    vtimer_masked = false;
+                }
+            }
+            match vcpu.run()? {
+                Exit::Canceled => {
+                    stats.canceled.fetch_add(1, Ordering::Relaxed);
+                }
+                Exit::VtimerActivated => {
+                    // Only seen without an in-kernel GIC; raise the PPI ourselves.
+                    stats.vtimer.fetch_add(1, Ordering::Relaxed);
+                    vcpu.set_ppi_pending(VTIMER_PPI)?;
+                    vtimer_masked = true;
+                }
+                Exit::Exception { syndrome, ipa, .. } => {
+                    if let Some(flow) = self.exception(idx, vcpu, syndrome, ipa)? {
+                        return Ok(flow);
+                    }
+                }
+                Exit::Unknown(r) => {
+                    self.request_stop(StopReason::Fault(format!("vcpu{idx}: unknown exit reason {r}")));
+                    return Ok(Flow::Stop);
+                }
+            }
+        }
+    }
+
+    fn advance_pc(vcpu: &Vcpu) -> Result<(), emu_hvf::Error> {
+        let pc = vcpu.reg(Reg::PC)?;
+        vcpu.set_reg(Reg::PC, pc + 4)
+    }
+
+    fn exception(&self, idx: usize, vcpu: &Vcpu, syndrome: u64, ipa: u64) -> Result<Option<Flow>, emu_hvf::Error> {
+        let stats = &self.stats[idx];
+        let ec = (syndrome >> 26) & 0x3f;
+        let iss = syndrome & 0x01ff_ffff;
+        match ec {
+            EC_DABT_LOWER => {
+                if (iss >> 24) & 1 == 0 {
+                    let pc = vcpu.reg(Reg::PC)?;
+                    self.request_stop(StopReason::Fault(format!(
+                        "vcpu{idx}: data abort without syndrome at ipa {ipa:#x} (pc {pc:#x}, esr {syndrome:#x})"
+                    )));
+                    return Ok(Some(Flow::Stop));
+                }
+                let size = 1usize << ((iss >> 22) & 3);
+                let sign_extend = (iss >> 21) & 1 == 1;
+                let rt = ((iss >> 16) & 0x1f) as u32;
+                let sixty_four = (iss >> 15) & 1 == 1;
+                let write = (iss >> 6) & 1 == 1;
+                if write {
+                    stats.mmio_write.fetch_add(1, Ordering::Relaxed);
+                    let v = if rt == 31 { 0 } else { vcpu.reg(Reg::x(rt))? };
+                    if !self.bus.write(ipa, &v.to_le_bytes()[..size]) {
+                        self.log_unmapped(ipa, true);
+                    }
+                } else {
+                    stats.mmio_read.fetch_add(1, Ordering::Relaxed);
+                    let mut buf = [0u8; 8];
+                    if !self.bus.read(ipa, &mut buf[..size]) {
+                        self.log_unmapped(ipa, false);
+                    }
+                    let mut v = le_value(&buf[..size]);
+                    if sign_extend && size < 8 {
+                        let shift = 64 - size * 8;
+                        v = (((v << shift) as i64) >> shift) as u64;
+                    }
+                    if !sixty_four {
+                        v &= 0xffff_ffff;
+                    }
+                    if rt != 31 {
+                        vcpu.set_reg(Reg::x(rt), v)?;
+                    }
+                }
+                Self::advance_pc(vcpu)?;
+            }
+            EC_HVC64 | EC_SMC64 => {
+                stats.hvc.fetch_add(1, Ordering::Relaxed);
+                // HVC leaves PC past the instruction already; SMC traps with PC on it.
+                if ec == EC_SMC64 {
+                    Self::advance_pc(vcpu)?;
+                }
+                return self.psci(idx, vcpu);
+            }
+            EC_WFX => {
+                stats.wfi.fetch_add(1, Ordering::Relaxed);
+                let is_wfe = iss & 1 == 1;
+                Self::advance_pc(vcpu)?;
+                if !is_wfe {
+                    self.wfi(idx, vcpu)?;
+                }
+            }
+            EC_SYSREG => {
+                stats.sysreg.fetch_add(1, Ordering::Relaxed);
+                // Registers the framework doesn't handle (debug, PMU, ...): RAZ/WI.
+                let is_read = iss & 1 == 1;
+                let rt = ((iss >> 5) & 0x1f) as u32;
+                let enc = iss & !(0x1f << 5) & !1;
+                self.log_sysreg(enc, is_read);
+                if is_read && rt != 31 {
+                    vcpu.set_reg(Reg::x(rt), 0)?;
+                }
+                Self::advance_pc(vcpu)?;
+            }
+            EC_IABT_LOWER => {
+                let pc = vcpu.reg(Reg::PC)?;
+                self.request_stop(StopReason::Fault(format!(
+                    "vcpu{idx}: instruction fetch from unmapped ipa {ipa:#x} (pc {pc:#x}, esr {syndrome:#x})"
+                )));
+                return Ok(Some(Flow::Stop));
+            }
+            _ => {
+                let pc = vcpu.reg(Reg::PC)?;
+                self.request_stop(StopReason::Fault(format!(
+                    "vcpu{idx}: unhandled exception class {ec:#x} (pc {pc:#x}, esr {syndrome:#x})"
+                )));
+                return Ok(Some(Flow::Stop));
+            }
+        }
+        Ok(None)
+    }
+
+    fn wfi(&self, idx: usize, vcpu: &Vcpu) -> Result<(), emu_hvf::Error> {
+        let ctl = vcpu.sys_reg(SysReg::CNTV_CTL_EL0)?;
+        let mut sleep = WFI_MAX_SLEEP;
+        if ctl & 1 == 1 && ctl & 2 == 0 {
+            let cval = vcpu.sys_reg(SysReg::CNTV_CVAL_EL0)?;
+            let now = emu_hvf::host_ticks().wrapping_sub(self.vtimer_offset);
+            if cval <= now {
+                return Ok(());
+            }
+            sleep = sleep.min(Duration::from_nanos(emu_hvf::ticks_to_nanos(cval - now)));
+        }
+        self.wakers.parkers[idx].park_timeout(sleep);
+        Ok(())
+    }
+
+    fn psci(&self, idx: usize, vcpu: &Vcpu) -> Result<Option<Flow>, emu_hvf::Error> {
+        let func = vcpu.reg(Reg::x(0))? as u32;
+        let arg = |n| vcpu.reg(Reg::x(n));
+        let ret: i64 = match func {
+            psci::VERSION => 0x2, // PSCI 0.2, matching the device tree
+            psci::CPU_SUSPEND_32 | psci::CPU_SUSPEND_64 => {
+                self.wfi(idx, vcpu)?;
+                psci::SUCCESS
+            }
+            psci::CPU_OFF => return Ok(Some(Flow::CpuOff)),
+            psci::CPU_ON_32 | psci::CPU_ON_64 => {
+                let target = (arg(1)? & 0xff) as usize;
+                let (entry, ctx) = (arg(2)?, arg(3)?);
+                match self.slots.get(target) {
+                    None => psci::INVALID_PARAMS,
+                    Some(slot) => {
+                        let mut p = slot.power.lock().unwrap_or_else(|e| e.into_inner());
+                        match *p {
+                            Power::On => psci::ALREADY_ON,
+                            Power::Pending { .. } => psci::ON_PENDING,
+                            Power::Off => {
+                                *p = Power::Pending { entry, ctx };
+                                slot.cv.notify_all();
+                                psci::SUCCESS
+                            }
+                        }
+                    }
+                }
+            }
+            psci::AFFINITY_INFO_32 | psci::AFFINITY_INFO_64 => {
+                let target = (arg(1)? & 0xff) as usize;
+                match self.slots.get(target) {
+                    None => psci::INVALID_PARAMS,
+                    Some(slot) => match *slot.power.lock().unwrap_or_else(|e| e.into_inner()) {
+                        Power::On => 0,
+                        Power::Off => 1,
+                        Power::Pending { .. } => 2,
+                    },
+                }
+            }
+            psci::MIGRATE_INFO_TYPE => 2, // no trusted OS
+            psci::SYSTEM_OFF => {
+                self.request_stop(StopReason::PowerOff);
+                return Ok(Some(Flow::Stop));
+            }
+            psci::SYSTEM_RESET => {
+                self.request_stop(StopReason::Reset);
+                return Ok(Some(Flow::Stop));
+            }
+            _ => psci::NOT_SUPPORTED,
+        };
+        vcpu.set_reg(Reg::x(0), ret as u64)?;
+        Ok(None)
+    }
+
+    fn log_unmapped(&self, ipa: u64, write: bool) {
+        if self.unmapped_logged.fetch_add(1, Ordering::Relaxed) < 16 {
+            eprintln!("emu: guest {} unmapped address {ipa:#x}", if write { "wrote" } else { "read" });
+        }
+    }
+
+    fn log_sysreg(&self, enc: u64, is_read: bool) {
+        let mut seen = self.sysreg_logged.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() < 64 && !seen.contains(&enc) {
+            seen.push(enc);
+            let (op0, op2, op1, crn, crm) = ((enc >> 20) & 3, (enc >> 17) & 7, (enc >> 14) & 7, (enc >> 10) & 0xf, (enc >> 1) & 0xf);
+            eprintln!(
+                "emu: trapped sysreg S{op0}_{op1}_C{crn}_C{crm}_{op2} ({}), treating as RAZ/WI",
+                if is_read { "read" } else { "write" }
+            );
+        }
+    }
+}
+
+enum Flow {
+    CpuOff,
+    Stop,
+}
