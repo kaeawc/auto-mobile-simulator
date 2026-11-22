@@ -439,7 +439,9 @@ mod tests {
 
     /// An SDK with a mobile and a Wear OS image, and an empty AVD home.
     fn fixture(tag: &str) -> Fixture {
-        let root = std::env::temp_dir().join(format!("sim-android-{tag}-{}", std::process::id()));
+        // Under /tmp, not $TMPDIR: the fake display socket's path must fit a unix socket address
+        // (104 bytes on macOS), and macOS's $TMPDIR alone takes about 50.
+        let root = PathBuf::from("/tmp").join(format!("sa-{tag}-{}", std::process::id()));
         let sdk = root.join("sdk");
         for (dir, api, image_tag) in
             [("android-36/google_apis/arm64-v8a", 36, "google_apis"), ("android-34/android-wear/arm64-v8a", 34, "android-wear")]

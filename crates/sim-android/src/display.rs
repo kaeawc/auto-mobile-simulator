@@ -56,7 +56,8 @@ mod tests {
 
     #[test]
     fn sends_input_lines_and_reads_frames() {
-        let dir = std::env::temp_dir().join(format!("sim-android-display-{}", std::process::id()));
+        // Under /tmp: the socket path must fit a unix socket address (104 bytes on macOS).
+        let dir = PathBuf::from("/tmp").join(format!("sa-display-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("emu-rs")).expect("dir");
         let listener = UnixListener::bind(socket(&dir)).expect("bind");
         let server = std::thread::spawn(move || {
