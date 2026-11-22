@@ -335,7 +335,9 @@ mod tests {
             .map(|d| (d["udid"].as_str().unwrap_or(""), d["sub_platform"].as_str().unwrap_or("")))
             .collect();
         assert_eq!(labels, [("fold", "android"), ("watch", "wearos")]);
-        assert_eq!(call(&mut s, "devices", &json!({"form_factor": "watch"})).expect("watches").as_array().map(Vec::len), Some(1));
+        // Android only: a macOS host lists its real Apple Watch simulators as watches too.
+        let watches = call(&mut s, "devices", &json!({"form_factor": "watch", "platform": "android"})).expect("watches");
+        assert_eq!(watches.as_array().map(Vec::len), Some(1));
         assert_eq!(call(&mut s, "devices", &json!({"booted": true, "platform": "android"})).expect("booted"), json!([]));
         let rts = call(&mut s, "runtimes", &json!({"platform": "android"})).expect("runtimes");
         assert_eq!(rts.as_array().map(Vec::len), Some(2));
