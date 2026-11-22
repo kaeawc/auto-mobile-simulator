@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 pub use bootconfig::BootConfig;
 pub use ini::parse_ini;
+use sim_core::form_factor::{Density, FormFactor, Profile, android_profile};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -167,6 +168,21 @@ impl Avd {
         self.sysdir.join("vendor.img")
     }
 
+    /// What the device is (phone, tablet, foldable, Wear OS watch, TV, Automotive head unit) and
+    /// its screen, shape, fold and inputs, inferred from `config.ini`. The system image tag is
+    /// read from the image's `source.properties` when the config doesn't name it.
+    pub fn profile(&self) -> Profile {
+        let image_tag = || {
+            let props = std::fs::read_to_string(self.sysdir.join("source.properties")).ok()?;
+            parse_ini(&props).get("SystemImage.TagId").cloned()
+        };
+        android_profile(|k| match (self.get(k), k) {
+            (Some(v), _) => Some(v.to_owned()),
+            (None, "tag.id") => image_tag(),
+            (None, _) => None,
+        })
+    }
+
     /// API level from the system image's `source.properties`, if present.
     pub fn api_level(&self) -> Option<u32> {
         let props = std::fs::read_to_string(self.sysdir.join("source.properties")).ok()?;
@@ -205,6 +221,8 @@ pub struct NewAvd {
     pub ram_mb: u64,
     pub cores: u32,
     pub data_gb: u32,
+    /// More `config.ini` lines (a foldable's hinge sensor, for one).
+    pub extra: Vec<(String, String)>,
 }
 
 impl NewAvd {
@@ -216,7 +234,30 @@ impl NewAvd {
             ram_mb: 2048,
             cores: 4,
             data_gb: 4,
+            extra: Vec::new(),
         }
+    }
+
+    /// An AVD shaped like `profile`: its screen, and for a foldable the hinge sensor the stock
+    /// emulator's foldable definitions declare (one hinge, 0-180°, three postures).
+    pub fn for_profile(name: &str, sysdir: &str, profile: &Profile) -> NewAvd {
+        let mut spec = NewAvd::new(name, sysdir);
+        if let Density::Dpi(dpi) = profile.density {
+            spec.lcd = (profile.width, profile.height, dpi);
+        }
+        if let Some(fold) = profile.fold.filter(|_| profile.kind.form_factor == FormFactor::Foldable) {
+            let kv = |k: &str, v: String| (k.to_owned(), v);
+            spec.extra = vec![
+                kv("hw.sensor.hinge", "yes".into()),
+                kv("hw.sensor.hinge.count", "1".into()),
+                kv("hw.sensor.hinge.type", "0".into()),
+                kv("hw.sensor.hinge.ranges", "0-180".into()),
+                kv("hw.sensor.hinge.defaults", format!("{}", fold.angle)),
+                kv("hw.sensor.posture_list", "1,2,3".into()),
+                kv("hw.sensor.hinge_angles_posture_definitions", "0-30, 30-150, 150-180".into()),
+            ];
+        }
+        spec
     }
 }
 
@@ -255,10 +296,67 @@ impl Env {
             sysdir = spec.sysdir,
             data = spec.data_gb,
         );
+        let config: String = config + &spec.extra.iter().map(|(k, v)| format!("{k}={v}\n")).collect::<String>();
         let cfg = dir.join("config.ini");
         std::fs::write(&cfg, config).map_err(|e| io(&cfg, e))?;
         Ok(dir)
     }
+}
+
+/// Where running emulators advertise themselves (`pid_<pid>.ini`), as the SDK tools look for them.
+pub fn running_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Caches/TemporaryItems/avd/running"))
+}
+
+/// A running emulator, from its advertisement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Running {
+    pub pid: i32,
+    pub avd_name: String,
+    pub console_port: u16,
+    pub adb_port: u16,
+    pub avd_dir: Option<PathBuf>,
+    /// emu-rs wrote it (the stock emulator writes the same file without `emulator=emu-rs`).
+    pub emu_rs: bool,
+}
+
+impl Running {
+    /// The adb serial, `emulator-<console port>`.
+    pub fn serial(&self) -> String {
+        format!("emulator-{}", self.console_port)
+    }
+
+    /// Parses `pid_<pid>.ini` named `file_name`.
+    pub fn parse(file_name: &str, text: &str) -> Option<Running> {
+        let pid = file_name.strip_prefix("pid_")?.strip_suffix(".ini")?.parse().ok()?;
+        let kv = parse_ini(text);
+        let console_port: u16 = kv.get("port.serial")?.parse().ok()?;
+        Some(Running {
+            pid,
+            avd_name: kv.get("avd.name")?.clone(),
+            console_port,
+            adb_port: kv.get("port.adb").and_then(|p| p.parse().ok()).unwrap_or(console_port + 1),
+            avd_dir: kv.get("avd.dir").map(PathBuf::from),
+            emu_rs: kv.get("emulator").is_some_and(|e| e == "emu-rs"),
+        })
+    }
+
+    /// Whether its process still exists.
+    pub fn alive(&self) -> bool {
+        rustix::process::Pid::from_raw(self.pid).is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
+    }
+}
+
+/// Every advertised emulator whose process is still alive.
+pub fn running_instances() -> Vec<Running> {
+    let Some(dir) = running_dir() else { return Vec::new() };
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| Running::parse(e.file_name().to_str()?, &std::fs::read_to_string(e.path()).ok()?))
+        .filter(Running::alive)
+        .collect()
 }
 
 /// Parses `2048`, `2048M`, `2048MB`, `2G`, `2GB` into megabytes.
@@ -292,6 +390,21 @@ mod tests {
     }
 
     #[test]
+    fn running_advertisements_parse() {
+        let text = "port.serial=5554\nport.adb=5555\navd.name=pixel\navd.dir=/a/pixel.avd\nemulator=emu-rs\n";
+        let r = Running::parse("pid_42.ini", text).expect("parsed");
+        assert_eq!((r.pid, r.avd_name.as_str(), r.console_port, r.adb_port, r.emu_rs), (42, "pixel", 5554, 5555, true));
+        assert_eq!(r.serial(), "emulator-5554");
+        assert_eq!(r.avd_dir.as_deref(), Some(Path::new("/a/pixel.avd")));
+        let stock = Running::parse("pid_7.ini", "port.serial=5556\navd.name=other\n").expect("stock");
+        assert_eq!((stock.adb_port, stock.emu_rs), (5557, false));
+        assert_eq!(Running::parse("notes.txt", text), None);
+        assert_eq!(Running::parse("pid_1.ini", "avd.name=x\n"), None);
+        let me = Running { pid: std::process::id() as i32, ..r };
+        assert!(me.alive());
+    }
+
+    #[test]
     fn loads_avd_from_dir() {
         let tmp = std::env::temp_dir().join(format!("emu-avd-test-{}", std::process::id()));
         let avd_home = tmp.join("avd");
@@ -307,7 +420,7 @@ mod tests {
         )
         .expect("write");
         std::fs::write(avd_home.join("pixel.ini"), format!("path={}\n", avd_home.join("pixel.avd").display())).expect("write");
-        let env = Env { sdk_root: Some(sdk), avd_home };
+        let env = Env { sdk_root: Some(sdk.clone()), avd_home };
         assert_eq!(env.list_avds(), vec!["pixel".to_string()]);
         let avd = env.load("pixel").expect("load");
         assert_eq!(avd.cpus(), 4);
@@ -326,6 +439,24 @@ mod tests {
         assert_eq!((made.lcd(), made.cpus(), made.ram_bytes()), ((480, 800, 240), 4, 2 << 30));
         assert!(env.create_avd(&spec).is_err());
         assert!(env.create_avd(&NewAvd::new("../evil", "a/b/c")).is_err());
+        assert_eq!(made.profile().kind.form_factor, FormFactor::Phone);
+
+        // Form factors come back from what was written: a foldable's hinge, a Wear image's tag.
+        let fold = sim_core::form_factor::Kind::new(sim_core::platform::Platform::Android, FormFactor::Foldable).expect("fold").profile();
+        env.create_avd(&NewAvd::for_profile("fold", "system-images/android-36/google_apis/arm64-v8a", &fold)).expect("create fold");
+        let made = env.load("fold").expect("load fold");
+        assert_eq!(made.lcd(), (2208, 1840, 420));
+        let p = made.profile();
+        assert_eq!((p.kind.form_factor, p.fold.map(|f| f.posture())), (FormFactor::Foldable, Some(sim_core::form_factor::Posture::Opened)));
+        let wear_sys = sdk.join("system-images/android-34/android-wear/arm64-v8a");
+        std::fs::create_dir_all(&wear_sys).expect("mkdir");
+        std::fs::write(wear_sys.join("system.img"), b"s").expect("write");
+        std::fs::write(wear_sys.join("source.properties"), "SystemImage.TagId=android-wear\n").expect("write");
+        let mut watch = NewAvd::new("watch", "system-images/android-34/android-wear/arm64-v8a");
+        watch.lcd = (454, 454, 320);
+        env.create_avd(&watch).expect("create watch");
+        let w = env.load("watch").expect("load watch").profile();
+        assert_eq!((w.kind.sub_platform.as_str(), w.shape), ("wearos", sim_core::form_factor::Shape::Round));
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

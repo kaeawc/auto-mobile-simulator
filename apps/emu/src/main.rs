@@ -13,8 +13,6 @@ mod console;
 mod display_server;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod instance;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod png;
 mod provision;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vkprobe;

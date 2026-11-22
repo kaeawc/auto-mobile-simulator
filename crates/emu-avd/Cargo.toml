@@ -1,6 +1,6 @@
 [package]
 name = "emu-avd"
-description = "AVD discovery and config: ini files, system image resolution, bootconfig."
+description = "AVD discovery and config: ini files, system image resolution, bootconfig, form factor, running instances."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,8 @@ publish.workspace = true
 doctest = false
 
 [dependencies]
+rustix.workspace = true
+sim-core.workspace = true
 thiserror.workspace = true
 
 [lints]

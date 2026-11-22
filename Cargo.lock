@@ -90,21 +90,22 @@ name = "emu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "crc32fast",
  "emu-avd",
  "emu-ext4",
  "emu-gfxstream",
  "emu-sdk",
  "emu-vmm",
- "flate2",
  "libc",
  "rustix",
+ "sim-core",
 ]
 
 [[package]]
 name = "emu-avd"
 version = "0.1.0"
 dependencies = [
+ "rustix",
+ "sim-core",
  "thiserror",
 ]
 

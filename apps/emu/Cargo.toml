@@ -19,9 +19,8 @@ emu-ext4.workspace = true
 emu-vmm.workspace = true
 emu-gfxstream.workspace = true
 libc.workspace = true
-flate2.workspace = true
-crc32fast.workspace = true
 rustix.workspace = true
+sim-core.workspace = true
 
 # `deny`, not the workspace's `forbid`: `shutdown_signals` (signal masks) opts back in, and is the
 # only unsafe code in this crate.

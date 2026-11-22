@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
+use sim_core::frame::{Frame, encode_png};
+use sim_core::pixels::{PixelFormat, to_rgba};
 
 pub struct ConsoleInfo {
     pub avd_name: String,
@@ -55,6 +57,7 @@ fn sensor(info: &ConsoleInfo, words: &[&str]) -> String {
 /// `EV_REL:REL_WHEEL:-1`) and `event text <string>`.
 fn event(info: &ConsoleInfo, words: &[&str]) -> String {
     use emu_vmm::virtio::input::{EV_ABS, EV_KEY, EV_REL, EV_SYN, InputEvent, keycode};
+    use sim_core::hid::{keystroke, linux_keycode};
     let guard = info.inputs.lock().unwrap_or_else(|e| e.into_inner());
     let Some(inputs) = guard.as_ref() else { return "KO: no input devices".into() };
     match words.first().copied() {
@@ -97,10 +100,17 @@ fn event(info: &ConsoleInfo, words: &[&str]) -> String {
             }
             "OK".into()
         }
+        // US layout, through the same key map iOS typing uses, so capitals and symbols type too.
         Some("text") => {
+            const SHIFT: u16 = 42;
             for ch in words[1..].join(" ").chars() {
-                if let Some(k) = keycode(&ch.to_string()).or_else(|| (ch == ' ').then_some(57)) {
-                    inputs.keyboard.tap_key(k);
+                let Some((stroke, code)) = keystroke(ch).and_then(|k| Some((k, linux_keycode(k.usage)?))) else { continue };
+                if stroke.shift {
+                    inputs.keyboard.send(vec![InputEvent::new(EV_KEY, SHIFT, 1), InputEvent::syn()]);
+                }
+                inputs.keyboard.tap_key(code);
+                if stroke.shift {
+                    inputs.keyboard.send(vec![InputEvent::new(EV_KEY, SHIFT, 0), InputEvent::syn()]);
                 }
             }
             "OK".into()
@@ -118,10 +128,13 @@ fn screenshot(info: &ConsoleInfo, path: Option<&str>) -> String {
     }
     // The renderer's own capture of the last posted frame; the post-callback copy is the fallback.
     let (width, height) = (f.width, f.height);
-    let rgba = emu_vmm::renderer_screenshot(width, height)
-        .unwrap_or_else(|| crate::png::to_rgba(f.width, f.height, f.stride, f.format, &f.pixels));
+    let rgba = emu_vmm::renderer_screenshot(width, height).or_else(|| {
+        let format = PixelFormat::from_virtio_gpu(f.format).unwrap_or(PixelFormat::Rgba);
+        to_rgba(&f.pixels, f.width as usize, f.height as usize, f.stride as usize, format)
+    });
+    let Some(rgba) = rgba else { return "KO: the scanout frame's geometry is inconsistent".into() };
     let path = path.map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join(format!("emu-rs-{}.png", std::process::id())));
-    match crate::png::encode(width, height, &rgba).and_then(|png| std::fs::write(&path, png)) {
+    match encode_png(&Frame { width, height, rgba }).and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string())) {
         Ok(()) => format!("{} ({}x{}, frame {})\r\nOK", path.display(), width, height, f.frames),
         Err(e) => format!("KO: {e}"),
     }
@@ -477,8 +490,7 @@ pub struct Advertisement {
 
 impl Advertisement {
     pub fn write(avd_name: &str, avd_dir: &std::path::Path, console_port: u16) -> Option<Advertisement> {
-        let base = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Caches/TemporaryItems"))?;
-        let dir = base.join("avd/running");
+        let dir = emu_avd::running_dir()?;
         std::fs::create_dir_all(&dir).ok()?;
         prune_stale(&dir);
         let path = dir.join(format!("pid_{}.ini", std::process::id()));
@@ -500,13 +512,9 @@ impl Advertisement {
 fn prune_stale(dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(pid) = name.to_str().and_then(|n| n.strip_prefix("pid_")?.strip_suffix(".ini")?.parse::<i32>().ok()) else {
-            continue;
-        };
-        let ours = std::fs::read_to_string(e.path()).is_ok_and(|t| t.lines().any(|l| l == "emulator=emu-rs"));
-        let alive = rustix::process::Pid::from_raw(pid).is_some_and(|p| rustix::process::test_kill_process(p).is_ok());
-        if ours && !alive {
+        let Some(name) = e.file_name().to_str().map(str::to_owned) else { continue };
+        let Some(running) = std::fs::read_to_string(e.path()).ok().and_then(|t| emu_avd::Running::parse(&name, &t)) else { continue };
+        if running.emu_rs && !running.alive() {
             let _ = std::fs::remove_file(e.path());
         }
     }
