@@ -99,10 +99,8 @@ impl Console {
         let (tx, rx) = channel();
         let nr_ports = ports.len() as u32;
         let handles = (0..nr_ports).map(|port| PortHandle { tx: tx.clone(), port }).collect();
-        let ports = ports
-            .into_iter()
-            .map(|p| Port { name: p.name, backend: p.backend, guest_open: false, pending: VecDeque::new() })
-            .collect();
+        let ports =
+            ports.into_iter().map(|p| Port { name: p.name, backend: p.backend, guest_open: false, pending: VecDeque::new() }).collect();
         (Console { ports: Some(ports), nr_ports, tx, rx: Some(rx), worker: None }, handles)
     }
 

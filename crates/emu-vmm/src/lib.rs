@@ -10,8 +10,8 @@ pub mod disk;
 pub mod irq;
 pub mod layout;
 pub mod modem;
-pub mod telephony;
 pub mod pipe;
+pub mod telephony;
 pub mod vcpu;
 pub mod virtio;
 
@@ -303,9 +303,7 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         // goldfish address-space area; direct-mapped buffers may be anywhere in RAM).
         let (ram, area) = (mem.clone(), as_area.clone());
         let translate: emu_gfxstream::DmaTranslator = Box::new(move |gpa| {
-            ram.host_range(gpa, 1)
-                .or_else(|| area.as_ref().and_then(|a| a.host_range(gpa, 1)))
-                .map_or(std::ptr::null_mut(), |h| h.as_ptr())
+            ram.host_range(gpa, 1).or_else(|| area.as_ref().and_then(|a| a.host_range(gpa, 1))).map_or(std::ptr::null_mut(), |h| h.as_ptr())
         });
         match r.set_dma_translator(Some(translate)) {
             Ok(()) => dma_renderer = Some(r.clone()),
@@ -347,7 +345,8 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         registry.register("QemuMiscPipe", Box::new(pipe::misc::MiscService { on_event: cfg.on_guest_event.clone() }));
         registry.register("qemud:sensors", Box::new(pipe::sensors::SensorService { sensors: cfg.sensors.clone() }));
         registry.register("clipboard", Box::new(pipe::clipboard::ClipboardService { clipboard: cfg.clipboard.clone() }));
-        registry.register("qemud:fingerprintlisten", Box::new(pipe::fingerprint::FingerprintService { fingerprint: cfg.fingerprint.clone() }));
+        registry
+            .register("qemud:fingerprintlisten", Box::new(pipe::fingerprint::FingerprintService { fingerprint: cfg.fingerprint.clone() }));
         registry.register("qemud:gps", Box::new(pipe::gps::GpsService { gps: cfg.gps.clone() }));
         registry.register("multidisplay", Box::new(pipe::misc::Silent("multidisplay")));
         registry.register("qemud:camera", Box::new(pipe::fingerprint::CameraService));

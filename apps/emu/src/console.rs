@@ -130,7 +130,9 @@ fn screenshot(info: &ConsoleInfo, path: Option<&str>) -> String {
 /// `geo fix <longitude> <latitude> [<altitude> [<satellites> [<velocity>]]]` (stock syntax;
 /// velocity in knots).
 fn geo(info: &ConsoleInfo, words: &[&str]) -> String {
-    let ["fix", rest @ ..] = words else { return "KO: usage: geo fix <longitude> <latitude> [<altitude> [<satellites> [<velocity>]]]".into() };
+    let ["fix", rest @ ..] = words else {
+        return "KO: usage: geo fix <longitude> <latitude> [<altitude> [<satellites> [<velocity>]]]".into();
+    };
     let nums: Result<Vec<f64>, _> = rest.iter().map(|w| w.parse::<f64>()).collect();
     match nums.as_deref() {
         Ok([lon, lat, more @ ..]) if more.len() <= 3 && (-180.0..=180.0).contains(lon) && (-90.0..=90.0).contains(lat) => {
@@ -264,7 +266,11 @@ fn gsm(info: &ConsoleInfo, words: &[&str]) -> String {
         }
         [which @ ("voice" | "data"), state] => match RegState::from_name(state) {
             Some(st) => {
-                if *which == "voice" { t.set_voice(st) } else { t.set_data(st) }
+                if *which == "voice" {
+                    t.set_voice(st)
+                } else {
+                    t.set_data(st)
+                }
                 "OK".into()
             }
             None => "KO: bad state, use unregistered|home|roaming|searching|denied|off|on".into(),

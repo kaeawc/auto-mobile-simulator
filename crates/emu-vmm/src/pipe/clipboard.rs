@@ -108,9 +108,7 @@ mod tests {
         assert!(p.guest_data(&msg[3..], &mut out));
         assert_eq!(cb.get(), b"hello");
         cb.set(b"from host");
-        let crate::pipe::WorkerEvent::Host { conn: 7, msg: HostMsg::Data(d) } = rx.try_recv().expect("pushed") else {
-            panic!("data")
-        };
+        let crate::pipe::WorkerEvent::Host { conn: 7, msg: HostMsg::Data(d) } = rx.try_recv().expect("pushed") else { panic!("data") };
         assert_eq!(d, message(b"from host"));
         p.closed();
         cb.set(b"x");
