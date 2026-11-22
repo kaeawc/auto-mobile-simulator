@@ -349,7 +349,11 @@ impl Running {
 
 /// Every advertised emulator whose process is still alive.
 pub fn running_instances() -> Vec<Running> {
-    let Some(dir) = running_dir() else { return Vec::new() };
+    running_dir().map(|d| running_instances_in(&d)).unwrap_or_default()
+}
+
+/// Every emulator advertised in `dir` whose process is still alive.
+pub fn running_instances_in(dir: &Path) -> Vec<Running> {
     std::fs::read_dir(dir)
         .into_iter()
         .flatten()

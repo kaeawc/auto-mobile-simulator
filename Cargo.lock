@@ -364,12 +364,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
+name = "sim-android"
+version = "0.1.0"
+dependencies = [
+ "emu-avd",
+ "png",
+ "sim-core",
+]
+
+[[package]]
 name = "sim-api"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "emu-avd",
  "serde",
  "serde_json",
+ "sim-android",
  "sim-audio",
  "sim-core",
  "sim-coresim",

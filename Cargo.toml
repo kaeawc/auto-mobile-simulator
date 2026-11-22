@@ -23,6 +23,7 @@ sim-debug = { path = "crates/sim-debug" }
 sim-api = { path = "crates/sim-api" }
 sim-netshape = { path = "crates/sim-netshape" }
 sim-audio = { path = "crates/sim-audio" }
+sim-android = { path = "crates/sim-android" }
 emu-avd = { path = "crates/emu-avd" }
 emu-gfxstream = { path = "crates/emu-gfxstream" }
 emu-ext4 = { path = "crates/emu-ext4" }
