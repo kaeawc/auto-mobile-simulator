@@ -131,7 +131,9 @@ sim-rs itself is portable Rust, but the iOS runtime it drives is Apple's: iOS us
 host's XNU kernel, running under a per-device `launchd_sim`, rendering through Metal into IOSurfaces.
 That only runs on macOS, and Apple's license limits the runtimes to Apple hardware. What can be
 portable: the desktop window (Rune runs on Linux and Windows) and the socket API, with a Mac
-running `sim-rs serve` as the device host.
+running `sim-rs serve` as the device host. The shared core, the API and the CLI already build and
+test on Linux (CI runs them there); the macOS-only crates compile to nothing on other hosts, and
+device methods report that iOS devices need a macOS host.
 
 ## Harness
 

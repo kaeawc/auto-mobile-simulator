@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{msg_send, sel};
+use sim_core::frame::Frame;
 use sim_core::pixels::bgra_to_rgba;
 
 use crate::error::{Error, Result};
@@ -25,14 +26,6 @@ unsafe extern "C" {
 
 const LOCK_READ_ONLY: u32 = 1;
 const FORMAT_BGRA: u32 = u32::from_be_bytes(*b"BGRA");
-
-/// One captured frame: tightly packed opaque RGBA.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Frame {
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
-}
 
 /// A retained handle to the framebuffer `IOSurface`, for zero-copy display. The simulated device
 /// keeps rendering into it, so readers see live (possibly mid-update) contents.

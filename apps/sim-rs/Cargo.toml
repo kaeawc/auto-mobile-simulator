@@ -17,12 +17,8 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-png.workspace = true
 serde_json.workspace = true
-sim-core.workspace = true
-sim-coresim.workspace = true
 sim-api.workspace = true
-sim-netshape.workspace = true
 
 [dev-dependencies]
 png.workspace = true
