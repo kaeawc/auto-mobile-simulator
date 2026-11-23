@@ -21,6 +21,7 @@ pub mod telephony;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod vcpu;
 pub mod virtio;
+pub mod wake;
 
 pub use disk::{DiskMode, DiskSpec};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

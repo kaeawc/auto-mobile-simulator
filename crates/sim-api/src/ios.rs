@@ -1,6 +1,8 @@
 //! The iOS backend: every device method, served through the host's simulator service.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -12,7 +14,9 @@ use sim_core::form_factor::FormFactor;
 use sim_core::geometry::Size;
 use sim_core::gesture::Sample;
 use sim_core::hid::{KEY_LEFT_SHIFT, keystroke};
-use sim_coresim::{Appearance, Context, Device, Direction, Hid, Orientation, StatusBar, WatchGesture};
+use sim_core::reuse::{BootKey, Reuse};
+use sim_core::worker::Workers;
+use sim_coresim::{Appearance, Context, Device, Direction, Display, Hid, Orientation, StateWatch, StatusBar, WatchGesture};
 
 use crate::params::{
     button, crown_delta, err, need_bool, need_f64, need_str, on_carplay, opt_form_factor, opt_orientation, opt_u64, pairs,
@@ -156,11 +160,135 @@ impl Session {
         let q = str_param(p, "device").unwrap_or("booted");
         self.ctx()?.device(q).map_err(|e| e.to_string())
     }
+
+    /// The UDID the `device` parameter names: as given when it is one (no lookup), else resolved.
+    fn udid(&mut self, p: &Value) -> Result<String, String> {
+        let q = str_param(p, "device").unwrap_or("booted");
+        if sim_core::device::is_udid(q) {
+            return Ok(q.to_ascii_uppercase());
+        }
+        self.ctx()?.resolve(q).map(|(_, info)| info.udid).map_err(|e| e.to_string())
+    }
 }
 
-fn screen(device: &Device) -> Result<Size, String> {
-    let (w, h) = device.display().and_then(|d| d.size()).map_err(err)?;
-    Ok(Size::new(f64::from(w), f64::from(h)))
+/// The methods that send input, each run on its device's input worker.
+const INPUT_METHODS: &[&str] = &["tap", "swipe", "touch", "rotary", "watch_gesture", "remote_swipe", "button", "type", "key"];
+
+/// One input worker per device (by UDID), shared by every API connection. A worker keeps its
+/// device's HID client and display between calls (the service's objects stay on the thread that
+/// made them), runs that device's input in order, and lets go after five idle minutes.
+static INPUT: Workers<String, Input> = Workers::new("sim-rs-input", Duration::from_secs(300));
+
+/// A device's input connection, owned by its worker thread: the device, a watch on its state, and
+/// the HID client and main display, reused while the device stays in the same boot.
+#[derive(Default)]
+struct Input {
+    ctx: Option<Context>,
+    device: Option<Device>,
+    /// State changes the watch has seen.
+    changes: Arc<AtomicU64>,
+    watch: Option<StateWatch>,
+    hid: Reuse<BootKey, Hid>,
+    display: Reuse<BootKey, Display>,
+}
+
+impl Input {
+    /// Runs `send` with the device's HID client and, when `screen` is set, its screen size. Both
+    /// are reused until the device's state changes (a reboot) and dropped, with the device, on any
+    /// failure; a device whose boots can't be told apart connects on every call, as before.
+    fn run<R>(&mut self, udid: &str, screen: bool, send: impl FnOnce(&Hid, Option<Size>) -> Result<R, String>) -> Result<R, String> {
+        let result = self.try_run(udid, screen, send);
+        if result.is_err() {
+            self.device = None;
+            self.watch = None;
+        }
+        result
+    }
+
+    fn try_run<R>(&mut self, udid: &str, screen: bool, send: impl FnOnce(&Hid, Option<Size>) -> Result<R, String>) -> Result<R, String> {
+        let Self { ctx, device, changes, watch, hid, display } = self;
+        let ctx = match ctx {
+            Some(ctx) => ctx,
+            None => ctx.insert(Context::new().map_err(err)?),
+        };
+        let device = match device {
+            Some(device) => device,
+            None => {
+                let found = ctx.device(udid).map_err(err)?;
+                let seen = changes.clone();
+                *watch = found
+                    .watch_state(move || {
+                        seen.fetch_add(1, Ordering::Release);
+                    })
+                    .ok();
+                device.insert(found)
+            }
+        };
+        let changes = watch.as_ref().map(|_| changes.load(Ordering::Acquire));
+        let key = BootKey::of(device.state() == DeviceState::Booted, changes, device.last_booted_at());
+        let size = if screen {
+            let (w, h) = display.with(key, || device.display().map_err(err), |d| d.size().map_err(err))?;
+            Some(Size::new(f64::from(w), f64::from(h)))
+        } else {
+            None
+        };
+        hid.with(key, || device.hid().map_err(err), |hid| send(hid, size))
+    }
+}
+
+/// Runs an input method on its device's worker.
+fn input(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
+    let udid = s.udid(p)?;
+    let (method, p) = (method.to_owned(), p.clone());
+    INPUT.run(&udid.clone(), move |input| sim_coresim::autoreleasepool(|| input_method(input, &udid, &method, &p)))?
+}
+
+fn input_method(input: &mut Input, udid: &str, method: &str, p: &Value) -> Result<Value, String> {
+    let null = |r: Result<(), String>| r.map(|()| Value::Null);
+    match method {
+        "tap" => play_on(input, udid, p, &tap_samples(p)?),
+        "swipe" => play_on(input, udid, p, &swipe_samples(p)?),
+        "touch" => {
+            let (at, phase) = touch_sample(p)?;
+            play_on(input, udid, p, &[Sample { point: at, phase, delay: Duration::ZERO }])
+        }
+        "rotary" => {
+            let delta = crown_delta(p)?;
+            input.run(udid, false, |hid, _| hid.crown(delta).map_err(err)).map(|()| json!({"delta": delta}))
+        }
+        "watch_gesture" => {
+            let name = need_str(p, "gesture")?;
+            let gesture = WatchGesture::parse(name).ok_or_else(|| format!("unknown gesture `{name}` (double-tap, wrist-flick)"))?;
+            null(input.run(udid, false, |hid, _| hid.watch_gesture(gesture).map_err(err)))
+        }
+        "remote_swipe" => {
+            let samples = remote_swipe_samples(p)?;
+            null(input.run(udid, false, |hid, _| {
+                for sample in samples {
+                    sleep(sample.delay);
+                    hid.remote_touch(sample.point, sample.phase).map_err(err)?;
+                }
+                Ok(())
+            }))
+        }
+        "button" => {
+            let (button, hold) = button(p)?;
+            null(input.run(udid, false, |hid, _| {
+                hid.button(button, Direction::Down).map_err(err)?;
+                sleep(hold);
+                hid.button(button, Direction::Up).map_err(err)
+            }))
+        }
+        "type" => {
+            let text = need_str(p, "text")?;
+            null(input.run(udid, false, |hid, _| type_text(hid, text)))
+        }
+        "key" => {
+            let usage = opt_u64(p, "usage").ok_or("missing number parameter `usage`")? as u32;
+            null(input.run(udid, false, |hid, _| press(hid, usage)))
+        }
+        other => Err(format!("`{other}` isn't an input method")),
+    }
 }
 
 /// The display a method's `display` parameter picks: the device's own, or its CarPlay screen.
@@ -182,16 +310,19 @@ fn play(hid: &Hid, screen: Size, samples: &[Sample]) -> Result<(), String> {
 }
 
 /// Plays touch samples on the device's screen, or its CarPlay screen (`display: "carplay"`).
-fn play_on(device: &Device, p: &Value, samples: &[Sample]) -> Result<Value, String> {
-    let hid = device.hid().map_err(err)?;
-    if !on_carplay(p)? {
-        return play(&hid, screen(device)?, samples).map(|()| Value::Null);
-    }
-    for s in samples {
-        sleep(s.delay);
-        hid.carplay_touch(carplay_screen().normalize(s.point), s.phase).map_err(err)?;
-    }
-    Ok(Value::Null)
+fn play_on(input: &mut Input, udid: &str, p: &Value, samples: &[Sample]) -> Result<Value, String> {
+    let carplay = on_carplay(p)?;
+    let played = input.run(udid, !carplay, |hid, screen| match screen {
+        Some(screen) => play(hid, screen, samples),
+        None => {
+            for s in samples {
+                sleep(s.delay);
+                hid.carplay_touch(carplay_screen().normalize(s.point), s.phase).map_err(err)?;
+            }
+            Ok(())
+        }
+    });
+    played.map(|()| Value::Null)
 }
 
 /// The orientation sim-rs last set per device (UDID), so `rotate` without one turns 90° from there.
@@ -312,47 +443,13 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             Ok(json!({"width": w, "height": h}))
         }
         "screenshot" => screenshot_result(&display_of(&s.device(p)?, p)?.capture().map_err(err)?, p),
-        "tap" => play_on(&s.device(p)?, p, &tap_samples(p)?),
-        "swipe" => play_on(&s.device(p)?, p, &swipe_samples(p)?),
-        "touch" => {
-            let (at, phase) = touch_sample(p)?;
-            play_on(&s.device(p)?, p, &[Sample { point: at, phase, delay: Duration::ZERO }])
-        }
-        "rotary" => {
-            let delta = crown_delta(p)?;
-            s.device(p)?.hid().and_then(|h| h.crown(delta)).map(|()| json!({"delta": delta})).map_err(err)
-        }
-        "watch_gesture" => {
-            let name = need_str(p, "gesture")?;
-            let gesture = WatchGesture::parse(name).ok_or_else(|| format!("unknown gesture `{name}` (double-tap, wrist-flick)"))?;
-            ok(s.device(p)?.hid().and_then(|h| h.watch_gesture(gesture)))
-        }
-        "remote_swipe" => {
-            let hid = s.device(p)?.hid().map_err(err)?;
-            for sample in remote_swipe_samples(p)? {
-                sleep(sample.delay);
-                hid.remote_touch(sample.point, sample.phase).map_err(err)?;
-            }
-            Ok(Value::Null)
-        }
+        m if INPUT_METHODS.contains(&m) => input(s, m, p),
         "rotate" => rotate(&s.device(p)?, opt_orientation(p)?),
         "carplay" => {
             let on = need_bool(p, "on")?;
             s.device(p)?.set_carplay(on).map_err(err)?;
             let size = carplay_screen();
             Ok(if on { json!({"display": "carplay", "width": size.width, "height": size.height}) } else { Value::Null })
-        }
-        "button" => {
-            let (button, hold) = button(p)?;
-            let hid = s.device(p)?.hid().map_err(err)?;
-            hid.button(button, Direction::Down).map_err(err)?;
-            sleep(hold);
-            hid.button(button, Direction::Up).map(|()| Value::Null).map_err(err)
-        }
-        "type" => type_text(&s.device(p)?.hid().map_err(err)?, need_str(p, "text")?).map(|()| Value::Null),
-        "key" => {
-            let usage = opt_u64(p, "usage").ok_or("missing number parameter `usage`")? as u32;
-            press(&s.device(p)?.hid().map_err(err)?, usage).map(|()| Value::Null)
         }
         "open_url" => ok(s.device(p)?.open_url(need_str(p, "url")?)),
         "install" => ok(s.device(p)?.install(need_str(p, "path")?)),

@@ -219,7 +219,10 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   the framework (zero WFI exits in practice).
 - **Kick on interrupt.** A vCPU idling inside the framework doesn't notice a newly raised SPI
   until its own timer fires. Kicking vCPUs out of `hv_vcpu_run` after raising one cut
-  first-boot `/data` encryption from 22 s to 8 s.
+  first-boot `/data` encryption from 22 s to 8 s. Only the SPI's target (`GICD_IROUTER`) is
+  kicked, and only while it is in the guest, once per entry (`crates/emu-vmm/src/wake.rs`).
+  Other VMMs on macOS 26 measured `hv_gic_set_spi` alone waking the target; A/B with
+  `EMU_VCPU_WAKE=none` (no kicks) and `EMU_VCPU_WAKE=all` (the old kick-everyone).
 - **Plain `fsync` for guest flushes.** `std`'s `sync_data` is `F_FULLFSYNC` on macOS, which
   drains the drive cache. It was 75% of the userdata disk thread's time, and APEX
   decompression on first boot took more than 270 s; with plain `fsync` it takes about 70 s.

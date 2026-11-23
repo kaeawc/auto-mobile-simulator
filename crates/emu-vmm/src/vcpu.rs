@@ -6,6 +6,7 @@ use std::time::Duration;
 use emu_hvf::{Exit, Reg, SysReg, Vcpu, VcpuHandle};
 
 use crate::bus::{Bus, le_value};
+use crate::wake::{self, VcpuControl};
 
 const EC_WFX: u64 = 0x01;
 const EC_HVC64: u64 = 0x16;
@@ -17,8 +18,6 @@ const EC_DABT_LOWER: u64 = 0x24;
 /// EL1h with D, A, I and F masked: the state the arm64 boot protocol requires.
 const CPSR_EL1H_DAIF: u64 = 0x3c5;
 const VTIMER_PPI: u32 = 27;
-/// Upper bound on a host-side WFI sleep when no timer deadline is armed.
-const WFI_MAX_SLEEP: Duration = Duration::from_millis(1);
 
 mod psci {
     pub const VERSION: u32 = 0x8400_0000;
@@ -50,29 +49,6 @@ pub enum StopReason {
     Fault(String),
 }
 
-/// Wakes a vCPU sleeping in a host-side WFI wait.
-#[derive(Default)]
-pub struct Parker {
-    pending: Mutex<bool>,
-    cv: Condvar,
-}
-
-impl Parker {
-    pub fn unpark(&self) {
-        let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        *p = true;
-        self.cv.notify_one();
-    }
-
-    fn park_timeout(&self, d: Duration) {
-        let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if !*p {
-            p = self.cv.wait_timeout(p, d).unwrap_or_else(|e| e.into_inner()).0;
-        }
-        *p = false;
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Power {
     Off,
@@ -85,37 +61,29 @@ struct CpuSlot {
     cv: Condvar,
 }
 
-/// What a device thread uses to rouse vCPUs after raising an interrupt.
-///
-/// An idle vCPU sits inside `hv_vcpu_run` (the framework handles WFI itself when the GIC is
-/// in-kernel) and doesn't notice a newly pending SPI until its own timer fires. Kicking it out
-/// of the run loop makes it re-enter with the interrupt visible.
-#[derive(Default)]
-pub struct Wakers {
-    parkers: Vec<Parker>,
+/// What device threads use to rouse vCPUs after raising an interrupt (see [`wake`]).
+pub type Wakers = wake::Wakers<HvVcpus>;
+
+/// The framework side of [`Wakers`]: each vCPU's handle (registered by its thread) and the
+/// GIC's SPI routing.
+pub struct HvVcpus {
     handles: Vec<OnceLock<VcpuHandle>>,
 }
 
-impl Wakers {
-    pub fn new(cpus: usize) -> Wakers {
-        Wakers { parkers: (0..cpus).map(|_| Parker::default()).collect(), handles: (0..cpus).map(|_| OnceLock::new()).collect() }
+impl HvVcpus {
+    pub fn new(cpus: usize) -> HvVcpus {
+        HvVcpus { handles: (0..cpus).map(|_| OnceLock::new()).collect() }
+    }
+}
+
+impl VcpuControl for HvVcpus {
+    fn kick(&self, cpus: u64) {
+        let handles = self.handles.iter().enumerate().filter(|(i, _)| cpus & (1 << i) != 0);
+        emu_hvf::kick_vcpus(handles.filter_map(|(_, h)| h.get().copied()));
     }
 
-    pub fn len(&self) -> usize {
-        self.parkers.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.parkers.is_empty()
-    }
-
-    pub fn wake_all(&self) {
-        for (p, h) in self.parkers.iter().zip(&self.handles) {
-            p.unpark();
-            if let Some(h) = h.get() {
-                h.kick();
-            }
-        }
+    fn spi_router(&self, intid: u32) -> Option<u64> {
+        emu_hvf::Vm::spi_router(intid).ok()
     }
 }
 
@@ -221,7 +189,7 @@ impl Cpus {
         vcpu.set_vtimer_offset(self.vtimer_offset)?;
         let sctlr_reset = vcpu.sys_reg(SysReg::SCTLR_EL1)?;
         let slot = &self.slots[idx];
-        let _ = self.wakers.handles[idx].set(vcpu.handle());
+        let _ = self.wakers.control().handles[idx].set(vcpu.handle());
         if let Some((entry, x0)) = boot {
             *slot.power.lock().unwrap_or_else(|e| e.into_inner()) = Power::Pending { entry, ctx: x0 };
         }
@@ -234,6 +202,7 @@ impl Cpus {
                     }
                     if let Power::Pending { entry, ctx } = *p {
                         *p = Power::On;
+                        self.wakers.online(idx);
                         break (entry, ctx);
                     }
                     p = slot.cv.wait(p).unwrap_or_else(|e| e.into_inner());
@@ -248,7 +217,10 @@ impl Cpus {
             vcpu.set_reg(Reg::PC, entry)?;
             vcpu.set_reg(Reg::CPSR, CPSR_EL1H_DAIF)?;
             match self.run(idx, &vcpu)? {
-                Flow::CpuOff => *slot.power.lock().unwrap_or_else(|e| e.into_inner()) = Power::Off,
+                Flow::CpuOff => {
+                    self.wakers.offline(idx);
+                    *slot.power.lock().unwrap_or_else(|e| e.into_inner()) = Power::Off;
+                }
                 Flow::Stop => return Ok(()),
             }
         }
@@ -269,7 +241,10 @@ impl Cpus {
                     vtimer_masked = false;
                 }
             }
-            match vcpu.run()? {
+            self.wakers.enter(idx);
+            let exit = vcpu.run();
+            self.wakers.leave(idx);
+            match exit? {
                 Exit::Canceled => {
                     stats.canceled.fetch_add(1, Ordering::Relaxed);
                 }
@@ -387,18 +362,20 @@ impl Cpus {
         Ok(None)
     }
 
+    /// Host-side WFI: waits for the timer deadline, an interrupt for this vCPU, or (while
+    /// another vCPU could send an SGI, which never reaches the VMM) at most [`wake::SGI_POLL`].
     fn wfi(&self, idx: usize, vcpu: &Vcpu) -> Result<(), emu_hvf::Error> {
         let ctl = vcpu.sys_reg(SysReg::CNTV_CTL_EL0)?;
-        let mut sleep = WFI_MAX_SLEEP;
+        let mut timer = None;
         if ctl & 1 == 1 && ctl & 2 == 0 {
             let cval = vcpu.sys_reg(SysReg::CNTV_CVAL_EL0)?;
             let now = emu_hvf::host_ticks().wrapping_sub(self.vtimer_offset);
             if cval <= now {
                 return Ok(());
             }
-            sleep = sleep.min(Duration::from_nanos(emu_hvf::ticks_to_nanos(cval - now)));
+            timer = Some(Duration::from_nanos(emu_hvf::ticks_to_nanos(cval - now)));
         }
-        self.wakers.parkers[idx].park_timeout(sleep);
+        self.wakers.park(idx, timer);
         Ok(())
     }
 
@@ -423,6 +400,8 @@ impl Cpus {
                             Power::On => psci::ALREADY_ON,
                             Power::Pending { .. } => psci::ON_PENDING,
                             Power::Off => {
+                                // Online before it runs: from now on it can send SGIs.
+                                self.wakers.online(target);
                                 *p = Power::Pending { entry, ctx };
                                 slot.cv.notify_all();
                                 psci::SUCCESS
