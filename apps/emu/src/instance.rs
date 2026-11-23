@@ -495,3 +495,140 @@ fn boot_props(avd: &Avd) -> Vec<(String, String)> {
     }
     props
 }
+
+#[cfg(test)]
+mod tests {
+    use emu_avd::{Env, NewAvd};
+
+    use super::*;
+
+    /// An SDK with one image per form factor (its tag, `build.prop` and `advancedFeatures.ini`
+    /// as the real images have them) and an AVD made from each the way `emu -create-avd` does.
+    struct Sdk {
+        root: PathBuf,
+        env: Env,
+    }
+
+    impl Drop for Sdk {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn sdk(tag: &str) -> Sdk {
+        let root = std::env::temp_dir().join(format!("emu-plan-{tag}-{}", std::process::id()));
+        let sdk = root.join("sdk");
+        let images: [(&str, &str, &str); 6] = [
+            ("android-36/google_apis/arm64-v8a", "ro.product.name=sdk_gphone64_arm64\n", "VirtioSndCard = on\n"),
+            ("android-36/android-wear-signed/arm64-v8a", "", "VirtioSndCard = on\n"),
+            ("android-34/android-tv/arm64-v8a", "", "VirtioSndCard = on\n"),
+            ("android-34-ext9/android-automotive/arm64-v8a", "ro.product.name=sdk_car_arm64\n", "VirtioSndCard = on\n"),
+            ("android-34/google-xr/arm64-v8a", "", "GuestAngle = on\nVirtioDualModeMouse = on\n"),
+            ("android-36/ai-glasses/arm64-v8a", "", "VirtioSndCard = on\nXrStatusLed = on\n"),
+        ];
+        for (dir, build_prop, features) in images {
+            let d = sdk.join("system-images").join(dir);
+            std::fs::create_dir_all(&d).expect("image dir");
+            for f in ["kernel-ranchu", "ramdisk.img", "system.img", "vendor.img"] {
+                std::fs::write(d.join(f), b"x").expect("image file");
+            }
+            if !build_prop.is_empty() {
+                std::fs::write(d.join("build.prop"), build_prop).expect("build.prop");
+            }
+            std::fs::write(d.join("advancedFeatures.ini"), features).expect("features");
+            std::fs::write(d.join("VerifiedBootParams.textproto"), "param: \"androidboot.vbmeta.size=6592\"\n").expect("vbmeta");
+        }
+        std::fs::write(sdk.join("system-images/android-36/ai-glasses/arm64-v8a/kernel_cmdline.txt"), "8250.nr_uarts=1\n").expect("cmdline");
+        let env = Env { sdk_root: Some(sdk.clone()), avd_home: root.join("avd") };
+        for (name, dir) in [
+            ("phone", "android-36/google_apis/arm64-v8a"),
+            ("watch", "android-36/android-wear-signed/arm64-v8a"),
+            ("tv", "android-34/android-tv/arm64-v8a"),
+            ("car", "android-34-ext9/android-automotive/arm64-v8a"),
+            ("headset", "android-34/google-xr/arm64-v8a"),
+            ("glasses", "android-36/ai-glasses/arm64-v8a"),
+        ] {
+            env.create_avd(&NewAvd::for_image(name, &format!("system-images/{dir}"))).expect("create");
+        }
+        Sdk { root, env }
+    }
+
+    fn plan(s: &Sdk, name: &str) -> BootPlan {
+        BootPlan::new(&s.env.load(name).expect("load"), &Opts::default(), None)
+    }
+
+    #[test]
+    fn each_form_factor_gets_its_devices() {
+        let s = sdk("devices");
+        let shape = |p: &BootPlan| (p.touch_screen, p.touchpad, p.dual_mode_mouse, p.xr, p.car, p.sound);
+        assert_eq!(shape(&plan(&s, "phone")), (true, None, false, false, false, false));
+        assert_eq!(shape(&plan(&s, "watch")), (true, None, false, false, false, false));
+        assert_eq!(shape(&plan(&s, "tv")), (false, None, false, false, false, false), "no touch screen");
+        assert_eq!(shape(&plan(&s, "car")), (true, None, false, false, true, true), "the VHAL and a sound card");
+        assert_eq!(shape(&plan(&s, "headset")), (true, None, true, true, false, true));
+        assert_eq!(shape(&plan(&s, "glasses")), (true, Some((1542, 297)), false, true, false, true), "a touchpad, no mouse");
+
+        let tv = plan(&s, "tv").devices().join(", ");
+        assert!(tv.contains("virtio-input: keyboard (qwerty2), rotary") && !tv.contains("multi-touch"), "{tv}");
+        let glasses = plan(&s, "glasses").devices().join(", ");
+        assert!(glasses.contains("virtio-input: touchpad") && !glasses.contains("dual-mode mouse"), "{glasses}");
+        assert!(plan(&s, "car").devices().contains(&"qemud:car (vehicle HAL)"));
+        assert!(plan(&s, "headset").devices().contains(&"qemud:xr_service"));
+    }
+
+    #[test]
+    fn plans_tell_the_guest_its_screen_and_shape() {
+        let s = sdk("boot");
+        let watch = plan(&s, "watch");
+        assert_eq!((watch.screen, watch.ram_bytes), ((454, 454, 320), 1 << 30), "512 MB, booted with stock's padding");
+        let bc = |p: &BootPlan, k: &str| p.bootconfig.get(k).map(str::to_owned);
+        assert_eq!(bc(&watch, "androidboot.emulator.circular").as_deref(), Some("1"));
+        assert_eq!(bc(&watch, "androidboot.qemu.skin").as_deref(), Some("454x454"));
+        assert_eq!(bc(&watch, "androidboot.qemu.avd_name").as_deref(), Some("watch"));
+        assert_eq!(bc(&watch, "androidboot.vbmeta.size").as_deref(), Some("6592"));
+        assert_eq!(bc(&watch, "androidboot.hardware.gltransport"), None, "no renderer, no graphics transport");
+        assert!(watch.boot_props.contains(&("qemu.hw.mainkeys".into(), "1".into())));
+        assert_eq!(bc(&plan(&s, "phone"), "androidboot.emulator.circular"), None);
+
+        let with_gpu = BootPlan::new(&s.env.load("phone").expect("load"), &Opts::default(), Some(PathBuf::from("/r/lib64")));
+        assert_eq!(bc(&with_gpu, "androidboot.hardware.gltransport").as_deref(), Some("virtio-gpu-asg"));
+        assert!(with_gpu.devices().iter().any(|d| d.starts_with("virtio-gpu")));
+
+        let glasses = plan(&s, "glasses");
+        assert!(
+            glasses.cmdline.starts_with(BASE_CMDLINE) && glasses.cmdline.ends_with(" 8250.nr_uarts=1"),
+            "the image's cmdline is appended"
+        );
+        assert_eq!((glasses.screen, glasses.ram_bytes), ((450, 450, 160), 2 << 30));
+        assert_eq!(plan(&s, "car").ram_bytes, 3686 << 20);
+        assert_eq!(plan(&s, "car").kind, "Android Automotive · Auto");
+    }
+
+    #[test]
+    fn plans_follow_the_command_line_and_find_missing_files() {
+        let s = sdk("opts");
+        let avd = s.env.load("phone").expect("load");
+        let opts = Opts { cores: Some(2), memory_mb: Some(1536), read_only: true, no_boot_anim: true, ..Opts::default() };
+        let p = BootPlan::new(&avd, &opts, None);
+        assert_eq!((p.cpus, p.ram_bytes), (2, 1536 << 20));
+        assert!(p.disks.iter().all(|d| d.mode == DiskMode::Ephemeral), "-read-only keeps every write in memory");
+        assert_eq!(p.bootconfig.get("androidboot.debug.sf.nobootanimation"), Some("1"));
+        assert!(p.missing().is_empty(), "the AVD's own disks are made at boot");
+
+        let p = BootPlan::new(&avd, &Opts::default(), None);
+        let userdata = p.disks.iter().find(|d| d.serial == "userdata").expect("userdata");
+        assert_eq!((userdata.slot, userdata.mode), (slots::USERDATA, DiskMode::Persistent));
+        std::fs::remove_file(avd.vendor_image()).expect("rm");
+        assert_eq!(p.missing(), [avd.vendor_image().as_path()]);
+
+        let text = p.to_string();
+        for line in [
+            "avd       phone (Android · Phone)",
+            "machine   4 vCPUs, 2048 MB RAM, 720x1280 @ 320 dpi",
+            "  userdata  slot 29 ",
+            "bootconfig\n  androidboot.hardware=ranchu\n",
+        ] {
+            assert!(text.contains(line), "{line:?} missing from\n{text}");
+        }
+    }
+}

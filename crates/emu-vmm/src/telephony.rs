@@ -102,3 +102,43 @@ impl PortBackend for ModemPort {
         self.0.with(|m| m.input(data))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtio::console::{Console, PortSpec, Sink};
+
+    #[test]
+    fn console_commands_change_the_modem_the_guest_talks_to() {
+        let t = Arc::new(Telephony::default());
+        let (_console, handles) = Console::new(vec![PortSpec { name: "modem".into(), backend: Box::new(Sink) }]);
+        // Before a guest boots there's no port: events still change the modem.
+        t.set_signal(20, 3);
+        assert_eq!(t.signal(), (20, 3));
+        t.attach(handles[0].clone());
+        assert_eq!(t.signal(), Modem::new().signal(), "a new boot gets a fresh modem");
+
+        let mut port = t.backend();
+        let reply = |port: &mut Box<dyn PortBackend>, at: &str| String::from_utf8_lossy(&port.guest_data(at.as_bytes())).into_owned();
+        assert!(reply(&mut port, "AT\r").contains("OK"), "the guest's radio HAL gets answers");
+        t.call(CallOp::Incoming, "5551234").expect_err("the radio is off until the HAL turns it on");
+        assert!(reply(&mut port, "AT+CFUN=1\r").contains("OK"));
+
+        t.set_voice(RegState::Roaming);
+        t.set_data(RegState::Searching);
+        assert_eq!(t.states(), (RegState::Roaming, RegState::Searching));
+
+        t.call(CallOp::Incoming, "5551234").expect("ring");
+        assert_eq!(t.list_calls().len(), 1);
+        assert!(reply(&mut port, "AT+CLCC\r").contains("5551234"), "the HAL's call poll sees it");
+        t.call(CallOp::Busy, "5551234").expect_err("busy is for outgoing calls");
+        t.call(CallOp::Accept, "5551234").expect("accept");
+        t.call(CallOp::Hold, "5551234").expect("hold");
+        t.call(CallOp::Cancel, "5551234").expect("hang up");
+        assert!(t.list_calls().is_empty());
+        t.call(CallOp::Busy, "5550000").expect_err("no such call");
+
+        t.sms_deliver("5551234", "hello").expect("sms");
+        assert!(t.sent_sms().is_empty(), "nothing sent by the guest yet");
+    }
+}
