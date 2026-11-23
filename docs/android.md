@@ -241,7 +241,9 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   loop per pixel format (no per-pixel `match`) takes 7.8 ms: 86 → 19 ms. The API passes the
   emulator's PNG straight through (with `path`, emu writes the file itself) instead of decoding
   and re-encoding it, and the display socket's frame loop no longer clones the whole frame just
-  to read its size.
+  to read its size. The display socket's per-frame downscale (a box filter) went from 22.7 to
+  7.2 ms at factor 2 (16.4 to 7.5 ms at 3): const-generic kernels for factors 2–4 and division by
+  a reciprocal, identical output.
 - **vsock without intermediate copies.** adb (and every qemud pipe) rides vsock. Host bytes were
   copied into the connection's queue, out of it into a packet `Vec`, and then into the guest's
   buffer; now the adb forwarder hands its buffer over, the worker takes it over when nothing is

@@ -4,7 +4,7 @@
 use std::time::Instant;
 
 use sim_core::frame::{Frame, encode_png};
-use sim_core::pixels::{PixelFormat, to_rgba};
+use sim_core::pixels::{PixelFormat, downscale, to_rgba};
 
 fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| "docs/desktop-android.png".into());
@@ -28,6 +28,9 @@ fn main() {
     time("to_rgba (BGRA scanout)", 20, &mut || {
         to_rgba(&bgra, w as usize, h as usize, w as usize * 4, PixelFormat::Bgra).expect("rgba").len()
     });
+    for factor in [2, 3] {
+        time(&format!("downscale /{factor} (display socket)"), 20, &mut || downscale(w, h, &rgba, factor).2.len());
+    }
     let frame = Frame { width: w, height: h, rgba };
     time("encode_png", 10, &mut || encode_png(&frame).expect("png").len());
     for (name, c) in [

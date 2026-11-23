@@ -75,24 +75,71 @@ pub fn downscale(width: u32, height: u32, rgba: &[u8], factor: u32) -> (u32, u32
     if factor <= 1 {
         return (width, height, rgba.to_vec());
     }
-    let (ow, oh) = (width / factor, height / factor);
-    let mut out = Vec::with_capacity(ow as usize * oh as usize * 4);
-    let n = factor * factor;
+    let out = match factor {
+        2 => box_filter::<2>(width, height, rgba),
+        3 => box_filter::<3>(width, height, rgba),
+        4 => box_filter::<4>(width, height, rgba),
+        f => box_filter_any(width, height, rgba, f as usize),
+    };
+    (width / factor, height / factor, out)
+}
+
+/// `downscale` for a factor known at compile time (the display socket's usual 2–4), so each
+/// block's loops unroll.
+fn box_filter<const F: usize>(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let (ow, oh, in_row) = (width as usize / F, height as usize / F, width as usize * 4);
+    let mut out = Vec::with_capacity(ow * oh * 4);
+    let div = Reciprocal::new((F * F) as u32);
     for oy in 0..oh {
+        let rows: [&[u8]; F] = std::array::from_fn(|dy| &rgba[(oy * F + dy) * in_row..][..ow * F * 4]);
         for ox in 0..ow {
             let mut acc = [0u32; 4];
-            for dy in 0..factor {
-                let row = ((oy * factor + dy) * width + ox * factor) as usize * 4;
-                for dx in 0..factor as usize {
-                    for (c, a) in acc.iter_mut().enumerate() {
-                        *a += u32::from(rgba[row + dx * 4 + c]);
+            for row in rows {
+                for px in row[ox * F * 4..][..F * 4].as_chunks::<4>().0 {
+                    for c in 0..4 {
+                        acc[c] += u32::from(px[c]);
                     }
                 }
             }
-            out.extend(acc.map(|v| (v / n) as u8));
+            out.extend(acc.map(|v| div.of(v)));
         }
     }
-    (ow, oh, out)
+    out
+}
+
+fn box_filter_any(width: u32, height: u32, rgba: &[u8], f: usize) -> Vec<u8> {
+    let (ow, oh, in_row) = (width as usize / f, height as usize / f, width as usize * 4);
+    let mut out = Vec::with_capacity(ow * oh * 4);
+    let div = Reciprocal::new((f * f) as u32);
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let mut acc = [0u32; 4];
+            for dy in 0..f {
+                for px in rgba[(oy * f + dy) * in_row + ox * f * 4..][..f * 4].as_chunks::<4>().0 {
+                    for c in 0..4 {
+                        acc[c] += u32::from(px[c]);
+                    }
+                }
+            }
+            out.extend(acc.map(|v| div.of(v)));
+        }
+    }
+    out
+}
+
+/// Division by a fixed `n` as a multiply and shift: exact (`v / n`, rounded down) for the sums
+/// a box filter produces (`v <= 255 * n`, `n < 2^16`).
+#[derive(Clone, Copy)]
+struct Reciprocal(u64);
+
+impl Reciprocal {
+    fn new(n: u32) -> Reciprocal {
+        Reciprocal((1u64 << 32).div_ceil(u64::from(n)))
+    }
+
+    fn of(self, v: u32) -> u8 {
+        ((u64::from(v) * self.0) >> 32) as u8
+    }
 }
 
 /// The smallest whole factor that brings `width` down to at most `max_width` (at least 1).
@@ -103,6 +150,48 @@ pub fn downscale_factor(width: u32, max_width: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The box filter `downscale` replaced, kept as the reference.
+    fn naive(width: u32, height: u32, rgba: &[u8], factor: u32) -> Vec<u8> {
+        let (ow, oh) = (width / factor, height / factor);
+        let mut out = Vec::new();
+        for oy in 0..oh {
+            for ox in 0..ow {
+                let mut acc = [0u32; 4];
+                for dy in 0..factor {
+                    let row = ((oy * factor + dy) * width + ox * factor) as usize * 4;
+                    for dx in 0..factor as usize {
+                        for (c, a) in acc.iter_mut().enumerate() {
+                            *a += u32::from(rgba[row + dx * 4 + c]);
+                        }
+                    }
+                }
+                out.extend(acc.map(|v| (v / (factor * factor)) as u8));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn downscale_matches_the_reference_box_filter_for_every_factor() {
+        let (w, h) = (37u32, 29u32); // not multiples: the remainder rows and columns are dropped
+        let rgba: Vec<u8> = (0..w * h * 4).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        for factor in 2..=7 {
+            let (ow, oh, out) = downscale(w, h, &rgba, factor);
+            assert_eq!((ow, oh), (w / factor, h / factor));
+            assert_eq!(out, naive(w, h, &rgba, factor), "factor {factor}");
+        }
+    }
+
+    #[test]
+    fn reciprocal_division_is_exact_for_box_sums() {
+        for n in 1..=64u32 {
+            let r = Reciprocal::new(n);
+            for v in 0..=255 * n {
+                assert_eq!(u32::from(r.of(v)), v / n, "{v} / {n}");
+            }
+        }
+    }
 
     #[test]
     fn swaps_channels_and_drops_padding() {
