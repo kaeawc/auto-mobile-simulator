@@ -51,6 +51,8 @@ sha1_smol = { version = "1", default-features = false }
 # Objective-C runtime bindings. Only sim-coresim may depend on these.
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError"] }
+# Objective-C blocks, for the simulator service's completion handlers (sim-coresim only).
+block2 = { version = "0.6", default-features = false, features = ["std"] }
 
 # unsafe is forbidden everywhere except the FFI crates, which set their own lints: sim-coresim
 # (Objective-C), emu-hvf (Hypervisor.framework, guest RAM), emu-gfxstream (the renderer) and

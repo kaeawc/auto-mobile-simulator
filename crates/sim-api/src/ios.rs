@@ -12,11 +12,11 @@ use sim_core::form_factor::FormFactor;
 use sim_core::geometry::Size;
 use sim_core::gesture::Sample;
 use sim_core::hid::{KEY_LEFT_SHIFT, keystroke};
-use sim_coresim::{Appearance, Context, Device, Direction, Hid, StatusBar};
+use sim_coresim::{Appearance, Context, Device, Direction, Hid, Orientation, StatusBar, WatchGesture};
 
 use crate::params::{
-    button, err, need_bool, need_f64, need_str, opt_form_factor, opt_u64, pairs, screenshot_result, str_param, strings, swipe_samples,
-    tap_samples, touch_sample,
+    button, crown_delta, err, need_bool, need_f64, need_str, on_carplay, opt_form_factor, opt_orientation, opt_u64, pairs,
+    remote_swipe_samples, screenshot_result, str_param, strings, swipe_samples, tap_samples, touch_sample,
 };
 
 /// Shaping proxies, one per device, owned by this (long-running) process.
@@ -163,12 +163,48 @@ fn screen(device: &Device) -> Result<Size, String> {
     Ok(Size::new(f64::from(w), f64::from(h)))
 }
 
+/// The display a method's `display` parameter picks: the device's own, or its CarPlay screen.
+fn display_of(device: &Device, p: &Value) -> Result<sim_coresim::Display, String> {
+    if on_carplay(p)? { device.external_display() } else { device.display() }.map_err(err)
+}
+
+/// The CarPlay screen's size: the car display sim-rs attaches.
+fn carplay_screen() -> Size {
+    Size::new(f64::from(sim_core::carplay::WIDTH), f64::from(sim_core::carplay::HEIGHT))
+}
+
 fn play(hid: &Hid, screen: Size, samples: &[Sample]) -> Result<(), String> {
     for s in samples {
         sleep(s.delay);
         hid.touch(screen.normalize(s.point), s.phase).map_err(err)?;
     }
     Ok(())
+}
+
+/// Plays touch samples on the device's screen, or its CarPlay screen (`display: "carplay"`).
+fn play_on(device: &Device, p: &Value, samples: &[Sample]) -> Result<Value, String> {
+    let hid = device.hid().map_err(err)?;
+    if !on_carplay(p)? {
+        return play(&hid, screen(device)?, samples).map(|()| Value::Null);
+    }
+    for s in samples {
+        sleep(s.delay);
+        hid.carplay_touch(carplay_screen().normalize(s.point), s.phase).map_err(err)?;
+    }
+    Ok(Value::Null)
+}
+
+/// The orientation sim-rs last set per device (UDID), so `rotate` without one turns 90° from there.
+static ORIENTATIONS: std::sync::Mutex<Option<std::collections::HashMap<String, Orientation>>> = std::sync::Mutex::new(None);
+
+fn rotate(device: &Device, wanted: Option<Orientation>) -> Result<Value, String> {
+    let udid = device.info().udid;
+    let mut guard = ORIENTATIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let known = guard.get_or_insert_with(Default::default);
+    let next = wanted.unwrap_or_else(|| known.get(&udid).copied().unwrap_or(Orientation::Portrait).clockwise());
+    device.set_orientation(next).map_err(err)?;
+    known.insert(udid, next);
+    Ok(json!({"orientation": next.as_str()}))
 }
 
 /// Presses and releases one key.
@@ -220,8 +256,8 @@ fn pids(udid: &str) -> Result<Vec<i32>, String> {
 /// for iOS but isn't a device type of its own.
 fn check_form_factor(ctx: &Context, device_type: &str, form_factor: FormFactor) -> Result<(), String> {
     if form_factor == FormFactor::Auto {
-        return Err("CarPlay is a display attached to an iPhone simulator, not a device type: create an iPhone (attaching the CarPlay \
-                    display isn't implemented yet)"
+        return Err("CarPlay is a display attached to an iPhone simulator, not a device type: create an iPhone, boot it, then call \
+                    `carplay` with on=true (iOS 26 runtimes)"
             .into());
     }
     let types = ctx.device_types().map_err(err)?;
@@ -272,23 +308,39 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "shutdown" => ok(s.device(p)?.shutdown()),
         "erase" => ok(s.device(p)?.erase()),
         "screen" => {
-            let size = screen(&s.device(p)?)?;
-            Ok(json!({"width": size.width, "height": size.height}))
+            let (w, h) = display_of(&s.device(p)?, p)?.size().map_err(err)?;
+            Ok(json!({"width": w, "height": h}))
         }
-        "screenshot" => screenshot_result(&s.device(p)?.display().and_then(|d| d.capture()).map_err(err)?, p),
-        "tap" => {
-            let d = s.device(p)?;
-            play(&d.hid().map_err(err)?, screen(&d)?, &tap_samples(p)?).map(|()| Value::Null)
-        }
-        "swipe" => {
-            let d = s.device(p)?;
-            play(&d.hid().map_err(err)?, screen(&d)?, &swipe_samples(p)?).map(|()| Value::Null)
-        }
+        "screenshot" => screenshot_result(&display_of(&s.device(p)?, p)?.capture().map_err(err)?, p),
+        "tap" => play_on(&s.device(p)?, p, &tap_samples(p)?),
+        "swipe" => play_on(&s.device(p)?, p, &swipe_samples(p)?),
         "touch" => {
-            let d = s.device(p)?;
             let (at, phase) = touch_sample(p)?;
-            let at = screen(&d)?.normalize(at);
-            d.hid().and_then(|h| h.touch(at, phase)).map(|()| Value::Null).map_err(err)
+            play_on(&s.device(p)?, p, &[Sample { point: at, phase, delay: Duration::ZERO }])
+        }
+        "rotary" => {
+            let delta = crown_delta(p)?;
+            s.device(p)?.hid().and_then(|h| h.crown(delta)).map(|()| json!({"delta": delta})).map_err(err)
+        }
+        "watch_gesture" => {
+            let name = need_str(p, "gesture")?;
+            let gesture = WatchGesture::parse(name).ok_or_else(|| format!("unknown gesture `{name}` (double-tap, wrist-flick)"))?;
+            ok(s.device(p)?.hid().and_then(|h| h.watch_gesture(gesture)))
+        }
+        "remote_swipe" => {
+            let hid = s.device(p)?.hid().map_err(err)?;
+            for sample in remote_swipe_samples(p)? {
+                sleep(sample.delay);
+                hid.remote_touch(sample.point, sample.phase).map_err(err)?;
+            }
+            Ok(Value::Null)
+        }
+        "rotate" => rotate(&s.device(p)?, opt_orientation(p)?),
+        "carplay" => {
+            let on = need_bool(p, "on")?;
+            s.device(p)?.set_carplay(on).map_err(err)?;
+            let size = carplay_screen();
+            Ok(if on { json!({"display": "carplay", "width": size.width, "height": size.height}) } else { Value::Null })
         }
         "button" => {
             let (button, hold) = button(p)?;

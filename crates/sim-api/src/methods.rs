@@ -34,15 +34,16 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     ("shutdown", "device", "Shut down"),
     ("erase", "device", "Erase content and settings (shut down first)"),
-    ("screen", "device", "Screen size in pixels"),
-    ("screenshot", "device, path?", "PNG to path, else base64 in `png`"),
-    ("tap", "device, x, y, hold_ms?", "Tap at pixels"),
-    ("swipe", "device, x1, y1, x2, y2, duration_ms?, settle?", "Swipe between pixels"),
-    ("touch", "device, x, y, phase(down|move|up)", "One raw touch sample"),
+    ("screen", "device, display?(main|carplay)", "Screen size in pixels"),
+    ("screenshot", "device, path?, display?(main|carplay)", "PNG to path, else base64 in `png`"),
+    ("tap", "device, x, y, hold_ms?, display?(main|carplay)", "Tap at pixels (display: an iPhone's CarPlay screen, iOS only)"),
+    ("swipe", "device, x1, y1, x2, y2, duration_ms?, settle?, display?", "Swipe between pixels"),
+    ("touch", "device, x, y, phase(down|move|up), display?", "One raw touch sample"),
     (
         "button",
-        "device, button(home|lock|side|siri|apple-pay | back|volume-up|volume-down|recents|menu|up|down|left|right|select), hold_ms?",
-        "Press a hardware button (the first group are iOS's, the second Android's; home and lock are both)",
+        "device, button(home|lock|side|siri|apple-pay|action | back|volume-up|volume-down|recents|menu|up|down|left|right|select|play-pause), hold_ms?",
+        "Press a hardware button, as the device's form factor has it: the Siri Remote on Apple TV (menu/back, home, select, \
+         play-pause, arrows) and the D-pad on Android TV; on Apple Watch home is the crown's press",
     ),
     ("type", "device, text", "Type on the hardware keyboard"),
     ("key", "device, usage", "Press a key by HID usage"),
@@ -123,9 +124,24 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "device, command | commands",
         "Emulator console commands (`adb emu`'s protocol: sensor, geo, sms, gsm, finger, power, ...); reply lines",
     ),
-    ("rotate", "device", "Rotate the device 90° clockwise"),
+    (
+        "rotate",
+        "device, orientation?(portrait|landscape-right|portrait-upside-down|landscape-left; iOS)",
+        "Rotate the device 90° clockwise, or to an orientation (iOS)",
+    ),
     ("fold", "device, angle(0-180) | posture(closed|half-opened|opened)", "Set a foldable's hinge"),
-    ("rotary", "device, ticks", "Turn a watch's rotary input (crown or bezel)"),
+    (
+        "rotary",
+        "device, ticks | delta (Digital Crown units; iOS)",
+        "Turn a watch's rotary input: the Wear OS crown or bezel, the Apple Watch Digital Crown",
+    ),
+    ("watch_gesture", "device, gesture(double-tap|wrist-flick)", "An Apple Watch hand gesture"),
+    ("remote_swipe", "device, direction(up|down|left|right), duration_ms?", "Swipe on the Siri Remote's touch surface (Apple TV)"),
+    (
+        "carplay",
+        "device, on",
+        "Attach (or detach) the CarPlay display to a booted iPhone (iOS 26 runtimes); then tap/swipe/screenshot with display=carplay",
+    ),
 ];
 
 /// Per-connection state: each backend's service connection, created on first use.
@@ -162,9 +178,11 @@ const ALL_PLATFORMS: &[&str] = &[
     "key",
     "location",
     "info",
+    "rotate",
+    "rotary",
 ];
 /// Methods only Android devices have.
-const ANDROID_ONLY: &[&str] = &["console", "rotate", "fold", "rotary"];
+const ANDROID_ONLY: &[&str] = &["console", "fold"];
 
 /// The platforms whose devices `method` works on.
 pub fn platforms(method: &str) -> &'static [Platform] {
@@ -295,6 +313,10 @@ mod tests {
         assert_eq!(find("status_bar")["platforms"], json!(["ios"]));
         assert_eq!(find("tap")["platforms"], json!(["android", "ios"]));
         assert_eq!(find("fold")["platforms"], json!(["android"]));
+        assert_eq!(find("rotary")["platforms"], json!(["android", "ios"]));
+        assert_eq!(find("rotate")["platforms"], json!(["android", "ios"]));
+        assert_eq!(find("carplay")["platforms"], json!(["ios"]));
+        assert_eq!(find("watch_gesture")["platforms"], json!(["ios"]));
         assert!(help.as_array().expect("array").iter().all(|m| m["platforms"].as_array().is_some_and(|p| !p.is_empty())));
     }
 
@@ -358,6 +380,12 @@ mod tests {
             "unknown posture `ajar` (closed, half-opened, opened)"
         );
         assert_eq!(call(&mut s, "rotate", &json!({"device": "fold"})).expect_err("stopped"), "fold isn't running; boot it first");
+        let err = call(&mut s, "rotate", &json!({"device": "fold", "orientation": "portrait"})).expect_err("iOS-only orientation");
+        assert!(err.contains("`orientation` is iOS-only"), "{err}");
+        let err = call(&mut s, "tap", &json!({"device": "fold", "x": 1, "y": 1, "display": "carplay"})).expect_err("no CarPlay");
+        assert!(err.starts_with("display=carplay is an iPhone's CarPlay screen"), "{err}");
+        let err = call(&mut s, "carplay", &json!({"device": "fold", "on": true})).expect_err("iOS-only");
+        assert_eq!(err, "`carplay` isn't available on Android devices (it works on iOS)");
         assert!(
             call(&mut s, "tap", &json!({"device": "no-such-device", "x": 1, "y": 1})).expect_err("missing").contains("no device matches")
         );

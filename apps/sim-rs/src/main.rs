@@ -93,7 +93,13 @@ enum Cmd {
     /// Erase all content and settings (device must be shut down).
     Erase { device: String },
     /// Save the screen as a PNG.
-    Screenshot { device: String, path: String },
+    Screenshot {
+        device: String,
+        path: String,
+        /// `carplay` for an iPhone's CarPlay screen.
+        #[arg(long, default_value = "main")]
+        display: String,
+    },
     /// Tap at a point, in pixels from the top-left of the screen.
     Tap {
         device: String,
@@ -102,6 +108,9 @@ enum Cmd {
         /// Hold time in milliseconds.
         #[arg(long, default_value_t = 60)]
         hold: u64,
+        /// `carplay` for an iPhone's CarPlay screen.
+        #[arg(long, default_value = "main")]
+        display: String,
     },
     /// Swipe between two points, in pixels.
     Swipe {
@@ -116,9 +125,13 @@ enum Cmd {
         /// Pause at the end before lifting (a drag rather than a flick).
         #[arg(long)]
         settle: bool,
+        /// `carplay` for an iPhone's CarPlay screen.
+        #[arg(long, default_value = "main")]
+        display: String,
     },
-    /// Press a hardware button: home, lock (power), side, siri, apple-pay (iOS); back, volume-up,
-    /// volume-down, recents, menu, up, down, left, right, select (Android).
+    /// Press a hardware button: home, lock (power), side, siri, apple-pay, action (iOS); back,
+    /// volume-up, volume-down, recents, menu (Android); up, down, left, right, select, play-pause
+    /// (TV remotes: the Siri Remote on Apple TV, where menu and back are its Menu button).
     Button {
         device: String,
         button: String,
@@ -151,13 +164,31 @@ enum Cmd {
     Privacy { device: String, action: String, service: String, bundle_id: String },
     /// Simulate a memory warning.
     MemoryWarning { device: String },
-    /// Rotate an Android device 90° clockwise.
-    Rotate { device: String },
+    /// Rotate a device 90° clockwise, or (iOS) to an orientation.
+    Rotate {
+        device: String,
+        /// portrait, landscape-right, portrait-upside-down or landscape-left (iOS).
+        #[arg(long)]
+        orientation: Option<String>,
+    },
     /// Set an Android foldable's hinge: a posture (closed, half-opened, opened) or an angle (0-180).
     Fold { device: String, posture: String },
-    /// Turn an Android watch's rotary input by some ticks (negative turns back).
+    /// Turn a watch's crown (Wear OS rotary input, Apple Watch Digital Crown) by some ticks
+    /// (negative turns back).
     #[command(allow_negative_numbers = true)]
-    Rotary { device: String, ticks: i64 },
+    Rotary {
+        device: String,
+        ticks: i64,
+        /// Apple Watch: the turn in Digital Crown units instead of ticks.
+        #[arg(long)]
+        delta: Option<f64>,
+    },
+    /// An Apple Watch hand gesture: double-tap or wrist-flick.
+    WatchGesture { device: String, gesture: String },
+    /// Swipe on the Siri Remote's touch surface (Apple TV): up, down, left or right.
+    RemoteSwipe { device: String, direction: String },
+    /// Attach (`on`) or detach (`off`) an iPhone's CarPlay display (iOS 26 runtimes).
+    Carplay { device: String, state: String },
     /// Send commands to an Android device's emulator console (`adb emu`'s protocol).
     Console {
         device: String,
@@ -270,13 +301,15 @@ fn main() -> Result<()> {
         }
         Cmd::Shutdown { device } => drop(call("shutdown", json!({"device": device}))?),
         Cmd::Erase { device } => drop(call("erase", json!({"device": device}))?),
-        Cmd::Screenshot { device, path } => drop(call("screenshot", json!({"device": device, "path": path}))?),
-        Cmd::Tap { device, x, y, hold } => {
-            call("tap", json!({"device": device, "x": x, "y": y, "hold_ms": hold}))?;
+        Cmd::Screenshot { device, path, display } => drop(call("screenshot", json!({"device": device, "path": path, "display": display}))?),
+        Cmd::Tap { device, x, y, hold, display } => {
+            call("tap", json!({"device": device, "x": x, "y": y, "hold_ms": hold, "display": display}))?;
             flush();
         }
-        Cmd::Swipe { device, x1, y1, x2, y2, duration, settle } => {
-            call("swipe", json!({"device": device, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": duration, "settle": settle}))?;
+        Cmd::Swipe { device, x1, y1, x2, y2, duration, settle, display } => {
+            let params = json!({"device": device, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": duration, "settle": settle,
+                "display": display});
+            call("swipe", params)?;
             flush();
         }
         Cmd::Button { device, button, hold } => {
@@ -305,7 +338,12 @@ fn main() -> Result<()> {
             drop(call("privacy", json!({"device": device, "action": action, "service": service, "bundle_id": bundle_id}))?)
         }
         Cmd::MemoryWarning { device } => drop(call("memory_warning", json!({"device": device}))?),
-        Cmd::Rotate { device } => drop(call("rotate", json!({"device": device}))?),
+        Cmd::Rotate { device, orientation } => {
+            let r = call("rotate", json!({"device": device, "orientation": orientation}))?;
+            if let Some(o) = r["orientation"].as_str() {
+                println!("{o}");
+            }
+        }
         Cmd::Fold { device, posture } => {
             let params = match posture.parse::<f64>() {
                 Ok(angle) => json!({"device": device, "angle": angle}),
@@ -314,7 +352,29 @@ fn main() -> Result<()> {
             let r = call("fold", params)?;
             println!("{} ({}°)", text(&r["posture"]), r["angle"]);
         }
-        Cmd::Rotary { device, ticks } => drop(call("rotary", json!({"device": device, "ticks": ticks}))?),
+        Cmd::Rotary { device, ticks, delta } => {
+            call("rotary", json!({"device": device, "ticks": ticks, "delta": delta}))?;
+            flush();
+        }
+        Cmd::WatchGesture { device, gesture } => {
+            call("watch_gesture", json!({"device": device, "gesture": gesture}))?;
+            flush();
+        }
+        Cmd::RemoteSwipe { device, direction } => {
+            call("remote_swipe", json!({"device": device, "direction": direction}))?;
+            flush();
+        }
+        Cmd::Carplay { device, state } => {
+            let on = match state.as_str() {
+                "on" => true,
+                "off" => false,
+                other => anyhow::bail!("`{other}`: say on or off"),
+            };
+            let r = call("carplay", json!({"device": device, "on": on}))?;
+            if on {
+                println!("CarPlay display {}x{}", number(&r["width"]), number(&r["height"]));
+            }
+        }
         Cmd::Console { device, command } => {
             items(&call("console", json!({"device": device, "command": command.join(" ")}))?).iter().for_each(|l| println!("{}", text(l)));
         }
@@ -426,7 +486,19 @@ mod tests {
         for m in ["button", "type", "key", "open_url", "install", "uninstall", "launch", "terminate", "apps", "appearance"] {
             assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
         }
-        for m in ["location", "privacy", "memory_warning", "exec", "rotate", "fold", "rotary", "console"] {
+        for m in [
+            "location",
+            "privacy",
+            "memory_warning",
+            "exec",
+            "rotate",
+            "fold",
+            "rotary",
+            "console",
+            "watch_gesture",
+            "remote_swipe",
+            "carplay",
+        ] {
             assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
         }
     }

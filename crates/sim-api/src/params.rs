@@ -9,7 +9,7 @@ use sim_core::form_factor::FormFactor;
 use sim_core::frame::{Frame, encode_png};
 use sim_core::geometry::Point;
 use sim_core::gesture::{self, Phase, Sample};
-use sim_core::hid::Button;
+use sim_core::hid::{Button, CROWN_UNITS_PER_TICK, Orientation};
 use sim_core::platform::Platform;
 
 pub fn str_param<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
@@ -103,11 +103,87 @@ pub fn button(p: &Value) -> Result<(Button, Duration), String> {
     Ok((button, Duration::from_millis(opt_u64(p, "hold_ms").unwrap_or(80))))
 }
 
+/// The optional `orientation` parameter.
+pub fn opt_orientation(p: &Value) -> Result<Option<Orientation>, String> {
+    str_param(p, "orientation")
+        .map(|v| {
+            Orientation::parse(v).ok_or_else(|| {
+                let names: Vec<&str> = Orientation::ALL.iter().map(|o| o.as_str()).collect();
+                format!("unknown orientation `{v}` ({})", names.join(", "))
+            })
+        })
+        .transpose()
+}
+
+/// Whether the optional `display` parameter picks the CarPlay screen (`carplay`) rather than the
+/// device's own (`main`, the default).
+pub fn on_carplay(p: &Value) -> Result<bool, String> {
+    match str_param(p, "display").unwrap_or("main") {
+        "main" => Ok(false),
+        "carplay" | "car" => Ok(true),
+        other => Err(format!("unknown display `{other}` (main or carplay)")),
+    }
+}
+
+/// `remote_swipe` (iOS only, so unused where the iOS backend isn't built): a swipe across the Siri Remote's touch surface in `direction`, as samples
+/// normalized to the surface (`0..=1`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn remote_swipe_samples(p: &Value) -> Result<Vec<Sample>, String> {
+    let (from, to) = match need_str(p, "direction")? {
+        "up" => (Point::new(0.5, 0.8), Point::new(0.5, 0.2)),
+        "down" => (Point::new(0.5, 0.2), Point::new(0.5, 0.8)),
+        "left" => (Point::new(0.8, 0.5), Point::new(0.2, 0.5)),
+        "right" => (Point::new(0.2, 0.5), Point::new(0.8, 0.5)),
+        other => return Err(format!("unknown direction `{other}` (up, down, left, right)")),
+    };
+    let duration = Duration::from_millis(opt_u64(p, "duration_ms").unwrap_or(250));
+    Ok(gesture::swipe(from, to, duration, Duration::from_millis(17), false))
+}
+
+/// `rotary`'s turn on an Apple Watch, in Digital Crown units: `delta` as given, else `ticks` detents.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn crown_delta(p: &Value) -> Result<f64, String> {
+    match (p.get("delta").and_then(Value::as_f64), p.get("ticks").and_then(Value::as_i64)) {
+        (Some(delta), _) => Ok(delta),
+        (None, Some(ticks)) => Ok(ticks as f64 * CROWN_UNITS_PER_TICK),
+        (None, None) => Err("give `ticks` (detents) or `delta` (Digital Crown units)".into()),
+    }
+}
+
 /// `screenshot`'s result: written to `path`, else the PNG inline as base64.
 pub fn screenshot_result(frame: &Frame, p: &Value) -> Result<Value, String> {
     let png = encode_png(frame)?;
     match str_param(p, "path") {
         Some(path) => std::fs::write(path, &png).map(|()| json!({"path": path, "width": frame.width, "height": frame.height})).map_err(err),
         None => Ok(json!({"width": frame.width, "height": frame.height, "png": base64::engine::general_purpose::STANDARD.encode(png)})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn form_factor_inputs_parse() {
+        assert_eq!(opt_orientation(&json!({})), Ok(None));
+        assert_eq!(opt_orientation(&json!({"orientation": "landscape-left"})), Ok(Some(Orientation::LandscapeLeft)));
+        assert!(opt_orientation(&json!({"orientation": "diagonal"})).expect_err("bad").contains("portrait, landscape-right"));
+        assert_eq!(on_carplay(&json!({})), Ok(false));
+        assert_eq!(on_carplay(&json!({"display": "carplay"})), Ok(true));
+        assert!(on_carplay(&json!({"display": "hud"})).is_err());
+        assert_eq!(crown_delta(&json!({"ticks": -3})), Ok(-3.0 * CROWN_UNITS_PER_TICK));
+        assert_eq!(crown_delta(&json!({"delta": 12.5, "ticks": 1})), Ok(12.5));
+        assert!(crown_delta(&json!({})).is_err());
+    }
+
+    #[test]
+    fn remote_swipes_cross_the_touch_surface() {
+        let up = remote_swipe_samples(&json!({"direction": "up"})).expect("up");
+        assert_eq!((up[0].phase, up.last().map(|s| s.phase)), (Phase::Down, Some(Phase::Up)));
+        assert!(up[0].point.y > up.last().map_or(1.0, |s| s.point.y));
+        assert!(up.iter().all(|s| (0.0..=1.0).contains(&s.point.x) && (0.0..=1.0).contains(&s.point.y)));
+        let right = remote_swipe_samples(&json!({"direction": "right"})).expect("right");
+        assert!(right[0].point.x < right.last().map_or(0.0, |s| s.point.x));
+        assert!(remote_swipe_samples(&json!({"direction": "diagonal"})).is_err());
     }
 }

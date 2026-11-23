@@ -36,6 +36,9 @@ impl Session {
 pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Value, String> {
     let android = s.backend().clone();
     let d = android.device(udid)?;
+    if crate::params::on_carplay(p)? {
+        return Err("display=carplay is an iPhone's CarPlay screen; Android devices have one display".into());
+    }
     let null = |r: Result<(), String>| r.map(|()| Value::Null);
     match method {
         "delete" => null(android.delete(&d)),
@@ -88,7 +91,10 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             };
             d.console(&commands).map(|lines| json!(lines))
         }
-        "rotate" => null(d.rotate()),
+        "rotate" => match crate::params::opt_orientation(p)? {
+            None => null(d.rotate()),
+            Some(_) => Err("Android's rotate turns 90° clockwise per call; `orientation` is iOS-only".into()),
+        },
         "fold" => {
             let angle = match (p.get("angle").and_then(Value::as_f64), str_param(p, "posture")) {
                 (Some(a), _) => a as f32,
