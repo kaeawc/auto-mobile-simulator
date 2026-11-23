@@ -67,14 +67,14 @@ fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<e
         let g = inputs.lock().unwrap_or_else(|e| e.into_inner());
         match (input, g.as_ref()) {
             (Input::Hello { max_width: mw }, _) => max_width.store(mw, Ordering::Relaxed),
-            (Input::Touch { x, y, phase }, Some(i)) => match phase {
+            (Input::Touch { x, y, phase }, Some(emu_vmm::Inputs { touch: Some(touch), .. })) => match phase {
                 Phase::Down | Phase::Move => {
                     finger_down = true;
-                    i.touch.touch(x as i32, y as i32, true);
+                    touch.touch(x as i32, y as i32, true);
                 }
                 Phase::Up => {
                     if finger_down {
-                        i.touch.touch(x as i32, y as i32, false);
+                        touch.touch(x as i32, y as i32, false);
                     }
                     finger_down = false;
                 }

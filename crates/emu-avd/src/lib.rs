@@ -214,6 +214,11 @@ impl Avd {
 
     /// Whether the screen is round: `ro.emulator.circular` in `boot.prop` (what stock checks;
     /// `1`, `y`, `on`, `yes`, `true` and their prefixes count), or `hw.lcd.circular`.
+    /// Whether the screen takes touch: everything but `hw.screen=no-touch` (the SDK's TVs).
+    pub fn touch_screen(&self) -> bool {
+        self.get("hw.screen").map(str::trim) != Some("no-touch")
+    }
+
     pub fn circular(&self) -> bool {
         let truthy = |v: &str| ["1", "y", "on", "yes", "true"].iter().any(|t| v.starts_with(t));
         self.boot_properties().iter().any(|(k, v)| k == "ro.emulator.circular" && truthy(v)) || self.flag("hw.lcd.circular")

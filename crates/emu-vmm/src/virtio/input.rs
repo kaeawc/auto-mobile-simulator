@@ -404,7 +404,10 @@ impl Worker {
 /// Ways for the host to inject input into the running guest.
 #[derive(Clone)]
 pub struct Inputs {
-    pub touch: InputHandle,
+    /// The screen's size in pixels.
+    pub screen: (u32, u32),
+    /// The multi-touch screen; none on a `hw.screen=no-touch` device (TV), as on stock.
+    pub touch: Option<InputHandle>,
     pub keyboard: InputHandle,
     pub rotary: InputHandle,
     /// The dual-mode mouse (Android XR images only).

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
+use emu_vmm::Inputs;
 use sim_core::frame::{Frame, encode_png};
 use sim_core::pixels::{PixelFormat, to_rgba};
 
@@ -116,10 +117,13 @@ fn event(info: &ConsoleInfo, words: &[&str]) -> String {
                 let Ok(value) = v.parse::<i32>() else { return format!("KO: bad value '{v}'") };
                 batches.push((typ, InputEvent::new(typ, code, value)));
             }
+            if inputs.touch.is_none() && batches.iter().any(|(typ, _)| *typ == EV_ABS) {
+                return NO_TOUCH.into();
+            }
             for (typ, ev) in batches {
-                let dev = match typ {
-                    EV_REL => &inputs.rotary,
-                    EV_ABS => &inputs.touch,
+                let dev = match (typ, &inputs.touch) {
+                    (EV_REL, _) => &inputs.rotary,
+                    (EV_ABS, Some(touch)) => touch,
                     _ => &inputs.keyboard,
                 };
                 dev.send(vec![ev, InputEvent::syn()]);
@@ -347,7 +351,6 @@ fn gsm(info: &ConsoleInfo, words: &[&str]) -> String {
 /// guest over `qemud:xr_service` (stock reaches them only through gRPC), the dual-mode mouse as a
 /// pointer at device pixels, and `xr status`. Syntax: [`sim_core::xr::USAGE`].
 fn xr(info: &ConsoleInfo, words: &[&str]) -> String {
-    use emu_vmm::virtio::input::Kind;
     use sim_core::xr::{XrCommand, XrPointer, XrResponse, pointer_abs};
     let Some(xr) = &info.xr else { return "KO: not an Android XR device".into() };
     if words == ["status"] {
@@ -365,9 +368,8 @@ fn xr(info: &ConsoleInfo, words: &[&str]) -> String {
     if let XrCommand::Pointer { x, y, phase } = command {
         let guard = info.inputs.lock().unwrap_or_else(|e| e.into_inner());
         let Some(inputs) = guard.as_ref() else { return "KO: no input devices".into() };
-        let (Some(mouse), Kind::Touch { width, height }) = (&inputs.mouse, inputs.touch.kind) else {
-            return "KO: no dual-mode mouse".into();
-        };
+        let Some(mouse) = &inputs.mouse else { return "KO: no dual-mode mouse".into() };
+        let (width, height) = inputs.screen;
         let (ax, ay) = (pointer_abs(x, width), pointer_abs(y, height));
         match phase {
             XrPointer::Move => mouse.pointer(ax, ay, None),
@@ -385,6 +387,8 @@ fn xr(info: &ConsoleInfo, words: &[&str]) -> String {
         _ => "OK".into(),
     }
 }
+
+const NO_TOUCH: &str = "KO: this device has no touch screen (hw.screen=no-touch)";
 
 /// Commands this console implements (stock names first, then emu-rs extensions).
 const HELP: &[(&str, &str)] = &[
@@ -548,13 +552,14 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
             // emu-rs extension: `touch <x> <y> [down|up|tap]` in device pixels.
             let g = info.inputs.lock().unwrap_or_else(|e| e.into_inner());
             match (g.as_ref(), words.get(1).and_then(|v| v.parse().ok()), words.get(2).and_then(|v| v.parse().ok())) {
-                (Some(i), Some(x), Some(y)) => {
+                (Some(Inputs { touch: None, .. }), _, _) => NO_TOUCH.to_string(),
+                (Some(Inputs { touch: Some(touch), .. }), Some(x), Some(y)) => {
                     match words.get(3).copied().unwrap_or("tap") {
-                        "down" => i.touch.touch(x, y, true),
-                        "up" => i.touch.touch(x, y, false),
+                        "down" => touch.touch(x, y, true),
+                        "up" => touch.touch(x, y, false),
                         _ => {
-                            i.touch.touch(x, y, true);
-                            i.touch.touch(x, y, false);
+                            touch.touch(x, y, true);
+                            touch.touch(x, y, false);
                         }
                     }
                     "OK".to_string()
@@ -628,7 +633,7 @@ mod tests {
     use emu_vmm::pipe::car::CarService;
     use emu_vmm::pipe::xr::XrService;
     use emu_vmm::pipe::{HostMsg, PipeCtx, PipeService, WorkerEvent};
-    use emu_vmm::virtio::input::{EV_KEY, EV_REL, Input, InputEvent, Inputs, Kind, REL_WHEEL};
+    use emu_vmm::virtio::input::{EV_KEY, EV_REL, Input, InputEvent, Kind, REL_WHEEL};
     use sim_core::form_factor::FormFactor;
     use sim_core::vhal::{GEAR_SELECTION, Message, MsgType, PropValue};
 
@@ -655,16 +660,25 @@ mod tests {
     }
 
     struct Devices {
-        touch: Input,
+        touch: Option<Input>,
         keyboard: Input,
         rotary: Input,
         mouse: Option<Input>,
     }
 
-    /// Attaches input devices (720x1280 touch screen; the dual-mode mouse on request) that
-    /// no guest driver has taken, so the events a command sends stay queued for inspection.
+    /// Attaches input devices (a 720x1280 touch screen unless `no_touch`; the dual-mode mouse
+    /// on request) that no guest driver has taken, so the events a command sends stay queued.
     fn attach_inputs(info: &ConsoleInfo, with_mouse: bool) -> Devices {
-        let (touch, th) = Input::new(Kind::Touch { width: 720, height: 1280 }, "touch");
+        attach(info, with_mouse, true)
+    }
+
+    fn attach(info: &ConsoleInfo, with_mouse: bool, touch_screen: bool) -> Devices {
+        let (touch, th) = if touch_screen {
+            let (t, h) = Input::new(Kind::Touch { width: 720, height: 1280 }, "touch");
+            (Some(t), Some(h))
+        } else {
+            (None, None)
+        };
         let (keyboard, kh) = Input::new(Kind::Keyboard, "keyboard");
         let (rotary, rh) = Input::new(Kind::Rotary, "rotary");
         let (mouse, mh) = if with_mouse {
@@ -673,7 +687,7 @@ mod tests {
         } else {
             (None, None)
         };
-        *info.inputs.lock().expect("inputs") = Some(Inputs { touch: th, keyboard: kh, rotary: rh, mouse: mh });
+        *info.inputs.lock().expect("inputs") = Some(Inputs { screen: (720, 1280), touch: th, keyboard: kh, rotary: rh, mouse: mh });
         Devices { touch, keyboard, rotary, mouse }
     }
 
@@ -732,7 +746,7 @@ mod tests {
             devices.keyboard.take_queued(),
             vec![vec![InputEvent::new(EV_KEY, power, 1), InputEvent::syn()], vec![InputEvent::new(EV_KEY, power, 0), InputEvent::syn()]]
         );
-        assert!(devices.touch.take_queued().is_empty());
+        assert!(devices.touch.expect("touch").take_queued().is_empty());
         assert_eq!(run(&info, "event send EV_KEY:KEY_NOPE:1"), "KO: unknown key 'KEY_NOPE'");
         assert_eq!(run(&info, "event send EV_SYN"), "KO: bad event 'EV_SYN'");
     }
@@ -749,12 +763,23 @@ mod tests {
     }
 
     #[test]
+    fn no_touch_screens_refuse_touches_but_take_keys() {
+        let info = console(FormFactor::Tv);
+        let devices = attach(&info, false, false);
+        assert_eq!(run(&info, "touch 10 20"), NO_TOUCH);
+        assert_eq!(run(&info, "event send EV_ABS:0:5 EV_KEY:KEY_CENTER:1"), NO_TOUCH, "nothing half-sent");
+        assert!(devices.keyboard.take_queued().is_empty());
+        assert_eq!(run(&info, "event send EV_KEY:KEY_CENTER:1"), "OK");
+        assert_eq!(devices.keyboard.take_queued().len(), 1);
+    }
+
+    #[test]
     fn touch_lands_on_the_touch_screen() {
         let info = console(FormFactor::Tablet);
         assert_eq!(run(&info, "touch 10 20"), "KO: usage: touch <x> <y> [down|up|tap]", "no inputs before boot");
         let devices = attach_inputs(&info, false);
         assert_eq!(run(&info, "touch 10 20"), "OK");
-        let batches = devices.touch.take_queued();
+        let batches = devices.touch.expect("touch").take_queued();
         assert_eq!(batches.len(), 2, "down then up");
         assert!(batches[0].contains(&InputEvent::new(EV_KEY, emu_vmm::virtio::input::BTN_TOUCH, 1)));
         assert!(batches[1].contains(&InputEvent::new(EV_KEY, emu_vmm::virtio::input::BTN_TOUCH, 0)));

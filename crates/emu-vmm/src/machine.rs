@@ -123,6 +123,8 @@ pub struct MachineConfig {
     pub sound: bool,
     /// Touchscreen size; enables the virtio-input touchscreen, keyboard and rotary devices.
     pub input: Option<(u32, u32)>,
+    /// With `input`: a multi-touch screen (false for `hw.screen=no-touch`, TV's).
+    pub touch_screen: bool,
     /// Android XR: the `qemud:xr_service` link (console `xr`), and the dual-mode mouse with the
     /// other input devices.
     pub xr: Option<Arc<pipe::xr::Xr>>,
@@ -294,10 +296,13 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     }
     if let Some((w, h)) = cfg.input {
         use virtio::input::{Input, Kind};
-        let (touch, th) = Input::new(Kind::Touch { width: w, height: h }, "virtio_input_multi_touch_1");
+        let th = cfg.touch_screen.then(|| {
+            let (touch, th) = Input::new(Kind::Touch { width: w, height: h }, "virtio_input_multi_touch_1");
+            slots[slots::TOUCH as usize] = Some(Box::new(touch));
+            th
+        });
         let (kbd, kh) = Input::new(Kind::Keyboard, virtio::input::KEYBOARD_NAME);
         let (rot, rh) = Input::new(Kind::Rotary, "virtio_input_rotary");
-        slots[slots::TOUCH as usize] = Some(Box::new(touch));
         slots[slots::KEYBOARD as usize] = Some(Box::new(kbd));
         slots[slots::ROTARY as usize] = Some(Box::new(rot));
         let mouse = cfg.xr.is_some().then(|| {
@@ -306,7 +311,7 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
             mh
         });
         if let Some(cb) = &cfg.on_input {
-            cb(Inputs { touch: th, keyboard: kh, rotary: rh, mouse });
+            cb(Inputs { screen: (w, h), touch: th, keyboard: kh, rotary: rh, mouse });
         }
     }
     if let Some(port) = cfg.adb_port {

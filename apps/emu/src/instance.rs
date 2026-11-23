@@ -188,6 +188,7 @@ impl Instance {
             }),
             boot_props: plan.boot_props,
             input: Some((self.avd.lcd().0, self.avd.lcd().1)),
+            touch_screen: plan.touch_screen,
             xr: self.xr.clone(),
             sensors: self.sensors.clone(),
             clipboard: self.clipboard.clone(),
@@ -290,6 +291,8 @@ pub struct BootPlan {
     pub car: bool,
     /// Sensor handles the guest's sensors HAL is offered.
     pub sensor_mask: u32,
+    /// A multi-touch screen (not on `hw.screen=no-touch`, TV's).
+    pub touch_screen: bool,
 }
 
 impl BootPlan {
@@ -327,6 +330,7 @@ impl BootPlan {
             xr,
             car,
             sensor_mask: avd.sensor_mask(),
+            touch_screen: avd.touch_screen(),
         };
         plan.bootconfig = bootconfig(avd, opts, plan.renderer.is_some());
         plan
@@ -350,7 +354,11 @@ impl BootPlan {
     /// The virtio devices and host services the board gives the guest.
     pub fn devices(&self) -> Vec<&'static str> {
         let mut out = vec!["virtio-blk x5", "virtio-console (logcat, modem)", "virtio-rng", "virtio-vsock (adb, qemud pipes)"];
-        out.push("virtio-input: multi-touch, keyboard (qwerty2), rotary");
+        out.push(if self.touch_screen {
+            "virtio-input: multi-touch, keyboard (qwerty2), rotary"
+        } else {
+            "virtio-input: keyboard (qwerty2), rotary"
+        });
         if self.xr {
             out.push("virtio-input: dual-mode mouse");
         }

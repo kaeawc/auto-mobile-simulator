@@ -309,7 +309,7 @@ impl Device {
 
     /// Plays touch samples (device pixels) over one display connection.
     pub fn play(&self, samples: &[Sample]) -> Result<(), String> {
-        let mut display = display::Display::connect(&self.avd()?.dir)?;
+        let mut display = display::Display::connect(&self.touch_screen()?.dir)?;
         for s in samples {
             sleep(s.delay);
             display.send(&Input::Touch { x: s.point.x as f32, y: s.point.y as f32, phase: s.phase })?;
@@ -319,7 +319,17 @@ impl Device {
 
     /// One touch sample at device pixels.
     pub fn touch(&self, x: f64, y: f64, phase: Phase) -> Result<(), String> {
-        display::Display::connect(&self.avd()?.dir)?.send(&Input::Touch { x: x as f32, y: y as f32, phase })
+        display::Display::connect(&self.touch_screen()?.dir)?.send(&Input::Touch { x: x as f32, y: y as f32, phase })
+    }
+
+    /// The AVD, if its screen takes touch (an SDK TV's says `hw.screen=no-touch`).
+    fn touch_screen(&self) -> Result<&Avd, String> {
+        let avd = self.avd()?;
+        if avd.touch_screen() {
+            Ok(avd)
+        } else {
+            Err(format!("{} has no touch screen (hw.screen=no-touch); use button up|down|left|right|select", self.info.name))
+        }
     }
 
     /// Presses or releases a hardware button.
@@ -687,6 +697,18 @@ mod tests {
         std::fs::create_dir_all(&d).expect("image dir");
         std::fs::write(d.join("system.img"), b"s").expect("system.img");
         std::fs::write(d.join("source.properties"), format!("AndroidVersion.ApiLevel=34\nSystemImage.TagId={image_tag}\n")).expect("props");
+    }
+
+    #[test]
+    fn tvs_have_no_touch_screen() {
+        let f = fixture("tv");
+        add_image(&f, "android-34/android-tv/arm64-v8a", "android-tv");
+        f.android.create("tv", "system-images;android-34;android-tv;arm64-v8a", None).expect("tv");
+        let tv = f.android.device("tv").expect("tv");
+        assert_eq!(tv.avd.as_ref().and_then(|a| a.get("hw.screen")), Some("no-touch"));
+        let err = tv.touch(10.0, 10.0, Phase::Down).expect_err("no touch screen");
+        assert!(err.starts_with("tv has no touch screen (hw.screen=no-touch)"), "{err}");
+        assert!(tv.play(&[]).expect_err("no swipes either").contains("no touch screen"));
     }
 
     #[test]
