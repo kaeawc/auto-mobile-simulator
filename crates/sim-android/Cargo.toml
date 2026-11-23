@@ -15,5 +15,9 @@ emu-avd.workspace = true
 png.workspace = true
 sim-core.workspace = true
 
+[features]
+# The fake emulator in `testing`, for other crates' tests.
+testing = []
+
 [lints]
 workspace = true

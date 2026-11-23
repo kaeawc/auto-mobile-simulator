@@ -12,8 +12,7 @@ use sim_core::hid::Direction;
 use sim_core::xr::XrCommand;
 
 use crate::params::{
-    button, need_str, opt_u64, reading_json, screenshot_result, str_param, swipe_samples, tap_samples, touch_sample, vehicle_area,
-    vehicle_value,
+    button, need_str, opt_u64, png_result, reading_json, str_param, swipe_samples, tap_samples, touch_sample, vehicle_area, vehicle_value,
 };
 
 /// The SDK and AVD home, read from the environment on first use.
@@ -49,7 +48,11 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
         "boot" => null(d.boot(&android, Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)))),
         "shutdown" => null(d.shutdown()),
         "screen" => d.screen_size().map(|(w, h)| json!({"width": w, "height": h})),
-        "screenshot" => screenshot_result(&d.screenshot()?, p),
+        // The emulator's own PNG, passed through: with `path` it writes the file itself.
+        "screenshot" => match str_param(p, "path") {
+            Some(path) => d.screenshot_png_to(std::path::Path::new(path)).map(|(w, h)| json!({"path": path, "width": w, "height": h})),
+            None => d.screenshot_png().and_then(|(w, h, png)| png_result(w, h, &png, p)),
+        },
         "tap" => null(d.play(&tap_samples(p)?)),
         "swipe" => null(d.play(&swipe_samples(p)?)),
         "touch" => {

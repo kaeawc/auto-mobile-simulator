@@ -152,20 +152,22 @@ fn event(info: &ConsoleInfo, words: &[&str]) -> String {
 /// `screenshot [path]`: the latest scanout frame as PNG.
 fn screenshot(info: &ConsoleInfo, path: Option<&str>) -> String {
     let Some(display) = &info.display else { return "KO: no display (started with -gpu off?)".into() };
-    let f = display.snapshot();
-    if f.frames == 0 {
+    let (width, height, frames) = display.geometry();
+    if frames == 0 {
         return "KO: no frame presented yet".into();
     }
-    // The renderer's own capture of the last posted frame; the post-callback copy is the fallback.
-    let (width, height) = (f.width, f.height);
+    // The renderer's own capture of the last posted frame; the post-callback copy (cloned only
+    // then) is the fallback.
     let rgba = renderer_capture(width, height).or_else(|| {
+        let f = display.snapshot();
         let format = PixelFormat::from_virtio_gpu(f.format).unwrap_or(PixelFormat::Rgba);
         to_rgba(&f.pixels, f.width as usize, f.height as usize, f.stride as usize, format)
+            .filter(|_| (f.width, f.height) == (width, height))
     });
     let Some(rgba) = rgba else { return "KO: the scanout frame's geometry is inconsistent".into() };
     let path = path.map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join(format!("emu-rs-{}.png", std::process::id())));
     match encode_png(&Frame { width, height, rgba }).and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string())) {
-        Ok(()) => format!("{} ({}x{}, frame {})\r\nOK", path.display(), width, height, f.frames),
+        Ok(()) => format!("{} ({}x{}, frame {})\r\nOK", path.display(), width, height, frames),
         Err(e) => format!("KO: {e}"),
     }
 }
@@ -931,5 +933,23 @@ mod tests {
         assert_eq!(run(&info, "clipboard set hello there"), "OK");
         assert_eq!(run(&info, "clipboard get"), "hello there\r\nOK");
         assert_eq!(run(&info, "screenshot"), "KO: no display (started with -gpu off?)");
+    }
+
+    #[test]
+    fn screenshots_come_from_the_latest_frame() {
+        use emu_vmm::display::DisplaySink;
+        let mut info = console(FormFactor::Phone);
+        let store = Arc::new(emu_vmm::display::FrameStore::default());
+        info.display = Some(store.clone());
+        assert_eq!(run(&info, "screenshot"), "KO: no frame presented yet");
+        // A 2x1 BGRA scanout (virtio-gpu format 1).
+        store.present(2, 1, 8, 1, &[0, 0, 255, 255, 255, 0, 0, 255]);
+        let path = std::env::temp_dir().join(format!("emu-console-shot-{}.png", std::process::id()));
+        let reply = run(&info, &format!("screenshot {}", path.display()));
+        let png = std::fs::read(&path).expect("written");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(reply, format!("{} (2x1, frame 1)\r\nOK", path.display()));
+        assert_eq!(sim_core::frame::png_size(&png), Some((2, 1)));
+        assert_eq!(run(&info, "frames"), "1\r\nOK");
     }
 }

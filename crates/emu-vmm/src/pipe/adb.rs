@@ -29,9 +29,11 @@ pub struct AdbService {
 }
 
 impl AdbService {
-    /// Listens on 127.0.0.1:`port`; `vsock` is the vsock worker's event channel.
+    /// Listens on 127.0.0.1:`port` (0 picks a free one; `port` says which); `vsock` is the vsock
+    /// worker's event channel.
     pub fn bind(port: u16, vsock: Sender<WorkerEvent>) -> std::io::Result<AdbService> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+        let port = listener.local_addr()?.port();
         let mm = Arc::new(Mutex::new(Matchmaker::default()));
         let m = mm.clone();
         std::thread::Builder::new().name("adb-listen".into()).spawn(move || {
@@ -134,6 +136,10 @@ impl PipeHandler for TcpForward {
 
     fn host_msg(&mut self, msg: HostMsg, to_guest: &mut Vec<u8>) -> bool {
         match msg {
+            HostMsg::Data(d) if to_guest.is_empty() => {
+                *to_guest = d; // the common case: hand the buffer over
+                true
+            }
             HostMsg::Data(d) => {
                 to_guest.extend_from_slice(&d);
                 true
@@ -223,5 +229,110 @@ impl PipeHandler for AdbPipe {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc::{Receiver, channel};
+
+    use super::*;
+
+    fn next(events: &Receiver<WorkerEvent>) -> WorkerEvent {
+        events.recv_timeout(Duration::from_secs(5)).expect("an event")
+    }
+
+    fn data(events: &Receiver<WorkerEvent>) -> HostMsg {
+        match next(events) {
+            WorkerEvent::Host { msg, .. } => msg,
+            _ => panic!("expected a host message"),
+        }
+    }
+
+    fn read_exactly(s: &mut TcpStream, n: usize) -> Vec<u8> {
+        s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+        let mut b = vec![0u8; n];
+        s.read_exact(&mut b).expect("read");
+        b
+    }
+
+    #[test]
+    fn host_clients_become_vsock_connections_to_adbd() {
+        let (vsock, events) = channel();
+        let svc = AdbService::bind(0, vsock).expect("bind");
+        assert_ne!(svc.port, 0, "the port actually bound");
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, svc.port)).expect("connect");
+        let WorkerEvent::Connect { guest_port, make, refused } = next(&events) else { panic!("expected a connect") };
+        assert_eq!(guest_port, ADBD_VSOCK_PORT);
+
+        // adbd isn't listening yet: the attempt is retried while the client stays connected.
+        refused();
+        let WorkerEvent::Connect { make: retry, .. } = next(&events) else { panic!("expected a retry") };
+        drop(make);
+
+        let (pipe_events, from_host) = channel();
+        let mut h = retry(PipeCtx { conn: 3, events: pipe_events });
+        client.write_all(b"CNXN").expect("write");
+        let HostMsg::Data(d) = data(&from_host) else { panic!("expected data") };
+        assert_eq!(d, b"CNXN");
+        let mut to_guest = Vec::new();
+        assert!(h.host_msg(HostMsg::Data(d), &mut to_guest));
+        assert_eq!(to_guest, b"CNXN", "host bytes go to the guest");
+        assert!(h.guest_data(b"AUTH", &mut Vec::new()));
+        assert_eq!(read_exactly(&mut client, 4), b"AUTH");
+        drop(client);
+        assert!(matches!(data(&from_host), HostMsg::Close), "the client leaving closes the pipe");
+        assert!(!h.host_msg(HostMsg::Close, &mut Vec::new()));
+        h.closed();
+    }
+
+    #[test]
+    fn legacy_qemud_adb_pipes_handshake_then_forward() {
+        let (vsock, _events) = channel();
+        let svc = AdbService::bind(0, vsock).expect("bind");
+        let (pipe_events, from_host) = channel();
+        assert!(svc.open("qemud:sensors", PipeCtx { conn: 1, events: pipe_events.clone() }).is_none());
+        let mut pipe = svc.open("qemud:adb", PipeCtx { conn: 7, events: pipe_events }).expect("adb pipe");
+        let mut to_guest = Vec::new();
+        assert!(pipe.guest_data(b"acc", &mut to_guest) && pipe.guest_data(b"ept", &mut to_guest), "accept may arrive split");
+        assert!(pipe.host_msg(HostMsg::Data(b"early".to_vec()), &mut to_guest) && to_guest.is_empty(), "nothing before a client");
+
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, svc.port)).expect("connect");
+        let attach = data(&from_host);
+        assert!(matches!(attach, HostMsg::Attach(_)), "the waiting pipe gets the client");
+        assert!(pipe.host_msg(attach, &mut to_guest));
+        assert_eq!(to_guest, b"ok");
+        assert!(pipe.guest_data(b"startCNXN", &mut Vec::new()), "start, then adb protocol in the same write");
+        assert_eq!(read_exactly(&mut client, 4), b"CNXN");
+        client.write_all(b"OKAY").expect("write");
+        let HostMsg::Data(d) = data(&from_host) else { panic!("expected data") };
+        let mut to_guest = Vec::new();
+        assert!(pipe.host_msg(HostMsg::Data(d), &mut to_guest));
+        assert_eq!(to_guest, b"OKAY");
+        pipe.closed();
+        assert_eq!(client.read(&mut [0u8; 1]).expect("eof"), 0, "closing the pipe hangs up on the client");
+    }
+
+    #[test]
+    fn a_closed_pipe_leaves_the_queue() {
+        let (vsock, events) = channel();
+        let svc = AdbService::bind(0, vsock).expect("bind");
+        let (pipe_events, _from_host) = channel();
+        let mut pipe = svc.open("qemud:adb", PipeCtx { conn: 9, events: pipe_events }).expect("adb pipe");
+        assert!(pipe.guest_data(b"accept", &mut Vec::new()));
+        pipe.closed();
+        let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, svc.port)).expect("connect");
+        assert!(matches!(next(&events), WorkerEvent::Connect { .. }), "no waiting pipe: the client goes to vsock");
+    }
+
+    #[test]
+    fn still_open_tells_a_live_client_from_a_gone_one() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        assert!(still_open(&server));
+        drop(client);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!still_open(&server));
     }
 }

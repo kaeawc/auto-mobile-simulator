@@ -23,6 +23,7 @@ sim-audio.workspace = true
 
 [dev-dependencies]
 emu-avd.workspace = true
+sim-android = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

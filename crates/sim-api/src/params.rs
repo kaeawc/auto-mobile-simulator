@@ -6,6 +6,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use serde_json::{Value, json};
 use sim_core::form_factor::FormFactor;
+#[cfg(target_os = "macos")]
 use sim_core::frame::{Frame, encode_png};
 use sim_core::geometry::Point;
 use sim_core::gesture::{self, Phase, Sample};
@@ -195,11 +196,16 @@ pub fn reading_json(r: &vhal::Reading) -> Value {
 }
 
 /// `screenshot`'s result: written to `path`, else the PNG inline as base64.
+#[cfg(target_os = "macos")]
 pub fn screenshot_result(frame: &Frame, p: &Value) -> Result<Value, String> {
-    let png = encode_png(frame)?;
+    png_result(frame.width, frame.height, &encode_png(frame)?, p)
+}
+
+/// An encoded screenshot written to `path`, or returned as base64 without one.
+pub fn png_result(width: u32, height: u32, png: &[u8], p: &Value) -> Result<Value, String> {
     match str_param(p, "path") {
-        Some(path) => std::fs::write(path, &png).map(|()| json!({"path": path, "width": frame.width, "height": frame.height})).map_err(err),
-        None => Ok(json!({"width": frame.width, "height": frame.height, "png": base64::engine::general_purpose::STANDARD.encode(png)})),
+        Some(path) => std::fs::write(path, png).map(|()| json!({"path": path, "width": width, "height": height})).map_err(err),
+        None => Ok(json!({"width": width, "height": height, "png": base64::engine::general_purpose::STANDARD.encode(png)})),
     }
 }
 

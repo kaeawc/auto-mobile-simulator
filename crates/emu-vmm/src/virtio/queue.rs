@@ -70,6 +70,28 @@ impl Chain {
         }
         Ok(total)
     }
+
+    /// [`Chain::write_all`] of `parts` back to back, without joining them first (a packet's
+    /// header and its payload's pieces). Returns bytes written.
+    pub fn write_parts(&self, mem: &GuestRam, parts: &[&[u8]]) -> Result<u32, QueueError> {
+        let mut total = 0u32;
+        let mut parts = parts.iter().copied().filter(|p| !p.is_empty());
+        let mut part = parts.next();
+        for d in self.writable() {
+            let (mut addr, mut room) = (d.addr, d.len as usize);
+            while room > 0 {
+                let Some(p) = part.as_mut() else { return Ok(total) };
+                let n = room.min(p.len());
+                mem.write(addr, &p[..n]).map_err(|_| QueueError::BadAddress(addr))?;
+                (addr, room, total) = (addr + n as u64, room - n, total + n as u32);
+                *p = &p[n..];
+                if p.is_empty() {
+                    part = parts.next();
+                }
+            }
+        }
+        Ok(total)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -233,18 +255,23 @@ pub(crate) mod tests {
 
     impl Driver {
         pub fn new(size: u16) -> Driver {
-            let desc = RAM_BASE + 0x1000;
+            Driver::at(RAM_BASE + 0x1000, size)
+        }
+
+        /// A queue whose rings start at `desc` (devices with several queues need each apart).
+        pub fn at(desc: u64, size: u16) -> Driver {
             let avail = desc + u64::from(size) * 16;
             let used = (avail + 6 + u64::from(size) * 2 + 3) & !3;
             Driver { cfg: QueueConfig { size, desc, avail, used }, next_desc: 0, avail_idx: 0 }
         }
 
-        /// Publishes a chain of (addr, len, writable) buffers; returns its head.
+        /// Publishes a chain of (addr, len, writable) buffers; returns its head. Descriptors are
+        /// reused in order once the table wraps (callers recycle buffers in order).
         pub fn push(&mut self, mem: &GuestRam, bufs: &[(u64, u32, bool)]) -> u16 {
-            let head = self.next_desc;
+            let head = self.next_desc % self.cfg.size;
             for (i, (addr, len, w)) in bufs.iter().enumerate() {
-                let idx = self.next_desc;
-                self.next_desc += 1;
+                let idx = self.next_desc % self.cfg.size;
+                self.next_desc = self.next_desc.wrapping_add(1);
                 let last = i == bufs.len() - 1;
                 let mut flags = if *w { DESC_F_WRITE } else { 0 };
                 if !last {
@@ -254,12 +281,12 @@ pub(crate) mod tests {
                 b[..8].copy_from_slice(&addr.to_le_bytes());
                 b[8..12].copy_from_slice(&len.to_le_bytes());
                 b[12..14].copy_from_slice(&flags.to_le_bytes());
-                b[14..16].copy_from_slice(&(idx + 1).to_le_bytes());
+                b[14..16].copy_from_slice(&((idx + 1) % self.cfg.size).to_le_bytes());
                 mem.write(self.cfg.desc + u64::from(idx) * 16, &b).expect("desc");
             }
             let slot = self.cfg.avail + 4 + u64::from(self.avail_idx % self.cfg.size) * 2;
             mem.write_u16(slot, head).expect("ring");
-            self.avail_idx += 1;
+            self.avail_idx = self.avail_idx.wrapping_add(1);
             mem.write_u16(self.cfg.avail + 2, self.avail_idx).expect("idx");
             head
         }
@@ -272,6 +299,22 @@ pub(crate) mod tests {
         pub fn used_idx(&self, mem: &GuestRam) -> u16 {
             mem.read_u16(self.cfg.used + 2).expect("used idx")
         }
+    }
+
+    #[test]
+    fn write_parts_spans_parts_and_buffers() {
+        let mem = GuestRam::new(RAM_BASE, 0x10_0000).expect("ram");
+        let mut drv = Driver::new(8);
+        let mut q = Queue::new(drv.cfg, false);
+        let (a, b) = (RAM_BASE + 0x8000, RAM_BASE + 0x9000);
+        drv.push(&mem, &[(a, 3, true), (b, 10, true)]);
+        let chain = q.pop(&mem).expect("pop").expect("chain");
+        assert_eq!(chain.write_parts(&mem, &[b"hd", b"", b"payload", b"xyzw"]), Ok(13), "cut off where the buffers end");
+        let mut got = [0u8; 13];
+        mem.read(a, &mut got[..3]).expect("a");
+        mem.read(b, &mut got[3..]).expect("b");
+        assert_eq!(&got, b"hdpayloadxyzw");
+        assert_eq!(chain.write_parts(&mem, &[b"ok"]), Ok(2));
     }
 
     #[test]

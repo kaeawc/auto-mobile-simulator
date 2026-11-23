@@ -424,7 +424,11 @@ impl Worker {
         let Some(h) = conn.handler.as_mut() else { return };
         let mut to_guest = Vec::new();
         let keep = h.host_msg(msg, &mut to_guest);
-        conn.out.extend(to_guest);
+        if conn.out.is_empty() {
+            conn.out = to_guest.into(); // takes the buffer over, no copy
+        } else {
+            conn.out.extend(to_guest);
+        }
         if !keep {
             conn.closing = true;
         }
@@ -461,8 +465,8 @@ impl Worker {
                 }
             };
             let cap: usize = chain.writable().map(|d| d.len as usize).sum::<usize>().saturating_sub(HDR);
-            let (hdr, payload) = match work {
-                RxWork::Control(h) => (h, Vec::new()),
+            let written = match work {
+                RxWork::Control(h) => chain.write_all(&self.mem, &h.encode()).unwrap_or(0),
                 RxWork::Data(key) => {
                     let Some(c) = self.conns.get_mut(&key) else {
                         let _ = self.rxq.add_used(&self.mem, chain.head, 0);
@@ -470,15 +474,17 @@ impl Worker {
                         continue;
                     };
                     let n = c.out.len().min(c.credit()).min(cap).min(MAX_PKT);
-                    let payload: Vec<u8> = c.out.drain(..n).collect();
                     c.tx_cnt = c.tx_cnt.wrapping_add(n as u32);
                     c.advertised_fwd = c.fwd_cnt;
-                    (reply(self.guest_cid, key, OP_RW, n as u32, c.fwd_cnt), payload)
+                    let hdr = reply(self.guest_cid, key, OP_RW, n as u32, c.fwd_cnt).encode();
+                    // Straight from the connection's buffer into the guest's, header first.
+                    let (front, back) = c.out.as_slices();
+                    let (a, b) = if n <= front.len() { (&front[..n], &[][..]) } else { (front, &back[..n - front.len()]) };
+                    let written = chain.write_parts(&self.mem, &[&hdr, a, b]).unwrap_or(0);
+                    c.out.drain(..n);
+                    written
                 }
             };
-            let mut pkt = hdr.encode().to_vec();
-            pkt.extend_from_slice(&payload);
-            let written = chain.write_all(&self.mem, &pkt).unwrap_or(0);
             let _ = self.rxq.add_used(&self.mem, chain.head, written);
             used = true;
         }
@@ -529,7 +535,413 @@ enum RxWork {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
     use super::*;
+    use crate::irq::TestLine;
+    use crate::pipe::{HostMsg, PipeService};
+    use crate::virtio::queue::tests::{Driver, RAM_BASE};
+
+    const GUEST_CID: u64 = 77;
+    const RX_BUFS: u64 = RAM_BASE + 0x10_0000;
+    const BUF: u32 = 4096;
+
+    /// Echoes guest bytes back, and remembers the latest context and whether it was closed.
+    #[derive(Default)]
+    struct Echo {
+        ctx: Mutex<Option<PipeCtx>>,
+        closed: Arc<Mutex<u32>>,
+    }
+
+    struct EchoPipe(Arc<Mutex<u32>>);
+
+    impl PipeHandler for EchoPipe {
+        fn guest_data(&mut self, data: &[u8], to_guest: &mut Vec<u8>) -> bool {
+            to_guest.extend_from_slice(data);
+            data != b"bye"
+        }
+        fn host_msg(&mut self, msg: HostMsg, to_guest: &mut Vec<u8>) -> bool {
+            match msg {
+                // As the adb forwarder does.
+                HostMsg::Data(d) if to_guest.is_empty() => {
+                    *to_guest = d;
+                    true
+                }
+                HostMsg::Data(d) => {
+                    to_guest.extend(d);
+                    true
+                }
+                _ => false,
+            }
+        }
+        fn closed(&mut self) {
+            *self.0.lock().expect("closed") += 1;
+        }
+    }
+
+    impl PipeService for Arc<Echo> {
+        fn open(&self, name: &str, ctx: PipeCtx) -> Option<Box<dyn PipeHandler>> {
+            (name == "echo").then(|| {
+                *self.ctx.lock().expect("ctx") = Some(ctx);
+                Box::new(EchoPipe(self.closed.clone())) as Box<dyn PipeHandler>
+            })
+        }
+    }
+
+    /// The guest's virtio-vsock driver: rx buffers posted up front, tx packets one per chain.
+    struct Guest {
+        mem: Arc<GuestRam>,
+        dev: Vsock,
+        rx: Driver,
+        tx: Driver,
+        rx_seen: u16,
+        tx_next: u64,
+        echo: Arc<Echo>,
+    }
+
+    fn guest() -> Guest {
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x40_0000).expect("ram"));
+        let echo = Arc::new(Echo::default());
+        let mut registry = PipeRegistry::default();
+        registry.register("echo", Box::new(echo.clone()));
+        let (events, rx_events) = event_channel();
+        let mut dev = Vsock::new(GUEST_CID, Arc::new(registry), events, rx_events);
+        let (mut rx, tx) = (Driver::at(RAM_BASE + 0x1000, 64), Driver::at(RAM_BASE + 0x8000, 64));
+        for i in 0..32 {
+            rx.push(&mem, &[(RX_BUFS + i * u64::from(BUF), BUF, true)]);
+        }
+        let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+        dev.activate(Activation { mem: mem.clone(), irq, queues: vec![Some(rx.cfg), Some(tx.cfg), None], features: 0 }).expect("activate");
+        Guest { mem, dev, rx, tx, rx_seen: 0, tx_next: RAM_BASE + 0x20_0000, echo }
+    }
+
+    impl Guest {
+        fn send(&mut self, op: u16, src_port: u32, dst_port: u32, payload: &[u8]) {
+            let h = Hdr {
+                src_cid: GUEST_CID,
+                dst_cid: HOST_CID,
+                src_port,
+                dst_port,
+                len: payload.len() as u32,
+                typ: TYPE_STREAM,
+                op,
+                flags: 0,
+                buf_alloc: 64 * 1024,
+                fwd_cnt: 0,
+            };
+            let mut pkt = h.encode().to_vec();
+            pkt.extend_from_slice(payload);
+            self.mem.write(self.tx_next, &pkt).expect("tx buf");
+            self.tx.push(&self.mem, &[(self.tx_next, pkt.len() as u32, false)]);
+            self.tx_next += 0x1000;
+            self.dev.notify(TXQ as u16);
+        }
+
+        /// The next packet the device puts in an rx buffer.
+        fn recv(&mut self) -> (Hdr, Vec<u8>) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.rx.used_idx(&self.mem) == self.rx_seen {
+                assert!(Instant::now() < deadline, "no rx packet");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let (id, len) = self.rx.used(&self.mem, self.rx_seen);
+            self.rx_seen += 1;
+            let mut b = vec![0u8; len as usize];
+            self.mem.read(RX_BUFS + u64::from(id) * u64::from(BUF), &mut b).expect("rx buf");
+            let h = Hdr::parse(&b).expect("header");
+            (h, b[HDR..HDR + h.len as usize].to_vec())
+        }
+
+        fn quiet(&self) -> bool {
+            std::thread::sleep(Duration::from_millis(50));
+            self.rx.used_idx(&self.mem) == self.rx_seen
+        }
+    }
+
+    /// Host → guest throughput through one pipe, as `adb push`/`install` stream: the guest posts
+    /// 4 KiB receive buffers (Linux's default) and returns credit as it reads.
+    ///     cargo test --release -p emu-vmm vsock_throughput -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn vsock_throughput() {
+        const TOTAL: usize = 64 << 20;
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x80_0000).expect("ram"));
+        let echo = Arc::new(Echo::default());
+        let mut registry = PipeRegistry::default();
+        registry.register("echo", Box::new(echo.clone()));
+        let (events, rx_events) = event_channel();
+        let mut dev = Vsock::new(GUEST_CID, Arc::new(registry), events, rx_events);
+        let size = 256u16;
+        let (mut rx, mut tx) = (Driver::at(RAM_BASE + 0x1000, size), Driver::at(RAM_BASE + 0x10_000, size));
+        let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+        // Fixed rx buffers, reposted after use; the ring wraps, so the driver's descriptor ids do too.
+        let buf = |i: u16| RX_BUFS + u64::from(i) * u64::from(BUF);
+        for i in 0..size {
+            rx.push(&mem, &[(buf(i), BUF, true)]);
+        }
+        dev.activate(Activation { mem: mem.clone(), irq, queues: vec![Some(rx.cfg), Some(tx.cfg), None], features: 0 }).expect("activate");
+        let mut tx_addr = RAM_BASE + 0x40_0000;
+        let mut send = |dev: &mut Vsock, tx: &mut Driver, op: u16, fwd: u32, payload: &[u8]| {
+            let h = Hdr {
+                src_cid: GUEST_CID,
+                dst_cid: HOST_CID,
+                src_port: 1,
+                dst_port: PIPE_PORT,
+                len: payload.len() as u32,
+                typ: TYPE_STREAM,
+                op,
+                flags: 0,
+                buf_alloc: 256 * 1024,
+                fwd_cnt: fwd,
+            };
+            let mut pkt = h.encode().to_vec();
+            pkt.extend_from_slice(payload);
+            mem.write(tx_addr, &pkt).expect("tx");
+            tx.push(&mem, &[(tx_addr, pkt.len() as u32, false)]);
+            tx_addr = if tx_addr > RAM_BASE + 0x70_0000 { RAM_BASE + 0x40_0000 } else { tx_addr + 0x100 };
+            dev.notify(TXQ as u16);
+        };
+        send(&mut dev, &mut tx, OP_REQUEST, 0, &[]);
+        send(&mut dev, &mut tx, OP_RW, 0, b"pipe:echo\0");
+        let ctx = loop {
+            if let Some(c) = echo.ctx.lock().expect("ctx").clone() {
+                break c;
+            }
+            std::thread::yield_now();
+        };
+        let chunk = vec![0x5au8; 64 * 1024];
+        let start = Instant::now();
+        let producer = std::thread::spawn(move || {
+            for _ in 0..TOTAL / chunk.len() {
+                ctx.send(HostMsg::Data(chunk.clone()));
+            }
+        });
+        let (mut seen, mut got, mut credited) = (0u16, 0usize, 0usize);
+        while got < TOTAL {
+            let used = rx.used_idx(&mem);
+            if used == seen {
+                std::thread::yield_now();
+                continue;
+            }
+            while seen != used {
+                let (id, len) = rx.used(&mem, seen % size);
+                seen = seen.wrapping_add(1);
+                let h = Hdr::parse(&{
+                    let mut b = [0u8; HDR];
+                    mem.read(buf(id as u16 % size), &mut b).expect("hdr");
+                    b
+                })
+                .expect("hdr");
+                if h.op == OP_RW {
+                    got += len as usize - HDR;
+                }
+                rx.push(&mem, &[(buf(id as u16 % size), BUF, true)]);
+            }
+            if got - credited >= 64 * 1024 {
+                send(&mut dev, &mut tx, OP_CREDIT_UPDATE, got as u32, &[]);
+                credited = got;
+            }
+            dev.notify(RXQ as u16);
+        }
+        let secs = start.elapsed().as_secs_f64();
+        producer.join().expect("producer");
+        println!("vsock host->guest: {} MiB in {:.3} s = {:.0} MiB/s", TOTAL >> 20, secs, (TOTAL >> 20) as f64 / secs);
+    }
+
+    /// Guest → host throughput through one pipe, as `adb pull`/`exec-out` stream: the guest
+    /// sends 64 KiB packets (Linux's largest) into a sink.
+    ///     cargo test --release -p emu-vmm vsock_throughput_to_host -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn vsock_throughput_to_host() {
+        struct Count(Arc<std::sync::atomic::AtomicUsize>);
+        impl PipeHandler for Count {
+            fn guest_data(&mut self, data: &[u8], _to_guest: &mut Vec<u8>) -> bool {
+                self.0.fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            fn host_msg(&mut self, _msg: HostMsg, _to_guest: &mut Vec<u8>) -> bool {
+                true
+            }
+        }
+        struct Sink(Arc<std::sync::atomic::AtomicUsize>);
+        impl PipeService for Sink {
+            fn open(&self, name: &str, _ctx: PipeCtx) -> Option<Box<dyn PipeHandler>> {
+                (name == "sink").then(|| Box::new(Count(self.0.clone())) as Box<dyn PipeHandler>)
+            }
+        }
+        const TOTAL: usize = 256 << 20;
+        const PKT: usize = 64 * 1024;
+        let got = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x200_0000).expect("ram"));
+        let mut registry = PipeRegistry::default();
+        registry.register("sink", Box::new(Sink(got.clone())));
+        let (events, rx_events) = event_channel();
+        let mut dev = Vsock::new(GUEST_CID, Arc::new(registry), events, rx_events);
+        let size = 64u16;
+        let (mut rx, mut tx) = (Driver::at(RAM_BASE + 0x1000, size), Driver::at(RAM_BASE + 0x8000, size));
+        for i in 0..size {
+            rx.push(&mem, &[(RX_BUFS + u64::from(i) * u64::from(BUF), BUF, true)]);
+        }
+        let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+        dev.activate(Activation { mem: mem.clone(), irq, queues: vec![Some(rx.cfg), Some(tx.cfg), None], features: 0 }).expect("activate");
+        // Packets prebuilt in guest RAM, one slot per descriptor, reused as the ring wraps.
+        let slot = |i: u16| RAM_BASE + 0x40_0000 + u64::from(i) * (HDR + PKT) as u64;
+        let packet = |payload: &[u8], fwd: u32| {
+            let h = Hdr {
+                src_cid: GUEST_CID,
+                dst_cid: HOST_CID,
+                src_port: 1,
+                dst_port: PIPE_PORT,
+                len: payload.len() as u32,
+                typ: TYPE_STREAM,
+                op: OP_RW,
+                flags: 0,
+                buf_alloc: 256 * 1024,
+                fwd_cnt: fwd,
+            };
+            let mut p = h.encode().to_vec();
+            p.extend_from_slice(payload);
+            p
+        };
+        let mut req = packet(&[], 0);
+        req[30] = OP_REQUEST as u8;
+        mem.write(slot(0), &req).expect("req");
+        tx.push(&mem, &[(slot(0), HDR as u32, false)]);
+        let name = packet(b"pipe:sink\0", 0);
+        mem.write(slot(1), &name).expect("name");
+        tx.push(&mem, &[(slot(1), name.len() as u32, false)]);
+        dev.notify(TXQ as u16);
+        // The request and name must be read before their slots are reused.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tx.used_idx(&mem) < 2 {
+            assert!(Instant::now() < deadline, "the connection never opened");
+            std::thread::yield_now();
+        }
+        let data = packet(&vec![0xa5u8; PKT], 0);
+        for i in 0..size {
+            mem.write(slot(i), &data).expect("slot");
+        }
+        let start = Instant::now();
+        let mut sent = 0usize;
+        let mut pushed = 2u16;
+        while sent < TOTAL {
+            // Keep the ring full: as many packets in flight as the queue holds.
+            while pushed.wrapping_sub(tx.used_idx(&mem)) < size && sent < TOTAL {
+                tx.push(&mem, &[(slot(pushed % size), (HDR + PKT) as u32, false)]);
+                pushed = pushed.wrapping_add(1);
+                sent += PKT;
+            }
+            dev.notify(TXQ as u16);
+            std::thread::yield_now();
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while got.load(std::sync::atomic::Ordering::Relaxed) < TOTAL {
+            assert!(Instant::now() < deadline, "only {} bytes arrived", got.load(std::sync::atomic::Ordering::Relaxed));
+            std::thread::yield_now();
+        }
+        let secs = start.elapsed().as_secs_f64();
+        println!("vsock guest->host: {} MiB in {:.3} s = {:.0} MiB/s", TOTAL >> 20, secs, (TOTAL >> 20) as f64 / secs);
+    }
+
+    #[test]
+    fn a_guest_pipe_connects_names_its_service_and_echoes() {
+        let mut g = guest();
+        let mut cfg = [0u8; 8];
+        g.dev.read_config(0, &mut cfg);
+        assert_eq!(u64::from_le_bytes(cfg), GUEST_CID);
+
+        g.send(OP_REQUEST, 1024, PIPE_PORT, &[]);
+        let (h, _) = g.recv();
+        assert_eq!((h.op, h.src_cid, h.dst_cid, h.src_port, h.dst_port), (OP_RESPONSE, HOST_CID, GUEST_CID, PIPE_PORT, 1024));
+        // The name may arrive split, and data may follow it in the same packet.
+        g.send(OP_RW, 1024, PIPE_PORT, b"pipe:ec");
+        g.send(OP_RW, 1024, PIPE_PORT, b"ho\0hello");
+        let (h, data) = g.recv();
+        assert_eq!((h.op, data.as_slice()), (OP_RW, &b"hello"[..]));
+        assert_eq!(h.fwd_cnt, 15, "everything the guest sent counts as forwarded");
+
+        // The host side talks through the context the service got.
+        let ctx = g.echo.ctx.lock().expect("ctx").clone().expect("opened");
+        assert!(ctx.send(HostMsg::Data(b"from host".to_vec())));
+        let (_, data) = g.recv();
+        assert_eq!(data, b"from host");
+
+        // The handler ending the conversation resets the connection and closes the pipe.
+        g.send(OP_RW, 1024, PIPE_PORT, b"bye");
+        let (h, data) = g.recv();
+        assert_eq!((h.op, data.as_slice()), (OP_RST, &[][..]));
+        assert_eq!(*g.echo.closed.lock().expect("closed"), 1);
+        g.send(OP_RW, 1024, PIPE_PORT, b"late");
+        assert_eq!(g.recv().0.op, OP_RST, "a closed connection is reset");
+    }
+
+    #[test]
+    fn unknown_pipes_ports_and_peers_are_reset() {
+        let mut g = guest();
+        g.send(OP_REQUEST, 1, 1234, &[]);
+        assert_eq!(g.recv().0.op, OP_RST, "only the pipe port listens");
+        g.send(OP_REQUEST, 2, PIPE_PORT, &[]);
+        assert_eq!(g.recv().0.op, OP_RESPONSE);
+        g.send(OP_REQUEST, 2, PIPE_PORT, &[]);
+        assert_eq!(g.recv().0.op, OP_RST, "a second request on a live connection");
+        g.send(OP_RW, 3, PIPE_PORT, b"pipe:nope\0");
+        assert_eq!(g.recv().0.op, OP_RST, "data on no connection");
+        g.send(OP_REQUEST, 4, PIPE_PORT, &[]);
+        assert_eq!(g.recv().0.op, OP_RESPONSE);
+        g.send(OP_RW, 4, PIPE_PORT, b"pipe:nope\0");
+        assert_eq!(g.recv().0.op, OP_RST, "no such service");
+        g.send(OP_RST, 9, PIPE_PORT, &[]);
+        assert!(g.quiet(), "a reset is never answered");
+        g.send(OP_SHUTDOWN, 2, PIPE_PORT, &[]);
+        assert_eq!(g.recv().0.op, OP_RST, "shutdown closes");
+    }
+
+    #[test]
+    fn credit_requests_are_answered() {
+        let mut g = guest();
+        g.send(OP_REQUEST, 5, PIPE_PORT, &[]);
+        g.recv();
+        g.send(OP_RW, 5, PIPE_PORT, b"pipe:echo\0");
+        g.send(OP_CREDIT_REQUEST, 5, PIPE_PORT, &[]);
+        let (h, _) = g.recv();
+        assert_eq!((h.op, h.fwd_cnt, h.buf_alloc), (OP_CREDIT_UPDATE, 10, BUF_ALLOC));
+    }
+
+    #[test]
+    fn host_connections_start_once_the_guest_answers() {
+        let mut g = guest();
+        let made = Arc::new(Mutex::new(Vec::new()));
+        let refused = Arc::new(Mutex::new(0));
+        let connect = |g: &Guest, port: u32| {
+            let (made, refused) = (made.clone(), refused.clone());
+            let make: crate::pipe::MakeHandler = Box::new(move |ctx: PipeCtx| {
+                made.lock().expect("made").push(ctx.conn);
+                Box::new(EchoPipe(Arc::default())) as Box<dyn PipeHandler>
+            });
+            let refused: Box<dyn FnOnce() + Send> = Box::new(move || *refused.lock().expect("refused") += 1);
+            g.dev.events.send(WorkerEvent::Connect { guest_port: port, make, refused }).expect("connect");
+        };
+        connect(&g, 5555);
+        let (h, _) = g.recv();
+        assert_eq!((h.op, h.dst_port, h.src_port), (OP_REQUEST, 5555, 50_000));
+        assert!(made.lock().expect("made").is_empty(), "no host I/O before the guest accepts");
+        g.send(OP_RESPONSE, 5555, 50_000, &[]);
+        g.send(OP_RW, 5555, 50_000, b"ping");
+        assert_eq!(g.recv().1, b"ping");
+        assert_eq!(made.lock().expect("made").len(), 1);
+
+        connect(&g, 6000);
+        let (h, _) = g.recv();
+        g.send(OP_RST, 6000, h.src_port, &[]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while *refused.lock().expect("refused") == 0 {
+            assert!(Instant::now() < deadline, "refusal not reported");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(g.quiet(), "a refused request isn't reset back");
+    }
 
     #[test]
     fn header_round_trip() {

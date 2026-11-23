@@ -11,6 +11,8 @@
 
 pub mod console;
 pub mod display;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -298,18 +300,38 @@ impl Device {
         if r.alive() { Err(format!("{} is still running after `kill`", self.info.name)) } else { Ok(()) }
     }
 
-    /// The current screen at full resolution, from the emulator's renderer.
+    /// The current screen at full resolution, from the emulator's renderer, decoded.
     pub fn screenshot(&self) -> Result<Frame, String> {
+        let (_, _, png) = self.screenshot_png()?;
+        decode_png(&png)
+    }
+
+    /// The current screen as the emulator encodes it: width, height and PNG bytes, with no
+    /// decode and re-encode on the way.
+    pub fn screenshot_png(&self) -> Result<(u32, u32, Vec<u8>), String> {
         let path = std::env::temp_dir().join(format!("sim-android-{}-{}.png", std::process::id(), self.info.udid));
-        self.console(&[format!("screenshot {}", path.display())])?;
+        let size = self.screenshot_png_to(&path);
         let png = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()));
         let _ = std::fs::remove_file(&path);
-        decode_png(&png?)
+        let (w, h) = size?;
+        Ok((w, h, png?))
+    }
+
+    /// Has the emulator write the current screen to `path` as PNG (it runs on this host);
+    /// returns the width and height.
+    pub fn screenshot_png_to(&self, path: &Path) -> Result<(u32, u32), String> {
+        let path = std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        self.console(&[format!("screenshot {}", path.display())])?;
+        let mut header = [0u8; 24];
+        std::fs::File::open(&path)
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut header))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        sim_core::frame::png_size(&header).ok_or_else(|| format!("{} isn't a PNG", path.display()))
     }
 
     /// Plays touch samples (device pixels) over one display connection.
     pub fn play(&self, samples: &[Sample]) -> Result<(), String> {
-        let mut display = display::Display::connect(&self.touch_screen()?.dir)?;
+        let mut display = self.display(self.touch_screen()?)?;
         for s in samples {
             sleep(s.delay);
             display.send(&Input::Touch { x: s.point.x as f32, y: s.point.y as f32, phase: s.phase })?;
@@ -319,7 +341,7 @@ impl Device {
 
     /// One touch sample at device pixels.
     pub fn touch(&self, x: f64, y: f64, phase: Phase) -> Result<(), String> {
-        display::Display::connect(&self.touch_screen()?.dir)?.send(&Input::Touch { x: x as f32, y: y as f32, phase })
+        self.display(self.touch_screen()?)?.send(&Input::Touch { x: x as f32, y: y as f32, phase })
     }
 
     /// A touch on the touchpad beside the screen (`hw.touchpad0`: Android XR display glasses), in
@@ -353,6 +375,12 @@ impl Device {
         self.avd()?
             .touchpad()
             .ok_or_else(|| format!("{} has no touchpad (hw.touchpad0; Android XR display glasses have one)", self.info.name))
+    }
+
+    /// A connection to the running emulator's display socket (frames and input).
+    fn display(&self, avd: &Avd) -> Result<display::Display, String> {
+        self.running()?;
+        display::Display::connect(&avd.dir)
     }
 
     /// The AVD, if its screen takes touch (an SDK TV's says `hw.screen=no-touch`).
@@ -433,7 +461,7 @@ impl Device {
     /// scales to stock's 15 units per click (`sim_core::stream::wheel_units`). Watches only.
     pub fn rotary(&self, ticks: i32) -> Result<(), String> {
         self.require(InputMethod::Rotary, "rotary input")?;
-        display::Display::connect(&self.avd()?.dir)?.send(&Input::Wheel(ticks))
+        self.display(self.avd()?)?.send(&Input::Wheel(ticks))
     }
 
     /// An XR control (head pose, environment, input mode, pointer) through emu-rs's `xr` console
@@ -521,6 +549,7 @@ fn decode_png(bytes: &[u8]) -> Result<Frame, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{fake_emulator, wait_for};
 
     struct Fixture {
         root: PathBuf,
@@ -606,90 +635,19 @@ mod tests {
         f.android.create("watch", "system-images;android-34;android-wear;arm64-v8a", None).expect("watch");
         let d = f.android.device("watch").expect("watch");
         assert_eq!(d.rotate(), Err("watch isn't running; boot it first".into()));
+        assert_eq!(d.touch(1.0, 1.0, Phase::Down), Err("watch isn't running; boot it first".into()), "not a socket error");
+        assert_eq!(d.rotary(1), Err("watch isn't running; boot it first".into()));
         assert!(d.fold(90.0).expect_err("not a foldable").starts_with("folding needs a device with Hinge; watch is Wear OS · Watch"));
         assert!(d.button(Button::Siri, Direction::Down).expect_err("no Siri").contains("doesn't exist on Android"));
         f.android.delete(&d).expect("delete");
         assert!(f.android.devices().is_empty());
     }
 
-    /// A stand-in for a running emu-rs: an advertisement naming this process, a console that
-    /// records commands (and writes a PNG for `screenshot`), and a display socket that records
-    /// input lines.
-    struct FakeEmulator {
-        console: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-        display: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    fn fake_emulator(f: &Fixture, avd: &str) -> FakeEmulator {
-        use std::io::{BufRead, BufReader, Write};
-        use std::sync::{Arc, Mutex};
-        let console = Arc::new(Mutex::new(Vec::new()));
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("console");
-        let port = listener.local_addr().expect("addr").port();
-        let log = console.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let mut out = stream.try_clone().expect("clone");
-                let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
-                for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                    let line = line.trim().to_owned();
-                    if line == "quit" {
-                        break;
-                    }
-                    let reply = match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-                        ["ping"] => "I am alive!\r\nOK".to_owned(),
-                        ["frames"] => "3\r\nOK".to_owned(),
-                        ["car", "get", ..] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\nOK".to_owned(),
-                        ["car", "list"] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\n\
-                                            property=INFO_MAKE id=0x11100101 area=0 status=available value=Toy Car\r\nOK"
-                            .to_owned(),
-                        ["screenshot", path] => {
-                            let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };
-                            std::fs::write(path, sim_core::frame::encode_png(&frame).expect("png")).expect("write png");
-                            format!("{path} (2x1, frame 3)\r\nOK")
-                        }
-                        _ => "OK".to_owned(),
-                    };
-                    log.lock().expect("log").push(line);
-                    let _ = out.write_all(format!("{reply}\r\n").as_bytes());
-                }
-            }
-        });
-        let display = Arc::new(Mutex::new(Vec::new()));
-        let dir = f.android.env.avd_home.join(format!("{avd}.avd/emu-rs"));
-        std::fs::create_dir_all(&dir).expect("emu-rs dir");
-        let socket = std::os::unix::net::UnixListener::bind(dir.join("display.sock")).expect("display");
-        let lines = display.clone();
-        std::thread::spawn(move || {
-            for conn in socket.incoming().flatten() {
-                let lines = lines.clone();
-                std::thread::spawn(move || {
-                    for l in BufReader::new(conn).lines().map_while(Result::ok) {
-                        lines.lock().expect("lines").push(l);
-                    }
-                });
-            }
-        });
-        let running = f.android.running_dir.clone().expect("running dir");
-        std::fs::create_dir_all(&running).expect("running");
-        let ad = format!("port.serial={port}\nport.adb={}\navd.name={avd}\nemulator=emu-rs\n", port + 1);
-        std::fs::write(running.join(format!("pid_{}.ini", std::process::id())), ad).expect("advertise");
-        FakeEmulator { console, display }
-    }
-
-    fn wait_for(lines: &std::sync::Mutex<Vec<String>>, n: usize) -> Vec<String> {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while lines.lock().expect("lines").len() < n && Instant::now() < deadline {
-            sleep(Duration::from_millis(10));
-        }
-        lines.lock().expect("lines").clone()
-    }
-
     #[test]
     fn running_devices_are_driven_over_console_and_display() {
         let f = fixture("running");
         f.android.create("fold", "system-images;android-36;google_apis;arm64-v8a", Some(FormFactor::Foldable)).expect("fold");
-        let fake = fake_emulator(&f, "fold");
+        let fake = fake_emulator(&f.android, "fold");
         let d = f.android.device("booted").expect("the running device is `booted`");
         assert_eq!((d.info.udid.as_str(), d.info.state), ("fold", DeviceState::Booted));
         let r = d.running.clone().expect("running");
@@ -717,6 +675,11 @@ mod tests {
         );
         let shot = d.screenshot().expect("screenshot");
         assert_eq!((shot.width, shot.height, shot.rgba[0]), (2, 1, 9));
+        let (w, h, png) = d.screenshot_png().expect("png");
+        assert_eq!((w, h, sim_core::frame::png_size(&png)), (2, 1, Some((2, 1))));
+        let to = f.root.join("shot.png");
+        assert_eq!(d.screenshot_png_to(&to), Ok((2, 1)));
+        assert!(std::fs::read(&to).expect("written").starts_with(b"\x89PNG"), "the emulator wrote it there");
 
         d.play(&sim_core::gesture::tap(sim_core::geometry::Point::new(100.0, 200.0), Duration::ZERO)).expect("tap");
         assert_eq!(wait_for(&fake.display, 2), ["touch 100 200 down", "touch 100 200 up"]);
@@ -780,7 +743,7 @@ mod tests {
         f.android.create("watch", "system-images;android-34;android-wear;arm64-v8a", None).expect("watch");
         let watch = f.android.device("watch").expect("watch");
         assert_eq!(watch.xr(&rotate), Err("XR controls need an Android XR device; watch is Wear OS · Watch".into()));
-        let fake = fake_emulator(&f, "headset");
+        let fake = fake_emulator(&f.android, "headset");
         let d = f.android.device("headset").expect("running headset");
         d.xr(&rotate).expect("rotate");
         d.xr(&XrCommand::Recenter).expect("recenter");
@@ -811,7 +774,7 @@ mod tests {
         assert!(d.vehicle_set("gear", 0, "fast").expect_err("bad value").contains("isn't a Int32 value"));
         assert_eq!(d.vehicle_set("gear", 0, "drive"), Err("car isn't running; boot it first".into()));
 
-        let fake = fake_emulator(&f, "car");
+        let fake = fake_emulator(&f.android, "car");
         let d = f.android.device("car").expect("car");
         d.vehicle_set("gear", 0, "drive").expect("set");
         d.vehicle_set("HVAC_TEMPERATURE_SET", 49, "21.5").expect("set seat");

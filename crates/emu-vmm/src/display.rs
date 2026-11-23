@@ -28,6 +28,12 @@ impl FrameStore {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// The latest frame's width, height and number, without copying its pixels.
+    pub fn geometry(&self) -> (u32, u32, u64) {
+        let s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        (s.width, s.height, s.frames)
+    }
+
     pub fn frames(&self) -> u64 {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).frames
     }
@@ -43,5 +49,23 @@ impl DisplaySink for FrameStore {
         s.pixels.clear();
         s.pixels.extend_from_slice(pixels);
         s.frames += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_the_latest_frame_and_counts_them() {
+        let store = FrameStore::default();
+        assert_eq!((store.frames(), store.snapshot().pixels.len()), (0, 0));
+        store.present(2, 1, 8, 1, &[1; 8]);
+        store.present(1, 1, 4, 2, &[7, 7, 7, 7]);
+        let f = store.snapshot();
+        assert_eq!((f.width, f.height, f.stride, f.format, f.frames), (1, 1, 4, 2, 2));
+        assert_eq!(f.pixels, [7, 7, 7, 7], "replaced, not appended");
+        assert_eq!(store.geometry(), (1, 1, 2));
+        assert_eq!(store.frames(), 2);
     }
 }

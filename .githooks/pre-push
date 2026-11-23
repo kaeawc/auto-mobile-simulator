@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Runs scripts/check.sh before every push (enable with scripts/install-hooks.sh; skip once with
+# `git push --no-verify`).
+exec "$(git rev-parse --show-toplevel)/scripts/check.sh"

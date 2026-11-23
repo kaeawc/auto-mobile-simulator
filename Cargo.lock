@@ -148,7 +148,7 @@ name = "emu-sdk"
 version = "0.1.0"
 dependencies = [
  "emu-hvf",
- "libc",
+ "flate2",
  "roxmltree",
  "sha1_smol",
  "sim-core",
@@ -449,8 +449,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "emu-avd",
  "png",
  "serde_json",
+ "sim-android",
  "sim-api",
  "sim-core",
 ]

@@ -416,6 +416,68 @@ mod tests {
     }
 
     #[test]
+    fn running_android_devices_are_driven_through_every_method() {
+        use base64::Engine;
+        use sim_android::testing::{fake_emulator, wait_for};
+        use sim_core::form_factor::FormFactor;
+        // Under /tmp, not $TMPDIR: the fake display socket's path must fit a unix socket address
+        // (104 bytes on macOS).
+        let root = std::path::PathBuf::from("/tmp").join(format!("sa-live-{}", std::process::id()));
+        let sdk = root.join("sdk/system-images/android-36/google_apis/arm64-v8a");
+        std::fs::create_dir_all(&sdk).expect("image dir");
+        std::fs::write(sdk.join("system.img"), b"s").expect("system.img");
+        std::fs::write(sdk.join("source.properties"), "AndroidVersion.ApiLevel=36\nSystemImage.TagId=google_apis\n").expect("props");
+        let env = emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") };
+        let mut android = sim_android::Android::new(env);
+        android.running_dir = Some(root.join("running"));
+        android.create("fold", "system-images;android-36;google_apis;arm64-v8a", Some(FormFactor::Foldable)).expect("create");
+        let fake = fake_emulator(&android, "fold");
+        let mut s = Session::with_android(android);
+        let ok = |s: &mut Session, method: &str, params: Value| call(s, method, &params).unwrap_or_else(|e| panic!("{method}: {e}"));
+
+        ok(&mut s, "tap", json!({"device": "fold", "x": 10, "y": 20}));
+        ok(&mut s, "touch", json!({"device": "fold", "x": 5, "y": 6, "phase": "down"}));
+        ok(&mut s, "button", json!({"device": "fold", "button": "home"}));
+        ok(&mut s, "key", json!({"device": "fold", "usage": 0x28}));
+        ok(&mut s, "location", json!({"device": "fold", "latitude": 37.5, "longitude": -122.25}));
+        ok(&mut s, "rotate", json!({"device": "fold"}));
+        assert_eq!(ok(&mut s, "fold", json!({"device": "fold", "posture": "half-opened"}))["posture"], "half-opened");
+        assert_eq!(ok(&mut s, "fold", json!({"device": "fold", "angle": 170}))["angle"], 170.0);
+        assert_eq!(ok(&mut s, "console", json!({"device": "fold", "command": "ping"})), json!(["I am alive!"]));
+        assert_eq!(ok(&mut s, "console", json!({"device": "fold", "commands": ["frames", "ping"]})), json!(["3", "I am alive!"]));
+        assert_eq!(call(&mut s, "console", &json!({"device": "fold"})).expect_err("no command"), "give `command` or `commands`");
+
+        let shot = ok(&mut s, "screenshot", json!({"device": "fold"}));
+        assert_eq!((shot["width"].as_u64(), shot["height"].as_u64()), (Some(2), Some(1)));
+        let png = base64::engine::general_purpose::STANDARD.decode(shot["png"].as_str().expect("png")).expect("base64");
+        assert_eq!(sim_core::frame::png_size(&png), Some((2, 1)), "the emulator's PNG, passed through");
+        let path = root.join("shot.png");
+        let saved = ok(&mut s, "screenshot", json!({"device": "fold", "path": path.to_str()}));
+        assert_eq!(saved["width"], 2);
+        assert!(std::fs::read(&path).expect("written by the emulator").starts_with(b"\x89PNG"));
+
+        let console = wait_for(&fake.console, 13);
+        for want in
+            ["event send EV_KEY:KEY_HOME:1", "event send EV_KEY:KEY_HOME:0", "event send EV_KEY:28:1", "geo fix -122.25 37.5", "rotate"]
+        {
+            assert!(console.iter().any(|l| l == want), "{want} not in {console:?}");
+        }
+        assert!(console.iter().any(|l| l.starts_with("sensor set hinge-angle0 ")), "{console:?}");
+        assert_eq!(wait_for(&fake.display, 3)[..3], ["touch 10 20 down", "touch 10 20 up", "touch 5 6 down"]);
+
+        // Form-factor checks happen before anything reaches the emulator.
+        let err = |s: &mut Session, method: &str, params: Value| call(s, method, &params).expect_err(method);
+        assert!(err(&mut s, "rotary", json!({"device": "fold", "ticks": 1})).starts_with("rotary input needs a device with Rotary"));
+        assert!(err(&mut s, "vehicle", json!({"device": "fold"})).contains("vehicle HAL"));
+        assert!(err(&mut s, "touchpad", json!({"device": "fold", "x": 1, "y": 1})).contains("no touchpad"));
+        assert_eq!(err(&mut s, "rotary", json!({"device": "fold"})), "missing number parameter `ticks`");
+        assert_eq!(err(&mut s, "key", json!({"device": "fold"})), "missing number parameter `usage`");
+        assert!(err(&mut s, "fold", json!({"device": "fold"})).starts_with("give `angle`"));
+        assert!(err(&mut s, "rotate", json!({"device": "fold", "orientation": "portrait"})).contains("iOS-only"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn android_xr_devices_take_xr_controls() {
         let (mut s, root) = android_session("xr");
         let xr = "system-images;android-34;google-xr;arm64-v8a";

@@ -111,10 +111,13 @@ emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a -lcd
 always macOS/arm64's), downloads it with the system's `/usr/bin/curl` (resumable, into `$ANDROID_HOME/.downloads`),
 checks size and sha1, unpacks it with `/usr/bin/unzip` and moves it into the standard SDK layout.
 Installed packages are skipped, manifests are cached for a day, and the archive is deleted once
-unpacked. unzip writes disk images out in full, so the zero blocks of each `*.img` are then
-punched out (`F_PUNCHHOLE` on macOS, `fallocate` on Linux): TV 34's `system.img` takes 1.4 GB
-instead of 8.1 GB, reading back unchanged. The SDK is `$ANDROID_SDK_ROOT`/`$ANDROID_HOME`, else Android Studio's default
-(`~/Library/Android/sdk` on macOS, `~/Android/Sdk` on Linux). An API level a tag publishes only
+unpacked. Disk images (`*.img`) don't go through a plain unzip: each streams out of the archive
+(`unzip -p`) into a file where only non-zero 4 KiB blocks are written, so zero runs stay holes.
+Most of a system image is zeros: TV 34's 8.6 GB `system.img` takes 1.4 GB and reads back
+byte-identical. Unpacking TV 34 took 64 s instead of 4 min 48 s (unzip writing 8.6 GB, then a pass
+reading it back to punch holes) on a Linux VM, against a 40 s floor for inflating it at all. The SDK is `$ANDROID_SDK_ROOT`/`$ANDROID_HOME`, else Android Studio's default
+(`~/Library/Android/sdk` on macOS, `~/Android/Sdk` on Linux). `SDK_TEST_BASE_URL` (the variable sdkmanager honours) points provisioning at another repository,
+a mirror or a `file://` copy. An API level a tag publishes only
 at extension levels (Automotive's API 34 and 35) resolves to the newest of them. Provisioning
 works on Linux too, for preparing images and AVDs; there `-provision` skips the renderer, since
 only Apple silicon boots guests.
@@ -232,6 +235,24 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   dm-default-key metadata encryption, which passes discard through but not write-zeroes, and
   zeroes it writes land as ciphertext. So discard is the only way to free space, and a fresh
   first boot (about 610 MB allocated) has only about 2 MB left to trim.
+- **Screenshots: fast PNG, no re-encode, no needless copies.** Automation takes a screenshot
+  after nearly every step. On a 2480×1740 screen (`cargo run --release -p sim-core --example
+  frame_bench`), PNG encoding at the `png` crate's default level took 74 ms and BGRA→RGBA
+  conversion 11 ms; `Fast` (fdeflate) encodes in 11.5 ms for a file 1.7× larger, and a conversion
+  loop per pixel format (no per-pixel `match`) takes 7.8 ms: 86 → 19 ms. The API passes the
+  emulator's PNG straight through (with `path`, emu writes the file itself) instead of decoding
+  and re-encoding it, and the display socket's frame loop no longer clones the whole frame just
+  to read its size. The display socket's per-frame downscale (a box filter) went from 22.7 to
+  7.2 ms at factor 2 (16.4 to 7.5 ms at 3): const-generic kernels for factors 2–4 and division by
+  a reciprocal, identical output.
+- **vsock without intermediate copies.** adb (and every qemud pipe) rides vsock. Host bytes were
+  copied into the connection's queue, out of it into a packet `Vec`, and then into the guest's
+  buffer; now the adb forwarder hands its buffer over, the worker takes it over when nothing is
+  queued, and packets are written straight from the queue into the guest's descriptors
+  (`Chain::write_parts`). Host→guest through one pipe with the guest posting Linux's 4 KiB
+  receive buffers (`cargo test --release -p emu-vmm vsock_throughput -- --ignored`): median of 5,
+  284 → 512 MiB/s on a 4-core Linux VM. Guest→host (`vsock_throughput_to_host`, 64 KiB
+  packets) runs at about 4 GiB/s, so host→guest's limit is the guest's small receive buffers.
 
 ## Development
 
