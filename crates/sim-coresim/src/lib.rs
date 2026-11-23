@@ -16,9 +16,16 @@ mod hid;
 mod rt;
 mod service;
 
-pub use display::{Display, Surface};
+pub use display::{Display, FrameWatch, Surface};
 pub use error::{Error, Result};
 pub use hid::Hid;
-pub use service::{Appearance, Context, Device, ExecOutput, StatusBar, developer_dir};
+pub use service::{Appearance, Context, Device, ExecOutput, StateWatch, StatusBar, developer_dir};
 pub use sim_core::frame::Frame;
 pub use sim_core::hid::{Direction, Orientation, WatchGesture};
+
+/// Runs `f` in an autorelease pool. Long-lived threads that call the service (API input workers,
+/// the desktop's capture) wrap each unit of work, so objects the service autoreleases are freed as
+/// they go instead of when the thread exits.
+pub fn autoreleasepool<R>(f: impl FnOnce() -> R) -> R {
+    objc2::rc::autoreleasepool(|_| f())
+}

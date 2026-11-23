@@ -166,6 +166,13 @@ pub fn select(devices: &[DeviceInfo], query: &str) -> Selection {
     }
 }
 
+/// Whether `query` has a simulator UDID's shape (8-4-4-4-12 hex digits): it selects that device
+/// before any name (see [`select`]), so callers can key per-device state by it without a lookup.
+pub fn is_udid(query: &str) -> bool {
+    let groups: Vec<&str> = query.split('-').collect();
+    groups.len() == 5 && groups.iter().zip([8, 4, 4, 4, 12]).all(|(g, len)| g.len() == len && g.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 impl Selection {
     fn or_ambiguous(self) -> Self {
         if self == Self::None { Self::Ambiguous } else { self }
@@ -175,6 +182,22 @@ impl Selection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn udid_shapes() {
+        assert!(is_udid("6F1C3B2A-0D4E-4F5A-9B8C-7D6E5F4A3B2C"));
+        assert!(is_udid("6f1c3b2a-0d4e-4f5a-9b8c-7d6e5f4a3b2c"));
+        for not in [
+            "booted",
+            "iPhone 17 Pro",
+            "",
+            "6F1C3B2A-0D4E-4F5A-9B8C",
+            "6F1C3B2A-0D4E-4F5A-9B8C-7D6E5F4A3B2G",
+            "6F1C3B2A0D4E4F5A9B8C7D6E5F4A3B2C",
+        ] {
+            assert!(!is_udid(not), "{not}");
+        }
+    }
 
     fn dev(udid: &str, name: &str, state: DeviceState) -> DeviceInfo {
         DeviceInfo {

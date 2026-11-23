@@ -206,6 +206,13 @@ pub(crate) fn dict_set(dict: &AnyObject, key: &str, value: &AnyObject) {
     let _: () = unsafe { msg_send![dict, setObject: value, forKey: &*nsstring(key)] };
 }
 
+/// The string under `key` in an `NSDictionary`; `None` when missing or not a string.
+pub(crate) fn dict_string(dict: &AnyObject, key: &str) -> Option<String> {
+    // SAFETY: `objectForKey:` takes a key object and returns nil or the value.
+    let value: Option<Obj> = unsafe { msg_send![dict, objectForKey: &*nsstring(key)] };
+    value.and_then(|v| v.downcast::<NSString>().ok()).map(|s| s.to_string())
+}
+
 /// A dictionary of string pairs.
 pub(crate) fn string_dictionary(pairs: &[(String, String)]) -> Obj {
     let dict = mutable_dictionary();
