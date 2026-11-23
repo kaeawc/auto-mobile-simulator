@@ -147,7 +147,8 @@ scripts/automobile-harness-android.sh emulator-5554
   demo, android, foldable, watch, tv, empty. On Linux it renders with Mesa's lavapipe.
 - `scripts/` — `parity.sh`, `automobile-harness.sh`, `pf-shape.sh` (pf/dummynet, needs sudo);
   Android: `sign-run.sh` (the cargo runner: hypervisor entitlement), `sdk-shim.sh` (SDK overlay
-  whose `emulator` is emu-rs), `automobile-harness-android.sh`, `android-bench.sh`.
+  whose `emulator` is emu-rs), `automobile-harness-android.sh`, `android-bench.sh`, `inspect-image.py` (what a system image
+  expects of the board, unpacked without booting: fstab, modules, input names, vendor HALs).
 - `docs/research/` — `network-shaping.md`, `audio-camera.md`; `docs/automobile-tool-matrix.md`.
   `docs/architecture.md` (layers, process model, shared logic, the conflict decisions),
   `docs/form-factors.md` (support matrix, profiles, inference, launching each kind, known gaps).

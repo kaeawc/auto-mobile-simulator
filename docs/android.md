@@ -195,8 +195,17 @@ images included; emu-rs leaves phones without it until it has been tried on one.
 **Needs a real boot.** Whether the car image reaches the launcher with these two pieces; that
 the VHAL connects and `car get gear` answers; that the kernel's `virtio_snd` driver binds on
 virtio-mmio and `caremu` opens card 0 (its mixer has no controls, which its init loop
-tolerates); that the SDK's car images ship `build.prop` in the image directory; and the rest of
-the car stack (EVS, cluster display, rotary controller), which emu-rs doesn't model.
+tolerates); and the rest of the car stack (EVS, cluster display, rotary controller), which
+emu-rs doesn't model.
+
+**Checked offline** against `system-images;android-34-ext9;android-automotive;arm64-v8a` r5
+(`scripts/inspect-image.py`, `emu -avd Car34 -dry-run`): the image ships `build.prop` beside it,
+so emu-rs recognizes it as a car and adds `qemud:car` and the sound card; its first-stage fstab
+and modules match the board; its VHAL (`android.hardware.automotive.vehicle@V1-emulator-service`)
+opens `pipe:qemud:car`, over vsock first; and every property and gear/ignition value in
+`sim_core::vhal` exists in the image's own `vehicle-types-meta.json` (a trimmed copy is a test
+fixture). Its vendor also runs EVS, CAN, broadcast radio and remote-access HALs, none of which
+emu-rs serves.
 
 ## Performance notes
 
