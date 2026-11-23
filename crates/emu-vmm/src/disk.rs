@@ -102,8 +102,7 @@ impl Disk {
     pub fn persistent(path: &Path) -> io::Result<Disk> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let size = file.metadata()?.len();
-        let block =
-            rustix::fs::fstatfs(&file).ok().map(|s| u64::from(s.f_bsize)).filter(|b| b.is_power_of_two() && *b >= 512).unwrap_or(CHUNK);
+        let block = rustix::fs::fstatvfs(&file).ok().map(|s| s.f_frsize).filter(|b| b.is_power_of_two() && *b >= 512).unwrap_or(CHUNK);
         Ok(Disk { file, size, block, punch: true, overlay: None, fsync: false })
     }
 
@@ -208,7 +207,7 @@ impl Disk {
         match emu_hvf::host::punch_hole(&self.file, first, last - first) {
             Ok(()) => Ok(()),
             Err(e) => {
-                if matches!(e.raw_os_error(), Some(libc::ENOTSUP | libc::EOPNOTSUPP)) {
+                if [Some(libc::ENOTSUP), Some(libc::EOPNOTSUPP)].contains(&e.raw_os_error()) {
                     self.punch = false;
                 }
                 write_zeroes(&self.file, first, last)

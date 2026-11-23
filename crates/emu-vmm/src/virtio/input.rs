@@ -184,6 +184,18 @@ impl Input {
         (Input { kind, name: name.to_string(), select: (0, 0), tx, rx: Some(rx), worker: None }, handle)
     }
 
+    /// Takes the event batches queued while no guest driver has the device (before activation),
+    /// as the host sent them: what an input would deliver, for tests and diagnostics.
+    pub fn take_queued(&self) -> Vec<Vec<InputEvent>> {
+        let Some(rx) = &self.rx else { return Vec::new() };
+        rx.try_iter()
+            .filter_map(|m| match m {
+                Msg::Events(e) => Some(e),
+                Msg::Kick | Msg::Stop => None,
+            })
+            .collect()
+    }
+
     fn stop_worker(&mut self) {
         if let Some(h) = self.worker.take() {
             let _ = self.tx.send(Msg::Stop);
@@ -387,6 +399,16 @@ impl Worker {
             self.irq.raise(INT_USED_RING);
         }
     }
+}
+
+/// Ways for the host to inject input into the running guest.
+#[derive(Clone)]
+pub struct Inputs {
+    pub touch: InputHandle,
+    pub keyboard: InputHandle,
+    pub rotary: InputHandle,
+    /// The dual-mode mouse (Android XR images only).
+    pub mouse: Option<InputHandle>,
 }
 
 #[cfg(test)]

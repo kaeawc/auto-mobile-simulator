@@ -1,4 +1,5 @@
 //! Interrupt lines from devices to the interrupt controller.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::sync::Arc;
 
 /// A wire into the interrupt controller. `set(true)` asserts it (level) or produces an edge.
@@ -7,11 +8,13 @@ pub trait IrqLine: Send + Sync {
 }
 
 /// An SPI on the in-kernel GIC.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub struct GicSpi {
     intid: u32,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl GicSpi {
     /// `wake` runs after asserting, to rouse vCPUs parked in a host-side WFI wait.
     pub fn new(intid: u32, wake: Arc<dyn Fn() + Send + Sync>) -> GicSpi {

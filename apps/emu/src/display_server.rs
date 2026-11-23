@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use emu_vmm::virtio::gpu::FrameStore;
+use emu_vmm::display::FrameStore;
 use sim_core::gesture::Phase;
 use sim_core::pixels::{downscale, downscale_factor};
 use sim_core::stream::{FrameHeader, Input};

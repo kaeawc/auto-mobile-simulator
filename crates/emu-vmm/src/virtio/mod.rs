@@ -1,6 +1,7 @@
 //! virtio devices over the MMIO transport.
 pub mod blk;
 pub mod console;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod gpu;
 pub mod input;
 pub mod mmio;

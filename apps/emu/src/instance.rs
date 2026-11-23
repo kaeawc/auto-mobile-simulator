@@ -27,7 +27,7 @@ pub struct Instance {
     /// Console port (the `emulator-<port>` serial); adb listens on port + 1.
     pub console_port: u16,
     /// Latest guest frame, when host rendering is on.
-    pub display: Option<std::sync::Arc<emu_vmm::virtio::gpu::FrameStore>>,
+    pub display: Option<std::sync::Arc<emu_vmm::display::FrameStore>>,
     gpu_lib64: Option<PathBuf>,
     /// Input handles of the current run, for the console and desktop.
     pub inputs: std::sync::Arc<std::sync::Mutex<Option<emu_vmm::Inputs>>>,
@@ -124,7 +124,7 @@ impl Instance {
             emu_gfxstream::link_beside_exe(lib64);
             emu_gfxstream::configure_environment(emulator_dir, icd);
         }
-        let display = gpu_lib64.as_ref().map(|_| std::sync::Arc::new(emu_vmm::virtio::gpu::FrameStore::default()));
+        let display = gpu_lib64.as_ref().map(|_| std::sync::Arc::new(emu_vmm::display::FrameStore::default()));
         Ok(Instance {
             avd: avd.clone(),
             dir,

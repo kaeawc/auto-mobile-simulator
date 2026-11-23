@@ -1,6 +1,9 @@
 //! The emulator console: a line-oriented TCP control channel on the console port, as used by
 //! `adb emu <cmd>` and test harnesses. Same framing and replies as the stock console
 //! (`OK` / `KO: <reason>`, CRLF line endings, token auth from `~/.emulator_console_auth_token`).
+//!
+//! It builds everywhere so its commands are tested on any host; only Apple silicon serves it.
+#![cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -14,7 +17,7 @@ use sim_core::pixels::{PixelFormat, to_rgba};
 pub struct ConsoleInfo {
     pub avd_name: String,
     pub stop: Arc<AtomicBool>,
-    pub display: Option<Arc<emu_vmm::virtio::gpu::FrameStore>>,
+    pub display: Option<Arc<emu_vmm::display::FrameStore>>,
     pub inputs: Arc<std::sync::Mutex<Option<emu_vmm::Inputs>>>,
     pub sensors: Arc<emu_vmm::pipe::sensors::Sensors>,
     pub clipboard: Arc<emu_vmm::pipe::clipboard::Clipboard>,
@@ -151,7 +154,7 @@ fn screenshot(info: &ConsoleInfo, path: Option<&str>) -> String {
     }
     // The renderer's own capture of the last posted frame; the post-callback copy is the fallback.
     let (width, height) = (f.width, f.height);
-    let rgba = emu_vmm::renderer_screenshot(width, height).or_else(|| {
+    let rgba = renderer_capture(width, height).or_else(|| {
         let format = PixelFormat::from_virtio_gpu(f.format).unwrap_or(PixelFormat::Rgba);
         to_rgba(&f.pixels, f.width as usize, f.height as usize, f.stride as usize, format)
     });
@@ -160,6 +163,17 @@ fn screenshot(info: &ConsoleInfo, path: Option<&str>) -> String {
     match encode_png(&Frame { width, height, rgba }).and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string())) {
         Ok(()) => format!("{} ({}x{}, frame {})\r\nOK", path.display(), width, height, f.frames),
         Err(e) => format!("KO: {e}"),
+    }
+}
+
+/// The renderer's capture of its last posted frame (Apple silicon only; elsewhere there's none).
+fn renderer_capture(width: u32, height: u32) -> Option<Vec<u8>> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    return emu_vmm::renderer_screenshot(width, height);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (width, height);
+        None
     }
 }
 
@@ -463,94 +477,103 @@ fn session(stream: TcpStream, info: &ConsoleInfo) -> std::io::Result<()> {
             // prints everything it reads, so an extra OK leaks into answers like `avd name`.
             ("quit" | "exit", _) => return Ok(()),
             (_, false) => "KO: unknown command, try 'help'".to_string(),
-            // Lists what emu-rs implements, in stock's format (tools probe it, e.g. for "finger").
-            ("help" | "h" | "?", true) => {
-                let mut s = String::from("Android console commands:\r\n\r\n");
-                for (name, what) in HELP {
-                    s.push_str(&format!("    {name:<16} {what}\r\n"));
-                }
-                s.push_str("\r\ntry 'help <command>' for command-specific help\r\nOK");
-                s
-            }
-            ("ping", true) => "I am alive!\r\nOK".to_string(),
-            ("screenshot", true) => screenshot(info, words.get(1).copied()),
-            ("event", true) => event(info, &words[1..]),
-            ("sensor", true) => sensor(info, &words[1..]),
-            ("geo", true) => geo(info, &words[1..]),
-            ("power", true) => power(info, &words[1..]),
-            ("sms", true) => sms(info, &words[1..]),
-            ("gsm", true) => gsm(info, &words[1..]),
-            ("xr", true) => xr(info, &words[1..]),
-            ("car", true) => car(info, &words[1..]),
-            // Stock: rotate the device 90° clockwise. Gravity in device coordinates turns the
-            // other way, and the guest's auto-rotation follows the accelerometer.
-            ("rotate", true) => match info.sensors.get("acceleration").as_deref() {
-                Some(&[x, y, z]) => {
-                    info.sensors.set("acceleration", vec![-y + 0.0, x + 0.0, z]);
-                    info.sensors.set("acceleration-uncalibrated", vec![-y + 0.0, x + 0.0, z]);
-                    "OK".into()
-                }
-                _ => "KO: no accelerometer".into(),
-            },
-            ("finger", true) => match (words.get(1).copied(), words.get(2).and_then(|v| v.parse::<u32>().ok())) {
-                (Some("touch"), Some(id)) if id > 0 => {
-                    info.fingerprint.touch(id);
-                    "OK".into()
-                }
-                (Some("remove"), _) => {
-                    info.fingerprint.remove();
-                    "OK".into()
-                }
-                _ => "KO: usage: finger touch <fingerid> | finger remove".into(),
-            },
-            // emu-rs extension: `clipboard get` / `clipboard set <text>`.
-            ("clipboard", true) => match words.get(1).copied() {
-                Some("get") => format!("{}\r\nOK", String::from_utf8_lossy(&info.clipboard.get())),
-                Some("set") => {
-                    info.clipboard.set(words[2..].join(" ").as_bytes());
-                    "OK".into()
-                }
-                _ => "KO: usage: clipboard get|set <text>".into(),
-            },
-            ("touch", true) => {
-                // emu-rs extension: `touch <x> <y> [down|up|tap]` in device pixels.
-                let g = info.inputs.lock().unwrap_or_else(|e| e.into_inner());
-                match (g.as_ref(), words.get(1).and_then(|v| v.parse().ok()), words.get(2).and_then(|v| v.parse().ok())) {
-                    (Some(i), Some(x), Some(y)) => {
-                        match words.get(3).copied().unwrap_or("tap") {
-                            "down" => i.touch.touch(x, y, true),
-                            "up" => i.touch.touch(x, y, false),
-                            _ => {
-                                i.touch.touch(x, y, true);
-                                i.touch.touch(x, y, false);
-                            }
-                        }
-                        "OK".to_string()
-                    }
-                    _ => "KO: usage: touch <x> <y> [down|up|tap]".to_string(),
-                }
-            }
-            ("frames", true) => match &info.display {
-                Some(d) => format!("{}\r\nOK", d.frames()),
-                None => "KO: no display".to_string(),
-            },
             ("kill", true) => {
                 out.write_all(b"OK: killing emulator, bye bye\r\n")?;
                 info.stop.store(true, Ordering::SeqCst);
                 return Ok(());
             }
-            ("avd", true) => match words.get(1).copied() {
-                Some("name") => format!("{}\r\nOK", info.avd_name),
-                Some("status") => "virtual device is running\r\nOK".to_string(),
-                Some("id") => format!("{}\r\nOK", info.avd_name),
-                _ => "KO: unsupported 'avd' subcommand in emu-rs".to_string(),
-            },
-            (other, true) => format!("KO: '{other}' is not implemented in emu-rs yet"),
+            (_, true) => command(info, &words),
         };
         out.write_all(reply.as_bytes())?;
         out.write_all(b"\r\n")?;
     }
     Ok(())
+}
+
+/// One authenticated command line (split into words), answered as stock does: the reply's lines
+/// ending in `OK`, or `KO: <reason>`. `auth`, `quit` and `kill` belong to the session.
+fn command(info: &ConsoleInfo, words: &[&str]) -> String {
+    let Some(&cmd) = words.first() else { return String::new() };
+    match cmd {
+        // Lists what emu-rs implements, in stock's format (tools probe it, e.g. for "finger").
+        "help" | "h" | "?" => {
+            let mut s = String::from("Android console commands:\r\n\r\n");
+            for (name, what) in HELP {
+                s.push_str(&format!("    {name:<16} {what}\r\n"));
+            }
+            s.push_str("\r\ntry 'help <command>' for command-specific help\r\nOK");
+            s
+        }
+        "ping" => "I am alive!\r\nOK".to_string(),
+        "screenshot" => screenshot(info, words.get(1).copied()),
+        "event" => event(info, &words[1..]),
+        "sensor" => sensor(info, &words[1..]),
+        "geo" => geo(info, &words[1..]),
+        "power" => power(info, &words[1..]),
+        "sms" => sms(info, &words[1..]),
+        "gsm" => gsm(info, &words[1..]),
+        "xr" => xr(info, &words[1..]),
+        "car" => car(info, &words[1..]),
+        // Stock: rotate the device 90° clockwise. Gravity in device coordinates turns the
+        // other way, and the guest's auto-rotation follows the accelerometer.
+        "rotate" => match info.sensors.get("acceleration").as_deref() {
+            Some(&[x, y, z]) => {
+                info.sensors.set("acceleration", vec![-y + 0.0, x + 0.0, z]);
+                info.sensors.set("acceleration-uncalibrated", vec![-y + 0.0, x + 0.0, z]);
+                "OK".into()
+            }
+            _ => "KO: no accelerometer".into(),
+        },
+        "finger" => match (words.get(1).copied(), words.get(2).and_then(|v| v.parse::<u32>().ok())) {
+            (Some("touch"), Some(id)) if id > 0 => {
+                info.fingerprint.touch(id);
+                "OK".into()
+            }
+            (Some("remove"), _) => {
+                info.fingerprint.remove();
+                "OK".into()
+            }
+            _ => "KO: usage: finger touch <fingerid> | finger remove".into(),
+        },
+        // emu-rs extension: `clipboard get` / `clipboard set <text>`.
+        "clipboard" => match words.get(1).copied() {
+            Some("get") => format!("{}\r\nOK", String::from_utf8_lossy(&info.clipboard.get())),
+            Some("set") => {
+                info.clipboard.set(words[2..].join(" ").as_bytes());
+                "OK".into()
+            }
+            _ => "KO: usage: clipboard get|set <text>".into(),
+        },
+        "touch" => {
+            // emu-rs extension: `touch <x> <y> [down|up|tap]` in device pixels.
+            let g = info.inputs.lock().unwrap_or_else(|e| e.into_inner());
+            match (g.as_ref(), words.get(1).and_then(|v| v.parse().ok()), words.get(2).and_then(|v| v.parse().ok())) {
+                (Some(i), Some(x), Some(y)) => {
+                    match words.get(3).copied().unwrap_or("tap") {
+                        "down" => i.touch.touch(x, y, true),
+                        "up" => i.touch.touch(x, y, false),
+                        _ => {
+                            i.touch.touch(x, y, true);
+                            i.touch.touch(x, y, false);
+                        }
+                    }
+                    "OK".to_string()
+                }
+                _ => "KO: usage: touch <x> <y> [down|up|tap]".to_string(),
+            }
+        }
+        "frames" => match &info.display {
+            Some(d) => format!("{}\r\nOK", d.frames()),
+            None => "KO: no display".to_string(),
+        },
+        "avd" => match words.get(1).copied() {
+            Some("name") => format!("{}\r\nOK", info.avd_name),
+            Some("status") => "virtual device is running\r\nOK".to_string(),
+            Some("id") => format!("{}\r\nOK", info.avd_name),
+            _ => "KO: unsupported 'avd' subcommand in emu-rs".to_string(),
+        },
+        other => format!("KO: '{other}' is not implemented in emu-rs yet"),
+    }
 }
 
 /// `<discovery dir>/avd/running/pid_<pid>.ini`, which tools read to find running instances.
@@ -593,5 +616,253 @@ fn prune_stale(dir: &std::path::Path) {
 impl Drop for Advertisement {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Receiver, channel};
+    use std::time::Duration;
+
+    use emu_vmm::pipe::car::CarService;
+    use emu_vmm::pipe::xr::XrService;
+    use emu_vmm::pipe::{HostMsg, PipeCtx, PipeService, WorkerEvent};
+    use emu_vmm::virtio::input::{EV_KEY, EV_REL, Input, InputEvent, Inputs, Kind, REL_WHEEL};
+    use sim_core::form_factor::FormFactor;
+    use sim_core::vhal::{GEAR_SELECTION, Message, MsgType, PropValue};
+
+    use super::*;
+
+    /// A console as a device of `form_factor` gets it: its sensors, and the XR link or the
+    /// vehicle HAL when the image has one.
+    fn console(form_factor: FormFactor) -> ConsoleInfo {
+        let mask = sim_core::goldfish::sensor_mask(|_| None, form_factor, Some(34));
+        ConsoleInfo {
+            avd_name: "Test_AVD".into(),
+            stop: Arc::default(),
+            display: None,
+            inputs: Arc::default(),
+            sensors: Arc::new(emu_vmm::pipe::sensors::Sensors::new(mask)),
+            clipboard: Arc::default(),
+            fingerprint: Arc::default(),
+            gps: Arc::default(),
+            battery: Arc::default(),
+            telephony: Arc::default(),
+            xr: (form_factor == FormFactor::Vision).then(Arc::default),
+            car: (form_factor == FormFactor::Auto).then(Arc::default),
+        }
+    }
+
+    struct Devices {
+        touch: Input,
+        keyboard: Input,
+        rotary: Input,
+        mouse: Option<Input>,
+    }
+
+    /// Attaches input devices (720x1280 touch screen; the dual-mode mouse on request) that
+    /// no guest driver has taken, so the events a command sends stay queued for inspection.
+    fn attach_inputs(info: &ConsoleInfo, with_mouse: bool) -> Devices {
+        let (touch, th) = Input::new(Kind::Touch { width: 720, height: 1280 }, "touch");
+        let (keyboard, kh) = Input::new(Kind::Keyboard, "keyboard");
+        let (rotary, rh) = Input::new(Kind::Rotary, "rotary");
+        let (mouse, mh) = if with_mouse {
+            let (m, h) = Input::new(Kind::DualModeMouse, "mouse");
+            (Some(m), Some(h))
+        } else {
+            (None, None)
+        };
+        *info.inputs.lock().expect("inputs") = Some(Inputs { touch: th, keyboard: kh, rotary: rh, mouse: mh });
+        Devices { touch, keyboard, rotary, mouse }
+    }
+
+    fn run(info: &ConsoleInfo, line: &str) -> String {
+        command(info, &line.split_whitespace().collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn help_lists_every_command_dispatched() {
+        let info = console(FormFactor::Phone);
+        let help = run(&info, "help");
+        assert!(help.starts_with("Android console commands:\r\n") && help.ends_with("OK"), "{help}");
+        for (names, _) in HELP {
+            let name = names.split('|').next().expect("name");
+            assert!(help.contains(names), "{name} missing from help");
+            if !["kill", "quit"].contains(&name) {
+                assert!(!run(&info, name).contains("is not implemented"), "{name} is listed but not dispatched");
+            }
+        }
+        assert_eq!(run(&info, "ping"), "I am alive!\r\nOK");
+        assert_eq!(run(&info, "avd name"), "Test_AVD\r\nOK");
+        assert_eq!(run(&info, "network status"), "KO: 'network' is not implemented in emu-rs yet");
+    }
+
+    #[test]
+    fn rotate_turns_gravity_clockwise_and_back_after_four() {
+        let info = console(FormFactor::Phone);
+        assert_eq!(run(&info, "rotate"), "OK");
+        assert_eq!(run(&info, "sensor get acceleration"), "acceleration = -9.80665:0:0\r\nOK");
+        for _ in 0..3 {
+            assert_eq!(run(&info, "rotate"), "OK");
+        }
+        assert_eq!(run(&info, "sensor get acceleration"), "acceleration = 0:9.80665:0\r\nOK");
+    }
+
+    #[test]
+    fn foldables_advertise_and_take_the_hinge_angle() {
+        let fold = console(FormFactor::Foldable);
+        assert!(run(&fold, "sensor status").contains("hinge-angle0: enabled."));
+        assert_eq!(run(&fold, "sensor set hinge-angle0 90"), "OK");
+        assert_eq!(run(&fold, "sensor get hinge-angle0"), "hinge-angle0 = 90\r\nOK");
+        assert_eq!(run(&fold, "sensor set hinge-angle0 90:1"), "KO: bad sensor 'hinge-angle0' or value count");
+        assert!(!run(&console(FormFactor::Phone), "sensor status").contains("hinge"), "phones have no hinge");
+    }
+
+    #[test]
+    fn watches_get_the_heart_rate_and_rotary_wheel_events() {
+        let info = console(FormFactor::Watch);
+        assert!(run(&info, "sensor status").contains("heart-rate: enabled."));
+        let devices = attach_inputs(&info, false);
+        assert_eq!(run(&info, "event send EV_REL:REL_WHEEL:-1"), "OK");
+        assert_eq!(devices.rotary.take_queued(), vec![vec![InputEvent::new(EV_REL, REL_WHEEL, -1), InputEvent::syn()]]);
+        assert_eq!(run(&info, "event send EV_KEY:KEY_POWER:1 EV_KEY:KEY_POWER:0"), "OK");
+        let power = sim_core::goldfish::keycode("KEY_POWER").expect("power");
+        assert_eq!(
+            devices.keyboard.take_queued(),
+            vec![vec![InputEvent::new(EV_KEY, power, 1), InputEvent::syn()], vec![InputEvent::new(EV_KEY, power, 0), InputEvent::syn()]]
+        );
+        assert!(devices.touch.take_queued().is_empty());
+        assert_eq!(run(&info, "event send EV_KEY:KEY_NOPE:1"), "KO: unknown key 'KEY_NOPE'");
+        assert_eq!(run(&info, "event send EV_SYN"), "KO: bad event 'EV_SYN'");
+    }
+
+    #[test]
+    fn event_text_types_capitals_with_shift() {
+        let info = console(FormFactor::Tv);
+        let devices = attach_inputs(&info, false);
+        assert_eq!(run(&info, "event text Hi"), "OK");
+        let keys: Vec<(u16, i32)> =
+            devices.keyboard.take_queued().concat().into_iter().filter(|e| e.typ == EV_KEY).map(|e| (e.code, e.value)).collect();
+        // Shift down, H, shift up, I (Linux keycodes 42, 35, 23).
+        assert_eq!(keys, [(42, 1), (35, 1), (35, 0), (42, 0), (23, 1), (23, 0)]);
+    }
+
+    #[test]
+    fn touch_lands_on_the_touch_screen() {
+        let info = console(FormFactor::Tablet);
+        assert_eq!(run(&info, "touch 10 20"), "KO: usage: touch <x> <y> [down|up|tap]", "no inputs before boot");
+        let devices = attach_inputs(&info, false);
+        assert_eq!(run(&info, "touch 10 20"), "OK");
+        let batches = devices.touch.take_queued();
+        assert_eq!(batches.len(), 2, "down then up");
+        assert!(batches[0].contains(&InputEvent::new(EV_KEY, emu_vmm::virtio::input::BTN_TOUCH, 1)));
+        assert!(batches[1].contains(&InputEvent::new(EV_KEY, emu_vmm::virtio::input::BTN_TOUCH, 0)));
+    }
+
+    /// Opens the guest end of a qemud pipe the way the guest's service does.
+    fn open_pipe(service: &dyn PipeService, name: &str) -> (Box<dyn emu_vmm::pipe::PipeHandler>, Receiver<WorkerEvent>) {
+        let (events, host) = channel();
+        (service.open(name, PipeCtx { conn: 7, events }).expect("open"), host)
+    }
+
+    fn next_frame(host: &Receiver<WorkerEvent>) -> Vec<u8> {
+        match host.recv_timeout(Duration::from_secs(5)) {
+            Ok(WorkerEvent::Host { conn: 7, msg: HostMsg::Data(d) }) => d,
+            _ => panic!("expected data for the pipe"),
+        }
+    }
+
+    #[test]
+    fn xr_requests_reach_the_guest_service() {
+        assert_eq!(run(&console(FormFactor::Phone), "xr recenter"), "KO: not an Android XR device");
+        let info = console(FormFactor::Vision);
+        assert_eq!(run(&info, "xr status"), "xr_service: not connected\r\nlast reply: none\r\nOK");
+        assert_eq!(run(&info, "xr recenter"), "KO: the guest's XR service isn't connected (still booting?)");
+        let xr = info.xr.clone().expect("xr");
+        let (_pipe, host) = open_pipe(&XrService { xr }, "qemud:xr_service");
+        assert_eq!(run(&info, "xr recenter"), "OK");
+        let frame = next_frame(&host);
+        let request = sim_core::xr::XrCommand::Recenter.request().expect("request");
+        assert_eq!(&frame[4..], &request[..], "qemud-framed EmulatorRequest");
+        assert_eq!(&frame[..4], format!("{:04x}", request.len()).as_bytes());
+        assert!(run(&info, "xr status").starts_with("xr_service: connected\r\n"));
+        assert!(run(&info, "xr fly").starts_with("KO: "));
+    }
+
+    #[test]
+    fn xr_pointer_drives_the_dual_mode_mouse() {
+        let info = console(FormFactor::Vision);
+        let _no_mouse = attach_inputs(&info, false);
+        assert_eq!(run(&info, "xr pointer 10 10"), "KO: no dual-mode mouse");
+        let devices = attach_inputs(&info, true);
+        assert_eq!(run(&info, "xr pointer 360 640 click"), "OK");
+        let (x, y) = (sim_core::xr::pointer_abs(360, 720), sim_core::xr::pointer_abs(640, 1280));
+        let mouse = devices.mouse.expect("mouse").take_queued();
+        let left = |down| InputEvent::new(EV_KEY, emu_vmm::virtio::input::BTN_LEFT, down);
+        assert_eq!(mouse.len(), 2);
+        assert!(mouse[0].contains(&left(1)) && mouse[1].contains(&left(0)));
+        assert!(mouse[0].contains(&InputEvent::new(emu_vmm::virtio::input::EV_ABS, emu_vmm::virtio::input::ABS_X, x)));
+        assert!(mouse[0].contains(&InputEvent::new(emu_vmm::virtio::input::EV_ABS, emu_vmm::virtio::input::ABS_Y, y)));
+    }
+
+    /// Answers the next vehicle HAL command the console sends, as the guest's VHAL does.
+    fn answer_vhal(pipe: &Mutex<Box<dyn emu_vmm::pipe::PipeHandler>>, host: &Receiver<WorkerEvent>, reply: impl Fn(&Message) -> Message) {
+        let frame = next_frame(host);
+        let sent = Message::decode(&frame[4..]).expect("decode");
+        let payload = reply(&sent).encode();
+        let mut guest = format!("{:04x}", payload.len()).into_bytes();
+        guest.extend_from_slice(&payload);
+        assert!(pipe.lock().expect("pipe").guest_data(&guest, &mut Vec::new()));
+    }
+
+    #[test]
+    fn car_sets_and_reads_vehicle_properties_through_the_guest_vhal() {
+        assert_eq!(run(&console(FormFactor::Phone), "car get gear"), "KO: not an Automotive image: there is no vehicle HAL");
+        let info = Arc::new(console(FormFactor::Auto));
+        assert!(run(&info, "car set gear drive").starts_with("KO: "), "no VHAL connected yet");
+        let car = info.car.clone().expect("car");
+        let (pipe, host) = open_pipe(&CarService { car }, "qemud:car");
+        let pipe = Mutex::new(pipe);
+
+        let console = info.clone();
+        let set = std::thread::spawn(move || run(&console, "car set gear drive"));
+        answer_vhal(&pipe, &host, |sent| {
+            assert!(sent.is(MsgType::SetPropertyCmd));
+            assert_eq!((sent.values[0].prop, &sent.values[0].int32_values[..]), (GEAR_SELECTION, &[8][..]));
+            Message { msg_type: MsgType::SetPropertyResp as i32, status: Some(0), ..Default::default() }
+        });
+        assert_eq!(set.join().expect("set"), "OK");
+
+        let console = info.clone();
+        let get = std::thread::spawn(move || run(&console, "car get gear"));
+        answer_vhal(&pipe, &host, |sent| {
+            assert!(sent.is(MsgType::GetPropertyCmd));
+            let value = PropValue { prop: GEAR_SELECTION, area_id: Some(0), int32_values: vec![8], ..Default::default() };
+            Message { msg_type: MsgType::GetPropertyResp as i32, status: Some(0), values: vec![value], ..Default::default() }
+        });
+        let reply = get.join().expect("get");
+        let reading = sim_core::vhal::Reading::parse(reply.lines().next().expect("line")).expect("reading");
+        assert_eq!((reading.id, reading.area_id, reading.status.as_str()), (GEAR_SELECTION, 0, "available"));
+        assert!(reply.ends_with("\r\nOK"), "{reply}");
+        assert!(run(&info, "car names").contains("GEAR_SELECTION 0x11400400\r\n"));
+        assert!(run(&info, "car set").starts_with("KO: "));
+    }
+
+    #[test]
+    fn phone_services_answer_in_stock_format() {
+        let info = console(FormFactor::Phone);
+        assert_eq!(run(&info, "geo fix -122.08 37.42 10"), "OK");
+        assert_eq!(run(&info, "geo fix 200 0"), "KO: bad geo fix arguments (longitude -180..180, latitude -90..90)");
+        assert_eq!(run(&info, "power capacity 42"), "OK");
+        assert_eq!(run(&info, "power ac off"), "OK");
+        let display = run(&info, "power display");
+        assert!(display.contains("AC: offline\r\n") && display.contains("capacity: 42\r\n"), "{display}");
+        assert_eq!(run(&info, "gsm voice roaming"), "OK");
+        assert!(run(&info, "gsm status").starts_with("gsm voice state: roaming\r\n"));
+        assert_eq!(run(&info, "finger touch 0"), "KO: usage: finger touch <fingerid> | finger remove");
+        assert_eq!(run(&info, "clipboard set hello there"), "OK");
+        assert_eq!(run(&info, "clipboard get"), "hello there\r\nOK");
+        assert_eq!(run(&info, "screenshot"), "KO: no display (started with -gpu off?)");
     }
 }
