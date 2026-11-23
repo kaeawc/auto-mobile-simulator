@@ -9,24 +9,16 @@ use objc2::{msg_send, sel};
 use objc2_foundation::NSError;
 use sim_core::geometry::Point;
 use sim_core::gesture::Phase;
-use sim_core::hid::Button;
+use sim_core::hid::{Button, Direction};
 
 use crate::error::{Error, Result};
 use crate::rt::{self, CGPoint, Library, Obj};
 
-/// Key or button direction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Direction {
-    Down,
-    Up,
-}
-
-impl Direction {
-    fn raw(self) -> u32 {
-        match self {
-            Self::Down => 1,
-            Self::Up => 2,
-        }
+/// The service's raw direction value.
+fn raw(direction: Direction) -> u32 {
+    match direction {
+        Direction::Down => 1,
+        Direction::Up => 2,
     }
 }
 
@@ -112,13 +104,14 @@ impl Hid {
 
     /// Presses or releases a hardware button.
     pub fn button(&self, button: Button, direction: Direction) -> Result<()> {
+        let source = button.apple_source().ok_or_else(|| Error::Invalid(format!("the {} button doesn't exist on iOS", button.as_str())))?;
         // SAFETY: plain integer arguments; returns a malloc'd message or null.
-        self.send(unsafe { (self.button)(button.source(), direction.raw(), TARGET_HARDWARE) })
+        self.send(unsafe { (self.button)(source, raw(direction), TARGET_HARDWARE) })
     }
 
     /// Presses or releases a keyboard key by HID usage.
     pub fn key(&self, usage: u32, direction: Direction) -> Result<()> {
         // SAFETY: plain integer arguments; returns a malloc'd message or null.
-        self.send(unsafe { (self.keyboard)(usage, direction.raw()) })
+        self.send(unsafe { (self.keyboard)(usage, raw(direction)) })
     }
 }

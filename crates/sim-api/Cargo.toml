@@ -1,6 +1,6 @@
 [package]
 name = "sim-api"
-description = "sim-rs unix socket API: a JSON-lines protocol over every device control and debug surface."
+description = "sim-rs unix socket API: a JSON-lines protocol over every device control and debug surface, for iOS and Android devices."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,10 +15,14 @@ base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sim-core.workspace = true
+sim-android.workspace = true
 sim-coresim.workspace = true
 sim-debug.workspace = true
 sim-netshape.workspace = true
 sim-audio.workspace = true
+
+[dev-dependencies]
+emu-avd.workspace = true
 
 [lints]
 workspace = true

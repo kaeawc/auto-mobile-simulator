@@ -1,0 +1,171 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!-- Trimmed from https://dl.google.com/android/repository/repository2-3.xml (ndk-like entry and emulator 37.2.13's archive made up) -->
+<sdk:sdk-repository xmlns:sdk="http://schemas.android.com/sdk/android/repo/repository2/03" xmlns:common="http://schemas.android.com/repository/android/common/02" xmlns:generic="http://schemas.android.com/repository/android/generic/02" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <license id="android-sdk-license" type="text">Terms and Conditions (trimmed)</license>
+  <channel id="channel-0">stable</channel>
+  <channel id="channel-1">beta</channel>
+  <channel id="channel-2">dev</channel>
+  <channel id="channel-3">canary</channel>
+  <remotePackage path="platform-tools">
+    <type-details xsi:type="generic:genericDetailsType"/>
+    <revision><major>38</major><minor>0</minor><micro>0</micro><preview>1</preview></revision>
+    <display-name>Android SDK Platform-Tools</display-name>
+    <channelRef ref="channel-2"/>
+    <archives>
+      <archive>
+        <complete>
+          <size>17000000</size>
+          <checksum type="sha1">5555555555555555555555555555555555555555</checksum>
+          <url>platform-tools_r38.0.0-rc1-darwin.zip</url>
+        </complete>
+        <host-os>macosx</host-os>
+      </archive>
+    </archives>
+  </remotePackage>
+  <remotePackage path="platform-tools">
+    <type-details xsi:type="generic:genericDetailsType"/>
+    <revision>
+      <major>37</major>
+      <minor>0</minor>
+      <micro>3</micro>
+    </revision>
+    <display-name>Android SDK Platform-Tools</display-name>
+    <uses-license ref="android-sdk-license"/>
+    <channelRef ref="channel-0"/>
+    <archives>
+      <archive>
+        <complete>
+          <size>9571024</size>
+          <checksum type="sha1">e1579b288a7ae4e9bc28dedec6a154d78b3c04ed</checksum>
+          <url>platform-tools_r37.0.3-linux.zip</url>
+        </complete>
+        <host-os>linux</host-os>
+      </archive>
+      <archive>
+        <complete>
+          <size>16597626</size>
+          <checksum type="sha1">D48920E2650321710B4D15D3ACD9E277D59CD55B</checksum>
+          <url>platform-tools_r37.0.3-darwin.zip</url>
+        </complete>
+        <host-os>macosx</host-os>
+      </archive>
+      <archive>
+        <complete>
+          <size>8188601</size>
+          <checksum type="sha1">7fea85bc18d0480bc81d3603952d666f49496e5a</checksum>
+          <url>platform-tools_r37.0.3-win.zip</url>
+        </complete>
+        <host-os>windows</host-os>
+      </archive>
+    </archives>
+  </remotePackage>
+  <remotePackage path="ndk;23.0.7421159">
+    <type-details xsi:type="generic:genericDetailsType"/>
+    <revision><major>23</major><minor>0</minor><micro>7421159</micro></revision>
+    <display-name>NDK (Side by side) 23.0.7421159</display-name>
+    <archives>
+      <archive>
+        <complete>
+          <size>694920487</size>
+          <checksum type="sha1">a8fedcf0dd3b3a340e68684a5a2308154a952039</checksum>
+          <url>android-ndk-r23-darwin-x86_64.zip</url>
+        </complete>
+        <host-os>macosx</host-os>
+        <host-arch>x64</host-arch>
+      </archive>
+      <archive>
+        <complete>
+          <size>694920400</size>
+          <checksum type="sha1">6666666666666666666666666666666666666666</checksum>
+          <url>https://example.invalid/android-ndk-r23-darwin-aarch64.zip</url>
+        </complete>
+        <host-os>macosx</host-os>
+        <host-arch>aarch64</host-arch>
+      </archive>
+    </archives>
+  </remotePackage>
+  <remotePackage path="emulator">
+    <type-details xsi:type="generic:genericDetailsType"/>
+    <revision><major>37</major><minor>4</minor><micro>1</micro></revision>
+    <display-name>Android Emulator</display-name>
+    <channelRef ref="channel-2"/>
+    <archives>
+      <archive>
+        <complete>
+          <size>424581828</size>
+          <checksum type="sha1">893994ff1590e8a53a6b9efad62c04714cde2dcf</checksum>
+          <url>emulator-darwin_aarch64-16916650.zip</url>
+        </complete>
+        <host-os>macosx</host-os>
+        <host-arch>aarch64</host-arch>
+      </archive>
+    </archives>
+  </remotePackage>
+  <remotePackage path="emulator">
+    <type-details xsi:type="generic:genericDetailsType"/>
+    <revision><major>37</major><minor>3</minor><micro>10</micro></revision>
+    <display-name>Android Emulator</display-name>
+    <uses-license ref="android-sdk-license"/>
+    <channelRef ref="channel-0"/>
+    <archives>
+      <archive>
+        <complete>
+          <size>350068887</size>
+          <checksum type="sha1">5f7314368fc6c05c937f6991bb4106214dc389e7</checksum>
+          <url>emulator-linux_x64-16970787.zip</url>
+        </complete>
+        <host-os>linux</host-os>
+        <host-arch>x64</host-arch>
+      </archive>
+      <archive>
+        <complete>
+          <size>487638528</size>
+          <checksum type="sha1">8845fc2dd60325425e3013dd0ed2c50e0beb68c0</checksum>
+          <url>emulator-darwin_x64-16970787.zip</url>
+        </complete>
+        <host-os>macosx</host-os>
+        <host-arch>x64</host-arch>
+      </archive>
+      <archive>
+        <complete>
+          <size>420629851</size>
+          <checksum type="sha1">3ec739595d44092e835f006d806dd380bc8d6dd7</checksum>
+          <url>emulator-darwin_aarch64-16970787.zip</url>
+        </complete>
+        <host-os>macosx</host-os>
+        <host-arch>aarch64</host-arch>
+      </archive>
+    </archives>
+  </remotePackage>
+  <remotePackage path="emulator">
+    <type-details xsi:type="generic:genericDetailsType"/>
+    <revision><major>37</major><minor>2</minor><micro>13</micro></revision>
+    <display-name>Android Emulator</display-name>
+    <channelRef ref="channel-0"/>
+    <archives>
+      <archive>
+        <complete>
+          <size>410000000</size>
+          <checksum type="sha1">8888888888888888888888888888888888888888</checksum>
+          <url>emulator-darwin_aarch64-16740729.zip</url>
+        </complete>
+        <host-os>macosx</host-os>
+        <host-arch>aarch64</host-arch>
+      </archive>
+    </archives>
+  </remotePackage>
+  <remotePackage path="x86-only">
+    <revision><major>1</major></revision>
+    <archives>
+      <archive>
+        <complete>
+          <size>10</size>
+          <checksum type="sha1">7777777777777777777777777777777777777777</checksum>
+          <url>x86-only-darwin-x86_64.zip</url>
+        </complete>
+        <host-os>macosx</host-os>
+        <host-arch>x64</host-arch>
+      </archive>
+    </archives>
+  </remotePackage>
+</sdk:sdk-repository>

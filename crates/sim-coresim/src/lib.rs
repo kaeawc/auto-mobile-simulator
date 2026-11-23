@@ -17,6 +17,7 @@ mod service;
 
 pub use display::{Display, Surface};
 pub use error::{Error, Result};
-pub use hid::{Direction, Hid};
+pub use hid::Hid;
 pub use service::{Appearance, Context, Device, ExecOutput, StatusBar, developer_dir};
 pub use sim_core::frame::Frame;
+pub use sim_core::hid::Direction;

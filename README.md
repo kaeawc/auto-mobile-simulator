@@ -20,9 +20,12 @@ headless by default, zero-copy display).
 cargo build
 alias sim-rs=target/debug/sim-rs
 
-sim-rs list [--booted] [--json]          # devices, grouped by runtime
+sim-rs list [--booted] [--json]          # devices, grouped by runtime, labelled [iPadOS · Tablet]
+sim-rs list --platform ios --form-factor watch
+sim-rs form-factors [--platform android] # which form factors each platform offers, and why not
 sim-rs runtimes | device-types           # what can be created
 sim-rs create "My Phone" "iPhone 17" "iOS 26.5"   # prints the UDID
+sim-rs create "Pad" "iPad Pro 11-inch (M4)" "iOS 26.5" --form-factor tablet  # checked against the type
 sim-rs boot <device>                     # waits until the device finishes booting
 sim-rs screenshot <device> out.png       # full-resolution PNG from the framebuffer
 sim-rs tap <device> 600 1300             # pixels from the top-left of the screen
