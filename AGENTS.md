@@ -134,7 +134,8 @@ scripts/automobile-harness-android.sh emulator-5554
   `tests/e2e_android.rs` against a running AVD when `SIM_RS_E2E_AVD` is.
 - `apps/emu` — the Android emulator binary, a drop-in for the SDK's `emulator`: `args.rs` (SDK
   flags), `instance.rs` (disks, bootconfig, boot props), `console.rs` (console server,
-  running-instance file; its commands build and test on any host), `display_server.rs` (frames and input on `display.sock`),
+  running-instance file; its commands build and test on any host), `display_server.rs` (frames
+  and input on `display.sock`),
   `provision.rs` (`-provision`, `-list-images`). Boots only on Apple silicon; elsewhere it lists,
   creates and provisions AVDs.
 - `desktop/` — Rune app, one window for both platforms: `device.rs` (the live iOS device facade; a
@@ -147,8 +148,9 @@ scripts/automobile-harness-android.sh emulator-5554
   demo, android, foldable, watch, tv, empty. On Linux it renders with Mesa's lavapipe.
 - `scripts/` — `parity.sh`, `automobile-harness.sh`, `pf-shape.sh` (pf/dummynet, needs sudo);
   Android: `sign-run.sh` (the cargo runner: hypervisor entitlement), `sdk-shim.sh` (SDK overlay
-  whose `emulator` is emu-rs), `automobile-harness-android.sh`, `android-bench.sh`, `inspect-image.py` (what a system image
-  expects of the board, unpacked without booting: fstab, modules, input names, vendor HALs).
+  whose `emulator` is emu-rs), `automobile-harness-android.sh`, `android-bench.sh`,
+  `inspect-image.py` (what a system image expects of the board, unpacked without booting: fstab,
+  modules, input names, vendor HALs).
 - `docs/research/` — `network-shaping.md`, `audio-camera.md`; `docs/automobile-tool-matrix.md`.
   `docs/architecture.md` (layers, process model, shared logic, the conflict decisions),
   `docs/form-factors.md` (support matrix, profiles, inference, launching each kind, known gaps).
