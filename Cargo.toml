@@ -84,6 +84,15 @@ opt-level = 1
 [profile.dev.package.emu]
 opt-level = 1
 
+# Tests don't run guests: build the VMM crates unoptimized there, which takes the incremental
+# test build after a sim-core change from ~17 s to ~10 s (opt-level 1 is for running `emu`).
+[profile.test.package.emu-vmm]
+opt-level = 0
+[profile.test.package.emu-hvf]
+opt-level = 0
+[profile.test.package.emu]
+opt-level = 0
+
 # PNG encoding of full-resolution framebuffers is the hot path of `screenshot` in debug builds.
 [profile.dev.package.png]
 opt-level = 3
