@@ -58,6 +58,16 @@ What a new device of each kind gets unless told otherwise. Real devices report t
 | CarPlay | 800×480 | @2x | rectangle | — | touch, head unit |
 
 The Android phone keeps emu-rs's deliberately small default: smaller screens boot markedly faster.
+New Wear, TV, Automotive and XR AVDs follow the SDK's own device definitions (`wearos_large_round`,
+`tv_1080p`, `automotive_1024p_landscape`, `xr_headset_device`, `ai_glasses_device`, from
+`sdklib/.../devices/*.xml` in `platform/tools/base`). They get the `config.ini` keys avdmanager
+writes for those devices: `hw.device.name`, the sensors (`hw.accelerometer`, `hw.gyroscope`,
+`hw.sensors.*`, with orientation following the gyroscope), `hw.mainKeys`, `hw.dPad`,
+`hw.trackBall`, `hw.gps`, `hw.battery`, TV's `hw.screen=no-touch` and the glasses'
+`hw.touchpad0`. The sensors decide what the guest's sensors HAL is offered: a TV has no motion
+sensors, and an Automotive head unit has only light (plus the uncalibrated variants, which default
+on as in stock). Automotive gets the definition's 3686 MB of RAM. `emu -create-avd` and
+`-provision -create-avd` shape AVDs from the image the same way `sim-rs create` does.
 The Android XR profiles are the SDK's own device definitions (`xr_headset_device`, 4 GiB;
 `ai_glasses_device`, 2 GiB; both landscape), and a new XR AVD gets their RAM and
 `hw.initialOrientation=landscape` too.
@@ -151,8 +161,8 @@ What is modelled and labelled but not (or not verifiably) working end to end:
 | --- | --- |
 | CarPlay | Implemented as above but never run: no Mac was available. Whether `simctl io enumerate` then labels the screen "CarPlay" (what auto-mobile's CarPlay observe looks for, auto-mobile #18729) is unconfirmed. Only touch: the knob, back, home and Siri head-unit inputs aren't sent (auto-mobile #19059 is finding out whether SimulatorKit takes them). The desktop doesn't show the CarPlay screen. |
 | Android Automotive | emu-rs serves the vehicle HAL channel (`qemud:car`, driven by `vehicle` / console `car`) and a silent virtio-snd card for the car audio HAL, but no car image has been booted on them yet; EVS, the cluster display and the rotary controller aren't modelled ([android.md](android.md#automotive)). |
-| Android TV | Not among the images emu-rs has booted so far. |
-| Android XR | Not booted on emu-rs yet. The images expect a sound card (stock enables `VirtioSndCard` for them); emu-rs gives Android XR images its silent virtio-snd card. The room renders in the guest through gfxstream (emu-rs already defaults to ANGLE), but stock's other XR feature flags (`XrModeUI`, `XrHandAndEyePointers`, `VirtioMouse`, `MultiDisplay`, `BluetoothEmulation`) have no emu-rs equivalent yet. The dual-mode mouse matches stock's device (name, ids, event bits, axes); how the guest maps it to its hand ray and gaze pointers, and whether head pose, options, hand and eye events over `xr_service` take effect, is unverified. auto-mobile's `xrHeadsetInput` (auto-mobile #19076) sends hand and eye events over stock's gRPC `streamInputEvent`, which emu-rs doesn't serve yet (its gRPC `EmulatorController` is on the roadmap); `xr hand`/`xr eye` put the same messages on the guest's pipe. `emu -create-avd` doesn't apply the XR profile (pass `-lcd 2560x2558@240 -memory 4096`); `sim-rs create` does. |
+| Android TV | Not among the images emu-rs has booted so far. Its AVDs say `hw.screen=no-touch` like stock's, but emu-rs still gives every guest a multi-touch device. |
+| Android XR | Not booted on emu-rs yet. The images expect a sound card (stock enables `VirtioSndCard` for them); emu-rs gives Android XR images its silent virtio-snd card. The room renders in the guest through gfxstream (emu-rs already defaults to ANGLE), but stock's other XR feature flags (`XrModeUI`, `XrHandAndEyePointers`, `VirtioMouse`, `MultiDisplay`, `BluetoothEmulation`) have no emu-rs equivalent yet. The dual-mode mouse matches stock's device (name, ids, event bits, axes); how the guest maps it to its hand ray and gaze pointers, and whether head pose, options, hand and eye events over `xr_service` take effect, is unverified. auto-mobile's `xrHeadsetInput` (auto-mobile #19076) sends hand and eye events over stock's gRPC `streamInputEvent`, which emu-rs doesn't serve yet (its gRPC `EmulatorController` is on the roadmap); `xr hand`/`xr eye` put the same messages on the guest's pipe. The display glasses' SDK device has a temple touchpad (`hw.touchpad0`, 1542×297), which new AVDs declare but emu-rs doesn't model yet. |
 | Apple Watch, Apple TV | The crown, gestures, Siri Remote buttons and touch surface use the messages Simulator.app sends (confirmed live by other projects on watchOS/tvOS 26.5 and 27), but not run by sim-rs. The crown's units per tick are a calibration. From Xcode 27 the guest can switch input to `dtuhidd` (once `com.apple.coredevice.dtuhidd.active` is set, e.g. by Device Hub), after which legacy HID buttons and keys are dropped; sim-rs doesn't detect that yet. |
 | Vision Pro | Gaze, pinch and the camera (look around, pan, orbit) go through Xcode's visionOS UI plugin in Simulator.app, whose messages aren't public; sim-rs sends plain touches, which no source confirms visionOS honours. auto-mobile can't script visionOS input either (auto-mobile #19055). |
 | iOS rotation | Runtimes that report device motion can ignore the orientation event (idb switches to a vendor-defined HID message through `dtuhidd` there); not handled. |

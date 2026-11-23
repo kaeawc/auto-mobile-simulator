@@ -5,6 +5,7 @@
 
 mod bootconfig;
 mod ini;
+pub mod sdk_device;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -315,6 +316,15 @@ impl NewAvd {
         }
     }
 
+    /// An AVD shaped like its system image's own kind, from the tag in `sysdir`
+    /// (`system-images/android-34/android-wear/arm64-v8a`): a round watch for Wear OS, a TV with a
+    /// D-pad, a headset for Android XR, a phone for mobile images.
+    pub fn for_image(name: &str, sysdir: &str) -> NewAvd {
+        let tag = sysdir.trim_matches('/').split('/').nth(2).unwrap_or_default().to_owned();
+        let profile = sim_core::form_factor::android_profile(|k| (k == "tag.id").then(|| tag.clone()));
+        NewAvd::for_profile(name, sysdir, &profile.kind.image_profile(&tag))
+    }
+
     /// An AVD shaped like `profile`: its screen, and the hardware the SDK's device profiles give
     /// its form factor.
     pub fn for_profile(name: &str, sysdir: &str, profile: &Profile) -> NewAvd {
@@ -323,6 +333,22 @@ impl NewAvd {
             spec.lcd = (profile.width, profile.height, dpi);
         }
         let kv = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        // The SDK device definition the form factor follows; its hardware keys go in as
+        // avdmanager writes them.
+        let device = match profile.kind.form_factor {
+            FormFactor::Watch => Some(sdk_device::WEAR_LARGE_ROUND),
+            FormFactor::Tv => Some(sdk_device::TV_1080P),
+            FormFactor::Auto => Some(sdk_device::AUTOMOTIVE_1024P_LANDSCAPE),
+            FormFactor::Vision if spec.lcd == ANDROID_GLASSES_SCREEN => Some(sdk_device::AI_GLASSES),
+            FormFactor::Vision => Some(sdk_device::XR_HEADSET),
+            FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable => None,
+        };
+        if let Some(device) = device {
+            spec.ram_mb = device.ram_mb;
+            spec.main_keys = device.hard_buttons;
+            spec.dpad = device.nav == sdk_device::Nav::Dpad;
+            spec.extra = device.config();
+        }
         match profile.kind.form_factor {
             // The hinge sensor the stock emulator's foldable definitions declare (one hinge,
             // 0-180°, three postures).
@@ -339,37 +365,19 @@ impl NewAvd {
                     ];
                 }
             }
-            // Wear OS: 512 MB (booted with stock's 512 MB of padding, see `Avd::ram_bytes`),
-            // hardware keys, no D-pad; avdmanager marks a round screen in boot.prop.
+            // Wear OS: 512 MB, booted with stock's 512 MB of padding (see `Avd::ram_bytes`);
+            // avdmanager marks a round screen in boot.prop.
             FormFactor::Watch => {
-                spec.ram_mb = 512;
-                spec.main_keys = true;
                 if profile.shape == Shape::Round {
                     spec.boot_props.push(kv("ro.emulator.circular", "true"));
                 }
             }
-            // Android TV (tv.xml): 2 GB (stock refuses less than 1 GB), hardware keys, a D-pad.
-            FormFactor::Tv => {
-                spec.ram_mb = 2048;
-                spec.main_keys = true;
-                spec.dpad = true;
-            }
-            // Automotive (device/generic/car/common/config.ini): 4 GB, on-screen navigation,
-            // and only the motion sensors.
-            FormFactor::Auto => {
-                spec.ram_mb = 4096;
-                spec.extra = ["light", "pressure", "humidity", "proximity", "magnetic_field", "orientation", "temperature"]
-                    .iter()
-                    .map(|s| kv(&format!("hw.sensors.{s}"), "no"))
-                    .collect();
-            }
-            FormFactor::Phone | FormFactor::Tablet | FormFactor::Vision => {}
-        }
-        // Android XR, as the SDK defines its devices: the headset has 4 GiB, the display glasses
-        // (`ai_glasses_device`) 2; both are landscape.
-        if profile.kind.form_factor == FormFactor::Vision {
-            spec.ram_mb = if spec.lcd == ANDROID_GLASSES_SCREEN { 2048 } else { 4096 };
-            spec.extra.push(("hw.initialOrientation".to_owned(), "landscape".to_owned()));
+            // Automotive images' own hardware defaults (device/generic/car/common/config.ini)
+            // also turn off the sensors the SDK definition doesn't mention.
+            FormFactor::Auto => spec.extra.extend([kv("hw.sensors.temperature", "no"), kv("hw.sensors.humidity", "no")]),
+            // Android XR: both SDK devices are landscape.
+            FormFactor::Vision => spec.extra.push(kv("hw.initialOrientation", "landscape")),
+            FormFactor::Phone | FormFactor::Tablet | FormFactor::Tv => {}
         }
         spec
     }
@@ -414,8 +422,11 @@ impl Env {
             data = spec.data_gb,
         );
         let lines = |kv: &[(String, String)]| kv.iter().map(|(k, v)| format!("{k}={v}\n")).collect::<String>();
+        // `extra` keys replace the defaults above rather than repeat them.
+        let base: String =
+            config.lines().filter(|l| !spec.extra.iter().any(|(k, _)| l.split('=').next() == Some(k))).map(|l| format!("{l}\n")).collect();
         let cfg = dir.join("config.ini");
-        std::fs::write(&cfg, config + &lines(&spec.extra)).map_err(|e| io(&cfg, e))?;
+        std::fs::write(&cfg, base + &lines(&spec.extra)).map_err(|e| io(&cfg, e))?;
         if !spec.boot_props.is_empty() {
             let boot = dir.join("boot.prop");
             std::fs::write(&boot, lines(&spec.boot_props)).map_err(|e| io(&boot, e))?;
@@ -644,6 +655,28 @@ mod tests {
     }
 
     #[test]
+    fn new_avds_take_their_image_form_factor() {
+        let shape = |sysdir: &str| {
+            let s = NewAvd::for_image("x", sysdir);
+            (s.lcd, s.ram_mb, s.main_keys, s.dpad)
+        };
+        assert_eq!(shape("system-images/android-36/google_apis/arm64-v8a"), ((720, 1280, 320), 2048, false, false));
+        assert_eq!(shape("system-images/android-34/android-wear/arm64-v8a/"), ((454, 454, 320), 512, true, false));
+        assert_eq!(shape("system-images/android-34/android-tv/arm64-v8a"), ((1920, 1080, 320), 2048, true, true));
+        assert_eq!(shape("system-images/android-34-ext9/android-automotive/arm64-v8a"), ((1024, 768, 160), 3686, false, false));
+        assert_eq!(shape("system-images/android-34/google-xr/arm64-v8a"), ((2560, 2558, 240), 4096, false, false));
+        assert_eq!(shape("system-images/android-36/ai-glasses/arm64-v8a"), ((450, 450, 160), 2048, false, false));
+        let wear = NewAvd::for_image("w", "system-images/android-34/android-wear/arm64-v8a");
+        assert_eq!(wear.boot_props, [("ro.emulator.circular".to_owned(), "true".to_owned())]);
+        let get = |spec: &NewAvd, key: &str| spec.extra.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+        let headset = NewAvd::for_image("h", "system-images/android-34/google-xr/arm64-v8a");
+        assert_eq!(get(&headset, "hw.trackBall").as_deref(), Some("yes"), "xr_headset_device navigates by trackball");
+        let glasses = NewAvd::for_image("g", "system-images/android-36/ai-glasses/arm64-v8a");
+        assert_eq!(get(&glasses, "hw.device.name").as_deref(), Some("ai_glasses_device"));
+        assert_eq!((get(&glasses, "hw.touchpad0").as_deref(), get(&glasses, "hw.gps").as_deref()), (Some("yes"), Some("no")));
+    }
+
+    #[test]
     fn properties_parse_in_order() {
         let text = "# avdmanager\nro.emulator.circular = true\n\n  qemu.x=a=b\nnot a property\n=v\n";
         let expect = [("ro.emulator.circular", "true"), ("qemu.x", "a=b")].map(|(k, v)| (k.to_string(), v.to_string()));
@@ -691,15 +724,30 @@ mod tests {
         let props: Vec<String> = watch.qemu_props().iter().map(|(k, v)| format!("{k}={v}")).collect();
         assert_eq!(props, ["ro.emulator.circular=true", "qemu.sf.lcd_density=320", "qemu.hw.mainkeys=1"]);
         assert_eq!(watch.sensor_mask(), phone_mask | (1 << 14) | (1 << 16));
+        assert_eq!(watch.get("hw.device.name"), Some("wearos_large_round"));
 
+        // TV (the SDK's tv_1080p): no touch screen, light and GPS only, mains power.
         let tv = create("tv", FormFactor::Tv, &image("google-tv", 34));
         assert_eq!(hw(&tv), "yes yes yes no");
         assert_eq!((tv.profile().kind.form_factor, tv.ram_bytes(), tv.circular()), (FormFactor::Tv, 2 << 30, false));
+        assert_eq!([tv.get("hw.device.name"), tv.get("hw.screen"), tv.get("hw.battery")], [Some("tv_1080p"), Some("no-touch"), Some("no")]);
+        let sensors = |avd: &Avd| {
+            let mask = avd.sensor_mask();
+            sim_core::goldfish::SENSORS.iter().enumerate().filter(|(h, _)| mask & (1 << h) != 0).map(|(_, n)| *n).collect::<Vec<_>>()
+        };
+        let calibrated = |avd: &Avd| sensors(avd).into_iter().filter(|n| !n.ends_with("-uncalibrated")).collect::<Vec<_>>();
+        assert_eq!(calibrated(&tv), ["temperature", "light", "humidity"], "no motion sensors");
 
+        // Automotive (automotive_1024p_landscape): its 3686 MB, light and GPS, on-screen navigation.
         let car = create("car", FormFactor::Auto, &image("android-automotive", 34));
         assert_eq!(hw(&car), "no no yes no");
-        assert_eq!((car.profile().kind.form_factor, car.ram_bytes()), (FormFactor::Auto, 4 << 30));
-        assert_eq!(car.sensor_mask(), 0b11 | (1 << 9) | (1 << 10) | (1 << 17), "motion sensors only");
+        assert_eq!((car.profile().kind.form_factor, car.ram_bytes()), (FormFactor::Auto, 3686 << 20));
+        assert_eq!(calibrated(&car), ["light"]);
+        assert_eq!(car.get("hw.gps"), Some("yes"));
+
+        // Each key once: the device's values replace the phone defaults.
+        let config = std::fs::read_to_string(car.dir.join("config.ini")).expect("config");
+        assert_eq!(config.lines().filter(|l| l.starts_with("hw.mainKeys=")).count(), 1, "{config}");
 
         let fold = create("fold", FormFactor::Foldable, &image("google_apis", 36));
         assert_eq!(fold.sensor_mask(), phone_mask | (1 << 11), "the hinge reaches the HAL");

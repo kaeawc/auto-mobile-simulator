@@ -143,13 +143,7 @@ impl Sdk {
     pub fn new(root: impl Into<PathBuf>) -> Result<Sdk> {
         let root = root.into();
         std::fs::create_dir_all(&root).map_err(io(&root))?;
-        Ok(Sdk {
-            root,
-            manifest_max_age: Duration::from_secs(24 * 3600),
-            quiet: false,
-            curl: host_tool("curl"),
-            unzip: host_tool("unzip"),
-        })
+        Ok(Sdk { root, manifest_max_age: Duration::from_secs(24 * 3600), quiet: false, curl: host_tool("curl"), unzip: host_tool("unzip") })
     }
 
     pub fn root(&self) -> &Path {

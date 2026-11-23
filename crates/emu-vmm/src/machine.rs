@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use emu_hvf::{GuestRam, Vm};
 
 use crate::bus::Bus;
+use crate::disk::{DiskMode, DiskSpec};
 use crate::irq::{GicSpi, IrqLine};
 use crate::layout::*;
 pub use crate::vcpu::StopReason;
@@ -17,22 +18,6 @@ use crate::virtio::Interrupt;
 use crate::virtio::input::Inputs;
 use crate::virtio::mmio::MmioTransport;
 use crate::{board, boot, devices, disk, pipe, telephony, virtio};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DiskMode {
-    /// Guest writes go to the file.
-    Persistent,
-    /// Guest writes are kept in memory and discarded at exit.
-    Ephemeral,
-}
-
-#[derive(Clone, Debug)]
-pub struct DiskSpec {
-    pub slot: u32,
-    pub path: PathBuf,
-    pub mode: DiskMode,
-    pub serial: String,
-}
 
 /// Host GPU rendering through gfxstream.
 pub struct GpuSpec {

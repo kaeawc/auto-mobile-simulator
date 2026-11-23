@@ -10,13 +10,31 @@ use std::collections::btree_map::Entry;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use emu_hvf::GuestRam;
 
 const CHUNK: u64 = 4096;
 /// Largest buffer of zeroes written at once where a range can't be punched.
 const ZERO_BUF: u64 = 1 << 20;
+
+/// How a disk image is attached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskMode {
+    /// Guest writes go to the file.
+    Persistent,
+    /// Guest writes are kept in memory and discarded at exit.
+    Ephemeral,
+}
+
+/// A disk in a virtio-blk slot of the board.
+#[derive(Clone, Debug)]
+pub struct DiskSpec {
+    pub slot: u32,
+    pub path: PathBuf,
+    pub mode: DiskMode,
+    pub serial: String,
+}
 
 pub struct Disk {
     /// fsync on guest FLUSH (see `set_fsync`).
