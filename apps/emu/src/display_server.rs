@@ -53,20 +53,26 @@ pub fn start(
 }
 
 fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<emu_vmm::Inputs>>>, stop: Arc<AtomicBool>) {
-    let Ok(writer) = conn.try_clone() else { return };
     let max_width = Arc::new(AtomicU32::new(0));
     let done = Arc::new(AtomicBool::new(false));
-    {
-        let (display, max_width, done, stop) = (display.clone(), max_width.clone(), done.clone(), stop.clone());
-        let _ = std::thread::Builder::new().name("display-frames".into()).spawn(move || frames(writer, display, max_width, done, stop));
-    }
+    // Frames go only to clients that ask (`hello`): input-only connections (one per API touch)
+    // get no frame thread.
+    let mut writer = conn.try_clone().ok();
     let mut finger_down = false;
     for line in BufReader::new(conn).lines() {
         let Ok(line) = line else { break };
         let Some(input) = Input::parse(&line) else { continue };
         let g = inputs.lock().unwrap_or_else(|e| e.into_inner());
         match (input, g.as_ref()) {
-            (Input::Hello { max_width: mw }, _) => max_width.store(mw, Ordering::Relaxed),
+            (Input::Hello { max_width: mw }, _) => {
+                max_width.store(mw, Ordering::Relaxed);
+                if let Some(writer) = writer.take() {
+                    let (display, max_width, done, stop) = (display.clone(), max_width.clone(), done.clone(), stop.clone());
+                    let _ = std::thread::Builder::new()
+                        .name("display-frames".into())
+                        .spawn(move || frames(writer, display, max_width, done, stop));
+                }
+            }
             (Input::Touch { x, y, phase }, Some(emu_vmm::Inputs { touch: Some(touch), .. })) => match phase {
                 Phase::Down | Phase::Move => {
                     finger_down = true;
@@ -106,19 +112,25 @@ fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<e
 fn frames(mut out: UnixStream, display: Arc<FrameStore>, max_width: Arc<AtomicU32>, done: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
     let mut sent = 0u64;
     let mut last = Instant::now() - MIN_INTERVAL;
+    // One readback buffer for the stream's life.
+    let mut rgba = Vec::new();
     while !done.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(8));
+        // At most one frame per MIN_INTERVAL; then wait for a new one (woken by the frame, or
+        // every 100 ms to notice the client or the emulator going away).
+        let since = last.elapsed();
+        if since < MIN_INTERVAL {
+            std::thread::sleep(MIN_INTERVAL - since);
+        }
+        let n = display.wait_newer(sent, Duration::from_millis(100));
         let mw = max_width.load(Ordering::Relaxed);
-        let n = display.frames();
-        if mw == 0 || n == sent || last.elapsed() < MIN_INTERVAL {
+        if mw == 0 || n == sent {
             continue;
         }
         // Only the size: the pixels come from the renderer's own capture.
         let (width, height, _) = display.geometry();
-        if width == 0 {
+        if width == 0 || !emu_vmm::renderer_screenshot_into(width, height, &mut rgba) {
             continue;
         }
-        let Some(rgba) = emu_vmm::renderer_screenshot(width, height) else { continue };
         let (w, h, px) = downscale(width, height, &rgba, downscale_factor(width, mw));
         let hdr = FrameHeader { width: w, height: h, device_width: width, device_height: height, frame: n, len: px.len() as u32 };
         if out.write_all(&hdr.encode()).and_then(|()| out.write_all(&px)).is_err() {

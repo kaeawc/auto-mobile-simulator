@@ -36,6 +36,12 @@ pub fn fake_emulator(android: &Android, avd: &str) -> FakeEmulator {
                     break;
                 }
                 let reply = match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+                    // Authentication is the session's, not a command: answered, never recorded
+                    // (clients send it whenever `~/.emulator_console_auth_token` exists).
+                    ["auth", ..] => {
+                        let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
+                        continue;
+                    }
                     ["ping"] => "I am alive!\r\nOK".to_owned(),
                     ["frames"] => "3\r\nOK".to_owned(),
                     ["car", "get", ..] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\nOK".to_owned(),

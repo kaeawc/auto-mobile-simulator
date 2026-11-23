@@ -31,7 +31,7 @@ pub struct Flow {
 
 struct Shared {
     profile_path: std::path::PathBuf,
-    profile: Mutex<(Profile, Option<SystemTime>, Instant)>,
+    profile: Mutex<(Arc<Profile>, Option<SystemTime>, Instant)>,
     up_free_at: Mutex<Instant>,
     down_free_at: Mutex<Instant>,
     log: Mutex<VecDeque<Flow>>,
@@ -41,15 +41,16 @@ struct Shared {
 
 impl Shared {
     /// The current profile, re-read at most every 250 ms when the file changed.
-    fn profile(&self) -> Profile {
-        let Ok(mut guard) = self.profile.lock() else { return Profile::default() };
+    /// Shared, not copied: flows ask for every chunk they move.
+    fn profile(&self) -> Arc<Profile> {
+        let Ok(mut guard) = self.profile.lock() else { return Arc::default() };
         let (profile, mtime, checked) = &mut *guard;
         if checked.elapsed() >= Duration::from_millis(250) {
             *checked = Instant::now();
             let modified = std::fs::metadata(&self.profile_path).and_then(|m| m.modified()).ok();
             if modified != *mtime {
                 *mtime = modified;
-                *profile = std::fs::read_to_string(&self.profile_path).map(|t| Profile::from_conf(&t)).unwrap_or_default();
+                *profile = Arc::new(std::fs::read_to_string(&self.profile_path).map(|t| Profile::from_conf(&t)).unwrap_or_default());
             }
         }
         profile.clone()
@@ -57,10 +58,7 @@ impl Shared {
 
     /// Sleeps so this direction's traffic stays under the profile's rate (shared by all flows).
     fn pace(&self, bytes: usize, up: bool, host: &str) {
-        let kbps = {
-            let p = self.profile().for_host(host);
-            if up { p.up_kbps } else { p.down_kbps }
-        };
+        let kbps = self.profile().rate_kbps(host, up);
         if kbps == 0 || bytes == 0 {
             return;
         }
@@ -100,7 +98,7 @@ impl Proxy {
         let now = Instant::now();
         let shared = Arc::new(Shared {
             profile_path,
-            profile: Mutex::new((Profile::default(), None, now.checked_sub(Duration::from_secs(1)).unwrap_or(now))),
+            profile: Mutex::new((Arc::default(), None, now.checked_sub(Duration::from_secs(1)).unwrap_or(now))),
             up_free_at: Mutex::new(now),
             down_free_at: Mutex::new(now),
             log: Mutex::new(VecDeque::new()),
@@ -338,6 +336,9 @@ fn connect_and_tunnel(
 
 /// Pumps both directions until either side closes, shaping each chunk. Returns (up, down) bytes.
 fn tunnel(s: &Shared, client: TcpStream, upstream: TcpStream, host: &str) -> (u64, u64) {
+    // A relay mustn't add Nagle's delay to the small writes it forwards; shaping adds its own.
+    let _ = client.set_nodelay(true);
+    let _ = upstream.set_nodelay(true);
     // The last direction data moved, for request/response turnaround latency.
     let last_up = Arc::new(AtomicBool::new(true));
     let pump = |mut from: TcpStream, mut to: TcpStream, up: bool, last_up: Arc<AtomicBool>, s: &Shared| -> u64 {

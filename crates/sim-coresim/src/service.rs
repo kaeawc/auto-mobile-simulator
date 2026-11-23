@@ -19,16 +19,23 @@ use crate::rt::{self, CGSize, Library, Obj};
 
 const CORE_SIMULATOR: &str = "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/CoreSimulator";
 
-/// The active developer directory: `DEVELOPER_DIR`, else `xcode-select -p`.
+/// The active developer directory: `DEVELOPER_DIR`, else `xcode-select -p` (run once per process:
+/// every context, API connection, capture and boot thread asks).
 pub fn developer_dir() -> Result<String> {
     if let Ok(dir) = std::env::var("DEVELOPER_DIR")
         && !dir.is_empty()
     {
         return Ok(dir);
     }
-    let out = Command::new("/usr/bin/xcode-select").arg("-p").output().map_err(|e| Error::Unavailable(format!("xcode-select -p: {e}")))?;
-    let dir = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    if out.status.success() && !dir.is_empty() { Ok(dir) } else { Err(Error::Unavailable("xcode-select -p returned nothing".into())) }
+    static SELECTED: std::sync::OnceLock<std::result::Result<String, String>> = std::sync::OnceLock::new();
+    SELECTED
+        .get_or_init(|| {
+            let out = Command::new("/usr/bin/xcode-select").arg("-p").output().map_err(|e| format!("xcode-select -p: {e}"))?;
+            let dir = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if out.status.success() && !dir.is_empty() { Ok(dir) } else { Err("xcode-select -p returned nothing".to_owned()) }
+        })
+        .clone()
+        .map_err(Error::Unavailable)
 }
 
 /// Status bar overrides. Raw values follow the service's enums: data network 0 = hidden, 1 = Wi-Fi,
@@ -101,7 +108,10 @@ impl Context {
 
     /// Resolves a UDID, a name, or `booted`.
     pub fn device(&self, query: &str) -> Result<Device> {
-        let mut devices = self.devices()?;
+        // Unsorted, and each device's info read once (it's several Objective-C calls): `select`
+        // doesn't depend on order.
+        let list = rt::object_prop(&self.set, sel!(devices))?;
+        let mut devices: Vec<Device> = rt::array_items(&list).into_iter().map(|obj| Device { obj, kit: self.kit }).collect();
         let infos: Vec<DeviceInfo> = devices.iter().map(Device::info).collect();
         match select(&infos, query) {
             Selection::One(i) => Ok(devices.swap_remove(i)),

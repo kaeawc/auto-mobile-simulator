@@ -167,6 +167,7 @@ impl VirtioDevice for Gpu {
             scanout: None,
             pending: Vec::new(),
             frame: Vec::new(),
+            req: Vec::new(),
         };
         let handle = std::thread::Builder::new()
             .name("gpu".into())
@@ -269,6 +270,8 @@ struct Worker {
     scanout: Option<Scanout>,
     pending: Vec<Pending>,
     frame: Vec<u8>,
+    /// The current control request, reused across requests (command streams are KBs to MBs).
+    req: Vec<u8>,
 }
 
 impl Worker {
@@ -316,9 +319,12 @@ impl Worker {
                     break;
                 }
             };
-            let req = chain.read_all(&self.mem, 32 << 20).unwrap_or_default();
+            let mut req = std::mem::take(&mut self.req);
+            if chain.read_all_into(&self.mem, 32 << 20, &mut req).is_err() {
+                req.clear();
+            }
             let (hdr, resp) = match Hdr::parse(&req) {
-                Some(h) => (h, self.handle(&h, &req, &chain)),
+                Some(h) => (h, self.handle(&h, &mut req, &chain)),
                 None => (Hdr::default(), Hdr::default().reply(cmd::ERR_UNSPEC)),
             };
             let len = chain.write_all(&self.mem, &resp).unwrap_or(0);
@@ -359,6 +365,7 @@ impl Worker {
                     le32(&resp, 0)
                 );
             }
+            self.req = req;
             if hdr.flags & FLAG_FENCE != 0 {
                 let ringed = hdr.flags & FLAG_RING_IDX != 0;
                 let timeline = if ringed { (hdr.ctx_id, hdr.ring_idx) } else { (0, 0) };
@@ -417,7 +424,7 @@ impl Worker {
             .collect()
     }
 
-    fn handle(&mut self, h: &Hdr, req: &[u8], _chain: &Chain) -> Vec<u8> {
+    fn handle(&mut self, h: &Hdr, req: &mut [u8], _chain: &Chain) -> Vec<u8> {
         let r = &self.cfg.renderer;
         let ok = || h.reply(cmd::OK_NODATA);
         match h.typ {
@@ -557,11 +564,9 @@ impl Worker {
             }
             cmd::SUBMIT_3D => {
                 let size = le32(req, 24) as usize;
-                let mut buf = req.get(32..32 + size).map(<[u8]>::to_vec).unwrap_or_default();
-                if buf.len() != size {
-                    return h.reply(cmd::ERR_INVALID_PARAMETER);
-                }
-                match r.submit(h.ctx_id, &mut buf) {
+                // The command stream in place, not a copy of it.
+                let Some(buf) = req.get_mut(32..32 + size) else { return h.reply(cmd::ERR_INVALID_PARAMETER) };
+                match r.submit(h.ctx_id, buf) {
                     Ok(()) => ok(),
                     Err(_) => h.reply(cmd::ERR_UNSPEC),
                 }

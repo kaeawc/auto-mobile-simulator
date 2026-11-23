@@ -153,6 +153,7 @@ impl VirtioDevice for Vsock {
             next_id: 1,
             next_host_port: 50_000,
             control: VecDeque::new(),
+            pkt: Vec::new(),
         };
         let handle = std::thread::Builder::new()
             .name("vsock".into())
@@ -216,6 +217,8 @@ struct Worker {
     next_host_port: u32,
     /// Header-only packets (responses, resets, credit updates) waiting for rx buffers.
     control: VecDeque<Hdr>,
+    /// The guest packet being handled, reused across packets.
+    pkt: Vec<u8>,
 }
 
 impl Worker {
@@ -278,12 +281,15 @@ impl Worker {
                     break;
                 }
             };
-            if let Ok(pkt) = chain.read_all(&self.mem, HDR + MAX_PKT)
+            // One packet buffer for the worker's life, not an allocation per packet.
+            let mut pkt = std::mem::take(&mut self.pkt);
+            if chain.read_all_into(&self.mem, HDR + MAX_PKT, &mut pkt).is_ok()
                 && let Some(h) = Hdr::parse(&pkt)
             {
                 let end = (HDR + h.len as usize).min(pkt.len());
                 self.guest_packet(h, &pkt[HDR..end]);
             }
+            self.pkt = pkt;
             let _ = self.txq.add_used(&self.mem, chain.head, 0);
             done = true;
         }

@@ -327,6 +327,57 @@ mod tests {
         16 * segs.len() as u32
     }
 
+    /// Device-side cost of reads, as the guest issues them during boot: batches of requests at
+    /// spread sectors, each popped, served by `pread` into guest RAM, and completed.
+    ///     cargo test --release -p emu-vmm blk_read_throughput -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn blk_read_throughput() {
+        use std::time::Instant;
+        const FILE: u64 = 64 << 20;
+        let path = std::env::temp_dir().join(format!("emu-blk-bench-{}.img", std::process::id()));
+        let data: Vec<u8> = (0..FILE).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+        std::fs::write(&path, &data).expect("image");
+        for (kind, disk) in [("persistent", Disk::persistent(&path)), ("ephemeral", Disk::ephemeral(&path))] {
+            let disk = disk.expect("disk");
+            let blk = Blk::new(disk, "bench");
+            let mem = Arc::new(GuestRam::new(RAM_BASE, 64 << 20).expect("ram"));
+            let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+            for (size, total) in [(4096u32, 64u64 << 20), (65536, 512 << 20)] {
+                let mut drv = Driver::new(256);
+                let mut w = worker(&blk, &mem, &irq, &drv);
+                let batch = 64u64;
+                let start = Instant::now();
+                let mut done = 0u64;
+                let mut n = 0u64;
+                while done < total {
+                    for i in 0..batch {
+                        let hdr = RAM_BASE + 0x10_0000 + i * 32;
+                        let sector = (n * 7919 % (FILE / u64::from(size))) * u64::from(size) / 512;
+                        let mut h = [0u8; 16];
+                        h[..4].copy_from_slice(&T_IN.to_le_bytes());
+                        h[8..].copy_from_slice(&sector.to_le_bytes());
+                        mem.write(hdr, &h).expect("hdr");
+                        let buf = RAM_BASE + 0x20_0000 + i * u64::from(size);
+                        drv.push(&mem, &[(hdr, 16, false), (buf, size, true), (hdr + 16, 1, true)]);
+                        n += 1;
+                    }
+                    w.drain();
+                    done += batch * u64::from(size);
+                }
+                let secs = start.elapsed().as_secs_f64();
+                println!(
+                    "blk {kind:<10} {:>3} KiB reads: {:>7.0} req/s, {:>6.0} MiB/s, {:>5.1} us/req",
+                    size / 1024,
+                    n as f64 / secs,
+                    (done >> 20) as f64 / secs,
+                    secs * 1e6 / n as f64
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn discard_and_write_zeroes() {
         const SECTORS: u64 = 128;

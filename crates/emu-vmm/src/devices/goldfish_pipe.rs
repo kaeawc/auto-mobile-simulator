@@ -116,9 +116,17 @@ impl GoldfishPipe {
         let _ = self.mem.write(addr, &v.to_le_bytes());
     }
 
+    /// The command's (address, length) buffers: its pointer and size arrays read in one go each,
+    /// not two guest reads per buffer.
     fn buffers(&self, cb: u64) -> Vec<(u64, usize)> {
         let n = (self.rd32(cb + CB_BUFFERS_COUNT) as usize).min(MAX_BUFFERS);
-        (0..n).map(|i| (self.rd64(cb + CB_PTRS + 8 * i as u64), self.rd32(cb + CB_SIZES + 4 * i as u64) as usize)).collect()
+        let (mut ptrs, mut sizes) = (vec![0u8; 8 * n], vec![0u8; 4 * n]);
+        if self.mem.read(cb + CB_PTRS, &mut ptrs).is_err() || self.mem.read(cb + CB_SIZES, &mut sizes).is_err() {
+            return Vec::new();
+        }
+        let ptrs = ptrs.as_chunks::<8>().0.iter().map(|p| u64::from_le_bytes(*p));
+        let sizes = sizes.as_chunks::<4>().0.iter().map(|z| u32::from_le_bytes(*z) as usize);
+        ptrs.zip(sizes).collect()
     }
 
     fn command(&self, s: &mut State, id: u32) {
@@ -197,11 +205,10 @@ impl GoldfishPipe {
     }
 
     fn pipe_write(&self, s: &mut State, id: u32, cb: u64) -> (i32, i32) {
-        let mut data = Vec::new();
-        for (addr, len) in self.buffers(cb) {
-            let start = data.len();
-            data.resize(start + len, 0);
-            if self.mem.read(addr, &mut data[start..]).is_err() {
+        let bufs = self.buffers(cb);
+        let mut data = Vec::with_capacity(bufs.iter().map(|&(_, len)| len).sum());
+        for (addr, len) in bufs {
+            if self.mem.read_append(addr, len, &mut data).is_err() {
                 return (ERR_INVAL, 0);
             }
         }
@@ -262,10 +269,13 @@ impl GoldfishPipe {
             if n == 0 {
                 break;
             }
-            let chunk: Vec<u8> = p.inbound.drain(..n).collect();
-            if self.mem.write(addr, &chunk).is_err() {
+            // Straight from the queue's (at most two) slices.
+            let (front, back) = p.inbound.as_slices();
+            let (a, b) = if n <= front.len() { (&front[..n], &[][..]) } else { (front, &back[..n - front.len()]) };
+            if self.mem.write(addr, a).is_err() || (!b.is_empty() && self.mem.write(addr + a.len() as u64, b).is_err()) {
                 return (ERR_INVAL, done as i32);
             }
+            p.inbound.drain(..n);
             done += n;
         }
         (done as i32, done as i32)
@@ -493,5 +503,45 @@ mod tests {
         assert_eq!(run(&d, &mem, 3, cb, CMD_POLL, None).0, POLL_OUT);
         assert_eq!(run(&d, &mem, 3, cb, CMD_CLOSE, None).0, 0);
         assert_eq!(run(&d, &mem, 3, cb, CMD_POLL, None).0, ERR_INVAL, "closed");
+    }
+
+    /// Issues `cmd` with several buffers.
+    fn run_bufs(d: &GoldfishPipe, mem: &GuestRam, id: u32, cb: u64, cmd: i32, bufs: &[(u64, u32)]) -> (i32, i32) {
+        mem.write(cb + CB_CMD, &cmd.to_le_bytes()).expect("w");
+        mem.write(cb + CB_BUFFERS_COUNT, &(bufs.len() as u32).to_le_bytes()).expect("w");
+        for (i, &(addr, len)) in bufs.iter().enumerate() {
+            mem.write(cb + CB_PTRS + 8 * i as u64, &addr.to_le_bytes()).expect("w");
+            mem.write(cb + CB_SIZES + 4 * i as u64, &len.to_le_bytes()).expect("w");
+        }
+        wr(d, REG_CMD, id);
+        (mem.read_u32(cb + CB_STATUS).expect("r") as i32, mem.read_u32(cb + CB_CONSUMED).expect("r") as i32)
+    }
+
+    #[test]
+    fn commands_span_several_buffers() {
+        let mem = Arc::new(GuestRam::new(RAM, 0x10_0000).expect("ram"));
+        let mut reg = PipeRegistry::default();
+        reg.register("GLProcessPipe", Box::new(GlProcess::default()));
+        let d = GoldfishPipe::new(mem.clone(), Arc::new(reg), Arc::new(TestLine::default()));
+        wr(&d, REG_VERSION, 4);
+        let (open_buf, cb) = (RAM + 0x1000, RAM + 0x3000);
+        wr(&d, REG_OPEN_BUFFER_HIGH, 0);
+        wr(&d, REG_OPEN_BUFFER, open_buf as u32);
+        mem.write(open_buf, &cb.to_le_bytes()).expect("w");
+        assert_eq!(run_bufs(&d, &mem, 5, cb, CMD_OPEN, &[]).0, 0);
+        // The name split across buffers, and the confirmation in the last one.
+        let (a, b, c) = (RAM + 0x8000, RAM + 0x9000, RAM + 0xa000);
+        mem.write(a, b"pipe:GLPro").expect("w");
+        mem.write(b, b"cessPipe\0").expect("w");
+        mem.write(c, &7u32.to_le_bytes()).expect("w");
+        assert_eq!(run_bufs(&d, &mem, 5, cb, CMD_WRITE, &[(a, 10), (b, 9), (c, 4)]), (23, 23));
+        // The 8-byte reply read into a 3- and a 5-byte buffer.
+        let (r1, r2) = (RAM + 0xb000, RAM + 0xc000);
+        assert_eq!(run_bufs(&d, &mem, 5, cb, CMD_READ, &[(r1, 3), (r2, 5)]), (8, 8));
+        let mut reply = [0u8; 8];
+        mem.read(r1, &mut reply[..3]).expect("r1");
+        mem.read(r2, &mut reply[3..]).expect("r2");
+        assert_eq!(u64::from_le_bytes(reply), 1, "the first process id, whole");
+        assert_eq!(run_bufs(&d, &mem, 5, cb, CMD_READ, &[(r1, 8)]).0, ERR_AGAIN, "all consumed");
     }
 }

@@ -256,6 +256,9 @@ fn ok(name: &'static str, rc: c_int) -> Result<()> {
 pub struct Renderer {
     api: Api,
     handle: *mut c_void,
+    /// FrameBuffer members, resolved on first use (readback per streamed frame, release per
+    /// freed buffer), not per call.
+    fb: std::sync::OnceLock<std::result::Result<FbApi, &'static str>>,
 }
 
 // SAFETY: the dlopen handle is only used for dlsym, which is thread-safe.
@@ -299,7 +302,7 @@ impl Renderer {
             dlopen(&dep, true)?;
         }
         let h = dlopen(&lib64.join(BACKEND), false)?;
-        Ok(Renderer { api: Api::load(h)?, handle: h })
+        Ok(Renderer { api: Api::load(h)?, handle: h, fb: std::sync::OnceLock::new() })
     }
 
     /// Initializes the renderer for a `width`×`height` primary display. `on_fence` runs on a
@@ -698,52 +701,84 @@ type ReadColorBuffer = unsafe extern "C" fn(*mut c_void, u32, i32, i32, i32, i32
 /// `GfxstreamFormat::R8G8B8A8_UNORM`.
 const GFXSTREAM_RGBA8: u32 = 1;
 
+/// The renderer's `FrameBuffer` members emu-rs calls directly.
+#[derive(Clone, Copy)]
+struct FbApi {
+    get_fb: GetFb,
+    last: GetLastPosted,
+    flush: FlushFromVk,
+    read: ReadColorBuffer,
+    on_last: OnLastColorBufferRef,
+}
+
+impl FbApi {
+    fn load(h: *mut c_void) -> Result<FbApi> {
+        Ok(FbApi {
+            get_fb: sym!(h, "_ZN9gfxstream4host11FrameBuffer5getFBEv"),
+            last: sym!(h, "_ZN9gfxstream4host11FrameBuffer24getLastPostedColorBufferEv"),
+            flush: sym!(h, "_ZN9gfxstream4host11FrameBuffer22flushColorBufferFromVkEj"),
+            read: sym!(h, "_ZN9gfxstream4host11FrameBuffer15readColorBufferEjiiiiNS0_15GfxstreamFormatEPvy"),
+            on_last: sym!(h, "_ZN9gfxstream4host11FrameBuffer20onLastColorBufferRefEj"),
+        })
+    }
+}
+
 impl Renderer {
+    fn fb_api(&self) -> Result<FbApi> {
+        let api = self.fb.get_or_init(|| {
+            FbApi::load(self.handle).map_err(|e| match e {
+                Error::Symbol(name) => name,
+                _ => "FrameBuffer",
+            })
+        });
+        api.map_err(Error::Symbol)
+    }
+
     /// The last color buffer the renderer posted (host composition's output), read back as
     /// RGBA, `width` x `height`, top row first. Composition runs in Vulkan, and reads go
     /// through GL, so the Vulkan image is synced to GL first; the renderer's own readback
     /// paths (post callback, `getScreenshot`) skip that and return stale or garbage pixels.
     pub fn read_last_posted(&self, width: u32, height: u32) -> Result<Vec<u8>> {
-        let h = self.handle;
-        let get_fb: GetFb = sym!(h, "_ZN9gfxstream4host11FrameBuffer5getFBEv");
-        let last: GetLastPosted = sym!(h, "_ZN9gfxstream4host11FrameBuffer24getLastPostedColorBufferEv");
-        let flush: FlushFromVk = sym!(h, "_ZN9gfxstream4host11FrameBuffer22flushColorBufferFromVkEj");
-        let read: ReadColorBuffer = sym!(h, "_ZN9gfxstream4host11FrameBuffer15readColorBufferEjiiiiNS0_15GfxstreamFormatEPvy");
-        let mut px = vec![0u8; width as usize * height as usize * 4];
+        let mut px = Vec::new();
+        self.read_last_posted_into(width, height, &mut px)?;
+        Ok(px)
+    }
+
+    /// [`Renderer::read_last_posted`] into `px`, reusing its allocation (one per stream, not
+    /// one per frame).
+    pub fn read_last_posted_into(&self, width: u32, height: u32, px: &mut Vec<u8>) -> Result<()> {
+        let f = self.fb_api()?;
+        px.resize(width as usize * height as usize * 4, 0);
         // SAFETY: member functions with `this` first (Itanium ABI); readColorBuffer writes at
-        // most the size we pass.
+        // most the size we pass, which is `px`'s length.
         unsafe {
-            let fb = get_fb();
+            let fb = (f.get_fb)();
             if fb.is_null() {
                 return Err(Error::Call("FrameBuffer::getFB", 0));
             }
-            let cb = last(fb);
+            let cb = (f.last)(fb);
             if cb == 0 {
                 return Err(Error::Call("FrameBuffer::getLastPostedColorBuffer", 0));
             }
-            flush(fb, cb);
-            read(fb, cb, 0, 0, width as i32, height as i32, GFXSTREAM_RGBA8, px.as_mut_ptr().cast(), px.len() as u64);
+            (f.flush)(fb, cb);
+            (f.read)(fb, cb, 0, 0, width as i32, height as i32, GFXSTREAM_RGBA8, px.as_mut_ptr().cast(), px.len() as u64);
         }
-        Ok(px)
+        Ok(())
     }
-}
 
-impl Renderer {
     /// Frees color buffer `handle` once its last guest reference is gone (the guest's
     /// `refcount` pipe closed). Needs the RefCountPipe feature, under which consumers' explicit
     /// closes no longer free buffers.
     pub fn release_color_buffer(&self, handle: u32) -> Result<()> {
-        let h = self.handle;
-        let get_fb: GetFb = sym!(h, "_ZN9gfxstream4host11FrameBuffer5getFBEv");
-        let on_last: OnLastColorBufferRef = sym!(h, "_ZN9gfxstream4host11FrameBuffer20onLastColorBufferRefEj");
+        let f = self.fb_api()?;
         // SAFETY: getFB returns the singleton or null; onLastColorBufferRef is a member function
         // taking `this` first (Itanium ABI) and tolerates unknown handles.
         unsafe {
-            let fb = get_fb();
+            let fb = (f.get_fb)();
             if fb.is_null() {
                 return Err(Error::Call("FrameBuffer::getFB", 0));
             }
-            on_last(fb, handle);
+            (f.on_last)(fb, handle);
         }
         Ok(())
     }

@@ -37,6 +37,11 @@ pub fn renderer_screenshot(width: u32, height: u32) -> Option<Vec<u8>> {
     RENDERER.get()?.read_last_posted(width, height).ok()
 }
 
+/// [`renderer_screenshot`] into `px`, reusing its allocation (the display stream's per frame).
+pub fn renderer_screenshot_into(width: u32, height: u32, px: &mut Vec<u8>) -> bool {
+    RENDERER.get().is_some_and(|r| r.read_last_posted_into(width, height, px).is_ok())
+}
+
 /// The renderer is process-wide: loaded and initialized once, reused across guest reboots.
 fn renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     if let Some(r) = RENDERER.get() {
@@ -74,9 +79,7 @@ fn renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
             if f.top_down {
                 display.present(f.width, f.height, f.width * 4, format, f.pixels);
             } else {
-                let row = f.width as usize * 4;
-                let flipped: Vec<u8> = f.pixels.chunks(row).rev().flatten().copied().collect();
-                display.present(f.width, f.height, f.width * 4, format, &flipped);
+                display.present_bottom_up(f.width, f.height, format, f.pixels);
             }
         }
     }));

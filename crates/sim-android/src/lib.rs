@@ -67,9 +67,20 @@ impl Android {
         self.env.list_avds().into_iter().map(|name| self.describe(&name, &running).info).collect()
     }
 
-    /// Resolves a UDID-or-name query (`booted` is the only running device) to a device.
+    /// Whether an AVD is named exactly `name` (its UDID), without loading any. Compared with the
+    /// directory's own names, not by opening `<name>.ini`: on a case-insensitive filesystem
+    /// (APFS) `Pixel.ini` opens `pixel.ini`.
+    pub fn has_avd(&self, name: &str) -> bool {
+        !name.is_empty() && self.env.list_avds().iter().any(|n| n == name)
+    }
+
+    /// Resolves a UDID-or-name query (`booted` is the only running device) to a device. An exact
+    /// AVD name loads just that AVD.
     pub fn device(&self, query: &str) -> Result<Device, String> {
         let running = self.running();
+        if self.has_avd(query) {
+            return Ok(self.describe(query, &running));
+        }
         let devices: Vec<Device> = self.env.list_avds().into_iter().map(|name| self.describe(&name, &running)).collect();
         let infos: Vec<DeviceInfo> = devices.iter().map(|d| d.info.clone()).collect();
         match select(&infos, query) {
@@ -331,17 +342,18 @@ impl Device {
 
     /// Plays touch samples (device pixels) over one display connection.
     pub fn play(&self, samples: &[Sample]) -> Result<(), String> {
-        let mut display = self.display(self.touch_screen()?)?;
-        for s in samples {
-            sleep(s.delay);
-            display.send(&Input::Touch { x: s.point.x as f32, y: s.point.y as f32, phase: s.phase })?;
-        }
-        Ok(())
+        self.with_display(self.touch_screen()?, |display| {
+            for s in samples {
+                sleep(s.delay);
+                display.send(&Input::Touch { x: s.point.x as f32, y: s.point.y as f32, phase: s.phase })?;
+            }
+            Ok(())
+        })
     }
 
     /// One touch sample at device pixels.
     pub fn touch(&self, x: f64, y: f64, phase: Phase) -> Result<(), String> {
-        self.display(self.touch_screen()?)?.send(&Input::Touch { x: x as f32, y: y as f32, phase })
+        self.with_display(self.touch_screen()?, |d| d.send(&Input::Touch { x: x as f32, y: y as f32, phase }))
     }
 
     /// A touch on the touchpad beside the screen (`hw.touchpad0`: Android XR display glasses), in
@@ -377,10 +389,42 @@ impl Device {
             .ok_or_else(|| format!("{} has no touchpad (hw.touchpad0; Android XR display glasses have one)", self.info.name))
     }
 
-    /// A connection to the running emulator's display socket (frames and input).
-    fn display(&self, avd: &Avd) -> Result<display::Display, String> {
+    /// Runs `f` on this process's connection to the running emulator's display socket, made on
+    /// first use and kept: the server reads each connection on its own thread, so input sent
+    /// over separate connections (a tap, then the next touch) can reach the guest out of order.
+    /// One connection per device keeps it in order, and a touch doesn't pay a connect. A
+    /// connection that fails (the emulator restarted) is replaced once.
+    fn with_display<T>(&self, avd: &Avd, mut f: impl FnMut(&mut display::Display) -> Result<T, String>) -> Result<T, String> {
+        type Slot = std::sync::Arc<std::sync::Mutex<Option<display::Display>>>;
+        static DISPLAYS: std::sync::Mutex<Vec<(PathBuf, Slot)>> = std::sync::Mutex::new(Vec::new());
         self.running()?;
-        display::Display::connect(&avd.dir)
+        let path = display::socket(&avd.dir);
+        let slot = {
+            let mut all = DISPLAYS.lock().unwrap_or_else(|e| e.into_inner());
+            match all.iter().find(|(p, _)| *p == path) {
+                Some((_, slot)) => slot.clone(),
+                None => {
+                    let slot = Slot::default();
+                    all.push((path, slot.clone()));
+                    slot
+                }
+            }
+        };
+        let mut conn = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retried = false;
+        loop {
+            let d = match conn.as_mut() {
+                Some(d) => d,
+                None => conn.insert(display::Display::connect(&avd.dir)?),
+            };
+            match f(d) {
+                Err(_) if !retried => {
+                    *conn = None;
+                    retried = true;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// The AVD, if its screen takes touch (an SDK TV's says `hw.screen=no-touch`).
@@ -461,7 +505,7 @@ impl Device {
     /// scales to stock's 15 units per click (`sim_core::stream::wheel_units`). Watches only.
     pub fn rotary(&self, ticks: i32) -> Result<(), String> {
         self.require(InputMethod::Rotary, "rotary input")?;
-        self.display(self.avd()?)?.send(&Input::Wheel(ticks))
+        self.with_display(self.avd()?, |d| d.send(&Input::Wheel(ticks)))
     }
 
     /// An XR control (head pose, environment, input mode, pointer) through emu-rs's `xr` console
@@ -527,9 +571,31 @@ fn booted(r: &Running, adb: Option<&Path>) -> bool {
     }
 }
 
-/// The last `n` lines of a device's guest console (`<avd>/emu-rs/console.log`).
+/// The last `n` lines of a device's guest console (`<avd>/emu-rs/console.log`). Reads from the
+/// end, 64 KiB at a time, until it has them: the log grows to megabytes of kernel output, and
+/// the desktop asks every two seconds. Bytes that aren't UTF-8 show as U+FFFD.
 pub fn console_log_tail(avd_dir: &Path, n: usize) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(avd_dir.join("emu-rs/console.log")) else { return Vec::new() };
+    use std::io::{Read, Seek, SeekFrom};
+    const STEP: u64 = 64 * 1024;
+    let Ok(mut f) = std::fs::File::open(avd_dir.join("emu-rs/console.log")) else { return Vec::new() };
+    let Ok(len) = f.metadata().map(|m| m.len()) else { return Vec::new() };
+    let mut window = STEP.min(len);
+    let tail = loop {
+        let mut buf = Vec::new();
+        if f.seek(SeekFrom::Start(len - window)).and_then(|_| f.by_ref().take(window).read_to_end(&mut buf)).is_err() {
+            return Vec::new();
+        }
+        // More newlines than lines wanted: even after dropping the partial first line, enough.
+        if window == len || buf.iter().filter(|&&b| b == b'\n').count() > n {
+            if window < len {
+                let first = buf.iter().position(|&b| b == b'\n').map_or(0, |i| i + 1);
+                buf.drain(..first);
+            }
+            break buf;
+        }
+        window = (window * 2).min(len);
+    };
+    let text = String::from_utf8_lossy(&tail);
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].iter().map(|l| (*l).to_owned()).collect()
 }
@@ -706,6 +772,47 @@ mod tests {
         let glasses = f.android.device("glasses").expect("glasses");
         assert_eq!(glasses.touchpad_swipe((0, 0), (1542, 10), Duration::ZERO), Err("the touchpad is 1542x297".into()));
         assert_eq!(glasses.touchpad(1, 1, "tap"), Err("glasses isn't running; boot it first".into()));
+    }
+
+    #[test]
+    fn console_log_tail_reads_only_the_end() {
+        let dir = std::env::temp_dir().join(format!("sa-tail-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("emu-rs")).expect("dir");
+        let log = dir.join("emu-rs/console.log");
+        let naive = |n: usize| -> Vec<String> {
+            let text = String::from_utf8_lossy(&std::fs::read(&log).expect("read")).into_owned();
+            let lines: Vec<&str> = text.lines().collect();
+            lines[lines.len().saturating_sub(n)..].iter().map(|l| (*l).to_owned()).collect()
+        };
+        assert!(console_log_tail(&dir, 5).is_empty(), "no log yet");
+        // Long, with lines of every length, CRLFs and a non-UTF-8 byte.
+        let mut text = Vec::new();
+        for i in 0..200_000u32 {
+            text.extend(format!("[{i:>8}] {}{}", "x".repeat((i % 97) as usize), if i % 7 == 0 { "\r\n" } else { "\n" }).bytes());
+        }
+        text.extend(b"bad \xff byte\nno newline at the end");
+        std::fs::write(&log, &text).expect("write");
+        for n in [0, 1, 2, 200, 5000] {
+            assert_eq!(console_log_tail(&dir, n), naive(n), "last {n}");
+        }
+        assert_eq!(console_log_tail(&dir, 1), ["no newline at the end"]);
+        assert_eq!(console_log_tail(&dir, 2)[0], "bad \u{fffd} byte", "kept, not an empty panel");
+        std::fs::write(&log, "one\ntwo\n").expect("short");
+        assert_eq!(console_log_tail(&dir, 200), ["one", "two"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_avd_names_resolve_without_a_scan() {
+        let f = fixture("exact");
+        f.android.create("pixel", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        assert!(f.android.has_avd("pixel"));
+        for not in ["", "pix", "../avd/pixel", "pixel/"] {
+            assert!(!f.android.has_avd(not), "{not:?}");
+        }
+        assert_eq!(f.android.device("pixel").expect("exact").info.udid, "pixel");
+        assert!(!f.android.has_avd("Pixel"), "exact case, whatever the filesystem");
+        assert_eq!(f.android.device("Pixel").map(|d| d.info.udid), Ok("pixel".into()), "the scan still matches names loosely");
     }
 
     #[test]

@@ -128,6 +128,22 @@ impl GuestRam {
         Ok(())
     }
 
+    /// Appends guest `[addr, addr + len)` to `out` without zero-filling it first (device paths
+    /// copy whole packets and commands out of the guest this way).
+    pub fn read_append(&self, addr: u64, len: usize, out: &mut Vec<u8>) -> std::result::Result<(), MemError> {
+        let off = self.offset(addr, len)?;
+        out.reserve(len);
+        let start = out.len();
+        // SAFETY: `off + len` is within the mapping (checked above); `reserve` made room for `len`
+        // bytes after `start` in `out`'s own allocation, which cannot overlap guest memory, and
+        // every one of them is initialized by the copy before `set_len` exposes them.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.ptr.add(off), out.as_mut_ptr().add(start), len);
+            out.set_len(start + len);
+        }
+        Ok(())
+    }
+
     /// Copies `buf` into guest memory at `addr`.
     pub fn write(&self, addr: u64, buf: &[u8]) -> std::result::Result<(), MemError> {
         let off = self.offset(addr, buf.len())?;
@@ -242,6 +258,18 @@ impl Drop for GuestRam {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_append_extends_without_touching_what_is_there() {
+        let ram = GuestRam::new(0x4000_0000, 0x8000).expect("alloc");
+        ram.write(0x4000_0100, b"guest").expect("write");
+        let mut out = b"host:".to_vec();
+        ram.read_append(0x4000_0100, 5, &mut out).expect("append");
+        assert_eq!(out, b"host:guest");
+        assert!(ram.read_append(0x4000_7ffe, 4, &mut out).is_err(), "past the end");
+        assert_eq!(out, b"host:guest", "unchanged on error");
+        ram.read_append(0x4000_0000, 0, &mut out).expect("empty");
+    }
 
     #[test]
     fn round_trips_and_bounds_checks() {
