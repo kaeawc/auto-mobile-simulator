@@ -44,7 +44,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 libc = { version = "0.2", default-features = false }
 # Safe syscall wrappers (plain fsync: std's sync_data is F_FULLFSYNC on macOS; the adb bridge's
 # non-blocking send).
-rustix = { version = "1", default-features = false, features = ["fs", "net", "process", "std"] }
+rustix = { version = "1", default-features = false, features = ["event", "fs", "net", "process", "std"] }
 # SDK repository manifests (emu-sdk): a small read-only XML tree.
 roxmltree = { version = "0.21", default-features = false, features = ["std"] }
 # The SDK repository publishes sha1 checksums; dependency-free pure Rust.

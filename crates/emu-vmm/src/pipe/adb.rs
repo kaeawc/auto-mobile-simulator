@@ -14,8 +14,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::Thread;
 use std::time::Duration;
 
+use rustix::event::{PollFd, PollFlags};
 use rustix::io::Errno;
-use rustix::net::SendFlags;
 
 use super::{HostMsg, PipeCtx, PipeHandler, PipeService, WorkerEvent};
 
@@ -103,7 +103,9 @@ fn connect_vsock(stream: Arc<TcpStream>, vsock: Sender<WorkerEvent>, port: u16) 
 /// Host end of a forwarded stream: TCP bytes → guest, guest bytes → TCP.
 ///
 /// Neither direction ever blocks the pipe's transport thread (the vsock worker, which serves
-/// every pipe). Guest bytes go straight to the client's socket without waiting; what it can't
+/// every pipe). The socket is non-blocking (macOS ignores `MSG_DONTWAIT` on a blocking socket's
+/// send), and its reader and writer threads poll for it. Guest bytes go straight to the client's
+/// socket without waiting; what it can't
 /// take now is queued for a writer thread and reported as backlog, so vsock withholds that much
 /// of the guest's credit: a client that stops reading stops only its own guest sender, with at
 /// most vsock's receive buffer held here. Client bytes are read only while less than
@@ -195,15 +197,22 @@ impl Window {
     }
 }
 
-#[cfg(not(target_vendor = "apple"))]
-const SEND_NOW: SendFlags = SendFlags::DONTWAIT.union(SendFlags::NOSIGNAL);
-// No MSG_NOSIGNAL there; Rust ignores SIGPIPE.
-#[cfg(target_vendor = "apple")]
-const SEND_NOW: SendFlags = SendFlags::DONTWAIT;
+/// Waits until the non-blocking socket is ready for `flags` or has hung up (the next read or
+/// write then says which); false if it can't be polled.
+fn ready(s: &TcpStream, flags: PollFlags) -> bool {
+    let mut fds = [PollFd::new(s, flags)];
+    loop {
+        match rustix::event::poll(&mut fds, None) {
+            Ok(_) => return true,
+            Err(Errno::INTR) => {}
+            Err(_) => return false,
+        }
+    }
+}
 
 impl TcpForward {
     fn start(stream: &TcpStream, ctx: PipeCtx) -> TcpForward {
-        let (Ok(writer), Ok(reader)) = (stream.try_clone(), stream.try_clone()) else {
+        let (Ok(writer), Ok(reader), Ok(())) = (stream.try_clone(), stream.try_clone(), stream.set_nonblocking(true)) else {
             ctx.send(HostMsg::Close);
             return TcpForward::default();
         };
@@ -228,6 +237,11 @@ fn spawn_reader(mut reader: TcpStream, ctx: PipeCtx, window: Arc<Window>) {
                     window.queued.fetch_add(n, Ordering::SeqCst);
                     if !ctx.send(HostMsg::Data(buf[..n].to_vec())) {
                         return;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    if !ready(&reader, PollFlags::IN) {
+                        break;
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
@@ -268,6 +282,7 @@ fn spawn_writer(stream: Arc<TcpStream>, ctx: PipeCtx, q: Arc<ToHost>) {
                             ctx.drained();
                         }
                     }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock && ready(&stream, PollFlags::OUT) => {}
                     Err(e) if e.kind() == ErrorKind::Interrupted => {}
                     _ => {
                         let mut st = q.lock();
@@ -297,9 +312,9 @@ impl PipeHandler for TcpForward {
         }
         if st.buf.is_empty() && !st.writing {
             // The client keeps up (the usual case): straight into its socket, no thread hop.
-            match rustix::net::send(&**stream, data, SEND_NOW) {
+            match (&**stream).write(data) {
                 Ok(n) => data = &data[n..],
-                Err(e) if e == Errno::AGAIN || e == Errno::INTR => {}
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
                 Err(_) => {
                     st.failed = true;
                     return false;
