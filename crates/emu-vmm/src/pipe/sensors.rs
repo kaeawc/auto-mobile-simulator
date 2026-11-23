@@ -13,36 +13,24 @@ use super::qemud::{frame, take_frames};
 use super::{HostMsg, PipeCtx, PipeHandler, PipeService};
 
 /// Protocol names in handle order (handle = index), as the HAL's sensor list defines them.
-pub const NAMES: [&str; 18] = [
-    "acceleration",
-    "gyroscope",
-    "magnetic",
-    "orientation",
-    "temperature",
-    "proximity",
-    "light",
-    "pressure",
-    "humidity",
-    "magnetic-uncalibrated",
-    "gyroscope-uncalibrated",
-    "hinge-angle0",
-    "hinge-angle1",
-    "hinge-angle2",
-    "heart-rate",
-    "",
-    "wrist-tilt",
-    "acceleration-uncalibrated",
-];
+pub use sim_core::goldfish::SENSORS as NAMES;
 
 /// Shared, live sensor values.
 pub struct Sensors {
     values: Mutex<HashMap<String, Vec<f32>>>,
-    /// Bitmask of sensor handles the device has (phones: motion + environment).
+    /// Bitmask of sensor handles the device has (`sim_core::goldfish::sensor_mask`).
     pub mask: u32,
 }
 
 impl Sensors {
+    /// A phone's sensors with stock's defaults: motion, magnetic, orientation and environment
+    /// (handles 0–10 and 17).
     pub fn phone() -> Sensors {
+        Sensors::new(0x7ff | (1 << 17))
+    }
+
+    /// The sensors in `mask`, at rest. Every sensor has a value, so the console can set any.
+    pub fn new(mask: u32) -> Sensors {
         let mut v: HashMap<String, Vec<f32>> = HashMap::new();
         v.insert("acceleration".into(), vec![0.0, 9.80665, 0.0]);
         v.insert("acceleration-uncalibrated".into(), vec![0.0, 9.80665, 0.0]);
@@ -57,10 +45,17 @@ impl Sensors {
         v.insert("pressure".into(), vec![1013.25]);
         v.insert("humidity".into(), vec![40.0]);
         v.insert("hinge-angle0".into(), vec![180.0]);
+        v.insert("hinge-angle1".into(), vec![180.0]);
+        v.insert("hinge-angle2".into(), vec![180.0]);
         v.insert("heart-rate".into(), vec![70.0]);
-        // Handles 0–10 and 17: motion, magnetic, orientation and environment sensors.
-        let mask = 0x7ff | (1 << 17);
+        v.insert("rgbc-light".into(), vec![0.0, 0.0, 0.0, 0.0]);
+        v.insert("wrist-tilt".into(), vec![0.0]);
         Sensors { values: Mutex::new(v), mask }
+    }
+
+    /// Whether the device advertises sensor `name` (console or protocol spelling).
+    pub fn advertised(&self, name: &str) -> bool {
+        sim_core::goldfish::sensor_handle(Self::protocol_name(name)).is_some_and(|h| self.mask & (1 << h) != 0)
     }
 
     /// Console names (stock spelling) → protocol names.
@@ -210,6 +205,23 @@ mod tests {
         let frames = take_frames(&mut d);
         assert_eq!(frames[0], b"acceleration:1:2:3");
         assert!(frames[1].starts_with(b"sync:"));
+        pipe.closed();
+    }
+
+    #[test]
+    fn the_mask_decides_what_the_hal_lists() {
+        let watch = (0x7ff | (1 << 17)) | (1 << 14) | (1 << 16);
+        let sensors = Arc::new(Sensors::new(watch));
+        assert!(sensors.advertised("heart-rate") && sensors.advertised("wrist-tilt") && sensors.advertised("magnetic-field"));
+        assert!(!sensors.advertised("hinge-angle0") && !sensors.advertised("nope"));
+        assert!(sensors.set("wrist-tilt", vec![1.0]) && sensors.set("hinge-angle1", vec![90.0]), "every sensor has a value");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut pipe = SensorService { sensors }.open("qemud:sensors", PipeCtx { conn: 1, events: tx }).expect("open");
+        let mut req = Vec::new();
+        frame(&mut req, b"list-sensors");
+        let mut out = Vec::new();
+        assert!(pipe.guest_data(&req, &mut out));
+        assert_eq!(take_frames(&mut out), vec![watch.to_string().into_bytes()]);
         pipe.closed();
     }
 }

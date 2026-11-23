@@ -128,7 +128,7 @@ impl Instance {
             display,
             gpu_lib64,
             inputs: Default::default(),
-            sensors: Default::default(),
+            sensors: std::sync::Arc::new(emu_vmm::pipe::sensors::Sensors::new(avd.sensor_mask())),
             clipboard: Default::default(),
             fingerprint: Default::default(),
             gps: Default::default(),
@@ -167,6 +167,10 @@ impl Instance {
         if opts.no_boot_anim {
             bc.set("androidboot.debug.sf.nobootanimation", "1");
         }
+        // A round screen (boot.prop's `ro.emulator.circular`), as stock tells the guest.
+        if self.avd.circular() {
+            bc.set("androidboot.emulator.circular", "1");
+        }
         for (k, v) in self.avd.vbmeta_params() {
             bc.set(k, v);
         }
@@ -181,8 +185,7 @@ impl Instance {
 
     /// What the stock host hands `qemu-props` at boot.
     fn boot_props(&self) -> Vec<(String, String)> {
-        let (_, _, density) = self.avd.lcd();
-        let mut props = vec![("qemu.sf.lcd_density".to_string(), density.to_string()), ("qemu.hw.mainkeys".to_string(), "0".to_string())];
+        let mut props = self.avd.qemu_props();
         if let Ok(tz) = std::fs::read_link("/etc/localtime")
             && let Some(name) = tz.to_str().and_then(|s| s.split("zoneinfo/").nth(1))
         {

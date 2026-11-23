@@ -81,13 +81,19 @@ fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<e
             },
             // A console key name, or a raw Linux keycode (as the console's `event send` takes).
             (Input::Key(name), Some(i)) => {
-                if let Some(code) = emu_vmm::virtio::input::keycode(&name).or_else(|| name.parse().ok()) {
+                if let Some(code) = sim_core::goldfish::keycode(&name) {
                     i.keyboard.tap_key(code);
                 }
             }
-            (Input::Wheel(t), Some(i)) => {
+            // Clicks become the rotary's units here, once; the console's `event send
+            // EV_REL:REL_WHEEL:<n>` stays raw.
+            (Input::Wheel(clicks), Some(i)) => {
                 i.rotary.send(vec![
-                    emu_vmm::virtio::input::InputEvent::new(emu_vmm::virtio::input::EV_REL, emu_vmm::virtio::input::REL_WHEEL, t),
+                    emu_vmm::virtio::input::InputEvent::new(
+                        emu_vmm::virtio::input::EV_REL,
+                        emu_vmm::virtio::input::REL_WHEEL,
+                        sim_core::stream::wheel_units(clicks),
+                    ),
                     emu_vmm::virtio::input::InputEvent::syn(),
                 ]);
             }

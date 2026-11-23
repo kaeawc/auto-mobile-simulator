@@ -45,8 +45,7 @@ fn sensor(info: &ConsoleInfo, words: &[&str]) -> String {
             }
         }
         ["status"] => {
-            let names: Vec<&str> =
-                emu_vmm::pipe::sensors::NAMES.iter().copied().filter(|n| !n.is_empty() && info.sensors.get(n).is_some()).collect();
+            let names: Vec<&str> = emu_vmm::pipe::sensors::NAMES.iter().copied().filter(|n| info.sensors.advertised(n)).collect();
             format!("{}\r\nOK", names.iter().map(|n| format!("{n}: enabled.")).collect::<Vec<_>>().join("\r\n"))
         }
         _ => "KO: usage: sensor set <name> <v:v:v> | sensor get <name> | sensor status".into(),
@@ -56,7 +55,8 @@ fn sensor(info: &ConsoleInfo, words: &[&str]) -> String {
 /// `event send <type>:<code>:<value> ...` (stock syntax, e.g. `EV_KEY:KEY_POWER:1`,
 /// `EV_REL:REL_WHEEL:-1`) and `event text <string>`.
 fn event(info: &ConsoleInfo, words: &[&str]) -> String {
-    use emu_vmm::virtio::input::{EV_ABS, EV_KEY, EV_REL, EV_SYN, InputEvent, keycode};
+    use emu_vmm::virtio::input::{EV_ABS, EV_KEY, EV_REL, EV_SYN, InputEvent};
+    use sim_core::goldfish::keycode;
     use sim_core::hid::{keystroke, linux_keycode};
     let guard = info.inputs.lock().unwrap_or_else(|e| e.into_inner());
     let Some(inputs) = guard.as_ref() else { return "KO: no input devices".into() };
@@ -78,7 +78,7 @@ fn event(info: &ConsoleInfo, words: &[&str]) -> String {
                 };
                 let code = match (typ, *c) {
                     (EV_REL, "REL_WHEEL") => emu_vmm::virtio::input::REL_WHEEL,
-                    (EV_KEY, name) => match keycode(name).or_else(|| name.parse().ok()) {
+                    (EV_KEY, name) => match keycode(name) {
                         Some(k) => k,
                         None => return format!("KO: unknown key '{name}'"),
                     },

@@ -3,12 +3,18 @@
 //! Three device kinds: a multi-touch screen (INPUT_PROP_DIRECT, so Android treats it as a
 //! touchscreen), a keyboard (hardware keys incl. power/volume/back/home) and a rotary encoder
 //! (REL_WHEEL, used by Wear OS). Host code injects through an [`InputHandle`].
+//!
+//! The keyboard looks like stock's (hw/input/virtio-input-hid.c): named `qwerty2` with ids
+//! 0627:0001, so the guest loads goldfish's `qwerty2.kl` (102 is HOME, 232 DPAD_CENTER, 580
+//! APP_SWITCH) instead of `Generic.kl`, and advertising stock's key set, since the kernel drops
+//! codes a device doesn't advertise.
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
 use emu_hvf::GuestRam;
+use sim_core::goldfish::keyboard_has;
 
 use super::queue::Queue;
 use super::{Activation, INT_USED_RING, Interrupt, VirtioDevice};
@@ -19,6 +25,8 @@ pub const EV_SYN: u16 = 0x00;
 pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
 pub const EV_ABS: u16 = 0x03;
+pub const EV_LED: u16 = 0x11;
+pub const EV_REP: u16 = 0x14;
 pub const SYN_REPORT: u16 = 0;
 pub const BTN_TOUCH: u16 = 0x14a;
 pub const REL_WHEEL: u16 = 0x08;
@@ -38,6 +46,13 @@ const CFG_ID_DEVIDS: u8 = 0x03;
 const CFG_PROP_BITS: u8 = 0x10;
 const CFG_EV_BITS: u8 = 0x11;
 const CFG_ABS_INFO: u8 = 0x12;
+
+/// The keyboard's name: goldfish's vendor image ships `qwerty2.idc` and `qwerty2.kl` for it.
+pub const KEYBOARD_NAME: &str = "qwerty2";
+/// Bus, vendor, product, version of stock's keyboard (`BUS_VIRTUAL`, 0627:0001).
+const KEYBOARD_IDS: [u16; 4] = [0x06, 0x0627, 0x0001, 0x0001];
+/// Ids of the other devices.
+const OTHER_IDS: [u16; 4] = [0x06, 0x18d1, 0x0001, 0x0001];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputEvent {
@@ -142,6 +157,13 @@ impl Input {
     }
 
     fn ev_bits(&self, typ: u8) -> Vec<u8> {
+        match (self.kind, u16::from(typ)) {
+            // Like stock: an (empty) EV_REP entry turns on the kernel's key repeat, and the
+            // keyboard has num, caps and scroll lock LEDs.
+            (Kind::Keyboard, EV_REP) => return vec![0],
+            (Kind::Keyboard, EV_LED) => return vec![0b111],
+            _ => {}
+        }
         let mut bits = vec![0u8; 128];
         let mut set = |code: u16| {
             if let Some(b) = bits.get_mut(code as usize / 8) {
@@ -156,7 +178,7 @@ impl Input {
                 }
             }
             (Kind::Keyboard, EV_KEY) => {
-                for c in 1..=248u16 {
+                for c in (0..1024u16).filter(|&c| keyboard_has(c)) {
                     set(c);
                 }
             }
@@ -187,7 +209,10 @@ impl Input {
         match sel {
             CFG_ID_NAME => self.name.as_bytes().to_vec(),
             CFG_ID_SERIAL => b"emu-rs".to_vec(),
-            CFG_ID_DEVIDS => [0x06u16, 0x18d1, 0x0001, 0x0001].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            CFG_ID_DEVIDS => {
+                let ids = if self.kind == Kind::Keyboard { KEYBOARD_IDS } else { OTHER_IDS };
+                ids.iter().flat_map(|v| v.to_le_bytes()).collect()
+            }
             CFG_PROP_BITS => match self.kind {
                 Kind::Touch { .. } => vec![1 << INPUT_PROP_DIRECT],
                 _ => Vec::new(),
@@ -318,57 +343,6 @@ impl Worker {
     }
 }
 
-/// Linux keycodes for console/desktop key names (KEY_* without the prefix, case-insensitive).
-pub fn keycode(name: &str) -> Option<u16> {
-    let n = name.trim_start_matches("KEY_").to_ascii_uppercase();
-    let letters = "QWERTYUIOP";
-    Some(match n.as_str() {
-        "ESC" => 1,
-        "1" => 2,
-        "2" => 3,
-        "3" => 4,
-        "4" => 5,
-        "5" => 6,
-        "6" => 7,
-        "7" => 8,
-        "8" => 9,
-        "9" => 10,
-        "0" => 11,
-        "BACKSPACE" => 14,
-        "TAB" => 15,
-        "ENTER" => 28,
-        "SPACE" => 57,
-        "HOME" => 102,
-        "UP" => 103,
-        "LEFT" => 105,
-        "RIGHT" => 106,
-        "DOWN" => 108,
-        "MUTE" => 113,
-        "VOLUMEDOWN" => 114,
-        "VOLUMEUP" => 115,
-        "POWER" => 116,
-        "MENU" => 139,
-        "BACK" => 158,
-        "APPSELECT" => 580,
-        "HOMEPAGE" => 172,
-        "SEARCH" => 217,
-        "SLEEP" => 142,
-        "WAKEUP" => 143,
-        "CAMERA" => 212,
-        s if s.len() == 1 => {
-            let c = s.as_bytes()[0];
-            if let Some(i) = letters.find(c as char) {
-                16 + i as u16
-            } else if let Some(i) = "ASDFGHJKL".find(c as char) {
-                30 + i as u16
-            } else {
-                44 + "ZXCVBNM".find(c as char)? as u16
-            }
-        }
-        _ => return None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,11 +390,27 @@ mod tests {
         assert_eq!(mem.read_u16(RAM_BASE + 0x20000 + 2).expect("code"), 116);
     }
 
+    fn has(bits: &[u8], code: u16) -> bool {
+        bits.get(code as usize / 8).is_some_and(|b| b & (1 << (code % 8)) != 0)
+    }
+
     #[test]
-    fn key_names() {
-        assert_eq!(keycode("KEY_POWER"), Some(116));
-        assert_eq!(keycode("a"), Some(30));
-        assert_eq!(keycode("KEY_Q"), Some(16));
-        assert_eq!(keycode("nope"), None);
+    fn keyboard_looks_like_stocks_qwerty2() {
+        let (mut dev, _h) = Input::new(Kind::Keyboard, KEYBOARD_NAME);
+        assert_eq!(cfg(&mut dev, CFG_ID_NAME, 0), b"qwerty2");
+        assert_eq!(cfg(&mut dev, CFG_ID_DEVIDS, 0), [0x06, 0, 0x27, 0x06, 0x01, 0, 0x01, 0]);
+        // The bitmap is `sim_core::goldfish::keyboard_has`, up to ASSIST (585).
+        let keys = cfg(&mut dev, CFG_EV_BITS, EV_KEY as u8);
+        assert!((0..1024).all(|c| has(&keys, c) == keyboard_has(c)));
+        assert!(has(&keys, 232) && has(&keys, 580) && !has(&keys, 0));
+        assert_eq!(keys.len(), 585 / 8 + 1);
+        assert_eq!(cfg(&mut dev, CFG_EV_BITS, EV_REP as u8), [0], "key repeat on");
+        assert_eq!(cfg(&mut dev, CFG_EV_BITS, EV_LED as u8), [0b111]);
+        assert!(cfg(&mut dev, CFG_PROP_BITS, 0).is_empty());
+
+        let (mut rotary, _h) = Input::new(Kind::Rotary, "virtio_input_rotary");
+        assert_eq!(cfg(&mut rotary, CFG_ID_DEVIDS, 0), [0x06, 0, 0xd1, 0x18, 0x01, 0, 0x01, 0]);
+        assert!(cfg(&mut rotary, CFG_EV_BITS, EV_REP as u8).is_empty());
+        assert!(has(&cfg(&mut rotary, CFG_EV_BITS, EV_REL as u8), REL_WHEEL));
     }
 }
