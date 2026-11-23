@@ -6,7 +6,8 @@
 //! directory under the SDK and renamed into the standard layout. Shelling out to the system's
 //! curl and unzip keeps a TLS stack and a zip implementation out of the binary. The host
 //! renderer is unpacked out of the `emulator` package the same way, into emu-rs's own directory
-//! (see [`renderer`]).
+//! (see [`renderer`]). Other hosts (Linux, for preparing images and AVDs) use the `curl` and
+//! `unzip` on their `PATH`.
 
 mod manifest;
 pub mod renderer;
@@ -119,6 +120,12 @@ impl Drop for TempDir {
     }
 }
 
+/// A system tool: macOS's own copy in `/usr/bin` (never a `PATH` lookup there), else `name` as
+/// found on the `PATH`.
+fn host_tool(name: &str) -> PathBuf {
+    if cfg!(target_os = "macos") { Path::new("/usr/bin").join(name) } else { PathBuf::from(name) }
+}
+
 /// An SDK root being provisioned.
 #[derive(Clone, Debug)]
 pub struct Sdk {
@@ -140,8 +147,8 @@ impl Sdk {
             root,
             manifest_max_age: Duration::from_secs(24 * 3600),
             quiet: false,
-            curl: "/usr/bin/curl".into(),
-            unzip: "/usr/bin/unzip".into(),
+            curl: host_tool("curl"),
+            unzip: host_tool("unzip"),
         })
     }
 
@@ -167,7 +174,15 @@ impl Sdk {
     }
 
     fn run(&self, cmd: &mut Command) -> Result<std::process::ExitStatus> {
-        cmd.status().map_err(|e| Error::Command(format!("{:?}: {e}", cmd.get_program())))
+        cmd.status().map_err(|e| {
+            let program = Path::new(cmd.get_program());
+            if e.kind() == std::io::ErrorKind::NotFound {
+                let name = program.file_name().unwrap_or(program.as_os_str()).to_string_lossy();
+                Error::Command(format!("`{}` not found: install {name} (e.g. `apt install {name}`)", program.display()))
+            } else {
+                Error::Command(format!("{}: {e}", program.display()))
+            }
+        })
     }
 
     /// Fetches (or reads from the daily cache) and parses a manifest.

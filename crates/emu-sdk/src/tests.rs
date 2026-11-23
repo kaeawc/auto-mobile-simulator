@@ -468,3 +468,14 @@ fn the_current_host_matches_the_build_target() {
     assert_eq!(host, Host::MACOS_ARM64);
     assert!(repo().resolve("platform-tools", Host { os: "linux", arch: "x64" }).is_ok());
 }
+
+#[test]
+fn a_missing_host_tool_says_what_to_install() {
+    let dir = std::env::temp_dir().join(format!("emu-sdk-missing-tool-{}", std::process::id()));
+    let mut sdk = Sdk::new(&dir).expect("sdk");
+    sdk.quiet = true;
+    sdk.curl = "/nonexistent/curl".into();
+    let err = sdk.manifest("https://example.invalid/repository2-3.xml").expect_err("no curl").to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(err.contains("`/nonexistent/curl` not found: install curl"), "{err}");
+}
