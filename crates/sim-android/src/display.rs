@@ -42,8 +42,13 @@ pub fn read_frame(r: &mut impl Read) -> std::io::Result<(FrameHeader, Vec<u8>)> 
     let mut hdr = [0u8; HEADER_LEN];
     r.read_exact(&mut hdr)?;
     let header = FrameHeader::decode(&hdr).map_err(std::io::Error::other)?;
-    let mut rgba = vec![0u8; header.len as usize];
-    r.read_exact(&mut rgba)?;
+    // Straight into reserved capacity: no zero-fill of a multi-megabyte frame first.
+    let len = header.len as usize;
+    let mut rgba = Vec::with_capacity(len);
+    r.take(len as u64).read_to_end(&mut rgba)?;
+    if rgba.len() != len {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
     Ok((header, rgba))
 }
 
@@ -72,6 +77,10 @@ mod tests {
         d.send(&Input::Hello { max_width: 720 }).expect("hello");
         d.send(&Input::Touch { x: 5.0, y: 6.0, phase: Phase::Down }).expect("touch");
         let (h, rgba) = read_frame(&mut d.try_clone().expect("clone")).expect("frame");
+        // A frame cut short is an error, not a short frame.
+        let cut = FrameHeader { width: 1, height: 2, device_width: 2, device_height: 2, frame: 2, len: 8 };
+        let mut short = std::io::Cursor::new([cut.encode().to_vec(), vec![1; 5]].concat());
+        assert_eq!(read_frame(&mut short).map(|_| ()).map_err(|e| e.kind()), Err(std::io::ErrorKind::UnexpectedEof));
         assert_eq!((h.device_width, rgba), (2, vec![1, 2, 3, 4]));
         assert_eq!(server.join().expect("server"), vec!["hello 720".to_owned(), "touch 5 6 down".to_owned()]);
         std::fs::remove_dir_all(dir).ok();
