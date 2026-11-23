@@ -131,6 +131,11 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     ("fold", "device, angle(0-180) | posture(closed|half-opened|opened)", "Set a foldable's hinge"),
     (
+        "xr",
+        "device, action(recenter | rotate|move: x, y, z | options: environment(day|night), passthrough(0-1) | input: mode(mouse|hand|eye) | viewport: mode(pan|zoom|rotate) | pointer: x, y, phase?(move|down|up|click))",
+        "Android XR: turn (radians) or move (metres) the head, recenter, set the room and passthrough, the input mode, or point the dual-mode mouse at pixels",
+    ),
+    (
         "rotary",
         "device, ticks | delta (Digital Crown units; iOS)",
         "Turn a watch's rotary input: the Wear OS crown or bezel, the Apple Watch Digital Crown",
@@ -182,7 +187,7 @@ const ALL_PLATFORMS: &[&str] = &[
     "rotary",
 ];
 /// Methods only Android devices have.
-const ANDROID_ONLY: &[&str] = &["console", "fold"];
+const ANDROID_ONLY: &[&str] = &["console", "fold", "xr"];
 
 /// The platforms whose devices `method` works on.
 pub fn platforms(method: &str) -> &'static [Platform] {
@@ -313,6 +318,7 @@ mod tests {
         assert_eq!(find("status_bar")["platforms"], json!(["ios"]));
         assert_eq!(find("tap")["platforms"], json!(["android", "ios"]));
         assert_eq!(find("fold")["platforms"], json!(["android"]));
+        assert_eq!(find("xr")["platforms"], json!(["android"]));
         assert_eq!(find("rotary")["platforms"], json!(["android", "ios"]));
         assert_eq!(find("rotate")["platforms"], json!(["android", "ios"]));
         assert_eq!(find("carplay")["platforms"], json!(["ios"]));
@@ -320,12 +326,15 @@ mod tests {
         assert!(help.as_array().expect("array").iter().all(|m| m["platforms"].as_array().is_some_and(|p| !p.is_empty())));
     }
 
-    /// An SDK with a mobile and a Wear OS image, and an empty AVD home.
+    /// An SDK with a mobile, a Wear OS and an Android XR image, and an empty AVD home.
     fn android_session(tag: &str) -> (Session, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("sim-api-android-{tag}-{}", std::process::id()));
         let sdk = root.join("sdk");
-        for (dir, image_tag) in [("android-36/google_apis/arm64-v8a", "google_apis"), ("android-34/android-wear/arm64-v8a", "android-wear")]
-        {
+        for (dir, image_tag) in [
+            ("android-36/google_apis/arm64-v8a", "google_apis"),
+            ("android-34/android-wear/arm64-v8a", "android-wear"),
+            ("android-34/google-xr/arm64-v8a", "android-xr"),
+        ] {
             let d = sdk.join("system-images").join(dir);
             std::fs::create_dir_all(&d).expect("image dir");
             std::fs::write(d.join("system.img"), b"s").expect("system.img");
@@ -351,7 +360,7 @@ mod tests {
         let err = call(&mut s, "create", &json!({"platform": "android", "name": "t", "system_image": wear, "form_factor": "tablet"}));
         assert!(err.expect_err("tablet from Wear").contains("boots Wear OS · Watch devices, not tablet"));
         let err = call(&mut s, "create", &json!({"platform": "android", "name": "v", "system_image": mobile, "form_factor": "vision"}));
-        assert!(err.expect_err("vision").starts_with("vision is not supported on Android"));
+        assert!(err.expect_err("vision from a phone image").ends_with("boots Android · Phone devices, not vision"));
 
         let devices = call(&mut s, "devices", &json!({"platform": "android"})).expect("devices");
         let labels: Vec<(&str, &str)> = devices
@@ -366,7 +375,7 @@ mod tests {
         assert_eq!(watches.as_array().map(Vec::len), Some(1));
         assert_eq!(call(&mut s, "devices", &json!({"booted": true, "platform": "android"})).expect("booted"), json!([]));
         let rts = call(&mut s, "runtimes", &json!({"platform": "android"})).expect("runtimes");
-        assert_eq!(rts.as_array().map(Vec::len), Some(2));
+        assert_eq!(rts.as_array().map(Vec::len), Some(3));
 
         assert_eq!(call(&mut s, "screen", &json!({"device": "watch"})).expect("screen"), json!({"width": 454, "height": 454}));
         let info = call(&mut s, "info", &json!({"device": "fold"})).expect("info");
@@ -395,6 +404,29 @@ mod tests {
     }
 
     #[test]
+    fn android_xr_devices_take_xr_controls() {
+        let (mut s, root) = android_session("xr");
+        let xr = "system-images;android-34;google-xr;arm64-v8a";
+        let headset = call(&mut s, "create", &json!({"platform": "android", "name": "headset", "system_image": xr})).expect("headset");
+        assert_eq!((headset["form_factor"].as_str(), headset["sub_platform"].as_str()), (Some("vision"), Some("androidxr")));
+        let wear = "system-images;android-34;android-wear;arm64-v8a";
+        call(&mut s, "create", &json!({"platform": "android", "name": "watch", "system_image": wear})).expect("watch");
+        assert_eq!(call(&mut s, "screen", &json!({"device": "headset"})).expect("screen"), json!({"width": 2560, "height": 2558}));
+        let visions = call(&mut s, "devices", &json!({"form_factor": "vision", "platform": "android"})).expect("visions");
+        assert_eq!(visions.as_array().map(Vec::len), Some(1));
+
+        let rotate = json!({"device": "headset", "action": "rotate", "x": 0, "y": 0.5, "z": 0});
+        assert_eq!(call(&mut s, "xr", &rotate).expect_err("stopped"), "headset isn't running; boot it first");
+        let err = call(&mut s, "xr", &json!({"device": "watch", "action": "recenter"})).expect_err("not XR");
+        assert_eq!(err, "XR controls need an Android XR device; watch is Wear OS · Watch");
+        let err = call(&mut s, "xr", &json!({"device": "headset", "action": "teleport"})).expect_err("unknown action");
+        assert!(err.starts_with("xr: unknown variant `teleport`"), "{err}");
+        let err = call(&mut s, "xr", &json!({"device": "headset", "action": "options", "environment": "day"})).expect_err("missing");
+        assert!(err.contains("missing field `passthrough`"), "{err}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn form_factors_lists_the_matrix_with_reasons() {
         let mut s = Session::default();
         let all = call(&mut s, "form_factors", &Value::Null).expect("matrix");
@@ -407,6 +439,12 @@ mod tests {
         assert_eq!(watch[0]["sub_platform"], "watchos");
         assert_eq!(watch[0]["inputs"][1]["label"], "Digital Crown");
         assert_eq!(watch[0]["profile"]["shape"], "rounded");
+        let xr = call(&mut s, "form_factors", &json!({"form_factor": "vision", "platform": "android"})).expect("Android XR");
+        assert_eq!((xr[0]["supported"].as_bool(), xr[0]["sub_platform"].as_str()), (Some(true), Some("androidxr")));
+        assert_eq!(xr[0]["inputs"][0]["label"], "Eye tracking");
+        assert_eq!((xr[0]["profile"]["width"].as_u64(), xr[0]["profile"]["height"].as_u64()), (Some(2560), Some(2558)));
+        let unsupported: Vec<&Value> = all.as_array().expect("rows").iter().filter(|r| r["supported"] == false).collect();
+        assert_eq!(unsupported.len(), 1, "a foldable iPhone is the only gap");
         let err = call(&mut s, "form_factors", &json!({"form_factor": "laptop"})).expect_err("unknown");
         assert!(err.contains("phone, tablet, foldable, watch, tv, auto, vision"), "{err}");
         assert!(call(&mut s, "devices", &json!({"platform": "windows"})).expect_err("unknown").contains("android or ios"));

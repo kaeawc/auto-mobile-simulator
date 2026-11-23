@@ -56,6 +56,8 @@ pub enum Action {
     Fold(Posture),
     /// Watches: turn the rotary input (Wear OS) or the Digital Crown (Apple Watch).
     Rotary(i32),
+    /// Android XR: head pose and recentering.
+    Xr(sim_core::xr::XrCommand),
     Debug(debug::DebugAction),
 }
 
@@ -538,6 +540,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
                 s.live.iter().for_each(|l| l.crown(ticks));
                 s.screen.iter().for_each(|sc| sc.wheel(ticks));
             }
+            Action::Xr(command) => android_action(s, |d| d.xr(&command).map(drop)),
             Action::Debug(a) => {
                 if let Some(udid) = s.live.as_ref().map(|l| l.udid.clone())
                     && let Some(msg) = s.debug.perform(&udid, a)

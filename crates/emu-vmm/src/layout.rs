@@ -73,6 +73,8 @@ pub mod slots {
     pub const TOUCH: u32 = 20;
     pub const KEYBOARD: u32 = 21;
     pub const ROTARY: u32 = 22;
+    /// virtio-input dual-mode mouse, Android XR images only (stock: on PCI like its other inputs).
+    pub const MOUSE: u32 = 17;
     /// Not on the stock board (which puts vsock on PCI); the guest driver doesn't care.
     pub const VSOCK: u32 = 24;
     pub const RNG: u32 = 25;

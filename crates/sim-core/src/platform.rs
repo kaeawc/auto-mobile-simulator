@@ -1,5 +1,5 @@
 //! Platforms: which engine runs a device (Android emulator or Apple simulator) and the
-//! sub-platform it presents (iPadOS, watchOS, Wear OS, Android TV, CarPlay, ...).
+//! sub-platform it presents (iPadOS, watchOS, Wear OS, Android TV, Android XR, CarPlay, ...).
 //!
 //! Every device, API method and UI element carries these labels, so a reader always knows which
 //! side of the house they are looking at.
@@ -96,6 +96,9 @@ pub enum AndroidOs {
     /// Android Automotive OS (`android-automotive*` images): the OS runs on the head unit itself.
     /// Android Auto, by contrast, projects from a phone; the emulator boots Automotive images.
     Automotive,
+    /// Android XR headsets and glasses (`google-xr`, `android-xr-*` and `ai-glasses` images).
+    #[serde(rename = "androidxr")]
+    Xr,
 }
 
 impl AndroidOs {
@@ -105,6 +108,7 @@ impl AndroidOs {
             Self::WearOs => "wearos",
             Self::Tv => "androidtv",
             Self::Automotive => "automotive",
+            Self::Xr => "androidxr",
         }
     }
 
@@ -114,6 +118,7 @@ impl AndroidOs {
             Self::WearOs => "Wear OS",
             Self::Tv => "Android TV",
             Self::Automotive => "Android Automotive",
+            Self::Xr => "Android XR",
         }
     }
 }
@@ -173,6 +178,8 @@ mod tests {
             (SubPlatform::Android(AndroidOs::Mobile), "android", "Android", Platform::Android),
             (SubPlatform::Android(AndroidOs::WearOs), "wearos", "Wear OS", Platform::Android),
             (SubPlatform::Android(AndroidOs::Tv), "androidtv", "Android TV", Platform::Android),
+            (SubPlatform::Android(AndroidOs::Xr), "androidxr", "Android XR", Platform::Android),
+            (SubPlatform::Apple(AppleOs::VisionOs), "visionos", "visionOS", Platform::Ios),
         ];
         for (sub, name, label, platform) in cases {
             assert_eq!(serde_json::to_value(sub).expect("json"), name);

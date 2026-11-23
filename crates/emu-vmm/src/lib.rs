@@ -54,6 +54,8 @@ pub struct Inputs {
     pub touch: virtio::input::InputHandle,
     pub keyboard: virtio::input::InputHandle,
     pub rotary: virtio::input::InputHandle,
+    /// The dual-mode mouse (Android XR images only).
+    pub mouse: Option<virtio::input::InputHandle>,
 }
 
 /// Host GPU rendering through gfxstream.
@@ -155,6 +157,9 @@ pub struct MachineConfig {
     pub telephony: Arc<telephony::Telephony>,
     /// Touchscreen size; enables the virtio-input touchscreen, keyboard and rotary devices.
     pub input: Option<(u32, u32)>,
+    /// Android XR: the `qemud:xr_service` link (console `xr`), and the dual-mode mouse with the
+    /// other input devices.
+    pub xr: Option<Arc<pipe::xr::Xr>>,
     /// Receives the input handles of this run (they change when the guest reboots).
     pub on_input: Option<Arc<dyn Fn(Inputs) + Send + Sync>>,
     /// Where guest console (PL011) output goes.
@@ -326,8 +331,13 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         slots[slots::TOUCH as usize] = Some(Box::new(touch));
         slots[slots::KEYBOARD as usize] = Some(Box::new(kbd));
         slots[slots::ROTARY as usize] = Some(Box::new(rot));
+        let mouse = cfg.xr.is_some().then(|| {
+            let (mouse, mh) = Input::new(Kind::DualModeMouse, virtio::input::DUAL_MODE_MOUSE_NAME);
+            slots[slots::MOUSE as usize] = Some(Box::new(mouse));
+            mh
+        });
         if let Some(cb) = &cfg.on_input {
-            cb(Inputs { touch: th, keyboard: kh, rotary: rh });
+            cb(Inputs { touch: th, keyboard: kh, rotary: rh, mouse });
         }
     }
     if let Some(port) = cfg.adb_port {
@@ -348,6 +358,9 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         registry
             .register("qemud:fingerprintlisten", Box::new(pipe::fingerprint::FingerprintService { fingerprint: cfg.fingerprint.clone() }));
         registry.register("qemud:gps", Box::new(pipe::gps::GpsService { gps: cfg.gps.clone() }));
+        if let Some(xr) = &cfg.xr {
+            registry.register("qemud:xr_service", Box::new(pipe::xr::XrService { xr: xr.clone() }));
+        }
         registry.register("multidisplay", Box::new(pipe::misc::Silent("multidisplay")));
         registry.register("qemud:camera", Box::new(pipe::fingerprint::CameraService));
         registry.register("GLProcessPipe", Box::new(devices::goldfish_pipe::GlProcess::default()));

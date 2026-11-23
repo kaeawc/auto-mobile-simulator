@@ -51,7 +51,7 @@ Details, and the decisions behind them: [docs/architecture.md](docs/architecture
 | watch | Wear OS | watchOS | touch, rotary input / Digital Crown, buttons |
 | tv | Android TV | tvOS | D-pad remote / Siri Remote, keyboard |
 | auto | Android Automotive | CarPlay | touch, head unit |
-| vision | unsupported: no Android headset image | visionOS | gaze, pinch, keyboard |
+| vision | Android XR | visionOS | eye tracking / gaze, hand tracking / pinch, keyboard |
 
 `sim-rs form-factors` prints this matrix (and `call form_factors` returns it with reference
 screen sizes, densities, shapes and fold states). Unsupported combinations are rejected with the

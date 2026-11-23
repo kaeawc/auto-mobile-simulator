@@ -34,11 +34,14 @@ pub fn sites_url() -> String {
     format!("{REPO_URL}addons_list-5.xml")
 }
 
-/// The system-image manifest that carries `tag`. `default` lives under `sys-img/android/`, and
-/// 16 KB page-size variants (`google_apis_ps16k`) share their base tag's manifest.
+/// The system-image manifest that carries `tag`. `default` lives under `sys-img/android/`, 16 KB
+/// page-size variants (`google_apis_ps16k`) share their base tag's manifest, and every Android XR
+/// image (`google-xr`, `android-xr-*`, `ai-glasses`, or the `android-xr` tag they carry) is
+/// under `sys-img/google_xr/`.
 pub fn sys_img_url(tag: &str) -> String {
     let dir = match tag {
         "default" => "android",
+        t if sim_core::form_factor::is_xr_tag(t) => "google_xr",
         t => t.strip_suffix("_ps16k").unwrap_or(t),
     };
     format!("{REPO_URL}sys-img/{dir}/sys-img2-3.xml")
