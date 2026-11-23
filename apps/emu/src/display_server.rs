@@ -631,9 +631,13 @@ mod tests {
     #[test]
     fn a_client_can_go_back_to_socket_frames() {
         let rig = Rig::new("back");
-        let (mut d, mut reader) = rig.connect(true, 4096);
-        d.send(&Input::Socket).expect("socket");
-        std::thread::sleep(Duration::from_millis(50));
+        // Lines are handled in order, so the stream starts after `socket` took effect.
+        let mut d = Display::connect(&rig.dir).expect("connect");
+        for input in [Input::Shared, Input::Socket, Input::Hello { max_width: 4096 }] {
+            d.send(&input).expect("send");
+        }
+        let mut reader = d.try_clone().expect("clone");
+        reader.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
         rig.store.posted(3, 2);
         // The header-only decoder: an EMUR or EMUS here would be an error.
         let (h, rgba) = read_frame(&mut reader).expect("socket frame");
