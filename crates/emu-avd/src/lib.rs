@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 pub use bootconfig::BootConfig;
 pub use ini::parse_ini;
-use sim_core::form_factor::{ANDROID_GLASSES_SCREEN, Density, FormFactor, Profile, android_profile};
+use sim_core::form_factor::{ANDROID_GLASSES_SCREEN, Density, FormFactor, Profile, Shape, android_profile};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -183,6 +183,44 @@ impl Avd {
         })
     }
 
+    /// Whether the device has hardware Back/Home keys (`hw.mainKeys`, stock's default yes). The
+    /// guest hides its navigation bar when it does (`qemu.hw.mainkeys=1`).
+    pub fn main_keys(&self) -> bool {
+        self.get("hw.mainKeys").is_none_or(|v| matches!(v.trim(), "yes" | "true"))
+    }
+
+    /// The properties stock forwards to the guest at boot from `boot.prop`: the AVD's own, else
+    /// the system image's (avdmanager writes `ro.emulator.circular=true` for round watches).
+    pub fn boot_properties(&self) -> Vec<(String, String)> {
+        [self.dir.join("boot.prop"), self.sysdir.join("boot.prop")]
+            .iter()
+            .find_map(|p| std::fs::read_to_string(p).ok())
+            .map(|text| parse_properties(&text))
+            .unwrap_or_default()
+    }
+
+    /// The properties the stock host hands the guest's `qemu-props` for this AVD: `boot.prop`'s
+    /// lines, then the LCD density and whether there are hardware keys (set last, as in stock).
+    pub fn qemu_props(&self) -> Vec<(String, String)> {
+        let mut props = self.boot_properties();
+        props.push(("qemu.sf.lcd_density".to_owned(), self.lcd().2.to_string()));
+        props.push(("qemu.hw.mainkeys".to_owned(), if self.main_keys() { "1" } else { "0" }.to_owned()));
+        props
+    }
+
+    /// Whether the screen is round: `ro.emulator.circular` in `boot.prop` (what stock checks;
+    /// `1`, `y`, `on`, `yes`, `true` and their prefixes count), or `hw.lcd.circular`.
+    pub fn circular(&self) -> bool {
+        let truthy = |v: &str| ["1", "y", "on", "yes", "true"].iter().any(|t| v.starts_with(t));
+        self.boot_properties().iter().any(|(k, v)| k == "ro.emulator.circular" && truthy(v)) || self.flag("hw.lcd.circular")
+    }
+
+    /// The sensors the guest's HAL is told about (`list-sensors`), decided like stock: by the
+    /// `hw.sensor*` flags, plus heart rate and wrist tilt on Wear OS at API 28 and later.
+    pub fn sensor_mask(&self) -> u32 {
+        sim_core::goldfish::sensor_mask(|k| self.get(k).map(str::to_owned), self.profile().kind.form_factor, self.api_level())
+    }
+
     /// API level from the system image's `source.properties`, if present.
     pub fn api_level(&self) -> Option<u32> {
         let props = std::fs::read_to_string(self.sysdir.join("source.properties")).ok()?;
@@ -221,11 +259,19 @@ pub struct NewAvd {
     pub ram_mb: u64,
     pub cores: u32,
     pub data_gb: u32,
+    /// Hardware Back/Home keys (`hw.mainKeys`): the guest then shows no navigation bar.
+    pub main_keys: bool,
+    /// A D-pad (`hw.dPad`).
+    pub dpad: bool,
     /// More `config.ini` lines (a foldable's hinge sensor, for one).
     pub extra: Vec<(String, String)>,
+    /// `<avd>/boot.prop` lines, forwarded to the guest at boot (a round watch's
+    /// `ro.emulator.circular`). None writes no file.
+    pub boot_props: Vec<(String, String)>,
 }
 
 impl NewAvd {
+    /// A phone: on-screen navigation, no D-pad, a hardware keyboard.
     pub fn new(name: &str, sysdir: &str) -> NewAvd {
         NewAvd {
             name: name.to_string(),
@@ -234,28 +280,62 @@ impl NewAvd {
             ram_mb: 2048,
             cores: 4,
             data_gb: 4,
+            main_keys: false,
+            dpad: false,
             extra: Vec::new(),
+            boot_props: Vec::new(),
         }
     }
 
-    /// An AVD shaped like `profile`: its screen, and for a foldable the hinge sensor the stock
-    /// emulator's foldable definitions declare (one hinge, 0-180°, three postures).
+    /// An AVD shaped like `profile`: its screen, and the hardware the SDK's device profiles give
+    /// its form factor.
     pub fn for_profile(name: &str, sysdir: &str, profile: &Profile) -> NewAvd {
         let mut spec = NewAvd::new(name, sysdir);
         if let Density::Dpi(dpi) = profile.density {
             spec.lcd = (profile.width, profile.height, dpi);
         }
-        if let Some(fold) = profile.fold.filter(|_| profile.kind.form_factor == FormFactor::Foldable) {
-            let kv = |k: &str, v: String| (k.to_owned(), v);
-            spec.extra = vec![
-                kv("hw.sensor.hinge", "yes".into()),
-                kv("hw.sensor.hinge.count", "1".into()),
-                kv("hw.sensor.hinge.type", "0".into()),
-                kv("hw.sensor.hinge.ranges", "0-180".into()),
-                kv("hw.sensor.hinge.defaults", format!("{}", fold.angle)),
-                kv("hw.sensor.posture_list", "1,2,3".into()),
-                kv("hw.sensor.hinge_angles_posture_definitions", "0-30, 30-150, 150-180".into()),
-            ];
+        let kv = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        match profile.kind.form_factor {
+            // The hinge sensor the stock emulator's foldable definitions declare (one hinge,
+            // 0-180°, three postures).
+            FormFactor::Foldable => {
+                if let Some(fold) = profile.fold {
+                    spec.extra = vec![
+                        kv("hw.sensor.hinge", "yes"),
+                        kv("hw.sensor.hinge.count", "1"),
+                        kv("hw.sensor.hinge.type", "0"),
+                        kv("hw.sensor.hinge.ranges", "0-180"),
+                        kv("hw.sensor.hinge.defaults", &fold.angle.to_string()),
+                        kv("hw.sensor.posture_list", "1,2,3"),
+                        kv("hw.sensor.hinge_angles_posture_definitions", "0-30, 30-150, 150-180"),
+                    ];
+                }
+            }
+            // Wear OS: 512 MB (booted with stock's 512 MB of padding, see `Avd::ram_bytes`),
+            // hardware keys, no D-pad; avdmanager marks a round screen in boot.prop.
+            FormFactor::Watch => {
+                spec.ram_mb = 512;
+                spec.main_keys = true;
+                if profile.shape == Shape::Round {
+                    spec.boot_props.push(kv("ro.emulator.circular", "true"));
+                }
+            }
+            // Android TV (tv.xml): 2 GB (stock refuses less than 1 GB), hardware keys, a D-pad.
+            FormFactor::Tv => {
+                spec.ram_mb = 2048;
+                spec.main_keys = true;
+                spec.dpad = true;
+            }
+            // Automotive (device/generic/car/common/config.ini): 4 GB, on-screen navigation,
+            // and only the motion sensors.
+            FormFactor::Auto => {
+                spec.ram_mb = 4096;
+                spec.extra = ["light", "pressure", "humidity", "proximity", "magnetic_field", "orientation", "temperature"]
+                    .iter()
+                    .map(|s| kv(&format!("hw.sensors.{s}"), "no"))
+                    .collect();
+            }
+            FormFactor::Phone | FormFactor::Tablet | FormFactor::Vision => {}
         }
         // Android XR, as the SDK defines its devices: the headset has 4 GiB, the display glasses
         // (`ai_glasses_device`) 2; both are landscape.
@@ -291,20 +371,27 @@ impl Env {
         let pointer_body = format!("avd.ini.encoding=UTF-8\npath={}\npath.rel=avd/{}.avd\ntarget={target}\n", dir.display(), spec.name);
         std::fs::write(&pointer, pointer_body).map_err(|e| io(&pointer, e))?;
         let (w, h, dpi) = spec.lcd;
+        let yes_no = |b: bool| if b { "yes" } else { "no" };
         let config = format!(
             "AvdId={name}\navd.ini.displayname={name}\nabi.type={abi}\nhw.cpu.arch={arch}\nhw.cpu.ncore={cores}\n\
              hw.ramSize={ram}\nhw.lcd.width={w}\nhw.lcd.height={h}\nhw.lcd.density={dpi}\nhw.gpu.enabled=yes\n\
-             hw.gpu.mode=auto\nhw.keyboard=yes\nhw.sdCard=no\nimage.sysdir.1={sysdir}\ntag.id={tag}\n\
-             disk.dataPartition.size={data}G\nfastboot.forceColdBoot=yes\n",
+             hw.gpu.mode=auto\nhw.keyboard=yes\nhw.mainKeys={main_keys}\nhw.dPad={dpad}\nhw.trackBall=no\n\
+             hw.sdCard=no\nimage.sysdir.1={sysdir}\ntag.id={tag}\ndisk.dataPartition.size={data}G\nfastboot.forceColdBoot=yes\n",
             name = spec.name,
             cores = spec.cores,
             ram = spec.ram_mb,
+            main_keys = yes_no(spec.main_keys),
+            dpad = yes_no(spec.dpad),
             sysdir = spec.sysdir,
             data = spec.data_gb,
         );
-        let config: String = config + &spec.extra.iter().map(|(k, v)| format!("{k}={v}\n")).collect::<String>();
+        let lines = |kv: &[(String, String)]| kv.iter().map(|(k, v)| format!("{k}={v}\n")).collect::<String>();
         let cfg = dir.join("config.ini");
-        std::fs::write(&cfg, config).map_err(|e| io(&cfg, e))?;
+        std::fs::write(&cfg, config + &lines(&spec.extra)).map_err(|e| io(&cfg, e))?;
+        if !spec.boot_props.is_empty() {
+            let boot = dir.join("boot.prop");
+            std::fs::write(&boot, lines(&spec.boot_props)).map_err(|e| io(&boot, e))?;
+        }
         Ok(dir)
     }
 }
@@ -366,6 +453,18 @@ pub fn running_instances_in(dir: &Path) -> Vec<Running> {
         .flatten()
         .filter_map(|e| Running::parse(e.file_name().to_str()?, &std::fs::read_to_string(e.path()).ok()?))
         .filter(Running::alive)
+        .collect()
+}
+
+/// Parses an Android property file (`name=value` lines; blank lines, `#` comments and lines
+/// without `=` skipped), in order.
+pub fn parse_properties(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split_once('='))
+        .filter(|(k, _)| !k.trim().is_empty())
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
         .collect()
 }
 
@@ -481,6 +580,81 @@ mod tests {
         assert_eq!(made.profile().kind.label(), "Android XR · Vision");
         let glasses = NewAvd::for_profile("glasses", "system-images/android-36/ai-glasses/arm64-v8a", &xr.image_profile("ai-glasses"));
         assert_eq!((glasses.lcd, glasses.ram_mb), ((450, 450, 160), 2048));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn properties_parse_in_order() {
+        let text = "# avdmanager\nro.emulator.circular = true\n\n  qemu.x=a=b\nnot a property\n=v\n";
+        let expect = [("ro.emulator.circular", "true"), ("qemu.x", "a=b")].map(|(k, v)| (k.to_string(), v.to_string()));
+        assert_eq!(parse_properties(text), expect);
+    }
+
+    /// Creates each form factor's AVD from its profile and loads it back.
+    #[test]
+    fn new_avds_get_their_form_factors_hardware() {
+        use sim_core::form_factor::Kind;
+        use sim_core::platform::Platform;
+        let tmp = std::env::temp_dir().join(format!("emu-avd-kinds-{}", std::process::id()));
+        let sdk = tmp.join("sdk");
+        let env = Env { sdk_root: Some(sdk.clone()), avd_home: tmp.join("avd") };
+        let image = |tag: &str, api: u32| {
+            let rel = format!("system-images/android-{api}/{tag}/arm64-v8a");
+            let dir = sdk.join(&rel);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("system.img"), b"s").expect("write");
+            std::fs::write(dir.join("source.properties"), format!("AndroidVersion.ApiLevel={api}\n")).expect("write");
+            rel
+        };
+        let create = |name: &str, form_factor: FormFactor, sysdir: &str| {
+            let profile = Kind::new(Platform::Android, form_factor).expect("kind").profile();
+            env.create_avd(&NewAvd::for_profile(name, sysdir, &profile)).expect("create");
+            env.load(name).expect("load")
+        };
+        let hw =
+            |avd: &Avd| ["hw.mainKeys", "hw.dPad", "hw.keyboard", "hw.trackBall"].map(|k| avd.get(k).unwrap_or("-").to_string()).join(" ");
+        let phone_mask = 0x7ff | (1 << 17);
+
+        let phone = create("phone", FormFactor::Phone, &image("google_apis", 36));
+        assert_eq!(hw(&phone), "no no yes no");
+        assert_eq!((phone.main_keys(), phone.circular(), phone.ram_bytes()), (false, false, 2 << 30));
+        assert_eq!(phone.qemu_props().last(), Some(&("qemu.hw.mainkeys".to_string(), "0".to_string())), "a navigation bar");
+        assert!(!phone.dir.join("boot.prop").exists());
+        assert_eq!(phone.sensor_mask(), phone_mask);
+
+        // Wear: 512 MB (booted as 1 GB), hardware keys, round, heart rate and wrist tilt.
+        let watch = create("watch", FormFactor::Watch, &image("android-wear", 34));
+        assert_eq!(hw(&watch), "yes no yes no");
+        assert_eq!((watch.get("hw.ramSize"), watch.ram_bytes()), (Some("512"), 1 << 30));
+        assert_eq!(watch.boot_properties(), [("ro.emulator.circular".to_string(), "true".to_string())]);
+        assert!(watch.main_keys() && watch.circular());
+        let props: Vec<String> = watch.qemu_props().iter().map(|(k, v)| format!("{k}={v}")).collect();
+        assert_eq!(props, ["ro.emulator.circular=true", "qemu.sf.lcd_density=320", "qemu.hw.mainkeys=1"]);
+        assert_eq!(watch.sensor_mask(), phone_mask | (1 << 14) | (1 << 16));
+
+        let tv = create("tv", FormFactor::Tv, &image("google-tv", 34));
+        assert_eq!(hw(&tv), "yes yes yes no");
+        assert_eq!((tv.profile().kind.form_factor, tv.ram_bytes(), tv.circular()), (FormFactor::Tv, 2 << 30, false));
+
+        let car = create("car", FormFactor::Auto, &image("android-automotive", 34));
+        assert_eq!(hw(&car), "no no yes no");
+        assert_eq!((car.profile().kind.form_factor, car.ram_bytes()), (FormFactor::Auto, 4 << 30));
+        assert_eq!(car.sensor_mask(), 0b11 | (1 << 9) | (1 << 10) | (1 << 17), "motion sensors only");
+
+        let fold = create("fold", FormFactor::Foldable, &image("google_apis", 36));
+        assert_eq!(fold.sensor_mask(), phone_mask | (1 << 11), "the hinge reaches the HAL");
+        assert_eq!(hw(&fold), "no no yes no");
+
+        // An AVD without boot.prop falls back to the image's; `hw.mainKeys` defaults to yes.
+        let mut bare = phone.clone();
+        bare.config.remove("hw.mainKeys");
+        assert!(bare.main_keys(), "stock's default");
+        std::fs::write(bare.sysdir.join("boot.prop"), "ro.emulator.circular=1\n").expect("write");
+        assert!(bare.circular());
+        std::fs::write(bare.dir.join("boot.prop"), "ro.emulator.circular=no\n").expect("write");
+        assert!(!bare.circular(), "the AVD's boot.prop wins");
+        bare.config.insert("hw.lcd.circular".into(), "yes".into());
+        assert!(bare.circular());
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

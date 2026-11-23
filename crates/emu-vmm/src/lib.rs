@@ -326,7 +326,7 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     if let Some((w, h)) = cfg.input {
         use virtio::input::{Input, Kind};
         let (touch, th) = Input::new(Kind::Touch { width: w, height: h }, "virtio_input_multi_touch_1");
-        let (kbd, kh) = Input::new(Kind::Keyboard, "virtio_input_keyboard");
+        let (kbd, kh) = Input::new(Kind::Keyboard, virtio::input::KEYBOARD_NAME);
         let (rot, rh) = Input::new(Kind::Rotary, "virtio_input_rotary");
         slots[slots::TOUCH as usize] = Some(Box::new(touch));
         slots[slots::KEYBOARD as usize] = Some(Box::new(kbd));

@@ -148,23 +148,26 @@ impl Button {
             || self.apple_remote_key().is_some()
     }
 
-    /// The Android emulator console's key name for this button (`event send EV_KEY:<name>:1`), if
-    /// Android has it. D-pad center is `KEY_SELECT` (353), which Android maps to DPAD_CENTER.
+    /// The Android emulator console's key for this button (`event send EV_KEY:<key>:1`), if
+    /// Android has it: a stock console name, so stock emulators take it too, or a keycode where
+    /// stock has no name. The codes are what goldfish's `qwerty2.kl` maps: `KEY_CENTER` (232) is
+    /// DPAD_CENTER, 580 (Linux `KEY_APPSELECT`) is APP_SWITCH, `KEY_PLAYPAUSE` (164) is
+    /// MEDIA_PLAY_PAUSE.
     pub fn android_key(self) -> Option<&'static str> {
         Some(match self {
-            Self::Home => "HOME",
-            Self::Lock | Self::Side => "POWER",
-            Self::Back => "BACK",
-            Self::VolumeUp => "VOLUMEUP",
-            Self::VolumeDown => "VOLUMEDOWN",
-            Self::Recents => "APPSELECT",
-            Self::Menu => "MENU",
-            Self::DpadUp => "UP",
-            Self::DpadDown => "DOWN",
-            Self::DpadLeft => "LEFT",
-            Self::DpadRight => "RIGHT",
-            Self::DpadCenter => "353",
-            Self::PlayPause => "PLAYPAUSE",
+            Self::Home => "KEY_HOME",
+            Self::Lock | Self::Side => "KEY_POWER",
+            Self::Back => "KEY_BACK",
+            Self::VolumeUp => "KEY_VOLUMEUP",
+            Self::VolumeDown => "KEY_VOLUMEDOWN",
+            Self::Recents => "580",
+            Self::Menu => "KEY_MENU",
+            Self::DpadUp => "KEY_UP",
+            Self::DpadDown => "KEY_DOWN",
+            Self::DpadLeft => "KEY_LEFT",
+            Self::DpadRight => "KEY_RIGHT",
+            Self::DpadCenter => "KEY_CENTER",
+            Self::PlayPause => "KEY_PLAYPAUSE",
             Self::Siri | Self::ApplePay | Self::Action => return None,
         })
     }
@@ -209,6 +212,9 @@ pub const KEY_RETURN: u32 = 0x28;
 
 /// The Linux input keycode (`KEY_*`, what Android's virtio keyboard takes) for a HID keyboard usage,
 /// so one key map ([`keystroke`]) types on both platforms. `None` for usages without one.
+///
+/// The guest reads them through goldfish's `qwerty2.kl`, where grave is 399 (`KEY_GREEN`), 102
+/// and 107 are HOME and ENDCALL, and the text cursor's Home and End are 452 and 453.
 pub fn linux_keycode(usage: u32) -> Option<u16> {
     // a..z in usage order (0x04..=0x1d).
     const LETTERS: [u16; 26] = [30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44];
@@ -228,7 +234,7 @@ pub fn linux_keycode(usage: u32) -> Option<u16> {
         0x31 => 43,
         0x33 => 39,
         0x34 => 40,
-        0x35 => 41,
+        0x35 => 399,
         0x36 => 51,
         0x37 => 52,
         0x38 => 53,
@@ -236,10 +242,10 @@ pub fn linux_keycode(usage: u32) -> Option<u16> {
         0x3a..=0x43 => 59 + (usage - 0x3a) as u16,
         0x44 => 87,
         0x45 => 88,
-        0x4a => 102,
+        0x4a => 452,
         0x4b => 104,
         0x4c => 111,
-        0x4d => 107,
+        0x4d => 453,
         0x4e => 109,
         0x4f => 106,
         0x50 => 105,
@@ -445,11 +451,12 @@ mod tests {
 
     #[test]
     fn buttons_map_per_platform() {
-        assert_eq!((Button::Back.apple_press(None), Button::Back.android_key()), (None, Some("BACK")));
+        assert_eq!((Button::Back.apple_press(None), Button::Back.android_key()), (None, Some("KEY_BACK")));
         assert_eq!((Button::Siri.apple_press(None).map(|p| p.source), Button::Siri.android_key()), (Some(0x40_0002), None));
-        assert_eq!(Button::PlayPause.android_key(), Some("PLAYPAUSE"));
-        assert_eq!(Button::Lock.android_key(), Some("POWER"));
-        assert_eq!(Button::DpadCenter.android_key(), Some("353"));
+        assert_eq!(Button::PlayPause.android_key(), Some("KEY_PLAYPAUSE"));
+        assert_eq!(Button::Lock.android_key(), Some("KEY_POWER"));
+        assert_eq!(Button::DpadCenter.android_key(), Some("KEY_CENTER"));
+        assert_eq!(Button::Recents.android_key(), Some("580"));
     }
 
     #[test]
@@ -511,12 +518,14 @@ mod tests {
     #[test]
     fn hid_usages_map_to_linux_keycodes() {
         let code = |c: char| keystroke(c).and_then(|k| linux_keycode(k.usage));
-        // The Linux codes the Android console names (emu-vmm's `keycode`): Q=16, A=30, Z=44, 1=2, 0=11.
+        // The Linux codes the Android console names (`goldfish::keycode`): Q=16, A=30, Z=44, 1=2, 0=11.
         assert_eq!([code('q'), code('a'), code('z'), code('1'), code('0')], [Some(16), Some(30), Some(44), Some(2), Some(11)]);
         assert_eq!([code('m'), code(' '), code('\n'), code('/')], [Some(50), Some(57), Some(28), Some(53)]);
         assert_eq!(linux_keycode(KEY_LEFT_SHIFT), Some(42));
         assert_eq!(linux_keycode(0x50), Some(105));
         assert_eq!(linux_keycode(0x32), None);
+        // What qwerty2.kl expects for grave and the cursor's Home and End.
+        assert_eq!([code('`'), code('~'), linux_keycode(0x4a), linux_keycode(0x4d)], [Some(399), Some(399), Some(452), Some(453)]);
         // Every key a US-layout character can need has a Linux code.
         for c in (' '..='~').chain(['\n', '\t']) {
             if let Some(k) = keystroke(c) {

@@ -164,6 +164,7 @@ dependencies = [
  "flate2",
  "libc",
  "rustix",
+ "sim-core",
 ]
 
 [[package]]

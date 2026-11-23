@@ -385,7 +385,8 @@ impl Device {
         self.console(&[format!("sensor set hinge-angle0 {angle}")]).map(drop)
     }
 
-    /// Turns the rotary input (Wear OS crown or bezel) by `ticks`. Watches only.
+    /// Turns the rotary input (Wear OS crown or bezel) by `ticks` clicks, which the emulator
+    /// scales to stock's 15 units per click (`sim_core::stream::wheel_units`). Watches only.
     pub fn rotary(&self, ticks: i32) -> Result<(), String> {
         self.require(InputMethod::Rotary, "rotary input")?;
         display::Display::connect(&self.avd()?.dir)?.send(&Input::Wheel(ticks))
@@ -633,8 +634,8 @@ mod tests {
             [
                 "event send EV_KEY:42:1 EV_KEY:35:1 EV_KEY:35:0 EV_KEY:42:0",
                 "event send EV_KEY:23:1 EV_KEY:23:0",
-                "event send EV_KEY:HOME:1",
-                "event send EV_KEY:BACK:0",
+                "event send EV_KEY:KEY_HOME:1",
+                "event send EV_KEY:KEY_BACK:0",
                 "event send EV_KEY:28:1",
                 "geo fix -122.25 37.5",
                 "rotate",
