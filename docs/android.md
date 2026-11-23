@@ -253,6 +253,22 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   receive buffers (`cargo test --release -p emu-vmm vsock_throughput -- --ignored`): median of 5,
   284 → 512 MiB/s on a 4-core Linux VM. Guest→host (`vsock_throughput_to_host`, 64 KiB
   packets) runs at about 4 GiB/s, so host→guest's limit is the guest's small receive buffers.
+- **vsock backpressure: a stalled client stalls only itself.** One worker thread serves every
+  pipe, and the adb forwarder used to `write_all` to its client on it, so an adb client that
+  stopped reading (`kill -STOP`) froze sensors, GPS, the vehicle HAL and every other adb session
+  once its socket filled. Now the worker advertises `fwd_cnt` only for bytes a pipe has
+  delivered (`PipeHandler::backlog`), as Firecracker and Cloud Hypervisor do, and sends the
+  credit update itself, because Linux guests never send CREDIT_REQUEST. The forwarder sends
+  without waiting and queues the rest for a writer thread, at most the 256 KiB the guest was
+  allowed. A guest that sends past its credit is reset, as Linux resets one. The other
+  direction is bounded too: a client is read only while less than 1 MiB waits for the guest
+  (`guest_took`). The stock emulator's vsock path buffers without limit both ways. Connections
+  take turns for rx buffers (a ready queue rather than a scan per buffer), and tx waits while
+  a queue's worth of replies waits for rx buffers, as vhost-vsock does. Medians of 10
+  interleaved runs on a 4-core Linux VM, before → after: `vsock_throughput` 474 → 597 MiB/s,
+  `vsock_throughput_to_host` 5.9 → 6.4 GiB/s (its guest now honours credit),
+  `adb_throughput_to_guest` (TCP client → guest, end to end) 498 → 870 MiB/s,
+  `adb_throughput_to_host` 1382 → 1433 MiB/s.
 
 ## Development
 
