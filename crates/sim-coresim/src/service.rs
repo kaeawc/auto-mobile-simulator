@@ -3,8 +3,9 @@
 use std::process::Command;
 use std::ptr;
 
+use block2::{Block, RcBlock};
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyObject, Sel};
 use objc2::{msg_send, sel};
 use objc2_foundation::{NSError, NSString};
 use sim_core::device::{DeviceInfo, DeviceState, DeviceTypeInfo, RuntimeInfo, Selection, select};
@@ -108,13 +109,18 @@ impl Context {
 
     /// Resolves a UDID, a name, or `booted`.
     pub fn device(&self, query: &str) -> Result<Device> {
+        self.resolve(query).map(|(device, _)| device)
+    }
+
+    /// Resolves a UDID, a name, or `booted`, with the device's info (read while selecting).
+    pub fn resolve(&self, query: &str) -> Result<(Device, DeviceInfo)> {
         // Unsorted, and each device's info read once (it's several Objective-C calls): `select`
         // doesn't depend on order.
         let list = rt::object_prop(&self.set, sel!(devices))?;
         let mut devices: Vec<Device> = rt::array_items(&list).into_iter().map(|obj| Device { obj, kit: self.kit }).collect();
-        let infos: Vec<DeviceInfo> = devices.iter().map(Device::info).collect();
+        let mut infos: Vec<DeviceInfo> = devices.iter().map(Device::info).collect();
         match select(&infos, query) {
-            Selection::One(i) => Ok(devices.swap_remove(i)),
+            Selection::One(i) => Ok((devices.swap_remove(i), infos.swap_remove(i))),
             Selection::None => Err(Error::NotFound(query.to_owned())),
             Selection::Ambiguous => Err(Error::Ambiguous(query.to_owned())),
         }
@@ -207,6 +213,23 @@ pub struct Device {
     kit: Library,
 }
 
+/// A registered state handler ([`Device::watch_state`]); dropping it unregisters the handler.
+pub struct StateWatch {
+    device: Obj,
+    handle: u64,
+    _block: RcBlock<dyn Fn(*mut AnyObject)>,
+}
+
+impl Drop for StateWatch {
+    fn drop(&mut self) {
+        // SAFETY: the device responds to the selector (checked at registration), which takes
+        // (unsigned long long, NSError **) and returns BOOL; the handle is the registration's.
+        let done: std::result::Result<(), Retained<NSError>> =
+            unsafe { msg_send![&*self.device, unregisterNotificationHandler: self.handle, error: _] };
+        done.ok();
+    }
+}
+
 const MACH_SEND_MSG: i32 = 0x1;
 const MACH_SEND_TIMEOUT: i32 = 0x10;
 
@@ -258,6 +281,40 @@ impl Device {
         }
         // SAFETY: `state` returns an unsigned long long (checked to exist).
         DeviceState::from_raw(unsafe { msg_send![&*self.obj, state] })
+    }
+
+    /// When the device's current (or last) boot began, in seconds since the reference date; `None`
+    /// when the service doesn't say. A reboot changes it.
+    pub fn last_booted_at(&self) -> Option<f64> {
+        let date = rt::optional_prop(&self.obj, sel!(lastBootedAt))?;
+        // SAFETY: an NSDate's `timeIntervalSinceReferenceDate` takes no arguments and returns a double.
+        unsafe { rt::send_scalar(&date, sel!(timeIntervalSinceReferenceDate)) }
+    }
+
+    /// Calls `on_change` whenever the device's state changes (booting, booted, shutting down,
+    /// shut down), until the returned watch drops: the device's `device_state` notifications, the
+    /// signal idb drops its HID connection on. `on_change` runs on a service queue: keep it short.
+    pub fn watch_state(&self, on_change: impl Fn() + Send + Sync + 'static) -> Result<StateWatch> {
+        let register = sel!(registerNotificationHandler:);
+        rt::require(&self.obj, register)?;
+        rt::require(&self.obj, sel!(unregisterNotificationHandler:error:))?;
+        let block = RcBlock::new(move |info: *mut AnyObject| {
+            // A notification that can't be read counts as a change: reconnecting is always safe.
+            let state = crate::autoreleasepool(|| {
+                // SAFETY: the service passes nil or a valid NSDictionary for the duration of the call.
+                unsafe { info.as_ref() }.and_then(|d| rt::dict_string(d, "notification")).is_none_or(|n| n == "device_state")
+            });
+            if state {
+                on_change();
+            }
+        });
+        type RegisterFn = unsafe extern "C" fn(*const AnyObject, Sel, *const Block<dyn Fn(*mut AnyObject)>) -> u64;
+        // SAFETY: the method's signature is (void (^)(NSDictionary *)) -> unsigned long long.
+        let send: RegisterFn = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
+        // SAFETY: the device responds to the selector (checked); the service copies the block, and
+        // the watch keeps ours alive until it unregisters.
+        let handle = unsafe { send(&*self.obj, register, &*block) };
+        Ok(StateWatch { device: self.obj.clone(), handle, _block: block })
     }
 
     /// Whether the device reports its boot sequence finished (data migration done, SpringBoard up).

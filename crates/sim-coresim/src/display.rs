@@ -2,9 +2,10 @@
 
 use std::ffi::c_void;
 
+use block2::{Block, RcBlock};
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
-use objc2::{msg_send, sel};
+use objc2::runtime::{AnyObject, Sel};
+use objc2::{class, msg_send, sel};
 use sim_core::frame::Frame;
 use sim_core::pixels::bgra_to_rgba;
 
@@ -102,6 +103,27 @@ impl Display {
         Ok((w as u32, h as u32))
     }
 
+    /// Calls `on_frame` whenever the device presents a frame, until the returned watch drops. It is
+    /// the port's damage-rectangle callback (Xcode 9 on; modern runtimes call it once per frame,
+    /// with no rectangles), what idb's lazy video stream follows. `on_frame` runs on a service
+    /// thread while the service waits: keep it to a flag and a wakeup.
+    pub fn watch_frames(&self, on_frame: impl Fn() + Send + Sync + 'static) -> Result<FrameWatch> {
+        let register = sel!(registerCallbackWithUUID:damageRectanglesCallback:);
+        rt::require(&self.descriptor, register)?;
+        rt::require(&self.descriptor, sel!(unregisterDamageRectanglesCallbackWithUUID:))?;
+        // SAFETY: `+[NSUUID UUID]` returns a new random UUID.
+        let uuid: Obj = unsafe { msg_send![class!(NSUUID), UUID] };
+        let block = RcBlock::new(move |_rects: *mut AnyObject| on_frame());
+        type RegisterFn = unsafe extern "C" fn(*const AnyObject, Sel, *const AnyObject, *const Block<dyn Fn(*mut AnyObject)>);
+        // SAFETY: the method's signature is (NSUUID *, void (^)(NSArray *)) -> void; the descriptor
+        // is a remote proxy, so it's called through `objc_msgSend`, not `msg_send!`.
+        let send: RegisterFn = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
+        // SAFETY: the descriptor responds to the selector (checked); the service copies the block,
+        // and the watch keeps ours alive until it unregisters.
+        unsafe { send(&*self.descriptor, register, &*uuid, &*block) };
+        Ok(FrameWatch { descriptor: self.descriptor.clone(), uuid, _block: block })
+    }
+
     /// Copies the current framebuffer contents.
     pub fn capture(&self) -> Result<Frame> {
         let surface = self.surface().ok_or_else(|| Error::NoDisplay("no framebuffer surface yet".into()))?;
@@ -130,6 +152,25 @@ impl Display {
         unsafe { IOSurfaceUnlock(s, LOCK_READ_ONLY, std::ptr::null_mut()) };
         let rgba = rgba.ok_or_else(|| Error::NoDisplay("framebuffer geometry is inconsistent".into()))?;
         Ok(Frame { width: width as u32, height: height as u32, rgba })
+    }
+}
+
+/// A registered frame callback ([`Display::watch_frames`]); dropping it unregisters the callback.
+pub struct FrameWatch {
+    descriptor: Obj,
+    uuid: Obj,
+    _block: RcBlock<dyn Fn(*mut AnyObject)>,
+}
+
+impl Drop for FrameWatch {
+    fn drop(&mut self) {
+        type UnregisterFn = unsafe extern "C" fn(*const AnyObject, Sel, *const AnyObject);
+        // SAFETY: the method's signature is (NSUUID *) -> void; called through `objc_msgSend` as
+        // the descriptor is a remote proxy.
+        let send: UnregisterFn = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
+        // SAFETY: the descriptor responds to the selector (checked at registration); `uuid` is the
+        // registration's.
+        unsafe { send(&*self.descriptor, sel!(unregisterDamageRectanglesCallbackWithUUID:), &*self.uuid) };
     }
 }
 

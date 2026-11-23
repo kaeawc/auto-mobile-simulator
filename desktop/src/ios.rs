@@ -15,6 +15,7 @@ use sim_core::geometry::{Point, Size};
 use sim_core::gesture::Phase;
 use sim_core::hid::Direction;
 use sim_core::hid::{Button, CROWN_UNITS_PER_TICK, KEY_LEFT_SHIFT, KeyStroke, Orientation};
+use sim_core::pacing::{Pacer, Pacing};
 pub use sim_coresim::Context;
 use sim_coresim::{Appearance, Device, Frame, Hid, Surface};
 
@@ -27,6 +28,8 @@ pub struct Live {
     hid: Option<Hid>,
     pub shared: Arc<Shared>,
     capture: Option<JoinHandle<()>>,
+    /// Set when input goes out, so the capture thread looks for its response at once.
+    kicked: Arc<AtomicBool>,
     pub dark: bool,
     orientation: Orientation,
 }
@@ -37,13 +40,15 @@ impl Live {
         let device = ctx.device(udid).map_err(|e| e.to_string())?;
         let hid = device.hid().map_err(|e| e.to_string())?;
         let shared = Arc::new(Shared::default());
-        let capture = spawn_capture(udid.to_owned(), native, shared.clone(), waker)?;
+        let kicked = Arc::new(AtomicBool::new(false));
+        let capture = spawn_capture(udid.to_owned(), native, shared.clone(), kicked.clone(), waker)?;
         Ok(Self {
             udid: udid.to_owned(),
             device,
             hid: Some(hid),
             shared,
             capture: Some(capture),
+            kicked,
             dark: false,
             orientation: Orientation::Portrait,
         })
@@ -53,12 +58,21 @@ impl Live {
         self.shared.size().map(|(w, h)| Size::new(f64::from(w), f64::from(h)))
     }
 
+    /// Input went out: wake the capture thread to look for the response.
+    fn kick(&self) {
+        self.kicked.store(true, Ordering::Relaxed);
+        if let Some(t) = &self.capture {
+            t.thread().unpark();
+        }
+    }
+
     /// Sends a touch at a point given in device pixels.
     pub fn touch(&self, x: f32, y: f32, phase: Phase) {
         let (Some(hid), Some(screen)) = (&self.hid, self.screen()) else { return };
         if let Err(e) = hid.touch(screen.normalize(Point::new(f64::from(x), f64::from(y))), phase) {
             eprintln!("touch: {e}");
         }
+        self.kick();
     }
 
     /// Presses or releases a hardware button. Callers schedule the release so the UI never sleeps.
@@ -67,6 +81,7 @@ impl Live {
         if let Err(e) = hid.button(button, direction) {
             eprintln!("button: {e}");
         }
+        self.kick();
     }
 
     /// Turns an Apple Watch's Digital Crown by rotary ticks (negative turns back).
@@ -75,6 +90,7 @@ impl Live {
         if let Err(e) = hid.crown(f64::from(ticks) * CROWN_UNITS_PER_TICK) {
             eprintln!("crown: {e}");
         }
+        self.kick();
     }
 
     /// Rotates the device 90° clockwise from the orientation this window last set.
@@ -84,6 +100,7 @@ impl Live {
             Ok(()) => self.orientation = next,
             Err(e) => eprintln!("rotate: {e}"),
         }
+        self.kick();
     }
 
     /// The device's data directory on the host.
@@ -114,6 +131,7 @@ impl Live {
                 eprintln!("key: {e}");
             }
         }
+        self.kick();
     }
 
     pub fn toggle_appearance(&mut self) {
@@ -122,6 +140,7 @@ impl Live {
         if let Err(e) = self.device.set_appearance(mode) {
             eprintln!("appearance: {e}");
         }
+        self.kick();
     }
 
     pub fn shutdown(&self) -> Result<(), String> {
@@ -134,6 +153,7 @@ impl Drop for Live {
         self.shared.stop.store(true, Ordering::Relaxed);
         self.hid = None;
         if let Some(t) = self.capture.take() {
+            t.thread().unpark();
             t.join().ok();
         }
     }
@@ -141,8 +161,18 @@ impl Drop for Live {
 
 /// Shows the device framebuffer without copying it: wraps its IOSurface once (again when the
 /// device swaps surfaces, e.g. on rotation) and re-presents it whenever its seed changes. The
-/// thread opens its own service connection: service objects stay on the thread that made them.
-fn spawn_capture(udid: String, native: NativeSurface, shared: Arc<Shared>, waker: rune::Waker) -> Result<JoinHandle<()>, String> {
+/// device announces each frame (the display's frame callback wakes this thread), so a still screen
+/// costs a safety look every 100 ms; without announcements (or once they stop matching the seed)
+/// it polls, fast while the screen changes and backing off to 32 ms when still, and input from
+/// the window wakes it at once. The thread opens its own service connection: service objects stay
+/// on the thread that made them.
+fn spawn_capture(
+    udid: String,
+    native: NativeSurface,
+    shared: Arc<Shared>,
+    kicked: Arc<AtomicBool>,
+    waker: rune::Waker,
+) -> Result<JoinHandle<()>, String> {
     std::thread::Builder::new()
         .name("sim-rs-capture".into())
         .spawn(move || {
@@ -150,33 +180,54 @@ fn spawn_capture(udid: String, native: NativeSurface, shared: Arc<Shared>, waker
                 Ok(d) => d,
                 Err(e) => return eprintln!("capture: {e}"),
             };
+            let announced = Arc::new(AtomicBool::new(false));
+            let watch = {
+                let (announced, this) = (announced.clone(), std::thread::current());
+                display.watch_frames(move || {
+                    announced.store(true, Ordering::Release);
+                    this.unpark();
+                })
+            };
+            let mut pacer = Pacer::new(Pacing::FRAMEBUFFER, Instant::now());
+            match &watch {
+                Ok(_) => pacer = pacer.announcing(),
+                Err(e) => eprintln!("capture: no frame callback ({e}); polling"),
+            }
             let mut current: Option<(Surface, PixelBuffer)> = None;
             let mut last_seed = None;
             let mut frame_id = 0u64;
             let mut next_check = Instant::now();
             while !shared.stop.load(Ordering::Relaxed) {
+                if kicked.swap(false, Ordering::Relaxed) {
+                    pacer.kick(Instant::now());
+                }
+                let announced = announced.swap(false, Ordering::Acquire);
                 if current.is_none() || Instant::now() >= next_check {
                     next_check = Instant::now() + Duration::from_millis(250);
-                    if let Some(surface) = display.surface_handle()
-                        && current.as_ref().is_none_or(|(s, _)| s.as_raw() != surface.as_raw())
-                    {
-                        match crate::surface::wrap(&surface) {
-                            Ok(buffer) => {
-                                let (w, h) = surface.size();
-                                let packed = (w << 16) | (h & 0xffff);
-                                if shared.size.swap(packed, Ordering::Relaxed) != packed {
-                                    waker();
+                    sim_coresim::autoreleasepool(|| {
+                        if let Some(surface) = display.surface_handle()
+                            && current.as_ref().is_none_or(|(s, _)| s.as_raw() != surface.as_raw())
+                        {
+                            match crate::surface::wrap(&surface) {
+                                Ok(buffer) => {
+                                    let (w, h) = surface.size();
+                                    let packed = (w << 16) | (h & 0xffff);
+                                    if shared.size.swap(packed, Ordering::Relaxed) != packed {
+                                        waker();
+                                    }
+                                    current = Some((surface, buffer));
+                                    last_seed = None;
                                 }
-                                current = Some((surface, buffer));
-                                last_seed = None;
+                                Err(e) => eprintln!("capture: {e}"),
                             }
-                            Err(e) => eprintln!("capture: {e}"),
                         }
-                    }
+                    });
                 }
+                let mut changed = false;
                 if let Some((surface, buffer)) = &current {
                     let seed = surface.seed();
                     if Some(seed) != last_seed {
+                        changed = last_seed.is_some();
                         last_seed = Some(seed);
                         frame_id += 1;
                         if let Err(e) = native.push(buffer.clone(), frame_id) {
@@ -185,8 +236,14 @@ fn spawn_capture(udid: String, native: NativeSurface, shared: Arc<Shared>, waker
                         shared.frames.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                std::thread::sleep(Duration::from_millis(2));
+                let trusted = pacer.trusts_announcements();
+                let wait = pacer.polled(changed, announced, Instant::now());
+                if trusted && !pacer.trusts_announcements() {
+                    eprintln!("capture: frames changed without their callback; polling");
+                }
+                std::thread::park_timeout(wait);
             }
+            drop(watch);
             native.clear();
         })
         .map_err(|e| e.to_string())
