@@ -11,13 +11,13 @@ pub trait IrqLine: Send + Sync {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub struct GicSpi {
     intid: u32,
-    wake: Arc<dyn Fn() + Send + Sync>,
+    wake: Arc<dyn Fn(u32) + Send + Sync>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl GicSpi {
-    /// `wake` runs after asserting, to rouse vCPUs parked in a host-side WFI wait.
-    pub fn new(intid: u32, wake: Arc<dyn Fn() + Send + Sync>) -> GicSpi {
+    /// `wake(intid)` runs after asserting, to rouse the vCPU the SPI is routed to.
+    pub fn new(intid: u32, wake: Arc<dyn Fn(u32) + Send + Sync>) -> GicSpi {
         GicSpi { intid, wake }
     }
 }
@@ -29,7 +29,7 @@ impl IrqLine for GicSpi {
             eprintln!("emu: SPI {} -> {level}: {e}", self.intid);
         }
         if level {
-            (self.wake)();
+            (self.wake)(self.intid);
         }
     }
 }

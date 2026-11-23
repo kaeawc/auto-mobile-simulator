@@ -18,6 +18,8 @@ pub struct MachTimebaseInfo {
 
 /// `HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0`.
 pub const GICR_ISPENDR0: u32 = 0x10200;
+/// `HV_GIC_DISTRIBUTOR_REG_GICD_IROUTER32`; IROUTER<n> follows at 8-byte steps (register offsets).
+pub const GICD_IROUTER32: u32 = 0x6100;
 
 #[link(name = "Hypervisor", kind = "framework")]
 unsafe extern "C" {
@@ -49,6 +51,7 @@ unsafe extern "C" {
     pub fn hv_gic_get_redistributor_region_size(size: *mut usize) -> i32;
     pub fn hv_gic_get_spi_interrupt_range(base: *mut u32, count: *mut u32) -> i32;
     pub fn hv_gic_set_spi(intid: u32, level: bool) -> i32;
+    pub fn hv_gic_get_distributor_reg(reg: u32, value: *mut u64) -> i32;
     pub fn hv_gic_set_redistributor_reg(vcpu: u64, reg: u32, value: u64) -> i32;
 }
 
