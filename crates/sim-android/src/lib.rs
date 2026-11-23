@@ -25,6 +25,7 @@ use sim_core::gesture::{Phase, Sample};
 use sim_core::hid::{Button, Direction, KEY_LEFT_SHIFT, KeyStroke, keystroke, linux_keycode};
 use sim_core::platform::{AndroidOs, Platform, SubPlatform};
 use sim_core::stream::Input;
+use sim_core::vhal;
 use sim_core::xr::XrCommand;
 
 /// The Android backend over one SDK and AVD home.
@@ -401,6 +402,31 @@ impl Device {
             None => Err(format!("XR controls: {}'s form factor is unknown", self.info.name)),
         }
     }
+
+    /// Sets a vehicle HAL property through the emulator's `car` console command (an emu-rs
+    /// extension). `property` is a VHAL name (`GEAR_SELECTION`, `gear`) or id; `value` is typed
+    /// by the property (`drive`, `12.5`, `true`). Automotive devices only.
+    pub fn vehicle_set(&self, property: &str, area_id: i32, value: &str) -> Result<(), String> {
+        self.require(InputMethod::HeadUnit, "the vehicle HAL")?;
+        // Checked here so a bad name or value fails before any emulator is involved.
+        let prop = vhal::property(property)?;
+        vhal::parse_value(prop, area_id, value)?;
+        self.console(&[format!("car set {prop:#x} {area_id} {value}")]).map(drop)
+    }
+
+    /// A vehicle HAL property's current value, read from the guest. Automotive devices only.
+    pub fn vehicle_get(&self, property: &str, area_id: i32) -> Result<vhal::Reading, String> {
+        self.require(InputMethod::HeadUnit, "the vehicle HAL")?;
+        let prop = vhal::property(property)?;
+        let lines = self.console(&[format!("car get {prop:#x} {area_id}")])?;
+        lines.iter().find_map(|l| vhal::Reading::parse(l)).ok_or_else(|| format!("unexpected `car get` reply: {lines:?}"))
+    }
+
+    /// Every vehicle HAL property's current value. Automotive devices only.
+    pub fn vehicle_list(&self) -> Result<Vec<vhal::Reading>, String> {
+        self.require(InputMethod::HeadUnit, "the vehicle HAL")?;
+        Ok(self.console(&["car list".into()])?.iter().filter_map(|l| vhal::Reading::parse(l)).collect())
+    }
 }
 
 /// Whether a running instance has finished booting.
@@ -570,6 +596,10 @@ mod tests {
                     let reply = match line.split_whitespace().collect::<Vec<_>>().as_slice() {
                         ["ping"] => "I am alive!\r\nOK".to_owned(),
                         ["frames"] => "3\r\nOK".to_owned(),
+                        ["car", "get", ..] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\nOK".to_owned(),
+                        ["car", "list"] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\n\
+                                            property=INFO_MAKE id=0x11100101 area=0 status=available value=Toy Car\r\nOK"
+                            .to_owned(),
                         ["screenshot", path] => {
                             let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };
                             std::fs::write(path, sim_core::frame::encode_png(&frame).expect("png")).expect("write png");
@@ -687,6 +717,44 @@ mod tests {
         d.xr(&rotate).expect("rotate");
         d.xr(&XrCommand::Recenter).expect("recenter");
         assert_eq!(wait_for(&fake.console, 2), ["xr rotate 0 0.5 0", "xr recenter"]);
+    }
+
+    #[test]
+    fn automotive_devices_drive_the_vehicle_hal() {
+        let f = fixture("car");
+        let image = f.android.env.sdk_root.clone().expect("sdk").join("system-images/android-34/android-automotive/arm64-v8a");
+        std::fs::create_dir_all(&image).expect("image dir");
+        std::fs::write(image.join("system.img"), b"s").expect("system.img");
+        std::fs::write(image.join("source.properties"), "AndroidVersion.ApiLevel=34\nSystemImage.TagId=android-automotive\n")
+            .expect("props");
+        let car = f.android.create("car", "system-images;android-34;android-automotive;arm64-v8a", None).expect("car");
+        assert_eq!(car.form_factor, Some(FormFactor::Auto));
+        f.android.create("watch", "system-images;android-34;android-wear;arm64-v8a", None).expect("watch");
+        let watch = f.android.device("watch").expect("watch");
+        assert!(
+            watch
+                .vehicle_set("gear", 0, "drive")
+                .expect_err("not a car")
+                .starts_with("the vehicle HAL needs a device with Automotive head unit; watch is Wear OS")
+        );
+
+        let d = f.android.device("car").expect("car");
+        assert!(d.vehicle_set("warp_drive", 0, "1").expect_err("unknown").contains("unknown vehicle property"));
+        assert!(d.vehicle_set("gear", 0, "fast").expect_err("bad value").contains("isn't a Int32 value"));
+        assert_eq!(d.vehicle_set("gear", 0, "drive"), Err("car isn't running; boot it first".into()));
+
+        let fake = fake_emulator(&f, "car");
+        let d = f.android.device("car").expect("car");
+        d.vehicle_set("gear", 0, "drive").expect("set");
+        d.vehicle_set("HVAC_TEMPERATURE_SET", 49, "21.5").expect("set seat");
+        let gear = d.vehicle_get("GEAR_SELECTION", 0).expect("get");
+        assert_eq!((gear.property.as_str(), gear.id, gear.value.as_str()), ("GEAR_SELECTION", 0x1140_0400, "8"));
+        let all = d.vehicle_list().expect("list");
+        assert_eq!(all.iter().map(|r| r.value.as_str()).collect::<Vec<_>>(), ["8", "Toy Car"]);
+        assert_eq!(
+            wait_for(&fake.console, 4),
+            ["car set 0x11400400 0 drive", "car set 0x15600503 49 21.5", "car get 0x11400400 0", "car list"]
+        );
     }
 
     #[test]

@@ -34,7 +34,8 @@ Captured from a running stock instance (`/sys/firmware/fdt`, `/proc/iomem`, `/pr
 | 30 | `a003c00` | blk: encryptionkey.img (GPT: metadata) mounted by path on `/metadata` | vdd |
 | 31 | `a003e00` | blk: vendor.img (GPT: vendor) | vde |
 
-emu-rs adds vsock at slot 24 (stock puts it on PCI).
+emu-rs adds vsock at slot 24 and, for Automotive and XR images only, virtio-snd at slot 18
+(stock puts both on PCI; the guest drivers bind on either transport).
 
 ## PCI devices (stock)
 

@@ -11,6 +11,7 @@ use sim_core::geometry::Point;
 use sim_core::gesture::{self, Phase, Sample};
 use sim_core::hid::{Button, CROWN_UNITS_PER_TICK, Orientation};
 use sim_core::platform::Platform;
+use sim_core::vhal;
 
 pub fn str_param<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
     p.get(key).and_then(Value::as_str)
@@ -150,6 +151,49 @@ pub fn crown_delta(p: &Value) -> Result<f64, String> {
     }
 }
 
+/// `vehicle`'s `area_id`: a number, or a string in decimal or hex (`"0x31"`); default 0, the
+/// global area.
+pub fn vehicle_area(p: &Value) -> Result<i32, String> {
+    match p.get("area_id") {
+        None | Some(Value::Null) => Some(0),
+        Some(Value::Number(n)) => n.as_i64().and_then(|v| vhal::parse_id(&v.to_string())),
+        Some(Value::String(s)) => vhal::parse_id(s),
+        Some(_) => None,
+    }
+    .ok_or_else(|| "`area_id` must be a 32-bit number".into())
+}
+
+/// `vehicle`'s `value` as the console's text: strings as given, numbers and booleans written
+/// out, arrays comma-separated.
+pub fn vehicle_value(p: &Value) -> Result<Option<String>, String> {
+    let text = |v: &Value| match v {
+        Value::String(s) => Ok(s.clone()),
+        Value::Number(_) | Value::Bool(_) => Ok(v.to_string()),
+        _ => Err("`value` must be a string, number, boolean or an array of numbers".to_string()),
+    };
+    match p.get("value") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => items.iter().map(text).collect::<Result<Vec<_>, _>>().map(|t| Some(t.join(","))),
+        Some(v) => text(v).map(Some),
+    }
+}
+
+/// A vehicle property reading as JSON, its value typed by the property (booleans, numbers,
+/// arrays of numbers; strings and bytes stay text).
+pub fn reading_json(r: &vhal::Reading) -> Value {
+    use vhal::PropType as T;
+    let num = |s: &str| -> Value {
+        s.parse::<i64>().map(Value::from).or_else(|_| s.parse::<f64>().map(Value::from)).unwrap_or_else(|_| s.into())
+    };
+    let value = match r.prop_type() {
+        T::Boolean => Value::Bool(r.value == "true"),
+        T::Int32 | T::Int64 | T::Float => num(&r.value),
+        T::Int32Vec | T::Int64Vec | T::FloatVec => Value::Array(r.value.split(',').filter(|s| !s.is_empty()).map(num).collect()),
+        _ => Value::String(r.value.clone()),
+    };
+    json!({"property": r.property, "id": format!("{:#010x}", r.id as u32), "area_id": r.area_id, "status": r.status, "value": value})
+}
+
 /// `screenshot`'s result: written to `path`, else the PNG inline as base64.
 pub fn screenshot_result(frame: &Frame, p: &Value) -> Result<Value, String> {
     let png = encode_png(frame)?;
@@ -174,6 +218,33 @@ mod tests {
         assert_eq!(crown_delta(&json!({"ticks": -3})), Ok(-3.0 * CROWN_UNITS_PER_TICK));
         assert_eq!(crown_delta(&json!({"delta": 12.5, "ticks": 1})), Ok(12.5));
         assert!(crown_delta(&json!({})).is_err());
+    }
+
+    #[test]
+    fn vehicle_parameters_and_readings() {
+        assert_eq!(vehicle_area(&json!({})), Ok(0));
+        assert_eq!(vehicle_area(&json!({"area_id": 49})), Ok(49));
+        assert_eq!(vehicle_area(&json!({"area_id": "0x31"})), Ok(49));
+        assert!(vehicle_area(&json!({"area_id": true})).is_err());
+        assert_eq!(vehicle_value(&json!({})), Ok(None));
+        assert_eq!(vehicle_value(&json!({"value": "drive"})), Ok(Some("drive".into())));
+        assert_eq!(vehicle_value(&json!({"value": 12.5})), Ok(Some("12.5".into())));
+        assert_eq!(vehicle_value(&json!({"value": false})), Ok(Some("false".into())));
+        assert_eq!(vehicle_value(&json!({"value": [2, 0]})), Ok(Some("2,0".into())));
+        assert!(vehicle_value(&json!({"value": {"a": 1}})).is_err());
+        let r = |id: u32, value: &str| vhal::Reading {
+            property: vhal::label(id as i32),
+            id: id as i32,
+            area_id: 0,
+            status: "available".into(),
+            value: value.into(),
+        };
+        assert_eq!(reading_json(&r(0x1140_0400, "8"))["value"], json!(8));
+        assert_eq!(reading_json(&r(0x1140_0400, "8"))["id"], json!("0x11400400"));
+        assert_eq!(reading_json(&r(0x1160_0207, "12.5"))["value"], json!(12.5));
+        assert_eq!(reading_json(&r(0x1120_0407, "true"))["value"], json!(true));
+        assert_eq!(reading_json(&r(0x1141_0a01, "2,0"))["value"], json!([2, 0]));
+        assert_eq!(reading_json(&r(0x1110_0101, "Toy Car"))["value"], json!("Toy Car"));
     }
 
     #[test]

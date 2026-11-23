@@ -140,6 +140,12 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "device, ticks | delta (Digital Crown units; iOS)",
         "Turn a watch's rotary input: the Wear OS crown or bezel, the Apple Watch Digital Crown",
     ),
+    (
+        "vehicle",
+        "device, property?(VHAL name or id: GEAR_SELECTION, gear, speed, 0x11600207, ...), area_id?, value?",
+        "Android Automotive's vehicle HAL: list every property's value, read one, or set one when `value` is given \
+         (typed by the property: drive, 12.5, true); through the emulator console's `car` command (emu-rs)",
+    ),
     ("watch_gesture", "device, gesture(double-tap|wrist-flick)", "An Apple Watch hand gesture"),
     ("remote_swipe", "device, direction(up|down|left|right), duration_ms?", "Swipe on the Siri Remote's touch surface (Apple TV)"),
     (
@@ -187,7 +193,7 @@ const ALL_PLATFORMS: &[&str] = &[
     "rotary",
 ];
 /// Methods only Android devices have.
-const ANDROID_ONLY: &[&str] = &["console", "fold", "xr"];
+const ANDROID_ONLY: &[&str] = &["console", "fold", "xr", "vehicle"];
 
 /// The platforms whose devices `method` works on.
 pub fn platforms(method: &str) -> &'static [Platform] {
@@ -323,6 +329,7 @@ mod tests {
         assert_eq!(find("rotate")["platforms"], json!(["android", "ios"]));
         assert_eq!(find("carplay")["platforms"], json!(["ios"]));
         assert_eq!(find("watch_gesture")["platforms"], json!(["ios"]));
+        assert_eq!(find("vehicle")["platforms"], json!(["android"]));
         assert!(help.as_array().expect("array").iter().all(|m| m["platforms"].as_array().is_some_and(|p| !p.is_empty())));
     }
 
@@ -423,6 +430,37 @@ mod tests {
         assert!(err.starts_with("xr: unknown variant `teleport`"), "{err}");
         let err = call(&mut s, "xr", &json!({"device": "headset", "action": "options", "environment": "day"})).expect_err("missing");
         assert!(err.contains("missing field `passthrough`"), "{err}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn vehicle_is_for_automotive_devices() {
+        let (mut s, root) = android_session("vehicle");
+        let car = root.join("sdk/system-images/android-34/android-automotive/arm64-v8a");
+        std::fs::create_dir_all(&car).expect("image dir");
+        std::fs::write(car.join("system.img"), b"s").expect("system.img");
+        std::fs::write(car.join("source.properties"), "AndroidVersion.ApiLevel=34\nSystemImage.TagId=android-automotive\n").expect("props");
+        let made = call(
+            &mut s,
+            "create",
+            &json!({"platform": "android", "name": "car", "system_image": "system-images;android-34;android-automotive;arm64-v8a"}),
+        )
+        .expect("car");
+        assert_eq!(made["form_factor"], "auto");
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        call(&mut s, "create", &json!({"platform": "android", "name": "phone", "system_image": mobile})).expect("phone");
+
+        let err = call(&mut s, "vehicle", &json!({"device": "phone"})).expect_err("not a car");
+        assert!(err.starts_with("the vehicle HAL needs a device with Automotive head unit; phone is Android · Phone"), "{err}");
+        let err = call(&mut s, "vehicle", &json!({"device": "car", "property": "warp", "value": 1})).expect_err("unknown property");
+        assert!(err.contains("unknown vehicle property `warp`"), "{err}");
+        let err = call(&mut s, "vehicle", &json!({"device": "car", "property": "gear", "value": "fast"})).expect_err("bad value");
+        assert!(err.contains("isn't a Int32 value for GEAR_SELECTION"), "{err}");
+        assert_eq!(call(&mut s, "vehicle", &json!({"device": "car", "value": 1})).expect_err("no property"), "give the `property` to set");
+        let err = call(&mut s, "vehicle", &json!({"device": "car", "property": "gear", "value": "drive"})).expect_err("stopped");
+        assert_eq!(err, "car isn't running; boot it first");
+        let err = call(&mut s, "vehicle", &json!({"device": "car", "property": "speed", "area_id": [1]})).expect_err("bad area");
+        assert_eq!(err, "`area_id` must be a 32-bit number");
         std::fs::remove_dir_all(root).ok();
     }
 

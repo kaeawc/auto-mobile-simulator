@@ -4,6 +4,7 @@
 //! (CID 2, port 5000) and sends `pipe:<name>\0`; everything after that belongs to the named
 //! service. `qemud:adb` is adbd's transport; others (boot properties, sensors, ...) follow.
 pub mod adb;
+pub mod car;
 pub mod clipboard;
 pub mod fingerprint;
 pub mod gps;

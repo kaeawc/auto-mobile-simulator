@@ -12,4 +12,5 @@ pub mod hid;
 pub mod pixels;
 pub mod platform;
 pub mod stream;
+pub mod vhal;
 pub mod xr;

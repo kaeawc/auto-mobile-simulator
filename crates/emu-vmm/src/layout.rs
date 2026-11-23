@@ -81,6 +81,9 @@ pub mod slots {
     pub const NET: u32 = 26;
     /// virtio-console with named ports (`modem`); stock puts its consoles on PCI.
     pub const VPORTS: u32 = 19;
+    /// virtio-snd (Automotive and XR images); stock puts it on PCI, and the guest driver
+    /// doesn't care which transport.
+    pub const SOUND: u32 = 18;
     /// vda: system.img (GPT: vbmeta, super). `androidboot.boot_devices` points here.
     pub const SYSTEM: u32 = 27;
     /// vdb: cache.img.

@@ -11,7 +11,10 @@ use sim_core::form_factor::Posture;
 use sim_core::hid::Direction;
 use sim_core::xr::XrCommand;
 
-use crate::params::{button, need_str, opt_u64, screenshot_result, str_param, swipe_samples, tap_samples, touch_sample};
+use crate::params::{
+    button, need_str, opt_u64, reading_json, screenshot_result, str_param, swipe_samples, tap_samples, touch_sample, vehicle_area,
+    vehicle_value,
+};
 
 /// The SDK and AVD home, read from the environment on first use.
 #[derive(Default)]
@@ -113,6 +116,15 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
         "xr" => {
             let command: XrCommand = serde_json::from_value(p.clone()).map_err(|e| format!("xr: {e} ({})", sim_core::xr::USAGE))?;
             d.xr(&command).map(|lines| json!(lines))
+        }
+        "vehicle" => {
+            let area = vehicle_area(p)?;
+            match (str_param(p, "property"), vehicle_value(p)?) {
+                (None, None) => d.vehicle_list().map(|all| all.iter().map(reading_json).collect()),
+                (None, Some(_)) => Err("give the `property` to set".into()),
+                (Some(prop), None) => d.vehicle_get(prop, area).map(|r| reading_json(&r)),
+                (Some(prop), Some(value)) => null(d.vehicle_set(prop, area, &value)),
+            }
         }
         other => Err(format!("`{other}` isn't implemented for Android devices")),
     }

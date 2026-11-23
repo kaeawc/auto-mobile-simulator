@@ -120,6 +120,7 @@ adb -s emulator-5554 shell                    # it is an ordinary emulator to ev
 sim-rs fold Fold half-opened                  # the hinge (foldables only)
 sim-rs rotary Wear 3                          # the rotary input (watches only)
 sim-rs xr XR recenter                         # Android XR head pose, options, pointer
+sim-rs vehicle Car gear drive                 # a vehicle HAL property (Automotive only)
 sim-rs console Pixel sensor get acceleration  # anything the emulator console speaks
 sim-rs shutdown Pixel
 ```
