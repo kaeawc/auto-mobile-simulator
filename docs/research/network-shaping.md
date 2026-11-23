@@ -73,7 +73,10 @@ matters, add pf/dummynet on runners that allow sudo (hosted macOS runners do).
 - **Rebuilding the shaper** changes its cached path; `network_shape {inject:"boot"}` checks that
   SpringBoard maps the current build and reboots otherwise.
 - **Measured overhead** is negligible for unshaped devices (the base case matches uninjected timing
-  within noise), and the shaper ran in about 120 processes per device without issues.
+  within noise), and the shaper ran in about 120 processes per device without issues. Per call,
+  an unshaped fd costs one atomic load, and a shaped socket's I/O takes no locks and makes no
+  extra system calls ([netshape-overhead.md](netshape-overhead.md): design, comparison with other
+  interposers, microbenchmarks).
 
 ## Kernel shaping: pf + dummynet
 
