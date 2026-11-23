@@ -1,5 +1,6 @@
 //! The hypervisor itself: the VM, its GIC, vCPUs and the host counter (Apple silicon only).
 use std::marker::PhantomData;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{Error, GuestRam, HostRange, Result, ffi};
@@ -156,6 +157,18 @@ impl Vm {
         // SAFETY: plain FFI call on the process-wide GIC.
         check("hv_gic_set_spi", unsafe { ffi::hv_gic_set_spi(intid, level) })
     }
+
+    /// `GICD_IROUTER<intid>`: which vCPU the guest routes SPI `intid` to. Callable from any
+    /// thread.
+    pub fn spi_router(intid: u32) -> Result<u64> {
+        if !(32..1020).contains(&intid) {
+            return Err(Error::Invalid("SPI INTID must be in 32..1020"));
+        }
+        let mut v = 0;
+        // SAFETY: plain FFI call on the process-wide GIC; out-pointer references a live local.
+        check("hv_gic_get_distributor_reg", unsafe { ffi::hv_gic_get_distributor_reg(ffi::GICD_IROUTER32 + (intid - 32) * 8, &mut v) })?;
+        Ok(v)
+    }
 }
 
 impl Drop for Vm {
@@ -282,6 +295,28 @@ impl VcpuHandle {
     }
 }
 
+/// [`VcpuHandle::kick`] for several vCPUs in one `hv_vcpus_exit` call (per 64).
+pub fn kick_vcpus(handles: impl IntoIterator<Item = VcpuHandle>) {
+    let mut ids = [0u64; 64];
+    let mut n = 0;
+    let flush = |ids: &[u64]| {
+        if !ids.is_empty() {
+            // SAFETY: `ids` is a live array of `len` vCPU ids; hv_vcpus_exit is documented as
+            // callable from any thread.
+            unsafe { ffi::hv_vcpus_exit(ids.as_ptr(), ids.len() as u32) };
+        }
+    };
+    for h in handles {
+        ids[n] = h.0;
+        n += 1;
+        if n == ids.len() {
+            flush(&ids);
+            n = 0;
+        }
+    }
+    flush(&ids[..n]);
+}
+
 /// Host counter the guest's virtual timer is derived from (`mach_absolute_time`).
 pub fn host_ticks() -> u64 {
     // SAFETY: no arguments, no preconditions.
@@ -290,11 +325,16 @@ pub fn host_ticks() -> u64 {
 
 /// Converts host counter ticks to nanoseconds.
 pub fn ticks_to_nanos(ticks: u64) -> u64 {
-    let mut info = ffi::MachTimebaseInfo { numer: 0, denom: 0 };
-    // SAFETY: out-pointer references a live local.
-    unsafe { ffi::mach_timebase_info(&mut info) };
-    if info.denom == 0 {
+    // The timebase is fixed for the life of the system: ask once.
+    static TIMEBASE: OnceLock<(u32, u32)> = OnceLock::new();
+    let &(numer, denom) = TIMEBASE.get_or_init(|| {
+        let mut info = ffi::MachTimebaseInfo { numer: 0, denom: 0 };
+        // SAFETY: out-pointer references a live local.
+        unsafe { ffi::mach_timebase_info(&mut info) };
+        (info.numer, info.denom)
+    });
+    if denom == 0 {
         return ticks;
     }
-    (u128::from(ticks) * u128::from(info.numer) / u128::from(info.denom)) as u64
+    (u128::from(ticks) * u128::from(numer) / u128::from(denom)) as u64
 }

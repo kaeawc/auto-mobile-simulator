@@ -13,10 +13,11 @@ use crate::disk::{DiskMode, DiskSpec};
 use crate::irq::{GicSpi, IrqLine};
 use crate::layout::*;
 pub use crate::vcpu::StopReason;
-use crate::vcpu::{Cpus, Wakers};
+use crate::vcpu::{Cpus, HvVcpus, Wakers};
 use crate::virtio::Interrupt;
 use crate::virtio::input::Inputs;
 use crate::virtio::mmio::MmioTransport;
+use crate::wake::Mode as WakeMode;
 use crate::{board, boot, devices, disk, pipe, telephony, virtio};
 
 /// Host GPU rendering through gfxstream.
@@ -210,10 +211,10 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     mem.write(DTB_ADDR, &dtb)?;
 
     // Devices.
-    let wakers = Arc::new(Wakers::new(cfg.cpus as usize));
-    let wake: Arc<dyn Fn() + Send + Sync> = {
+    let wakers = Arc::new(Wakers::new(cfg.cpus as usize, HvVcpus::new(cfg.cpus as usize), WakeMode::from_env()));
+    let wake: Arc<dyn Fn(u32) + Send + Sync> = {
         let w = wakers.clone();
-        Arc::new(move || w.wake_all())
+        Arc::new(move |intid| w.wake_spi(intid))
     };
     let spi = |n: u32| -> Arc<dyn IrqLine> { Arc::new(GicSpi::new(spi_intid(n), wake.clone())) };
 
