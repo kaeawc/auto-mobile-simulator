@@ -6,7 +6,8 @@
 //! directory under the SDK and renamed into the standard layout. Shelling out to the system's
 //! curl and unzip keeps a TLS stack and a zip implementation out of the binary. The host
 //! renderer is unpacked out of the `emulator` package the same way, into emu-rs's own directory
-//! (see [`renderer`]).
+//! (see [`renderer`]). Other hosts (Linux, for preparing images and AVDs) use the `curl` and
+//! `unzip` on their `PATH`.
 
 mod manifest;
 pub mod renderer;
@@ -119,6 +120,12 @@ impl Drop for TempDir {
     }
 }
 
+/// A system tool: macOS's own copy in `/usr/bin` (never a `PATH` lookup there), else `name` as
+/// found on the `PATH`.
+fn host_tool(name: &str) -> PathBuf {
+    if cfg!(target_os = "macos") { Path::new("/usr/bin").join(name) } else { PathBuf::from(name) }
+}
+
 /// An SDK root being provisioned.
 #[derive(Clone, Debug)]
 pub struct Sdk {
@@ -136,13 +143,7 @@ impl Sdk {
     pub fn new(root: impl Into<PathBuf>) -> Result<Sdk> {
         let root = root.into();
         std::fs::create_dir_all(&root).map_err(io(&root))?;
-        Ok(Sdk {
-            root,
-            manifest_max_age: Duration::from_secs(24 * 3600),
-            quiet: false,
-            curl: "/usr/bin/curl".into(),
-            unzip: "/usr/bin/unzip".into(),
-        })
+        Ok(Sdk { root, manifest_max_age: Duration::from_secs(24 * 3600), quiet: false, curl: host_tool("curl"), unzip: host_tool("unzip") })
     }
 
     pub fn root(&self) -> &Path {
@@ -167,7 +168,15 @@ impl Sdk {
     }
 
     fn run(&self, cmd: &mut Command) -> Result<std::process::ExitStatus> {
-        cmd.status().map_err(|e| Error::Command(format!("{:?}: {e}", cmd.get_program())))
+        cmd.status().map_err(|e| {
+            let program = Path::new(cmd.get_program());
+            if e.kind() == std::io::ErrorKind::NotFound {
+                let name = program.file_name().unwrap_or(program.as_os_str()).to_string_lossy();
+                Error::Command(format!("`{}` not found: install {name} (e.g. `apt install {name}`)", program.display()))
+            } else {
+                Error::Command(format!("{}: {e}", program.display()))
+            }
+        })
     }
 
     /// Fetches (or reads from the daily cache) and parses a manifest.
@@ -179,6 +188,15 @@ impl Sdk {
     /// A manifest's text, refreshed when the cached copy is older than `manifest_max_age`. A
     /// failed refresh falls back to a stale cached copy.
     fn fetch_cached(&self, url: &str) -> Result<String> {
+        self.fetch_cached_as(url, "-sSfL")
+    }
+
+    /// [`Sdk::fetch_cached`] for a URL that may well not exist: curl stays silent about it.
+    fn probe_cached(&self, url: &str) -> Result<String> {
+        self.fetch_cached_as(url, "-sfL")
+    }
+
+    fn fetch_cached_as(&self, url: &str, curl_flags: &str) -> Result<String> {
         let dl = self.downloads();
         std::fs::create_dir_all(&dl).map_err(io(&dl))?;
         let name: String = url.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
@@ -186,7 +204,7 @@ impl Sdk {
         let age = std::fs::metadata(&cache).and_then(|m| m.modified()).ok().and_then(|t| SystemTime::now().duration_since(t).ok());
         if age.is_none_or(|a| a > self.manifest_max_age) {
             let part = cache.with_extension("part");
-            let status = self.run(Command::new(&self.curl).args(["-sSfL", "--retry", "3", "-o"]).arg(&part).arg(url))?;
+            let status = self.run(Command::new(&self.curl).args([curl_flags, "--retry", "3", "-o"]).arg(&part).arg(url))?;
             if status.success() {
                 std::fs::rename(&part, &cache).map_err(io(&cache))?;
             } else if cache.is_file() {
@@ -198,13 +216,42 @@ impl Sdk {
         std::fs::read_to_string(&cache).map_err(io(&cache))
     }
 
+    /// A manifest at a URL that may not exist (a tag's guessed site).
+    fn probe_manifest(&self, url: &str) -> Result<Manifest> {
+        let base = &url[..url.rfind('/').map_or(0, |i| i + 1)];
+        Manifest::parse(&self.probe_cached(url)?, base)
+    }
+
     /// Every system-image manifest for `tag`, or for all tags (from `addons_list-5.xml`).
     pub fn system_image_manifests(&self, tag: Option<&str>) -> Result<Vec<Manifest>> {
-        let urls = match tag {
-            Some(t) => vec![sys_img_url(t)],
-            None => parse_site_list(&self.fetch_cached(&sites_url())?, REPO_URL)?,
-        };
-        urls.iter().map(|u| self.manifest(u)).collect()
+        // A tag's own site when it has one; variants live on another tag's site
+        // (`android-wear-signed` on `android-wear`'s), so then every site.
+        if let Some(t) = tag
+            && let Ok(m) = self.probe_manifest(&sys_img_url(t))
+        {
+            return Ok(vec![m]);
+        }
+        self.all_system_image_manifests()
+    }
+
+    /// Every system image site the repository's site list names.
+    fn all_system_image_manifests(&self) -> Result<Vec<Manifest>> {
+        let urls = parse_site_list(&self.fetch_cached(&sites_url())?, REPO_URL)?;
+        // A listed site that fails to load is skipped, not fatal: the others may have the image.
+        Ok(urls.iter().filter_map(|u| self.manifest(u).ok()).collect())
+    }
+
+    /// The download for system image `api`/`tag`/`abi` (see
+    /// [`Manifest::resolve_system_image`]), from the tag's own site, else from whichever site
+    /// lists it.
+    pub fn find_system_image(&self, api: &str, tag: &str, abi: &str, host: Host) -> Result<Download> {
+        let guess = self.probe_manifest(&sys_img_url(tag)).and_then(|m| m.resolve_system_image(api, tag, abi, host));
+        match guess {
+            Ok(d) => Ok(d),
+            Err(first) => {
+                self.all_system_image_manifests()?.iter().find_map(|m| m.resolve_system_image(api, tag, abi, host).ok()).ok_or(first)
+            }
+        }
     }
 
     /// Downloads `d` (resuming a partial download), verifies its size and sha1, and unpacks it
@@ -225,6 +272,7 @@ impl Sdk {
         if !top.join("source.properties").is_file() {
             self.say(&format!("warning: {} has no source.properties", d.file_name()));
         }
+        self.sparsify_images(&top);
 
         let dest = self.root.join(d.install_dir());
         replace_dir(&top, &dest)?;
@@ -291,6 +339,24 @@ impl Sdk {
         Ok(part)
     }
 
+    /// Punches holes in the zero blocks of a package's disk images (`*.img`): unzip writes them
+    /// out in full, and most of a system image is zeros (8.1 of TV 34's 8.6 GB `system.img`).
+    /// Reads still return zeros there. Best effort: a filesystem without holes keeps the file.
+    fn sparsify_images(&self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for path in entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "img") && p.is_file()) {
+            match sparsify(&path) {
+                Ok(0) => {}
+                Ok(freed) => self.say(&format!(
+                    "{}: {} of zeros made sparse",
+                    path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+                    format_size(freed)
+                )),
+                Err(e) => self.say(&format!("warning: {} stays dense: {e}", path.display())),
+            }
+        }
+    }
+
     /// Runs unzip with the arguments `args` builds for a fresh temporary directory under the
     /// download cache, and returns that directory. Exit status 11 (a pattern matched nothing) is
     /// accepted when `allow_unmatched`; the caller then checks for the files it needs.
@@ -337,3 +403,48 @@ impl Sdk {
 
 #[cfg(test)]
 mod tests;
+
+/// Deallocates every all-zero, block-aligned run of `path` (4 KiB blocks, the APFS and ext4
+/// block size) and returns how many bytes it freed. Contents read back unchanged.
+pub fn sparsify(path: &Path) -> std::io::Result<u64> {
+    use std::io::Read;
+    const BLOCK: usize = 4096;
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let mut reader = std::io::BufReader::with_capacity(4 << 20, &file);
+    let mut block = vec![0u8; BLOCK];
+    let (mut offset, mut run_start, mut freed) = (0u64, None::<u64>, 0u64);
+    let mut punch = |start: u64, end: u64| -> std::io::Result<()> {
+        emu_hvf::host::punch_hole(&file, start, end - start)?;
+        freed += end - start;
+        Ok(())
+    };
+    loop {
+        let mut n = 0;
+        while n < BLOCK {
+            match reader.read(&mut block[n..]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        // A short final block stays allocated: holes cover whole blocks only.
+        let zero = n == BLOCK && block.iter().all(|&b| b == 0);
+        match (zero, run_start) {
+            (true, None) => run_start = Some(offset),
+            (false, Some(start)) => {
+                punch(start, offset)?;
+                run_start = None;
+            }
+            _ => {}
+        }
+        offset += n as u64;
+        if n < BLOCK {
+            break;
+        }
+    }
+    if let Some(start) = run_start {
+        punch(start, offset)?;
+    }
+    Ok(freed)
+}

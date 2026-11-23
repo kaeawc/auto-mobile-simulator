@@ -309,7 +309,7 @@ impl Device {
 
     /// Plays touch samples (device pixels) over one display connection.
     pub fn play(&self, samples: &[Sample]) -> Result<(), String> {
-        let mut display = display::Display::connect(&self.avd()?.dir)?;
+        let mut display = display::Display::connect(&self.touch_screen()?.dir)?;
         for s in samples {
             sleep(s.delay);
             display.send(&Input::Touch { x: s.point.x as f32, y: s.point.y as f32, phase: s.phase })?;
@@ -319,7 +319,50 @@ impl Device {
 
     /// One touch sample at device pixels.
     pub fn touch(&self, x: f64, y: f64, phase: Phase) -> Result<(), String> {
-        display::Display::connect(&self.avd()?.dir)?.send(&Input::Touch { x: x as f32, y: y as f32, phase })
+        display::Display::connect(&self.touch_screen()?.dir)?.send(&Input::Touch { x: x as f32, y: y as f32, phase })
+    }
+
+    /// A touch on the touchpad beside the screen (`hw.touchpad0`: Android XR display glasses), in
+    /// touchpad units: `phase` is down, move, up or tap. Through emu-rs's console `touchpad`.
+    pub fn touchpad(&self, x: u32, y: u32, phase: &str) -> Result<(), String> {
+        self.touchpad_size()?;
+        self.console(&[format!("touchpad {x} {y} {phase}")]).map(drop)
+    }
+
+    /// A swipe across the touchpad from `from` to `to` (touchpad units) over about `duration`.
+    pub fn touchpad_swipe(&self, from: (u32, u32), to: (u32, u32), duration: Duration) -> Result<(), String> {
+        let (w, h) = self.touchpad_size()?;
+        if from.0.max(to.0) >= w || from.1.max(to.1) >= h {
+            return Err(format!("the touchpad is {w}x{h}"));
+        }
+        const STEPS: u32 = 10;
+        let lerp = |a: u32, b: u32, i: u32| (f64::from(a) + (f64::from(b) - f64::from(a)) * f64::from(i) / f64::from(STEPS)).round() as u32;
+        let mut lines = vec![format!("touchpad {} {} down", from.0, from.1)];
+        lines.extend((1..=STEPS).map(|i| format!("touchpad {} {} move", lerp(from.0, to.0, i), lerp(from.1, to.1, i))));
+        lines.push(format!("touchpad {} {} up", to.0, to.1));
+        let pause = duration / STEPS;
+        for line in lines {
+            self.console(&[line])?;
+            sleep(pause);
+        }
+        Ok(())
+    }
+
+    /// The touchpad's size, if the AVD has one.
+    fn touchpad_size(&self) -> Result<(u32, u32), String> {
+        self.avd()?
+            .touchpad()
+            .ok_or_else(|| format!("{} has no touchpad (hw.touchpad0; Android XR display glasses have one)", self.info.name))
+    }
+
+    /// The AVD, if its screen takes touch (an SDK TV's says `hw.screen=no-touch`).
+    fn touch_screen(&self) -> Result<&Avd, String> {
+        let avd = self.avd()?;
+        if avd.touch_screen() {
+            Ok(avd)
+        } else {
+            Err(format!("{} has no touch screen (hw.screen=no-touch); use button up|down|left|right|select", self.info.name))
+        }
     }
 
     /// Presses or releases a hardware button.
@@ -687,6 +730,31 @@ mod tests {
         std::fs::create_dir_all(&d).expect("image dir");
         std::fs::write(d.join("system.img"), b"s").expect("system.img");
         std::fs::write(d.join("source.properties"), format!("AndroidVersion.ApiLevel=34\nSystemImage.TagId={image_tag}\n")).expect("props");
+    }
+
+    #[test]
+    fn only_devices_with_a_touchpad_take_touchpad_input() {
+        let f = fixture("pad");
+        add_image(&f, "android-36/ai-glasses/arm64-v8a", "ai-glasses");
+        f.android.create("glasses", "system-images;android-36;ai-glasses;arm64-v8a", None).expect("glasses");
+        f.android.create("watch", "system-images;android-34;android-wear;arm64-v8a", None).expect("watch");
+        let watch = f.android.device("watch").expect("watch");
+        assert!(watch.touchpad(1, 1, "tap").expect_err("no touchpad").starts_with("watch has no touchpad"));
+        let glasses = f.android.device("glasses").expect("glasses");
+        assert_eq!(glasses.touchpad_swipe((0, 0), (1542, 10), Duration::ZERO), Err("the touchpad is 1542x297".into()));
+        assert_eq!(glasses.touchpad(1, 1, "tap"), Err("glasses isn't running; boot it first".into()));
+    }
+
+    #[test]
+    fn tvs_have_no_touch_screen() {
+        let f = fixture("tv");
+        add_image(&f, "android-34/android-tv/arm64-v8a", "android-tv");
+        f.android.create("tv", "system-images;android-34;android-tv;arm64-v8a", None).expect("tv");
+        let tv = f.android.device("tv").expect("tv");
+        assert_eq!(tv.avd.as_ref().and_then(|a| a.get("hw.screen")), Some("no-touch"));
+        let err = tv.touch(10.0, 10.0, Phase::Down).expect_err("no touch screen");
+        assert!(err.starts_with("tv has no touch screen (hw.screen=no-touch)"), "{err}");
+        assert!(tv.play(&[]).expect_err("no swipes either").contains("no touch screen"));
     }
 
     #[test]

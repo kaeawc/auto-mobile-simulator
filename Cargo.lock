@@ -147,6 +147,8 @@ dependencies = [
 name = "emu-sdk"
 version = "0.1.0"
 dependencies = [
+ "emu-hvf",
+ "libc",
  "roxmltree",
  "sha1_smol",
  "sim-core",

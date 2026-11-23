@@ -113,6 +113,27 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             let ticks = p.get("ticks").and_then(Value::as_i64).ok_or("missing number parameter `ticks`")?;
             null(d.rotary(i32::try_from(ticks).map_err(|e| e.to_string())?))
         }
+        "touchpad" => {
+            let coord = |k: &str| -> Result<Option<u32>, String> {
+                p.get(k).map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or(format!("`{k}` must be a whole number"))).transpose()
+            };
+            let at = |k: &str| coord(k)?.ok_or(format!("missing number parameter `{k}`"));
+            let (x, y) = (at("x")?, at("y")?);
+            match (coord("to_x")?, coord("to_y")?) {
+                (Some(tx), Some(ty)) => {
+                    let ms = p.get("duration_ms").and_then(Value::as_u64).unwrap_or(300);
+                    null(d.touchpad_swipe((x, y), (tx, ty), std::time::Duration::from_millis(ms)))
+                }
+                (None, None) => {
+                    let phase = str_param(p, "phase").unwrap_or("tap");
+                    if !["down", "move", "up", "tap"].contains(&phase) {
+                        return Err(format!("unknown phase `{phase}` (down, move, up, tap)"));
+                    }
+                    null(d.touchpad(x, y, phase))
+                }
+                _ => Err("a swipe needs both `to_x` and `to_y`".into()),
+            }
+        }
         "xr" => {
             let command: XrCommand = serde_json::from_value(p.clone()).map_err(|e| format!("xr: {e} ({})", sim_core::xr::USAGE))?;
             d.xr(&command).map(|lines| json!(lines))

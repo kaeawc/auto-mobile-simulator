@@ -100,16 +100,24 @@ emu -provision 36 -create-avd small36                   # platform-tools + googl
 emu -provision 35 -tag google_apis_playstore -create-avd play35 -lcd 480x800@240 -cores 2 -memory 1536
 emu -provision 36 -dry-run                              # resolve only: URL, size, sha1, install dir
 emu -provision 36 -no-renderer                          # skip the renderer (boots without graphics)
+emu -provision 34 -tag android-automotive               # no plain 34 image: picks the newest, 34-ext9
 emu -provision-renderer                                 # install or update just the renderer
 emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a -lcd 720x1280@320
 ```
 
 `crates/emu-sdk` reads Google's repository manifests (`repository2-3.xml`, and
-`sys-img/<tag>/sys-img2-3.xml` per tag), picks the newest stable archive for macOS/arm64,
-downloads it with the system's `/usr/bin/curl` (resumable, into `$ANDROID_HOME/.downloads`),
+`sys-img/<tag>/sys-img2-3.xml` per tag), picks the newest stable archive for the host
+(platform-tools for the machine it runs on; system images are host-independent; the renderer is
+always macOS/arm64's), downloads it with the system's `/usr/bin/curl` (resumable, into `$ANDROID_HOME/.downloads`),
 checks size and sha1, unpacks it with `/usr/bin/unzip` and moves it into the standard SDK layout.
 Installed packages are skipped, manifests are cached for a day, and the archive is deleted once
-unpacked. The SDK is `$ANDROID_SDK_ROOT`/`$ANDROID_HOME`, else `~/Library/Android/sdk`.
+unpacked. unzip writes disk images out in full, so the zero blocks of each `*.img` are then
+punched out (`F_PUNCHHOLE` on macOS, `fallocate` on Linux): TV 34's `system.img` takes 1.4 GB
+instead of 8.1 GB, reading back unchanged. The SDK is `$ANDROID_SDK_ROOT`/`$ANDROID_HOME`, else Android Studio's default
+(`~/Library/Android/sdk` on macOS, `~/Android/Sdk` on Linux). An API level a tag publishes only
+at extension levels (Automotive's API 34 and 35) resolves to the newest of them. Provisioning
+works on Linux too, for preparing images and AVDs; there `-provision` skips the renderer, since
+only Apple silicon boots guests.
 
 **The renderer** comes out of the SDK's `emulator` package, fetched on demand: the archive
 (420.6 MB for 37.3.10) is verified like any other, but only `emulator/lib64/**` minus
@@ -187,8 +195,17 @@ images included; emu-rs leaves phones without it until it has been tried on one.
 **Needs a real boot.** Whether the car image reaches the launcher with these two pieces; that
 the VHAL connects and `car get gear` answers; that the kernel's `virtio_snd` driver binds on
 virtio-mmio and `caremu` opens card 0 (its mixer has no controls, which its init loop
-tolerates); that the SDK's car images ship `build.prop` in the image directory; and the rest of
-the car stack (EVS, cluster display, rotary controller), which emu-rs doesn't model.
+tolerates); and the rest of the car stack (EVS, cluster display, rotary controller), which
+emu-rs doesn't model.
+
+**Checked offline** against `system-images;android-34-ext9;android-automotive;arm64-v8a` r5
+(`scripts/inspect-image.py`, `emu -avd Car34 -dry-run`): the image ships `build.prop` beside it,
+so emu-rs recognizes it as a car and adds `qemud:car` and the sound card; its first-stage fstab
+and modules match the board; its VHAL (`android.hardware.automotive.vehicle@V1-emulator-service`)
+opens `pipe:qemud:car`, over vsock first; and every property and gear/ignition value in
+`sim_core::vhal` exists in the image's own `vehicle-types-meta.json` (a trimmed copy is a test
+fixture). Its vendor also runs EVS, CAN, broadcast radio and remote-access HALs, none of which
+emu-rs serves.
 
 ## Performance notes
 

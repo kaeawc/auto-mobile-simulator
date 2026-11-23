@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 pub const USAGE: &str = "\
 usage: emu -avd NAME [options]
        emu @NAME [options]
+       emu -avd NAME -dry-run   (print the boot plan without booting; any host)
        emu -list-avds | -version | -accel-check
        emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a [-lcd 720x1280@320] [-cores N] [-memory MB]
        emu -provision API [-tag google_apis] [-abi arm64-v8a] [-no-renderer] [-dry-run] [-create-avd NAME [-lcd WxH@DPI] [-cores N] [-memory MB]]
@@ -19,7 +20,8 @@ provisioning (no Java or sdkmanager; SDK at $ANDROID_HOME, default ~/Library/And
   -no-renderer      with -provision: skip the renderer (emu then boots without graphics)
   -tag TAG          default, google_apis (default), google_apis_playstore, android-wear, ...
   -abi ABI          default arm64-v8a
-  -dry-run          resolve and print URL, size and sha1 without downloading
+  -dry-run          resolve and print URL, size and sha1 without downloading; with -avd, print
+                    the boot plan (cmdline, bootconfig, boot props, disks, devices) instead of booting
   -list-images      system images available for this host (all tags unless -tag)
 
 options:

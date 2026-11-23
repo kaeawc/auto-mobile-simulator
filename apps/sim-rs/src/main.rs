@@ -180,6 +180,21 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
+    /// Touch the touchpad beside the screen (Android XR display glasses), in touchpad units: X Y
+    /// [down|move|up|tap], or swipe with --to X2 Y2.
+    Touchpad {
+        device: String,
+        x: u32,
+        y: u32,
+        /// down, move, up or tap (the default).
+        phase: Option<String>,
+        /// Swipe to this point instead.
+        #[arg(long, num_args = 2, value_names = ["X2", "Y2"])]
+        to: Option<Vec<u32>>,
+        /// The swipe's duration.
+        #[arg(long, default_value_t = 300)]
+        duration_ms: u64,
+    },
     /// Turn a watch's crown (Wear OS rotary input, Apple Watch Digital Crown) by some ticks
     /// (negative turns back).
     #[command(allow_negative_numbers = true)]
@@ -378,6 +393,13 @@ fn main() -> Result<()> {
         Cmd::Xr { device, command } => {
             items(&call("xr", xr_params(&device, &command)?)?).iter().for_each(|l| println!("{}", text(l)));
         }
+        Cmd::Touchpad { device, x, y, phase, to, duration_ms } => {
+            let params = match to.as_deref() {
+                Some([tx, ty]) => json!({"device": device, "x": x, "y": y, "to_x": tx, "to_y": ty, "duration_ms": duration_ms}),
+                _ => json!({"device": device, "x": x, "y": y, "phase": phase.as_deref().unwrap_or("tap")}),
+            };
+            call("touchpad", params)?;
+        }
         Cmd::Rotary { device, ticks, delta } => {
             call("rotary", json!({"device": device, "ticks": ticks, "delta": delta}))?;
             flush();
@@ -546,6 +568,7 @@ mod tests {
             "carplay",
             "xr",
             "vehicle",
+            "touchpad",
         ] {
             assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
         }

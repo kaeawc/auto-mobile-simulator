@@ -58,6 +58,16 @@ What a new device of each kind gets unless told otherwise. Real devices report t
 | CarPlay | 800×480 | @2x | rectangle | — | touch, head unit |
 
 The Android phone keeps emu-rs's deliberately small default: smaller screens boot markedly faster.
+New Wear, TV, Automotive and XR AVDs follow the SDK's own device definitions (`wearos_large_round`,
+`tv_1080p`, `automotive_1024p_landscape`, `xr_headset_device`, `ai_glasses_device`, from
+`sdklib/.../devices/*.xml` in `platform/tools/base`). They get the `config.ini` keys avdmanager
+writes for those devices: `hw.device.name`, the sensors (`hw.accelerometer`, `hw.gyroscope`,
+`hw.sensors.*`, with orientation following the gyroscope), `hw.mainKeys`, `hw.dPad`,
+`hw.trackBall`, `hw.gps`, `hw.battery`, TV's `hw.screen=no-touch` and the glasses'
+`hw.touchpad0`. The sensors decide what the guest's sensors HAL is offered: a TV has no motion
+sensors, and an Automotive head unit has only light (plus the uncalibrated variants, which default
+on as in stock). Automotive gets the definition's 3686 MB of RAM. `emu -create-avd` and
+`-provision -create-avd` shape AVDs from the image the same way `sim-rs create` does.
 The Android XR profiles are the SDK's own device definitions (`xr_headset_device`, 4 GiB;
 `ai_glasses_device`, 2 GiB; both landscape), and a new XR AVD gets their RAM and
 `hw.initialOrientation=landscape` too.
@@ -93,9 +103,9 @@ Foldable postures follow the stock emulator's hinge ranges: closed below 30°, h
 | Android foldable | the same image, `--form-factor foldable` | as phone, plus `fold <closed\|half-opened\|opened\|angle>` |
 | Wear OS | `--system-image "system-images;android-34;android-wear;arm64-v8a"` | touch, `rotary <ticks>`, `button back\|home\|power` |
 | Android TV | `--system-image "system-images;android-34;google-tv;arm64-v8a"` | `button up\|down\|left\|right\|select\|back\|home` |
-| Automotive | `--system-image "system-images;android-34;android-automotive;arm64-v8a"` | touch, `button back\|home`, `vehicle <property> [<value>]` (gear, speed, ignition, ...; unverified, see below) |
+| Automotive | `--system-image "system-images;android-34-ext9;android-automotive;arm64-v8a"` (API 34 and 35 Automotive images exist only at extension levels; `emu -provision 34 -tag android-automotive` picks `34-ext9`) | touch, `button back\|home`, `vehicle <property> [<value>]` (gear, speed, ignition, ...; unverified, see below) |
 | Android XR headset | `--system-image "system-images;android-34;google-xr;arm64-v8a"` (install: `emu -provision 34 -tag google-xr`) | `xr recenter`, `xr rotate X Y Z` (radians), `xr move DX DY DZ` (metres), `xr options day\|night PASSTHROUGH`, `xr input mouse\|hand\|eye`, `xr viewport pan\|zoom\|rotate`, `xr pointer X Y [move\|down\|up\|click]`, `xr hand\|eye X Y [aim\|press]`, `xr gesture right-pinch\|…`, `type` |
-| Android XR glasses | `--system-image "system-images;android-36;ai-glasses;arm64-v8a"` | as the headset (unverified, see below) |
+| Android XR glasses | `--system-image "system-images;android-36;ai-glasses;arm64-v8a"` | `touchpad X Y [down\|move\|up\|tap]` or `touchpad X Y --to X2 Y2` (the temple touchpad, in its 1542×297 units), the `xr` controls but `xr pointer` (no dual-mode mouse); unverified, see below |
 
 The device type and runtime names above are examples: `sim-rs device-types`, `sim-rs runtimes` and
 `emu -list-images -tag <tag>` list what your host has (`-tag android-xr` lists the XR headsets by
@@ -143,6 +153,27 @@ without one fails that input with `Unavailable`, never a crash.
   supported for CarPlay"). `create --form-factor auto` on iOS says to do this instead, since
   CarPlay isn't a device type.
 
+## Checked against real images
+
+Each form factor's current SDK image was provisioned with `emu -provision`, given an AVD by
+`emu -create-avd`, and compared offline with emu-rs's board: `emu -avd NAME -dry-run` for what
+emu-rs would give it, `scripts/inspect-image.py` for what the image expects (its features, the
+first-stage fstab and modules in every ramdisk archive, and the vendor partition's input
+configuration, keylayouts and HALs). None of this boots the image.
+
+| Image | What matched | What changed in emu-rs |
+| --- | --- | --- |
+| `android-wear-signed` 36 r1 | fstab slots, modules, `.idc` names (the rotary is a `rotaryEncoder`), every `button` key in `qwerty2.kl` | `-provision` found it (it lives on the `android-wear` site) |
+| `android-tv` 34 r3 | fstab slots, modules, `.idc` names, every `button` key in `qwerty.kl`; generic goldfish vendor, no TV-only HAL | no touch device (`hw.screen=no-touch`), no motion sensors; `system.img` 8.1 → 1.4 GB on disk |
+| `android-automotive` 34-ext9 r5 | fstab slots, modules; `build.prop` beside the image (car detection); the VHAL opens `pipe:qemud:car`; every `vhal` property and gear/ignition value | `-provision 34` resolves to `34-ext9`; light-only sensors, 3686 MB |
+| `google-xr` 34 r7 | fstab slots, modules, `.idc` names; `GuestAngle` and `VirtioDualModeMouse` | the dual-mode mouse follows `VirtioDualModeMouse` |
+| `ai-glasses` 36 r6 | fstab slots, modules, `kernel_cmdline.txt` | the touchpad (`virtio_input_multi_touch_touchpad_0`), no dual-mode mouse |
+
+Every fstab mounts system through `androidboot.boot_devices` (slot 27, `a003600`), userdata as
+`vdc` and metadata at `a003c00`; every first-stage module list is virtio blk, console, mmio, rng
+and vsock (plus PCI, unused). All five enable `VirtioSndCard`; Wear, TV and XR run the goldfish
+audio HAL that phones boot without a card on.
+
 ## Known gaps
 
 What is modelled and labelled but not (or not verifiably) working end to end:
@@ -150,9 +181,9 @@ What is modelled and labelled but not (or not verifiably) working end to end:
 | Kind | Gap |
 | --- | --- |
 | CarPlay | Implemented as above but never run: no Mac was available. Whether `simctl io enumerate` then labels the screen "CarPlay" (what auto-mobile's CarPlay observe looks for, auto-mobile #18729) is unconfirmed. Only touch: the knob, back, home and Siri head-unit inputs aren't sent (auto-mobile #19059 is finding out whether SimulatorKit takes them). The desktop doesn't show the CarPlay screen. |
-| Android Automotive | emu-rs serves the vehicle HAL channel (`qemud:car`, driven by `vehicle` / console `car`) and a silent virtio-snd card for the car audio HAL, but no car image has been booted on them yet; EVS, the cluster display and the rotary controller aren't modelled ([android.md](android.md#automotive)). |
-| Android TV | Not among the images emu-rs has booted so far. |
-| Android XR | Not booted on emu-rs yet. The images expect a sound card (stock enables `VirtioSndCard` for them); emu-rs gives Android XR images its silent virtio-snd card. The room renders in the guest through gfxstream (emu-rs already defaults to ANGLE), but stock's other XR feature flags (`XrModeUI`, `XrHandAndEyePointers`, `VirtioMouse`, `MultiDisplay`, `BluetoothEmulation`) have no emu-rs equivalent yet. The dual-mode mouse matches stock's device (name, ids, event bits, axes); how the guest maps it to its hand ray and gaze pointers, and whether head pose, options, hand and eye events over `xr_service` take effect, is unverified. auto-mobile's `xrHeadsetInput` (auto-mobile #19076) sends hand and eye events over stock's gRPC `streamInputEvent`, which emu-rs doesn't serve yet (its gRPC `EmulatorController` is on the roadmap); `xr hand`/`xr eye` put the same messages on the guest's pipe. `emu -create-avd` doesn't apply the XR profile (pass `-lcd 2560x2558@240 -memory 4096`); `sim-rs create` does. |
+| Android Automotive | emu-rs serves the vehicle HAL channel (`qemud:car`, driven by `vehicle` / console `car`) and a silent virtio-snd card for the car audio HAL, but no car image has been booted on them yet (checked offline against 34-ext9: [android.md](android.md#automotive)); EVS, the cluster display and the rotary controller aren't modelled ([android.md](android.md#automotive)). |
+| Android TV | Not among the images emu-rs has booted so far. Checked offline against `android-tv` 34 r3 (`emu -avd TV34 -dry-run` plus its unpacked ramdisk and vendor partition): the first-stage fstab addresses the board's slots (system at `a003600`, userdata `vdc`, metadata at `a003c00`), its first-stage modules are emu-rs's devices, the vendor partition is the generic goldfish one (no HDMI-CEC or TV-input HAL), the `.idc` files match emu-rs's input names, and every `button` key maps to its Android key in the `qwerty.kl` the guest uses. The image enables `VirtioSndCard` but runs the goldfish HIDL audio HAL phones use, which boots without a card, so TV stays without one like phones. Its AVDs say `hw.screen=no-touch` like stock's, and emu-rs then attaches no touch device, as stock doesn't; `tap`, `swipe` and console `touch` say so. |
+| Android XR | Not booted on emu-rs yet. Checked offline against `google-xr` 34 r7: its fstab, modules and input `.idc` names match the board, and its features ask for what emu-rs gives it (`GuestAngle`, `VirtioDualModeMouse`). It enables `VirtioSndCard` but runs the goldfish audio HAL phones use, so emu-rs's silent card is stock-like rather than required. The room renders in the guest through gfxstream (emu-rs already defaults to ANGLE), but stock's other XR feature flags (`XrModeUI`, `XrHandAndEyePointers`, `VirtioMouse`, `MultiDisplay`, `BluetoothEmulation`) have no emu-rs equivalent yet. The dual-mode mouse matches stock's device (name, ids, event bits, axes); how the guest maps it to its hand ray and gaze pointers, and whether head pose, options, hand and eye events over `xr_service` take effect, is unverified. auto-mobile's `xrHeadsetInput` (auto-mobile #19076) sends hand and eye events over stock's gRPC `streamInputEvent`, which emu-rs doesn't serve yet (its gRPC `EmulatorController` is on the roadmap); `xr hand`/`xr eye` put the same messages on the guest's pipe. The display glasses' temple touchpad (`hw.touchpad0`, 1542×297, which the `ai-glasses` image configures as `virtio_input_multi_touch_touchpad_0`) is attached and driven by `touchpad`, but how the guest's UI reacts to it is unverified. Only images that enable `VirtioDualModeMouse` (the headsets, not the glasses) get the dual-mode mouse, as on stock. |
 | Apple Watch, Apple TV | The crown, gestures, Siri Remote buttons and touch surface use the messages Simulator.app sends (confirmed live by other projects on watchOS/tvOS 26.5 and 27), but not run by sim-rs. The crown's units per tick are a calibration. From Xcode 27 the guest can switch input to `dtuhidd` (once `com.apple.coredevice.dtuhidd.active` is set, e.g. by Device Hub), after which legacy HID buttons and keys are dropped; sim-rs doesn't detect that yet. |
 | Vision Pro | Gaze, pinch and the camera (look around, pan, orbit) go through Xcode's visionOS UI plugin in Simulator.app, whose messages aren't public; sim-rs sends plain touches, which no source confirms visionOS honours. auto-mobile can't script visionOS input either (auto-mobile #19055). |
 | iOS rotation | Runtimes that report device motion can ignore the orientation event (idb switches to a vendor-defined HID message through `dtuhidd` there); not handled. |

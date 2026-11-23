@@ -11,10 +11,14 @@ publish.workspace = true
 doctest = false
 
 [dependencies]
+emu-hvf.workspace = true
 roxmltree.workspace = true
 sha1_smol.workspace = true
 sim-core.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
 
 [lints]
 workspace = true

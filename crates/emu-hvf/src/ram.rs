@@ -96,6 +96,7 @@ impl GuestRam {
         self.base + self.len
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn host_ptr(&self) -> *mut u8 {
         self.ptr
     }

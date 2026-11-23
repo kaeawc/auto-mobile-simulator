@@ -109,12 +109,14 @@ scripts/automobile-harness-android.sh emulator-5554
 - `crates/sim-android` — the Android backend's client: AVDs as labelled devices, system images as
   runtimes, AVD creation shaped by form factor, starting `emu` and waiting for boot, the console
   client (`console.rs`) and the display socket client (`display.rs`). No FFI.
-- `crates/emu-hvf` — `Vm` (GIC, RAM mapping, SPIs), `Vcpu` (run/regs/vtimer), `GuestRam`.
-- `crates/emu-vmm` — `lib.rs` (`run`), `layout.rs`, `board.rs` (DT), `vcpu.rs` (exits, PSCI,
+- `crates/emu-hvf` — `Vm` (GIC, RAM mapping, SPIs), `Vcpu` (run/regs/vtimer), `GuestRam`. `GuestRam` and
+  `host` (hole punching) build on any unix host; the hypervisor (`hv.rs`) is Apple silicon only.
+- `crates/emu-vmm` — `machine.rs` (`run`), `layout.rs`, `board.rs` (DT), `vcpu.rs` (exits, PSCI,
   wakers), `bus.rs`, `devices/` (PL011, PL031, goldfish), `virtio/` (mmio transport, queue, blk,
   rng, vsock, gpu, input incl. XR's dual-mode mouse, console, snd), `pipe/` (adb bridge, qemud
   services incl. `car.rs`, the vehicle HAL, and `xr.rs`, Android XR's `xr_service`), `modem/`,
-  `disk.rs`, `boot.rs`.
+  `disk.rs`, `boot.rs`, `display.rs` (`FrameStore`). Everything but `machine.rs`, `vcpu.rs` and
+  `virtio/gpu.rs` builds and tests on Linux: put device logic there, not behind the hypervisor.
 - `crates/emu-avd` — `Env` (SDK/AVD paths), `Avd` (config, `profile()`), `NewAvd`
   (`for_profile`), running-instance advertisements (`Running`), `BootConfig`, ini parsing.
 - `crates/emu-sdk` — Java-free provisioning: repository manifests, verified downloads, the
@@ -132,7 +134,8 @@ scripts/automobile-harness-android.sh emulator-5554
   `tests/e2e_android.rs` against a running AVD when `SIM_RS_E2E_AVD` is.
 - `apps/emu` — the Android emulator binary, a drop-in for the SDK's `emulator`: `args.rs` (SDK
   flags), `instance.rs` (disks, bootconfig, boot props), `console.rs` (console server,
-  running-instance file), `display_server.rs` (frames and input on `display.sock`),
+  running-instance file; its commands build and test on any host), `display_server.rs` (frames
+  and input on `display.sock`),
   `provision.rs` (`-provision`, `-list-images`). Boots only on Apple silicon; elsewhere it lists,
   creates and provisions AVDs.
 - `desktop/` — Rune app, one window for both platforms: `device.rs` (the live iOS device facade; a
@@ -145,7 +148,9 @@ scripts/automobile-harness-android.sh emulator-5554
   demo, android, foldable, watch, tv, empty. On Linux it renders with Mesa's lavapipe.
 - `scripts/` — `parity.sh`, `automobile-harness.sh`, `pf-shape.sh` (pf/dummynet, needs sudo);
   Android: `sign-run.sh` (the cargo runner: hypervisor entitlement), `sdk-shim.sh` (SDK overlay
-  whose `emulator` is emu-rs), `automobile-harness-android.sh`, `android-bench.sh`.
+  whose `emulator` is emu-rs), `automobile-harness-android.sh`, `android-bench.sh`,
+  `inspect-image.py` (what a system image expects of the board, unpacked without booting: fstab,
+  modules, input names, vendor HALs).
 - `docs/research/` — `network-shaping.md`, `audio-camera.md`; `docs/automobile-tool-matrix.md`.
   `docs/architecture.md` (layers, process model, shared logic, the conflict decisions),
   `docs/form-factors.md` (support matrix, profiles, inference, launching each kind, known gaps).

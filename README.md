@@ -113,7 +113,7 @@ sim-rs create Tablet  --platform android --system-image "system-images;android-3
 sim-rs create Fold    --platform android --system-image "system-images;android-36;google_apis;arm64-v8a" --form-factor foldable
 sim-rs create Wear    --platform android --system-image "system-images;android-34;android-wear;arm64-v8a"
 sim-rs create TV      --platform android --system-image "system-images;android-34;google-tv;arm64-v8a"
-sim-rs create Car     --platform android --system-image "system-images;android-34;android-automotive;arm64-v8a"
+sim-rs create Car     --platform android --system-image "system-images;android-34-ext9;android-automotive;arm64-v8a"
 sim-rs create XR      --platform android --system-image "system-images;android-34;google-xr;arm64-v8a"
 sim-rs boot Pixel                             # starts emu; waits for sys.boot_completed
 adb -s emulator-5554 shell                    # it is an ordinary emulator to every tool

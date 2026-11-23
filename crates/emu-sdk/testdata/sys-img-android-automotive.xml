@@ -1,0 +1,146 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!-- Trimmed from https://dl.google.com/android/repository/sys-img/android-automotive/sys-img2-3.xml
+     (2026-11-23: licenses, dependencies, x86 and Play Store images dropped). Automotive publishes
+     API 34 and 35 only at extension levels. -->
+<sys-img:sdk-sys-img xmlns:sys-img="http://schemas.android.com/sdk/android/repo/sys-img2/03" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <channel id="channel-0">stable</channel>
+  <channel id="channel-1">beta</channel>
+  <channel id="channel-2">dev</channel>
+  <channel id="channel-3">canary</channel>
+  <remotePackage path="system-images;android-36.1;android-automotive;arm64-v8a">
+    <type-details xsi:type="sys-img:sysImgDetailsType">
+      <api-level>36.1</api-level>
+      <extension-level>20</extension-level>
+      <base-extension>true</base-extension>
+      <tag>
+        <id>android-automotive</id>
+        <display>Automotive</display>
+      </tag>
+      <tag>
+        <id>google_apis</id>
+        <display>Google APIs</display>
+      </tag>
+      <vendor>
+        <id>google</id>
+        <display>Google Inc.</display>
+      </vendor>
+      <abi>arm64-v8a</abi>
+    </type-details>
+    <revision>
+      <major>1</major>
+    </revision>
+    <display-name>Android Automotive with Google APIs arm64-v8a System Image</display-name>
+    <channelRef ref="channel-2"/>
+    <archives>
+      <archive>
+        <complete>
+          <size>1488333461</size>
+          <checksum type="sha1">ac278b4d775ae66d7a5968ccc83f9561d3d4f8d9</checksum>
+          <url>arm64-v8a-36.1_r01.zip</url>
+        </complete>
+      </archive>
+    </archives>
+  </remotePackage>
+  <remotePackage path="system-images;android-35-ext15;android-automotive;arm64-v8a">
+    <type-details xsi:type="sys-img:sysImgDetailsType">
+      <api-level>35x</api-level>
+      <extension-level>15</extension-level>
+      <base-extension>false</base-extension>
+      <tag>
+        <id>android-automotive</id>
+        <display>Automotive</display>
+      </tag>
+      <tag>
+        <id>google_apis</id>
+        <display>Google APIs</display>
+      </tag>
+      <vendor>
+        <id>google</id>
+        <display>Google Inc.</display>
+      </vendor>
+      <abi>arm64-v8a</abi>
+    </type-details>
+    <revision>
+      <major>4</major>
+    </revision>
+    <display-name>Android Automotive with Google APIs arm64-v8a System Image</display-name>
+    <channelRef ref="channel-0"/>
+    <archives>
+      <archive>
+        <complete>
+          <size>1363609651</size>
+          <checksum type="sha1">c09e314f49e53b23721147480db60de7dd903399</checksum>
+          <url>arm64-v8a-35-ext15_r04.zip</url>
+        </complete>
+      </archive>
+    </archives>
+  </remotePackage>
+  <remotePackage path="system-images;android-34-ext9;android-automotive;arm64-v8a">
+    <type-details xsi:type="sys-img:sysImgDetailsType">
+      <api-level>34x</api-level>
+      <extension-level>9</extension-level>
+      <base-extension>false</base-extension>
+      <tag>
+        <id>android-automotive</id>
+        <display>Automotive</display>
+      </tag>
+      <tag>
+        <id>google_apis</id>
+        <display>Google APIs</display>
+      </tag>
+      <vendor>
+        <id>google</id>
+        <display>Google Inc.</display>
+      </vendor>
+      <abi>arm64-v8a</abi>
+    </type-details>
+    <revision>
+      <major>5</major>
+    </revision>
+    <display-name>Android Automotive with Google APIs arm64-v8a System Image</display-name>
+    <channelRef ref="channel-0"/>
+    <archives>
+      <archive>
+        <complete>
+          <size>1337707768</size>
+          <checksum type="sha1">898559aa3c3ec2f276866e998ba074dc32c10405</checksum>
+          <url>arm64-v8a-34-ext9_r05.zip</url>
+        </complete>
+      </archive>
+    </archives>
+  </remotePackage>
+  <remotePackage path="system-images;android-33;android-automotive;arm64-v8a">
+    <type-details xsi:type="sys-img:sysImgDetailsType">
+      <api-level>33</api-level>
+      <extension-level>3</extension-level>
+      <base-extension>true</base-extension>
+      <tag>
+        <id>android-automotive</id>
+        <display>Automotive</display>
+      </tag>
+      <tag>
+        <id>google_apis</id>
+        <display>Google APIs</display>
+      </tag>
+      <vendor>
+        <id>google</id>
+        <display>Google Inc.</display>
+      </vendor>
+      <abi>arm64-v8a</abi>
+    </type-details>
+    <revision>
+      <major>5</major>
+    </revision>
+    <display-name>Android Automotive with Google APIs arm64-v8a System Image</display-name>
+    <channelRef ref="channel-0"/>
+    <archives>
+      <archive>
+        <complete>
+          <size>1311397288</size>
+          <checksum type="sha1">1350f29ead803659be77949886e4cc0fca543ae3</checksum>
+          <url>arm64-v8a-33_r05.zip</url>
+        </complete>
+      </archive>
+    </archives>
+  </remotePackage>
+</sys-img:sdk-sys-img>

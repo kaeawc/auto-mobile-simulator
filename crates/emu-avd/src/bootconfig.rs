@@ -26,6 +26,11 @@ impl BootConfig {
         self
     }
 
+    /// Every entry, in the order first set.
+    pub fn entries(&self) -> &[(String, String)] {
+        &self.entries
+    }
+
     pub fn get(&self, key: &str) -> Option<&str> {
         self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }

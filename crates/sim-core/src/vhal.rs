@@ -1016,6 +1016,28 @@ impl Tracker {
 mod tests {
     use super::*;
 
+    /// Every property and gear/ignition name agrees with a real Automotive image's VHAL
+    /// (`vehicle-types-meta.json` from the SDK's android-34-ext9 image, trimmed).
+    #[test]
+    fn properties_and_enums_match_the_image_vhal() {
+        let meta: serde_json::Value = serde_json::from_str(include_str!("../testdata/vhal-meta-34.json")).expect("fixture");
+        for (name, id) in PROPERTIES {
+            assert!(meta["VehicleProperty"].get(id.to_string()).is_some(), "{name} ({id:#x}) isn't a VHAL property");
+        }
+        let check = |table: &[(&str, i32)], enum_name: &str, prefix: &str| {
+            for (alias, value) in table {
+                let full = format!("{prefix}{}", alias.to_ascii_uppercase());
+                if let Some(v) = meta[enum_name].get(&full) {
+                    assert_eq!(v.as_i64(), Some(i64::from(*value)), "{alias} is {enum_name}::{full}");
+                } else {
+                    assert!(alias.len() == 1, "{alias} isn't in {enum_name}");
+                }
+            }
+        };
+        check(GEARS, "VehicleGear", "GEAR_");
+        check(IGNITION, "VehicleIgnitionState", "");
+    }
+
     fn hex(s: &str) -> Vec<u8> {
         s.split_whitespace().map(|b| u8::from_str_radix(b, 16).expect("hex")).collect()
     }

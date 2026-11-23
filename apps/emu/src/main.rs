@@ -7,11 +7,9 @@
 mod args;
 // The VMM, the renderer and everything that drives them exist only on Apple silicon Macs (the
 // Hypervisor.framework); elsewhere `emu` still lists, creates and provisions AVDs.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod console;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod display_server;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod instance;
 mod provision;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -77,9 +75,10 @@ fn main() -> ExitCode {
     }
 }
 
-/// `-create-avd`: writes the AVD with the requested hardware, warning if its image is missing.
+/// `-create-avd`: writes the AVD shaped like its image's form factor (a round watch, a TV, an XR
+/// headset, ...), with the requested hardware on top, warning if its image is missing.
 fn create_avd(env: &emu_avd::Env, name: &str, sysdir: &str, opts: &args::Opts) -> Result<()> {
-    let mut spec = emu_avd::NewAvd::new(name, sysdir);
+    let mut spec = emu_avd::NewAvd::for_image(name, sysdir);
     if let Some(lcd) = opts.lcd {
         spec.lcd = lcd;
     }
@@ -153,7 +152,24 @@ fn real_main() -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
     let name = opts.avd.clone().context("no AVD given (use -avd NAME, or -list-avds)")?;
+    if opts.dry_run {
+        return dry_run(&env, &name, &opts);
+    }
     boot(&env, &name, &opts, signals)
+}
+
+/// `-avd NAME -dry-run`: prints the boot plan without booting (on any host), and fails if the
+/// image is missing files the boot reads.
+fn dry_run(env: &emu_avd::Env, name: &str, opts: &args::Opts) -> Result<ExitCode> {
+    let avd = env.load(name)?;
+    let renderer = if cfg!(all(target_os = "macos", target_arch = "aarch64")) { instance::renderer(&avd, opts) } else { None };
+    let plan = instance::BootPlan::new(&avd, opts, renderer);
+    print!("{plan}");
+    let missing = plan.missing();
+    for path in &missing {
+        eprintln!("emu: missing {}", path.display());
+    }
+    Ok(if missing.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

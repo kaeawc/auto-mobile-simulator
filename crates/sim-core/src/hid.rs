@@ -150,7 +150,8 @@ impl Button {
 
     /// The Android emulator console's key for this button (`event send EV_KEY:<key>:1`), if
     /// Android has it: a stock console name, so stock emulators take it too, or a keycode where
-    /// stock has no name. The codes are what goldfish's `qwerty2.kl` maps: `KEY_CENTER` (232) is
+    /// stock has no name. The codes are what goldfish's `qwerty.kl` maps (the layout its `qwerty2`
+    /// keyboard's `.idc` names; checked against TV 34's vendor image): `KEY_CENTER` (232) is
     /// DPAD_CENTER, 580 (Linux `KEY_APPSELECT`) is APP_SWITCH, `KEY_PLAYPAUSE` (164) is
     /// MEDIA_PLAY_PAUSE.
     pub fn android_key(self) -> Option<&'static str> {

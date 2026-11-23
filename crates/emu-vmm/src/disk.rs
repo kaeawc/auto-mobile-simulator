@@ -10,13 +10,31 @@ use std::collections::btree_map::Entry;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use emu_hvf::GuestRam;
 
 const CHUNK: u64 = 4096;
 /// Largest buffer of zeroes written at once where a range can't be punched.
 const ZERO_BUF: u64 = 1 << 20;
+
+/// How a disk image is attached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskMode {
+    /// Guest writes go to the file.
+    Persistent,
+    /// Guest writes are kept in memory and discarded at exit.
+    Ephemeral,
+}
+
+/// A disk in a virtio-blk slot of the board.
+#[derive(Clone, Debug)]
+pub struct DiskSpec {
+    pub slot: u32,
+    pub path: PathBuf,
+    pub mode: DiskMode,
+    pub serial: String,
+}
 
 pub struct Disk {
     /// fsync on guest FLUSH (see `set_fsync`).
@@ -102,8 +120,7 @@ impl Disk {
     pub fn persistent(path: &Path) -> io::Result<Disk> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let size = file.metadata()?.len();
-        let block =
-            rustix::fs::fstatfs(&file).ok().map(|s| u64::from(s.f_bsize)).filter(|b| b.is_power_of_two() && *b >= 512).unwrap_or(CHUNK);
+        let block = rustix::fs::fstatvfs(&file).ok().map(|s| s.f_frsize).filter(|b| b.is_power_of_two() && *b >= 512).unwrap_or(CHUNK);
         Ok(Disk { file, size, block, punch: true, overlay: None, fsync: false })
     }
 
@@ -208,7 +225,7 @@ impl Disk {
         match emu_hvf::host::punch_hole(&self.file, first, last - first) {
             Ok(()) => Ok(()),
             Err(e) => {
-                if matches!(e.raw_os_error(), Some(libc::ENOTSUP | libc::EOPNOTSUPP)) {
+                if [Some(libc::ENOTSUP), Some(libc::EOPNOTSUPP)].contains(&e.raw_os_error()) {
                     self.punch = false;
                 }
                 write_zeroes(&self.file, first, last)

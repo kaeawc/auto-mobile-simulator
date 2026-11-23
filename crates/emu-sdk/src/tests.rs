@@ -436,3 +436,99 @@ fn installs_renderer_from_a_local_archive() {
     assert_eq!(std::fs::read_dir(sdk.downloads()).expect("ls").count(), 0, "useless archive deleted");
     let _ = std::fs::remove_dir_all(work);
 }
+
+#[test]
+fn bare_api_levels_fall_back_to_the_newest_extension_level() {
+    let m = Manifest::parse(
+        include_str!("../testdata/sys-img-android-automotive.xml"),
+        "https://dl.google.com/android/repository/sys-img/android-automotive/",
+    )
+    .expect("parse Automotive fixture");
+    let path = |api: &str| m.resolve_system_image(api, "android-automotive", "arm64-v8a", HOST).map(|d| d.path);
+    // Automotive has no plain API 34 or 35 image, only extension levels.
+    assert_eq!(path("34").expect("34"), "system-images;android-34-ext9;android-automotive;arm64-v8a");
+    assert_eq!(path("android-35").expect("35"), "system-images;android-35-ext15;android-automotive;arm64-v8a");
+    assert_eq!(path("33").expect("33"), "system-images;android-33;android-automotive;arm64-v8a", "exact match first");
+    assert_eq!(path("34-ext9").expect("explicit"), "system-images;android-34-ext9;android-automotive;arm64-v8a");
+    assert!(matches!(path("34-ext8"), Err(Error::UnknownPackage(..))), "an explicit extension level is never swapped");
+    assert!(matches!(path("3"), Err(Error::UnknownPackage(..))), "34-ext9 isn't an extension of 3");
+    assert!(matches!(path("36"), Err(Error::UnknownPackage(..))), "36.1 is a dev-channel preview, not 36");
+    let tv = m.resolve_system_image("34", "android-tv", "arm64-v8a", HOST);
+    assert!(matches!(tv, Err(Error::UnknownPackage(..))), "only the asked tag");
+}
+
+#[test]
+fn the_current_host_matches_the_build_target() {
+    let host = Host::current();
+    #[cfg(target_os = "linux")]
+    assert_eq!(host.os, "linux");
+    #[cfg(target_os = "macos")]
+    assert_eq!(host.os, "macosx");
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    assert_eq!(host, Host::MACOS_ARM64);
+    assert!(repo().resolve("platform-tools", Host { os: "linux", arch: "x64" }).is_ok());
+}
+
+#[test]
+fn a_missing_host_tool_says_what_to_install() {
+    let dir = std::env::temp_dir().join(format!("emu-sdk-missing-tool-{}", std::process::id()));
+    let mut sdk = Sdk::new(&dir).expect("sdk");
+    sdk.quiet = true;
+    sdk.curl = "/nonexistent/curl".into();
+    let err = sdk.manifest("https://example.invalid/repository2-3.xml").expect_err("no curl").to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(err.contains("`/nonexistent/curl` not found: install curl"), "{err}");
+}
+
+#[test]
+fn sparsify_frees_zero_blocks_and_keeps_contents() {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::env::temp_dir().join(format!("emu-sdk-sparse-{}.img", std::process::id()));
+    let mut data = vec![0u8; 64 * 4096 + 100];
+    data[5 * 4096 + 7] = 1; // block 5 stays
+    data[40 * 4096..41 * 4096].fill(0xff); // block 40 stays
+    std::fs::write(&path, &data).expect("write");
+    let before = std::fs::metadata(&path).expect("meta").blocks();
+    let freed = match sparsify(&path) {
+        Ok(f) => f,
+        // tmpfs and some overlay filesystems have no holes.
+        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => return,
+        Err(e) => panic!("{e}"),
+    };
+    let after = std::fs::read(&path).expect("read");
+    let blocks = std::fs::metadata(&path).expect("meta").blocks();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(after, data, "contents unchanged");
+    assert_eq!(freed, 62 * 4096, "every whole zero block; the short tail stays");
+    assert!(blocks < before, "allocation shrank: {before} -> {blocks} sectors");
+}
+
+#[test]
+fn tag_variants_are_found_on_whichever_site_lists_them() {
+    // `android-wear-signed` images live on the `android-wear` site; there's no site of their own.
+    let dir = std::env::temp_dir().join(format!("emu-sdk-sites-{}", std::process::id()));
+    let mut sdk = Sdk::new(&dir).expect("sdk");
+    sdk.quiet = true;
+    sdk.curl = "/nonexistent/curl".into(); // offline: only cached manifests load
+    let cache = |url: &str, text: &str| {
+        let name: String = url.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+        std::fs::create_dir_all(sdk.downloads()).expect("downloads");
+        std::fs::write(sdk.downloads().join(name), text).expect("cache");
+    };
+    let wear_site = format!("{REPO_URL}sys-img/android-wear/sys-img2-3.xml");
+    cache(
+        &sites_url(),
+        r#"<common:site-list xmlns:sdk="http://schemas.android.com/sdk/android/addons-list/5" xmlns:common="http://schemas.android.com/repository/android/sites-common/1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <site xsi:type="sdk:sysImgSiteType"><displayName>Android TV</displayName><url>sys-img/android-tv/sys-img2-3.xml</url></site>
+  <site xsi:type="sdk:sysImgSiteType"><displayName>Wear OS</displayName><url>sys-img/android-wear/sys-img2-3.xml</url></site>
+</common:site-list>"#,
+    );
+    cache(&wear_site, &include_str!("../testdata/sys-img-android-automotive.xml").replace("android-automotive", "android-wear-signed"));
+    let found = sdk.find_system_image("34", "android-wear-signed", "arm64-v8a", HOST).map(|d| d.path);
+    let listed = sdk.system_image_manifests(Some("android-wear-signed")).map(|m| m.len());
+    let missing = sdk.find_system_image("34", "android-tv", "arm64-v8a", HOST).map(|d| d.path);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(found.expect("found"), "system-images;android-34-ext9;android-wear-signed;arm64-v8a");
+    assert_eq!(listed.expect("listed"), 1, "the TV site isn't cached, so it's skipped");
+    assert!(missing.is_err());
+}

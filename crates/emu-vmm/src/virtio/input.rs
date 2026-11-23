@@ -69,6 +69,9 @@ const CFG_ABS_INFO: u8 = 0x12;
 
 /// The keyboard's name: goldfish's vendor image ships `qwerty2.idc` and `qwerty2.kl` for it.
 pub const KEYBOARD_NAME: &str = "qwerty2";
+/// The touchpad's name, which the guest's `virtio_input_multi_touch_touchpad_0.idc` configures
+/// as `touchNavigation` (the display glasses' images ship it).
+pub const TOUCHPAD_NAME: &str = "virtio_input_multi_touch_touchpad_0";
 /// Bus, vendor, product, version of stock's keyboard (`BUS_VIRTUAL`, 0627:0001).
 const KEYBOARD_IDS: [u16; 4] = [0x06, 0x0627, 0x0001, 0x0001];
 /// Ids of the other devices.
@@ -182,6 +185,18 @@ impl Input {
         let (tx, rx) = channel();
         let handle = InputHandle { tx: tx.clone(), kind };
         (Input { kind, name: name.to_string(), select: (0, 0), tx, rx: Some(rx), worker: None }, handle)
+    }
+
+    /// Takes the event batches queued while no guest driver has the device (before activation),
+    /// as the host sent them: what an input would deliver, for tests and diagnostics.
+    pub fn take_queued(&self) -> Vec<Vec<InputEvent>> {
+        let Some(rx) = &self.rx else { return Vec::new() };
+        rx.try_iter()
+            .filter_map(|m| match m {
+                Msg::Events(e) => Some(e),
+                Msg::Kick | Msg::Stop => None,
+            })
+            .collect()
     }
 
     fn stop_worker(&mut self) {
@@ -387,6 +402,21 @@ impl Worker {
             self.irq.raise(INT_USED_RING);
         }
     }
+}
+
+/// Ways for the host to inject input into the running guest.
+#[derive(Clone)]
+pub struct Inputs {
+    /// The screen's size in pixels.
+    pub screen: (u32, u32),
+    /// The multi-touch screen; none on a `hw.screen=no-touch` device (TV), as on stock.
+    pub touch: Option<InputHandle>,
+    pub keyboard: InputHandle,
+    pub rotary: InputHandle,
+    /// The dual-mode mouse (Android XR images only).
+    pub mouse: Option<InputHandle>,
+    /// A touchpad beside the screen (`hw.touchpad0`: Android XR display glasses).
+    pub touchpad: Option<InputHandle>,
 }
 
 #[cfg(test)]
