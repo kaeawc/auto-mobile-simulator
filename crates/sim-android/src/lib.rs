@@ -11,6 +11,8 @@
 
 pub mod console;
 pub mod display;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -541,6 +543,7 @@ fn decode_png(bytes: &[u8]) -> Result<Frame, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{fake_emulator, wait_for};
 
     struct Fixture {
         root: PathBuf,
@@ -632,84 +635,11 @@ mod tests {
         assert!(f.android.devices().is_empty());
     }
 
-    /// A stand-in for a running emu-rs: an advertisement naming this process, a console that
-    /// records commands (and writes a PNG for `screenshot`), and a display socket that records
-    /// input lines.
-    struct FakeEmulator {
-        console: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-        display: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    fn fake_emulator(f: &Fixture, avd: &str) -> FakeEmulator {
-        use std::io::{BufRead, BufReader, Write};
-        use std::sync::{Arc, Mutex};
-        let console = Arc::new(Mutex::new(Vec::new()));
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("console");
-        let port = listener.local_addr().expect("addr").port();
-        let log = console.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let mut out = stream.try_clone().expect("clone");
-                let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
-                for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                    let line = line.trim().to_owned();
-                    if line == "quit" {
-                        break;
-                    }
-                    let reply = match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-                        ["ping"] => "I am alive!\r\nOK".to_owned(),
-                        ["frames"] => "3\r\nOK".to_owned(),
-                        ["car", "get", ..] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\nOK".to_owned(),
-                        ["car", "list"] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\n\
-                                            property=INFO_MAKE id=0x11100101 area=0 status=available value=Toy Car\r\nOK"
-                            .to_owned(),
-                        ["screenshot", path] => {
-                            let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };
-                            std::fs::write(path, sim_core::frame::encode_png(&frame).expect("png")).expect("write png");
-                            format!("{path} (2x1, frame 3)\r\nOK")
-                        }
-                        _ => "OK".to_owned(),
-                    };
-                    log.lock().expect("log").push(line);
-                    let _ = out.write_all(format!("{reply}\r\n").as_bytes());
-                }
-            }
-        });
-        let display = Arc::new(Mutex::new(Vec::new()));
-        let dir = f.android.env.avd_home.join(format!("{avd}.avd/emu-rs"));
-        std::fs::create_dir_all(&dir).expect("emu-rs dir");
-        let socket = std::os::unix::net::UnixListener::bind(dir.join("display.sock")).expect("display");
-        let lines = display.clone();
-        std::thread::spawn(move || {
-            for conn in socket.incoming().flatten() {
-                let lines = lines.clone();
-                std::thread::spawn(move || {
-                    for l in BufReader::new(conn).lines().map_while(Result::ok) {
-                        lines.lock().expect("lines").push(l);
-                    }
-                });
-            }
-        });
-        let running = f.android.running_dir.clone().expect("running dir");
-        std::fs::create_dir_all(&running).expect("running");
-        let ad = format!("port.serial={port}\nport.adb={}\navd.name={avd}\nemulator=emu-rs\n", port + 1);
-        std::fs::write(running.join(format!("pid_{}.ini", std::process::id())), ad).expect("advertise");
-        FakeEmulator { console, display }
-    }
-
-    fn wait_for(lines: &std::sync::Mutex<Vec<String>>, n: usize) -> Vec<String> {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while lines.lock().expect("lines").len() < n && Instant::now() < deadline {
-            sleep(Duration::from_millis(10));
-        }
-        lines.lock().expect("lines").clone()
-    }
-
     #[test]
     fn running_devices_are_driven_over_console_and_display() {
         let f = fixture("running");
         f.android.create("fold", "system-images;android-36;google_apis;arm64-v8a", Some(FormFactor::Foldable)).expect("fold");
-        let fake = fake_emulator(&f, "fold");
+        let fake = fake_emulator(&f.android, "fold");
         let d = f.android.device("booted").expect("the running device is `booted`");
         assert_eq!((d.info.udid.as_str(), d.info.state), ("fold", DeviceState::Booted));
         let r = d.running.clone().expect("running");
@@ -805,7 +735,7 @@ mod tests {
         f.android.create("watch", "system-images;android-34;android-wear;arm64-v8a", None).expect("watch");
         let watch = f.android.device("watch").expect("watch");
         assert_eq!(watch.xr(&rotate), Err("XR controls need an Android XR device; watch is Wear OS · Watch".into()));
-        let fake = fake_emulator(&f, "headset");
+        let fake = fake_emulator(&f.android, "headset");
         let d = f.android.device("headset").expect("running headset");
         d.xr(&rotate).expect("rotate");
         d.xr(&XrCommand::Recenter).expect("recenter");
@@ -836,7 +766,7 @@ mod tests {
         assert!(d.vehicle_set("gear", 0, "fast").expect_err("bad value").contains("isn't a Int32 value"));
         assert_eq!(d.vehicle_set("gear", 0, "drive"), Err("car isn't running; boot it first".into()));
 
-        let fake = fake_emulator(&f, "car");
+        let fake = fake_emulator(&f.android, "car");
         let d = f.android.device("car").expect("car");
         d.vehicle_set("gear", 0, "drive").expect("set");
         d.vehicle_set("HVAC_TEMPERATURE_SET", 49, "21.5").expect("set seat");
