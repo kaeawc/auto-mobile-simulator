@@ -278,6 +278,9 @@ impl GoldfishPipe {
             p.inbound.drain(..n);
             done += n;
         }
+        if let Some(h) = p.handler.as_mut() {
+            h.guest_took(done);
+        }
         (done as i32, done as i32)
     }
 }

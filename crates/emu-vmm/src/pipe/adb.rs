@@ -8,9 +8,14 @@
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::Thread;
 use std::time::Duration;
+
+use rustix::event::{PollFd, PollFlags};
+use rustix::io::Errno;
 
 use super::{HostMsg, PipeCtx, PipeHandler, PipeService, WorkerEvent};
 
@@ -96,42 +101,240 @@ fn connect_vsock(stream: Arc<TcpStream>, vsock: Sender<WorkerEvent>, port: u16) 
 }
 
 /// Host end of a forwarded stream: TCP bytes → guest, guest bytes → TCP.
+///
+/// Neither direction ever blocks the pipe's transport thread (the vsock worker, which serves
+/// every pipe). The socket is non-blocking (macOS ignores `MSG_DONTWAIT` on a blocking socket's
+/// send), and its reader and writer threads poll for it. Guest bytes go straight to the client's
+/// socket without waiting; what it can't
+/// take now is queued for a writer thread and reported as backlog, so vsock withholds that much
+/// of the guest's credit: a client that stops reading stops only its own guest sender, with at
+/// most vsock's receive buffer held here. Client bytes are read only while less than
+/// [`TO_GUEST_WINDOW`] waits for the guest, so a guest that reads slowly pushes back on the
+/// client through TCP instead of queueing without bound.
+#[derive(Default)]
 struct TcpForward {
-    stream: Option<TcpStream>,
+    stream: Option<Arc<TcpStream>>,
+    to_host: Arc<ToHost>,
+    window: Arc<Window>,
+}
+
+/// Client bytes one connection may have read but the guest not yet taken.
+const TO_GUEST_WINDOW: usize = 1 << 20;
+const READ_CHUNK: usize = 64 * 1024;
+/// Guest bytes held for a client that isn't reading. vsock's credit keeps a guest well under
+/// this; only the goldfish pipe, which has no credit, can reach it, and then `guest_data` waits
+/// for the client as the blocking write it replaces did.
+const MAX_BACKLOG: usize = 1 << 20;
+
+/// Guest bytes waiting for the client.
+#[derive(Default)]
+struct ToHost {
+    queue: Mutex<Queued>,
+    /// The writer waits for bytes; a full `guest_data` waits for room.
+    more: Condvar,
+    room: Condvar,
+    /// Bytes accepted from the guest and not yet written to the client.
+    backlog: AtomicUsize,
+    /// A `Drained` event is on its way to the worker, which clears this when it reads the backlog.
+    reported: AtomicBool,
+}
+
+#[derive(Default)]
+struct Queued {
+    buf: Vec<u8>,
+    /// The writer holds bytes taken from `buf`.
+    writing: bool,
+    closed: bool,
+    failed: bool,
+}
+
+impl ToHost {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Queued> {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Client bytes in flight to the guest, and the reader thread that waits for room.
+#[derive(Default)]
+struct Window {
+    queued: AtomicUsize,
+    closed: AtomicBool,
+    reader: OnceLock<Thread>,
+}
+
+impl Window {
+    /// Waits until another read fits; false once the connection is closed.
+    fn wait_for_room(&self) -> bool {
+        loop {
+            if self.closed.load(Ordering::SeqCst) {
+                return false;
+            }
+            if self.queued.load(Ordering::SeqCst) + READ_CHUNK <= TO_GUEST_WINDOW {
+                return true;
+            }
+            std::thread::park();
+        }
+    }
+
+    fn took(&self, n: usize) {
+        // Saturating: bytes the pipe wrote itself (the legacy handshake's `ok`) were never read.
+        let prev = self.queued.update(Ordering::SeqCst, Ordering::SeqCst, |q| q.saturating_sub(n));
+        let low = TO_GUEST_WINDOW - READ_CHUNK;
+        if prev > low && prev.saturating_sub(n) <= low {
+            self.wake();
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        if let Some(t) = self.reader.get() {
+            t.unpark();
+        }
+    }
+}
+
+/// Waits until the non-blocking socket is ready for `flags` or has hung up (the next read or
+/// write then says which); false if it can't be polled.
+fn ready(s: &TcpStream, flags: PollFlags) -> bool {
+    let mut fds = [PollFd::new(s, flags)];
+    loop {
+        match rustix::event::poll(&mut fds, None) {
+            Ok(_) => return true,
+            Err(Errno::INTR) => {}
+            Err(_) => return false,
+        }
+    }
 }
 
 impl TcpForward {
     fn start(stream: &TcpStream, ctx: PipeCtx) -> TcpForward {
-        let (Ok(writer), Ok(reader)) = (stream.try_clone(), stream.try_clone()) else {
+        let (Ok(writer), Ok(reader), Ok(())) = (stream.try_clone(), stream.try_clone(), stream.set_nonblocking(true)) else {
             ctx.send(HostMsg::Close);
-            return TcpForward { stream: None };
+            return TcpForward::default();
         };
-        spawn_reader(reader, ctx);
-        TcpForward { stream: Some(writer) }
+        let f = TcpForward { stream: Some(Arc::new(writer)), ..TcpForward::default() };
+        spawn_reader(reader, ctx.clone(), f.window.clone());
+        if let Some(s) = &f.stream {
+            spawn_writer(s.clone(), ctx, f.to_host.clone());
+        }
+        f
     }
 }
 
-fn spawn_reader(mut reader: TcpStream, ctx: PipeCtx) {
-    let name = format!("adb-conn-{}", ctx.conn);
+fn spawn_reader(mut reader: TcpStream, ctx: PipeCtx, window: Arc<Window>) {
+    let name = format!("adb-in-{}", ctx.conn);
     let _ = std::thread::Builder::new().name(name).spawn(move || {
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
+        let _ = window.reader.set(std::thread::current());
+        let mut buf = vec![0u8; READ_CHUNK];
+        while window.wait_for_room() {
             match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(n) => {
+                    window.queued.fetch_add(n, Ordering::SeqCst);
                     if !ctx.send(HostMsg::Data(buf[..n].to_vec())) {
                         return;
                     }
                 }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    if !ready(&reader, PollFlags::IN) {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => break,
             }
         }
         ctx.send(HostMsg::Close);
     });
 }
 
+/// Writes what the client couldn't take at once, as it can, reporting progress to the worker.
+fn spawn_writer(stream: Arc<TcpStream>, ctx: PipeCtx, q: Arc<ToHost>) {
+    let name = format!("adb-out-{}", ctx.conn);
+    let _ = std::thread::Builder::new().name(name).spawn(move || {
+        // Two buffers trade places: the writer drains one while the worker fills the other.
+        let mut chunk = Vec::new();
+        'run: loop {
+            {
+                let mut st = q.lock();
+                st.writing = false;
+                while st.buf.is_empty() && !st.closed && !st.failed {
+                    st = q.more.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                if st.buf.is_empty() || st.failed {
+                    break;
+                }
+                std::mem::swap(&mut st.buf, &mut chunk);
+                st.writing = true;
+            }
+            let mut off = 0;
+            while off < chunk.len() {
+                match (&*stream).write(&chunk[off..]) {
+                    Ok(n) if n > 0 => {
+                        off += n;
+                        q.backlog.fetch_sub(n, Ordering::SeqCst);
+                        q.room.notify_all();
+                        if !q.reported.swap(true, Ordering::SeqCst) {
+                            ctx.drained();
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock && ready(&stream, PollFlags::OUT) => {}
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    _ => {
+                        let mut st = q.lock();
+                        (st.failed, st.writing) = (true, false);
+                        q.room.notify_all();
+                        drop(st);
+                        ctx.send(HostMsg::Close);
+                        break 'run;
+                    }
+                }
+            }
+            chunk.clear();
+        }
+        if q.lock().closed {
+            // `closed` already shut the read side; XNU refuses `Both` then, without sending the FIN.
+            let _ = stream.shutdown(Shutdown::Write);
+        }
+    });
+}
+
 impl PipeHandler for TcpForward {
-    fn guest_data(&mut self, data: &[u8], _to_guest: &mut Vec<u8>) -> bool {
-        self.stream.as_mut().is_some_and(|s| s.write_all(data).is_ok())
+    fn guest_data(&mut self, mut data: &[u8], _to_guest: &mut Vec<u8>) -> bool {
+        let Some(stream) = &self.stream else { return false };
+        let q = &self.to_host;
+        let mut st = q.lock();
+        if st.failed {
+            return false;
+        }
+        if st.buf.is_empty() && !st.writing {
+            // The client keeps up (the usual case): straight into its socket, no thread hop.
+            match (&**stream).write(data) {
+                Ok(n) => data = &data[n..],
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+                Err(_) => {
+                    st.failed = true;
+                    return false;
+                }
+            }
+            if data.is_empty() {
+                return true;
+            }
+        }
+        while !st.failed && q.backlog.load(Ordering::SeqCst) > 0 && q.backlog.load(Ordering::SeqCst) + data.len() > MAX_BACKLOG {
+            st = q.room.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        if st.failed {
+            return false;
+        }
+        st.buf.extend_from_slice(data);
+        q.backlog.fetch_add(data.len(), Ordering::SeqCst);
+        q.more.notify_one();
+        true
     }
 
     fn host_msg(&mut self, msg: HostMsg, to_guest: &mut Vec<u8>) -> bool {
@@ -148,10 +351,29 @@ impl PipeHandler for TcpForward {
         }
     }
 
+    fn backlog(&self) -> usize {
+        // Read after clearing, so a write that lands meanwhile reports again.
+        self.to_host.reported.store(false, Ordering::SeqCst);
+        self.to_host.backlog.load(Ordering::SeqCst)
+    }
+
+    fn guest_took(&mut self, n: usize) {
+        self.window.took(n);
+    }
+
     fn closed(&mut self) {
-        if let Some(s) = &self.stream {
+        self.window.close();
+        let Some(s) = &self.stream else { return };
+        let mut st = self.to_host.lock();
+        st.closed = true;
+        if st.buf.is_empty() && !st.writing {
             let _ = s.shutdown(Shutdown::Both);
+        } else {
+            // The writer delivers what the guest sent before it closed, then hangs up.
+            let _ = s.shutdown(Shutdown::Read);
         }
+        self.to_host.more.notify_all();
+        self.to_host.room.notify_all();
     }
 }
 
@@ -217,6 +439,19 @@ impl PipeHandler for AdbPipe {
             (State::Forwarding(f), msg) => f.host_msg(msg, to_guest),
             (_, HostMsg::Close) => false,
             _ => true,
+        }
+    }
+
+    fn backlog(&self) -> usize {
+        match &self.state {
+            State::Forwarding(f) => f.backlog(),
+            _ => 0,
+        }
+    }
+
+    fn guest_took(&mut self, n: usize) {
+        if let State::Forwarding(f) = &mut self.state {
+            f.guest_took(n);
         }
     }
 
@@ -323,6 +558,118 @@ mod tests {
         pipe.closed();
         let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, svc.port)).expect("connect");
         assert!(matches!(next(&events), WorkerEvent::Connect { .. }), "no waiting pipe: the client goes to vsock");
+    }
+
+    /// A forwarder on one end of a loopback connection, the client on the other.
+    fn forwarder() -> (TcpForward, TcpStream, Receiver<WorkerEvent>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        let (events, from_host) = channel();
+        (TcpForward::start(&server, PipeCtx { conn: 1, events }), client, from_host)
+    }
+
+    /// Bytes numbered from `at`, so reordering or loss shows.
+    fn numbered(at: usize, n: usize) -> Vec<u8> {
+        (at..at + n).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn guest_bytes_for_a_stalled_client_queue_without_blocking_and_drain_in_order() {
+        let (mut f, mut client, from_host) = forwarder();
+        // Until the socket is full, bytes go straight in; then they queue, each call returning at once.
+        let chunk = 64 * 1024;
+        let mut sent = 0;
+        while f.backlog() == 0 {
+            assert!(sent < 256 << 20, "the socket never filled");
+            let start = std::time::Instant::now();
+            assert!(f.guest_data(&numbered(sent, chunk), &mut Vec::new()));
+            assert!(start.elapsed() < Duration::from_millis(100), "guest_data blocked");
+            sent += chunk;
+        }
+        for _ in 0..4 {
+            let start = std::time::Instant::now();
+            assert!(f.guest_data(&numbered(sent, chunk), &mut Vec::new()));
+            assert!(start.elapsed() < Duration::from_millis(100), "guest_data blocked");
+            sent += chunk;
+        }
+        let held = f.backlog();
+        assert!(held > 0 && held <= MAX_BACKLOG);
+        assert!(from_host.try_recv().is_err(), "nothing delivered, nothing to report");
+
+        // The client reads again: every byte, in order, and the worker hears the backlog shrink.
+        assert_eq!(read_exactly(&mut client, sent), numbered(0, sent));
+        assert!(matches!(next(&from_host), WorkerEvent::Drained { conn: 1 }));
+        let start = std::time::Instant::now();
+        while f.backlog() != 0 {
+            assert!(start.elapsed() < Duration::from_secs(5), "the backlog never drained");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Back to direct writes.
+        assert!(f.guest_data(b"tail", &mut Vec::new()));
+        assert_eq!(f.backlog(), 0);
+        assert_eq!(read_exactly(&mut client, 4), b"tail");
+        f.closed();
+    }
+
+    #[test]
+    fn closing_delivers_what_the_guest_sent_then_hangs_up() {
+        let (mut f, mut client, _from_host) = forwarder();
+        let mut sent = 0;
+        while f.backlog() == 0 {
+            assert!(f.guest_data(&numbered(sent, 64 * 1024), &mut Vec::new()));
+            sent += 64 * 1024;
+        }
+        f.closed();
+        assert_eq!(read_exactly(&mut client, sent), numbered(0, sent));
+        assert_eq!(client.read(&mut [0u8; 1]).expect("eof"), 0, "then the client sees the end");
+    }
+
+    #[test]
+    fn a_client_that_hung_up_ends_the_pipe() {
+        let (mut f, client, from_host) = forwarder();
+        drop(client);
+        let start = std::time::Instant::now();
+        while f.guest_data(&[0u8; 64 * 1024], &mut Vec::new()) {
+            assert!(start.elapsed() < Duration::from_secs(5), "writes to a closed client kept succeeding");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(data(&from_host), HostMsg::Close), "the reader sees the hang-up too");
+        f.closed();
+    }
+
+    #[test]
+    fn the_client_is_read_only_while_the_guest_keeps_up() {
+        const TOTAL: usize = 8 << 20;
+        let (mut f, mut client, from_host) = forwarder();
+        let all = numbered(0, TOTAL);
+        let writer = std::thread::spawn(move || {
+            client.write_all(&all).expect("write");
+            client
+        });
+        // The guest takes nothing: reading stops at the window, and TCP holds the rest.
+        let mut got = Vec::new();
+        while got.len() < TO_GUEST_WINDOW - READ_CHUNK {
+            let HostMsg::Data(d) = data(&from_host) else { panic!("expected data") };
+            got.extend(d);
+        }
+        while let Ok(WorkerEvent::Host { msg: HostMsg::Data(d), .. }) = from_host.recv_timeout(Duration::from_millis(200)) {
+            got.extend(d);
+        }
+        assert!(got.len() <= TO_GUEST_WINDOW, "read {} bytes ahead of the guest", got.len());
+        // As the guest takes bytes, reading resumes, until everything has come through in order.
+        let mut taken = 0;
+        while got.len() < TOTAL {
+            f.guest_took(got.len() - taken);
+            taken = got.len();
+            let HostMsg::Data(d) = data(&from_host) else { panic!("expected data") };
+            got.extend(d);
+        }
+        assert_eq!(got, numbered(0, TOTAL));
+        f.guest_took(got.len() - taken);
+        let _client = writer.join().expect("writer");
+        f.closed();
+        assert!(matches!(data(&from_host), HostMsg::Close), "closing stops the reader");
     }
 
     #[test]

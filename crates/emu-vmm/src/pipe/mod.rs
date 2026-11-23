@@ -40,6 +40,11 @@ pub enum WorkerEvent {
         make: MakeHandler,
         refused: Box<dyn FnOnce() + Send>,
     },
+    /// The host side of `conn` delivered guest bytes it was holding ([`PipeHandler::backlog`]
+    /// shrank), so the guest may get its credit back.
+    Drained {
+        conn: u64,
+    },
     Stop,
 }
 
@@ -54,13 +59,32 @@ impl PipeCtx {
     pub fn send(&self, msg: HostMsg) -> bool {
         self.events.send(WorkerEvent::Host { conn: self.conn, msg }).is_ok()
     }
+
+    /// Reports that [`PipeHandler::backlog`] shrank.
+    pub fn drained(&self) -> bool {
+        self.events.send(WorkerEvent::Drained { conn: self.conn }).is_ok()
+    }
 }
 
 /// One open pipe. Bytes for the guest are appended to `to_guest`; returning false closes it.
+///
+/// Handlers run on the transport's thread (the vsock worker serves every pipe), so they must
+/// never block: a handler whose host side can be slow (a socket) queues guest bytes, reports
+/// them as [`backlog`](PipeHandler::backlog) and calls [`PipeCtx::drained`] as they go out.
+/// vsock returns credit to the guest only for bytes that left the backlog, so a slow consumer
+/// slows the guest's sender on that connection alone, and the backlog never exceeds the
+/// receive buffer vsock advertises.
 pub trait PipeHandler: Send {
     fn guest_data(&mut self, data: &[u8], to_guest: &mut Vec<u8>) -> bool;
     fn host_msg(&mut self, msg: HostMsg, to_guest: &mut Vec<u8>) -> bool;
     fn closed(&mut self) {}
+    /// Guest bytes accepted but not yet delivered to the host side.
+    fn backlog(&self) -> usize {
+        0
+    }
+    /// The guest took `n` more of the bytes this pipe queued for it (a host producer can bound
+    /// what it has in flight by this).
+    fn guest_took(&mut self, _n: usize) {}
 }
 
 pub trait PipeService: Send + Sync {

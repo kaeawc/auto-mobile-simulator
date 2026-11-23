@@ -153,7 +153,11 @@ impl VirtioDevice for Vsock {
             next_id: 1,
             next_host_port: 50_000,
             control: VecDeque::new(),
+            ready: VecDeque::new(),
+            closing: Vec::new(),
+            tx_throttled: false,
             pkt: Vec::new(),
+            scratch: Vec::new(),
         };
         let handle = std::thread::Builder::new()
             .name("vsock".into())
@@ -190,16 +194,63 @@ struct Conn {
     handler: Option<Box<dyn PipeHandler>>,
     peer_buf_alloc: u32,
     peer_fwd_cnt: u32,
+    /// Payload bytes sent to the guest.
     tx_cnt: u32,
+    /// Payload bytes received from the guest.
+    rx_cnt: u32,
+    /// Of those, the bytes the host side has taken: all but the handler's backlog. The guest's
+    /// credit is counted from this, so a slow host side withholds it.
     fwd_cnt: u32,
+    /// The `fwd_cnt` last put in a packet to the guest.
     advertised_fwd: u32,
+    /// The handler held a backlog at the last credit check.
+    held: bool,
     out: VecDeque<u8>,
     closing: bool,
+    /// Queued in `Worker::ready`.
+    ready: bool,
+    /// A credit update waits in `Worker::control`.
+    update_queued: bool,
 }
 
 impl Conn {
+    fn new(id: u64, connected: bool) -> Conn {
+        Conn {
+            id,
+            connected,
+            refused: None,
+            pending: None,
+            name_buf: None,
+            handler: None,
+            peer_buf_alloc: 0,
+            peer_fwd_cnt: 0,
+            tx_cnt: 0,
+            rx_cnt: 0,
+            fwd_cnt: 0,
+            advertised_fwd: 0,
+            held: false,
+            out: VecDeque::new(),
+            closing: false,
+            ready: false,
+            update_queued: false,
+        }
+    }
+
     fn credit(&self) -> usize {
         self.peer_buf_alloc.saturating_sub(self.tx_cnt.wrapping_sub(self.peer_fwd_cnt)) as usize
+    }
+
+    /// Has data for the guest and the guest has room for it.
+    fn sendable(&self) -> bool {
+        self.connected && !self.out.is_empty() && self.credit() > 0
+    }
+}
+
+/// Puts `key` at the back of the ready queue if it has something to send and isn't queued.
+fn schedule(ready: &mut VecDeque<Key>, key: Key, c: &mut Conn) {
+    if !c.ready && c.sendable() {
+        c.ready = true;
+        ready.push_back(key);
     }
 }
 
@@ -217,8 +268,16 @@ struct Worker {
     next_host_port: u32,
     /// Header-only packets (responses, resets, credit updates) waiting for rx buffers.
     control: VecDeque<Hdr>,
+    /// Connections with data the guest has room for, served a buffer each in turn.
+    ready: VecDeque<Key>,
+    /// Connections whose host side finished, closed once their data drains.
+    closing: Vec<Key>,
+    /// Tx packets wait until the guest has taken the replies queued in `control`.
+    tx_throttled: bool,
     /// The guest packet being handled, reused across packets.
     pkt: Vec<u8>,
+    /// A handler's replies to guest data, reused across packets.
+    scratch: Vec<u8>,
 }
 
 impl Worker {
@@ -232,11 +291,29 @@ impl Worker {
                     WorkerEvent::Kick => self.process_tx(),
                     WorkerEvent::Host { conn, msg } => self.host_msg(conn, msg),
                     WorkerEvent::Connect { guest_port, make, refused } => self.connect(guest_port, make, refused),
+                    WorkerEvent::Drained { conn } => {
+                        if let Some(&key) = self.ids.get(&conn) {
+                            self.refresh_credit(key);
+                        }
+                    }
                 }
                 ev = rx.try_recv().ok();
             }
             self.flush();
+            // The guest took the replies that held its tx packets back: take those now (it
+            // won't kick the tx queue again for packets it already published).
+            while self.tx_throttled && self.control.len() < self.control_limit() {
+                self.process_tx();
+                self.flush();
+            }
         }
+    }
+
+    /// Most header-only replies queued before tx packets wait for the guest to take them (as
+    /// vhost-vsock does), so a guest that sends without posting rx buffers can't grow the
+    /// queue without bound.
+    fn control_limit(&self) -> usize {
+        usize::from(self.rxq.size()).max(1)
     }
 
     fn connect(&mut self, guest_port: u32, make: crate::pipe::MakeHandler, refused: Box<dyn FnOnce() + Send>) {
@@ -250,29 +327,22 @@ impl Worker {
         let key = (guest_port, host_port);
         let id = self.next_id;
         self.next_id += 1;
-        let conn = Conn {
-            id,
-            connected: false,
-            refused: Some(refused),
-            pending: Some(make),
-            name_buf: None,
-            handler: None,
-            peer_buf_alloc: 0,
-            peer_fwd_cnt: 0,
-            tx_cnt: 0,
-            fwd_cnt: 0,
-            advertised_fwd: 0,
-            out: VecDeque::new(),
-            closing: false,
-        };
+        let mut conn = Conn::new(id, false);
+        conn.refused = Some(refused);
+        conn.pending = Some(make);
         self.control.push_back(reply(self.guest_cid, key, OP_REQUEST, 0, 0));
         self.conns.insert(key, conn);
         self.ids.insert(id, key);
     }
 
     fn process_tx(&mut self) {
+        self.tx_throttled = false;
         let mut done = false;
         loop {
+            if self.control.len() >= self.control_limit() {
+                self.tx_throttled = true;
+                break;
+            }
             let chain = match self.txq.pop(&self.mem) {
                 Ok(Some(c)) => c,
                 Ok(None) => break,
@@ -313,21 +383,9 @@ impl Worker {
             }
             let id = self.next_id;
             self.next_id += 1;
-            let conn = Conn {
-                id,
-                connected: true,
-                refused: None,
-                pending: None,
-                name_buf: Some(Vec::new()),
-                handler: None,
-                peer_buf_alloc: h.buf_alloc,
-                peer_fwd_cnt: h.fwd_cnt,
-                tx_cnt: 0,
-                fwd_cnt: 0,
-                advertised_fwd: 0,
-                out: VecDeque::new(),
-                closing: false,
-            };
+            let mut conn = Conn::new(id, true);
+            conn.name_buf = Some(Vec::new());
+            (conn.peer_buf_alloc, conn.peer_fwd_cnt) = (h.buf_alloc, h.fwd_cnt);
             self.control.push_back(reply(self.guest_cid, key, OP_RESPONSE, 0, conn.fwd_cnt));
             self.conns.insert(key, conn);
             self.ids.insert(id, key);
@@ -341,28 +399,30 @@ impl Worker {
         };
         conn.peer_buf_alloc = h.buf_alloc;
         conn.peer_fwd_cnt = h.fwd_cnt;
+        // Every header carries the guest's credit: data waiting for it may go now.
+        schedule(&mut self.ready, key, conn);
         match h.op {
             OP_RW => {
-                conn.fwd_cnt = conn.fwd_cnt.wrapping_add(payload.len() as u32);
-                let keep = self.deliver(key, payload);
-                if !keep {
+                let len = payload.len() as u32;
+                // A guest may only send what it was told it may; one that doesn't is reset
+                // (as Linux and Firecracker do) rather than buffered without bound.
+                if conn.rx_cnt.wrapping_add(len).wrapping_sub(conn.advertised_fwd) > BUF_ALLOC {
+                    eprintln!("emu: vsock: guest port {} sent past its credit; resetting", key.0);
                     self.close(key, true);
                     return;
                 }
-                if let Some(c) = self.conns.get(&key)
-                    && c.fwd_cnt.wrapping_sub(c.advertised_fwd) >= BUF_ALLOC / 2
-                {
-                    let hdr = reply(self.guest_cid, key, OP_CREDIT_UPDATE, 0, c.fwd_cnt);
-                    self.control.push_back(hdr);
-                    if let Some(c) = self.conns.get_mut(&key) {
-                        c.advertised_fwd = c.fwd_cnt;
-                    }
+                conn.rx_cnt = conn.rx_cnt.wrapping_add(len);
+                if !self.deliver(key, payload) {
+                    self.close(key, true);
+                    return;
                 }
+                self.refresh_credit(key);
             }
             OP_CREDIT_REQUEST => {
-                let hdr = reply(self.guest_cid, key, OP_CREDIT_UPDATE, 0, conn.fwd_cnt);
-                conn.advertised_fwd = conn.fwd_cnt;
-                self.control.push_back(hdr);
+                if !conn.update_queued {
+                    conn.update_queued = true;
+                    self.control.push_back(reply(self.guest_cid, key, OP_CREDIT_UPDATE, 0, conn.fwd_cnt));
+                }
             }
             OP_CREDIT_UPDATE => {}
             OP_RESPONSE => {
@@ -418,10 +478,31 @@ impl Worker {
             return true;
         }
         let Some(h) = conn.handler.as_mut() else { return false };
-        let mut to_guest = Vec::new();
-        let keep = h.guest_data(data, &mut to_guest);
-        conn.out.extend(to_guest);
+        self.scratch.clear();
+        let keep = h.guest_data(data, &mut self.scratch);
+        conn.out.extend(&self.scratch);
+        schedule(&mut self.ready, key, conn);
         keep
+    }
+
+    /// Recounts what the host side has taken of the guest's bytes, and queues a credit update
+    /// when the guest should hear about it.
+    fn refresh_credit(&mut self, key: Key) {
+        let Some(c) = self.conns.get_mut(&key) else { return };
+        let backlog = c.handler.as_ref().map_or(0, |h| h.backlog());
+        // Never backwards, whatever a handler reports.
+        let backlog = (backlog as u64).min(u64::from(c.rx_cnt.wrapping_sub(c.fwd_cnt))) as u32;
+        c.fwd_cnt = c.rx_cnt.wrapping_sub(backlog);
+        let freed = c.fwd_cnt.wrapping_sub(c.advertised_fwd);
+        let drained = c.held && backlog == 0;
+        c.held = backlog > 0;
+        // Linux guests never ask for credit (a blocked sender waits for any packet with a newer
+        // fwd_cnt), so say so unasked: once half the buffer is free, and as soon as a backlog
+        // that held the guest back is gone.
+        if freed > 0 && (freed >= BUF_ALLOC / 2 || drained) && !c.update_queued {
+            c.update_queued = true;
+            self.control.push_back(reply(self.guest_cid, key, OP_CREDIT_UPDATE, 0, c.fwd_cnt));
+        }
     }
 
     fn host_msg(&mut self, id: u64, msg: crate::pipe::HostMsg) {
@@ -435,14 +516,19 @@ impl Worker {
         } else {
             conn.out.extend(to_guest);
         }
-        if !keep {
+        schedule(&mut self.ready, key, conn);
+        if !keep && !conn.closing {
             conn.closing = true;
+            self.closing.push(key);
         }
     }
 
     fn close(&mut self, key: Key, send_rst: bool) {
         if let Some(mut c) = self.conns.remove(&key) {
             self.ids.remove(&c.id);
+            if c.ready {
+                self.ready.retain(|k| *k != key);
+            }
             if let Some(h) = c.handler.as_mut() {
                 h.closed();
             }
@@ -472,7 +558,17 @@ impl Worker {
             };
             let cap: usize = chain.writable().map(|d| d.len as usize).sum::<usize>().saturating_sub(HDR);
             let written = match work {
-                RxWork::Control(h) => chain.write_all(&self.mem, &h.encode()).unwrap_or(0),
+                RxWork::Control(mut h) => {
+                    if h.op == OP_CREDIT_UPDATE
+                        && let Some(c) = self.conns.get_mut(&(h.dst_port, h.src_port))
+                    {
+                        // As of now, not as of when it was queued.
+                        h.fwd_cnt = c.fwd_cnt;
+                        c.advertised_fwd = c.fwd_cnt;
+                        c.update_queued = false;
+                    }
+                    chain.write_all(&self.mem, &h.encode()).unwrap_or(0)
+                }
                 RxWork::Data(key) => {
                     let Some(c) = self.conns.get_mut(&key) else {
                         let _ = self.rxq.add_used(&self.mem, chain.head, 0);
@@ -488,32 +584,64 @@ impl Worker {
                     let (a, b) = if n <= front.len() { (&front[..n], &[][..]) } else { (front, &back[..n - front.len()]) };
                     let written = chain.write_parts(&self.mem, &[&hdr, a, b]).unwrap_or(0);
                     c.out.drain(..n);
+                    if let Some(h) = c.handler.as_mut() {
+                        h.guest_took(n);
+                    }
+                    // One buffer per turn: the connection goes to the back of the line.
+                    if c.sendable() {
+                        self.ready.push_back(key);
+                    } else {
+                        c.ready = false;
+                    }
                     written
                 }
             };
             let _ = self.rxq.add_used(&self.mem, chain.head, written);
             used = true;
         }
-        // Connections whose host side finished and whose data has drained.
-        let done: Vec<Key> = self.conns.iter().filter(|(_, c)| c.closing && c.out.is_empty()).map(|(k, _)| *k).collect();
-        for k in done {
-            self.close(k, true);
-        }
+        self.reap_closing();
         if used && self.rxq.should_notify(&self.mem) {
             self.irq.raise(INT_USED_RING);
         }
     }
 
+    /// Closes the connections whose host side finished once their data has drained.
+    fn reap_closing(&mut self) {
+        let mut i = 0;
+        while let Some(&key) = self.closing.get(i) {
+            match self.conns.get(&key) {
+                Some(c) if c.closing && !c.out.is_empty() => i += 1,
+                Some(c) if c.closing => {
+                    self.closing.swap_remove(i);
+                    self.close(key, true);
+                }
+                _ => {
+                    self.closing.swap_remove(i);
+                }
+            }
+        }
+    }
+
+    /// Header-only packets first, then data from the connections in turn.
     fn next_rx_work(&mut self) -> Option<RxWork> {
         if let Some(h) = self.control.pop_front() {
             return Some(RxWork::Control(h));
         }
-        self.conns.iter().find(|(_, c)| c.connected && !c.out.is_empty() && c.credit() > 0).map(|(k, _)| RxWork::Data(*k))
+        while let Some(key) = self.ready.pop_front() {
+            match self.conns.get_mut(&key) {
+                Some(c) if c.sendable() => return Some(RxWork::Data(key)),
+                // Its credit shrank (the guest lowered buf_alloc) since it was queued.
+                Some(c) => c.ready = false,
+                None => {}
+            }
+        }
+        None
     }
 
     fn unpop(&mut self, work: RxWork) {
-        if let RxWork::Control(h) = work {
-            self.control.push_front(h);
+        match work {
+            RxWork::Control(h) => self.control.push_front(h),
+            RxWork::Data(key) => self.ready.push_front(key),
         }
     }
 }
@@ -541,11 +669,14 @@ enum RxWork {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, TcpStream};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     use super::*;
     use crate::irq::TestLine;
+    use crate::pipe::adb::{ADBD_VSOCK_PORT, AdbService};
     use crate::pipe::{HostMsg, PipeService};
     use crate::virtio::queue::tests::{Driver, RAM_BASE};
 
@@ -553,11 +684,70 @@ mod tests {
     const RX_BUFS: u64 = RAM_BASE + 0x10_0000;
     const BUF: u32 = 4096;
 
-    /// Echoes guest bytes back, and remembers the latest context and whether it was closed.
+    /// Echoes guest bytes back, and remembers its contexts (the latest, and all in order) and
+    /// how many pipes were closed.
     #[derive(Default)]
     struct Echo {
         ctx: Mutex<Option<PipeCtx>>,
+        all: Mutex<Vec<PipeCtx>>,
         closed: Arc<Mutex<u32>>,
+    }
+
+    impl Echo {
+        /// The context of the `i`th echo pipe opened, once it is.
+        fn nth(&self, i: usize) -> PipeCtx {
+            let start = Instant::now();
+            loop {
+                if let Some(c) = self.all.lock().expect("all").get(i) {
+                    return c.clone();
+                }
+                deadline_passed(start, "the pipe never opened");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Holds every guest byte until the test lets it go, like a client that stopped reading.
+    #[derive(Default)]
+    struct Slow {
+        held: Arc<std::sync::atomic::AtomicUsize>,
+        ctx: Mutex<Option<PipeCtx>>,
+        closed: Arc<Mutex<u32>>,
+    }
+
+    struct SlowPipe(Arc<std::sync::atomic::AtomicUsize>, Arc<Mutex<u32>>);
+
+    impl PipeHandler for SlowPipe {
+        fn guest_data(&mut self, data: &[u8], _to_guest: &mut Vec<u8>) -> bool {
+            self.0.fetch_add(data.len(), std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+        fn host_msg(&mut self, _msg: HostMsg, _to_guest: &mut Vec<u8>) -> bool {
+            true
+        }
+        fn backlog(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn closed(&mut self) {
+            *self.1.lock().expect("closed") += 1;
+        }
+    }
+
+    impl PipeService for Arc<Slow> {
+        fn open(&self, name: &str, ctx: PipeCtx) -> Option<Box<dyn PipeHandler>> {
+            (name == "slow").then(|| {
+                *self.ctx.lock().expect("ctx") = Some(ctx);
+                Box::new(SlowPipe(self.held.clone(), self.closed.clone())) as Box<dyn PipeHandler>
+            })
+        }
+    }
+
+    impl Slow {
+        /// The host side delivers `n` held bytes.
+        fn release(&self, n: usize) {
+            self.held.fetch_sub(n, std::sync::atomic::Ordering::SeqCst);
+            assert!(self.ctx.lock().expect("ctx").as_ref().expect("opened").drained());
+        }
     }
 
     struct EchoPipe(Arc<Mutex<u32>>);
@@ -589,41 +779,114 @@ mod tests {
     impl PipeService for Arc<Echo> {
         fn open(&self, name: &str, ctx: PipeCtx) -> Option<Box<dyn PipeHandler>> {
             (name == "echo").then(|| {
+                self.all.lock().expect("all").push(ctx.clone());
                 *self.ctx.lock().expect("ctx") = Some(ctx);
                 Box::new(EchoPipe(self.closed.clone())) as Box<dyn PipeHandler>
             })
         }
     }
 
-    /// The guest's virtio-vsock driver: rx buffers posted up front, tx packets one per chain.
+    /// Descriptors per queue in the test guest.
+    const RING: u16 = 64;
+    /// Where the guest builds tx packets: one slot per descriptor, each a header and 64 KiB.
+    const TX_SLOTS: u64 = RAM_BASE + 0x20_0000;
+    const SLOT: u64 = 0x11000;
+    /// The receive buffer the guest advertises (Linux's default).
+    const GUEST_BUF_ALLOC: u32 = 256 * 1024;
+
+    /// What the guest knows about one connection, keyed (guest port, host port).
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Peer {
+        /// The host's latest buf_alloc and fwd_cnt.
+        buf_alloc: u32,
+        fwd_cnt: u32,
+        /// Payload bytes sent to and received from the host.
+        sent: u32,
+        got: u32,
+    }
+
+    /// The guest's virtio-vsock driver, as Linux's: 4 KiB rx buffers reposted as they're used,
+    /// tx packets one per chain, and credit honoured both ways.
     struct Guest {
         mem: Arc<GuestRam>,
         dev: Vsock,
         rx: Driver,
         tx: Driver,
         rx_seen: u16,
-        tx_next: u64,
+        rx_posted: u16,
+        /// Repost each rx buffer as soon as its packet is read (off: the test posts them).
+        repost: bool,
+        tx_pushed: u16,
         echo: Arc<Echo>,
+        /// Packets received but not yet taken, in arrival order.
+        inbox: VecDeque<(Hdr, Vec<u8>)>,
+        peers: HashMap<Key, Peer>,
     }
 
     fn guest() -> Guest {
-        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x40_0000).expect("ram"));
+        guest_with(|_, _| {}, RING)
+    }
+
+    /// A guest whose registry also gets what `register` adds (given the worker's event sender),
+    /// with `posted` rx buffers to start.
+    fn guest_with(register: impl FnOnce(&mut PipeRegistry, &Sender<WorkerEvent>), posted: u16) -> Guest {
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x100_0000).expect("ram"));
         let echo = Arc::new(Echo::default());
         let mut registry = PipeRegistry::default();
         registry.register("echo", Box::new(echo.clone()));
         let (events, rx_events) = event_channel();
+        register(&mut registry, &events);
         let mut dev = Vsock::new(GUEST_CID, Arc::new(registry), events, rx_events);
-        let (mut rx, tx) = (Driver::at(RAM_BASE + 0x1000, 64), Driver::at(RAM_BASE + 0x8000, 64));
-        for i in 0..32 {
-            rx.push(&mem, &[(RX_BUFS + i * u64::from(BUF), BUF, true)]);
-        }
+        let (rx, tx) = (Driver::at(RAM_BASE + 0x1000, RING), Driver::at(RAM_BASE + 0x8000, RING));
         let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
         dev.activate(Activation { mem: mem.clone(), irq, queues: vec![Some(rx.cfg), Some(tx.cfg), None], features: 0 }).expect("activate");
-        Guest { mem, dev, rx, tx, rx_seen: 0, tx_next: RAM_BASE + 0x20_0000, echo }
+        let mut g = Guest {
+            mem,
+            dev,
+            rx,
+            tx,
+            rx_seen: 0,
+            rx_posted: 0,
+            repost: true,
+            tx_pushed: 0,
+            echo,
+            inbox: VecDeque::new(),
+            peers: HashMap::new(),
+        };
+        g.post(posted);
+        g
+    }
+
+    fn rx_buf(id: u16) -> u64 {
+        RX_BUFS + u64::from(id % RING) * u64::from(BUF)
+    }
+
+    fn deadline_passed(start: Instant, what: &str) {
+        assert!(start.elapsed() < Duration::from_secs(10), "{what}");
     }
 
     impl Guest {
+        /// Posts `n` more rx buffers and tells the device. Buffers are used in order, so the
+        /// descriptor the driver picks is always the one whose buffer this reuses.
+        fn post(&mut self, n: u16) {
+            for _ in 0..n {
+                self.rx.push(&self.mem, &[(rx_buf(self.rx_posted), BUF, true)]);
+                self.rx_posted = self.rx_posted.wrapping_add(1);
+            }
+            if n > 0 {
+                self.dev.notify(RXQ as u16);
+            }
+        }
+
         fn send(&mut self, op: u16, src_port: u32, dst_port: u32, payload: &[u8]) {
+            let start = Instant::now();
+            while self.tx_pushed.wrapping_sub(self.tx.used_idx(&self.mem)) >= RING {
+                deadline_passed(start, "the device stopped taking tx packets");
+                std::thread::yield_now();
+            }
+            let key = (src_port, dst_port);
+            let p = self.peers.entry(key).or_default();
+            p.sent = p.sent.wrapping_add(payload.len() as u32);
             let h = Hdr {
                 src_cid: GUEST_CID,
                 dst_cid: HOST_CID,
@@ -633,35 +896,71 @@ mod tests {
                 typ: TYPE_STREAM,
                 op,
                 flags: 0,
-                buf_alloc: 64 * 1024,
-                fwd_cnt: 0,
+                buf_alloc: GUEST_BUF_ALLOC,
+                // Everything received has been read.
+                fwd_cnt: p.got,
             };
-            let mut pkt = h.encode().to_vec();
-            pkt.extend_from_slice(payload);
-            self.mem.write(self.tx_next, &pkt).expect("tx buf");
-            self.tx.push(&self.mem, &[(self.tx_next, pkt.len() as u32, false)]);
-            self.tx_next += 0x1000;
+            let slot = TX_SLOTS + u64::from(self.tx_pushed % RING) * SLOT;
+            self.mem.write(slot, &h.encode()).expect("tx hdr");
+            self.mem.write(slot + HDR as u64, payload).expect("tx payload");
+            self.tx.push(&self.mem, &[(slot, (HDR + payload.len()) as u32, false)]);
+            self.tx_pushed = self.tx_pushed.wrapping_add(1);
             self.dev.notify(TXQ as u16);
+        }
+
+        /// How much the host lets the guest send on `key` now.
+        fn credit(&self, key: Key) -> u32 {
+            let p = self.peers.get(&key).copied().unwrap_or_default();
+            p.buf_alloc.saturating_sub(p.sent.wrapping_sub(p.fwd_cnt))
+        }
+
+        /// Moves every packet the device has completed into the inbox.
+        fn poll(&mut self) {
+            let used = self.rx.used_idx(&self.mem);
+            let mut reposts = 0;
+            while self.rx_seen != used {
+                let (id, len) = self.rx.used(&self.mem, self.rx_seen % RING);
+                self.rx_seen = self.rx_seen.wrapping_add(1);
+                let mut b = vec![0u8; len as usize];
+                self.mem.read(rx_buf(id as u16), &mut b).expect("rx buf");
+                let h = Hdr::parse(&b).expect("header");
+                let p = self.peers.entry((h.dst_port, h.src_port)).or_default();
+                (p.buf_alloc, p.fwd_cnt) = (h.buf_alloc, h.fwd_cnt);
+                p.got = p.got.wrapping_add(h.len);
+                self.inbox.push_back((h, b[HDR..HDR + h.len as usize].to_vec()));
+                reposts += 1;
+            }
+            if self.repost {
+                self.post(reposts);
+            }
         }
 
         /// The next packet the device puts in an rx buffer.
         fn recv(&mut self) -> (Hdr, Vec<u8>) {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while self.rx.used_idx(&self.mem) == self.rx_seen {
-                assert!(Instant::now() < deadline, "no rx packet");
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            let (id, len) = self.rx.used(&self.mem, self.rx_seen);
-            self.rx_seen += 1;
-            let mut b = vec![0u8; len as usize];
-            self.mem.read(RX_BUFS + u64::from(id) * u64::from(BUF), &mut b).expect("rx buf");
-            let h = Hdr::parse(&b).expect("header");
-            (h, b[HDR..HDR + h.len as usize].to_vec())
+            self.recv_where(|_| true)
         }
 
-        fn quiet(&self) -> bool {
+        /// The next packet for connection `key`; others stay in the inbox.
+        fn recv_on(&mut self, key: Key) -> (Hdr, Vec<u8>) {
+            self.recv_where(|h| (h.dst_port, h.src_port) == key)
+        }
+
+        fn recv_where(&mut self, want: impl Fn(&Hdr) -> bool) -> (Hdr, Vec<u8>) {
+            let start = Instant::now();
+            loop {
+                self.poll();
+                if let Some(i) = self.inbox.iter().position(|(h, _)| want(h)) {
+                    return self.inbox.remove(i).expect("packet");
+                }
+                deadline_passed(start, "no rx packet");
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        }
+
+        fn quiet(&mut self) -> bool {
             std::thread::sleep(Duration::from_millis(50));
-            self.rx.used_idx(&self.mem) == self.rx_seen
+            self.poll();
+            self.inbox.is_empty()
         }
     }
 
@@ -832,9 +1131,24 @@ mod tests {
         let start = Instant::now();
         let mut sent = 0usize;
         let mut pushed = 2u16;
+        // As Linux's driver: send only within the host's credit, learnt from the fwd_cnt of
+        // whatever it sends back (credit updates), reposting those rx buffers.
+        let (mut seen, mut host_fwd) = (0u16, 0u32);
+        let named = name.len() - HDR;
         while sent < TOTAL {
-            // Keep the ring full: as many packets in flight as the queue holds.
-            while pushed.wrapping_sub(tx.used_idx(&mem)) < size && sent < TOTAL {
+            let used = rx.used_idx(&mem);
+            while seen != used {
+                let (id, _) = rx.used(&mem, seen % size);
+                seen = seen.wrapping_add(1);
+                let at = RX_BUFS + u64::from(id) * u64::from(BUF);
+                let mut b = [0u8; HDR];
+                mem.read(at, &mut b).expect("hdr");
+                host_fwd = Hdr::parse(&b).expect("hdr").fwd_cnt;
+                rx.push(&mem, &[(at, BUF, true)]);
+            }
+            let in_flight = |sent: usize| (named + sent) as u32 - host_fwd;
+            // Keep the ring as full as the queue and the credit allow.
+            while pushed.wrapping_sub(tx.used_idx(&mem)) < size && sent < TOTAL && in_flight(sent) as usize + PKT <= BUF_ALLOC as usize {
                 tx.push(&mem, &[(slot(pushed % size), (HDR + PKT) as u32, false)]);
                 pushed = pushed.wrapping_add(1);
                 sent += PKT;
@@ -849,6 +1163,163 @@ mod tests {
         }
         let secs = start.elapsed().as_secs_f64();
         println!("vsock guest->host: {} MiB in {:.3} s = {:.0} MiB/s", TOTAL >> 20, secs, (TOTAL >> 20) as f64 / secs);
+    }
+
+    /// An adb client on the bridge's port whose vsock connection the guest's adbd accepted.
+    fn adb_guest() -> (Guest, TcpStream, Key) {
+        let mut port = 0;
+        let mut g = guest_with(
+            |registry, events| {
+                let svc = AdbService::bind(0, events.clone()).expect("bind");
+                port = svc.port;
+                registry.register("qemud:adb", Box::new(svc));
+            },
+            RING,
+        );
+        let client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect");
+        let (h, _) = g.recv();
+        assert_eq!((h.op, h.dst_port), (OP_REQUEST, ADBD_VSOCK_PORT));
+        let key = (h.dst_port, h.src_port);
+        g.send(OP_RESPONSE, key.0, key.1, &[]);
+        (g, client, key)
+    }
+
+    /// `adb push` end to end: a host client writes into the bridge, the guest reads 4 KiB
+    /// buffers and returns credit every 64 KiB.
+    ///     cargo test --release -p emu-vmm adb_throughput -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn adb_throughput_to_guest() {
+        const TOTAL: usize = 64 << 20;
+        let (mut g, mut client, key) = adb_guest();
+        let writer = std::thread::spawn(move || {
+            let chunk = vec![0x5au8; 64 * 1024];
+            for _ in 0..TOTAL / chunk.len() {
+                client.write_all(&chunk).expect("write");
+            }
+            client
+        });
+        let start = Instant::now();
+        let mut credited = 0u32;
+        loop {
+            g.poll();
+            g.inbox.clear();
+            let got = g.peers[&key].got;
+            if got as usize >= TOTAL {
+                break;
+            }
+            if got - credited >= 64 * 1024 {
+                g.send(OP_CREDIT_UPDATE, key.0, key.1, &[]);
+                credited = got;
+            }
+            std::thread::yield_now();
+        }
+        let secs = start.elapsed().as_secs_f64();
+        drop(writer.join().expect("writer"));
+        println!("adb host->guest: {} MiB in {:.3} s = {:.0} MiB/s", TOTAL >> 20, secs, (TOTAL >> 20) as f64 / secs);
+    }
+
+    /// `adb pull` end to end: the guest sends 64 KiB packets as its credit allows, a host client
+    /// reads them off the bridge.
+    ///     cargo test --release -p emu-vmm adb_throughput -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn adb_throughput_to_host() {
+        const TOTAL: usize = 256 << 20;
+        let (mut g, mut client, key) = adb_guest();
+        let reader = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut got = 0;
+            while got < TOTAL {
+                let n = client.read(&mut buf).expect("read");
+                assert!(n > 0, "the bridge hung up after {got} bytes");
+                got += n;
+            }
+        });
+        let payload = vec![0xa5u8; 64 * 1024];
+        let start = Instant::now();
+        let mut sent = 0;
+        while sent < TOTAL {
+            g.poll();
+            g.inbox.clear();
+            let n = (g.credit(key) as usize).min(payload.len()).min(TOTAL - sent);
+            if n == 0 {
+                std::thread::yield_now();
+                continue;
+            }
+            g.send(OP_RW, key.0, key.1, &payload[..n]);
+            sent += n;
+        }
+        reader.join().expect("reader");
+        let secs = start.elapsed().as_secs_f64();
+        println!("adb guest->host: {} MiB in {:.3} s = {:.0} MiB/s", TOTAL >> 20, secs, (TOTAL >> 20) as f64 / secs);
+    }
+
+    /// The guest sends on `key` as fast as its credit allows until the host has withheld credit
+    /// for 200 ms; returns the bytes sent.
+    fn send_until_stalled(g: &mut Guest, key: Key) -> usize {
+        let chunk = vec![0x11u8; 64 * 1024];
+        let (mut sent, mut last) = (0usize, Instant::now());
+        while last.elapsed() < Duration::from_millis(200) {
+            g.poll();
+            g.inbox.clear();
+            let n = (g.credit(key) as usize).min(chunk.len());
+            if n == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            assert!(sent < 256 << 20, "the host never withheld credit");
+            g.send(OP_RW, key.0, key.1, &chunk[..n]);
+            sent += n;
+            last = Instant::now();
+        }
+        sent
+    }
+
+    #[test]
+    fn a_stalled_adb_client_holds_up_neither_other_pipes_nor_other_sessions() {
+        let (mut g, mut stalled, adb) = adb_guest();
+        // `adb logcat` into a client that stopped reading (kill -STOP): once its socket is full,
+        // the guest runs out of credit instead of the worker blocking on the socket.
+        let sent = send_until_stalled(&mut g, adb);
+        assert_eq!(g.credit(adb), 0, "credit is withheld");
+        let held = sent - g.peers[&adb].fwd_cnt as usize;
+        assert!(held <= BUF_ALLOC as usize, "the host holds at most its advertised buffer ({held} bytes)");
+
+        // Another pipe still answers at once.
+        let start = Instant::now();
+        g.send(OP_REQUEST, 1024, PIPE_PORT, &[]);
+        assert_eq!(g.recv_on((1024, PIPE_PORT)).0.op, OP_RESPONSE);
+        g.send(OP_RW, 1024, PIPE_PORT, b"pipe:echo\0ping");
+        assert_eq!(g.recv_on((1024, PIPE_PORT)).1, b"ping");
+        // And so does another adb session, both ways.
+        let port = stalled.peer_addr().expect("addr").port();
+        let mut other = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect");
+        let (h, _) = g.recv_where(|h| h.op == OP_REQUEST);
+        let second = (h.dst_port, h.src_port);
+        g.send(OP_RESPONSE, second.0, second.1, &[]);
+        other.write_all(b"CNXN").expect("write");
+        assert_eq!(g.recv_on(second).1, b"CNXN");
+        g.send(OP_RW, second.0, second.1, b"AUTH");
+        other.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+        let mut b = [0u8; 4];
+        other.read_exact(&mut b).expect("read");
+        assert_eq!(&b, b"AUTH");
+        assert!(start.elapsed() < Duration::from_secs(1), "other traffic waited {:?}", start.elapsed());
+
+        // The client resumes: it gets every byte, and the guest its credit back unasked.
+        stalled.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+        let mut all = vec![0u8; sent];
+        stalled.read_exact(&mut all).expect("everything the guest sent");
+        assert!(all.iter().all(|&b| b == 0x11));
+        let start = Instant::now();
+        while g.peers[&adb].fwd_cnt as usize != sent {
+            deadline_passed(start, "the freed credit was never returned");
+            g.poll();
+            g.inbox.clear();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(g.credit(adb), BUF_ALLOC);
     }
 
     #[test]
@@ -947,6 +1418,122 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(g.quiet(), "a refused request isn't reset back");
+    }
+
+    /// A guest with a `slow` pipe open on (7, PIPE_PORT).
+    fn slow_guest() -> (Guest, Arc<Slow>, Key) {
+        let slow = Arc::new(Slow::default());
+        let s = slow.clone();
+        let mut g = guest_with(move |registry, _| registry.register("slow", Box::new(s)), RING);
+        let key = (7, PIPE_PORT);
+        g.send(OP_REQUEST, key.0, key.1, &[]);
+        assert_eq!(g.recv_on(key).0.op, OP_RESPONSE);
+        g.send(OP_RW, key.0, key.1, b"pipe:slow\0");
+        (g, slow, key)
+    }
+
+    #[test]
+    fn credit_is_withheld_while_a_pipe_holds_bytes_and_returned_unasked() {
+        let (mut g, slow, key) = slow_guest();
+        let sent = send_until_stalled(&mut g, key);
+        // The name was taken at once; everything after it is held.
+        assert_eq!(sent, BUF_ALLOC as usize - 10, "the guest may fill the advertised buffer");
+        assert_eq!(slow.held.load(std::sync::atomic::Ordering::SeqCst), sent);
+        assert_eq!(g.credit(key), 0);
+
+        // A little freed: not worth a packet while the guest still has room to wait for more.
+        slow.release(64 * 1024);
+        assert!(g.quiet(), "no update for 64 KiB");
+        // Half the buffer freed: an update the guest never asked for.
+        slow.release(64 * 1024);
+        let (h, _) = g.recv_on(key);
+        assert_eq!((h.op, h.fwd_cnt), (OP_CREDIT_UPDATE, 10 + 128 * 1024));
+        // The backlog gone: the rest at once, whatever its size.
+        slow.release(sent - 128 * 1024);
+        let (h, _) = g.recv_on(key);
+        assert_eq!((h.op, h.fwd_cnt), (OP_CREDIT_UPDATE, 10 + sent as u32));
+        assert_eq!(g.credit(key), BUF_ALLOC);
+        assert!(g.quiet());
+    }
+
+    #[test]
+    fn a_guest_that_sends_past_its_credit_is_reset() {
+        let (mut g, slow, key) = slow_guest();
+        send_until_stalled(&mut g, key);
+        g.send(OP_RW, key.0, key.1, b"one more");
+        assert_eq!(g.recv_on(key).0.op, OP_RST);
+        assert_eq!(*slow.closed.lock().expect("closed"), 1);
+    }
+
+    #[test]
+    fn connections_take_turns_for_rx_buffers() {
+        let mut g = guest_with(|_, _| {}, 0);
+        g.repost = false;
+        let keys = [(1, PIPE_PORT), (2, PIPE_PORT), (3, PIPE_PORT)];
+        for (i, k) in keys.iter().enumerate() {
+            g.post(1);
+            g.send(OP_REQUEST, k.0, k.1, &[]);
+            assert_eq!(g.recv_on(*k).0.op, OP_RESPONSE);
+            g.send(OP_RW, k.0, k.1, b"pipe:echo\0");
+            g.echo.nth(i);
+        }
+        // Each queues more than a buffer's worth while the guest has no buffers posted.
+        for (i, fill) in b"abc".iter().copied().enumerate() {
+            assert!(g.echo.nth(i).send(HostMsg::Data(vec![fill; 16 * 1024])));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        g.post(9);
+        let order: Vec<u8> = (0..9).map(|_| g.recv().1[0]).collect();
+        assert_eq!(order, b"abcabcabc", "a buffer each in turn, not one connection's queue at a time");
+    }
+
+    #[test]
+    fn replies_wait_for_rx_buffers_without_piling_up() {
+        let mut g = guest_with(|_, _| {}, 0);
+        g.repost = false;
+        // Packets for no connection, each answered by a reset, while no rx buffers are posted:
+        // the device takes a queue's worth, then leaves the rest in the tx ring.
+        for port in 0..u32::from(RING) + 8 {
+            g.send(OP_RW, 100 + port, PIPE_PORT, b"x");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(g.tx.used_idx(&g.mem), RING, "replies held back tx");
+        g.post(RING);
+        for port in 0..u32::from(RING) {
+            assert_eq!(g.recv_on((100 + port, PIPE_PORT)).0.op, OP_RST);
+        }
+        // With room again, the waiting packets are taken without another kick.
+        g.post(8);
+        for port in u32::from(RING)..u32::from(RING) + 8 {
+            assert_eq!(g.recv_on((100 + port, PIPE_PORT)).0.op, OP_RST);
+        }
+        assert_eq!(g.tx.used_idx(&g.mem), RING + 8);
+    }
+
+    #[test]
+    fn a_closing_pipe_drains_its_data_before_the_reset() {
+        let mut g = guest();
+        let key = (9, PIPE_PORT);
+        g.send(OP_REQUEST, key.0, key.1, &[]);
+        assert_eq!(g.recv_on(key).0.op, OP_RESPONSE);
+        g.send(OP_RW, key.0, key.1, b"pipe:echo\0");
+        let ctx = g.echo.nth(0);
+        let data: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+        assert!(ctx.send(HostMsg::Data(data.clone())));
+        assert!(ctx.send(HostMsg::Close));
+        let mut got = Vec::new();
+        loop {
+            let (h, d) = g.recv_on(key);
+            if h.op == OP_RST {
+                break;
+            }
+            assert_eq!(h.op, OP_RW);
+            got.extend(d);
+        }
+        assert_eq!(got, data, "everything queued arrives before the reset");
+        assert_eq!(*g.echo.closed.lock().expect("closed"), 1);
+        g.send(OP_RW, key.0, key.1, b"late");
+        assert_eq!(g.recv_on(key).0.op, OP_RST);
     }
 
     #[test]
