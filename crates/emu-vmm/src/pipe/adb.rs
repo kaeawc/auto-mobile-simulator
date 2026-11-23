@@ -297,7 +297,8 @@ fn spawn_writer(stream: Arc<TcpStream>, ctx: PipeCtx, q: Arc<ToHost>) {
             chunk.clear();
         }
         if q.lock().closed {
-            let _ = stream.shutdown(Shutdown::Both);
+            // `closed` already shut the read side; XNU refuses `Both` then, without sending the FIN.
+            let _ = stream.shutdown(Shutdown::Write);
         }
     });
 }
