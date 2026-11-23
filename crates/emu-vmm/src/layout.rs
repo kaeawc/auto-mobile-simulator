@@ -73,12 +73,17 @@ pub mod slots {
     pub const TOUCH: u32 = 20;
     pub const KEYBOARD: u32 = 21;
     pub const ROTARY: u32 = 22;
+    /// virtio-input dual-mode mouse, Android XR images only (stock: on PCI like its other inputs).
+    pub const MOUSE: u32 = 17;
     /// Not on the stock board (which puts vsock on PCI); the guest driver doesn't care.
     pub const VSOCK: u32 = 24;
     pub const RNG: u32 = 25;
     pub const NET: u32 = 26;
     /// virtio-console with named ports (`modem`); stock puts its consoles on PCI.
     pub const VPORTS: u32 = 19;
+    /// virtio-snd (Automotive and XR images); stock puts it on PCI, and the guest driver
+    /// doesn't care which transport.
+    pub const SOUND: u32 = 18;
     /// vda: system.img (GPT: vbmeta, super). `androidboot.boot_devices` points here.
     pub const SYSTEM: u32 = 27;
     /// vdb: cache.img.

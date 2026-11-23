@@ -13,6 +13,7 @@ doctest = false
 [dependencies]
 roxmltree.workspace = true
 sha1_smol.workspace = true
+sim-core.workspace = true
 thiserror.workspace = true
 
 [lints]

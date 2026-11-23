@@ -6,6 +6,7 @@ pub mod input;
 pub mod mmio;
 pub mod queue;
 pub mod rng;
+pub mod snd;
 pub mod vsock;
 
 use std::sync::{Arc, Mutex};

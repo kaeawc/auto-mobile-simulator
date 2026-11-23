@@ -34,7 +34,8 @@ Captured from a running stock instance (`/sys/firmware/fdt`, `/proc/iomem`, `/pr
 | 30 | `a003c00` | blk: encryptionkey.img (GPT: metadata) mounted by path on `/metadata` | vdd |
 | 31 | `a003e00` | blk: vendor.img (GPT: vendor) | vde |
 
-emu-rs adds vsock at slot 24 (stock puts it on PCI).
+emu-rs adds vsock at slot 24 and, for Automotive and XR images only, virtio-snd at slot 18
+(stock puts both on PCI; the guest drivers bind on either transport).
 
 ## PCI devices (stock)
 
@@ -54,6 +55,26 @@ Bootconfig is appended to the ramdisk. Keys: `androidboot.hardware=ranchu`,
 `dalvik.vm.heapsize=576m`, `qemu.skin=WxH`, `qemu.vsync`, `logcat`, `opengles.version`,
 `hardware.gltransport=pipe`, `hardware.vulkan=ranchu`, `qemu.adb.pubkey`,
 `qemu.settings.system.screen_off_timeout`, `qemu.virtiowifi`, `qemu.camera_*`, `qemu.hwcodec.*`.
+A round screen adds `emulator.circular=1`.
+
+## Boot properties, keys and sensors (from the emulator source, emu-master-dev)
+
+- `qemud:boot-properties` serves `boot.prop`'s lines (the AVD directory's, else the system
+  image's) and the host's own: `qemu.hw.mainkeys` is `hw.mainKeys` (hardware-properties.ini
+  default yes: no navigation bar), `qemu.sf.lcd_density`, `qemu.timezone`. A truthy
+  `ro.emulator.circular` there sets `hw.lcd.circular`, which becomes bootconfig
+  `androidboot.emulator.circular=1` (android-qemu2-glue/main.cpp, userspace-boot-properties.cpp).
+- The virtio keyboard is `qwerty2`, ids 0627:0001 (hw/input/virtio-input-hid.c), so the guest
+  uses goldfish's `qwerty2.kl`. It reports QEMU's qcode keys plus HOME, BACK, SEND, END, SOFT1/2,
+  VOLUMEUP/DOWN, POWER, SEARCH, SLEEP, CENTER (232, DPAD_CENTER), GREEN (399), MOVE_HOME/END
+  (452/453), APP_SWITCH (580) and STEM_PRIMARY..ASSIST (581–585); it also advertises EV_REP and
+  three LEDs. The console's `KEY_*` names are hw-events.h's; codes may also be numbers.
+- The rotary's unit is a degree (`virtio_input_rotary.idc`: `device.res = 57.295`); gRPC turns
+  15 per click.
+- `list-sensors` is built from the `hw.accelerometer`/`hw.gyroscope`/`hw.sensors.*` flags (on by
+  default except RGBC light, heart rate, wrist tilt), `hw.sensor.hinge` (angles 1 and 2 by
+  `hw.sensor.hinge.count`), and heart rate and wrist tilt forced on for Wear at API 28+
+  (android/hw-sensors.cpp).
 
 ## Facts that cost time to find
 

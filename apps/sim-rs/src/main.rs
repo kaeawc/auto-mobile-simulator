@@ -93,7 +93,13 @@ enum Cmd {
     /// Erase all content and settings (device must be shut down).
     Erase { device: String },
     /// Save the screen as a PNG.
-    Screenshot { device: String, path: String },
+    Screenshot {
+        device: String,
+        path: String,
+        /// `carplay` for an iPhone's CarPlay screen.
+        #[arg(long, default_value = "main")]
+        display: String,
+    },
     /// Tap at a point, in pixels from the top-left of the screen.
     Tap {
         device: String,
@@ -102,6 +108,9 @@ enum Cmd {
         /// Hold time in milliseconds.
         #[arg(long, default_value_t = 60)]
         hold: u64,
+        /// `carplay` for an iPhone's CarPlay screen.
+        #[arg(long, default_value = "main")]
+        display: String,
     },
     /// Swipe between two points, in pixels.
     Swipe {
@@ -116,9 +125,13 @@ enum Cmd {
         /// Pause at the end before lifting (a drag rather than a flick).
         #[arg(long)]
         settle: bool,
+        /// `carplay` for an iPhone's CarPlay screen.
+        #[arg(long, default_value = "main")]
+        display: String,
     },
-    /// Press a hardware button: home, lock (power), side, siri, apple-pay (iOS); back, volume-up,
-    /// volume-down, recents, menu, up, down, left, right, select (Android).
+    /// Press a hardware button: home, lock (power), side, siri, apple-pay, action (iOS); back,
+    /// volume-up, volume-down, recents, menu (Android); up, down, left, right, select, play-pause
+    /// (TV remotes: the Siri Remote on Apple TV, where menu and back are its Menu button).
     Button {
         device: String,
         button: String,
@@ -151,13 +164,54 @@ enum Cmd {
     Privacy { device: String, action: String, service: String, bundle_id: String },
     /// Simulate a memory warning.
     MemoryWarning { device: String },
-    /// Rotate an Android device 90° clockwise.
-    Rotate { device: String },
+    /// Rotate a device 90° clockwise, or (iOS) to an orientation.
+    Rotate {
+        device: String,
+        /// portrait, landscape-right, portrait-upside-down or landscape-left (iOS).
+        #[arg(long)]
+        orientation: Option<String>,
+    },
     /// Set an Android foldable's hinge: a posture (closed, half-opened, opened) or an angle (0-180).
     Fold { device: String, posture: String },
-    /// Turn an Android watch's rotary input by some ticks (negative turns back).
+    /// Android XR: recenter, rotate X Y Z (radians), move DX DY DZ (metres), options day|night
+    /// PASSTHROUGH (0-1), input mouse|hand|eye, viewport pan|zoom|rotate, pointer X Y [PHASE].
+    Xr {
+        device: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Turn a watch's crown (Wear OS rotary input, Apple Watch Digital Crown) by some ticks
+    /// (negative turns back).
     #[command(allow_negative_numbers = true)]
-    Rotary { device: String, ticks: i64 },
+    Rotary {
+        device: String,
+        ticks: i64,
+        /// Apple Watch: the turn in Digital Crown units instead of ticks.
+        #[arg(long)]
+        delta: Option<f64>,
+    },
+    /// An Apple Watch hand gesture: double-tap or wrist-flick.
+    WatchGesture { device: String, gesture: String },
+    /// Swipe on the Siri Remote's touch surface (Apple TV): up, down, left or right.
+    RemoteSwipe { device: String, direction: String },
+    /// Attach (`on`) or detach (`off`) an iPhone's CarPlay display (iOS 26 runtimes).
+    Carplay { device: String, state: String },
+    /// Android Automotive's vehicle HAL: list every property, read one, or set one, e.g.
+    /// `vehicle car gear drive`, `vehicle car speed 12.5`, `vehicle car IGNITION_STATE`.
+    #[command(allow_negative_numbers = true)]
+    Vehicle {
+        device: String,
+        /// A VHAL property name (GEAR_SELECTION, or gear, speed, ignition, night, parking-brake)
+        /// or id (0x11600207); none lists every property.
+        property: Option<String>,
+        /// Set the property to this (typed by the property: drive, 12.5, true, 2,0).
+        value: Option<String>,
+        /// The area (seat, door, ...) id; default 0, the global area.
+        #[arg(long)]
+        area: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Send commands to an Android device's emulator console (`adb emu`'s protocol).
     Console {
         device: String,
@@ -270,13 +324,15 @@ fn main() -> Result<()> {
         }
         Cmd::Shutdown { device } => drop(call("shutdown", json!({"device": device}))?),
         Cmd::Erase { device } => drop(call("erase", json!({"device": device}))?),
-        Cmd::Screenshot { device, path } => drop(call("screenshot", json!({"device": device, "path": path}))?),
-        Cmd::Tap { device, x, y, hold } => {
-            call("tap", json!({"device": device, "x": x, "y": y, "hold_ms": hold}))?;
+        Cmd::Screenshot { device, path, display } => drop(call("screenshot", json!({"device": device, "path": path, "display": display}))?),
+        Cmd::Tap { device, x, y, hold, display } => {
+            call("tap", json!({"device": device, "x": x, "y": y, "hold_ms": hold, "display": display}))?;
             flush();
         }
-        Cmd::Swipe { device, x1, y1, x2, y2, duration, settle } => {
-            call("swipe", json!({"device": device, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": duration, "settle": settle}))?;
+        Cmd::Swipe { device, x1, y1, x2, y2, duration, settle, display } => {
+            let params = json!({"device": device, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": duration, "settle": settle,
+                "display": display});
+            call("swipe", params)?;
             flush();
         }
         Cmd::Button { device, button, hold } => {
@@ -305,7 +361,12 @@ fn main() -> Result<()> {
             drop(call("privacy", json!({"device": device, "action": action, "service": service, "bundle_id": bundle_id}))?)
         }
         Cmd::MemoryWarning { device } => drop(call("memory_warning", json!({"device": device}))?),
-        Cmd::Rotate { device } => drop(call("rotate", json!({"device": device}))?),
+        Cmd::Rotate { device, orientation } => {
+            let r = call("rotate", json!({"device": device, "orientation": orientation}))?;
+            if let Some(o) = r["orientation"].as_str() {
+                println!("{o}");
+            }
+        }
         Cmd::Fold { device, posture } => {
             let params = match posture.parse::<f64>() {
                 Ok(angle) => json!({"device": device, "angle": angle}),
@@ -314,7 +375,43 @@ fn main() -> Result<()> {
             let r = call("fold", params)?;
             println!("{} ({}°)", text(&r["posture"]), r["angle"]);
         }
-        Cmd::Rotary { device, ticks } => drop(call("rotary", json!({"device": device, "ticks": ticks}))?),
+        Cmd::Xr { device, command } => {
+            items(&call("xr", xr_params(&device, &command)?)?).iter().for_each(|l| println!("{}", text(l)));
+        }
+        Cmd::Rotary { device, ticks, delta } => {
+            call("rotary", json!({"device": device, "ticks": ticks, "delta": delta}))?;
+            flush();
+        }
+        Cmd::WatchGesture { device, gesture } => {
+            call("watch_gesture", json!({"device": device, "gesture": gesture}))?;
+            flush();
+        }
+        Cmd::RemoteSwipe { device, direction } => {
+            call("remote_swipe", json!({"device": device, "direction": direction}))?;
+            flush();
+        }
+        Cmd::Carplay { device, state } => {
+            let on = match state.as_str() {
+                "on" => true,
+                "off" => false,
+                other => anyhow::bail!("`{other}`: say on or off"),
+            };
+            let r = call("carplay", json!({"device": device, "on": on}))?;
+            if on {
+                println!("CarPlay display {}x{}", number(&r["width"]), number(&r["height"]));
+            }
+        }
+        Cmd::Vehicle { device, property, value, area, json } => {
+            let r = call("vehicle", json!({"device": device, "property": property, "value": value, "area_id": area}))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else if !r.is_null() {
+                let readings = if r.is_array() { items(&r).to_vec() } else { vec![r] };
+                for v in readings {
+                    println!("{} area {}: {}", text(&v["property"]), v["area_id"], text(&v["value"]));
+                }
+            }
+        }
         Cmd::Console { device, command } => {
             items(&call("console", json!({"device": device, "command": command.join(" ")}))?).iter().for_each(|l| println!("{}", text(l)));
         }
@@ -376,6 +473,15 @@ fn form_factors_text(rows: &Value) -> String {
     out
 }
 
+/// The `xr` method's parameters for `sim-rs xr DEVICE WORDS...` (the console's `xr` syntax).
+fn xr_params(device: &str, words: &[String]) -> Result<Value> {
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let command = sim_core::xr::XrCommand::parse(&words).map_err(anyhow::Error::msg)?;
+    let mut params = serde_json::to_value(command)?;
+    params["device"] = Value::from(device);
+    Ok(params)
+}
+
 /// HID messages are delivered asynchronously; give the last one time to leave before exiting.
 fn flush() {
     sleep(Duration::from_millis(100));
@@ -426,8 +532,45 @@ mod tests {
         for m in ["button", "type", "key", "open_url", "install", "uninstall", "launch", "terminate", "apps", "appearance"] {
             assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
         }
-        for m in ["location", "privacy", "memory_warning", "exec", "rotate", "fold", "rotary", "console"] {
+        for m in [
+            "location",
+            "privacy",
+            "memory_warning",
+            "exec",
+            "rotate",
+            "fold",
+            "rotary",
+            "console",
+            "watch_gesture",
+            "remote_swipe",
+            "carplay",
+            "xr",
+            "vehicle",
+        ] {
             assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
         }
+    }
+
+    #[test]
+    fn xr_words_become_method_parameters() {
+        let words = |s: &str| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            xr_params("headset", &words("rotate 0 -0.5 0")).expect("rotate"),
+            json!({"device": "headset", "action": "rotate", "x": 0.0, "y": -0.5, "z": 0.0})
+        );
+        assert_eq!(
+            xr_params("headset", &words("options night 0.25")).expect("options"),
+            json!({"device": "headset", "action": "options", "environment": "night", "passthrough": 0.25})
+        );
+        assert!(xr_params("headset", &words("fly")).expect_err("unknown").to_string().starts_with("usage: xr recenter"));
+    }
+
+    #[test]
+    fn android_xr_is_listed_as_a_vision_form_factor() {
+        let mut s = sim_api::Session::default();
+        let rows = sim_api::call_method(&mut s, "form_factors", &json!({"platform": "android"})).expect("rows");
+        let out = form_factors_text(&rows);
+        assert!(out.contains("vision    android  Android XR · Vision (inputs: Eye tracking, Hand tracking, Keyboard)"), "{out}");
+        assert!(!out.contains("unsupported"), "{out}");
     }
 }

@@ -1,14 +1,22 @@
 //! virtio-input (virtio 1.2 §5.8): evdev-style events from the host into the guest.
 //!
-//! Three device kinds: a multi-touch screen (INPUT_PROP_DIRECT, so Android treats it as a
-//! touchscreen), a keyboard (hardware keys incl. power/volume/back/home) and a rotary encoder
-//! (REL_WHEEL, used by Wear OS). Host code injects through an [`InputHandle`].
+//! Four device kinds: a multi-touch screen (INPUT_PROP_DIRECT, so Android treats it as a
+//! touchscreen), a keyboard (hardware keys incl. power/volume/back/home), a rotary encoder
+//! (REL_WHEEL, used by Wear OS) and the stock emulator's virtio dual-mode mouse (absolute and
+//! relative axes, mouse buttons; Android XR images expect it). Host code injects through an
+//! [`InputHandle`].
+//!
+//! The keyboard looks like stock's (hw/input/virtio-input-hid.c): named `qwerty2` with ids
+//! 0627:0001, so the guest loads goldfish's `qwerty2.kl` (102 is HOME, 232 DPAD_CENTER, 580
+//! APP_SWITCH) instead of `Generic.kl`, and advertising stock's key set, since the kernel drops
+//! codes a device doesn't advertise.
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
 use emu_hvf::GuestRam;
+use sim_core::goldfish::keyboard_has;
 
 use super::queue::Queue;
 use super::{Activation, INT_USED_RING, Interrupt, VirtioDevice};
@@ -19,8 +27,21 @@ pub const EV_SYN: u16 = 0x00;
 pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
 pub const EV_ABS: u16 = 0x03;
+pub const EV_LED: u16 = 0x11;
+pub const EV_REP: u16 = 0x14;
 pub const SYN_REPORT: u16 = 0;
+pub const BTN_LEFT: u16 = 0x110;
+pub const BTN_RIGHT: u16 = 0x111;
+pub const BTN_MIDDLE: u16 = 0x112;
+pub const BTN_SIDE: u16 = 0x113;
+pub const BTN_EXTRA: u16 = 0x114;
+pub const BTN_TOOL_PEN: u16 = 0x140;
 pub const BTN_TOUCH: u16 = 0x14a;
+pub const BTN_GEAR_DOWN: u16 = 0x150;
+pub const BTN_GEAR_UP: u16 = 0x151;
+pub const REL_X: u16 = 0x00;
+pub const REL_Y: u16 = 0x01;
+pub const REL_HWHEEL: u16 = 0x06;
 pub const REL_WHEEL: u16 = 0x08;
 pub const ABS_X: u16 = 0x00;
 pub const ABS_Y: u16 = 0x01;
@@ -31,6 +52,13 @@ pub const ABS_MT_TRACKING_ID: u16 = 0x39;
 pub const ABS_MT_PRESSURE: u16 = 0x3a;
 pub const INPUT_PROP_DIRECT: u16 = 0x01;
 pub const MAX_SLOTS: u32 = 10;
+/// The dual-mode mouse's absolute axes span 0..=32767 (stock `INPUT_EVENT_ABS_MAX`).
+pub const MOUSE_ABS_MAX: u32 = 0x7fff;
+/// The stock dual-mode mouse's name, which the guest matches on.
+pub const DUAL_MODE_MOUSE_NAME: &str = "QEMU Virtio Dual Mode Mouse";
+/// Buttons the stock dual-mode mouse declares (its `keymap_button`).
+const MOUSE_BUTTONS: [u16; 9] = [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_GEAR_UP, BTN_GEAR_DOWN, BTN_SIDE, BTN_EXTRA, BTN_TOUCH, BTN_TOOL_PEN];
+const BUS_VIRTUAL: u16 = 0x06;
 
 const CFG_ID_NAME: u8 = 0x01;
 const CFG_ID_SERIAL: u8 = 0x02;
@@ -38,6 +66,13 @@ const CFG_ID_DEVIDS: u8 = 0x03;
 const CFG_PROP_BITS: u8 = 0x10;
 const CFG_EV_BITS: u8 = 0x11;
 const CFG_ABS_INFO: u8 = 0x12;
+
+/// The keyboard's name: goldfish's vendor image ships `qwerty2.idc` and `qwerty2.kl` for it.
+pub const KEYBOARD_NAME: &str = "qwerty2";
+/// Bus, vendor, product, version of stock's keyboard (`BUS_VIRTUAL`, 0627:0001).
+const KEYBOARD_IDS: [u16; 4] = [0x06, 0x0627, 0x0001, 0x0001];
+/// Ids of the other devices.
+const OTHER_IDS: [u16; 4] = [0x06, 0x18d1, 0x0001, 0x0001];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputEvent {
@@ -66,9 +101,15 @@ impl InputEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    Touch { width: u32, height: u32 },
+    Touch {
+        width: u32,
+        height: u32,
+    },
     Keyboard,
     Rotary,
+    /// `virtio-dual-mode-mouse` (stock `hw/input/virtio-input-hid.c`): absolute X/Y, relative
+    /// X/Y and both wheels, the mouse buttons. Named [`DUAL_MODE_MOUSE_NAME`].
+    DualModeMouse,
 }
 
 enum Msg {
@@ -114,6 +155,17 @@ impl InputHandle {
     pub fn tap_key(&self, code: u16) {
         self.send(vec![InputEvent::new(EV_KEY, code, 1), InputEvent::syn(), InputEvent::new(EV_KEY, code, 0), InputEvent::syn()]);
     }
+
+    /// Dual-mode mouse: moves to absolute axis values (0..=[`MOUSE_ABS_MAX`]) and, with `left`,
+    /// presses (`true`) or releases (`false`) the left button there.
+    pub fn pointer(&self, x: i32, y: i32, left: Option<bool>) {
+        let mut ev = vec![InputEvent::new(EV_ABS, ABS_X, x), InputEvent::new(EV_ABS, ABS_Y, y)];
+        if let Some(down) = left {
+            ev.push(InputEvent::new(EV_KEY, BTN_LEFT, i32::from(down)));
+        }
+        ev.push(InputEvent::syn());
+        self.send(ev);
+    }
 }
 
 pub struct Input {
@@ -142,6 +194,13 @@ impl Input {
     }
 
     fn ev_bits(&self, typ: u8) -> Vec<u8> {
+        match (self.kind, u16::from(typ)) {
+            // Like stock: an (empty) EV_REP entry turns on the kernel's key repeat, and the
+            // keyboard has num, caps and scroll lock LEDs.
+            (Kind::Keyboard, EV_REP) => return vec![0],
+            (Kind::Keyboard, EV_LED) => return vec![0b111],
+            _ => {}
+        }
         let mut bits = vec![0u8; 128];
         let mut set = |code: u16| {
             if let Some(b) = bits.get_mut(code as usize / 8) {
@@ -156,11 +215,14 @@ impl Input {
                 }
             }
             (Kind::Keyboard, EV_KEY) => {
-                for c in 1..=248u16 {
+                for c in (0..1024u16).filter(|&c| keyboard_has(c)) {
                     set(c);
                 }
             }
             (Kind::Rotary, EV_REL) => set(REL_WHEEL),
+            (Kind::DualModeMouse, EV_KEY) => MOUSE_BUTTONS.into_iter().for_each(&mut set),
+            (Kind::DualModeMouse, EV_REL) => [REL_X, REL_Y, REL_HWHEEL, REL_WHEEL].into_iter().for_each(&mut set),
+            (Kind::DualModeMouse, EV_ABS) => [ABS_X, ABS_Y].into_iter().for_each(&mut set),
             (_, EV_SYN) => set(SYN_REPORT),
             _ => return Vec::new(),
         }
@@ -170,13 +232,13 @@ impl Input {
     }
 
     fn abs_info(&self, axis: u8) -> Vec<u8> {
-        let Kind::Touch { width, height } = self.kind else { return Vec::new() };
-        let (min, max) = match u16::from(axis) {
-            ABS_X | ABS_MT_POSITION_X => (0, width.saturating_sub(1)),
-            ABS_Y | ABS_MT_POSITION_Y => (0, height.saturating_sub(1)),
-            ABS_MT_SLOT => (0, MAX_SLOTS - 1),
-            ABS_MT_TRACKING_ID => (0, 0xffff),
-            ABS_MT_PRESSURE => (0, 0xff),
+        let (min, max) = match (self.kind, u16::from(axis)) {
+            (Kind::Touch { width, .. }, ABS_X | ABS_MT_POSITION_X) => (0, width.saturating_sub(1)),
+            (Kind::Touch { height, .. }, ABS_Y | ABS_MT_POSITION_Y) => (0, height.saturating_sub(1)),
+            (Kind::Touch { .. }, ABS_MT_SLOT) => (0, MAX_SLOTS - 1),
+            (Kind::Touch { .. }, ABS_MT_TRACKING_ID) => (0, 0xffff),
+            (Kind::Touch { .. }, ABS_MT_PRESSURE) => (0, 0xff),
+            (Kind::DualModeMouse, ABS_X | ABS_Y) => (0, MOUSE_ABS_MAX),
             _ => return Vec::new(),
         };
         [min, max, 0, 0, 0].iter().flat_map(|v: &u32| v.to_le_bytes()).collect()
@@ -187,7 +249,16 @@ impl Input {
         match sel {
             CFG_ID_NAME => self.name.as_bytes().to_vec(),
             CFG_ID_SERIAL => b"emu-rs".to_vec(),
-            CFG_ID_DEVIDS => [0x06u16, 0x18d1, 0x0001, 0x0001].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            // bustype, vendor, product, version. The keyboard and the dual-mode mouse have stock's
+            // ids: QEMU's USB HID vendor and the product numbers their guest drivers bind to.
+            CFG_ID_DEVIDS => match self.kind {
+                Kind::Keyboard => KEYBOARD_IDS,
+                Kind::DualModeMouse => [BUS_VIRTUAL, 0x0627, 0x0004, 0x0001],
+                _ => OTHER_IDS,
+            }
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
             CFG_PROP_BITS => match self.kind {
                 Kind::Touch { .. } => vec![1 << INPUT_PROP_DIRECT],
                 _ => Vec::new(),
@@ -318,57 +389,6 @@ impl Worker {
     }
 }
 
-/// Linux keycodes for console/desktop key names (KEY_* without the prefix, case-insensitive).
-pub fn keycode(name: &str) -> Option<u16> {
-    let n = name.trim_start_matches("KEY_").to_ascii_uppercase();
-    let letters = "QWERTYUIOP";
-    Some(match n.as_str() {
-        "ESC" => 1,
-        "1" => 2,
-        "2" => 3,
-        "3" => 4,
-        "4" => 5,
-        "5" => 6,
-        "6" => 7,
-        "7" => 8,
-        "8" => 9,
-        "9" => 10,
-        "0" => 11,
-        "BACKSPACE" => 14,
-        "TAB" => 15,
-        "ENTER" => 28,
-        "SPACE" => 57,
-        "HOME" => 102,
-        "UP" => 103,
-        "LEFT" => 105,
-        "RIGHT" => 106,
-        "DOWN" => 108,
-        "MUTE" => 113,
-        "VOLUMEDOWN" => 114,
-        "VOLUMEUP" => 115,
-        "POWER" => 116,
-        "MENU" => 139,
-        "BACK" => 158,
-        "APPSELECT" => 580,
-        "HOMEPAGE" => 172,
-        "SEARCH" => 217,
-        "SLEEP" => 142,
-        "WAKEUP" => 143,
-        "CAMERA" => 212,
-        s if s.len() == 1 => {
-            let c = s.as_bytes()[0];
-            if let Some(i) = letters.find(c as char) {
-                16 + i as u16
-            } else if let Some(i) = "ASDFGHJKL".find(c as char) {
-                30 + i as u16
-            } else {
-                44 + "ZXCVBNM".find(c as char)? as u16
-            }
-        }
-        _ => return None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +415,56 @@ mod tests {
     }
 
     #[test]
+    fn dual_mode_mouse_config_matches_stock() {
+        let (mut dev, _h) = Input::new(Kind::DualModeMouse, DUAL_MODE_MOUSE_NAME);
+        assert_eq!(cfg(&mut dev, CFG_ID_NAME, 0), b"QEMU Virtio Dual Mode Mouse");
+        // BUS_VIRTUAL, vendor 0x0627, product 0x0004, version 1, little-endian.
+        assert_eq!(cfg(&mut dev, CFG_ID_DEVIDS, 0), [0x06, 0, 0x27, 0x06, 0x04, 0, 0x01, 0]);
+        assert!(cfg(&mut dev, CFG_PROP_BITS, 0).is_empty(), "a pointer, not a direct-touch screen");
+        // EV_ABS: X and Y; EV_REL: X, Y, HWHEEL, WHEEL (stock's two bitmap bytes).
+        assert_eq!(cfg(&mut dev, CFG_EV_BITS, EV_ABS as u8), [0b11]);
+        assert_eq!(cfg(&mut dev, CFG_EV_BITS, EV_REL as u8), [0b0100_0011, 0b1]);
+        let keys = cfg(&mut dev, CFG_EV_BITS, EV_KEY as u8);
+        let has = |code: u16| keys.get(code as usize / 8).is_some_and(|b| b & (1 << (code % 8)) != 0);
+        for b in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA, BTN_GEAR_UP, BTN_GEAR_DOWN, BTN_TOUCH, BTN_TOOL_PEN] {
+            assert!(has(b), "{b:#x}");
+        }
+        assert_eq!(keys.iter().map(|b| b.count_ones()).sum::<u32>(), 9);
+        assert_eq!(keys.len(), BTN_GEAR_UP as usize / 8 + 1);
+        for axis in [ABS_X, ABS_Y] {
+            // min 0, max 32767, fuzz, flat, resolution 0.
+            let info = cfg(&mut dev, CFG_ABS_INFO, axis as u8);
+            assert_eq!(info, [0u32, 32767, 0, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+        }
+        assert!(cfg(&mut dev, CFG_ABS_INFO, ABS_MT_POSITION_X as u8).is_empty());
+        // The keyboard has stock's `qwerty2` ids; the rotary keeps emu-rs's.
+        let (mut kbd, _k) = Input::new(Kind::Keyboard, "qwerty2");
+        assert_eq!(cfg(&mut kbd, CFG_ID_DEVIDS, 0), [0x06, 0, 0x27, 0x06, 0x01, 0, 0x01, 0]);
+        let (mut rotary, _r) = Input::new(Kind::Rotary, "virtio_input_rotary");
+        assert_eq!(cfg(&mut rotary, CFG_ID_DEVIDS, 0), [0x06, 0, 0xd1, 0x18, 0x01, 0, 0x01, 0]);
+    }
+
+    #[test]
+    fn pointer_events_move_then_press() {
+        let (mut dev, h) = Input::new(Kind::DualModeMouse, DUAL_MODE_MOUSE_NAME);
+        let rx = dev.rx.take().expect("receiver");
+        h.pointer(100, 200, Some(true));
+        let Ok(Msg::Events(ev)) = rx.try_recv() else { panic!("no events") };
+        assert_eq!(
+            ev,
+            [
+                InputEvent::new(EV_ABS, ABS_X, 100),
+                InputEvent::new(EV_ABS, ABS_Y, 200),
+                InputEvent::new(EV_KEY, BTN_LEFT, 1),
+                InputEvent::syn()
+            ]
+        );
+        h.pointer(5, 6, None);
+        let Ok(Msg::Events(ev)) = rx.try_recv() else { panic!("no events") };
+        assert_eq!(ev.len(), 3);
+    }
+
+    #[test]
     fn events_flow_into_guest_buffers() {
         let mem = Arc::new(GuestRam::new(RAM_BASE, 0x10_0000).expect("ram"));
         let line = Arc::new(TestLine::default());
@@ -416,11 +486,27 @@ mod tests {
         assert_eq!(mem.read_u16(RAM_BASE + 0x20000 + 2).expect("code"), 116);
     }
 
+    fn has(bits: &[u8], code: u16) -> bool {
+        bits.get(code as usize / 8).is_some_and(|b| b & (1 << (code % 8)) != 0)
+    }
+
     #[test]
-    fn key_names() {
-        assert_eq!(keycode("KEY_POWER"), Some(116));
-        assert_eq!(keycode("a"), Some(30));
-        assert_eq!(keycode("KEY_Q"), Some(16));
-        assert_eq!(keycode("nope"), None);
+    fn keyboard_looks_like_stocks_qwerty2() {
+        let (mut dev, _h) = Input::new(Kind::Keyboard, KEYBOARD_NAME);
+        assert_eq!(cfg(&mut dev, CFG_ID_NAME, 0), b"qwerty2");
+        assert_eq!(cfg(&mut dev, CFG_ID_DEVIDS, 0), [0x06, 0, 0x27, 0x06, 0x01, 0, 0x01, 0]);
+        // The bitmap is `sim_core::goldfish::keyboard_has`, up to ASSIST (585).
+        let keys = cfg(&mut dev, CFG_EV_BITS, EV_KEY as u8);
+        assert!((0..1024).all(|c| has(&keys, c) == keyboard_has(c)));
+        assert!(has(&keys, 232) && has(&keys, 580) && !has(&keys, 0));
+        assert_eq!(keys.len(), 585 / 8 + 1);
+        assert_eq!(cfg(&mut dev, CFG_EV_BITS, EV_REP as u8), [0], "key repeat on");
+        assert_eq!(cfg(&mut dev, CFG_EV_BITS, EV_LED as u8), [0b111]);
+        assert!(cfg(&mut dev, CFG_PROP_BITS, 0).is_empty());
+
+        let (mut rotary, _h) = Input::new(Kind::Rotary, "virtio_input_rotary");
+        assert_eq!(cfg(&mut rotary, CFG_ID_DEVIDS, 0), [0x06, 0, 0xd1, 0x18, 0x01, 0, 0x01, 0]);
+        assert!(cfg(&mut rotary, CFG_EV_BITS, EV_REP as u8).is_empty());
+        assert!(has(&cfg(&mut rotary, CFG_EV_BITS, EV_REL as u8), REL_WHEEL));
     }
 }

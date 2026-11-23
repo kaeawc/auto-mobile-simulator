@@ -109,14 +109,33 @@ fn send_getter(obj: &AnyObject, sel: Sel) -> Option<Obj> {
 /// Sends a no-argument message returning `unsigned short`, bypassing objc2's signature check:
 /// I/O port state objects are remote proxies that forward messages their class does not declare.
 pub(crate) fn send_u16(obj: &AnyObject, sel: Sel) -> Option<u16> {
+    // SAFETY: callers pass getters returning `unsigned short`.
+    unsafe { send_scalar(obj, sel) }
+}
+
+/// Sends a no-argument message returning a scalar (integer or `CGSize`-like struct of doubles),
+/// through `objc_msgSend` like [`send_u16`]. `None` when `obj` doesn't respond.
+///
+/// # Safety
+/// `sel` must name a no-argument method whose return type is `T` (as returned in registers).
+pub(crate) unsafe fn send_scalar<T: Copy>(obj: &AnyObject, sel: Sel) -> Option<T> {
     if !responds(obj, sel) {
         return None;
     }
-    type Getter = unsafe extern "C" fn(*const AnyObject, Sel) -> u16;
-    // SAFETY: `objc_msgSend` is called through the target's signature: no arguments, `unsigned short`.
-    let send: Getter = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
+    type Getter<T> = unsafe extern "C" fn(*const AnyObject, Sel) -> T;
+    // SAFETY: `objc_msgSend` is called through the target's signature (the caller's contract).
+    let send: Getter<T> = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
     // SAFETY: `obj` is a valid object that responds to `sel` (checked).
     Some(unsafe { send(obj, sel) })
+}
+
+/// An exported symbol of any image already loaded into the process (`dlsym(RTLD_DEFAULT, …)`).
+pub(crate) fn default_symbol(name: &CStr) -> Result<NonNull<c_void>> {
+    // RTLD_DEFAULT on Darwin.
+    let default = -2isize as *mut c_void;
+    // SAFETY: RTLD_DEFAULT is a valid pseudo-handle and `name` is NUL-terminated.
+    let ptr = unsafe { dlsym(default, name.as_ptr()) };
+    NonNull::new(ptr).ok_or_else(|| Error::Unavailable(format!("symbol {}", name.to_string_lossy())))
 }
 
 /// Reads a string-valued property; empty when missing, nil or not a string.
@@ -125,6 +144,11 @@ pub(crate) fn string_prop(obj: &AnyObject, sel: Sel) -> String {
         return String::new();
     }
     send_getter(obj, sel).and_then(|v| v.downcast::<NSString>().ok()).map(|s| s.to_string()).unwrap_or_default()
+}
+
+/// Reads an object-valued property that may be nil.
+pub(crate) fn optional_prop(obj: &AnyObject, sel: Sel) -> Option<Obj> {
+    if responds(obj, sel) { send_getter(obj, sel) } else { None }
 }
 
 /// Reads an object-valued property.

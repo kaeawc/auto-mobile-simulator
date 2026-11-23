@@ -23,8 +23,10 @@ use sim_core::form_factor::{FormFactor, InputMethod, Kind, Profile, android_prof
 use sim_core::frame::Frame;
 use sim_core::gesture::{Phase, Sample};
 use sim_core::hid::{Button, Direction, KEY_LEFT_SHIFT, KeyStroke, keystroke, linux_keycode};
-use sim_core::platform::Platform;
+use sim_core::platform::{AndroidOs, Platform, SubPlatform};
 use sim_core::stream::Input;
+use sim_core::vhal;
+use sim_core::xr::XrCommand;
 
 /// The Android backend over one SDK and AVD home.
 #[derive(Clone, Debug)]
@@ -145,7 +147,7 @@ impl Android {
             let label = Kind::new(Platform::Android, image).map(|k| k.label()).unwrap_or_default();
             return Err(format!("system image `{system_image}` (tag `{tag}`) boots {label} devices, not {}", wanted.as_str()));
         }
-        self.env.create_avd(&NewAvd::for_profile(name, &sysdir, &kind.profile())).map_err(|e| e.to_string())?;
+        self.env.create_avd(&NewAvd::for_profile(name, &sysdir, &kind.image_profile(&tag))).map_err(|e| e.to_string())?;
         Ok(self.describe(name, &[]).info)
     }
 
@@ -384,10 +386,46 @@ impl Device {
         self.console(&[format!("sensor set hinge-angle0 {angle}")]).map(drop)
     }
 
-    /// Turns the rotary input (Wear OS crown or bezel) by `ticks`. Watches only.
+    /// Turns the rotary input (Wear OS crown or bezel) by `ticks` clicks, which the emulator
+    /// scales to stock's 15 units per click (`sim_core::stream::wheel_units`). Watches only.
     pub fn rotary(&self, ticks: i32) -> Result<(), String> {
         self.require(InputMethod::Rotary, "rotary input")?;
         display::Display::connect(&self.avd()?.dir)?.send(&Input::Wheel(ticks))
+    }
+
+    /// An XR control (head pose, environment, input mode, pointer) through emu-rs's `xr` console
+    /// command; returns its reply lines. Android XR devices only.
+    pub fn xr(&self, command: &XrCommand) -> Result<Vec<String>, String> {
+        match self.info.kind() {
+            Some(k) if k.sub_platform == SubPlatform::Android(AndroidOs::Xr) => self.console(&[command.console()]),
+            Some(k) => Err(format!("XR controls need an Android XR device; {} is {}", self.info.name, k.label())),
+            None => Err(format!("XR controls: {}'s form factor is unknown", self.info.name)),
+        }
+    }
+
+    /// Sets a vehicle HAL property through the emulator's `car` console command (an emu-rs
+    /// extension). `property` is a VHAL name (`GEAR_SELECTION`, `gear`) or id; `value` is typed
+    /// by the property (`drive`, `12.5`, `true`). Automotive devices only.
+    pub fn vehicle_set(&self, property: &str, area_id: i32, value: &str) -> Result<(), String> {
+        self.require(InputMethod::HeadUnit, "the vehicle HAL")?;
+        // Checked here so a bad name or value fails before any emulator is involved.
+        let prop = vhal::property(property)?;
+        vhal::parse_value(prop, area_id, value)?;
+        self.console(&[format!("car set {prop:#x} {area_id} {value}")]).map(drop)
+    }
+
+    /// A vehicle HAL property's current value, read from the guest. Automotive devices only.
+    pub fn vehicle_get(&self, property: &str, area_id: i32) -> Result<vhal::Reading, String> {
+        self.require(InputMethod::HeadUnit, "the vehicle HAL")?;
+        let prop = vhal::property(property)?;
+        let lines = self.console(&[format!("car get {prop:#x} {area_id}")])?;
+        lines.iter().find_map(|l| vhal::Reading::parse(l)).ok_or_else(|| format!("unexpected `car get` reply: {lines:?}"))
+    }
+
+    /// Every vehicle HAL property's current value. Automotive devices only.
+    pub fn vehicle_list(&self) -> Result<Vec<vhal::Reading>, String> {
+        self.require(InputMethod::HeadUnit, "the vehicle HAL")?;
+        Ok(self.console(&["car list".into()])?.iter().filter_map(|l| vhal::Reading::parse(l)).collect())
     }
 }
 
@@ -514,7 +552,7 @@ mod tests {
         let err = f.android.create("t", wear, Some(FormFactor::Tablet)).expect_err("tablet from a Wear image");
         assert_eq!(err, format!("system image `{wear}` (tag `android-wear`) boots Wear OS · Watch devices, not tablet"));
         let err = f.android.create("v", "system-images;android-36;google_apis;arm64-v8a", Some(FormFactor::Vision)).expect_err("vision");
-        assert!(err.starts_with("vision is not supported on Android"), "{err}");
+        assert!(err.ends_with("(tag `google_apis`) boots Android · Phone devices, not vision"), "{err}");
         assert!(f.android.create("x", "android-36", None).expect_err("bad image").contains("should look like"));
         assert!(f.android.devices().is_empty(), "nothing was written");
     }
@@ -558,6 +596,10 @@ mod tests {
                     let reply = match line.split_whitespace().collect::<Vec<_>>().as_slice() {
                         ["ping"] => "I am alive!\r\nOK".to_owned(),
                         ["frames"] => "3\r\nOK".to_owned(),
+                        ["car", "get", ..] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\nOK".to_owned(),
+                        ["car", "list"] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\n\
+                                            property=INFO_MAKE id=0x11100101 area=0 status=available value=Toy Car\r\nOK"
+                            .to_owned(),
                         ["screenshot", path] => {
                             let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };
                             std::fs::write(path, sim_core::frame::encode_png(&frame).expect("png")).expect("write png");
@@ -622,8 +664,8 @@ mod tests {
             [
                 "event send EV_KEY:42:1 EV_KEY:35:1 EV_KEY:35:0 EV_KEY:42:0",
                 "event send EV_KEY:23:1 EV_KEY:23:0",
-                "event send EV_KEY:HOME:1",
-                "event send EV_KEY:BACK:0",
+                "event send EV_KEY:KEY_HOME:1",
+                "event send EV_KEY:KEY_BACK:0",
                 "event send EV_KEY:28:1",
                 "geo fix -122.25 37.5",
                 "rotate",
@@ -637,6 +679,82 @@ mod tests {
         assert_eq!(wait_for(&fake.display, 2), ["touch 100 200 down", "touch 100 200 up"]);
         assert!(d.rotary(1).expect_err("not a watch").starts_with("rotary input needs a device with Rotary input"));
         assert!(f.android.delete(&d).expect_err("running").contains("is running"));
+    }
+
+    /// Adds an installed system image under the fixture's SDK.
+    fn add_image(f: &Fixture, dir: &str, image_tag: &str) {
+        let d = f.root.join("sdk/system-images").join(dir);
+        std::fs::create_dir_all(&d).expect("image dir");
+        std::fs::write(d.join("system.img"), b"s").expect("system.img");
+        std::fs::write(d.join("source.properties"), format!("AndroidVersion.ApiLevel=34\nSystemImage.TagId={image_tag}\n")).expect("props");
+    }
+
+    #[test]
+    fn android_xr_images_make_headsets_and_glasses() {
+        let f = fixture("xr");
+        add_image(&f, "android-34/google-xr/arm64-v8a", "android-xr");
+        add_image(&f, "android-36/ai-glasses/arm64-v8a", "ai-glasses");
+        let headset = f.android.create("headset", "system-images;android-34;google-xr;arm64-v8a", None).expect("headset");
+        assert_eq!((headset.form_factor, headset.label()), (Some(FormFactor::Vision), "Android XR · Vision".to_owned()));
+        let d = f.android.device("headset").expect("headset");
+        assert_eq!(d.screen_size(), Ok((2560, 2558)));
+        assert_eq!(d.avd.as_ref().and_then(|a| a.get("hw.initialOrientation")), Some("landscape"));
+        let glasses =
+            f.android.create("glasses", "system-images;android-36;ai-glasses;arm64-v8a", Some(FormFactor::Vision)).expect("glasses");
+        assert_eq!(glasses.sub_platform.map(|s| s.as_str()), Some("androidxr"));
+        assert_eq!(f.android.device("glasses").expect("glasses").screen_size(), Ok((450, 450)));
+        let err = f.android.create("p", "system-images;android-34;google-xr;arm64-v8a", Some(FormFactor::Phone)).expect_err("phone");
+        assert!(err.ends_with("boots Android XR · Vision devices, not phone"), "{err}");
+
+        // XR controls are for Android XR devices, and go to a running one's console.
+        let rotate = XrCommand::Rotate { x: 0.0, y: 0.5, z: 0.0 };
+        assert_eq!(d.xr(&rotate), Err("headset isn't running; boot it first".into()));
+        f.android.create("watch", "system-images;android-34;android-wear;arm64-v8a", None).expect("watch");
+        let watch = f.android.device("watch").expect("watch");
+        assert_eq!(watch.xr(&rotate), Err("XR controls need an Android XR device; watch is Wear OS · Watch".into()));
+        let fake = fake_emulator(&f, "headset");
+        let d = f.android.device("headset").expect("running headset");
+        d.xr(&rotate).expect("rotate");
+        d.xr(&XrCommand::Recenter).expect("recenter");
+        assert_eq!(wait_for(&fake.console, 2), ["xr rotate 0 0.5 0", "xr recenter"]);
+    }
+
+    #[test]
+    fn automotive_devices_drive_the_vehicle_hal() {
+        let f = fixture("car");
+        let image = f.android.env.sdk_root.clone().expect("sdk").join("system-images/android-34/android-automotive/arm64-v8a");
+        std::fs::create_dir_all(&image).expect("image dir");
+        std::fs::write(image.join("system.img"), b"s").expect("system.img");
+        std::fs::write(image.join("source.properties"), "AndroidVersion.ApiLevel=34\nSystemImage.TagId=android-automotive\n")
+            .expect("props");
+        let car = f.android.create("car", "system-images;android-34;android-automotive;arm64-v8a", None).expect("car");
+        assert_eq!(car.form_factor, Some(FormFactor::Auto));
+        f.android.create("watch", "system-images;android-34;android-wear;arm64-v8a", None).expect("watch");
+        let watch = f.android.device("watch").expect("watch");
+        assert!(
+            watch
+                .vehicle_set("gear", 0, "drive")
+                .expect_err("not a car")
+                .starts_with("the vehicle HAL needs a device with Automotive head unit; watch is Wear OS")
+        );
+
+        let d = f.android.device("car").expect("car");
+        assert!(d.vehicle_set("warp_drive", 0, "1").expect_err("unknown").contains("unknown vehicle property"));
+        assert!(d.vehicle_set("gear", 0, "fast").expect_err("bad value").contains("isn't a Int32 value"));
+        assert_eq!(d.vehicle_set("gear", 0, "drive"), Err("car isn't running; boot it first".into()));
+
+        let fake = fake_emulator(&f, "car");
+        let d = f.android.device("car").expect("car");
+        d.vehicle_set("gear", 0, "drive").expect("set");
+        d.vehicle_set("HVAC_TEMPERATURE_SET", 49, "21.5").expect("set seat");
+        let gear = d.vehicle_get("GEAR_SELECTION", 0).expect("get");
+        assert_eq!((gear.property.as_str(), gear.id, gear.value.as_str()), ("GEAR_SELECTION", 0x1140_0400, "8"));
+        let all = d.vehicle_list().expect("list");
+        assert_eq!(all.iter().map(|r| r.value.as_str()).collect::<Vec<_>>(), ["8", "Toy Car"]);
+        assert_eq!(
+            wait_for(&fake.console, 4),
+            ["car set 0x11400400 0 drive", "car set 0x15600503 49 21.5", "car get 0x11400400 0", "car list"]
+        );
     }
 
     #[test]

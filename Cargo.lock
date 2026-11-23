@@ -33,6 +33,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
+name = "block2"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
+dependencies = [
+ "objc2",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -140,6 +149,7 @@ version = "0.1.0"
 dependencies = [
  "roxmltree",
  "sha1_smol",
+ "sim-core",
  "thiserror",
 ]
 
@@ -154,6 +164,7 @@ dependencies = [
  "flate2",
  "libc",
  "rustix",
+ "sim-core",
 ]
 
 [[package]]
@@ -409,6 +420,7 @@ dependencies = [
 name = "sim-coresim"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "objc2",
  "objc2-foundation",
  "sim-core",

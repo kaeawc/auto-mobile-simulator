@@ -14,7 +14,7 @@ use sim_core::device::{DeviceInfo, DeviceState};
 use sim_core::geometry::{Point, Size};
 use sim_core::gesture::Phase;
 use sim_core::hid::Direction;
-use sim_core::hid::{Button, KEY_LEFT_SHIFT, KeyStroke};
+use sim_core::hid::{Button, CROWN_UNITS_PER_TICK, KEY_LEFT_SHIFT, KeyStroke, Orientation};
 pub use sim_coresim::Context;
 use sim_coresim::{Appearance, Device, Frame, Hid, Surface};
 
@@ -28,6 +28,7 @@ pub struct Live {
     pub shared: Arc<Shared>,
     capture: Option<JoinHandle<()>>,
     pub dark: bool,
+    orientation: Orientation,
 }
 
 impl Live {
@@ -37,7 +38,15 @@ impl Live {
         let hid = device.hid().map_err(|e| e.to_string())?;
         let shared = Arc::new(Shared::default());
         let capture = spawn_capture(udid.to_owned(), native, shared.clone(), waker)?;
-        Ok(Self { udid: udid.to_owned(), device, hid: Some(hid), shared, capture: Some(capture), dark: false })
+        Ok(Self {
+            udid: udid.to_owned(),
+            device,
+            hid: Some(hid),
+            shared,
+            capture: Some(capture),
+            dark: false,
+            orientation: Orientation::Portrait,
+        })
     }
 
     fn screen(&self) -> Option<Size> {
@@ -57,6 +66,23 @@ impl Live {
         let Some(hid) = &self.hid else { return };
         if let Err(e) = hid.button(button, direction) {
             eprintln!("button: {e}");
+        }
+    }
+
+    /// Turns an Apple Watch's Digital Crown by rotary ticks (negative turns back).
+    pub fn crown(&self, ticks: i32) {
+        let Some(hid) = &self.hid else { return };
+        if let Err(e) = hid.crown(f64::from(ticks) * CROWN_UNITS_PER_TICK) {
+            eprintln!("crown: {e}");
+        }
+    }
+
+    /// Rotates the device 90° clockwise from the orientation this window last set.
+    pub fn rotate(&mut self) {
+        let next = self.orientation.clockwise();
+        match self.device.set_orientation(next) {
+            Ok(()) => self.orientation = next,
+            Err(e) => eprintln!("rotate: {e}"),
         }
     }
 

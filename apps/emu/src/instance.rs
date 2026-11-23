@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use emu_avd::{Avd, BootConfig};
 use emu_vmm::layout::slots;
 use emu_vmm::{DiskMode, DiskSpec, MachineConfig};
+use sim_core::platform::{AndroidOs, SubPlatform};
 
 use crate::args::Opts;
 
@@ -38,6 +39,10 @@ pub struct Instance {
     pub gps: std::sync::Arc<emu_vmm::pipe::gps::Gps>,
     pub battery: std::sync::Arc<emu_vmm::devices::goldfish_battery::Battery>,
     pub telephony: std::sync::Arc<emu_vmm::telephony::Telephony>,
+    /// Android XR images: the guest's XR service link (and, with it, the dual-mode mouse).
+    pub xr: Option<std::sync::Arc<emu_vmm::pipe::xr::Xr>>,
+    /// The vehicle HAL channel, for Automotive images only (as stock).
+    pub car: Option<std::sync::Arc<emu_vmm::pipe::car::Car>>,
     _lock: Option<File>,
 }
 
@@ -128,14 +133,28 @@ impl Instance {
             display,
             gpu_lib64,
             inputs: Default::default(),
-            sensors: Default::default(),
+            sensors: std::sync::Arc::new(emu_vmm::pipe::sensors::Sensors::new(avd.sensor_mask())),
             clipboard: Default::default(),
             fingerprint: Default::default(),
             gps: Default::default(),
             battery: Default::default(),
             telephony: Default::default(),
+            xr: (avd.profile().kind.sub_platform == SubPlatform::Android(AndroidOs::Xr)).then(Default::default),
+            car: avd.is_car().then(Default::default),
             _lock: lock,
         })
+    }
+
+    /// A silent virtio-snd card for images whose audio HAL needs ALSA card 0: Automotive
+    /// (`audio.primary.caremu` crashes without one) and Android XR (its images enable `VirtioSndCard`).
+    /// `EMU_VIRTIO_SND=1` or `0` forces it on or off for any image. `-no-audio` leaves it alone:
+    /// the card never plays on the host anyway.
+    fn sound(&self) -> bool {
+        match std::env::var("EMU_VIRTIO_SND").as_deref() {
+            Ok("1" | "on" | "yes") => true,
+            Ok("0" | "off" | "no") => false,
+            _ => self.car.is_some() || self.xr.is_some(),
+        }
     }
 
     fn bootconfig(&self, opts: &Opts) -> BootConfig {
@@ -167,6 +186,10 @@ impl Instance {
         if opts.no_boot_anim {
             bc.set("androidboot.debug.sf.nobootanimation", "1");
         }
+        // A round screen (boot.prop's `ro.emulator.circular`), as stock tells the guest.
+        if self.avd.circular() {
+            bc.set("androidboot.emulator.circular", "1");
+        }
         for (k, v) in self.avd.vbmeta_params() {
             bc.set(k, v);
         }
@@ -181,8 +204,7 @@ impl Instance {
 
     /// What the stock host hands `qemu-props` at boot.
     fn boot_props(&self) -> Vec<(String, String)> {
-        let (_, _, density) = self.avd.lcd();
-        let mut props = vec![("qemu.sf.lcd_density".to_string(), density.to_string()), ("qemu.hw.mainkeys".to_string(), "0".to_string())];
+        let mut props = self.avd.qemu_props();
         if let Ok(tz) = std::fs::read_link("/etc/localtime")
             && let Some(name) = tz.to_str().and_then(|s| s.split("zoneinfo/").nth(1))
         {
@@ -239,12 +261,15 @@ impl Instance {
             }),
             boot_props: self.boot_props(),
             input: Some((self.avd.lcd().0, self.avd.lcd().1)),
+            xr: self.xr.clone(),
             sensors: self.sensors.clone(),
             clipboard: self.clipboard.clone(),
             fingerprint: self.fingerprint.clone(),
             gps: self.gps.clone(),
             battery: self.battery.clone(),
             telephony: self.telephony.clone(),
+            car: self.car.clone(),
+            sound: self.sound(),
             on_guest_event: {
                 let started = std::time::Instant::now();
                 Some(std::sync::Arc::new(move |event: &str| {

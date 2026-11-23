@@ -9,6 +9,7 @@ use objc2::{msg_send, sel};
 use objc2_foundation::{NSError, NSString};
 use sim_core::device::{DeviceInfo, DeviceState, DeviceTypeInfo, RuntimeInfo, Selection, select};
 use sim_core::form_factor::{apple_family_form_factor, apple_kind};
+use sim_core::hid::Orientation;
 use sim_core::platform::Platform;
 
 use crate::display::Display;
@@ -194,6 +195,15 @@ fn device_type_info(t: &AnyObject) -> DeviceTypeInfo {
 pub struct Device {
     pub(crate) obj: Obj,
     kit: Library,
+}
+
+const MACH_SEND_MSG: i32 = 0x1;
+const MACH_SEND_TIMEOUT: i32 = 0x10;
+
+unsafe extern "C" {
+    static mach_task_self_: u32;
+    fn mach_msg(msg: *mut std::ffi::c_void, option: i32, send_size: u32, rcv_size: u32, rcv_name: u32, timeout: u32, notify: u32) -> i32;
+    fn mach_port_deallocate(task: u32, name: u32) -> i32;
 }
 
 /// Runs a `BOOL`-returning, `NSError**`-taking device method by name.
@@ -581,8 +591,57 @@ impl Device {
         Display::main(&self.obj)
     }
 
-    /// A HID input session. The device must be booted.
+    /// The external display (an iPhone's CarPlay screen once attached), not the main one.
+    pub fn external_display(&self) -> Result<Display> {
+        Display::external(&self.obj)
+    }
+
+    /// A HID input session. The device must be booted. Buttons and form-factor inputs follow the
+    /// device's form factor (the Siri Remote on Apple TV, the crown on Apple Watch).
     pub fn hid(&self) -> Result<Hid> {
-        Hid::connect(&self.obj, self.kit)
+        Hid::connect(&self.obj, self.kit, self.info().form_factor)
+    }
+
+    /// Attaches (or detaches) the CarPlay display to this iPhone and creates (or removes) the
+    /// CarPlay HID service its touches go to. iOS 26 runtimes and earlier: iOS 27 renders it black.
+    pub fn set_carplay(&self, on: bool) -> Result<()> {
+        let info = self.info();
+        if info.form_factor != Some(sim_core::form_factor::FormFactor::Phone) {
+            return Err(Error::Invalid(format!("CarPlay attaches to an iPhone; {} is {}", info.name, info.label())));
+        }
+        sim_core::carplay::runtime_supports(&info.runtime_id).map_err(Error::Invalid)?;
+        let hid = self.hid()?;
+        if on {
+            crate::carplay::set_display(&self.obj, &self.data_path(), true)?;
+            hid.carplay_service(true)
+        } else {
+            // The service may already be gone (a reboot removes it); detaching goes on regardless.
+            let removed = hid.carplay_service(false);
+            crate::carplay::set_display(&self.obj, &self.data_path(), false)?;
+            removed
+        }
+    }
+
+    /// Rotates the device's interface to `orientation`: a GSEvent to SpringBoard's
+    /// PurpleWorkspacePort, what Simulator.app's Rotate Left/Right send.
+    pub fn set_orientation(&self, orientation: Orientation) -> Result<()> {
+        let sel = sel!(lookup:error:);
+        rt::require(&self.obj, sel)?;
+        let mut error: *mut NSError = std::ptr::null_mut();
+        // SAFETY: `lookup:error:` takes (NSString, NSError**) and returns a mach_port_t (0 on failure).
+        let port: u32 = unsafe { msg_send![&*self.obj, lookup: &*rt::nsstring("PurpleWorkspacePort"), error: &mut error] };
+        if port == 0 {
+            return Err(rt::raw_error("look up PurpleWorkspacePort", error));
+        }
+        let mut message = orientation.purple_message(port);
+        // SAFETY: `message` is a complete 108-byte mach message (header included) in a 112-byte
+        // buffer; a send-only call with a timeout doesn't touch receive arguments.
+        let kr = unsafe { mach_msg(message.as_mut_ptr().cast(), MACH_SEND_MSG | MACH_SEND_TIMEOUT, 108, 0, 0, 2000, 0) };
+        // SAFETY: the lookup gave this task a send right to `port`; release it.
+        unsafe { mach_port_deallocate(mach_task_self_, port) };
+        if kr != 0 {
+            return Err(Error::Service { op: "rotate", message: format!("mach_msg to PurpleWorkspacePort failed ({kr:#x})") });
+        }
+        Ok(())
     }
 }

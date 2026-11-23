@@ -67,7 +67,19 @@ impl FrameHeader {
     }
 }
 
-/// One client → server line.
+/// Rotary units per wheel click. The rotary's unit is a degree (stock's
+/// `virtio_input_rotary.idc` sets `device.res = 57.295`, units per radian) and stock's gRPC
+/// rotary input turns 15 of them per click, so one click scrolls a Wear OS list as far as on the
+/// stock emulator.
+pub const WHEEL_UNITS_PER_CLICK: i32 = 15;
+
+/// The `REL_WHEEL` value for `clicks` rotary clicks.
+pub fn wheel_units(clicks: i32) -> i32 {
+    clicks.saturating_mul(WHEEL_UNITS_PER_CLICK)
+}
+
+/// One client → server line. `Wheel` carries rotary clicks; the server scales them with
+/// [`wheel_units`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum Input {
     Hello { max_width: u32 },
@@ -148,6 +160,14 @@ mod tests {
             assert_eq!(Input::parse(&i.to_line()), Some(i.clone()), "{}", i.to_line());
         }
         assert_eq!(Input::Touch { x: 10.4, y: 19.6, phase: Phase::Up }.to_line(), "touch 10 20 up");
+    }
+
+    #[test]
+    fn wheel_clicks_scale_to_degrees() {
+        assert_eq!(wheel_units(1), 15);
+        assert_eq!(wheel_units(-2), -30);
+        assert_eq!(wheel_units(0), 0);
+        assert_eq!(wheel_units(i32::MAX), i32::MAX, "saturates");
         assert_eq!(Input::parse("touch 1 nope up"), None);
         assert_eq!(Input::parse("dance"), None);
     }

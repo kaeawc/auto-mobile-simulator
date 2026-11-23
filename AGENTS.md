@@ -87,11 +87,17 @@ scripts/automobile-harness-android.sh emulator-5554
   screen, density, shape, fold and inputs, inference from Apple device types and Android AVD
   configs), device/runtime models (labelled with platform and form factor) and selection,
   privacy service names, geometry,
-  gesture planning, HID usages and buttons, BGRA→RGBA conversion, `Frame` and PNG encoding.
-  No FFI.
+  gesture planning, HID usages and buttons (per form factor: the Siri Remote, crown steps, watch
+  gestures, orientations and the Purple orientation message), `carplay.rs` (StarkConfig, runtime
+  gate), `goldfish.rs` (stock emulator key names, the `qwerty2` key set, sensor masks), `xr.rs`
+  (Android XR commands and the `xr_service` messages), `vhal.rs` (the vehicle HAL's
+  `EmulatorMessage` codec, property names and values), BGRA→RGBA conversion, `Frame` and PNG
+  encoding. No FFI.
 - `crates/sim-coresim` — the service boundary: `Context` (service + device set), `Device`
-  (lifecycle, apps, settings), `Display` (framebuffer surface, capture), `Hid` (touch, buttons,
-  keyboard). `rt.rs` holds the Objective-C runtime helpers.
+  (lifecycle, apps, settings, orientation, CarPlay), `Display` (framebuffer surface, capture; main
+  or external), `Hid` (touch, buttons, keyboard, the Digital Crown, watch gestures, the Siri
+  Remote's touch surface, CarPlay touches), `carplay.rs` (attaching the CarPlay display). `rt.rs`
+  holds the Objective-C runtime helpers.
 - `crates/sim-debug` — host-side introspection (no FFI): device process tree (`ps`), sockets
   (`lsof`), traffic (`nettop`), containers and files (confined to the device data dir), crash reports.
 - `crates/sim-netshape` — no-root network shaping: `native/netshape.c` (the injected socket/DNS
@@ -106,8 +112,9 @@ scripts/automobile-harness-android.sh emulator-5554
 - `crates/emu-hvf` — `Vm` (GIC, RAM mapping, SPIs), `Vcpu` (run/regs/vtimer), `GuestRam`.
 - `crates/emu-vmm` — `lib.rs` (`run`), `layout.rs`, `board.rs` (DT), `vcpu.rs` (exits, PSCI,
   wakers), `bus.rs`, `devices/` (PL011, PL031, goldfish), `virtio/` (mmio transport, queue, blk,
-  rng, vsock, gpu, input, console), `pipe/` (adb bridge, qemud services), `modem/`, `disk.rs`,
-  `boot.rs`.
+  rng, vsock, gpu, input incl. XR's dual-mode mouse, console, snd), `pipe/` (adb bridge, qemud
+  services incl. `car.rs`, the vehicle HAL, and `xr.rs`, Android XR's `xr_service`), `modem/`,
+  `disk.rs`, `boot.rs`.
 - `crates/emu-avd` — `Env` (SDK/AVD paths), `Avd` (config, `profile()`), `NewAvd`
   (`for_profile`), running-instance advertisements (`Running`), `BootConfig`, ini parsing.
 - `crates/emu-sdk` — Java-free provisioning: repository manifests, verified downloads, the

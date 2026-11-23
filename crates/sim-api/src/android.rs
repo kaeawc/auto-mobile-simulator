@@ -9,8 +9,12 @@ use sim_android::Android;
 use sim_core::device::DeviceInfo;
 use sim_core::form_factor::Posture;
 use sim_core::hid::Direction;
+use sim_core::xr::XrCommand;
 
-use crate::params::{button, need_str, opt_u64, screenshot_result, str_param, swipe_samples, tap_samples, touch_sample};
+use crate::params::{
+    button, need_str, opt_u64, reading_json, screenshot_result, str_param, swipe_samples, tap_samples, touch_sample, vehicle_area,
+    vehicle_value,
+};
 
 /// The SDK and AVD home, read from the environment on first use.
 #[derive(Default)]
@@ -36,6 +40,9 @@ impl Session {
 pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Value, String> {
     let android = s.backend().clone();
     let d = android.device(udid)?;
+    if crate::params::on_carplay(p)? {
+        return Err("display=carplay is an iPhone's CarPlay screen; Android devices have one display".into());
+    }
     let null = |r: Result<(), String>| r.map(|()| Value::Null);
     match method {
         "delete" => null(android.delete(&d)),
@@ -88,7 +95,10 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             };
             d.console(&commands).map(|lines| json!(lines))
         }
-        "rotate" => null(d.rotate()),
+        "rotate" => match crate::params::opt_orientation(p)? {
+            None => null(d.rotate()),
+            Some(_) => Err("Android's rotate turns 90° clockwise per call; `orientation` is iOS-only".into()),
+        },
         "fold" => {
             let angle = match (p.get("angle").and_then(Value::as_f64), str_param(p, "posture")) {
                 (Some(a), _) => a as f32,
@@ -102,6 +112,19 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
         "rotary" => {
             let ticks = p.get("ticks").and_then(Value::as_i64).ok_or("missing number parameter `ticks`")?;
             null(d.rotary(i32::try_from(ticks).map_err(|e| e.to_string())?))
+        }
+        "xr" => {
+            let command: XrCommand = serde_json::from_value(p.clone()).map_err(|e| format!("xr: {e} ({})", sim_core::xr::USAGE))?;
+            d.xr(&command).map(|lines| json!(lines))
+        }
+        "vehicle" => {
+            let area = vehicle_area(p)?;
+            match (str_param(p, "property"), vehicle_value(p)?) {
+                (None, None) => d.vehicle_list().map(|all| all.iter().map(reading_json).collect()),
+                (None, Some(_)) => Err("give the `property` to set".into()),
+                (Some(prop), None) => d.vehicle_get(prop, area).map(|r| reading_json(&r)),
+                (Some(prop), Some(value)) => null(d.vehicle_set(prop, area, &value)),
+            }
         }
         other => Err(format!("`{other}` isn't implemented for Android devices")),
     }
