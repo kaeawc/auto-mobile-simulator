@@ -105,7 +105,8 @@ scripts/automobile-harness-android.sh emulator-5554
 - `crates/sim-debug` — host-side introspection (no FFI): device process tree (`ps`), sockets
   (`lsof`), traffic (`nettop`), containers and files (confined to the device data dir), crash reports.
 - `crates/sim-netshape` — no-root network shaping: `native/netshape.c` (the injected socket/DNS
-  shaper, built on demand with Xcode's simulator clang and cached by source hash),
+  shaper, built on demand with Xcode's simulator clang and cached by source hash; its portable
+  core is tested on the host by `native/netshape_test.c` through `tests/native.rs`),
   `native/scproxy.m` (sets the device proxy in its `configd_sim`), `proxy.rs` (shaping HTTP/SOCKS
   proxy), `Profile`/`Rule` (the live profile file format).
 - `crates/sim-audio` — driverless per-device audio: `native/simaudio.swift` (process-tap helper,
