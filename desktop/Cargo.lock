@@ -3249,7 +3249,6 @@ name = "sim-api"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
- "png 0.18.1",
  "serde",
  "serde_json",
  "sim-audio",
@@ -3271,6 +3270,7 @@ dependencies = [
 name = "sim-core"
 version = "0.1.0"
 dependencies = [
+ "png 0.18.1",
  "serde",
 ]
 

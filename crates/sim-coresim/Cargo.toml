@@ -12,6 +12,9 @@ doctest = false
 
 [dependencies]
 sim-core.workspace = true
+
+# The simulator service is macOS-only; elsewhere the crate compiles to nothing.
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
 objc2-foundation.workspace = true
 thiserror.workspace = true

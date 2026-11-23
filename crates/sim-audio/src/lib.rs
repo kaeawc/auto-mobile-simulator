@@ -157,6 +157,8 @@ mod tests {
         assert_ne!(fnv1a(HELPER_SOURCE), fnv1a(""));
     }
 
+    // Settings are read and edited with the host's `plutil`, which only macOS ships.
+    #[cfg(target_os = "macos")]
     #[test]
     fn route_and_volume_edit_a_settings_file() {
         let root = std::env::temp_dir().join(format!("sim-audio-test-{}", std::process::id()));

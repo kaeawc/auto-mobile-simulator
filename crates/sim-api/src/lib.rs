@@ -9,9 +9,16 @@
 //! ```
 //!
 //! `{"method": "help"}` lists every method with its parameters. Each connection gets its own
-//! thread and its own service connection.
+//! thread and its own service connection. Device methods need the iOS backend, which exists on
+//! macOS hosts; elsewhere they fail with a clear reason.
 
+#[cfg(target_os = "macos")]
+mod ios;
+#[cfg(not(target_os = "macos"))]
+#[path = "ios_unavailable.rs"]
+mod ios;
 mod methods;
+mod params;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -20,7 +27,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-pub use methods::{METHODS, Session, call as call_method, encode_png};
+pub use methods::{METHODS, Session, call as call_method};
+pub use sim_core::frame::encode_png;
 
 /// The default socket path: `$SIM_RS_SOCKET`, else `$TMPDIR/sim-rs.sock`.
 pub fn default_socket() -> PathBuf {

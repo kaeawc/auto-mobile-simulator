@@ -21,8 +21,13 @@ app. The goal is to match its behavior exactly and then exceed it.
   keep it allocation-free on hot paths, never block in `close`/`read`/`write` for non-socket fds,
   and guard nested libSystem calls with `g_depth`. Rebuilding it changes its cached path, and
   `network_shape {inject:"boot"}` reboots devices still running an older build.
-- Pure logic (device selection, gestures, key maps, pixel conversion, geometry) goes in
-  `crates/sim-core` with unit tests; FFI crates stay thin.
+- Pure logic (device selection, gestures, key maps, pixel conversion, frames and PNG encoding,
+  geometry) goes in `crates/sim-core` with unit tests; FFI crates stay thin.
+- macOS-only crates gate themselves with a crate-level `#![cfg(target_os = "macos")]` and
+  target-specific dependencies, so the shared core, the API and the CLI build and test on Linux.
+  Callers gate their use the same way (`sim-api`'s `ios.rs` vs `ios_unavailable.rs`).
+- The CLI is a thin front over `sim-api`'s method table: a new device command is an API method
+  first, then a CLI subcommand that calls it.
 - Doctests are disabled; don't rely on them for coverage.
 - `desktop/` is a separate workspace (Rune is a large git dependency). Bump the Rune `rev` and every
   `[patch.crates-io]` entry together, and commit `desktop/Cargo.lock`.
@@ -37,7 +42,9 @@ cargo fmt --all
 cd desktop && cargo test     # Rune headless view tests
 ```
 
-After any change: `cargo c && cargo lint && cargo t`.
+After any change: `cargo c && cargo lint && cargo t`. On a non-macOS host, also lint the macOS
+code (no linking needed): `rustup target add aarch64-apple-darwin` once, then
+`cargo clippy --target aarch64-apple-darwin --all-targets -- -D warnings`.
 
 Against a real device (see "Harness" in README.md):
 
@@ -50,7 +57,8 @@ scripts/automobile-harness.sh <udid>     # auto-mobile drives a sim-rs device
 ## Map
 
 - `crates/sim-core` — device/runtime models and selection, privacy service names, geometry,
-  gesture planning, HID usages and buttons, BGRA→RGBA conversion. No FFI.
+  gesture planning, HID usages and buttons, BGRA→RGBA conversion, `Frame` and PNG encoding.
+  No FFI.
 - `crates/sim-coresim` — the service boundary: `Context` (service + device set), `Device`
   (lifecycle, apps, settings), `Display` (framebuffer surface, capture), `Hid` (touch, buttons,
   keyboard). `rt.rs` holds the Objective-C runtime helpers.
@@ -63,9 +71,11 @@ scripts/automobile-harness.sh <udid>     # auto-mobile drives a sim-rs device
 - `crates/sim-audio` — driverless per-device audio: `native/simaudio.swift` (process-tap helper,
   built on demand), capture/mute sessions, route and volume via the device's `audiosettings.plist`.
 - `crates/sim-api` — the JSON-lines unix socket API: `METHODS` table and dispatcher
-  (`methods.rs`), server and client (`lib.rs`). The CLI, the socket and the desktop panel all go
-  through it; add a capability here once and every surface gets it.
-- `apps/sim-rs` — CLI; `tests/e2e.rs` runs against a booted device when `SIM_RS_E2E_UDID` is set.
+  (`methods.rs`), parameter parsing (`params.rs`), the iOS backend's methods (`ios.rs`; on
+  non-macOS hosts `ios_unavailable.rs`), server and client (`lib.rs`). The CLI, the socket and the
+  desktop panel all go through it; add a capability here once and every surface gets it.
+- `apps/sim-rs` — CLI: argument parsing and output formatting over `sim-api`'s methods;
+  `tests/e2e.rs` runs against a booted device when `SIM_RS_E2E_UDID` is set.
 - `desktop/` — Rune app: `device.rs` (live device, capture thread), `surface.rs` (zero-copy
   IOSurface bridge), `debug.rs` (debug panel: tabs, API worker thread, views), `icons.rs` (SVG
   icons), `keys.rs` (host keys → HID), `view.rs`, `main.rs` (state, actions, poll, tests).

@@ -32,7 +32,25 @@ jobs:
       - run: cargo fmt --all --check
       - run: rustfmt --check --edition 2024 desktop/src/main.rs
 
-  # The service frameworks only exist on macOS, so lint and test run there.
+  # The shared core, the API and the CLI build everywhere; the macOS-only backends compile to
+  # nothing here, so this job checks everything that isn't FFI without a macOS runner.
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: linux
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --locked --all-targets --profile ci -- -D warnings
+      - run: cargo test --locked --profile ci
+
+  # The service frameworks only exist on macOS, so the backends are linted and tested there.
   lint-test:
     runs-on: macos-26
     timeout-minutes: 30

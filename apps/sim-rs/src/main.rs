@@ -1,15 +1,14 @@
 //! sim-rs: drive simulated iOS devices without the stock simulator app.
+//!
+//! Every device command is a call into the API's method table (`sim-api`), the same code the
+//! socket server and the desktop window run; this file only parses arguments and prints results.
 
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
-use sim_core::device::{DeviceState, privacy_service};
-use sim_core::geometry::{Point, Size};
-use sim_core::gesture::{self, Sample};
-use sim_core::hid::{Button, KEY_LEFT_SHIFT, keystroke};
-use sim_coresim::{Appearance, Context, Device, Direction, Frame, Hid};
+use serde_json::{Value, json};
 
 #[derive(Parser)]
 #[command(name = "sim-rs", version, about = "Create, boot and drive simulated iOS devices")]
@@ -156,195 +155,140 @@ fn main() -> Result<()> {
         }
         Cmd::Call { method, params, socket } => {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
-            let params: serde_json::Value = serde_json::from_str(params).context("params must be JSON")?;
+            let params: Value = serde_json::from_str(params).context("params must be JSON")?;
             let result = sim_api::call(&path, method, params).map_err(anyhow::Error::msg)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             return Ok(());
         }
         _ => {}
     }
-    let ctx = Context::new()?;
-    let device = |q: &str| ctx.device(q).map_err(anyhow::Error::from);
+    let mut session = sim_api::Session::default();
+    let mut call = |method: &str, params: Value| sim_api::call_method(&mut session, method, &params).map_err(anyhow::Error::msg);
     match cli.command {
         Cmd::List { json, booted } => {
-            let infos: Vec<_> = ctx.devices()?.iter().map(Device::info).filter(|d| !booted || d.state == DeviceState::Booted).collect();
+            let devices = call("devices", json!({"booted": booted}))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&infos)?);
+                println!("{}", serde_json::to_string_pretty(&devices)?);
             } else {
-                let mut runtime = String::new();
-                for d in infos {
-                    if d.runtime_id != runtime {
-                        runtime.clone_from(&d.runtime_id);
-                        println!("-- {runtime} --");
-                    }
-                    let note = if d.available { "" } else { " (unavailable)" };
-                    println!("    {} ({}) ({}){note}", d.name, d.udid, d.state.as_str());
-                }
+                print!("{}", list_text(&devices));
             }
         }
         Cmd::Runtimes { json } => {
-            let runtimes = ctx.runtimes()?;
+            let runtimes = call("runtimes", json!({}))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&runtimes)?);
             } else {
-                for r in runtimes {
-                    println!(
-                        "{} ({} - {}) - {}{}",
-                        r.name,
-                        r.version,
-                        r.build,
-                        r.identifier,
-                        if r.available { "" } else { " (unavailable)" }
-                    );
+                for r in items(&runtimes) {
+                    let note = if r["available"] == true { "" } else { " (unavailable)" };
+                    println!("{} ({} - {}) - {}{note}", text(&r["name"]), text(&r["version"]), text(&r["build"]), text(&r["identifier"]));
                 }
             }
         }
         Cmd::DeviceTypes { json } => {
-            let types = ctx.device_types()?;
+            let types = call("device_types", json!({}))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&types)?);
             } else {
-                for t in types {
-                    println!("{} ({}) {}x{} @{}x", t.name, t.identifier, t.screen_width, t.screen_height, t.screen_scale);
+                for t in items(&types) {
+                    println!(
+                        "{} ({}) {}x{} @{}x",
+                        text(&t["name"]),
+                        text(&t["identifier"]),
+                        number(&t["screen_width"]),
+                        number(&t["screen_height"]),
+                        number(&t["screen_scale"])
+                    );
                 }
             }
         }
-        Cmd::Create { name, device_type, runtime } => println!("{}", ctx.create(&name, &device_type, &runtime)?.info().udid),
-        Cmd::Delete { device: q } => ctx.delete(&device(&q)?)?,
-        Cmd::Boot { device: q, timeout, env, shaped } => {
-            let mut env: Vec<(String, String)> =
-                env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
-            let d = device(&q)?;
-            if shaped {
-                let dylib = sim_netshape::dylib().map_err(anyhow::Error::msg)?;
-                env.extend(sim_netshape::launch_env(&d.info().udid, &dylib));
-            }
-            if d.state() != DeviceState::Booted && !env.is_empty() {
-                d.boot_with_env(&env)?;
-            }
-            boot(&d, Duration::from_secs(timeout))?
+        Cmd::Create { name, device_type, runtime } => {
+            let d = call("create", json!({"name": name, "device_type": device_type, "runtime": runtime}))?;
+            println!("{}", text(&d["udid"]));
         }
-        Cmd::Shutdown { device: q } => device(&q)?.shutdown()?,
-        Cmd::Erase { device: q } => device(&q)?.erase()?,
-        Cmd::Screenshot { device: q, path } => write_png(&device(&q)?.display()?.capture()?, &path)?,
-        Cmd::Tap { device: q, x, y, hold } => {
-            let d = device(&q)?;
-            play(&d.hid()?, screen(&d)?, &gesture::tap(Point::new(x, y), Duration::from_millis(hold)))?;
+        Cmd::Delete { device } => drop(call("delete", json!({"device": device}))?),
+        Cmd::Boot { device, timeout, env, shaped } => {
+            let env: serde_json::Map<String, Value> =
+                env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), Value::from(v))).collect();
+            call("boot", json!({"device": device, "timeout_s": timeout, "env": env, "shaped": shaped}))?;
         }
-        Cmd::Swipe { device: q, x1, y1, x2, y2, duration, settle } => {
-            let d = device(&q)?;
-            let samples =
-                gesture::swipe(Point::new(x1, y1), Point::new(x2, y2), Duration::from_millis(duration), Duration::from_millis(17), settle);
-            play(&d.hid()?, screen(&d)?, &samples)?;
-        }
-        Cmd::Button { device: q, button, hold } => {
-            let button = Button::parse(&button).with_context(|| format!("unknown button `{button}`"))?;
-            let hid = device(&q)?.hid()?;
-            hid.button(button, Direction::Down)?;
-            sleep(Duration::from_millis(hold));
-            hid.button(button, Direction::Up)?;
+        Cmd::Shutdown { device } => drop(call("shutdown", json!({"device": device}))?),
+        Cmd::Erase { device } => drop(call("erase", json!({"device": device}))?),
+        Cmd::Screenshot { device, path } => drop(call("screenshot", json!({"device": device, "path": path}))?),
+        Cmd::Tap { device, x, y, hold } => {
+            call("tap", json!({"device": device, "x": x, "y": y, "hold_ms": hold}))?;
             flush();
         }
-        Cmd::Type { device: q, text } => type_text(&device(&q)?.hid()?, &text)?,
-        Cmd::Key { device: q, usage } => {
-            let hid = device(&q)?.hid()?;
-            press(&hid, usage)?;
+        Cmd::Swipe { device, x1, y1, x2, y2, duration, settle } => {
+            call("swipe", json!({"device": device, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": duration, "settle": settle}))?;
             flush();
         }
-        Cmd::OpenUrl { device: q, url } => device(&q)?.open_url(&url)?,
-        Cmd::Install { device: q, path } => device(&q)?.install(&path)?,
-        Cmd::Uninstall { device: q, bundle_id } => device(&q)?.uninstall(&bundle_id)?,
-        Cmd::Launch { device: q, bundle_id } => println!("{}", device(&q)?.launch(&bundle_id)?),
-        Cmd::Terminate { device: q, bundle_id } => device(&q)?.terminate(&bundle_id)?,
-        Cmd::Apps { device: q } => device(&q)?.installed_apps()?.iter().for_each(|id| println!("{id}")),
-        Cmd::Appearance { device: q, mode } => {
-            let appearance = match mode.as_str() {
-                "light" => Appearance::Light,
-                "dark" => Appearance::Dark,
-                other => bail!("unknown appearance `{other}` (light or dark)"),
-            };
-            device(&q)?.set_appearance(appearance)?;
+        Cmd::Button { device, button, hold } => {
+            call("button", json!({"device": device, "button": button, "hold_ms": hold}))?;
+            flush();
         }
-        Cmd::Location { device: q, latitude, longitude } => device(&q)?.set_location(latitude, longitude)?,
-        Cmd::Privacy { device: q, action, service, bundle_id } => {
-            let granted = match action.as_str() {
-                "grant" => true,
-                "revoke" => false,
-                other => bail!("unknown action `{other}` (grant or revoke)"),
-            };
-            let service = privacy_service(&service).with_context(|| format!("unknown privacy service `{service}`"))?;
-            device(&q)?.set_privacy(&service, &bundle_id, granted)?;
+        Cmd::Type { device, text } => {
+            call("type", json!({"device": device, "text": text}))?;
+            flush();
         }
-        Cmd::MemoryWarning { device: q } => device(&q)?.memory_warning()?,
+        Cmd::Key { device, usage } => {
+            call("key", json!({"device": device, "usage": usage}))?;
+            flush();
+        }
+        Cmd::OpenUrl { device, url } => drop(call("open_url", json!({"device": device, "url": url}))?),
+        Cmd::Install { device, path } => drop(call("install", json!({"device": device, "path": path}))?),
+        Cmd::Uninstall { device, bundle_id } => drop(call("uninstall", json!({"device": device, "bundle_id": bundle_id}))?),
+        Cmd::Launch { device, bundle_id } => println!("{}", call("launch", json!({"device": device, "bundle_id": bundle_id}))?["pid"]),
+        Cmd::Terminate { device, bundle_id } => drop(call("terminate", json!({"device": device, "bundle_id": bundle_id}))?),
+        Cmd::Apps { device } => items(&call("apps", json!({"device": device}))?).iter().for_each(|id| println!("{}", text(id))),
+        Cmd::Appearance { device, mode } => drop(call("appearance", json!({"device": device, "mode": mode}))?),
+        Cmd::Location { device, latitude, longitude } => {
+            drop(call("location", json!({"device": device, "latitude": latitude, "longitude": longitude}))?)
+        }
+        Cmd::Privacy { device, action, service, bundle_id } => {
+            drop(call("privacy", json!({"device": device, "action": action, "service": service, "bundle_id": bundle_id}))?)
+        }
+        Cmd::MemoryWarning { device } => drop(call("memory_warning", json!({"device": device}))?),
         Cmd::Serve { .. } | Cmd::Call { .. } => unreachable!("handled above"),
-        Cmd::Exec { device: q, env, program, args } => {
-            let env: Vec<(String, String)> =
-                env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
-            let out = device(&q)?.exec(&program, &args, &env)?;
-            print!("{}", out.stdout);
-            eprint!("{}", out.stderr);
+        Cmd::Exec { device, env, program, args } => {
+            let env: serde_json::Map<String, Value> =
+                env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), Value::from(v))).collect();
+            let out = call("exec", json!({"device": device, "program": program, "args": args, "env": env}))?;
+            print!("{}", text(&out["stdout"]));
+            eprint!("{}", text(&out["stderr"]));
         }
     }
     Ok(())
 }
 
-/// Boots (if needed) and waits for the display to produce a frame.
-fn boot(device: &Device, timeout: Duration) -> Result<()> {
-    if device.state() != DeviceState::Booted {
-        device.boot()?;
-    }
-    let deadline = Instant::now() + timeout;
-    loop {
-        let finished = device.state() == DeviceState::Booted && device.boot_finished().unwrap_or(true);
-        if finished && device.display().is_ok_and(|d| d.surface().is_some()) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("device did not finish booting within {}s", timeout.as_secs());
-        }
-        sleep(Duration::from_millis(100));
-    }
+/// The elements of a JSON array (none for anything else).
+fn items(v: &Value) -> &[Value] {
+    v.as_array().map_or(&[], Vec::as_slice)
 }
 
-/// The device's screen size in pixels.
-fn screen(device: &Device) -> Result<Size> {
-    let (w, h) = device.display()?.size()?;
-    Ok(Size::new(f64::from(w), f64::from(h)))
+/// A JSON string's contents; other values print as JSON.
+fn text(v: &Value) -> String {
+    v.as_str().map_or_else(|| v.to_string(), str::to_owned)
 }
 
-/// Plays touch samples given in pixels.
-fn play(hid: &Hid, screen: Size, samples: &[Sample]) -> Result<()> {
-    for s in samples {
-        sleep(s.delay);
-        hid.touch(screen.normalize(s.point), s.phase)?;
-    }
-    flush();
-    Ok(())
+/// A JSON number as Rust prints an `f64` (`1206`, not `1206.0`).
+fn number(v: &Value) -> f64 {
+    v.as_f64().unwrap_or_default()
 }
 
-fn press(hid: &Hid, usage: u32) -> Result<()> {
-    hid.key(usage, Direction::Down)?;
-    sleep(Duration::from_millis(15));
-    hid.key(usage, Direction::Up)?;
-    sleep(Duration::from_millis(15));
-    Ok(())
-}
-
-fn type_text(hid: &Hid, text: &str) -> Result<()> {
-    for c in text.chars() {
-        let stroke = keystroke(c).with_context(|| format!("no key for {c:?} on the US layout"))?;
-        if stroke.shift {
-            hid.key(KEY_LEFT_SHIFT, Direction::Down)?;
-            sleep(Duration::from_millis(10));
+/// `list` without `--json`: devices grouped under their runtime, as `simctl list` prints them.
+fn list_text(devices: &Value) -> String {
+    let mut out = String::new();
+    let mut runtime = "";
+    for d in items(devices) {
+        let rt = d["runtime_id"].as_str().unwrap_or_default();
+        if rt != runtime {
+            runtime = rt;
+            out.push_str(&format!("-- {runtime} --\n"));
         }
-        press(hid, stroke.usage)?;
-        if stroke.shift {
-            hid.key(KEY_LEFT_SHIFT, Direction::Up)?;
-            sleep(Duration::from_millis(10));
-        }
+        let note = if d["available"] == true { "" } else { " (unavailable)" };
+        out.push_str(&format!("    {} ({}) ({}){note}\n", text(&d["name"]), text(&d["udid"]), text(&d["state"])));
     }
-    flush();
-    Ok(())
+    out
 }
 
 /// HID messages are delivered asynchronously; give the last one time to leave before exiting.
@@ -352,7 +296,38 @@ fn flush() {
     sleep(Duration::from_millis(100));
 }
 
-fn write_png(frame: &Frame, path: &str) -> Result<()> {
-    let png = sim_api::encode_png(frame).map_err(anyhow::Error::msg)?;
-    std::fs::write(path, png).with_context(|| format!("cannot write {path}"))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_groups_devices_by_runtime() {
+        let devices = json!([
+            {"udid": "A", "name": "iPhone 17", "state": "Booted", "runtime_id": "rt.iOS-26-5", "available": true},
+            {"udid": "B", "name": "iPad", "state": "Shutting Down", "runtime_id": "rt.iOS-26-5", "available": false},
+            {"udid": "C", "name": "Watch", "state": "Shutdown", "runtime_id": "rt.watchOS-26-0", "available": true},
+        ]);
+        assert_eq!(
+            list_text(&devices),
+            "-- rt.iOS-26-5 --\n    iPhone 17 (A) (Booted)\n    iPad (B) (Shutting Down) (unavailable)\n-- rt.watchOS-26-0 --\n    Watch (C) (Shutdown)\n"
+        );
+    }
+
+    #[test]
+    fn numbers_print_like_f64() {
+        assert_eq!(format!("{}x{} @{}x", number(&json!(1206.0)), number(&json!(2622)), number(&json!(3.0))), "1206x2622 @3x");
+    }
+
+    #[test]
+    fn every_command_names_a_real_method() {
+        for m in ["devices", "runtimes", "device_types", "create", "delete", "boot", "shutdown", "erase", "screenshot", "tap", "swipe"] {
+            assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
+        }
+        for m in ["button", "type", "key", "open_url", "install", "uninstall", "launch", "terminate", "apps", "appearance"] {
+            assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
+        }
+        for m in ["location", "privacy", "memory_warning", "exec"] {
+            assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
+        }
+    }
 }

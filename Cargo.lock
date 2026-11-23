@@ -247,7 +247,6 @@ name = "sim-api"
 version = "0.1.0"
 dependencies = [
  "base64",
- "png",
  "serde",
  "serde_json",
  "sim-audio",
@@ -269,6 +268,7 @@ dependencies = [
 name = "sim-core"
 version = "0.1.0"
 dependencies = [
+ "png",
  "serde",
 ]
 
@@ -305,9 +305,6 @@ dependencies = [
  "png",
  "serde_json",
  "sim-api",
- "sim-core",
- "sim-coresim",
- "sim-netshape",
 ]
 
 [[package]]

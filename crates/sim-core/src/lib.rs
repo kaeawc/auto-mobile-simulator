@@ -2,6 +2,7 @@
 
 pub mod debug;
 pub mod device;
+pub mod frame;
 pub mod geometry;
 pub mod gesture;
 pub mod hid;
