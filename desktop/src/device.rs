@@ -74,6 +74,14 @@ mod unavailable {
             match self.never {}
         }
 
+        pub fn crown(&self, _: i32) {
+            match self.never {}
+        }
+
+        pub fn rotate(&mut self) {
+            match self.never {}
+        }
+
         pub fn data_path(&self) -> String {
             match self.never {}
         }

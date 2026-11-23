@@ -12,7 +12,7 @@
 //!
 //! `cargo run` opens the window (`SIM_RS_DEVICE=<udid|name|booted>` preselects a device);
 //! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
-//! watch, tv, empty).
+//! watch, tv, apple-watch, apple-tv, empty).
 
 mod android;
 mod controls;
@@ -50,11 +50,11 @@ pub enum Action {
     Button(Button),
     ToggleAppearance,
     Screenshot,
-    /// Android: rotate 90° clockwise.
+    /// Rotate 90° clockwise.
     Rotate,
     /// Android foldables: set the hinge.
     Fold(Posture),
-    /// Android watches: turn the rotary input.
+    /// Watches: turn the rotary input (Wear OS) or the Digital Crown (Apple Watch).
     Rotary(i32),
     Debug(debug::DebugAction),
 }
@@ -307,6 +307,8 @@ fn demo(s: &mut State) {
         info("D4", "iPad Pro 11-inch (M4)", "iPad-Pro-11-inch-M4", "iOS-26-5", DeviceState::Shutdown),
         info("C3", "iPhone 18 Pro", "iPhone-18-Pro", "iOS-27-0", DeviceState::Shutdown),
         info("E5", "Apple Watch Series 10 (46mm)", "Apple-Watch-Series-10-46mm", "watchOS-26-0", DeviceState::Shutdown),
+        info("F6", "Apple TV 4K (3rd generation)", "Apple-TV-4K-3rd-generation-4K", "tvOS-26-0", DeviceState::Shutdown),
+        info("G7", "Apple Vision Pro", "Apple-Vision-Pro", "xrOS-26-0", DeviceState::Shutdown),
         android_info("pixel_9", FormFactor::Phone, "android-36;google_apis", DeviceState::Booted),
         android_info("pixel_fold", FormFactor::Foldable, "android-36;google_apis", DeviceState::Shutdown),
         android_info("pixel_tablet", FormFactor::Tablet, "android-36;google_apis", DeviceState::Shutdown),
@@ -363,8 +365,8 @@ fn demo(s: &mut State) {
     ];
 }
 
-/// The demo data with one Android device selected and running.
-fn select_android(s: &mut State, udid: &str, (w, h): (u32, u32), shape: Shape) {
+/// The demo data with one device selected and running.
+fn select_running(s: &mut State, udid: &str, (w, h): (u32, u32), shape: Shape) {
     demo(s);
     for d in &mut s.devices {
         d.state = if d.udid == udid { DeviceState::Booted } else { DeviceState::Shutdown };
@@ -375,19 +377,27 @@ fn select_android(s: &mut State, udid: &str, (w, h): (u32, u32), shape: Shape) {
 }
 
 fn android_scene(s: &mut State) {
-    select_android(s, "pixel_9", (360, 800), Shape::Rounded);
+    select_running(s, "pixel_9", (360, 800), Shape::Rounded);
 }
 
 fn foldable_scene(s: &mut State) {
-    select_android(s, "pixel_fold", (552, 460), Shape::Rectangle);
+    select_running(s, "pixel_fold", (552, 460), Shape::Rectangle);
 }
 
 fn watch_scene(s: &mut State) {
-    select_android(s, "wear_round", (454, 454), Shape::Round);
+    select_running(s, "wear_round", (454, 454), Shape::Round);
 }
 
 fn tv_scene(s: &mut State) {
-    select_android(s, "google_tv", (960, 540), Shape::Rectangle);
+    select_running(s, "google_tv", (960, 540), Shape::Rectangle);
+}
+
+fn apple_watch_scene(s: &mut State) {
+    select_running(s, "E5", (416, 496), Shape::Rounded);
+}
+
+fn apple_tv_scene(s: &mut State) {
+    select_running(s, "F6", (960, 540), Shape::Rectangle);
 }
 
 fn empty(s: &mut State) {
@@ -519,9 +529,15 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             Action::Button(b) => press_button(s, b, t, tx),
             Action::ToggleAppearance => s.live.iter_mut().for_each(Live::toggle_appearance),
             Action::Screenshot => s.status = Some(screenshot(s)),
-            Action::Rotate => android_action(s, sim_android::Device::rotate),
+            Action::Rotate => match s.live.as_mut() {
+                Some(live) => live.rotate(),
+                None => android_action(s, sim_android::Device::rotate),
+            },
             Action::Fold(posture) => android_action(s, |d| d.fold(posture.angle())),
-            Action::Rotary(ticks) => s.screen.iter().for_each(|sc| sc.wheel(ticks)),
+            Action::Rotary(ticks) => {
+                s.live.iter().for_each(|l| l.crown(ticks));
+                s.screen.iter().for_each(|sc| sc.wheel(ticks));
+            }
             Action::Debug(a) => {
                 if let Some(udid) = s.live.as_ref().map(|l| l.udid.clone())
                     && let Some(msg) = s.debug.perform(&udid, a)
@@ -654,6 +670,8 @@ fn main() {
             ("foldable", foldable_scene),
             ("watch", watch_scene),
             ("tv", tv_scene),
+            ("apple-watch", apple_watch_scene),
+            ("apple-tv", apple_tv_scene),
             ("empty", empty),
         ],
         setup: Some(setup),
@@ -713,10 +731,12 @@ mod tests {
         let rt = runtime(demo);
         assert_eq!(text_of(&rt, "platform-ios"), "iOS");
         assert_eq!(text_of(&rt, "platform-android"), "Android");
-        assert_eq!(text_of(&rt, "device-5-platform"), "Android");
-        assert_eq!(text_of(&rt, "device-8-platform"), "Wear OS");
-        assert_eq!(text_of(&rt, "device-9-platform"), "Android TV");
-        assert_eq!(text_of(&rt, "device-10-platform"), "Android Automotive");
+        assert_eq!(text_of(&rt, "device-5-platform"), "tvOS");
+        assert_eq!(text_of(&rt, "device-6-platform"), "visionOS");
+        assert_eq!(text_of(&rt, "device-7-platform"), "Android");
+        assert_eq!(text_of(&rt, "device-10-platform"), "Wear OS");
+        assert_eq!(text_of(&rt, "device-11-platform"), "Android TV");
+        assert_eq!(text_of(&rt, "device-12-platform"), "Android Automotive");
     }
 
     #[test]
@@ -747,6 +767,17 @@ mod tests {
         assert!(rt.find("rotate-button").is_none());
         press(&mut rt, "dpad-select");
         assert_eq!(rt.state.actions, vec![Action::Button(Button::DpadCenter)]);
+        // Apple's: the crown and side button on a watch, the Siri Remote on a TV.
+        let mut rt = runtime(apple_watch_scene);
+        assert_eq!(text_of(&rt, "device-title"), "Apple Watch Series 10 (46mm) · watchOS · Watch · Booted");
+        assert!(rt.find("lock-button").is_none() && rt.find("rotate-button").is_none());
+        press(&mut rt, "crown-up");
+        press(&mut rt, "side-button");
+        assert_eq!(rt.state.actions, vec![Action::Rotary(-1), Action::Button(Button::Side)]);
+        let mut rt = runtime(apple_tv_scene);
+        press(&mut rt, "back-button");
+        press(&mut rt, "dpad-left");
+        assert_eq!(rt.state.actions, vec![Action::Button(Button::Menu), Action::Button(Button::DpadLeft)]);
     }
 
     #[test]
