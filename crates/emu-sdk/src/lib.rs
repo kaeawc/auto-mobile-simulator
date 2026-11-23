@@ -248,11 +248,9 @@ impl Sdk {
         let guess = self.probe_manifest(&sys_img_url(tag)).and_then(|m| m.resolve_system_image(api, tag, abi, host));
         match guess {
             Ok(d) => Ok(d),
-            Err(first) => self
-                .all_system_image_manifests()?
-                .iter()
-                .find_map(|m| m.resolve_system_image(api, tag, abi, host).ok())
-                .ok_or(first),
+            Err(first) => {
+                self.all_system_image_manifests()?.iter().find_map(|m| m.resolve_system_image(api, tag, abi, host).ok()).ok_or(first)
+            }
         }
     }
 
