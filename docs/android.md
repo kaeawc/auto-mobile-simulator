@@ -22,12 +22,12 @@ to use fewer resources.
 | Storage | virtio-blk with indirect descriptors, event-idx, and discard/write-zeroes (hole punching). System and vendor are copy-on-write in memory; userdata, cache and metadata persist per AVD. Userdata is created by a native ext4 formatter (no `mkfs.ext4`) |
 | Boot | Full Android boot to `sys.boot_completed` in about 11–20 s on a warm boot (stock, cold: 51 s); first boot formats and encrypts `/data` |
 | adb | virtio-vsock with a host bridge on `console port + 1`, announced to the adb server. `adb shell`/`root`/`push` work, and the device shows up about 8 s after launch on a warm boot |
-| Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot`, plus emu-rs's `touch`, `clipboard`, `frames`, `sms list` |
+| Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot`, plus emu-rs's `touch`, `clipboard`, `frames`, `sms list`, `car` |
 | Discovery | `-list-avds`, `pid_<pid>.ini` running-instance file, `emulator-<port>` serial on stdout |
 | Graphics | Home screen and apps render. virtio-gpu with gfxstream contexts on the host GPU: GLES through ANGLE on Metal, Vulkan on MoltenVK (lavapipe fallback), Vulkan composition. Host-visible memory via blob mapping; goldfish address space (PCIe, shared-slot allocator) and goldfish pipe (refcounted color buffers) for the ranchu gralloc; guest `screencap` and host screenshots both work |
 | Input & sensors | virtio-input touchscreen, keyboard and rotary; `qemud:sensors` with live values; GNSS over `qemud:gps`; goldfish battery; fingerprint; clipboard |
 | Telephony | AT modem on a virtio-console `modem` port: the radio HAL registers on LTE with a loaded SIM; incoming SMS and calls from the console |
-| Images | Phone API 35, 36, 37 and Wear boot (5–8 s warm; Wear gets stock's +512 MB below 1 GB). Automotive needs the vehicle HAL (`qemud:car`) and its audio HAL; Bluetooth needs a controller (in progress) |
+| Images | Phone API 35, 36, 37 and Wear boot (5–8 s warm; Wear gets stock's +512 MB below 1 GB). Automotive: the vehicle HAL channel (`qemud:car`) and a silent virtio-snd card are implemented but not yet booted ([Automotive](#automotive)); Bluetooth needs a controller (in progress) |
 | AutoMobile | API 37: 38 of 44 harness tools pass; open: network shaping, gRPC audio, VM snapshots |
 | Desktop app | sim-rs's window (`desktop/`), shared with iOS devices: AVD list, start/stop, live guest console, live screen with touch and form-factor controls (Back/Home/Recents/Power, rotate, hinge, rotary, D-pad) over `<avd>/emu-rs/display.sock` |
 
@@ -56,7 +56,7 @@ ignored for now.
 | Path | What |
 | --- | --- |
 | `crates/emu-hvf` | Safe wrappers over Hypervisor.framework: VM, vCPUs, GIC, guest RAM with zero-copy file I/O. One of the few crates allowed `unsafe` (see AGENTS.md). |
-| `crates/emu-vmm` | The machine: memory map (`layout.rs`), device tree (`board.rs`), vCPU loop and PSCI (`vcpu.rs`), MMIO bus, PL011/PL031, virtio-mmio transport, blk, rng, vsock, host pipe services (adb bridge, `qemud:boot-properties`) |
+| `crates/emu-vmm` | The machine: memory map (`layout.rs`), device tree (`board.rs`), vCPU loop and PSCI (`vcpu.rs`), MMIO bus, PL011/PL031, virtio-mmio transport, blk, rng, vsock, snd, host pipe services (adb bridge, `qemud:boot-properties`, `qemud:car`, ...) |
 | `crates/emu-avd` | AVD discovery and config (`~/.android/avd`, `config.ini`, system image), form factor (`Avd::profile`), running-instance advertisements, bootconfig encoding |
 | `crates/emu-sdk` | Java-free SDK provisioning: repository manifests, verified downloads, unpacking, the on-demand renderer (`emu -provision`, `-provision-renderer`) |
 | `crates/emu-ext4` | Native ext4 formatter for first-boot userdata: writes only metadata, so a fresh 10 GiB image takes under 1 MB on disk |
@@ -132,6 +132,60 @@ which emu links to the chosen `lib64`, then the build machine's `emulator/lib64`
 AVD defaults favour cheap, fast boots: 720×1280 screen, 2 GB RAM, 4 vCPU, 4 GB data.
 Benchmarks of the stock emulator found that smaller screens boot markedly faster and that RAM
 above 2 GB slows cold boots down.
+
+## Automotive
+
+What the AAOS sources show (`device/generic/car/emulator`, `hardware/interfaces/automotive/vehicle`,
+the emulator's `qemu-setup.cpp`), what emu-rs does with it, and what still needs a real boot.
+
+**Vehicle HAL.** The emulator VHAL (`vhal_aidl/VehicleEmulator`, API 33–36) opens the qemud
+`car` pipe only when `ro.boot.qemu` is set; if the open fails it logs and carries on, and its
+property values come from the image's own JSON config. So the pipe doesn't gate boot: it is how
+the host drives the car. Stock registers the service only for car images (`build.prop`'s
+`ro.product.name`, `ro.product.system.name` or `ro.build.flavor` contains `car`); emu-rs does
+the same (`Avd::is_car`, falling back to an `android-automotive*` tag when an image has no
+`build.prop`) and refuses the pipe on every other image, as before.
+
+The channel is `libqemud` framing (4 hex digits of length; the guest sends 64 KiB and larger
+payloads with a 4-byte big-endian `len | 0x8000_0000` header) around proto2
+`vhal_proto.EmulatorMessage`. The guest reads into a 2048-byte buffer and ends its read loop on
+a payload that fills it, so host frames carry at most 2047 bytes. It answers every command in
+order and sends `SET_PROPERTY_ASYNC` on its own from boot, so emu-rs drains the pipe whether or
+not anyone is waiting. `sim_core::vhal` is the protocol (a hand-written codec, no protobuf
+dependency, checked against hand-encoded stock commands), `emu_vmm::pipe::car` the pipe.
+
+Stock has no console command for the car (its controls live in the UI and in gRPC's
+`sendCarEvent`), so emu-rs adds one, as an extension:
+
+```
+car set <property> [<area>] <value>    # SET_PROPERTY_CMD, as stock's car page sends
+car get <property> [<area>]            # GET_PROPERTY_CMD
+car list                               # GET_PROPERTY_ALL_CMD
+car names                              # the property names the console knows
+```
+
+Properties are VHAL names (`GEAR_SELECTION`, `PERF_VEHICLE_SPEED`, `IGNITION_STATE`, ...; short
+`gear`, `speed`, `ignition`, `night`, `parking-brake`) or numeric ids; values are typed by the
+id's type bits (`drive`/`P`, `on`/`acc`, `12.5`, `true`, `2,0` for vectors, hex for bytes).
+Value lines read `property=<name> id=<hex> area=<n> status=<s> value=<text>`. sim-rs reaches it
+as the `vehicle` API method and CLI command (`sim-rs vehicle <avd> gear drive`), for devices
+whose form factor is auto.
+
+**Audio.** From API 35 the car audio HAL (`audio.primary.caremu`) calls `mixer_open(0)` and
+then `mixer_get_name()` without a NULL check, so without ALSA card 0 it most likely crash-loops.
+emu-rs adds a silent virtio-snd card (one output and one input stream, S16/S24/S32/float,
+8–48 kHz, mono or stereo, no jacks) on virtio-mmio slot 18 for car images and for XR images
+(whose image enables `VirtioSndCard`). Playback buffers are consumed and capture buffers come
+back as silence at the stream's real rate, so the HAL's blocking writes and reads keep their
+timing. `EMU_VIRTIO_SND=1` (or `0`) forces the card on (or off) for any image; `-no-audio`
+doesn't remove it, since it never plays on the host anyway. Stock puts virtio-snd on PCI, phone
+images included; emu-rs leaves phones without it until it has been tried on one.
+
+**Needs a real boot.** Whether the car image reaches the launcher with these two pieces; that
+the VHAL connects and `car get gear` answers; that the kernel's `virtio_snd` driver binds on
+virtio-mmio and `caremu` opens card 0 (its mixer has no controls, which its init loop
+tolerates); that the SDK's car images ship `build.prop` in the image directory; and the rest of
+the car stack (EVS, cluster display, rotary controller), which emu-rs doesn't model.
 
 ## Performance notes
 

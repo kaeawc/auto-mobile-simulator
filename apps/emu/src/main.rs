@@ -201,6 +201,7 @@ fn boot(env: &emu_avd::Env, name: &str, opts: &args::Opts, signals: std::sync::m
             gps: inst.gps.clone(),
             battery: inst.battery.clone(),
             telephony: inst.telephony.clone(),
+            car: inst.car.clone(),
         },
     )?;
     let _advert = console::Advertisement::write(&avd.name, &avd.dir, inst.console_port);

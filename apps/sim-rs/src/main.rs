@@ -189,6 +189,22 @@ enum Cmd {
     RemoteSwipe { device: String, direction: String },
     /// Attach (`on`) or detach (`off`) an iPhone's CarPlay display (iOS 26 runtimes).
     Carplay { device: String, state: String },
+    /// Android Automotive's vehicle HAL: list every property, read one, or set one, e.g.
+    /// `vehicle car gear drive`, `vehicle car speed 12.5`, `vehicle car IGNITION_STATE`.
+    #[command(allow_negative_numbers = true)]
+    Vehicle {
+        device: String,
+        /// A VHAL property name (GEAR_SELECTION, or gear, speed, ignition, night, parking-brake)
+        /// or id (0x11600207); none lists every property.
+        property: Option<String>,
+        /// Set the property to this (typed by the property: drive, 12.5, true, 2,0).
+        value: Option<String>,
+        /// The area (seat, door, ...) id; default 0, the global area.
+        #[arg(long)]
+        area: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Send commands to an Android device's emulator console (`adb emu`'s protocol).
     Console {
         device: String,
@@ -375,6 +391,17 @@ fn main() -> Result<()> {
                 println!("CarPlay display {}x{}", number(&r["width"]), number(&r["height"]));
             }
         }
+        Cmd::Vehicle { device, property, value, area, json } => {
+            let r = call("vehicle", json!({"device": device, "property": property, "value": value, "area_id": area}))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else if !r.is_null() {
+                let readings = if r.is_array() { items(&r).to_vec() } else { vec![r] };
+                for v in readings {
+                    println!("{} area {}: {}", text(&v["property"]), v["area_id"], text(&v["value"]));
+                }
+            }
+        }
         Cmd::Console { device, command } => {
             items(&call("console", json!({"device": device, "command": command.join(" ")}))?).iter().for_each(|l| println!("{}", text(l)));
         }
@@ -498,6 +525,7 @@ mod tests {
             "watch_gesture",
             "remote_swipe",
             "carplay",
+            "vehicle",
         ] {
             assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
         }

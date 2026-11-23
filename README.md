@@ -110,6 +110,7 @@ sim-rs boot Pixel                             # starts emu; waits for sys.boot_c
 adb -s emulator-5554 shell                    # it is an ordinary emulator to every tool
 sim-rs fold Fold half-opened                  # the hinge (foldables only)
 sim-rs rotary Wear 3                          # the rotary input (watches only)
+sim-rs vehicle Car gear drive                 # a vehicle HAL property (Automotive only)
 sim-rs console Pixel sensor get acceleration  # anything the emulator console speaks
 sim-rs shutdown Pixel
 ```

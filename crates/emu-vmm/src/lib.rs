@@ -153,6 +153,11 @@ pub struct MachineConfig {
     pub battery: Arc<devices::goldfish_battery::Battery>,
     /// The modem on the `modem` vport (console `sms`, `gsm`).
     pub telephony: Arc<telephony::Telephony>,
+    /// The vehicle HAL channel (`qemud:car`, console `car`). Like stock, only for car images;
+    /// other guests asking for the pipe are refused.
+    pub car: Option<Arc<pipe::car::Car>>,
+    /// A silent virtio-snd card (ALSA card 0).
+    pub sound: bool,
     /// Touchscreen size; enables the virtio-input touchscreen, keyboard and rotary devices.
     pub input: Option<(u32, u32)>,
     /// Receives the input handles of this run (they change when the guest reboots).
@@ -294,6 +299,9 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     if cfg.rng {
         slots[slots::RNG as usize] = Some(Box::new(virtio::rng::Rng::new()));
     }
+    if cfg.sound {
+        slots[slots::SOUND as usize] = Some(Box::new(virtio::snd::Snd::new()));
+    }
     let mut dma_renderer = None;
     let mut gpu_renderer = None;
     if let Some(spec) = &cfg.gpu {
@@ -348,6 +356,9 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         registry
             .register("qemud:fingerprintlisten", Box::new(pipe::fingerprint::FingerprintService { fingerprint: cfg.fingerprint.clone() }));
         registry.register("qemud:gps", Box::new(pipe::gps::GpsService { gps: cfg.gps.clone() }));
+        if let Some(car) = &cfg.car {
+            registry.register("qemud:car", Box::new(pipe::car::CarService { car: car.clone() }));
+        }
         registry.register("multidisplay", Box::new(pipe::misc::Silent("multidisplay")));
         registry.register("qemud:camera", Box::new(pipe::fingerprint::CameraService));
         registry.register("GLProcessPipe", Box::new(devices::goldfish_pipe::GlProcess::default()));

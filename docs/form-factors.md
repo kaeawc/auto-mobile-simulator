@@ -77,7 +77,7 @@ Foldable postures follow the stock emulator's hinge ranges: closed below 30°, h
 | Android foldable | the same image, `--form-factor foldable` | as phone, plus `fold <closed\|half-opened\|opened\|angle>` |
 | Wear OS | `--system-image "system-images;android-34;android-wear;arm64-v8a"` | touch, `rotary <ticks>`, `button back\|home\|power` |
 | Android TV | `--system-image "system-images;android-34;google-tv;arm64-v8a"` | `button up\|down\|left\|right\|select\|back\|home` |
-| Automotive | `--system-image "system-images;android-34;android-automotive;arm64-v8a"` | touch, `button back\|home` |
+| Automotive | `--system-image "system-images;android-34;android-automotive;arm64-v8a"` | touch, `button back\|home`, `vehicle <property> [<value>]` (gear, speed, ignition, ...; unverified, see below) |
 
 The device type and runtime names above are examples: `sim-rs device-types`, `sim-rs runtimes` and
 `emu -list-images -tag <tag>` list what your host has. `--form-factor` on iOS only checks the device
@@ -96,7 +96,7 @@ What is modelled and labelled but not (or not verifiably) working end to end:
 | Kind | Gap |
 | --- | --- |
 | CarPlay | Attaching the CarPlay display to an iPhone simulator isn't implemented; `create --form-factor auto` on iOS says so. |
-| Android Automotive | emu-rs doesn't implement the vehicle HAL (`qemud:car`) or its audio HAL yet, so automotive images may not reach the launcher ([android.md](android.md)). |
+| Android Automotive | emu-rs serves the vehicle HAL channel (`qemud:car`, driven by `vehicle` / console `car`) and a silent virtio-snd card for the car audio HAL, but no car image has been booted on them yet; EVS, the cluster display and the rotary controller aren't modelled ([android.md](android.md#automotive)). |
 | Android TV | Not among the images emu-rs has booted so far. |
 | Apple Watch, Apple TV, Vision Pro input | The Digital Crown, Siri Remote and gaze/pinch aren't injected yet; sim-rs sends these devices the same touch and HID key messages as an iPhone, and whether each runtime honours them hasn't been checked. The API's `rotary` is Android-only. |
 | iOS rotation | `rotate` is Android-only. |

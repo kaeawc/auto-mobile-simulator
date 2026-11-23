@@ -38,6 +38,8 @@ pub struct Instance {
     pub gps: std::sync::Arc<emu_vmm::pipe::gps::Gps>,
     pub battery: std::sync::Arc<emu_vmm::devices::goldfish_battery::Battery>,
     pub telephony: std::sync::Arc<emu_vmm::telephony::Telephony>,
+    /// The vehicle HAL channel, for Automotive images only (as stock).
+    pub car: Option<std::sync::Arc<emu_vmm::pipe::car::Car>>,
     _lock: Option<File>,
 }
 
@@ -134,8 +136,21 @@ impl Instance {
             gps: Default::default(),
             battery: Default::default(),
             telephony: Default::default(),
+            car: avd.is_car().then(Default::default),
             _lock: lock,
         })
+    }
+
+    /// A silent virtio-snd card for images whose audio HAL needs ALSA card 0: Automotive
+    /// (`audio.primary.caremu` crashes without one) and XR (its image enables `VirtioSndCard`).
+    /// `EMU_VIRTIO_SND=1` or `0` forces it on or off for any image. `-no-audio` leaves it alone:
+    /// the card never plays on the host anyway.
+    fn sound(&self) -> bool {
+        match std::env::var("EMU_VIRTIO_SND").as_deref() {
+            Ok("1" | "on" | "yes") => true,
+            Ok("0" | "off" | "no") => false,
+            _ => self.car.is_some() || self.avd.image_tags().split(',').any(|t| t.split(['-', '_']).any(|w| w == "xr")),
+        }
     }
 
     fn bootconfig(&self, opts: &Opts) -> BootConfig {
@@ -245,6 +260,8 @@ impl Instance {
             gps: self.gps.clone(),
             battery: self.battery.clone(),
             telephony: self.telephony.clone(),
+            car: self.car.clone(),
+            sound: self.sound(),
             on_guest_event: {
                 let started = std::time::Instant::now();
                 Some(std::sync::Arc::new(move |event: &str| {

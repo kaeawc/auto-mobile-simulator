@@ -22,6 +22,27 @@ pub struct ConsoleInfo {
     pub gps: Arc<emu_vmm::pipe::gps::Gps>,
     pub battery: Arc<emu_vmm::devices::goldfish_battery::Battery>,
     pub telephony: Arc<emu_vmm::telephony::Telephony>,
+    pub car: Option<Arc<emu_vmm::pipe::car::Car>>,
+}
+
+/// emu-rs extension (stock has no console command for the vehicle HAL; its car controls live
+/// in the UI and gRPC): `car set <property> [<area>] <value>`, `car get <property> [<area>]`,
+/// `car list` (every property's current value, from the guest) and `car names`. Properties
+/// are VHAL names (`GEAR_SELECTION`, or short `gear`, `speed`, `ignition`, `night`,
+/// `parking-brake`) or numeric ids; values are typed by the property (`drive`, `10.5`, `true`).
+/// Value lines read `property=<name> id=<hex> area=<n> status=<s> value=<text>`.
+fn car(info: &ConsoleInfo, words: &[&str]) -> String {
+    use sim_core::vhal;
+    let Some(car) = &info.car else { return "KO: not an Automotive image: there is no vehicle HAL".into() };
+    let lines = |values: &[vhal::PropValue]| values.iter().map(|v| vhal::describe(v) + "\r\n").collect::<String>() + "OK";
+    let result = match words {
+        ["set", rest @ ..] => vhal::parse_set(rest).and_then(|v| car.set(v)).map(|()| "OK".to_string()),
+        ["get", rest @ ..] => vhal::parse_get(rest).and_then(|(prop, area)| car.get(prop, area)).map(|v| lines(&[v])),
+        ["list"] => car.all().map(|values| lines(&values)),
+        ["names"] => Ok(vhal::PROPERTIES.iter().map(|(n, id)| format!("{n} {:#010x}\r\n", *id as u32)).collect::<String>() + "OK"),
+        _ => Err("usage: car set <property> [<area>] <value> | car get <property> [<area>] | car list | car names".into()),
+    };
+    result.unwrap_or_else(|e| format!("KO: {e}"))
 }
 
 /// `sensor set <name> <v[:v...]>` / `sensor get <name>` (stock syntax).
@@ -325,6 +346,7 @@ const HELP: &[(&str, &str)] = &[
     ("touch", "touch the screen at x y (emu-rs)"),
     ("clipboard", "get or set the guest clipboard (emu-rs)"),
     ("frames", "number of frames presented (emu-rs)"),
+    ("car", "get or set vehicle HAL properties on Automotive images (emu-rs)"),
 ];
 
 fn token_path() -> Option<PathBuf> {
@@ -412,6 +434,7 @@ fn session(stream: TcpStream, info: &ConsoleInfo) -> std::io::Result<()> {
             ("power", true) => power(info, &words[1..]),
             ("sms", true) => sms(info, &words[1..]),
             ("gsm", true) => gsm(info, &words[1..]),
+            ("car", true) => car(info, &words[1..]),
             // Stock: rotate the device 90° clockwise. Gravity in device coordinates turns the
             // other way, and the guest's auto-rotation follows the accelerometer.
             ("rotate", true) => match info.sensors.get("acceleration").as_deref() {

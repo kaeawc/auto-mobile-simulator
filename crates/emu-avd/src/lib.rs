@@ -183,6 +183,31 @@ impl Avd {
         })
     }
 
+    /// The system image's `build.prop` (SDK images ship it beside `system.img`); empty if absent.
+    pub fn build_props(&self) -> BTreeMap<String, String> {
+        std::fs::read_to_string(self.sysdir.join("build.prop")).map(|t| parse_ini(&t)).unwrap_or_default()
+    }
+
+    /// Whether the image is Android Automotive, decided as stock does: from `build.prop`. An
+    /// image without one falls back to its tag (`android-automotive*`).
+    pub fn is_car(&self) -> bool {
+        let props = self.build_props();
+        if props.is_empty() { self.image_tags().contains("automotive") } else { is_car_build(&props) }
+    }
+
+    /// The system image tags (`tag.id`, `tag.ids` in `config.ini`, else the image's
+    /// `source.properties`), lowercase and comma-separated.
+    pub fn image_tags(&self) -> String {
+        let configured = [self.get("tag.id"), self.get("tag.ids")].into_iter().flatten().collect::<Vec<_>>().join(",");
+        let tags = if configured.is_empty() {
+            let props = std::fs::read_to_string(self.sysdir.join("source.properties")).unwrap_or_default();
+            parse_ini(&props).get("SystemImage.TagId").cloned().unwrap_or_default()
+        } else {
+            configured
+        };
+        tags.to_ascii_lowercase()
+    }
+
     /// API level from the system image's `source.properties`, if present.
     pub fn api_level(&self) -> Option<u32> {
         let props = std::fs::read_to_string(self.sysdir.join("source.properties")).ok()?;
@@ -379,9 +404,26 @@ pub fn parse_size_mb(v: &str) -> Option<u64> {
     num.trim().parse::<u64>().ok().map(|n| n * mult)
 }
 
+/// Stock's car-image test (`qemu-setup.cpp`, `avd/util.c`): the product name, the system
+/// product name or the build flavor contains `car` (`sdk_car_arm64`, `gcar_emu_arm64-userdebug`).
+/// Stock registers the `qemud:car` service only for these images.
+pub fn is_car_build(props: &BTreeMap<String, String>) -> bool {
+    ["ro.product.name", "ro.product.system.name", "ro.build.flavor"].iter().any(|k| props.get(*k).is_some_and(|v| v.contains("car")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn car_images_are_found_from_build_prop() {
+        let props = |text: &str| parse_ini(text);
+        assert!(is_car_build(&props("ro.product.name=sdk_car_arm64\n")));
+        assert!(is_car_build(&props("ro.product.system.name=gcar_emu_arm64\n")));
+        assert!(is_car_build(&props("ro.build.flavor=sdk_car_md_arm64-userdebug\n")));
+        assert!(!is_car_build(&props("ro.product.name=sdk_gphone64_arm64\nro.build.flavor=sdk_gphone64_arm64-userdebug\n")));
+        assert!(!is_car_build(&BTreeMap::new()));
+    }
 
     #[test]
     fn sizes() {
@@ -461,6 +503,21 @@ mod tests {
         env.create_avd(&watch).expect("create watch");
         let w = env.load("watch").expect("load watch").profile();
         assert_eq!((w.kind.sub_platform.as_str(), w.shape), ("wearos", sim_core::form_factor::Shape::Round));
+        assert!(!env.load("watch").expect("load watch").is_car());
+
+        // Automotive: build.prop decides; without one, the image tag does.
+        let car_sys = sdk.join("system-images/android-34/android-automotive/arm64-v8a");
+        std::fs::create_dir_all(&car_sys).expect("mkdir");
+        std::fs::write(car_sys.join("system.img"), b"s").expect("write");
+        std::fs::write(car_sys.join("source.properties"), "SystemImage.TagId=android-automotive\n").expect("write");
+        env.create_avd(&NewAvd::new("car", "system-images/android-34/android-automotive/arm64-v8a")).expect("create car");
+        let car = env.load("car").expect("load car");
+        assert!(car.image_tags().contains("android-automotive"));
+        assert!(car.is_car(), "from the tag");
+        std::fs::write(car_sys.join("build.prop"), "ro.product.name=sdk_gphone64_arm64\n").expect("write");
+        assert!(!car.is_car(), "build.prop wins");
+        std::fs::write(car_sys.join("build.prop"), "# begin build properties\nro.build.flavor=sdk_car_arm64-userdebug\n").expect("write");
+        assert!(car.is_car());
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
