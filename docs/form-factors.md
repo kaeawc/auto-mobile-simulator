@@ -153,6 +153,27 @@ without one fails that input with `Unavailable`, never a crash.
   supported for CarPlay"). `create --form-factor auto` on iOS says to do this instead, since
   CarPlay isn't a device type.
 
+## Checked against real images
+
+Each form factor's current SDK image was provisioned with `emu -provision`, given an AVD by
+`emu -create-avd`, and compared offline with emu-rs's board: `emu -avd NAME -dry-run` for what
+emu-rs would give it, `scripts/inspect-image.py` for what the image expects (its features, the
+first-stage fstab and modules in every ramdisk archive, and the vendor partition's input
+configuration, keylayouts and HALs). None of this boots the image.
+
+| Image | What matched | What changed in emu-rs |
+| --- | --- | --- |
+| `android-wear-signed` 36 r1 | fstab slots, modules, `.idc` names (the rotary is a `rotaryEncoder`), every `button` key in `qwerty2.kl` | `-provision` found it (it lives on the `android-wear` site) |
+| `android-tv` 34 r3 | fstab slots, modules, `.idc` names, every `button` key in `qwerty.kl`; generic goldfish vendor, no TV-only HAL | no touch device (`hw.screen=no-touch`), no motion sensors; `system.img` 8.1 → 1.4 GB on disk |
+| `android-automotive` 34-ext9 r5 | fstab slots, modules; `build.prop` beside the image (car detection); the VHAL opens `pipe:qemud:car`; every `vhal` property and gear/ignition value | `-provision 34` resolves to `34-ext9`; light-only sensors, 3686 MB |
+| `google-xr` 34 r7 | fstab slots, modules, `.idc` names; `GuestAngle` and `VirtioDualModeMouse` | the dual-mode mouse follows `VirtioDualModeMouse` |
+| `ai-glasses` 36 r6 | fstab slots, modules, `kernel_cmdline.txt` | the touchpad (`virtio_input_multi_touch_touchpad_0`), no dual-mode mouse |
+
+Every fstab mounts system through `androidboot.boot_devices` (slot 27, `a003600`), userdata as
+`vdc` and metadata at `a003c00`; every first-stage module list is virtio blk, console, mmio, rng
+and vsock (plus PCI, unused). All five enable `VirtioSndCard`; Wear, TV and XR run the goldfish
+audio HAL that phones boot without a card on.
+
 ## Known gaps
 
 What is modelled and labelled but not (or not verifiably) working end to end:
