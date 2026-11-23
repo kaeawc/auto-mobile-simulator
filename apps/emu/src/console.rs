@@ -452,6 +452,8 @@ pub fn serve(port: u16, info: ConsoleInfo) -> Result<()> {
 }
 
 fn session(stream: TcpStream, info: &ConsoleInfo) -> std::io::Result<()> {
+    // Replies are small and the client waits for each: no Nagle delay behind a delayed ACK.
+    stream.set_nodelay(true)?;
     let mut out = stream.try_clone()?;
     let token = auth_token();
     let mut authed = token.is_none();
@@ -491,8 +493,9 @@ fn session(stream: TcpStream, info: &ConsoleInfo) -> std::io::Result<()> {
             }
             (_, true) => command(info, &words),
         };
+        let mut reply = reply;
+        reply.push_str("\r\n");
         out.write_all(reply.as_bytes())?;
-        out.write_all(b"\r\n")?;
     }
     Ok(())
 }
@@ -721,6 +724,35 @@ mod tests {
 
     fn run(info: &ConsoleInfo, line: &str) -> String {
         command(info, &line.split_whitespace().collect::<Vec<_>>())
+    }
+
+    /// Round trips through the real console server, as `adb emu` and sim-rs make them: one TCP
+    /// session per call, pipelined commands, then `quit`.
+    ///     cargo test --release -p emu console_latency -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn console_latency() {
+        use std::io::Read;
+        use std::time::Instant;
+        let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("probe").local_addr().expect("addr").port();
+        serve(port, console(FormFactor::Phone)).expect("serve");
+        let auth = auth_token().map(|t| format!("auth {t}\r\n")).unwrap_or_default();
+        for commands in [1usize, 10] {
+            let script = format!("{auth}{}quit\r\n", "ping\r\n".repeat(commands));
+            let n = 50;
+            let start = Instant::now();
+            for _ in 0..n {
+                let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect");
+                s.write_all(script.as_bytes()).expect("write");
+                let mut out = String::new();
+                s.read_to_string(&mut out).expect("read");
+                assert_eq!(out.matches("I am alive!").count(), commands);
+            }
+            println!(
+                "console: {commands:>2} command(s) per session: {:.2} ms per session",
+                start.elapsed().as_secs_f64() * 1000.0 / f64::from(n)
+            );
+        }
     }
 
     #[test]
