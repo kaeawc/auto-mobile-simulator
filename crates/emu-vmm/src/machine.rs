@@ -125,8 +125,11 @@ pub struct MachineConfig {
     pub input: Option<(u32, u32)>,
     /// With `input`: a multi-touch screen (false for `hw.screen=no-touch`, TV's).
     pub touch_screen: bool,
-    /// Android XR: the `qemud:xr_service` link (console `xr`), and the dual-mode mouse with the
-    /// other input devices.
+    /// With `input`: a touchpad of this many units (`hw.touchpad0`).
+    pub touchpad: Option<(u32, u32)>,
+    /// With `input`: the dual-mode mouse (Android XR headsets' `VirtioDualModeMouse`).
+    pub dual_mode_mouse: bool,
+    /// Android XR: the `qemud:xr_service` link (console `xr`).
     pub xr: Option<Arc<pipe::xr::Xr>>,
     /// Receives the input handles of this run (they change when the guest reboots).
     pub on_input: Option<Arc<dyn Fn(Inputs) + Send + Sync>>,
@@ -305,13 +308,18 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         let (rot, rh) = Input::new(Kind::Rotary, "virtio_input_rotary");
         slots[slots::KEYBOARD as usize] = Some(Box::new(kbd));
         slots[slots::ROTARY as usize] = Some(Box::new(rot));
-        let mouse = cfg.xr.is_some().then(|| {
+        let mouse = cfg.dual_mode_mouse.then(|| {
             let (mouse, mh) = Input::new(Kind::DualModeMouse, virtio::input::DUAL_MODE_MOUSE_NAME);
             slots[slots::MOUSE as usize] = Some(Box::new(mouse));
             mh
         });
+        let touchpad = cfg.touchpad.map(|(tw, th)| {
+            let (pad, ph) = Input::new(Kind::Touch { width: tw, height: th }, virtio::input::TOUCHPAD_NAME);
+            slots[slots::TOUCHPAD as usize] = Some(Box::new(pad));
+            ph
+        });
         if let Some(cb) = &cfg.on_input {
-            cb(Inputs { screen: (w, h), touch: th, keyboard: kh, rotary: rh, mouse });
+            cb(Inputs { screen: (w, h), touch: th, keyboard: kh, rotary: rh, mouse, touchpad });
         }
     }
     if let Some(port) = cfg.adb_port {

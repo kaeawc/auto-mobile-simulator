@@ -407,6 +407,7 @@ const HELP: &[(&str, &str)] = &[
     ("sensor", "manage emulator sensors"),
     ("screenshot", "take a screenshot of the display"),
     ("touch", "touch the screen at x y (emu-rs)"),
+    ("touchpad", "touch the touchpad at x y, display glasses (emu-rs)"),
     ("clipboard", "get or set the guest clipboard (emu-rs)"),
     ("frames", "number of frames presented (emu-rs)"),
     ("xr", "Android XR head pose, room, input mode and pointer (emu-rs)"),
@@ -567,6 +568,30 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
                 _ => "KO: usage: touch <x> <y> [down|up|tap]".to_string(),
             }
         }
+        // emu-rs extension: `touchpad <x> <y> [down|up|tap]` in touchpad units (display glasses).
+        "touchpad" => {
+            let g = info.inputs.lock().unwrap_or_else(|e| e.into_inner());
+            match (g.as_ref(), words.get(1).and_then(|v| v.parse().ok()), words.get(2).and_then(|v| v.parse().ok())) {
+                (Some(Inputs { touchpad: None, .. }), _, _) => "KO: this device has no touchpad (hw.touchpad0)".to_string(),
+                (Some(Inputs { touchpad: Some(pad), .. }), Some(x), Some(y)) => match words.get(3).copied().unwrap_or("tap") {
+                    "down" | "move" => {
+                        pad.touch(x, y, true);
+                        "OK".to_string()
+                    }
+                    "up" => {
+                        pad.touch(x, y, false);
+                        "OK".to_string()
+                    }
+                    "tap" => {
+                        pad.touch(x, y, true);
+                        pad.touch(x, y, false);
+                        "OK".to_string()
+                    }
+                    other => format!("KO: bad phase '{other}' (down, move, up, tap)"),
+                },
+                _ => "KO: usage: touchpad <x> <y> [down|move|up|tap]".to_string(),
+            }
+        }
         "frames" => match &info.display {
             Some(d) => format!("{}\r\nOK", d.frames()),
             None => "KO: no display".to_string(),
@@ -687,7 +712,8 @@ mod tests {
         } else {
             (None, None)
         };
-        *info.inputs.lock().expect("inputs") = Some(Inputs { screen: (720, 1280), touch: th, keyboard: kh, rotary: rh, mouse: mh });
+        *info.inputs.lock().expect("inputs") =
+            Some(Inputs { screen: (720, 1280), touch: th, keyboard: kh, rotary: rh, mouse: mh, touchpad: None });
         Devices { touch, keyboard, rotary, mouse }
     }
 
@@ -760,6 +786,22 @@ mod tests {
             devices.keyboard.take_queued().concat().into_iter().filter(|e| e.typ == EV_KEY).map(|e| (e.code, e.value)).collect();
         // Shift down, H, shift up, I (Linux keycodes 42, 35, 23).
         assert_eq!(keys, [(42, 1), (35, 1), (35, 0), (42, 0), (23, 1), (23, 0)]);
+    }
+
+    #[test]
+    fn glasses_touchpads_take_touches_in_their_own_units() {
+        let info = console(FormFactor::Vision);
+        let _devices = attach_inputs(&info, true);
+        assert_eq!(run(&info, "touchpad 10 10"), "KO: this device has no touchpad (hw.touchpad0)");
+        let (pad, handle) = Input::new(Kind::Touch { width: 1542, height: 297 }, emu_vmm::virtio::input::TOUCHPAD_NAME);
+        info.inputs.lock().expect("inputs").as_mut().expect("inputs").touchpad = Some(handle);
+        for line in ["touchpad 100 150 down", "touchpad 900 150 move", "touchpad 900 150 up"] {
+            assert_eq!(run(&info, line), "OK");
+        }
+        let batches = pad.take_queued();
+        let x = |b: &Vec<InputEvent>| b.iter().find(|e| e.code == emu_vmm::virtio::input::ABS_MT_POSITION_X).map(|e| e.value);
+        assert_eq!(batches.iter().map(x).collect::<Vec<_>>(), [Some(100), Some(900), None], "a swipe forward");
+        assert_eq!(run(&info, "touchpad 1 2 hold"), "KO: bad phase 'hold' (down, move, up, tap)");
     }
 
     #[test]

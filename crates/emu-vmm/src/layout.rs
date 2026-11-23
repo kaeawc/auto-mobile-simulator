@@ -75,6 +75,9 @@ pub mod slots {
     pub const ROTARY: u32 = 22;
     /// virtio-input dual-mode mouse, Android XR images only (stock: on PCI like its other inputs).
     pub const MOUSE: u32 = 17;
+    /// virtio-input touchpad (`hw.touchpad0`: the display glasses' temple), a multi-touch device
+    /// named `virtio_input_multi_touch_touchpad_0` (stock: on PCI like its other inputs).
+    pub const TOUCHPAD: u32 = 16;
     /// Not on the stock board (which puts vsock on PCI); the guest driver doesn't care.
     pub const VSOCK: u32 = 24;
     pub const RNG: u32 = 25;
@@ -99,6 +102,15 @@ pub mod slots {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_slot_is_taken_once() {
+        use slots::*;
+        let mut all =
+            [GPU, TOUCH, KEYBOARD, ROTARY, MOUSE, TOUCHPAD, VSOCK, RNG, NET, VPORTS, SOUND, SYSTEM, CACHE, USERDATA, METADATA, VENDOR];
+        all.sort_unstable();
+        assert!(all.windows(2).all(|w| w[0] != w[1]) && all.iter().all(|s| *s < 32), "{all:?}");
+    }
 
     #[test]
     fn stock_addresses() {

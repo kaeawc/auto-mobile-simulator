@@ -69,6 +69,9 @@ const CFG_ABS_INFO: u8 = 0x12;
 
 /// The keyboard's name: goldfish's vendor image ships `qwerty2.idc` and `qwerty2.kl` for it.
 pub const KEYBOARD_NAME: &str = "qwerty2";
+/// The touchpad's name, which the guest's `virtio_input_multi_touch_touchpad_0.idc` configures
+/// as `touchNavigation` (the display glasses' images ship it).
+pub const TOUCHPAD_NAME: &str = "virtio_input_multi_touch_touchpad_0";
 /// Bus, vendor, product, version of stock's keyboard (`BUS_VIRTUAL`, 0627:0001).
 const KEYBOARD_IDS: [u16; 4] = [0x06, 0x0627, 0x0001, 0x0001];
 /// Ids of the other devices.
@@ -412,6 +415,8 @@ pub struct Inputs {
     pub rotary: InputHandle,
     /// The dual-mode mouse (Android XR images only).
     pub mouse: Option<InputHandle>,
+    /// A touchpad beside the screen (`hw.touchpad0`: Android XR display glasses).
+    pub touchpad: Option<InputHandle>,
 }
 
 #[cfg(test)]

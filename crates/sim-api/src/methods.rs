@@ -136,6 +136,11 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "Android XR: turn (radians) or move (metres) the head, recenter, set the room and passthrough, the input mode, aim or pinch the hand ray and look or select with gaze at pixels (stock's gRPC hand and eye events), a hand gesture, or point the dual-mode mouse",
     ),
     (
+        "touchpad",
+        "device, x, y, phase?(down|move|up|tap) | x, y, to_x, to_y, duration_ms? (a swipe)",
+        "Touch or swipe the touchpad beside the screen, in touchpad units (Android XR display glasses: `hw.touchpad0`)",
+    ),
+    (
         "rotary",
         "device, ticks | delta (Digital Crown units; iOS)",
         "Turn a watch's rotary input: the Wear OS crown or bezel, the Apple Watch Digital Crown",
@@ -193,7 +198,7 @@ const ALL_PLATFORMS: &[&str] = &[
     "rotary",
 ];
 /// Methods only Android devices have.
-const ANDROID_ONLY: &[&str] = &["console", "fold", "xr", "vehicle"];
+const ANDROID_ONLY: &[&str] = &["console", "fold", "xr", "vehicle", "touchpad"];
 
 /// The platforms whose devices `method` works on.
 pub fn platforms(method: &str) -> &'static [Platform] {
@@ -430,6 +435,21 @@ mod tests {
         assert!(err.starts_with("xr: unknown variant `teleport`"), "{err}");
         let err = call(&mut s, "xr", &json!({"device": "headset", "action": "options", "environment": "day"})).expect_err("missing");
         assert!(err.contains("missing field `passthrough`"), "{err}");
+
+        // The headset has no touchpad (the display glasses do); parameters are checked first.
+        let mut pad = |p: Value| call(&mut s, "touchpad", &p);
+        let err = pad(json!({"device": "headset", "x": 1, "y": 2})).expect_err("no touchpad");
+        assert!(err.starts_with("headset has no touchpad"), "{err}");
+        assert_eq!(pad(json!({"device": "headset", "x": 1})).expect_err("y"), "missing number parameter `y`");
+        assert_eq!(pad(json!({"device": "headset", "x": -1, "y": 2})).expect_err("negative"), "`x` must be a whole number");
+        assert_eq!(
+            pad(json!({"device": "headset", "x": 1, "y": 2, "to_x": 3})).expect_err("half a swipe"),
+            "a swipe needs both `to_x` and `to_y`"
+        );
+        assert_eq!(
+            pad(json!({"device": "headset", "x": 1, "y": 2, "phase": "hold"})).expect_err("phase"),
+            "unknown phase `hold` (down, move, up, tap)"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

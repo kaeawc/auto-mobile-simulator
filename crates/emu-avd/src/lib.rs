@@ -214,6 +214,13 @@ impl Avd {
 
     /// Whether the screen is round: `ro.emulator.circular` in `boot.prop` (what stock checks;
     /// `1`, `y`, `on`, `yes`, `true` and their prefixes count), or `hw.lcd.circular`.
+    /// The touchpad's width and height in units (`hw.touchpad0`: the SDK's display glasses).
+    pub fn touchpad(&self) -> Option<(u32, u32)> {
+        let flag = self.get("hw.touchpad0").is_some_and(|v| matches!(v.trim(), "yes" | "true"));
+        let num = |k: &str| self.get(k).and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0);
+        flag.then(|| Some((num("hw.touchpad0.width")?, num("hw.touchpad0.height")?))).flatten()
+    }
+
     /// Whether the screen takes touch: everything but `hw.screen=no-touch` (the SDK's TVs).
     pub fn touch_screen(&self) -> bool {
         self.get("hw.screen").map(str::trim) != Some("no-touch")
@@ -240,6 +247,13 @@ impl Avd {
     pub fn is_car(&self) -> bool {
         let props = self.build_props();
         if props.is_empty() { self.image_tags().contains("automotive") } else { is_car_build(&props) }
+    }
+
+    /// Whether the image's `advancedFeatures.ini` turns `name` on (`VirtioSndCard = on`); a
+    /// feature it doesn't list is off, as stock reads it. None when the image has no such file.
+    pub fn image_feature(&self, name: &str) -> Option<bool> {
+        let text = std::fs::read_to_string(self.sysdir.join("advancedFeatures.ini")).ok()?;
+        Some(text.lines().any(|l| l.split_once('=').is_some_and(|(k, v)| k.trim() == name && v.trim().eq_ignore_ascii_case("on"))))
     }
 
     /// The system image tags (`tag.id`, `tag.ids` in `config.ini`, else the image's
@@ -656,6 +670,18 @@ mod tests {
         assert_eq!(made.profile().kind.label(), "Android XR · Vision");
         let glasses = NewAvd::for_profile("glasses", "system-images/android-36/ai-glasses/arm64-v8a", &xr.image_profile("ai-glasses"));
         assert_eq!((glasses.lcd, glasses.ram_mb), ((450, 450, 160), 2048));
+        assert_eq!(made.touchpad(), None);
+        let glasses_sys = sdk.join("system-images/android-36/ai-glasses/arm64-v8a");
+        std::fs::create_dir_all(&glasses_sys).expect("mkdir");
+        std::fs::write(glasses_sys.join("system.img"), b"s").expect("write");
+        env.create_avd(&glasses).expect("create glasses");
+        assert_eq!(env.load("glasses").expect("load glasses").touchpad(), Some((1542, 297)), "the temple touchpad");
+        assert_eq!(made.image_feature("VirtioDualModeMouse"), None, "no advancedFeatures.ini");
+        std::fs::write(xr_sys.join("advancedFeatures.ini"), "GuestAngle = on\nVirtioDualModeMouse = on\nXrModeUI=off\n").expect("write");
+        assert_eq!(
+            ["VirtioDualModeMouse", "XrModeUI", "VirtioMouse"].map(|f| made.image_feature(f)),
+            [Some(true), Some(false), Some(false)]
+        );
         let _ = std::fs::remove_dir_all(tmp);
     }
 

@@ -45,7 +45,7 @@ pub struct Instance {
     pub gps: std::sync::Arc<emu_vmm::pipe::gps::Gps>,
     pub battery: std::sync::Arc<emu_vmm::devices::goldfish_battery::Battery>,
     pub telephony: std::sync::Arc<emu_vmm::telephony::Telephony>,
-    /// Android XR images: the guest's XR service link (and, with it, the dual-mode mouse).
+    /// Android XR images: the guest's XR service link.
     pub xr: Option<std::sync::Arc<emu_vmm::pipe::xr::Xr>>,
     /// The vehicle HAL channel, for Automotive images only (as stock).
     pub car: Option<std::sync::Arc<emu_vmm::pipe::car::Car>>,
@@ -189,6 +189,8 @@ impl Instance {
             boot_props: plan.boot_props,
             input: Some((self.avd.lcd().0, self.avd.lcd().1)),
             touch_screen: plan.touch_screen,
+            touchpad: plan.touchpad,
+            dual_mode_mouse: plan.dual_mode_mouse,
             xr: self.xr.clone(),
             sensors: self.sensors.clone(),
             clipboard: self.clipboard.clone(),
@@ -285,7 +287,7 @@ pub struct BootPlan {
     pub renderer: Option<PathBuf>,
     /// A silent virtio-snd card.
     pub sound: bool,
-    /// `qemud:xr_service` and the dual-mode mouse.
+    /// `qemud:xr_service`.
     pub xr: bool,
     /// The vehicle HAL channel, `qemud:car`.
     pub car: bool,
@@ -293,6 +295,11 @@ pub struct BootPlan {
     pub sensor_mask: u32,
     /// A multi-touch screen (not on `hw.screen=no-touch`, TV's).
     pub touch_screen: bool,
+    /// A touchpad's size in units (`hw.touchpad0`, the display glasses').
+    pub touchpad: Option<(u32, u32)>,
+    /// The dual-mode mouse: XR images that enable `VirtioDualModeMouse` (the headsets, not the
+    /// display glasses), as stock adds it.
+    pub dual_mode_mouse: bool,
 }
 
 impl BootPlan {
@@ -331,6 +338,8 @@ impl BootPlan {
             car,
             sensor_mask: avd.sensor_mask(),
             touch_screen: avd.touch_screen(),
+            touchpad: avd.touchpad(),
+            dual_mode_mouse: xr && avd.image_feature("VirtioDualModeMouse").unwrap_or(true),
         };
         plan.bootconfig = bootconfig(avd, opts, plan.renderer.is_some());
         plan
@@ -359,8 +368,11 @@ impl BootPlan {
         } else {
             "virtio-input: keyboard (qwerty2), rotary"
         });
-        if self.xr {
+        if self.dual_mode_mouse {
             out.push("virtio-input: dual-mode mouse");
+        }
+        if self.touchpad.is_some() {
+            out.push("virtio-input: touchpad");
         }
         if self.renderer.is_some() {
             out.push("virtio-gpu (gfxstream), goldfish address space");
