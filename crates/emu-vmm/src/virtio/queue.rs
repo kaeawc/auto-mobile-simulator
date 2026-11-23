@@ -43,12 +43,11 @@ impl Chain {
 
     /// Copies the device-readable part of the chain into a buffer, up to `max` bytes.
     pub fn read_all(&self, mem: &GuestRam, max: usize) -> Result<Vec<u8>, QueueError> {
-        let mut out = Vec::new();
+        let total: usize = self.readable().map(|d| d.len as usize).sum::<usize>().min(max);
+        let mut out = Vec::with_capacity(total);
         for d in self.readable() {
             let take = (d.len as usize).min(max - out.len());
-            let start = out.len();
-            out.resize(start + take, 0);
-            mem.read(d.addr, &mut out[start..]).map_err(|_| QueueError::BadAddress(d.addr))?;
+            mem.read_append(d.addr, take, &mut out).map_err(|_| QueueError::BadAddress(d.addr))?;
             if out.len() == max {
                 break;
             }

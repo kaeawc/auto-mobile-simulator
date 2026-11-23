@@ -7,23 +7,22 @@ pub fn frame(out: &mut Vec<u8>, payload: &[u8]) {
     out.extend_from_slice(payload);
 }
 
-/// Splits complete framed messages off the front of `buf`.
+/// Splits complete framed messages off the front of `buf`, draining it once (not per message).
 pub fn take_frames(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {
     let mut msgs = Vec::new();
-    loop {
-        if buf.len() < 4 {
-            break;
-        }
-        let Some(len) = std::str::from_utf8(&buf[..4]).ok().and_then(|h| usize::from_str_radix(h, 16).ok()) else {
+    let mut at = 0;
+    while buf.len() - at >= 4 {
+        let Some(len) = std::str::from_utf8(&buf[at..at + 4]).ok().and_then(|h| usize::from_str_radix(h, 16).ok()) else {
             buf.clear(); // not qemud framing: drop rather than misparse
-            break;
+            return msgs;
         };
-        if buf.len() < 4 + len {
+        if buf.len() - at < 4 + len {
             break;
         }
-        msgs.push(buf[4..4 + len].to_vec());
-        buf.drain(..4 + len);
+        msgs.push(buf[at + 4..at + 4 + len].to_vec());
+        at += 4 + len;
     }
+    buf.drain(..at);
     msgs
 }
 
@@ -77,6 +76,24 @@ mod tests {
         let msgs = take_frames(&mut out);
         assert_eq!(msgs, vec![b"list".to_vec(), Vec::new()]);
         assert_eq!(out, b"00");
+    }
+
+    #[test]
+    fn many_frames_and_a_partial_body() {
+        let mut out = Vec::new();
+        for i in 0..1000u32 {
+            frame(&mut out, i.to_string().as_bytes());
+        }
+        out.extend_from_slice(b"0005ab"); // header plus part of the body
+        let msgs = take_frames(&mut out);
+        assert_eq!(msgs.len(), 1000);
+        assert_eq!((msgs[0].as_slice(), msgs[999].as_slice()), (&b"0"[..], &b"999"[..]));
+        assert_eq!(out, b"0005ab", "the partial frame waits");
+        out.extend_from_slice(b"cde");
+        assert_eq!(take_frames(&mut out), vec![b"abcde".to_vec()]);
+        assert!(out.is_empty());
+        let mut junk = b"zz12frame".to_vec();
+        assert!(take_frames(&mut junk).is_empty() && junk.is_empty(), "not qemud framing: dropped");
     }
 
     #[test]
