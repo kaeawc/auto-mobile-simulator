@@ -116,7 +116,8 @@ unpacked. Disk images (`*.img`) don't go through a plain unzip: each streams out
 Most of a system image is zeros: TV 34's 8.6 GB `system.img` takes 1.4 GB and reads back
 byte-identical. Unpacking TV 34 took 64 s instead of 4 min 48 s (unzip writing 8.6 GB, then a pass
 reading it back to punch holes) on a Linux VM, against a 40 s floor for inflating it at all. The SDK is `$ANDROID_SDK_ROOT`/`$ANDROID_HOME`, else Android Studio's default
-(`~/Library/Android/sdk` on macOS, `~/Android/Sdk` on Linux). An API level a tag publishes only
+(`~/Library/Android/sdk` on macOS, `~/Android/Sdk` on Linux). `SDK_TEST_BASE_URL` (the variable sdkmanager honours) points provisioning at another repository,
+a mirror or a `file://` copy. An API level a tag publishes only
 at extension levels (Automotive's API 34 and 35) resolves to the newest of them. Provisioning
 works on Linux too, for preparing images and AVDs; there `-provision` skips the renderer, since
 only Apple silicon boots guests.

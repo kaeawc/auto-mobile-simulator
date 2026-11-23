@@ -22,6 +22,9 @@ libc.workspace = true
 rustix.workspace = true
 sim-core.workspace = true
 
+[dev-dependencies]
+emu-sdk = { workspace = true, features = ["testing"] }
+
 # `deny`, not the workspace's `forbid`: `shutdown_signals` (signal masks) opts back in, and is the
 # only unsafe code in this crate.
 [lints.rust]

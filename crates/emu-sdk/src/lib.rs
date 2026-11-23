@@ -25,14 +25,29 @@ pub use manifest::{
 /// Google's SDK repository.
 pub const REPO_URL: &str = "https://dl.google.com/android/repository/";
 
+/// The repository to provision from: `$SDK_TEST_BASE_URL` (the variable sdkmanager honours, for
+/// mirrors and offline use; `file://` works), else [`REPO_URL`].
+pub fn repository_base() -> String {
+    match std::env::var("SDK_TEST_BASE_URL") {
+        Ok(base) if !base.is_empty() => {
+            if base.ends_with('/') {
+                base
+            } else {
+                base + "/"
+            }
+        }
+        _ => REPO_URL.to_owned(),
+    }
+}
+
 /// The main manifest (platform-tools, platforms, build-tools, emulator...).
 pub fn repository_url() -> String {
-    format!("{REPO_URL}repository2-3.xml")
+    format!("{}repository2-3.xml", repository_base())
 }
 
 /// The list of system-image manifests, one per tag family.
 pub fn sites_url() -> String {
-    format!("{REPO_URL}addons_list-5.xml")
+    format!("{}addons_list-5.xml", repository_base())
 }
 
 /// The system-image manifest that carries `tag`. `default` lives under `sys-img/android/`, 16 KB
@@ -45,7 +60,7 @@ pub fn sys_img_url(tag: &str) -> String {
         t if sim_core::form_factor::is_xr_tag(t) => "google_xr",
         t => t.strip_suffix("_ps16k").unwrap_or(t),
     };
-    format!("{REPO_URL}sys-img/{dir}/sys-img2-3.xml")
+    format!("{}sys-img/{dir}/sys-img2-3.xml", repository_base())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -238,7 +253,7 @@ impl Sdk {
 
     /// Every system image site the repository's site list names.
     fn all_system_image_manifests(&self) -> Result<Vec<Manifest>> {
-        let urls = parse_site_list(&self.fetch_cached(&sites_url())?, REPO_URL)?;
+        let urls = parse_site_list(&self.fetch_cached(&sites_url())?, &repository_base())?;
         // A listed site that fails to load is skipped, not fatal: the others may have the image.
         Ok(urls.iter().filter_map(|u| self.manifest(u).ok()).collect())
     }
@@ -434,6 +449,8 @@ impl Sdk {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 #[cfg(test)]
 mod tests;
 

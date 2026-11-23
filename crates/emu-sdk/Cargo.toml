@@ -12,6 +12,7 @@ doctest = false
 
 [dependencies]
 emu-hvf.workspace = true
+flate2 = { workspace = true, optional = true }
 roxmltree.workspace = true
 sha1_smol.workspace = true
 sim-core.workspace = true
@@ -19,6 +20,10 @@ thiserror.workspace = true
 
 [dev-dependencies]
 flate2.workspace = true
+
+[features]
+# `testing::stored_zip`, for other crates' tests.
+testing = ["dep:flate2"]
 
 [lints]
 workspace = true
