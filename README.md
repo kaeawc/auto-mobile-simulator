@@ -88,11 +88,19 @@ sim-rs create "Watch" "Apple Watch Series 10 (46mm)" "watchOS 26.0" --form-facto
 sim-rs create "TV" "Apple TV 4K (3rd generation)" "tvOS 26.0" --form-factor tv
 sim-rs create "Vision" "Apple Vision Pro" "visionOS 26.0" --form-factor vision
 sim-rs boot <device>                          # waits until the device finishes booting
+sim-rs rotate Phone --orientation landscape-left   # or 90° clockwise without --orientation
+sim-rs carplay Phone on                       # CarPlay display on a booted iPhone (iOS 26 runtimes)
+sim-rs tap Phone 400 240 --display carplay    # ...then touch and screenshot it
+sim-rs rotary Watch 3                         # the Digital Crown (--delta for raw crown units)
+sim-rs watch-gesture Watch double-tap         # or wrist-flick
+sim-rs button TV select                       # the Siri Remote: select, menu, home, play-pause, arrows
+sim-rs remote-swipe TV left                   # its touch surface
 ```
 
 `--form-factor` is checked against the device type (an iPhone is not a tablet). CarPlay is an
-external display of an iPhone simulator rather than a device type; attaching it isn't implemented
-yet, and `--form-factor auto` says so.
+external display of an iPhone simulator rather than a device type: `--form-factor auto` says so,
+and `carplay on` attaches it. See [docs/form-factors.md](docs/form-factors.md) for how each
+Apple input is sent.
 
 ### Android
 
@@ -106,10 +114,12 @@ sim-rs create Fold    --platform android --system-image "system-images;android-3
 sim-rs create Wear    --platform android --system-image "system-images;android-34;android-wear;arm64-v8a"
 sim-rs create TV      --platform android --system-image "system-images;android-34;google-tv;arm64-v8a"
 sim-rs create Car     --platform android --system-image "system-images;android-34;android-automotive;arm64-v8a"
+sim-rs create XR      --platform android --system-image "system-images;android-34;google-xr;arm64-v8a"
 sim-rs boot Pixel                             # starts emu; waits for sys.boot_completed
 adb -s emulator-5554 shell                    # it is an ordinary emulator to every tool
 sim-rs fold Fold half-opened                  # the hinge (foldables only)
 sim-rs rotary Wear 3                          # the rotary input (watches only)
+sim-rs xr XR recenter                         # Android XR head pose, options, pointer
 sim-rs console Pixel sensor get acceleration  # anything the emulator console speaks
 sim-rs shutdown Pixel
 ```
@@ -126,8 +136,11 @@ hinge). An image can't boot another family's form factor, and the error says whi
 sim-rs screenshot <device> out.png            # full-resolution PNG
 sim-rs tap <device> 600 1300                  # pixels from the top-left of the screen
 sim-rs swipe <device> 600 2000 600 900 --duration 300 [--settle]
-sim-rs button <device> home|lock              # iOS: side|siri|apple-pay; Android: back|recents|
-                                              # volume-up|volume-down|menu|up|down|left|right|select
+sim-rs button <device> home|lock              # iOS: side|siri|apple-pay|action; Android: back|recents|
+                                              # volume-up|volume-down|menu; TVs: up|down|left|right|
+                                              # select|play-pause (menu|back on the Siri Remote)
+sim-rs rotate <device>                        # 90° clockwise (iOS: --orientation too)
+sim-rs rotary <device> 3                      # a watch's crown (Wear OS or Apple Watch)
 sim-rs type <device> 'Hello, World!'          # hardware keyboard, US layout, on both platforms
 sim-rs key <device> 40                        # HID usage (40 = Return)
 sim-rs location <device> 37.33 -122.03
@@ -136,7 +149,8 @@ sim-rs shutdown|delete <device>
 
 `<device>` is a UDID (an Android device's is its AVD name), an exact name, or `booted`.
 iOS-only commands: `install|uninstall|launch|terminate|apps`, `open-url`, `appearance`, `privacy`,
-`memory-warning`, `erase`, `exec`; Android-only: `rotate`, `fold`, `rotary`, `console`. Using one
+`memory-warning`, `erase`, `exec`, `carplay`, `watch-gesture`, `remote-swipe`; Android-only:
+`fold`, `console`, `xr`. Using one
 on the other platform's device fails with the platforms it works on.
 
 ## Socket API
@@ -227,7 +241,7 @@ Microphone injection still needs a loopback device. Details: [docs/research/audi
 cd desktop
 cargo run --release                     # SIM_RS_DEVICE=<udid|name|booted> preselects a device
 cargo run -- --snap shot.png --scene demo   # headless render; scenes: demo, android, foldable,
-                                            # watch, tv, empty
+                                            # watch, tv, apple-watch, apple-tv, empty
 ```
 
 Devices are listed under iOS and Android, each with its sub-platform. Pick one (boot it if
@@ -236,12 +250,16 @@ needed): click and drag on the screen for touches; type to use the device keyboa
 
 | Device | Controls |
 | --- | --- |
-| iOS | Home, Lock, Appearance |
+| iPhone / iPad | Home, Lock, Rotate, Appearance |
+| Apple Watch | Crown press, Side button, Crown up / down |
+| Apple TV | Menu, TV, arrows and Select (the Siri Remote), Appearance |
+| Apple Vision Pro | Home, Appearance |
 | Android phone / tablet | Back, Home, Recents, Power, Rotate |
 | Android foldable | the above, plus Fold closed / Half open / Open flat |
 | Wear OS watch (round screen) | Back, Home, Power, Rotary up / down |
 | Android TV | Back, Home, Power, D-pad and Select |
 | Android Automotive | Back, Home |
+| Android XR | Back, Home, Power, Look left / Recenter / Look right |
 
 iOS frames go to the GPU without copying (the framebuffer IOSurface is sampled directly) and the
 right-hand panel has five debug tabs (Device, Network, Storage, Processes, Logs). Android frames

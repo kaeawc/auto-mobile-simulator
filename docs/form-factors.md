@@ -82,11 +82,12 @@ Foldable postures follow the stock emulator's hinge ranges: closed below 30°, h
 
 | Kind | Create | Drive |
 | --- | --- | --- |
-| iPhone | `sim-rs create P "iPhone 17" "iOS 26.5"` | touch, `button home\|lock`, `type` |
+| iPhone | `sim-rs create P "iPhone 17" "iOS 26.5"` | touch, `button home\|lock\|side\|action`, `type`, `rotate [--orientation …]` |
 | iPad | `sim-rs create T "iPad Pro 11-inch (M4)" "iOS 26.5" --form-factor tablet` | as iPhone |
-| Apple Watch | `sim-rs create W "Apple Watch Series 10 (46mm)" "watchOS 26.0" --form-factor watch` | touch, `button home` (unverified, see below) |
-| Apple TV | `sim-rs create TV "Apple TV 4K (3rd generation)" "tvOS 26.0" --form-factor tv` | `key` (arrows, Return; unverified, see below) |
-| Vision Pro | `sim-rs create V "Apple Vision Pro" "visionOS 26.0" --form-factor vision` | touch (unverified, see below) |
+| CarPlay | an iPhone on an iOS 26 runtime, booted: `sim-rs carplay P on` | `tap\|swipe\|screenshot … --display carplay`; `carplay P off` |
+| Apple Watch | `sim-rs create W "Apple Watch Series 10 (46mm)" "watchOS 26.0" --form-factor watch` | touch, `rotary <ticks> [--delta <crown units>]`, `button home` (the crown's press) `\|side\|action`, `watch-gesture double-tap\|wrist-flick` |
+| Apple TV | `sim-rs create TV "Apple TV 4K (3rd generation)" "tvOS 26.0" --form-factor tv` | `button select\|menu\|back\|home\|play-pause\|up\|down\|left\|right` (the Siri Remote), `remote-swipe up\|down\|left\|right` (its touch surface) |
+| Vision Pro | `sim-rs create V "Apple Vision Pro" "visionOS 26.0" --form-factor vision` | touch (unverified), `button home` |
 | Android phone | `sim-rs create P --platform android --system-image "system-images;android-36;google_apis;arm64-v8a"` | touch, `button back\|home\|recents`, `type`, `rotate` |
 | Android tablet | the same image, `--form-factor tablet` | as phone |
 | Android foldable | the same image, `--form-factor foldable` | as phone, plus `fold <closed\|half-opened\|opened\|angle>` |
@@ -104,14 +105,42 @@ the tag they carry; `-provision` takes the tag in the package path, `google-xr`)
 sends the guest what the stock emulator's XR controls send over the `qemud:xr_service` pipe
 (stock only offers them over gRPC), and `xr pointer` drives the virtio dual-mode mouse emu-rs adds
 to XR images. `adb emu xr status` says whether the guest's XR service is connected and what it
-last answered. The desktop gives XR devices look-left, recenter and look-right buttons. `--form-factor` on iOS only checks the device
-type; on Android it also shapes the new AVD (screen size, a foldable's hinge sensor). An image
-can't boot another family's form factor:
+last answered. The desktop gives XR devices look-left, recenter and look-right buttons.
+
+`--form-factor` on iOS only checks the device type; on Android it also shapes the new AVD (screen
+size, a foldable's hinge sensor). An image can't boot another family's form factor:
 
 ```text
 $ sim-rs create T --platform android --system-image "system-images;android-34;android-wear;arm64-v8a" --form-factor tablet
 Error: system image `system-images;android-34;android-wear;arm64-v8a` (tag `android-wear`) boots Wear OS · Watch devices, not tablet
 ```
+
+## Apple inputs and CarPlay
+
+Each Apple form factor gets its own HID messages, the ones Simulator.app sends, through
+SimulatorKit's HID client. Every message builder and selector is looked up first, so a runtime
+without one fails that input with `Unavailable`, never a crash.
+
+- **Apple TV**: `button` goes to the Siri Remote's own HID target (select `0x190`, menu `0x191`,
+  TV `0x192`, play/pause `0x194`, volume, Siri), released with 0; the arrows are keyboard arrows,
+  which the tvOS simulator maps to the remote's D-pad. `remote_swipe` sends a began → moved… →
+  ended contact on the touch surface (the focus engine moves only for the whole sequence); the
+  message's layout is checked before its phase fields are patched.
+- **Apple Watch**: `rotary` turns the Digital Crown (`IndigoHIDMessageForDigitalCrownEvent`, split
+  into steps of at most 200 units; one tick is 10 units, a calibration, or pass `delta`). Home is
+  the crown's press; the side and Action (Ultra) buttons are hardware buttons. `watch_gesture`
+  sends Double Tap or Wrist Flick (watchOS 11+, Wrist Flick 12+).
+- **iPhone and iPad**: `rotate` sends the GSEvent orientation message Simulator.app's Rotate
+  Left/Right send, to SpringBoard's `PurpleWorkspacePort`; without `orientation` it turns 90°
+  clockwise from the last orientation sim-rs set.
+- **CarPlay**: `carplay on` writes the device's StarkConfig (`extended_display.plist`: 800×480 @2x,
+  touch), sets the iPhone's TVOut screen to that mode with CarPlay properties (found through the
+  framebuffer server's screen adapter; an already-on plain display is turned off first, or the
+  guest keeps it as AirPlay), and creates the CarPlay HID service. Touches then go to HID target 1
+  and screenshots come from the external framebuffer (`display: "carplay"`). Only iPhones on iOS
+  26 runtimes and earlier: iOS 27 renders the CarPlay screen black (Apple: "iOS Simulator is not
+  supported for CarPlay"). `create --form-factor auto` on iOS says to do this instead, since
+  CarPlay isn't a device type.
 
 ## Known gaps
 
@@ -119,10 +148,11 @@ What is modelled and labelled but not (or not verifiably) working end to end:
 
 | Kind | Gap |
 | --- | --- |
-| CarPlay | Attaching the CarPlay display to an iPhone simulator isn't implemented; `create --form-factor auto` on iOS says so. |
+| CarPlay | Implemented as above but never run: no Mac was available. Whether `simctl io enumerate` then labels the screen "CarPlay" (what auto-mobile's CarPlay observe looks for, auto-mobile #18729) is unconfirmed. Only touch: the knob, back, home and Siri head-unit inputs aren't sent (auto-mobile #19059 is finding out whether SimulatorKit takes them). The desktop doesn't show the CarPlay screen. |
 | Android Automotive | emu-rs doesn't implement the vehicle HAL (`qemud:car`) or its audio HAL yet, so automotive images may not reach the launcher ([android.md](android.md)). |
 | Android TV | Not among the images emu-rs has booted so far. |
 | Android XR | Not booted on emu-rs yet. The images expect a sound card (stock enables `VirtioSndCard` for them); virtio-snd is being added to emu-rs. The room renders in the guest through gfxstream (emu-rs already defaults to ANGLE), but stock's other XR feature flags (`XrModeUI`, `XrHandAndEyePointers`, `VirtioMouse`, `MultiDisplay`, `BluetoothEmulation`) have no emu-rs equivalent yet. The dual-mode mouse matches stock's device (name, ids, event bits, axes); how the guest maps it to its hand ray and gaze pointers, and whether head pose and options over `xr_service` take effect, is unverified. `emu -create-avd` doesn't apply the XR profile (pass `-lcd 2560x2558@240 -memory 4096`); `sim-rs create` does. |
-| Apple Watch, Apple TV, Vision Pro input | The Digital Crown, Siri Remote and gaze/pinch aren't injected yet; sim-rs sends these devices the same touch and HID key messages as an iPhone, and whether each runtime honours them hasn't been checked. The API's `rotary` is Android-only. |
-| iOS rotation | `rotate` is Android-only. |
+| Apple Watch, Apple TV | The crown, gestures, Siri Remote buttons and touch surface use the messages Simulator.app sends (confirmed live by other projects on watchOS/tvOS 26.5 and 27), but not run by sim-rs. The crown's units per tick are a calibration. From Xcode 27 the guest can switch input to `dtuhidd` (once `com.apple.coredevice.dtuhidd.active` is set, e.g. by Device Hub), after which legacy HID buttons and keys are dropped; sim-rs doesn't detect that yet. |
+| Vision Pro | Gaze, pinch and the camera (look around, pan, orbit) go through Xcode's visionOS UI plugin in Simulator.app, whose messages aren't public; sim-rs sends plain touches, which no source confirms visionOS honours. auto-mobile can't script visionOS input either (auto-mobile #19055). |
+| iOS rotation | Runtimes that report device motion can ignore the orientation event (idb switches to a vendor-defined HID message through `dtuhidd` there); not handled. |
 | Every Apple form factor | Needs a Mac with the runtime installed; none could be booted in the environment the combined project was built in. |

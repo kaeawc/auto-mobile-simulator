@@ -87,11 +87,16 @@ scripts/automobile-harness-android.sh emulator-5554
   screen, density, shape, fold and inputs, inference from Apple device types and Android AVD
   configs), device/runtime models (labelled with platform and form factor) and selection,
   privacy service names, geometry,
-  gesture planning, HID usages and buttons, BGRA→RGBA conversion, `Frame` and PNG encoding.
-  No FFI.
+  gesture planning, HID usages and buttons (per form factor: the Siri Remote, crown steps, watch
+  gestures, orientations and the Purple orientation message), `carplay.rs` (StarkConfig, runtime
+  gate), `goldfish.rs` (stock emulator key names, the `qwerty2` key set, sensor masks), `xr.rs`
+  (Android XR commands and the `xr_service` messages), BGRA→RGBA conversion, `Frame` and PNG
+  encoding. No FFI.
 - `crates/sim-coresim` — the service boundary: `Context` (service + device set), `Device`
-  (lifecycle, apps, settings), `Display` (framebuffer surface, capture), `Hid` (touch, buttons,
-  keyboard). `rt.rs` holds the Objective-C runtime helpers.
+  (lifecycle, apps, settings, orientation, CarPlay), `Display` (framebuffer surface, capture; main
+  or external), `Hid` (touch, buttons, keyboard, the Digital Crown, watch gestures, the Siri
+  Remote's touch surface, CarPlay touches), `carplay.rs` (attaching the CarPlay display). `rt.rs`
+  holds the Objective-C runtime helpers.
 - `crates/sim-debug` — host-side introspection (no FFI): device process tree (`ps`), sockets
   (`lsof`), traffic (`nettop`), containers and files (confined to the device data dir), crash reports.
 - `crates/sim-netshape` — no-root network shaping: `native/netshape.c` (the injected socket/DNS
