@@ -36,6 +36,9 @@ pub struct Env {
     pub avd_home: PathBuf,
 }
 
+/// Where Android Studio puts the SDK, relative to the home directory.
+pub const DEFAULT_SDK: &str = if cfg!(target_os = "macos") { "Library/Android/sdk" } else { "Android/Sdk" };
+
 impl Env {
     /// `ANDROID_SDK_ROOT` / `ANDROID_HOME` (then the platform default) for the SDK;
     /// `ANDROID_AVD_HOME`, then `ANDROID_EMULATOR_HOME/avd`, then `ANDROID_USER_HOME/avd`,
@@ -44,7 +47,7 @@ impl Env {
         let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
         let home = var("HOME").unwrap_or_else(|| PathBuf::from("."));
         let sdk_root = var("ANDROID_SDK_ROOT").or_else(|| var("ANDROID_HOME")).or_else(|| {
-            let p = home.join("Library/Android/sdk");
+            let p = home.join(DEFAULT_SDK);
             p.is_dir().then_some(p)
         });
         let avd_home = var("ANDROID_AVD_HOME")

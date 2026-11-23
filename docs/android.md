@@ -100,16 +100,22 @@ emu -provision 36 -create-avd small36                   # platform-tools + googl
 emu -provision 35 -tag google_apis_playstore -create-avd play35 -lcd 480x800@240 -cores 2 -memory 1536
 emu -provision 36 -dry-run                              # resolve only: URL, size, sha1, install dir
 emu -provision 36 -no-renderer                          # skip the renderer (boots without graphics)
+emu -provision 34 -tag android-automotive               # no plain 34 image: picks the newest, 34-ext9
 emu -provision-renderer                                 # install or update just the renderer
 emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a -lcd 720x1280@320
 ```
 
 `crates/emu-sdk` reads Google's repository manifests (`repository2-3.xml`, and
-`sys-img/<tag>/sys-img2-3.xml` per tag), picks the newest stable archive for macOS/arm64,
-downloads it with the system's `/usr/bin/curl` (resumable, into `$ANDROID_HOME/.downloads`),
+`sys-img/<tag>/sys-img2-3.xml` per tag), picks the newest stable archive for the host
+(platform-tools for the machine it runs on; system images are host-independent; the renderer is
+always macOS/arm64's), downloads it with the system's `/usr/bin/curl` (resumable, into `$ANDROID_HOME/.downloads`),
 checks size and sha1, unpacks it with `/usr/bin/unzip` and moves it into the standard SDK layout.
 Installed packages are skipped, manifests are cached for a day, and the archive is deleted once
-unpacked. The SDK is `$ANDROID_SDK_ROOT`/`$ANDROID_HOME`, else `~/Library/Android/sdk`.
+unpacked. The SDK is `$ANDROID_SDK_ROOT`/`$ANDROID_HOME`, else Android Studio's default
+(`~/Library/Android/sdk` on macOS, `~/Android/Sdk` on Linux). An API level a tag publishes only
+at extension levels (Automotive's API 34 and 35) resolves to the newest of them. Provisioning
+works on Linux too, for preparing images and AVDs; there `-provision` skips the renderer, since
+only Apple silicon boots guests.
 
 **The renderer** comes out of the SDK's `emulator` package, fetched on demand: the archive
 (420.6 MB for 37.3.10) is verified like any other, but only `emulator/lib64/**` minus

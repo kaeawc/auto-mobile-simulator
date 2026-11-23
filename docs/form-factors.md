@@ -93,7 +93,7 @@ Foldable postures follow the stock emulator's hinge ranges: closed below 30°, h
 | Android foldable | the same image, `--form-factor foldable` | as phone, plus `fold <closed\|half-opened\|opened\|angle>` |
 | Wear OS | `--system-image "system-images;android-34;android-wear;arm64-v8a"` | touch, `rotary <ticks>`, `button back\|home\|power` |
 | Android TV | `--system-image "system-images;android-34;google-tv;arm64-v8a"` | `button up\|down\|left\|right\|select\|back\|home` |
-| Automotive | `--system-image "system-images;android-34;android-automotive;arm64-v8a"` | touch, `button back\|home`, `vehicle <property> [<value>]` (gear, speed, ignition, ...; unverified, see below) |
+| Automotive | `--system-image "system-images;android-34-ext9;android-automotive;arm64-v8a"` (API 34 and 35 Automotive images exist only at extension levels; `emu -provision 34 -tag android-automotive` picks `34-ext9`) | touch, `button back\|home`, `vehicle <property> [<value>]` (gear, speed, ignition, ...; unverified, see below) |
 | Android XR headset | `--system-image "system-images;android-34;google-xr;arm64-v8a"` (install: `emu -provision 34 -tag google-xr`) | `xr recenter`, `xr rotate X Y Z` (radians), `xr move DX DY DZ` (metres), `xr options day\|night PASSTHROUGH`, `xr input mouse\|hand\|eye`, `xr viewport pan\|zoom\|rotate`, `xr pointer X Y [move\|down\|up\|click]`, `xr hand\|eye X Y [aim\|press]`, `xr gesture right-pinch\|…`, `type` |
 | Android XR glasses | `--system-image "system-images;android-36;ai-glasses;arm64-v8a"` | as the headset (unverified, see below) |
 

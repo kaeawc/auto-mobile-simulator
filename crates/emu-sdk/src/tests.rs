@@ -436,3 +436,35 @@ fn installs_renderer_from_a_local_archive() {
     assert_eq!(std::fs::read_dir(sdk.downloads()).expect("ls").count(), 0, "useless archive deleted");
     let _ = std::fs::remove_dir_all(work);
 }
+
+#[test]
+fn bare_api_levels_fall_back_to_the_newest_extension_level() {
+    let m = Manifest::parse(
+        include_str!("../testdata/sys-img-android-automotive.xml"),
+        "https://dl.google.com/android/repository/sys-img/android-automotive/",
+    )
+    .expect("parse Automotive fixture");
+    let path = |api: &str| m.resolve_system_image(api, "android-automotive", "arm64-v8a", HOST).map(|d| d.path);
+    // Automotive has no plain API 34 or 35 image, only extension levels.
+    assert_eq!(path("34").expect("34"), "system-images;android-34-ext9;android-automotive;arm64-v8a");
+    assert_eq!(path("android-35").expect("35"), "system-images;android-35-ext15;android-automotive;arm64-v8a");
+    assert_eq!(path("33").expect("33"), "system-images;android-33;android-automotive;arm64-v8a", "exact match first");
+    assert_eq!(path("34-ext9").expect("explicit"), "system-images;android-34-ext9;android-automotive;arm64-v8a");
+    assert!(matches!(path("34-ext8"), Err(Error::UnknownPackage(..))), "an explicit extension level is never swapped");
+    assert!(matches!(path("3"), Err(Error::UnknownPackage(..))), "34-ext9 isn't an extension of 3");
+    assert!(matches!(path("36"), Err(Error::UnknownPackage(..))), "36.1 is a dev-channel preview, not 36");
+    let tv = m.resolve_system_image("34", "android-tv", "arm64-v8a", HOST);
+    assert!(matches!(tv, Err(Error::UnknownPackage(..))), "only the asked tag");
+}
+
+#[test]
+fn the_current_host_matches_the_build_target() {
+    let host = Host::current();
+    #[cfg(target_os = "linux")]
+    assert_eq!(host.os, "linux");
+    #[cfg(target_os = "macos")]
+    assert_eq!(host.os, "macosx");
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    assert_eq!(host, Host::MACOS_ARM64);
+    assert!(repo().resolve("platform-tools", Host { os: "linux", arch: "x64" }).is_ok());
+}

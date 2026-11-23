@@ -20,8 +20,20 @@ pub struct Host {
 }
 
 impl Host {
-    /// Apple silicon, the only host emu-rs runs on.
+    /// Apple silicon, the only host emu-rs boots guests on (and so the renderer's host).
     pub const MACOS_ARM64: Host = Host { os: "macosx", arch: "aarch64" };
+
+    /// The machine this binary runs on, for host tools such as platform-tools.
+    pub fn current() -> Host {
+        let os = if cfg!(target_os = "macos") {
+            "macosx"
+        } else if cfg!(target_os = "windows") {
+            "windows"
+        } else {
+            "linux"
+        };
+        Host { os, arch: if cfg!(target_arch = "aarch64") { "aarch64" } else { "x64" } }
+    }
 }
 
 impl fmt::Display for Host {
@@ -255,6 +267,24 @@ impl Manifest {
             .filter(|d| d.path == path)
             .max_by_key(|d| d.revision)
             .ok_or_else(|| Error::NoArchive(path.to_string(), host.to_string()))
+    }
+
+    /// The system image for `api`, `tag` and `abi`. When `api` is a bare level (`34`) that the
+    /// site publishes only at extension levels (Automotive's `34-ext9`), the newest of those.
+    pub fn resolve_system_image(&self, api: &str, tag: &str, abi: &str, host: Host) -> Result<Download> {
+        let path = system_image_path(api, tag, abi);
+        match self.resolve(&path, host) {
+            Err(Error::UnknownPackage(..)) if !api.contains("-ext") => {
+                let prefix = format!("{}-ext", api.strip_prefix("android-").unwrap_or(api));
+                let ext = |d: &Download| {
+                    let s = SysImagePath::parse(&d.path).filter(|s| s.tag == tag && s.abi == abi)?;
+                    s.api().strip_prefix(&prefix)?.parse::<u32>().ok()
+                };
+                let newest = self.latest(host).into_iter().filter_map(|d| Some((ext(&d)?, d))).max_by_key(|(n, _)| *n);
+                newest.map(|(_, d)| d).ok_or_else(|| Error::UnknownPackage(path, self.base_url.clone()))
+            }
+            r => r,
+        }
     }
 
     /// The newest stable version of every package that has an archive for `host`, by path.

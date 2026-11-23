@@ -9,7 +9,8 @@ use emu_sdk::{Host, Sdk, renderer};
 
 use crate::args::Opts;
 
-const HOST: Host = Host::MACOS_ARM64;
+/// Whether this host boots guests (and so needs the renderer).
+const BOOTS: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
 const DEFAULT_TAG: &str = "google_apis";
 const DEFAULT_ABI: &str = "arm64-v8a";
 
@@ -17,7 +18,7 @@ const DEFAULT_ABI: &str = "arm64-v8a";
 fn sdk(env: &Env) -> Result<Sdk> {
     let root = env.sdk_root.clone().unwrap_or_else(|| {
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        home.join("Library/Android/sdk")
+        home.join(emu_avd::DEFAULT_SDK)
     });
     Ok(Sdk::new(root)?)
 }
@@ -28,7 +29,7 @@ pub fn list_images(env: &Env, opts: &Opts) -> Result<()> {
     println!("{:<16} {:<28} {:>5} {:>9}  installed", "api", "tag", "rev", "size");
     let mut n = 0;
     for m in sdk.system_image_manifests(opts.tag.as_deref())? {
-        for d in m.system_images(HOST, opts.tag.as_deref(), abi) {
+        for d in m.system_images(Host::current(), opts.tag.as_deref(), abi) {
             let Some(p) = emu_sdk::SysImagePath::parse(&d.path) else { continue };
             let api = p.api();
             let have = if sdk.is_installed(&d.install_dir()) { "yes" } else { "" };
@@ -37,7 +38,11 @@ pub fn list_images(env: &Env, opts: &Opts) -> Result<()> {
         }
     }
     if n == 0 {
-        bail!("no stable {abi} system images for {HOST}{}", opts.tag.as_ref().map(|t| format!(" with tag {t}")).unwrap_or_default());
+        bail!(
+            "no stable {abi} system images for {}{}",
+            Host::current(),
+            opts.tag.as_ref().map(|t| format!(" with tag {t}")).unwrap_or_default()
+        );
     }
     Ok(())
 }
@@ -46,7 +51,6 @@ pub fn provision(env: &Env, api: &str, opts: &Opts) -> Result<()> {
     let sdk = sdk(env)?;
     let tag = opts.tag.as_deref().unwrap_or(DEFAULT_TAG);
     let abi = opts.abi.as_deref().unwrap_or(DEFAULT_ABI);
-    let image = emu_sdk::system_image_path(api, tag, abi);
     // Refuse before a multi-gigabyte download, not after.
     if let Some(name) = &opts.create_avd
         && (env.avd_home.join(format!("{name}.avd")).exists() || env.avd_home.join(format!("{name}.ini")).exists())
@@ -55,31 +59,27 @@ pub fn provision(env: &Env, api: &str, opts: &Opts) -> Result<()> {
     }
     println!("SDK: {}", sdk.root().display());
 
-    for (url, path) in [(emu_sdk::repository_url(), "platform-tools"), (emu_sdk::sys_img_url(tag), image.as_str())] {
-        let dir = emu_sdk::install_dir(path);
-        let installed = sdk.is_installed(&dir);
-        if installed && !opts.dry_run {
-            println!("have {path}");
-            continue;
-        }
-        let d = match sdk.manifest(&url)?.resolve(path, HOST) {
+    install(&sdk, opts, "platform-tools", || sdk.manifest(&emu_sdk::repository_url())?.resolve("platform-tools", Host::current()))?;
+    let mut image = emu_sdk::system_image_path(api, tag, abi);
+    if sdk.is_installed(&emu_sdk::install_dir(&image)) {
+        println!("have {image}");
+    } else {
+        let d = match sdk.manifest(&emu_sdk::sys_img_url(tag))?.resolve_system_image(api, tag, abi, Host::current()) {
             Err(e @ emu_sdk::Error::UnknownPackage(..)) => bail!("{e} (`emu -list-images -tag {tag}` shows what is available)"),
             r => r?,
         };
-        if opts.dry_run {
-            println!("{path} r{}{}", d.revision, if installed { " (installed)" } else { "" });
-            println!("  url  {}", d.url);
-            println!("  size {} ({})", d.size, emu_sdk::format_size(d.size));
-            println!("  sha1 {}", d.sha1);
-            println!("  into {}", sdk.root().join(&dir).display());
-            continue;
+        if d.path != image {
+            println!("{image} isn't published; {} is", d.path);
         }
-        println!("installing {path} r{}", d.revision);
-        let dest = sdk.install(&d)?;
-        println!("installed {path} r{} at {}", d.revision, dest.display());
+        image.clone_from(&d.path);
+        install(&sdk, opts, &image, || Ok(d))?;
     }
     if !opts.no_renderer {
-        renderer(&sdk, opts, opts.provision_renderer)?;
+        if BOOTS {
+            renderer(&sdk, opts, opts.provision_renderer)?;
+        } else {
+            println!("skipping the renderer: emu boots guests only on Apple silicon (-provision-renderer installs it anyway)");
+        }
     }
 
     if let Some(name) = &opts.create_avd {
@@ -91,6 +91,29 @@ pub fn provision(env: &Env, api: &str, opts: &Opts) -> Result<()> {
             crate::create_avd(&env, name, &sysdir, opts)?;
         }
     }
+    Ok(())
+}
+
+/// Installs package `path` unless the SDK has it; `resolve` finds its download. With `-dry-run`,
+/// prints what would be downloaded instead.
+fn install(sdk: &Sdk, opts: &Opts, path: &str, resolve: impl FnOnce() -> emu_sdk::Result<emu_sdk::Download>) -> Result<()> {
+    let dir = emu_sdk::install_dir(path);
+    if sdk.is_installed(&dir) {
+        println!("have {path}");
+        return Ok(());
+    }
+    let d = resolve()?;
+    if opts.dry_run {
+        println!("{path} r{}", d.revision);
+        println!("  url  {}", d.url);
+        println!("  size {} ({})", d.size, emu_sdk::format_size(d.size));
+        println!("  sha1 {}", d.sha1);
+        println!("  into {}", sdk.root().join(&dir).display());
+        return Ok(());
+    }
+    println!("installing {path} r{}", d.revision);
+    let dest = sdk.install(&d)?;
+    println!("installed {path} r{} at {}", d.revision, dest.display());
     Ok(())
 }
 
@@ -116,7 +139,7 @@ fn renderer(sdk: &Sdk, opts: &Opts, update: bool) -> Result<()> {
         println!("have renderer ({})", lib64.display());
         return Ok(());
     }
-    let d = sdk.manifest(&emu_sdk::repository_url())?.resolve(renderer::PACKAGE, HOST)?;
+    let d = sdk.manifest(&emu_sdk::repository_url())?.resolve(renderer::PACKAGE, Host::MACOS_ARM64)?;
     let have = installed.iter().find(|i| i.marker.revision == d.revision);
     if opts.dry_run {
         let state = match (have, &existing) {
