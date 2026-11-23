@@ -903,6 +903,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
+name = "emu-avd"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.6",
+ "sim-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3245,12 +3254,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sim-android"
+version = "0.1.0"
+dependencies = [
+ "emu-avd",
+ "png 0.18.1",
+ "sim-core",
+]
+
+[[package]]
 name = "sim-api"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "serde",
  "serde_json",
+ "sim-android",
  "sim-audio",
  "sim-core",
  "sim-coresim",
@@ -3278,6 +3297,7 @@ dependencies = [
 name = "sim-coresim"
 version = "0.1.0"
 dependencies = [
+ "block2 0.6.2",
  "objc2 0.6.5",
  "objc2-foundation 0.3.2",
  "sim-core",
@@ -3302,10 +3322,10 @@ dependencies = [
 name = "sim-rs-desktop"
 version = "0.1.0"
 dependencies = [
- "png 0.18.1",
  "rune",
  "serde",
  "serde_json",
+ "sim-android",
  "sim-api",
  "sim-core",
  "sim-coresim",

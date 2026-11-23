@@ -1,0 +1,820 @@
+//! Runtime binding to gfxstream's `stream_renderer_*` C API (virtio-gpu 3D on the host).
+//!
+//! The Android SDK ships the renderer as `emulator/lib64/libgfxstream_backend.dylib`; it is
+//! `dlopen`ed here so emu-rs needs no build-time dependency on it. The renderer is process-wide
+//! state, so there is at most one [`Renderer`] per process. Signatures follow
+//! `docs/reference/gfxstream/virtio-gpu-gfxstream-renderer.h`.
+#![cfg(target_os = "macos")]
+// `sym!` transmutes dlsym results to the type of the struct field it initializes.
+#![allow(clippy::missing_transmute_annotations)]
+
+mod macho;
+
+use std::collections::HashSet;
+use std::ffi::{CString, c_char, c_int, c_void};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+
+pub use emu_hvf::HostRange;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("loading {0}: {1}")]
+    Load(String, String),
+    #[error("missing symbol {0}")]
+    Symbol(&'static str),
+    #[error("{0} failed ({1})")]
+    Call(&'static str, i32),
+    #[error("the gfxstream renderer is already initialized in this process")]
+    AlreadyInitialized,
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Capability sets gfxstream exposes (virtio-gpu capset ids).
+pub mod capset {
+    pub const GFXSTREAM_VULKAN: u32 = 3;
+    pub const GFXSTREAM_GLES: u32 = 8;
+    pub const GFXSTREAM_COMPOSER: u32 = 9;
+    pub const ALL: [u32; 3] = [GFXSTREAM_VULKAN, GFXSTREAM_GLES, GFXSTREAM_COMPOSER];
+}
+
+/// `RendererFlags`.
+pub mod flags {
+    pub const USE_EGL: u64 = 1 << 0;
+    pub const USE_GLES: u64 = 1 << 4;
+    pub const USE_VK: u64 = 1 << 5;
+    /// Vulkan composition and posting. On macOS the GL post worker hands work to an
+    /// emulator-UI-thread hook that standalone hosts don't service (compose never completes).
+    pub const VULKAN_NATIVE_SWAPCHAIN: u64 = 1 << 8;
+}
+
+pub const FENCE_FLAG: u32 = 1 << 0;
+pub const FENCE_FLAG_RING_IDX: u32 = 1 << 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fence {
+    pub flags: u32,
+    pub fence_id: u64,
+    pub ctx_id: u32,
+    pub ring_idx: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResourceCreateArgs {
+    pub handle: u32,
+    pub target: u32,
+    pub format: u32,
+    pub bind: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub array_size: u32,
+    pub last_level: u32,
+    pub nr_samples: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Box3 {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+    pub w: u32,
+    pub h: u32,
+    pub d: u32,
+}
+
+#[repr(C)]
+struct Iov {
+    base: *mut c_void,
+    len: usize,
+}
+
+#[repr(C)]
+struct Param {
+    key: u64,
+    value: u64,
+}
+
+#[repr(C)]
+struct Command {
+    ctx_id: u32,
+    cmd_size: u32,
+    cmd: *mut u8,
+    num_in_fences: u32,
+    fences: *mut c_void,
+}
+
+#[repr(C)]
+struct CreateBlob {
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+}
+
+#[repr(C)]
+struct Debug {
+    debug_type: u32,
+    message: *const c_char,
+}
+
+type FenceCb = extern "C" fn(*mut c_void, *mut Fence);
+type DebugCb = extern "C" fn(*mut c_void, *mut Debug);
+
+struct Api {
+    init: unsafe extern "C" fn(*mut Param, u64) -> c_int,
+    get_cap_set: unsafe extern "C" fn(u32, *mut u32, *mut u32),
+    fill_caps: unsafe extern "C" fn(u32, u32, *mut c_void),
+    context_create: unsafe extern "C" fn(u32, u32, *const c_char, u32) -> c_int,
+    context_destroy: unsafe extern "C" fn(u32),
+    resource_create: unsafe extern "C" fn(*mut ResourceCreateArgs, *mut Iov, u32) -> c_int,
+    resource_unref: unsafe extern "C" fn(u32),
+    attach_iov: unsafe extern "C" fn(c_int, *mut Iov, c_int) -> c_int,
+    detach_iov: unsafe extern "C" fn(c_int, *mut *mut Iov, *mut c_int),
+    ctx_attach_resource: unsafe extern "C" fn(c_int, c_int),
+    ctx_detach_resource: unsafe extern "C" fn(c_int, c_int),
+    submit_cmd: unsafe extern "C" fn(*mut Command) -> c_int,
+    transfer_read_iov: unsafe extern "C" fn(u32, u32, u32, u32, u32, *mut Box3, u64, *mut Iov, c_int) -> c_int,
+    transfer_write_iov: unsafe extern "C" fn(u32, u32, c_int, u32, u32, *mut Box3, u64, *mut Iov, u32) -> c_int,
+    create_blob: unsafe extern "C" fn(u32, u32, *const CreateBlob, *const Iov, u32, *const c_void) -> c_int,
+    resource_map: unsafe extern "C" fn(u32, *mut *mut c_void, *mut u64) -> c_int,
+    resource_unmap: unsafe extern "C" fn(u32) -> c_int,
+    resource_map_info: unsafe extern "C" fn(u32, *mut u32) -> c_int,
+    create_fence: unsafe extern "C" fn(*const Fence) -> c_int,
+    suspend: unsafe extern "C" fn() -> c_int,
+    snapshot: unsafe extern "C" fn(*const c_char) -> c_int,
+    restore: unsafe extern "C" fn(*const c_char) -> c_int,
+    resume: unsafe extern "C" fn() -> c_int,
+}
+
+fn dlerror() -> String {
+    // SAFETY: dlerror returns a thread-local C string or null.
+    unsafe {
+        let e = libc::dlerror();
+        if e.is_null() { "unknown error".into() } else { std::ffi::CStr::from_ptr(e).to_string_lossy().into_owned() }
+    }
+}
+
+fn dlopen(path: &Path, global: bool) -> Result<*mut c_void> {
+    let c = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|e| Error::Load(path.display().to_string(), e.to_string()))?;
+    let mode = libc::RTLD_NOW | if global { libc::RTLD_GLOBAL } else { libc::RTLD_LOCAL };
+    // SAFETY: valid NUL-terminated path; the handle is intentionally never closed.
+    let h = unsafe { libc::dlopen(c.as_ptr(), mode) };
+    if h.is_null() { Err(Error::Load(path.display().to_string(), dlerror())) } else { Ok(h) }
+}
+
+macro_rules! sym {
+    ($h:expr, $name:literal) => {{
+        // SAFETY: the symbol name is a NUL-terminated literal; the transmute target matches the
+        // C prototype in virtio-gpu-gfxstream-renderer.h.
+        unsafe {
+            let p = libc::dlsym($h, concat!($name, "\0").as_ptr().cast());
+            if p.is_null() {
+                return Err(Error::Symbol($name));
+            }
+            std::mem::transmute::<*mut c_void, _>(p)
+        }
+    }};
+}
+
+impl Api {
+    fn load(h: *mut c_void) -> Result<Api> {
+        Ok(Api {
+            init: sym!(h, "stream_renderer_init"),
+            get_cap_set: sym!(h, "stream_renderer_get_cap_set"),
+            fill_caps: sym!(h, "stream_renderer_fill_caps"),
+            context_create: sym!(h, "stream_renderer_context_create"),
+            context_destroy: sym!(h, "stream_renderer_context_destroy"),
+            resource_create: sym!(h, "stream_renderer_resource_create"),
+            resource_unref: sym!(h, "stream_renderer_resource_unref"),
+            attach_iov: sym!(h, "stream_renderer_resource_attach_iov"),
+            detach_iov: sym!(h, "stream_renderer_resource_detach_iov"),
+            ctx_attach_resource: sym!(h, "stream_renderer_ctx_attach_resource"),
+            ctx_detach_resource: sym!(h, "stream_renderer_ctx_detach_resource"),
+            submit_cmd: sym!(h, "stream_renderer_submit_cmd"),
+            transfer_read_iov: sym!(h, "stream_renderer_transfer_read_iov"),
+            transfer_write_iov: sym!(h, "stream_renderer_transfer_write_iov"),
+            create_blob: sym!(h, "stream_renderer_create_blob"),
+            resource_map: sym!(h, "stream_renderer_resource_map"),
+            resource_unmap: sym!(h, "stream_renderer_resource_unmap"),
+            resource_map_info: sym!(h, "stream_renderer_resource_map_info"),
+            create_fence: sym!(h, "stream_renderer_create_fence"),
+            suspend: sym!(h, "stream_renderer_suspend"),
+            snapshot: sym!(h, "stream_renderer_snapshot"),
+            restore: sym!(h, "stream_renderer_restore"),
+            resume: sym!(h, "stream_renderer_resume"),
+        })
+    }
+}
+
+type FenceHandler = Arc<dyn Fn(Fence) + Send + Sync>;
+static FENCE_HANDLER: OnceLock<FenceHandler> = OnceLock::new();
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_fence(_: *mut c_void, fence: *mut Fence) {
+    if fence.is_null() {
+        return;
+    }
+    // SAFETY: the renderer passes a valid fence for the duration of the call.
+    let f = unsafe { *fence };
+    if let Some(h) = FENCE_HANDLER.get() {
+        h(f);
+    }
+}
+
+extern "C" fn on_debug(_: *mut c_void, d: *mut Debug) {
+    if d.is_null() {
+        return;
+    }
+    // SAFETY: valid for the duration of the call; message is NUL-terminated.
+    let (kind, msg) = unsafe { ((*d).debug_type, std::ffi::CStr::from_ptr((*d).message).to_string_lossy().into_owned()) };
+    if msg.contains("Failed to initialize global Vulkan emulation") {
+        VULKAN_FAILED.store(true, Ordering::Relaxed);
+    }
+    // 1 error, 2 warn, 3 info, 4 debug.
+    if kind <= 2 || (kind == 3 && VERBOSE.load(Ordering::Relaxed)) {
+        eprintln!("gfxstream: {}", msg.trim_end());
+    }
+}
+
+fn iovs(ranges: &[HostRange]) -> Vec<Iov> {
+    ranges.iter().map(|r| Iov { base: r.as_ptr().cast(), len: r.len() }).collect()
+}
+
+fn ok(name: &'static str, rc: c_int) -> Result<()> {
+    if rc == 0 { Ok(()) } else { Err(Error::Call(name, rc)) }
+}
+
+/// The initialized renderer. Calls may come from any thread.
+pub struct Renderer {
+    api: Api,
+    handle: *mut c_void,
+}
+
+// SAFETY: the dlopen handle is only used for dlsym, which is thread-safe.
+unsafe impl Send for Renderer {}
+// SAFETY: as above; renderer calls are thread-safe by the stream_renderer contract.
+unsafe impl Sync for Renderer {}
+
+/// The renderer library inside `lib64`.
+pub const BACKEND: &str = "libgfxstream_backend.dylib";
+
+/// The libraries `root` (a file in `lib64`) links from `lib64` itself, directly or indirectly,
+/// dependencies before their dependents; `root` is not included. Only `@rpath/<name>` and
+/// `@loader_path/<name>` references to files present in `lib64` count.
+pub fn bundled_deps(lib64: &Path, root: &str) -> Vec<PathBuf> {
+    fn visit(lib64: &Path, name: &str, seen: &mut HashSet<String>, out: &mut Vec<PathBuf>) {
+        if !seen.insert(name.to_string()) {
+            return;
+        }
+        let path = lib64.join(name);
+        for dep in macho::dylib_deps(&path).unwrap_or_default() {
+            let Some(dep) = dep.strip_prefix("@rpath/").or_else(|| dep.strip_prefix("@loader_path/")) else { continue };
+            if !dep.contains('/') && lib64.join(dep).is_file() {
+                visit(lib64, dep, seen, out);
+            }
+        }
+        out.push(path);
+    }
+    let mut out = Vec::new();
+    visit(lib64, root, &mut HashSet::new(), &mut out);
+    out.pop();
+    out
+}
+
+impl Renderer {
+    /// Loads the renderer from a `lib64` directory: the SDK's `emulator/lib64` or one installed by
+    /// `emu -provision-renderer`. The backend's `@rpath` dependencies are preloaded from the same
+    /// directory, leaves first, so dyld finds each one already loaded by install name and the
+    /// executable needs no rpath to it.
+    pub fn load(lib64: &Path) -> Result<Renderer> {
+        for dep in bundled_deps(lib64, BACKEND) {
+            dlopen(&dep, true)?;
+        }
+        let h = dlopen(&lib64.join(BACKEND), false)?;
+        Ok(Renderer { api: Api::load(h)?, handle: h })
+    }
+
+    /// Initializes the renderer for a `width`×`height` primary display. `on_fence` runs on a
+    /// renderer thread whenever a fence created with [`Renderer::create_fence`] signals.
+    pub fn init(&self, width: u32, height: u32, renderer_flags: u64, verbose: bool, on_fence: FenceHandler) -> Result<()> {
+        self.init_with_features(width, height, renderer_flags, None, verbose, on_fence)
+    }
+
+    /// Like [`Renderer::init`], with feature overrides: `"Name:enabled,Other:disabled"`.
+    pub fn init_with_features(
+        &self,
+        width: u32,
+        height: u32,
+        renderer_flags: u64,
+        features: Option<&str>,
+        verbose: bool,
+        on_fence: FenceHandler,
+    ) -> Result<()> {
+        if INITIALIZED.swap(true, Ordering::SeqCst) {
+            return Err(Error::AlreadyInitialized);
+        }
+        VERBOSE.store(verbose, Ordering::Relaxed);
+        let _ = FENCE_HANDLER.set(on_fence);
+        let features = features.map(|f| CString::new(f).unwrap_or_default());
+        let mut params = vec![
+            Param { key: 1, value: 0 },
+            Param { key: 2, value: renderer_flags },
+            Param { key: 3, value: on_fence_ptr() },
+            Param { key: 4, value: u64::from(width) },
+            Param { key: 5, value: u64::from(height) },
+            Param { key: 6, value: on_debug_ptr() },
+        ];
+        if let Some(f) = &features {
+            params.push(Param { key: 11, value: f.as_ptr() as usize as u64 });
+        }
+        // SAFETY: params (and the features string) outlive the call; callbacks are 'static.
+        ok("stream_renderer_init", unsafe { (self.api.init)(params.as_mut_ptr(), params.len() as u64) })
+    }
+
+    /// (max version, max size) of a capability set, or None if unsupported.
+    pub fn capset_info(&self, id: u32) -> Option<(u32, u32)> {
+        let (mut ver, mut size) = (0u32, 0u32);
+        // SAFETY: out-pointers reference live locals.
+        unsafe { (self.api.get_cap_set)(id, &mut ver, &mut size) };
+        (size > 0).then_some((ver, size))
+    }
+
+    pub fn capset(&self, id: u32, version: u32) -> Vec<u8> {
+        let Some((_, size)) = self.capset_info(id) else { return Vec::new() };
+        let mut buf = vec![0u8; size as usize];
+        // SAFETY: buf has exactly the size the renderer reported for this capset.
+        unsafe { (self.api.fill_caps)(id, version, buf.as_mut_ptr().cast()) };
+        buf
+    }
+
+    pub fn context_create(&self, ctx_id: u32, name: &[u8], context_init: u32) -> Result<()> {
+        // SAFETY: name pointer/length pair describes a live slice.
+        ok("context_create", unsafe { (self.api.context_create)(ctx_id, name.len() as u32, name.as_ptr().cast(), context_init) })
+    }
+
+    pub fn context_destroy(&self, ctx_id: u32) {
+        // SAFETY: plain call.
+        unsafe { (self.api.context_destroy)(ctx_id) }
+    }
+
+    /// Creates a resource, optionally backed by guest memory ranges.
+    pub fn resource_create(&self, mut args: ResourceCreateArgs, backing: &[HostRange]) -> Result<()> {
+        let mut v = iovs(backing);
+        let p = if v.is_empty() { std::ptr::null_mut() } else { v.as_mut_ptr() };
+        // SAFETY: the iovecs point into guest RAM, which outlives the renderer.
+        ok("resource_create", unsafe { (self.api.resource_create)(&mut args, p, v.len() as u32) })
+    }
+
+    pub fn resource_unref(&self, id: u32) {
+        // SAFETY: plain call.
+        unsafe { (self.api.resource_unref)(id) }
+    }
+
+    pub fn attach_backing(&self, id: u32, backing: &[HostRange]) -> Result<()> {
+        // The renderer keeps the iovec array, so it must outlive the resource: leak it.
+        let v = Box::leak(iovs(backing).into_boxed_slice());
+        // SAFETY: the array is leaked (lives forever) and points into guest RAM.
+        ok("attach_iov", unsafe { (self.api.attach_iov)(id as c_int, v.as_mut_ptr(), v.len() as c_int) })
+    }
+
+    pub fn detach_backing(&self, id: u32) {
+        let (mut p, mut n) = (std::ptr::null_mut(), 0);
+        // SAFETY: out-pointers reference live locals.
+        unsafe { (self.api.detach_iov)(id as c_int, &mut p, &mut n) }
+    }
+
+    pub fn ctx_attach_resource(&self, ctx: u32, res: u32) {
+        // SAFETY: plain call.
+        unsafe { (self.api.ctx_attach_resource)(ctx as c_int, res as c_int) }
+    }
+
+    pub fn ctx_detach_resource(&self, ctx: u32, res: u32) {
+        // SAFETY: plain call.
+        unsafe { (self.api.ctx_detach_resource)(ctx as c_int, res as c_int) }
+    }
+
+    pub fn submit(&self, ctx: u32, cmd: &mut [u8]) -> Result<()> {
+        let mut c =
+            Command { ctx_id: ctx, cmd_size: cmd.len() as u32, cmd: cmd.as_mut_ptr(), num_in_fences: 0, fences: std::ptr::null_mut() };
+        // SAFETY: the command buffer lives for the call.
+        ok("submit_cmd", unsafe { (self.api.submit_cmd)(&mut c) })
+    }
+
+    /// Copies resource contents into `dst` (guest backing when `dst` is empty).
+    #[allow(clippy::too_many_arguments)]
+    pub fn transfer_read(
+        &self,
+        res: u32,
+        ctx: u32,
+        level: u32,
+        stride: u32,
+        layer_stride: u32,
+        mut b: Box3,
+        offset: u64,
+        dst: &[HostRange],
+    ) -> Result<()> {
+        let mut v = iovs(dst);
+        let p = if v.is_empty() { std::ptr::null_mut() } else { v.as_mut_ptr() };
+        // SAFETY: iovecs (if any) point into memory valid for the call.
+        ok("transfer_read_iov", unsafe {
+            (self.api.transfer_read_iov)(res, ctx, level, stride, layer_stride, &mut b, offset, p, v.len() as c_int)
+        })
+    }
+
+    /// Reads into a host buffer (e.g. a scanout frame).
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_into(&self, res: u32, stride: u32, b: Box3, out: &mut [u8]) -> Result<()> {
+        // SAFETY: `out` is a live, exclusively borrowed buffer for the duration of the call.
+        let r = unsafe { HostRange::from_raw(out.as_mut_ptr(), out.len()) };
+        self.transfer_read(res, 0, 0, stride, 0, b, 0, &[r])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn transfer_write(&self, res: u32, ctx: u32, level: u32, stride: u32, layer_stride: u32, mut b: Box3, offset: u64) -> Result<()> {
+        // SAFETY: no iovecs: the renderer uses the resource's attached guest backing.
+        ok("transfer_write_iov", unsafe {
+            (self.api.transfer_write_iov)(res, ctx, level as c_int, stride, layer_stride, &mut b, offset, std::ptr::null_mut(), 0)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_blob(
+        &self,
+        ctx: u32,
+        res: u32,
+        blob_mem: u32,
+        blob_flags: u32,
+        blob_id: u64,
+        size: u64,
+        backing: &[HostRange],
+    ) -> Result<()> {
+        let b = CreateBlob { blob_mem, blob_flags, blob_id, size };
+        let v = Box::leak(iovs(backing).into_boxed_slice());
+        let p = if v.is_empty() { std::ptr::null() } else { v.as_ptr() };
+        // SAFETY: the blob descriptor lives for the call; the iovec array is leaked because the
+        // renderer may keep it for guest-memory blobs.
+        ok("create_blob", unsafe { (self.api.create_blob)(ctx, res, &b, p, v.len() as u32, std::ptr::null()) })
+    }
+
+    /// Host mapping of a mappable blob.
+    pub fn map(&self, res: u32) -> Result<HostRange> {
+        let (mut p, mut size) = (std::ptr::null_mut(), 0u64);
+        // SAFETY: out-pointers reference live locals.
+        ok("resource_map", unsafe { (self.api.resource_map)(res, &mut p, &mut size) })?;
+        // SAFETY: the renderer keeps the mapping alive until resource_unmap/unref.
+        Ok(unsafe { HostRange::from_raw(p.cast(), size as usize) })
+    }
+
+    pub fn unmap(&self, res: u32) -> Result<()> {
+        // SAFETY: plain call.
+        ok("resource_unmap", unsafe { (self.api.resource_unmap)(res) })
+    }
+
+    pub fn map_info(&self, res: u32) -> u32 {
+        let mut info = 0u32;
+        // SAFETY: out-pointer references a live local.
+        let _ = unsafe { (self.api.resource_map_info)(res, &mut info) };
+        info
+    }
+
+    pub fn create_fence(&self, f: Fence) -> Result<()> {
+        // SAFETY: the fence lives for the call.
+        ok("create_fence", unsafe { (self.api.create_fence)(&f) })
+    }
+
+    /// Stops renderer work ahead of a snapshot (the guest must be paused).
+    pub fn suspend(&self) -> Result<()> {
+        // SAFETY: no arguments.
+        ok("suspend", unsafe { (self.api.suspend)() })
+    }
+
+    /// Writes the renderer's state into directory `dir`.
+    pub fn snapshot(&self, dir: &Path) -> Result<()> {
+        let c = CString::new(dir.as_os_str().as_encoded_bytes()).map_err(|_| Error::Call("snapshot", -22))?;
+        // SAFETY: NUL-terminated path valid for the call.
+        ok("snapshot", unsafe { (self.api.snapshot)(c.as_ptr()) })
+    }
+
+    /// Loads the renderer's state from `dir` (before the guest runs).
+    pub fn restore(&self, dir: &Path) -> Result<()> {
+        let c = CString::new(dir.as_os_str().as_encoded_bytes()).map_err(|_| Error::Call("restore", -22))?;
+        // SAFETY: NUL-terminated path valid for the call.
+        ok("restore", unsafe { (self.api.restore)(c.as_ptr()) })
+    }
+
+    pub fn resume(&self) -> Result<()> {
+        // SAFETY: no arguments.
+        ok("resume", unsafe { (self.api.resume)() })
+    }
+}
+
+fn on_fence_ptr() -> u64 {
+    on_fence as FenceCb as usize as u64
+}
+
+fn on_debug_ptr() -> u64 {
+    on_debug as DebugCb as usize as u64
+}
+
+/// Host Vulkan driver for the renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Icd {
+    /// Metal, on the host GPU.
+    MoltenVk,
+    /// Software (llvmpipe); always works, uses CPU.
+    Lavapipe,
+    SwiftShader,
+}
+
+impl Icd {
+    pub fn manifest(self) -> &'static str {
+        match self {
+            Icd::MoltenVk => "MoltenVK_icd.json",
+            Icd::Lavapipe => "lvp_icd.json",
+            Icd::SwiftShader => "vk_swiftshader_icd.json",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Icd::MoltenVk => "moltenvk",
+            Icd::Lavapipe => "lavapipe",
+            Icd::SwiftShader => "swiftshader",
+        }
+    }
+}
+
+/// Whether the renderer brought up Vulkan (false after "Failed to initialize global Vulkan").
+pub fn vulkan_ok() -> bool {
+    !VULKAN_FAILED.load(Ordering::Relaxed)
+}
+
+static VULKAN_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Points the renderer at its Vulkan loader and ICDs (MoltenVK by default). gfxstream resolves
+/// `lib64/vulkan/*` and `lib64/gles_*` relative to its "launcher directory", which defaults to
+/// the executable's directory; set it to the parent of the renderer's `lib64` (the SDK's
+/// `emulator/`, or `<sdk>/emu-rs/renderer/<revision>/`).
+///
+/// Call before spawning threads that might read the environment.
+pub fn configure_environment(emulator_dir: &Path, icd: Icd) {
+    let vk = emulator_dir.join("lib64/vulkan");
+    let loader = vk.join("libvulkan.dylib");
+    let mut vars = vec![("ANDROID_EMULATOR_LAUNCHER_DIR", emulator_dir.as_os_str().to_owned())];
+    if loader.is_file() {
+        vars.push(("ANDROID_EMU_VK_LOADER_PATH", loader.into_os_string()));
+    }
+    // The loader otherwise searches only system ICD directories (found empty on macOS).
+    let manifest = vk.join(icd.manifest());
+    if manifest.is_file() {
+        vars.push(("VK_DRIVER_FILES", manifest.clone().into_os_string()));
+        vars.push(("VK_ICD_FILENAMES", manifest.into_os_string()));
+    }
+    vars.push(("ANDROID_EMU_VK_ICD", icd.name().into()));
+    // Host GLES through ANGLE (Metal) instead of the deprecated desktop GL, which lacks GLSL ES 3.
+    vars.push(("ANDROID_EGL_ON_EGL", "1".into()));
+    // ANGLE's default display on macOS is its CGL backend, whose context setup for a
+    // ColorBuffer's display surface hangs inside libGL (blocking that render thread and with it
+    // the guest's pipe reads). Metal is what the backend is meant to run on here.
+    vars.push(("ANGLE_DEFAULT_PLATFORM", "metal".into()));
+    if icd == Icd::MoltenVk {
+        // What gfxstream configures for MoltenVK: its compositor shaders fail to convert with
+        // Metal argument buffers on.
+        vars.push(("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0".into()));
+        vars.push(("MVK_CONFIG_VK_SEMAPHORE_SUPPORT_STYLE", "0".into()));
+        vars.push(("MVK_CONFIG_USE_MTLHEAP", "1".into()));
+    }
+    for (k, v) in vars {
+        if std::env::var_os(k).is_none() {
+            // SAFETY: documented precondition: called while the process is single-threaded
+            // with respect to environment access.
+            unsafe { std::env::set_var(k, v) };
+        }
+    }
+}
+
+/// Makes `<exe dir>/lib64` lead to `lib64`. gfxstream `dlopen`s some libraries by bare name
+/// (`libshadertranslator.dylib`), which dyld resolves only through the executable's rpaths, one
+/// of which is `@executable_path/lib64` (`apps/emu/build.rs`). In an SDK overlay `lib64` is
+/// already there (a real directory, left alone); for a build in `target/` a symlink is created,
+/// or repointed when it leads to another renderer (an old revision, another SDK). Best effort:
+/// skipped if the directory isn't writable. Returns the link when it leads to `lib64`.
+pub fn link_beside_exe(lib64: &Path) -> Option<PathBuf> {
+    let link = std::env::current_exe().ok()?.parent()?.join("lib64");
+    match std::fs::read_link(&link) {
+        Ok(target) if target == lib64 => return Some(link),
+        Ok(_) => {
+            // Replace atomically: a concurrent emu may be resolving through the old link.
+            let tmp = link.with_file_name(format!(".lib64.{}", std::process::id()));
+            let _ = std::fs::remove_file(&tmp);
+            std::os::unix::fs::symlink(lib64, &tmp).ok()?;
+            std::fs::rename(&tmp, &link).ok()?;
+        }
+        Err(_) if link.symlink_metadata().is_ok() => return None, // a real directory
+        Err(_) => std::os::unix::fs::symlink(lib64, &link).ok()?,
+    }
+    Some(link)
+}
+
+/// A frame the renderer posted to a display (read back to host memory).
+pub struct PostedFrame<'a> {
+    pub display: u32,
+    pub width: u32,
+    pub height: u32,
+    /// GL format of `pixels` (0x1908 RGBA, 0x80E1 BGRA).
+    pub gl_format: u32,
+    /// Rows are bottom-up when false.
+    pub top_down: bool,
+    pub pixels: &'a [u8],
+}
+
+type PostHandler = Box<dyn Fn(PostedFrame<'_>) + Send + Sync>;
+static POST_HANDLER: OnceLock<PostHandler> = OnceLock::new();
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn on_post(
+    _ctx: *mut c_void,
+    display: u32,
+    width: c_int,
+    height: c_int,
+    ydir: c_int,
+    format: c_int,
+    _ty: c_int,
+    pixels: *mut u8,
+) {
+    let (Ok(w), Ok(h)) = (u32::try_from(width), u32::try_from(height)) else { return };
+    if pixels.is_null() || w == 0 || h == 0 {
+        return;
+    }
+    let Some(handler) = POST_HANDLER.get() else { return };
+    // SAFETY: the renderer passes a w*h*4 readback buffer valid for the call.
+    let px = unsafe { std::slice::from_raw_parts(pixels, w as usize * h as usize * 4) };
+    handler(PostedFrame { display, width: w, height: h, gl_format: format as u32, top_down: ydir != -1, pixels: px });
+}
+
+type PostFn = extern "C" fn(*mut c_void, u32, c_int, c_int, c_int, c_int, c_int, *mut u8);
+type GetFb = unsafe extern "C" fn() -> *mut c_void;
+type SetPostCallback = unsafe extern "C" fn(*mut c_void, Option<PostFn>, *mut c_void, u32, bool);
+
+impl Renderer {
+    /// Receives every frame the renderer posts to displays 0–3 (host composition), read back
+    /// asynchronously as BGRA. This is how the stock emulator streams its screen. Uses the
+    /// renderer's exported C++ `FrameBuffer::getFB()` / `setPostCallback`.
+    pub fn set_post_callback(&self, handler: PostHandler) -> Result<()> {
+        let _ = POST_HANDLER.set(handler);
+        let h = self.handle;
+        let get_fb: GetFb = sym!(h, "_ZN9gfxstream4host11FrameBuffer5getFBEv");
+        let set_cb: SetPostCallback = sym!(h, "_ZN9gfxstream4host11FrameBuffer15setPostCallbackEPFvPvjiiiiiPhES2_jb");
+        // SAFETY: getFB returns the renderer's singleton (or null before init); setPostCallback
+        // is a member function whose `this` is the first argument (Itanium C++ ABI).
+        unsafe {
+            let fb = get_fb();
+            if fb.is_null() {
+                return Err(Error::Call("FrameBuffer::getFB", 0));
+            }
+            // The guest composer may create its primary display with a non-zero host id.
+            for display in 0..4 {
+                set_cb(fb, Some(on_post as PostFn), std::ptr::null_mut(), display, true);
+            }
+        }
+        Ok(())
+    }
+}
+
+type OnLastColorBufferRef = unsafe extern "C" fn(*mut c_void, u32);
+
+type GetLastPosted = unsafe extern "C" fn(*mut c_void) -> u32;
+type FlushFromVk = unsafe extern "C" fn(*mut c_void, u32) -> bool;
+type ReadColorBuffer = unsafe extern "C" fn(*mut c_void, u32, i32, i32, i32, i32, u32, *mut c_void, u64);
+
+/// `GfxstreamFormat::R8G8B8A8_UNORM`.
+const GFXSTREAM_RGBA8: u32 = 1;
+
+impl Renderer {
+    /// The last color buffer the renderer posted (host composition's output), read back as
+    /// RGBA, `width` x `height`, top row first. Composition runs in Vulkan, and reads go
+    /// through GL, so the Vulkan image is synced to GL first; the renderer's own readback
+    /// paths (post callback, `getScreenshot`) skip that and return stale or garbage pixels.
+    pub fn read_last_posted(&self, width: u32, height: u32) -> Result<Vec<u8>> {
+        let h = self.handle;
+        let get_fb: GetFb = sym!(h, "_ZN9gfxstream4host11FrameBuffer5getFBEv");
+        let last: GetLastPosted = sym!(h, "_ZN9gfxstream4host11FrameBuffer24getLastPostedColorBufferEv");
+        let flush: FlushFromVk = sym!(h, "_ZN9gfxstream4host11FrameBuffer22flushColorBufferFromVkEj");
+        let read: ReadColorBuffer = sym!(h, "_ZN9gfxstream4host11FrameBuffer15readColorBufferEjiiiiNS0_15GfxstreamFormatEPvy");
+        let mut px = vec![0u8; width as usize * height as usize * 4];
+        // SAFETY: member functions with `this` first (Itanium ABI); readColorBuffer writes at
+        // most the size we pass.
+        unsafe {
+            let fb = get_fb();
+            if fb.is_null() {
+                return Err(Error::Call("FrameBuffer::getFB", 0));
+            }
+            let cb = last(fb);
+            if cb == 0 {
+                return Err(Error::Call("FrameBuffer::getLastPostedColorBuffer", 0));
+            }
+            flush(fb, cb);
+            read(fb, cb, 0, 0, width as i32, height as i32, GFXSTREAM_RGBA8, px.as_mut_ptr().cast(), px.len() as u64);
+        }
+        Ok(px)
+    }
+}
+
+impl Renderer {
+    /// Frees color buffer `handle` once its last guest reference is gone (the guest's
+    /// `refcount` pipe closed). Needs the RefCountPipe feature, under which consumers' explicit
+    /// closes no longer free buffers.
+    pub fn release_color_buffer(&self, handle: u32) -> Result<()> {
+        let h = self.handle;
+        let get_fb: GetFb = sym!(h, "_ZN9gfxstream4host11FrameBuffer5getFBEv");
+        let on_last: OnLastColorBufferRef = sym!(h, "_ZN9gfxstream4host11FrameBuffer20onLastColorBufferRefEj");
+        // SAFETY: getFB returns the singleton or null; onLastColorBufferRef is a member function
+        // taking `this` first (Itanium ABI) and tolerates unknown handles.
+        unsafe {
+            let fb = get_fb();
+            if fb.is_null() {
+                return Err(Error::Call("FrameBuffer::getFB", 0));
+            }
+            on_last(fb, handle);
+        }
+        Ok(())
+    }
+}
+
+/// Resolves a guest-physical address to the host address backing it (null if unmapped).
+pub type DmaTranslator = Box<dyn Fn(u64) -> *mut u8 + Send + Sync>;
+static DMA: std::sync::RwLock<Option<DmaTranslator>> = std::sync::RwLock::new(None);
+
+extern "C" fn dma_get_host_addr(gpa: u64) -> *mut c_void {
+    match DMA.read() {
+        Ok(g) => g.as_ref().map_or(std::ptr::null_mut(), |f| f(gpa).cast()),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+extern "C" fn dma_unlock(_gpa: u64) {}
+
+type SetDmaGetHostAddr = unsafe extern "C" fn(Option<extern "C" fn(u64) -> *mut c_void>);
+type SetDmaUnlock = unsafe extern "C" fn(Option<extern "C" fn(u64)>);
+
+impl Renderer {
+    /// Installs how the renderer turns guest-physical addresses into host pointers. The guest's
+    /// gralloc reads color buffers into goldfish address-space memory by physical address
+    /// (`rcReadColorBufferDMA`), and direct-mapped GL buffers work the same way; the stock
+    /// emulator registers these through the renderer's exported DMA hooks. Pass `None` before
+    /// the memory the translator points into goes away.
+    pub fn set_dma_translator(&self, translate: Option<DmaTranslator>) -> Result<()> {
+        *DMA.write().unwrap_or_else(|e| e.into_inner()) = translate;
+        let h = self.handle;
+        let set_addr: SetDmaGetHostAddr = sym!(h, "_ZN9gfxstream4host31set_gfxstream_dma_get_host_addrEPFPvyE");
+        let set_unlock: SetDmaUnlock = sym!(h, "_ZN9gfxstream4host24set_gfxstream_dma_unlockEPFvyE");
+        // SAFETY: both setters store a plain function pointer; ours stay valid for the process.
+        unsafe {
+            set_addr(Some(dma_get_host_addr));
+            set_unlock(Some(dma_unlock));
+        }
+        Ok(())
+    }
+}
+
+/// A renderer mapping widened to `len` bytes (whole guest pages). Renderer allocations are
+/// page-aligned and page-granular, so the extra tail is part of the same allocation.
+pub fn page_range(host: HostRange, len: usize) -> HostRange {
+    // SAFETY: see above; the range starts at the renderer's page-aligned mapping.
+    unsafe { HostRange::from_raw(host.as_ptr(), len.max(host.len())) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_deps_are_ordered_leaves_first() {
+        let dir = std::env::temp_dir().join(format!("emu-gfxstream-deps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let write = |name: &str, deps: &[&str]| {
+            std::fs::write(dir.join(name), macho::tests::fake_dylib(&format!("@rpath/{name}"), deps)).expect("write");
+        };
+        // backend -> common -> {metrics -> abseil, abseil}; backend -> abseil; a cycle back to
+        // common; system and missing libraries are skipped; unrelated files aren't loaded.
+        write(BACKEND, &["@rpath/libcommon.dylib", "@rpath/libabseil.dylib", "/usr/lib/libc++.1.dylib", "@rpath/libmissing.dylib"]);
+        write("libcommon.dylib", &["@rpath/libmetrics.dylib", "@loader_path/libabseil.dylib"]);
+        write("libmetrics.dylib", &["@rpath/libabseil.dylib", "@rpath/libcommon.dylib"]);
+        write("libabseil.dylib", &[]);
+        write("libunrelated.dylib", &[]);
+        let order: Vec<String> =
+            bundled_deps(&dir, BACKEND).iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
+        assert_eq!(order, ["libabseil.dylib", "libmetrics.dylib", "libcommon.dylib"]);
+        assert!(bundled_deps(&dir.join("nowhere"), BACKEND).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

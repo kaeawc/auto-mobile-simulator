@@ -8,13 +8,16 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use sim_core::debug;
 use sim_core::device::{DeviceState, privacy_service};
-use sim_core::geometry::{Point, Size};
-use sim_core::gesture::{self, Phase, Sample};
-use sim_core::hid::{Button, KEY_LEFT_SHIFT, keystroke};
-use sim_coresim::{Appearance, Context, Device, Direction, Hid, StatusBar};
+use sim_core::form_factor::FormFactor;
+use sim_core::geometry::Size;
+use sim_core::gesture::Sample;
+use sim_core::hid::{KEY_LEFT_SHIFT, keystroke};
+use sim_coresim::{Appearance, Context, Device, Direction, Hid, Orientation, StatusBar, WatchGesture};
 
-use crate::encode_png;
-use crate::params::{err, need_bool, need_f64, need_str, opt_u64, pairs, str_param, strings};
+use crate::params::{
+    button, crown_delta, err, need_bool, need_f64, need_str, on_carplay, opt_form_factor, opt_orientation, opt_u64, pairs,
+    remote_swipe_samples, screenshot_result, str_param, strings, swipe_samples, tap_samples, touch_sample,
+};
 
 /// Shaping proxies, one per device, owned by this (long-running) process.
 static PROXIES: std::sync::Mutex<Option<std::collections::HashMap<String, sim_netshape::proxy::Proxy>>> = std::sync::Mutex::new(None);
@@ -160,12 +163,48 @@ fn screen(device: &Device) -> Result<Size, String> {
     Ok(Size::new(f64::from(w), f64::from(h)))
 }
 
+/// The display a method's `display` parameter picks: the device's own, or its CarPlay screen.
+fn display_of(device: &Device, p: &Value) -> Result<sim_coresim::Display, String> {
+    if on_carplay(p)? { device.external_display() } else { device.display() }.map_err(err)
+}
+
+/// The CarPlay screen's size: the car display sim-rs attaches.
+fn carplay_screen() -> Size {
+    Size::new(f64::from(sim_core::carplay::WIDTH), f64::from(sim_core::carplay::HEIGHT))
+}
+
 fn play(hid: &Hid, screen: Size, samples: &[Sample]) -> Result<(), String> {
     for s in samples {
         sleep(s.delay);
         hid.touch(screen.normalize(s.point), s.phase).map_err(err)?;
     }
     Ok(())
+}
+
+/// Plays touch samples on the device's screen, or its CarPlay screen (`display: "carplay"`).
+fn play_on(device: &Device, p: &Value, samples: &[Sample]) -> Result<Value, String> {
+    let hid = device.hid().map_err(err)?;
+    if !on_carplay(p)? {
+        return play(&hid, screen(device)?, samples).map(|()| Value::Null);
+    }
+    for s in samples {
+        sleep(s.delay);
+        hid.carplay_touch(carplay_screen().normalize(s.point), s.phase).map_err(err)?;
+    }
+    Ok(Value::Null)
+}
+
+/// The orientation sim-rs last set per device (UDID), so `rotate` without one turns 90° from there.
+static ORIENTATIONS: std::sync::Mutex<Option<std::collections::HashMap<String, Orientation>>> = std::sync::Mutex::new(None);
+
+fn rotate(device: &Device, wanted: Option<Orientation>) -> Result<Value, String> {
+    let udid = device.info().udid;
+    let mut guard = ORIENTATIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let known = guard.get_or_insert_with(Default::default);
+    let next = wanted.unwrap_or_else(|| known.get(&udid).copied().unwrap_or(Orientation::Portrait).clockwise());
+    device.set_orientation(next).map_err(err)?;
+    known.insert(udid, next);
+    Ok(json!({"orientation": next.as_str()}))
 }
 
 /// Presses and releases one key.
@@ -213,6 +252,24 @@ fn pids(udid: &str) -> Result<Vec<i32>, String> {
     Ok(sim_debug::process::collect(udid)?.iter().map(|p| p.pid).collect())
 }
 
+/// Rejects a `create` whose device type isn't the requested form factor. CarPlay (auto) is valid
+/// for iOS but isn't a device type of its own.
+fn check_form_factor(ctx: &Context, device_type: &str, form_factor: FormFactor) -> Result<(), String> {
+    if form_factor == FormFactor::Auto {
+        return Err("CarPlay is a display attached to an iPhone simulator, not a device type: create an iPhone, boot it, then call \
+                    `carplay` with on=true (iOS 26 runtimes)"
+            .into());
+    }
+    let types = ctx.device_types().map_err(err)?;
+    let actual = types.iter().find(|t| t.name == device_type || t.identifier == device_type).and_then(|t| t.form_factor);
+    match actual {
+        Some(actual) if actual != form_factor => {
+            Err(format!("device type `{device_type}` is a {}, not a {}", actual.as_str(), form_factor.as_str()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Dispatches one device method.
 pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     let ok = |r: sim_coresim::Result<()>| r.map(|()| Value::Null).map_err(err);
@@ -226,7 +283,11 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "runtimes" => serde_json::to_value(s.ctx()?.runtimes().map_err(err)?).map_err(err),
         "device_types" => serde_json::to_value(s.ctx()?.device_types().map_err(err)?).map_err(err),
         "create" => {
-            let d = s.ctx()?.create(need_str(p, "name")?, need_str(p, "device_type")?, need_str(p, "runtime")?).map_err(err)?;
+            let device_type = need_str(p, "device_type")?;
+            if let Some(form_factor) = opt_form_factor(p)? {
+                check_form_factor(s.ctx()?, device_type, form_factor)?;
+            }
+            let d = s.ctx()?.create(need_str(p, "name")?, device_type, need_str(p, "runtime")?).map_err(err)?;
             serde_json::to_value(d.info()).map_err(err)
         }
         "delete" => {
@@ -247,53 +308,45 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "shutdown" => ok(s.device(p)?.shutdown()),
         "erase" => ok(s.device(p)?.erase()),
         "screen" => {
-            let size = screen(&s.device(p)?)?;
-            Ok(json!({"width": size.width, "height": size.height}))
+            let (w, h) = display_of(&s.device(p)?, p)?.size().map_err(err)?;
+            Ok(json!({"width": w, "height": h}))
         }
-        "screenshot" => {
-            let frame = s.device(p)?.display().and_then(|d| d.capture()).map_err(err)?;
-            let png = encode_png(&frame)?;
-            match str_param(p, "path") {
-                Some(path) => {
-                    std::fs::write(path, &png).map(|()| json!({"path": path, "width": frame.width, "height": frame.height})).map_err(err)
-                }
-                None => {
-                    Ok(json!({"width": frame.width, "height": frame.height, "png": base64::engine::general_purpose::STANDARD.encode(png)}))
-                }
-            }
-        }
-        "tap" => {
-            let d = s.device(p)?;
-            let at = Point::new(need_f64(p, "x")?, need_f64(p, "y")?);
-            play(&d.hid().map_err(err)?, screen(&d)?, &gesture::tap(at, Duration::from_millis(opt_u64(p, "hold_ms").unwrap_or(60))))
-                .map(|()| Value::Null)
-        }
-        "swipe" => {
-            let d = s.device(p)?;
-            let from = Point::new(need_f64(p, "x1")?, need_f64(p, "y1")?);
-            let to = Point::new(need_f64(p, "x2")?, need_f64(p, "y2")?);
-            let duration = Duration::from_millis(opt_u64(p, "duration_ms").unwrap_or(300));
-            let settle = p.get("settle").and_then(Value::as_bool).unwrap_or(false);
-            play(&d.hid().map_err(err)?, screen(&d)?, &gesture::swipe(from, to, duration, Duration::from_millis(17), settle))
-                .map(|()| Value::Null)
-        }
+        "screenshot" => screenshot_result(&display_of(&s.device(p)?, p)?.capture().map_err(err)?, p),
+        "tap" => play_on(&s.device(p)?, p, &tap_samples(p)?),
+        "swipe" => play_on(&s.device(p)?, p, &swipe_samples(p)?),
         "touch" => {
-            let d = s.device(p)?;
-            let phase = match need_str(p, "phase")? {
-                "down" => Phase::Down,
-                "move" => Phase::Move,
-                "up" => Phase::Up,
-                other => return Err(format!("unknown phase `{other}`")),
-            };
-            let at = screen(&d)?.normalize(Point::new(need_f64(p, "x")?, need_f64(p, "y")?));
-            d.hid().and_then(|h| h.touch(at, phase)).map(|()| Value::Null).map_err(err)
+            let (at, phase) = touch_sample(p)?;
+            play_on(&s.device(p)?, p, &[Sample { point: at, phase, delay: Duration::ZERO }])
+        }
+        "rotary" => {
+            let delta = crown_delta(p)?;
+            s.device(p)?.hid().and_then(|h| h.crown(delta)).map(|()| json!({"delta": delta})).map_err(err)
+        }
+        "watch_gesture" => {
+            let name = need_str(p, "gesture")?;
+            let gesture = WatchGesture::parse(name).ok_or_else(|| format!("unknown gesture `{name}` (double-tap, wrist-flick)"))?;
+            ok(s.device(p)?.hid().and_then(|h| h.watch_gesture(gesture)))
+        }
+        "remote_swipe" => {
+            let hid = s.device(p)?.hid().map_err(err)?;
+            for sample in remote_swipe_samples(p)? {
+                sleep(sample.delay);
+                hid.remote_touch(sample.point, sample.phase).map_err(err)?;
+            }
+            Ok(Value::Null)
+        }
+        "rotate" => rotate(&s.device(p)?, opt_orientation(p)?),
+        "carplay" => {
+            let on = need_bool(p, "on")?;
+            s.device(p)?.set_carplay(on).map_err(err)?;
+            let size = carplay_screen();
+            Ok(if on { json!({"display": "carplay", "width": size.width, "height": size.height}) } else { Value::Null })
         }
         "button" => {
-            let name = need_str(p, "button")?;
-            let button = Button::parse(name).ok_or_else(|| format!("unknown button `{name}`"))?;
+            let (button, hold) = button(p)?;
             let hid = s.device(p)?.hid().map_err(err)?;
             hid.button(button, Direction::Down).map_err(err)?;
-            sleep(Duration::from_millis(opt_u64(p, "hold_ms").unwrap_or(80)));
+            sleep(hold);
             hid.button(button, Direction::Up).map(|()| Value::Null).map_err(err)
         }
         "type" => type_text(&s.device(p)?.hid().map_err(err)?, need_str(p, "text")?).map(|()| Value::Null),

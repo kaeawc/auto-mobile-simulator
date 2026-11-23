@@ -1,6 +1,6 @@
 [package]
 name = "sim-core"
-description = "Pure sim-rs building blocks: device models, geometry, frames and pixel conversion, HID usages, gestures."
+description = "Pure sim-rs building blocks: device models, platforms and form factors, geometry, frames and pixel conversion, HID usages, gestures."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,9 @@ doctest = false
 [dependencies]
 png.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

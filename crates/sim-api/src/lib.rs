@@ -12,6 +12,7 @@
 //! thread and its own service connection. Device methods need the iOS backend, which exists on
 //! macOS hosts; elsewhere they fail with a clear reason.
 
+mod android;
 #[cfg(target_os = "macos")]
 mod ios;
 #[cfg(not(target_os = "macos"))]

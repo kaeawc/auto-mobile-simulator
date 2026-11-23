@@ -1,0 +1,92 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!-- Trimmed from https://dl.google.com/android/repository/sys-img/google_xr/sys-img2-4.xml (licenses,
+     x86_64 and most dependencies dropped). -->
+<sys-img:sdk-sys-img xmlns:sys-img="http://schemas.android.com/sdk/android/repo/sys-img2/04" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <channel id="channel-0">stable</channel>
+  <channel id="channel-1">beta</channel>
+  <channel id="channel-2">dev</channel>
+  <channel id="channel-3">canary</channel>
+  <remotePackage path="system-images;android-34;google-xr;arm64-v8a">
+    <type-details xsi:type="sys-img:sysImgDetailsType">
+      <api-level>34</api-level>
+      <tag><id>android-xr</id><display>Android XR</display></tag>
+      <tag><id>google_apis_playstore</id><display>Google Play</display></tag>
+      <vendor><id>google</id><display>Google Inc.</display></vendor>
+      <abi>arm64-v8a</abi>
+    </type-details>
+    <revision><major>8</major></revision>
+    <display-name>Google Play XR API v1 ARM 64 v8a System Image (Developer Preview)</display-name>
+    <channelRef ref="channel-2"/>
+    <archives>
+      <archive>
+        <complete>
+          <size>1654932171</size>
+          <checksum type="sha1">fd3f853a823b27aea35879495cc9d9365eaa1ec0</checksum>
+          <url>xr-arm64-v8a-playstore-34_r08.zip</url>
+        </complete>
+      </archive>
+    </archives>
+  </remotePackage>
+  <remotePackage path="system-images;android-34;android-xr-v3-playstore;arm64-v8a">
+    <type-details xsi:type="sys-img:sysImgDetailsType">
+      <api-level>34</api-level>
+      <tag><id>android-xr</id><display>Android XR</display></tag>
+      <tag><id>google_apis_playstore</id><display>Google Play</display></tag>
+      <vendor><id>google</id><display>Google Inc.</display></vendor>
+      <abi>arm64-v8a</abi>
+    </type-details>
+    <revision><major>3</major></revision>
+    <display-name>Google Play XR API v3 ARM 64 v8a System Image (Developer Preview)</display-name>
+    <channelRef ref="channel-0"/>
+    <archives>
+      <archive>
+        <complete>
+          <size>1564406101</size>
+          <checksum type="sha1">3a839c1915b83067e0086fe690b52fc70a92c208</checksum>
+          <url>xr-v3-arm64-v8a-playstore-34_r03.zip</url>
+        </complete>
+      </archive>
+    </archives>
+  </remotePackage>
+  <remotePackage path="system-images;android-36;ai-glasses;arm64-v8a">
+    <type-details xsi:type="sys-img:sysImgDetailsType">
+      <api-level>36</api-level>
+      <tag><id>ai-glasses</id><display>AI Glasses</display></tag>
+      <vendor><id>google</id><display>Google Inc.</display></vendor>
+      <abi>arm64-v8a</abi>
+    </type-details>
+    <revision><major>6</major></revision>
+    <display-name>Intelligent Eyewear ARM 64 v8a System Image (Developer Preview)</display-name>
+    <channelRef ref="channel-0"/>
+    <archives>
+      <archive>
+        <complete>
+          <size>1560335044</size>
+          <checksum type="sha1">e5fc876895200234432927e4a5394b078e574d7e</checksum>
+          <url>microxr-arm64-v8a-36_r06.zip</url>
+        </complete>
+      </archive>
+    </archives>
+  </remotePackage>
+  <remotePackage path="system-images;android-34;google-xr;arm64-v8a">
+    <type-details xsi:type="sys-img:sysImgDetailsType">
+      <api-level>34</api-level>
+      <tag><id>android-xr</id><display>Android XR</display></tag>
+      <tag><id>google_apis_playstore</id><display>Google Play</display></tag>
+      <vendor><id>google</id><display>Google Inc.</display></vendor>
+      <abi>arm64-v8a</abi>
+    </type-details>
+    <revision><major>7</major></revision>
+    <display-name>Google Play XR ARM 64 v8a System Image (Developer Preview)</display-name>
+    <channelRef ref="channel-0"/>
+    <archives>
+      <archive>
+        <complete>
+          <size>1653826787</size>
+          <checksum type="sha1">ffde19d738e893c247024c840316f5c663e2f9d7</checksum>
+          <url>xr-arm64-v8a-playstore-34_r07.zip</url>
+        </complete>
+      </archive>
+    </archives>
+  </remotePackage>
+</sys-img:sdk-sys-img>

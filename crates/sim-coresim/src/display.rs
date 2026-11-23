@@ -56,26 +56,26 @@ pub struct Display {
 }
 
 impl Display {
-    /// Finds the main display among the device's I/O ports.
+    /// Finds the main display among the device's I/O ports: the class-0 framebuffer, else the
+    /// first one (Apple TV renders only to its TVOut port).
     pub(crate) fn main(device: &AnyObject) -> Result<Self> {
-        let io = rt::object_prop(device, sel!(io))?;
-        if rt::responds(&io, sel!(updateIOPorts)) {
-            // SAFETY: `updateIOPorts` takes no arguments and returns void (checked to exist).
-            unsafe { msg_send![&*io, updateIOPorts] }
-        }
-        let ports = rt::object_prop(&io, sel!(ioPorts))?;
-        let mut fallback = None;
-        for port in rt::array_items(&ports) {
-            let Ok(descriptor) = rt::object_prop(&port, sel!(descriptor)) else { continue };
-            if !rt::responds(&descriptor, sel!(framebufferSurface)) {
-                continue;
-            }
-            if display_class(&descriptor) == Some(0) {
-                return Ok(Self { descriptor });
-            }
-            fallback.get_or_insert(descriptor);
-        }
-        fallback.map(|descriptor| Self { descriptor }).ok_or_else(|| Error::NoDisplay("no framebuffer port; is the device booted?".into()))
+        let ports = framebuffer_ports(device)?;
+        let main = ports.iter().position(|d| display_class(d) == Some(0)).unwrap_or(0);
+        ports
+            .into_iter()
+            .nth(main)
+            .map(|descriptor| Self { descriptor })
+            .ok_or_else(|| Error::NoDisplay("no framebuffer port; is the device booted?".into()))
+    }
+
+    /// Finds an external display (an iPhone's TVOut screen, the CarPlay display once attached):
+    /// a framebuffer that isn't class 0 and has rendered a surface.
+    pub(crate) fn external(device: &AnyObject) -> Result<Self> {
+        framebuffer_ports(device)?
+            .into_iter()
+            .find(|d| display_class(d).is_some_and(|c| c != 0) && rt::object_prop(d, sel!(framebufferSurface)).is_ok())
+            .map(|descriptor| Self { descriptor })
+            .ok_or_else(|| Error::NoDisplay("no external display has rendered yet; attach CarPlay first".into()))
     }
 
     /// The current framebuffer surface (an `IOSurface`), if the device has rendered one.
@@ -131,6 +131,21 @@ impl Display {
         let rgba = rgba.ok_or_else(|| Error::NoDisplay("framebuffer geometry is inconsistent".into()))?;
         Ok(Frame { width: width as u32, height: height as u32, rgba })
     }
+}
+
+/// The descriptors of the device's framebuffer ports, in port order.
+fn framebuffer_ports(device: &AnyObject) -> Result<Vec<Obj>> {
+    let io = rt::object_prop(device, sel!(io))?;
+    if rt::responds(&io, sel!(updateIOPorts)) {
+        // SAFETY: `updateIOPorts` takes no arguments and returns void (checked to exist).
+        unsafe { msg_send![&*io, updateIOPorts] }
+    }
+    let ports = rt::object_prop(&io, sel!(ioPorts))?;
+    Ok(rt::array_items(&ports)
+        .iter()
+        .filter_map(|port| rt::object_prop(port, sel!(descriptor)).ok())
+        .filter(|d| rt::responds(d, sel!(framebufferSurface)))
+        .collect())
 }
 
 fn display_class(descriptor: &AnyObject) -> Option<u16> {

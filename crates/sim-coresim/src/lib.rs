@@ -9,6 +9,7 @@
 //! gate their iOS backend on `target_os = "macos"` and the shared core still builds and tests.
 #![cfg(target_os = "macos")]
 
+mod carplay;
 mod display;
 mod error;
 mod hid;
@@ -17,6 +18,7 @@ mod service;
 
 pub use display::{Display, Surface};
 pub use error::{Error, Result};
-pub use hid::{Direction, Hid};
+pub use hid::Hid;
 pub use service::{Appearance, Context, Device, ExecOutput, StatusBar, developer_dir};
 pub use sim_core::frame::Frame;
+pub use sim_core::hid::{Direction, Orientation, WatchGesture};

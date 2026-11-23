@@ -90,5 +90,6 @@ mod label_tests {
         assert_eq!(crate::view::runtime_label("com.apple.CoreSimulator.SimRuntime.iOS-26-5"), "iOS 26.5");
         assert_eq!(crate::view::runtime_label("com.apple.CoreSimulator.SimRuntime.iOS-27-2-iPhone19-4"), "iOS 27.2.iPhone19.4");
         assert_eq!(crate::view::runtime_label("weird"), "weird");
+        assert_eq!(crate::view::runtime_label("system-images;android-36;google_apis;arm64-v8a"), "Android 36 · google_apis");
     }
 }
