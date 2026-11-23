@@ -136,6 +136,10 @@ impl PipeHandler for TcpForward {
 
     fn host_msg(&mut self, msg: HostMsg, to_guest: &mut Vec<u8>) -> bool {
         match msg {
+            HostMsg::Data(d) if to_guest.is_empty() => {
+                *to_guest = d; // the common case: hand the buffer over
+                true
+            }
             HostMsg::Data(d) => {
                 to_guest.extend_from_slice(&d);
                 true

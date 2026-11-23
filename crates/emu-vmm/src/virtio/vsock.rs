@@ -424,7 +424,11 @@ impl Worker {
         let Some(h) = conn.handler.as_mut() else { return };
         let mut to_guest = Vec::new();
         let keep = h.host_msg(msg, &mut to_guest);
-        conn.out.extend(to_guest);
+        if conn.out.is_empty() {
+            conn.out = to_guest.into(); // takes the buffer over, no copy
+        } else {
+            conn.out.extend(to_guest);
+        }
         if !keep {
             conn.closing = true;
         }
@@ -461,8 +465,8 @@ impl Worker {
                 }
             };
             let cap: usize = chain.writable().map(|d| d.len as usize).sum::<usize>().saturating_sub(HDR);
-            let (hdr, payload) = match work {
-                RxWork::Control(h) => (h, Vec::new()),
+            let written = match work {
+                RxWork::Control(h) => chain.write_all(&self.mem, &h.encode()).unwrap_or(0),
                 RxWork::Data(key) => {
                     let Some(c) = self.conns.get_mut(&key) else {
                         let _ = self.rxq.add_used(&self.mem, chain.head, 0);
@@ -470,15 +474,17 @@ impl Worker {
                         continue;
                     };
                     let n = c.out.len().min(c.credit()).min(cap).min(MAX_PKT);
-                    let payload: Vec<u8> = c.out.drain(..n).collect();
                     c.tx_cnt = c.tx_cnt.wrapping_add(n as u32);
                     c.advertised_fwd = c.fwd_cnt;
-                    (reply(self.guest_cid, key, OP_RW, n as u32, c.fwd_cnt), payload)
+                    let hdr = reply(self.guest_cid, key, OP_RW, n as u32, c.fwd_cnt).encode();
+                    // Straight from the connection's buffer into the guest's, header first.
+                    let (front, back) = c.out.as_slices();
+                    let (a, b) = if n <= front.len() { (&front[..n], &[][..]) } else { (front, &back[..n - front.len()]) };
+                    let written = chain.write_parts(&self.mem, &[&hdr, a, b]).unwrap_or(0);
+                    c.out.drain(..n);
+                    written
                 }
             };
-            let mut pkt = hdr.encode().to_vec();
-            pkt.extend_from_slice(&payload);
-            let written = chain.write_all(&self.mem, &pkt).unwrap_or(0);
             let _ = self.rxq.add_used(&self.mem, chain.head, written);
             used = true;
         }
@@ -557,6 +563,11 @@ mod tests {
         }
         fn host_msg(&mut self, msg: HostMsg, to_guest: &mut Vec<u8>) -> bool {
             match msg {
+                // As the adb forwarder does.
+                HostMsg::Data(d) if to_guest.is_empty() => {
+                    *to_guest = d;
+                    true
+                }
                 HostMsg::Data(d) => {
                     to_guest.extend(d);
                     true
@@ -646,6 +657,96 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             self.rx.used_idx(&self.mem) == self.rx_seen
         }
+    }
+
+    /// Host → guest throughput through one pipe, as `adb push`/`install` stream: the guest posts
+    /// 4 KiB receive buffers (Linux's default) and returns credit as it reads.
+    ///     cargo test --release -p emu-vmm vsock_throughput -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn vsock_throughput() {
+        const TOTAL: usize = 64 << 20;
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x80_0000).expect("ram"));
+        let echo = Arc::new(Echo::default());
+        let mut registry = PipeRegistry::default();
+        registry.register("echo", Box::new(echo.clone()));
+        let (events, rx_events) = event_channel();
+        let mut dev = Vsock::new(GUEST_CID, Arc::new(registry), events, rx_events);
+        let size = 256u16;
+        let (mut rx, mut tx) = (Driver::at(RAM_BASE + 0x1000, size), Driver::at(RAM_BASE + 0x10_000, size));
+        let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+        // Fixed rx buffers, reposted after use; the ring wraps, so the driver's descriptor ids do too.
+        let buf = |i: u16| RX_BUFS + u64::from(i) * u64::from(BUF);
+        for i in 0..size {
+            rx.push(&mem, &[(buf(i), BUF, true)]);
+        }
+        dev.activate(Activation { mem: mem.clone(), irq, queues: vec![Some(rx.cfg), Some(tx.cfg), None], features: 0 }).expect("activate");
+        let mut tx_addr = RAM_BASE + 0x40_0000;
+        let mut send = |dev: &mut Vsock, tx: &mut Driver, op: u16, fwd: u32, payload: &[u8]| {
+            let h = Hdr {
+                src_cid: GUEST_CID,
+                dst_cid: HOST_CID,
+                src_port: 1,
+                dst_port: PIPE_PORT,
+                len: payload.len() as u32,
+                typ: TYPE_STREAM,
+                op,
+                flags: 0,
+                buf_alloc: 256 * 1024,
+                fwd_cnt: fwd,
+            };
+            let mut pkt = h.encode().to_vec();
+            pkt.extend_from_slice(payload);
+            mem.write(tx_addr, &pkt).expect("tx");
+            tx.push(&mem, &[(tx_addr, pkt.len() as u32, false)]);
+            tx_addr = if tx_addr > RAM_BASE + 0x70_0000 { RAM_BASE + 0x40_0000 } else { tx_addr + 0x100 };
+            dev.notify(TXQ as u16);
+        };
+        send(&mut dev, &mut tx, OP_REQUEST, 0, &[]);
+        send(&mut dev, &mut tx, OP_RW, 0, b"pipe:echo\0");
+        let ctx = loop {
+            if let Some(c) = echo.ctx.lock().expect("ctx").clone() {
+                break c;
+            }
+            std::thread::yield_now();
+        };
+        let chunk = vec![0x5au8; 64 * 1024];
+        let start = Instant::now();
+        let producer = std::thread::spawn(move || {
+            for _ in 0..TOTAL / chunk.len() {
+                ctx.send(HostMsg::Data(chunk.clone()));
+            }
+        });
+        let (mut seen, mut got, mut credited) = (0u16, 0usize, 0usize);
+        while got < TOTAL {
+            let used = rx.used_idx(&mem);
+            if used == seen {
+                std::thread::yield_now();
+                continue;
+            }
+            while seen != used {
+                let (id, len) = rx.used(&mem, seen % size);
+                seen = seen.wrapping_add(1);
+                let h = Hdr::parse(&{
+                    let mut b = [0u8; HDR];
+                    mem.read(buf(id as u16 % size), &mut b).expect("hdr");
+                    b
+                })
+                .expect("hdr");
+                if h.op == OP_RW {
+                    got += len as usize - HDR;
+                }
+                rx.push(&mem, &[(buf(id as u16 % size), BUF, true)]);
+            }
+            if got - credited >= 64 * 1024 {
+                send(&mut dev, &mut tx, OP_CREDIT_UPDATE, got as u32, &[]);
+                credited = got;
+            }
+            dev.notify(RXQ as u16);
+        }
+        let secs = start.elapsed().as_secs_f64();
+        producer.join().expect("producer");
+        println!("vsock host->guest: {} MiB in {:.3} s = {:.0} MiB/s", TOTAL >> 20, secs, (TOTAL >> 20) as f64 / secs);
     }
 
     #[test]

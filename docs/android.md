@@ -242,6 +242,13 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   emulator's PNG straight through (with `path`, emu writes the file itself) instead of decoding
   and re-encoding it, and the display socket's frame loop no longer clones the whole frame just
   to read its size.
+- **vsock without intermediate copies.** adb (and every qemud pipe) rides vsock. Host bytes were
+  copied into the connection's queue, out of it into a packet `Vec`, and then into the guest's
+  buffer; now the adb forwarder hands its buffer over, the worker takes it over when nothing is
+  queued, and packets are written straight from the queue into the guest's descriptors
+  (`Chain::write_parts`). Host→guest through one pipe with the guest posting Linux's 4 KiB
+  receive buffers (`cargo test --release -p emu-vmm vsock_throughput -- --ignored`): median of 5,
+  284 → 512 MiB/s on a 4-core Linux VM.
 
 ## Development
 
