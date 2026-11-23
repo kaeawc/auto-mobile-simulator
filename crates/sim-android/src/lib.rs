@@ -342,17 +342,18 @@ impl Device {
 
     /// Plays touch samples (device pixels) over one display connection.
     pub fn play(&self, samples: &[Sample]) -> Result<(), String> {
-        let mut display = self.display(self.touch_screen()?)?;
-        for s in samples {
-            sleep(s.delay);
-            display.send(&Input::Touch { x: s.point.x as f32, y: s.point.y as f32, phase: s.phase })?;
-        }
-        Ok(())
+        self.with_display(self.touch_screen()?, |display| {
+            for s in samples {
+                sleep(s.delay);
+                display.send(&Input::Touch { x: s.point.x as f32, y: s.point.y as f32, phase: s.phase })?;
+            }
+            Ok(())
+        })
     }
 
     /// One touch sample at device pixels.
     pub fn touch(&self, x: f64, y: f64, phase: Phase) -> Result<(), String> {
-        self.display(self.touch_screen()?)?.send(&Input::Touch { x: x as f32, y: y as f32, phase })
+        self.with_display(self.touch_screen()?, |d| d.send(&Input::Touch { x: x as f32, y: y as f32, phase }))
     }
 
     /// A touch on the touchpad beside the screen (`hw.touchpad0`: Android XR display glasses), in
@@ -388,10 +389,42 @@ impl Device {
             .ok_or_else(|| format!("{} has no touchpad (hw.touchpad0; Android XR display glasses have one)", self.info.name))
     }
 
-    /// A connection to the running emulator's display socket (frames and input).
-    fn display(&self, avd: &Avd) -> Result<display::Display, String> {
+    /// Runs `f` on this process's connection to the running emulator's display socket, made on
+    /// first use and kept: the server reads each connection on its own thread, so input sent
+    /// over separate connections (a tap, then the next touch) can reach the guest out of order.
+    /// One connection per device keeps it in order, and a touch doesn't pay a connect. A
+    /// connection that fails (the emulator restarted) is replaced once.
+    fn with_display<T>(&self, avd: &Avd, mut f: impl FnMut(&mut display::Display) -> Result<T, String>) -> Result<T, String> {
+        type Slot = std::sync::Arc<std::sync::Mutex<Option<display::Display>>>;
+        static DISPLAYS: std::sync::Mutex<Vec<(PathBuf, Slot)>> = std::sync::Mutex::new(Vec::new());
         self.running()?;
-        display::Display::connect(&avd.dir)
+        let path = display::socket(&avd.dir);
+        let slot = {
+            let mut all = DISPLAYS.lock().unwrap_or_else(|e| e.into_inner());
+            match all.iter().find(|(p, _)| *p == path) {
+                Some((_, slot)) => slot.clone(),
+                None => {
+                    let slot = Slot::default();
+                    all.push((path, slot.clone()));
+                    slot
+                }
+            }
+        };
+        let mut conn = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retried = false;
+        loop {
+            let d = match conn.as_mut() {
+                Some(d) => d,
+                None => conn.insert(display::Display::connect(&avd.dir)?),
+            };
+            match f(d) {
+                Err(_) if !retried => {
+                    *conn = None;
+                    retried = true;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// The AVD, if its screen takes touch (an SDK TV's says `hw.screen=no-touch`).
@@ -472,7 +505,7 @@ impl Device {
     /// scales to stock's 15 units per click (`sim_core::stream::wheel_units`). Watches only.
     pub fn rotary(&self, ticks: i32) -> Result<(), String> {
         self.require(InputMethod::Rotary, "rotary input")?;
-        self.display(self.avd()?)?.send(&Input::Wheel(ticks))
+        self.with_display(self.avd()?, |d| d.send(&Input::Wheel(ticks)))
     }
 
     /// An XR control (head pose, environment, input mode, pointer) through emu-rs's `xr` console
