@@ -29,19 +29,6 @@ impl PixelFormat {
             _ => return None,
         })
     }
-
-    fn rgba(self, px: &[u8; 4]) -> [u8; 4] {
-        match self {
-            Self::Bgra => [px[2], px[1], px[0], px[3]],
-            Self::Bgrx => [px[2], px[1], px[0], 0xff],
-            Self::Argb => [px[1], px[2], px[3], px[0]],
-            Self::Xrgb => [px[1], px[2], px[3], 0xff],
-            Self::Rgba => *px,
-            Self::Rgbx => [px[0], px[1], px[2], 0xff],
-            Self::Abgr => [px[3], px[2], px[1], px[0]],
-            Self::Xbgr => [px[3], px[2], px[1], 0xff],
-        }
-    }
 }
 
 /// Converts a framebuffer with `stride` bytes per row into tightly packed RGBA. Returns `None`
@@ -51,14 +38,29 @@ pub fn to_rgba(src: &[u8], width: usize, height: usize, stride: usize, format: P
     if stride < row_bytes || (height > 0 && src.len() < stride.checked_mul(height - 1)?.checked_add(row_bytes)?) {
         return None;
     }
-    let mut out = Vec::with_capacity(row_bytes * height);
-    for row in 0..height {
-        let line = &src[row * stride..row * stride + row_bytes];
-        for px in line.as_chunks::<4>().0 {
-            out.extend_from_slice(&format.rgba(px));
-        }
+    let mut out = vec![0u8; row_bytes * height];
+    // One loop per format, so the byte shuffle is a fixed permutation the compiler vectorizes.
+    let convert: fn(&[u8], &mut [u8]) = match format {
+        PixelFormat::Rgba => |src, dst| dst.copy_from_slice(src),
+        PixelFormat::Bgra => |src, dst| shuffle(src, dst, |p| [p[2], p[1], p[0], p[3]]),
+        PixelFormat::Bgrx => |src, dst| shuffle(src, dst, |p| [p[2], p[1], p[0], 0xff]),
+        PixelFormat::Argb => |src, dst| shuffle(src, dst, |p| [p[1], p[2], p[3], p[0]]),
+        PixelFormat::Xrgb => |src, dst| shuffle(src, dst, |p| [p[1], p[2], p[3], 0xff]),
+        PixelFormat::Rgbx => |src, dst| shuffle(src, dst, |p| [p[0], p[1], p[2], 0xff]),
+        PixelFormat::Abgr => |src, dst| shuffle(src, dst, |p| [p[3], p[2], p[1], p[0]]),
+        PixelFormat::Xbgr => |src, dst| shuffle(src, dst, |p| [p[3], p[2], p[1], 0xff]),
+    };
+    for (row, dst) in out.chunks_exact_mut(row_bytes.max(1)).enumerate().take(height) {
+        convert(&src[row * stride..row * stride + row_bytes], dst);
     }
     Some(out)
+}
+
+#[inline(always)]
+fn shuffle(src: &[u8], dst: &mut [u8], f: impl Fn(&[u8; 4]) -> [u8; 4]) {
+    for (s, d) in src.as_chunks::<4>().0.iter().zip(dst.as_chunks_mut::<4>().0) {
+        *d = f(s);
+    }
 }
 
 /// Converts a BGRA framebuffer into tightly packed opaque RGBA (the iOS framebuffer's alpha byte

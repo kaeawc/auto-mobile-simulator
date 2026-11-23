@@ -234,6 +234,14 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   dm-default-key metadata encryption, which passes discard through but not write-zeroes, and
   zeroes it writes land as ciphertext. So discard is the only way to free space, and a fresh
   first boot (about 610 MB allocated) has only about 2 MB left to trim.
+- **Screenshots: fast PNG, no re-encode, no needless copies.** Automation takes a screenshot
+  after nearly every step. On a 2480×1740 screen (`cargo run --release -p sim-core --example
+  frame_bench`), PNG encoding at the `png` crate's default level took 74 ms and BGRA→RGBA
+  conversion 11 ms; `Fast` (fdeflate) encodes in 11.5 ms for a file 1.7× larger, and a conversion
+  loop per pixel format (no per-pixel `match`) takes 7.8 ms: 86 → 19 ms. The API passes the
+  emulator's PNG straight through (with `path`, emu writes the file itself) instead of decoding
+  and re-encoding it, and the display socket's frame loop no longer clones the whole frame just
+  to read its size.
 
 ## Development
 

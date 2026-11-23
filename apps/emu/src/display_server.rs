@@ -113,13 +113,14 @@ fn frames(mut out: UnixStream, display: Arc<FrameStore>, max_width: Arc<AtomicU3
         if mw == 0 || n == sent || last.elapsed() < MIN_INTERVAL {
             continue;
         }
-        let f = display.snapshot();
-        if f.width == 0 {
+        // Only the size: the pixels come from the renderer's own capture.
+        let (width, height, _) = display.geometry();
+        if width == 0 {
             continue;
         }
-        let Some(rgba) = emu_vmm::renderer_screenshot(f.width, f.height) else { continue };
-        let (w, h, px) = downscale(f.width, f.height, &rgba, downscale_factor(f.width, mw));
-        let hdr = FrameHeader { width: w, height: h, device_width: f.width, device_height: f.height, frame: n, len: px.len() as u32 };
+        let Some(rgba) = emu_vmm::renderer_screenshot(width, height) else { continue };
+        let (w, h, px) = downscale(width, height, &rgba, downscale_factor(width, mw));
+        let hdr = FrameHeader { width: w, height: h, device_width: width, device_height: height, frame: n, len: px.len() as u32 };
         if out.write_all(&hdr.encode()).and_then(|()| out.write_all(&px)).is_err() {
             break;
         }

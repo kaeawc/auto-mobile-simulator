@@ -298,13 +298,33 @@ impl Device {
         if r.alive() { Err(format!("{} is still running after `kill`", self.info.name)) } else { Ok(()) }
     }
 
-    /// The current screen at full resolution, from the emulator's renderer.
+    /// The current screen at full resolution, from the emulator's renderer, decoded.
     pub fn screenshot(&self) -> Result<Frame, String> {
+        let (_, _, png) = self.screenshot_png()?;
+        decode_png(&png)
+    }
+
+    /// The current screen as the emulator encodes it: width, height and PNG bytes, with no
+    /// decode and re-encode on the way.
+    pub fn screenshot_png(&self) -> Result<(u32, u32, Vec<u8>), String> {
         let path = std::env::temp_dir().join(format!("sim-android-{}-{}.png", std::process::id(), self.info.udid));
-        self.console(&[format!("screenshot {}", path.display())])?;
+        let size = self.screenshot_png_to(&path);
         let png = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()));
         let _ = std::fs::remove_file(&path);
-        decode_png(&png?)
+        let (w, h) = size?;
+        Ok((w, h, png?))
+    }
+
+    /// Has the emulator write the current screen to `path` as PNG (it runs on this host);
+    /// returns the width and height.
+    pub fn screenshot_png_to(&self, path: &Path) -> Result<(u32, u32), String> {
+        let path = std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        self.console(&[format!("screenshot {}", path.display())])?;
+        let mut header = [0u8; 24];
+        std::fs::File::open(&path)
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut header))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        sim_core::frame::png_size(&header).ok_or_else(|| format!("{} isn't a PNG", path.display()))
     }
 
     /// Plays touch samples (device pixels) over one display connection.
@@ -717,6 +737,11 @@ mod tests {
         );
         let shot = d.screenshot().expect("screenshot");
         assert_eq!((shot.width, shot.height, shot.rgba[0]), (2, 1, 9));
+        let (w, h, png) = d.screenshot_png().expect("png");
+        assert_eq!((w, h, sim_core::frame::png_size(&png)), (2, 1, Some((2, 1))));
+        let to = f.root.join("shot.png");
+        assert_eq!(d.screenshot_png_to(&to), Ok((2, 1)));
+        assert!(std::fs::read(&to).expect("written").starts_with(b"\x89PNG"), "the emulator wrote it there");
 
         d.play(&sim_core::gesture::tap(sim_core::geometry::Point::new(100.0, 200.0), Duration::ZERO)).expect("tap");
         assert_eq!(wait_for(&fake.display, 2), ["touch 100 200 down", "touch 100 200 up"]);

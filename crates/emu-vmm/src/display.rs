@@ -28,6 +28,12 @@ impl FrameStore {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// The latest frame's width, height and number, without copying its pixels.
+    pub fn geometry(&self) -> (u32, u32, u64) {
+        let s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        (s.width, s.height, s.frames)
+    }
+
     pub fn frames(&self) -> u64 {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).frames
     }
@@ -59,6 +65,7 @@ mod tests {
         let f = store.snapshot();
         assert_eq!((f.width, f.height, f.stride, f.format, f.frames), (1, 1, 4, 2, 2));
         assert_eq!(f.pixels, [7, 7, 7, 7], "replaced, not appended");
+        assert_eq!(store.geometry(), (1, 1, 2));
         assert_eq!(store.frames(), 2);
     }
 }
