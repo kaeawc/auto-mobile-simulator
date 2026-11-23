@@ -438,13 +438,23 @@ impl Sdk {
 mod tests;
 
 /// Copies `src` into the empty file `dst`, writing only blocks that aren't all zeros (4 KiB, the
-/// APFS and ext4 block size): zero runs are never allocated and read back as zeros. Returns the
-/// length and how many bytes were written.
+/// APFS and ext4 block size), and deallocates the zero runs: they read back as zeros without
+/// taking space. Returns the length and how many bytes were written.
+///
+/// ext4 leaves skipped ranges as holes by itself; APFS allocates them (zero-filled) whether the
+/// file grows by a write past its end or by truncating, so each zero run is punched out
+/// explicitly, which on ext4 is a no-op. A filesystem without holes keeps the file dense.
 pub fn write_sparse(mut src: impl std::io::Read, dst: &std::fs::File) -> std::io::Result<(u64, u64)> {
     use std::os::unix::fs::FileExt;
     const BLOCK: usize = 4096;
     let mut buf = vec![0u8; 1 << 20];
     let (mut offset, mut written) = (0u64, 0u64);
+    // Where the current zero run started (file offset), across chunks.
+    let mut zeros: Option<u64> = None;
+    let punch = |start: u64, end: u64| {
+        // Best effort: the range already reads as zeros either way.
+        let _ = emu_hvf::host::punch_hole(dst, start, end - start);
+    };
     loop {
         let mut n = 0;
         while n < buf.len() {
@@ -455,21 +465,30 @@ pub fn write_sparse(mut src: impl std::io::Read, dst: &std::fs::File) -> std::io
                 Err(e) => return Err(e),
             }
         }
-        // Grow the file first, then write inside it: APFS zero-fills a gap that a write past the
-        // end leaves (ext4 leaves a hole), while space added by truncating is a hole on both.
         dst.set_len(offset + n as u64)?;
         // Each run of non-zero blocks goes out in one write.
         let mut run: Option<usize> = None;
         for (i, block) in buf[..n].chunks(BLOCK).enumerate() {
-            let zero = block.iter().all(|&b| b == 0);
+            let at = offset + (i * BLOCK) as u64;
+            // A short final block is written: holes cover whole blocks.
+            let zero = block.len() == BLOCK && block.iter().all(|&b| b == 0);
             match (zero, run) {
-                (false, None) => run = Some(i * BLOCK),
+                (false, None) => {
+                    run = Some(i * BLOCK);
+                    if let Some(z) = zeros.take() {
+                        punch(z, at);
+                    }
+                }
                 (true, Some(start)) => {
                     dst.write_all_at(&buf[start..i * BLOCK], offset + start as u64)?;
                     written += (i * BLOCK - start) as u64;
                     run = None;
+                    zeros = Some(at);
                 }
-                _ => {}
+                (true, None) => {
+                    zeros.get_or_insert(at);
+                }
+                (false, Some(_)) => {}
             }
         }
         if let Some(start) = run {
@@ -480,6 +499,9 @@ pub fn write_sparse(mut src: impl std::io::Read, dst: &std::fs::File) -> std::io
         if n < buf.len() {
             break;
         }
+    }
+    if let Some(z) = zeros {
+        punch(z, offset);
     }
     Ok((offset, written))
 }

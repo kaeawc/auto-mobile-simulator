@@ -147,6 +147,7 @@ dependencies = [
 name = "emu-sdk"
 version = "0.1.0"
 dependencies = [
+ "emu-hvf",
  "flate2",
  "roxmltree",
  "sha1_smol",
