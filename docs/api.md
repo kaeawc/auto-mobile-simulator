@@ -23,12 +23,12 @@ Generated from `sim-rs call help`. Transport: unix socket, one JSON request per 
 | `boot` | Android, iOS | device, timeout_s?, env?, shaped? | Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; Android: starts emu) |
 | `shutdown` | Android, iOS | device | Shut down |
 | `erase` | iOS | device | Erase content and settings (shut down first) |
-| `screen` | Android, iOS | device | Screen size in pixels |
-| `screenshot` | Android, iOS | device, path? | PNG to path, else base64 in `png` |
-| `tap` | Android, iOS | device, x, y, hold_ms? | Tap at pixels |
-| `swipe` | Android, iOS | device, x1, y1, x2, y2, duration_ms?, settle? | Swipe between pixels |
-| `touch` | Android, iOS | device, x, y, phase(down\|move\|up) | One raw touch sample |
-| `button` | Android, iOS | device, button(home\|lock\|side\|siri\|apple-pay \| back\|volume-up\|volume-down\|recents\|menu\|up\|down\|left\|right\|select), hold_ms? | Press a hardware button (the first group are iOS's, the second Android's; home and lock are both) |
+| `screen` | Android, iOS | device, display?(main\|carplay) | Screen size in pixels |
+| `screenshot` | Android, iOS | device, path?, display?(main\|carplay) | PNG to path, else base64 in `png` |
+| `tap` | Android, iOS | device, x, y, hold_ms?, display?(main\|carplay) | Tap at pixels (display: an iPhone's CarPlay screen, iOS only) |
+| `swipe` | Android, iOS | device, x1, y1, x2, y2, duration_ms?, settle?, display? | Swipe between pixels |
+| `touch` | Android, iOS | device, x, y, phase(down\|move\|up), display? | One raw touch sample |
+| `button` | Android, iOS | device, button(home\|lock\|side\|siri\|apple-pay\|action \| back\|volume-up\|volume-down\|recents\|menu\|up\|down\|left\|right\|select\|play-pause), hold_ms? | Press a hardware button, as the device's form factor has it: the Siri Remote on Apple TV (menu/back, home, select, play-pause, arrows) and the D-pad on Android TV; on Apple Watch home is the crown's press |
 | `type` | Android, iOS | device, text | Type on the hardware keyboard |
 | `key` | Android, iOS | device, usage | Press a key by HID usage |
 | `open_url` | iOS | device, url | Open a URL |
@@ -84,6 +84,11 @@ Generated from `sim-rs call help`. Transport: unix socket, one JSON request per 
 | `audio_mute` | iOS | device, on | Silence (or restore) this device's audio on the host: a per-device null sink |
 | `network_env` | iOS | device | Environment that makes one app launch shaped (for simctl: prefix each key with SIMCTL_CHILD_) |
 | `console` | Android | device, command \| commands | Emulator console commands (`adb emu`'s protocol: sensor, geo, sms, gsm, finger, power, ...); reply lines |
-| `rotate` | Android | device | Rotate the device 90° clockwise |
+| `rotate` | Android, iOS | device, orientation?(portrait\|landscape-right\|portrait-upside-down\|landscape-left; iOS) | Rotate the device 90° clockwise, or to an orientation (iOS) |
 | `fold` | Android | device, angle(0-180) \| posture(closed\|half-opened\|opened) | Set a foldable's hinge |
-| `rotary` | Android | device, ticks | Turn a watch's rotary input (crown or bezel) |
+| `xr` | Android | device, action(recenter \| rotate\|move: x, y, z \| options: environment(day\|night), passthrough(0-1) \| input: mode(mouse\|hand\|eye) \| viewport: mode(pan\|zoom\|rotate) \| pointer: x, y, phase?(move\|down\|up\|click)) | Android XR: turn (radians) or move (metres) the head, recenter, set the room and passthrough, the input mode, or point the dual-mode mouse at pixels |
+| `rotary` | Android, iOS | device, ticks \| delta (Digital Crown units; iOS) | Turn a watch's rotary input: the Wear OS crown or bezel, the Apple Watch Digital Crown |
+| `vehicle` | Android | device, property?(VHAL name or id: GEAR_SELECTION, gear, speed, 0x11600207, ...), area_id?, value? | Android Automotive's vehicle HAL: list every property's value, read one, or set one when `value` is given (typed by the property: drive, 12.5, true); through the emulator console's `car` command (emu-rs) |
+| `watch_gesture` | iOS | device, gesture(double-tap\|wrist-flick) | An Apple Watch hand gesture |
+| `remote_swipe` | iOS | device, direction(up\|down\|left\|right), duration_ms? | Swipe on the Siri Remote's touch surface (Apple TV) |
+| `carplay` | iOS | device, on | Attach (or detach) the CarPlay display to a booted iPhone (iOS 26 runtimes); then tap/swipe/screenshot with display=carplay |
