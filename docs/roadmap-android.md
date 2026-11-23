@@ -84,7 +84,7 @@ and run its tools one by one, fixing whatever breaks:
 - **Pipe services:** sensors, battery, camera, QemuMiscPipe (boot-complete signal).
 - **virtio devices:** virtio-console (logcat on `hvc1`, modem vport), virtio-snd, virtio-net or
   wifi with a user-mode NAT.
-- **gRPC `EmulatorController`:** audio injection and streaming.
+- **gRPC `EmulatorController`:** audio injection and streaming, and `streamInputEvent`'s XR fields (`xr_hand_event`, `xr_eye_event`, head pose, recenter), which auto-mobile's `xrHeadsetInput` sends; emu-rs already puts the same messages on `qemud:xr_service` (console `xr`).
 - **Process and launch contract:** the launch-success markers and `qemu-system-*` process
   naming the harness's stop fallback expects.
 

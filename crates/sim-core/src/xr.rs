@@ -1,4 +1,5 @@
-//! Android XR controls: head pose, the surrounding environment, the input mode and the pointer.
+//! Android XR controls: head pose, the surrounding environment, the input mode, hand and eye
+//! pointers, hand gestures and the pointer.
 //!
 //! The stock emulator drives the guest's XR service over the `qemud:xr_service` pipe: qemud
 //! framing around one `xr_emulator_proto.EmulatorRequest` per message (`xr_emulator_conn.proto`
@@ -50,6 +51,43 @@ pub enum XrPointer {
     Click,
 }
 
+/// Whether a hand or eye pointer event aims (buttons 0: hover, or release) or selects (buttons 1:
+/// a pinch, or a gaze click), as Android Studio's embedded emulator sends them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum XrPress {
+    #[default]
+    Aim,
+    Press,
+}
+
+/// The stock emulator's simulated hand gestures (`HandGesture`, its toolbar's "hands in space").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XrHandGesture {
+    LeftPinch,
+    LeftGrab,
+    LeftPoke,
+    RightPinch,
+    RightGrab,
+    RightPoke,
+}
+
+impl XrHandGesture {
+    const ALL: [XrHandGesture; 6] = [Self::LeftPinch, Self::LeftGrab, Self::LeftPoke, Self::RightPinch, Self::RightGrab, Self::RightPoke];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::LeftPinch => "left-pinch",
+            Self::LeftGrab => "left-grab",
+            Self::LeftPoke => "left-poke",
+            Self::RightPinch => "right-pinch",
+            Self::RightGrab => "right-grab",
+            Self::RightPoke => "right-poke",
+        }
+    }
+}
+
 /// One XR control. Serialized with an `action` tag (`{"action": "rotate", "x": 0, ...}`), the
 /// shape the API's `xr` method takes.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -87,12 +125,32 @@ pub enum XrCommand {
         #[serde(default)]
         phase: XrPointer,
     },
+    /// The hand ray at display pixels: aim it, or pinch (`xr_hand_event`, what stock's gRPC
+    /// `streamInputEvent` forwards to the guest).
+    Hand {
+        x: u32,
+        y: u32,
+        #[serde(default)]
+        press: XrPress,
+    },
+    /// Eye gaze at display pixels: look, or select (`xr_eye_event`).
+    Eye {
+        x: u32,
+        y: u32,
+        #[serde(default)]
+        press: XrPress,
+    },
+    /// A simulated hand gesture.
+    Gesture {
+        gesture: XrHandGesture,
+    },
 }
 
 /// The `xr` console command's syntax.
 pub const USAGE: &str = "xr recenter | rotate <x> <y> <z> (radians) | move <dx> <dy> <dz> (metres) | \
                          options day|night <passthrough 0-1> | input mouse|hand|eye | viewport pan|zoom|rotate | \
-                         pointer <x> <y> [move|down|up|click]";
+                         pointer <x> <y> [move|down|up|click] | hand|eye <x> <y> [aim|press] | \
+                         gesture left-pinch|left-grab|left-poke|right-pinch|right-grab|right-poke";
 
 impl XrCommand {
     /// Parses the words after `xr` on the console (`rotate 0 0.5 0`).
@@ -142,6 +200,21 @@ impl XrCommand {
                     other => return Err(format!("unknown pointer phase `{other}` (move, down, up, click)")),
                 },
             },
+            [which @ ("hand" | "eye"), x, y, rest @ ..] if rest.len() <= 1 => {
+                let (x, y) = (px(x)?, px(y)?);
+                let press = match rest.first().copied().unwrap_or("aim") {
+                    "aim" | "hover" | "up" => XrPress::Aim,
+                    "press" | "pinch" | "select" | "down" => XrPress::Press,
+                    other => return Err(format!("unknown {which} action `{other}` (aim, press)")),
+                };
+                if *which == "hand" { XrCommand::Hand { x, y, press } } else { XrCommand::Eye { x, y, press } }
+            }
+            ["gesture", name] => XrCommand::Gesture {
+                gesture: XrHandGesture::ALL.into_iter().find(|g| g.name() == *name).ok_or_else(|| {
+                    let names: Vec<&str> = XrHandGesture::ALL.iter().map(|g| g.name()).collect();
+                    format!("unknown gesture `{name}` ({})", names.join(", "))
+                })?,
+            },
             _ => return Err(format!("usage: {USAGE}")),
         })
     }
@@ -187,6 +260,21 @@ impl XrCommand {
                 put_varint_field(&mut out, 1, MSG_SET_VIEWPORT_CONTROL);
                 put_varint_field(&mut out, 4, mode as u64 + 1);
             }
+            XrCommand::Hand { x, y, press } | XrCommand::Eye { x, y, press } => {
+                let (msg, field) = if matches!(self, XrCommand::Hand { .. }) { (MSG_HAND_EVENT, 11) } else { (MSG_EYE_EVENT, 12) };
+                put_varint_field(&mut out, 1, msg);
+                // MouseEvent: every field is required (x, y, buttons, display 0: the main display).
+                let mut event = Vec::new();
+                put_varint_field(&mut event, 1, u64::from(x));
+                put_varint_field(&mut event, 2, u64::from(y));
+                put_varint_field(&mut event, 3, press as u64);
+                put_varint_field(&mut event, 4, 0);
+                put_bytes(&mut out, field, &event);
+            }
+            XrCommand::Gesture { gesture } => {
+                put_varint_field(&mut out, 1, MSG_HAND_GESTURE);
+                put_varint_field(&mut out, 10, gesture as u64 + 1);
+            }
             XrCommand::Pointer { .. } => return None,
         }
         Some(out)
@@ -204,6 +292,9 @@ impl fmt::Display for XrCommand {
             XrCommand::Input { mode } => write!(f, "input {}", serde_name(mode)),
             XrCommand::Viewport { mode } => write!(f, "viewport {}", serde_name(mode)),
             XrCommand::Pointer { x, y, phase } => write!(f, "pointer {x} {y} {}", serde_name(phase)),
+            XrCommand::Hand { x, y, press } => write!(f, "hand {x} {y} {}", serde_name(press)),
+            XrCommand::Eye { x, y, press } => write!(f, "eye {x} {y} {}", serde_name(press)),
+            XrCommand::Gesture { gesture } => write!(f, "gesture {}", gesture.name()),
         }
     }
 }
@@ -220,6 +311,9 @@ const MSG_SET_VIEWPORT_CONTROL: u64 = 4;
 const MSG_HEAD_ROTATION: u64 = 5;
 const MSG_HEAD_MOVEMENT: u64 = 6;
 const MSG_SET_OPTIONS: u64 = 9;
+const MSG_HAND_GESTURE: u64 = 11;
+const MSG_HAND_EVENT: u64 = 12;
+const MSG_EYE_EVENT: u64 = 13;
 
 const WIRE_VARINT: u64 = 0;
 const WIRE_FIXED64: u64 = 1;
@@ -384,6 +478,9 @@ mod tests {
             "viewport zoom",
             "pointer 100 200 down",
             "pointer 1 2 click",
+            "hand 100 200 press",
+            "eye 5 6 aim",
+            "gesture right-pinch",
         ] {
             let cmd = XrCommand::parse(&words(line)).expect(line);
             assert_eq!(cmd.to_string(), line);
@@ -399,6 +496,8 @@ mod tests {
             ("options day 2", "passthrough 2 is outside 0-1"),
             ("input feet", "unknown input mode `feet`"),
             ("pointer -1 2", "`-1` is not a pixel coordinate"),
+            ("hand 1 2 wave", "unknown hand action `wave`"),
+            ("gesture high-five", "unknown gesture `high-five`"),
             ("teleport", "usage: "),
         ] {
             let err = XrCommand::parse(&words(bad)).expect_err(bad);
@@ -426,6 +525,13 @@ mod tests {
         // msg_type 4, viewport_control_mode (field 4) VIEWPORT_CONTROL_MODE_ZOOM (2).
         assert_eq!(req("viewport zoom"), Some(vec![0x08, 0x04, 0x20, 0x02]));
         assert_eq!(req("pointer 1 1"), None);
+        // msg_type MSG_TYPE_SET_HAND_EVENT (12), xr_hand_event (field 11) MouseEvent {x: 100, y: 200,
+        // buttons: 1, display: 0}.
+        assert_eq!(req("hand 100 200 press"), Some(vec![0x08, 0x0c, 0x5a, 0x09, 0x08, 0x64, 0x10, 0xc8, 0x01, 0x18, 0x01, 0x20, 0x00]));
+        // msg_type MSG_TYPE_SET_EYE_EVENT (13), xr_eye_event (field 12), aiming: buttons 0.
+        assert_eq!(req("eye 1 2"), Some(vec![0x08, 0x0d, 0x62, 0x08, 0x08, 0x01, 0x10, 0x02, 0x18, 0x00, 0x20, 0x00]));
+        // msg_type MSG_TYPE_SET_HAND_GESTURE (11), hand_gesture (field 10) RIGHT_HAND_PINCH (4).
+        assert_eq!(req("gesture right-pinch"), Some(vec![0x08, 0x0b, 0x50, 0x04]));
         let mut long = Vec::new();
         put_varint(&mut long, 300);
         assert_eq!(long, [0xac, 0x02]);
@@ -458,6 +564,11 @@ mod tests {
             serde_json::from_value(serde_json::json!({"device": "xr", "action": "pointer", "x": 5, "y": 6})).expect("pointer");
         assert_eq!(pointer, XrCommand::Pointer { x: 5, y: 6, phase: XrPointer::Click });
         assert_eq!(serde_json::to_value(XrCommand::Recenter).expect("json"), serde_json::json!({"action": "recenter"}));
+        let hand: XrCommand =
+            serde_json::from_value(serde_json::json!({"action": "hand", "x": 1, "y": 2, "press": "press"})).expect("hand");
+        assert_eq!(hand, XrCommand::Hand { x: 1, y: 2, press: XrPress::Press });
+        let gesture: XrCommand = serde_json::from_value(serde_json::json!({"action": "gesture", "gesture": "left-grab"})).expect("gesture");
+        assert_eq!(gesture, XrCommand::Gesture { gesture: XrHandGesture::LeftGrab });
     }
 
     #[test]

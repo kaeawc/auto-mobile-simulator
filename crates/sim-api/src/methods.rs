@@ -132,8 +132,8 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("fold", "device, angle(0-180) | posture(closed|half-opened|opened)", "Set a foldable's hinge"),
     (
         "xr",
-        "device, action(recenter | rotate|move: x, y, z | options: environment(day|night), passthrough(0-1) | input: mode(mouse|hand|eye) | viewport: mode(pan|zoom|rotate) | pointer: x, y, phase?(move|down|up|click))",
-        "Android XR: turn (radians) or move (metres) the head, recenter, set the room and passthrough, the input mode, or point the dual-mode mouse at pixels",
+        "device, action(recenter | rotate|move: x, y, z | options: environment(day|night), passthrough(0-1) | input: mode(mouse|hand|eye) | viewport: mode(pan|zoom|rotate) | pointer: x, y, phase?(move|down|up|click) | hand|eye: x, y, press?(aim|press) | gesture: gesture(left-pinch|left-grab|left-poke|right-pinch|right-grab|right-poke))",
+        "Android XR: turn (radians) or move (metres) the head, recenter, set the room and passthrough, the input mode, aim or pinch the hand ray and look or select with gaze at pixels (stock's gRPC hand and eye events), a hand gesture, or point the dual-mode mouse",
     ),
     (
         "rotary",
