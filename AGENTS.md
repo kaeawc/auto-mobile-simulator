@@ -151,7 +151,8 @@ scripts/automobile-harness-android.sh emulator-5554
   whose `emulator` is emu-rs), `automobile-harness-android.sh`, `android-bench.sh`,
   `inspect-image.py` (what a system image expects of the board, unpacked without booting: fstab,
   modules, input names, vendor HALs).
-- `docs/research/` — `network-shaping.md`, `audio-camera.md`; `docs/automobile-tool-matrix.md`.
+- `docs/research/` — `network-shaping.md`, `audio-camera.md`, `ios-on-linux.md` (open-source iOS
+  framework reimplementations and a Rust runtime for Linux hosts); `docs/automobile-tool-matrix.md`.
   `docs/architecture.md` (layers, process model, shared logic, the conflict decisions),
   `docs/form-factors.md` (support matrix, profiles, inference, launching each kind, known gaps).
   Android: `docs/android.md` (status, provisioning, benchmarks, performance notes),
