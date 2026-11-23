@@ -64,8 +64,10 @@ pub fn provision(env: &Env, api: &str, opts: &Opts) -> Result<()> {
     if sdk.is_installed(&emu_sdk::install_dir(&image)) {
         println!("have {image}");
     } else {
-        let d = match sdk.manifest(&emu_sdk::sys_img_url(tag))?.resolve_system_image(api, tag, abi, Host::current()) {
-            Err(e @ emu_sdk::Error::UnknownPackage(..)) => bail!("{e} (`emu -list-images -tag {tag}` shows what is available)"),
+        let d = match sdk.find_system_image(api, tag, abi, Host::current()) {
+            Err(e @ (emu_sdk::Error::UnknownPackage(..) | emu_sdk::Error::Command(..))) => {
+                bail!("{e} (`emu -list-images -tag {tag}` shows what is available)")
+            }
             r => r?,
         };
         if d.path != image {

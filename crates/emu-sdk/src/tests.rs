@@ -502,3 +502,33 @@ fn sparsify_frees_zero_blocks_and_keeps_contents() {
     assert_eq!(freed, 62 * 4096, "every whole zero block; the short tail stays");
     assert!(blocks < before, "allocation shrank: {before} -> {blocks} sectors");
 }
+
+#[test]
+fn tag_variants_are_found_on_whichever_site_lists_them() {
+    // `android-wear-signed` images live on the `android-wear` site; there's no site of their own.
+    let dir = std::env::temp_dir().join(format!("emu-sdk-sites-{}", std::process::id()));
+    let mut sdk = Sdk::new(&dir).expect("sdk");
+    sdk.quiet = true;
+    sdk.curl = "/nonexistent/curl".into(); // offline: only cached manifests load
+    let cache = |url: &str, text: &str| {
+        let name: String = url.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+        std::fs::create_dir_all(sdk.downloads()).expect("downloads");
+        std::fs::write(sdk.downloads().join(name), text).expect("cache");
+    };
+    let wear_site = format!("{REPO_URL}sys-img/android-wear/sys-img2-3.xml");
+    cache(
+        &sites_url(),
+        r#"<common:site-list xmlns:sdk="http://schemas.android.com/sdk/android/addons-list/5" xmlns:common="http://schemas.android.com/repository/android/sites-common/1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <site xsi:type="sdk:sysImgSiteType"><displayName>Android TV</displayName><url>sys-img/android-tv/sys-img2-3.xml</url></site>
+  <site xsi:type="sdk:sysImgSiteType"><displayName>Wear OS</displayName><url>sys-img/android-wear/sys-img2-3.xml</url></site>
+</common:site-list>"#,
+    );
+    cache(&wear_site, &include_str!("../testdata/sys-img-android-automotive.xml").replace("android-automotive", "android-wear-signed"));
+    let found = sdk.find_system_image("34", "android-wear-signed", "arm64-v8a", HOST).map(|d| d.path);
+    let listed = sdk.system_image_manifests(Some("android-wear-signed")).map(|m| m.len());
+    let missing = sdk.find_system_image("34", "android-tv", "arm64-v8a", HOST).map(|d| d.path);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(found.expect("found"), "system-images;android-34-ext9;android-wear-signed;arm64-v8a");
+    assert_eq!(listed.expect("listed"), 1, "the TV site isn't cached, so it's skipped");
+    assert!(missing.is_err());
+}

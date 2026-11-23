@@ -188,6 +188,15 @@ impl Sdk {
     /// A manifest's text, refreshed when the cached copy is older than `manifest_max_age`. A
     /// failed refresh falls back to a stale cached copy.
     fn fetch_cached(&self, url: &str) -> Result<String> {
+        self.fetch_cached_as(url, "-sSfL")
+    }
+
+    /// [`Sdk::fetch_cached`] for a URL that may well not exist: curl stays silent about it.
+    fn probe_cached(&self, url: &str) -> Result<String> {
+        self.fetch_cached_as(url, "-sfL")
+    }
+
+    fn fetch_cached_as(&self, url: &str, curl_flags: &str) -> Result<String> {
         let dl = self.downloads();
         std::fs::create_dir_all(&dl).map_err(io(&dl))?;
         let name: String = url.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
@@ -195,7 +204,7 @@ impl Sdk {
         let age = std::fs::metadata(&cache).and_then(|m| m.modified()).ok().and_then(|t| SystemTime::now().duration_since(t).ok());
         if age.is_none_or(|a| a > self.manifest_max_age) {
             let part = cache.with_extension("part");
-            let status = self.run(Command::new(&self.curl).args(["-sSfL", "--retry", "3", "-o"]).arg(&part).arg(url))?;
+            let status = self.run(Command::new(&self.curl).args([curl_flags, "--retry", "3", "-o"]).arg(&part).arg(url))?;
             if status.success() {
                 std::fs::rename(&part, &cache).map_err(io(&cache))?;
             } else if cache.is_file() {
@@ -207,13 +216,44 @@ impl Sdk {
         std::fs::read_to_string(&cache).map_err(io(&cache))
     }
 
+    /// A manifest at a URL that may not exist (a tag's guessed site).
+    fn probe_manifest(&self, url: &str) -> Result<Manifest> {
+        let base = &url[..url.rfind('/').map_or(0, |i| i + 1)];
+        Manifest::parse(&self.probe_cached(url)?, base)
+    }
+
     /// Every system-image manifest for `tag`, or for all tags (from `addons_list-5.xml`).
     pub fn system_image_manifests(&self, tag: Option<&str>) -> Result<Vec<Manifest>> {
-        let urls = match tag {
-            Some(t) => vec![sys_img_url(t)],
-            None => parse_site_list(&self.fetch_cached(&sites_url())?, REPO_URL)?,
-        };
-        urls.iter().map(|u| self.manifest(u)).collect()
+        // A tag's own site when it has one; variants live on another tag's site
+        // (`android-wear-signed` on `android-wear`'s), so then every site.
+        if let Some(t) = tag
+            && let Ok(m) = self.probe_manifest(&sys_img_url(t))
+        {
+            return Ok(vec![m]);
+        }
+        self.all_system_image_manifests()
+    }
+
+    /// Every system image site the repository's site list names.
+    fn all_system_image_manifests(&self) -> Result<Vec<Manifest>> {
+        let urls = parse_site_list(&self.fetch_cached(&sites_url())?, REPO_URL)?;
+        // A listed site that fails to load is skipped, not fatal: the others may have the image.
+        Ok(urls.iter().filter_map(|u| self.manifest(u).ok()).collect())
+    }
+
+    /// The download for system image `api`/`tag`/`abi` (see
+    /// [`Manifest::resolve_system_image`]), from the tag's own site, else from whichever site
+    /// lists it.
+    pub fn find_system_image(&self, api: &str, tag: &str, abi: &str, host: Host) -> Result<Download> {
+        let guess = self.probe_manifest(&sys_img_url(tag)).and_then(|m| m.resolve_system_image(api, tag, abi, host));
+        match guess {
+            Ok(d) => Ok(d),
+            Err(first) => self
+                .all_system_image_manifests()?
+                .iter()
+                .find_map(|m| m.resolve_system_image(api, tag, abi, host).ok())
+                .ok_or(first),
+        }
     }
 
     /// Downloads `d` (resuming a partial download), verifies its size and sha1, and unpacks it
