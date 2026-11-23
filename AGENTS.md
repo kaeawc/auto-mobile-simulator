@@ -1,16 +1,20 @@
 # sim-rs
 
-An iOS simulator front end written from scratch in Rust: it drives the host's simulator service
-directly (device lifecycle, apps, framebuffer, HID input) with no dependency on the stock simulator
-app. The goal is to match its behavior exactly and then exceed it.
+iOS simulator and Android emulator devices from one Rust core. The iOS backend drives the host's
+simulator service directly (device lifecycle, apps, framebuffer, HID input) with no stock simulator
+app; the Android backend is emu-rs, an Android emulator on Hypervisor.framework that boots
+unmodified SDK system images and matches the stock emulator's board, ports and console. The goal
+for both is to match the stock tools exactly and then exceed them.
 
 ## Working rules
 
 - New dependencies go in root `[workspace.dependencies]` with `default-features = false` and only
   the features used; crates reference them with `{ workspace = true }`.
-- `unsafe` lives only in `crates/sim-coresim` (the Objective-C / IOSurface boundary) and
-  `desktop/src/surface.rs` (the zero-copy bridge). Every `unsafe` block carries a `// SAFETY:`
-  comment (`clippy::undocumented_unsafe_blocks` is denied there). Everything else forbids it.
+- `unsafe` lives only in `crates/sim-coresim` (the Objective-C / IOSurface boundary),
+  `crates/emu-hvf` (Hypervisor.framework and guest RAM), `crates/emu-gfxstream` (the renderer),
+  `apps/emu`'s `shutdown_signals` (signal masks) and `desktop/src/surface.rs` (the zero-copy
+  bridge). Every `unsafe` block carries a `// SAFETY:` comment
+  (`clippy::undocumented_unsafe_blocks` is denied or warned there). Everything else forbids it.
 - Private service APIs are reached by selector/symbol lookup at runtime and checked with
   `respondsToSelector:` / `dlsym` first, so a missing API is an `Error::Unavailable`, never a crash.
   Objects returned by I/O ports are remote proxies: call them through `rt::send_*` helpers, not
@@ -21,6 +25,19 @@ app. The goal is to match its behavior exactly and then exceed it.
   keep it allocation-free on hot paths, never block in `close`/`read`/`write` for non-socket fds,
   and guard nested libSystem calls with `g_depth`. Rebuilding it changes its cached path, and
   `network_shape {inject:"boot"}` reboots devices still running an older build.
+- Android: the guest-visible layout follows the stock board (`crates/emu-vmm/src/layout.rs`,
+  `docs/reference/stock-board.md`): images hard-code device addresses (fstab, boot_devices).
+  Change it only with evidence from a running stock emulator.
+- Android: measure before optimizing. `emu -verbose` prints per-vCPU exit counts; `sample <pid> 5`
+  shows host time per thread. Record results that change a design decision in docs/android.md.
+- Android: never modify the stock emulator's files in an AVD directory; emu-rs state lives in
+  `<avd>/emu-rs/` (console.log, emu.log, display.sock).
+- Android: one emulator process per device (Hypervisor.framework allows one VM per process). Start
+  guests with a recorded PID and stop them with `kill -INT <pid>`, `adb -s emulator-<port> emu kill`
+  or `sim-rs shutdown <avd>`; don't kill by name (other emulators may be running).
+- Front ends drive Android devices the way any tool can: the console port (stock text protocol)
+  and `<avd>/emu-rs/display.sock` (`sim_core::stream`). `sim-android` is that client; it never
+  links the VMM.
 - Pure logic (device selection, gestures, key maps, pixel conversion, frames and PNG encoding,
   geometry) goes in `crates/sim-core` with unit tests; FFI crates stay thin.
 - macOS-only crates gate themselves with a crate-level `#![cfg(target_os = "macos")]` and
@@ -49,12 +66,18 @@ After any change: `cargo c && cargo lint && cargo t`. On a non-macOS host, also 
 code (no linking needed): `rustup target add aarch64-apple-darwin` once, then
 `cargo clippy --target aarch64-apple-darwin --all-targets -- -D warnings`.
 
-Against a real device (see "Harness" in README.md):
+Unit tests never need a device or the hypervisor. Against a real device (see "Harness" in
+README.md):
 
 ```bash
 SIM_RS_E2E_UDID=<udid> cargo nextest run -p sim-rs --test e2e
 scripts/parity.sh <udid>                 # sim-rs vs simctl
 scripts/automobile-harness.sh <udid>     # auto-mobile drives a sim-rs device
+# Android (Apple silicon; cargo signs emu with the hypervisor entitlement via scripts/sign-run.sh)
+cargo run -p emu -- -avd <name> -show-kernel -verbose
+adb -s emulator-5554 shell getprop sys.boot_completed      # after VMM changes, boot an AVD and check
+SIM_RS_E2E_AVD=<avd> cargo nextest run -p sim-rs --test e2e_android
+scripts/automobile-harness-android.sh emulator-5554
 ```
 
 ## Map
@@ -77,16 +100,42 @@ scripts/automobile-harness.sh <udid>     # auto-mobile drives a sim-rs device
   proxy), `Profile`/`Rule` (the live profile file format).
 - `crates/sim-audio` — driverless per-device audio: `native/simaudio.swift` (process-tap helper,
   built on demand), capture/mute sessions, route and volume via the device's `audiosettings.plist`.
+- `crates/sim-android` — the Android backend's client: AVDs as labelled devices, system images as
+  runtimes, AVD creation shaped by form factor, starting `emu` and waiting for boot, the console
+  client (`console.rs`) and the display socket client (`display.rs`). No FFI.
+- `crates/emu-hvf` — `Vm` (GIC, RAM mapping, SPIs), `Vcpu` (run/regs/vtimer), `GuestRam`.
+- `crates/emu-vmm` — `lib.rs` (`run`), `layout.rs`, `board.rs` (DT), `vcpu.rs` (exits, PSCI,
+  wakers), `bus.rs`, `devices/` (PL011, PL031, goldfish), `virtio/` (mmio transport, queue, blk,
+  rng, vsock, gpu, input, console), `pipe/` (adb bridge, qemud services), `modem/`, `disk.rs`,
+  `boot.rs`.
+- `crates/emu-avd` — `Env` (SDK/AVD paths), `Avd` (config, `profile()`), `NewAvd`
+  (`for_profile`), running-instance advertisements (`Running`), `BootConfig`, ini parsing.
+- `crates/emu-sdk` — Java-free provisioning: repository manifests, verified downloads, the
+  on-demand gfxstream renderer.
+- `crates/emu-gfxstream` — `stream_renderer_*` FFI; `examples/renderer_caps.rs` checks a renderer.
+- `crates/emu-ext4` — the native ext4 formatter for first-boot userdata. `crates/emu-fdt` — the
+  device tree writer.
 - `crates/sim-api` — the JSON-lines unix socket API: `METHODS` table and dispatcher
   (`methods.rs`), parameter parsing (`params.rs`), the iOS backend's methods (`ios.rs`; on
-  non-macOS hosts `ios_unavailable.rs`), server and client (`lib.rs`). The CLI, the socket and the
+  non-macOS hosts `ios_unavailable.rs`), the Android backend's methods (`android.rs`), server
+  and client (`lib.rs`). The CLI, the socket and the
   desktop panel all go through it; add a capability here once and every surface gets it.
 - `apps/sim-rs` — CLI: argument parsing and output formatting over `sim-api`'s methods;
-  `tests/e2e.rs` runs against a booted device when `SIM_RS_E2E_UDID` is set.
+  `tests/e2e.rs` runs against a booted iOS device when `SIM_RS_E2E_UDID` is set,
+  `tests/e2e_android.rs` against a running AVD when `SIM_RS_E2E_AVD` is.
+- `apps/emu` — the Android emulator binary, a drop-in for the SDK's `emulator`: `args.rs` (SDK
+  flags), `instance.rs` (disks, bootconfig, boot props), `console.rs` (console server,
+  running-instance file), `display_server.rs` (frames and input on `display.sock`),
+  `provision.rs` (`-provision`, `-list-images`). Boots only on Apple silicon; elsewhere it lists,
+  creates and provisions AVDs.
 - `desktop/` — Rune app: `device.rs` (the live device facade; a stub where there's no simulator
   service, so the window builds and tests on Linux), `ios.rs` (live iOS device, capture thread;
   macOS), `surface.rs` (zero-copy IOSurface bridge; macOS), `debug.rs` (debug panel: tabs, API worker thread, views), `icons.rs` (SVG
   icons), `keys.rs` (host keys → HID), `view.rs`, `main.rs` (state, actions, poll, tests).
   Headless `--snap` needs a debug build (release builds lack Rune's tooling feature).
-- `scripts/` — `parity.sh`, `automobile-harness.sh`, `pf-shape.sh` (pf/dummynet, needs sudo).
+- `scripts/` — `parity.sh`, `automobile-harness.sh`, `pf-shape.sh` (pf/dummynet, needs sudo);
+  Android: `sign-run.sh` (the cargo runner: hypervisor entitlement), `sdk-shim.sh` (SDK overlay
+  whose `emulator` is emu-rs), `automobile-harness-android.sh`, `android-bench.sh`.
 - `docs/research/` — `network-shaping.md`, `audio-camera.md`; `docs/automobile-tool-matrix.md`.
+  Android: `docs/android.md` (status, provisioning, benchmarks, performance notes),
+  `docs/reference/stock-board.md`, `docs/design/desktop-and-display.md`, `docs/roadmap-android.md`.

@@ -50,7 +50,8 @@ jobs:
       - run: cargo clippy --locked --all-targets --profile ci -- -D warnings
       - run: cargo test --locked --profile ci
 
-  # The service frameworks only exist on macOS, so the backends are linted and tested there.
+  # The simulator service and Hypervisor.framework only exist on macOS, so the iOS and Android
+  # backends are linted and tested there (unit tests don't need the hypervisor).
   lint-test:
     runs-on: macos-26
     timeout-minutes: 30
@@ -66,6 +67,13 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --locked --all-targets --profile ci -- -D warnings
       - run: cargo test --locked --profile ci
+      # The Android emulator binary. Booting a guest needs nested Hypervisor.framework, which
+      # hosted runners lack, so that stays a local check (docs/android.md).
+      - run: cargo build --locked --release -p emu
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: emu-macos-arm64
+          path: target/release/emu
 
   desktop:
     runs-on: macos-26

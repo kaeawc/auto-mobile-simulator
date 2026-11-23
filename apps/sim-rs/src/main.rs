@@ -1,4 +1,4 @@
-//! sim-rs: drive simulated iOS devices without the stock simulator app.
+//! sim-rs: create, boot and drive iOS simulator devices and Android emulator devices.
 //!
 //! Every device command is a call into the API's method table (`sim-api`), the same code the
 //! socket server and the desktop window run; this file only parses arguments and prints results.
@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use sim_core::device::DeviceInfo;
 
 #[derive(Parser)]
-#[command(name = "sim-rs", version, about = "Create, boot and drive simulated iOS devices")]
+#[command(name = "sim-rs", version, about = "Create, boot and drive iOS simulator and Android emulator devices")]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -53,12 +53,23 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Create a device; prints its UDID.
+    /// Create a device; prints its UDID (an Android device's UDID is its AVD name).
+    ///
+    /// iOS: `create NAME DEVICE_TYPE RUNTIME`. Android: `create NAME --platform android
+    /// --system-image system-images;android-36;google_apis;arm64-v8a`.
     Create {
         name: String,
-        device_type: String,
-        runtime: String,
-        /// Fail unless the device type is this form factor.
+        /// iOS device type (name or identifier).
+        device_type: Option<String>,
+        /// iOS runtime (name or identifier).
+        runtime: Option<String>,
+        /// ios (default) or android.
+        #[arg(long)]
+        platform: Option<String>,
+        /// Android system image, as an SDK package or a path.
+        #[arg(long)]
+        system_image: Option<String>,
+        /// Fail unless the device type or system image is this form factor; shapes a new AVD.
         #[arg(long)]
         form_factor: Option<String>,
     },
@@ -106,7 +117,8 @@ enum Cmd {
         #[arg(long)]
         settle: bool,
     },
-    /// Press a hardware button: home, lock, side, siri, apple-pay.
+    /// Press a hardware button: home, lock (power), side, siri, apple-pay (iOS); back, volume-up,
+    /// volume-down, recents, menu, up, down, left, right, select (Android).
     Button {
         device: String,
         button: String,
@@ -139,6 +151,19 @@ enum Cmd {
     Privacy { device: String, action: String, service: String, bundle_id: String },
     /// Simulate a memory warning.
     MemoryWarning { device: String },
+    /// Rotate an Android device 90° clockwise.
+    Rotate { device: String },
+    /// Set an Android foldable's hinge: a posture (closed, half-opened, opened) or an angle (0-180).
+    Fold { device: String, posture: String },
+    /// Turn an Android watch's rotary input by some ticks (negative turns back).
+    #[command(allow_negative_numbers = true)]
+    Rotary { device: String, ticks: i64 },
+    /// Send commands to an Android device's emulator console (`adb emu`'s protocol).
+    Console {
+        device: String,
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
     /// Serve the JSON-lines API on a unix socket (default `$SIM_RS_SOCKET` or `$TMPDIR/sim-rs.sock`).
     Serve {
         #[arg(long)]
@@ -231,8 +256,10 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Create { name, device_type, runtime, form_factor } => {
-            let d = call("create", json!({"name": name, "device_type": device_type, "runtime": runtime, "form_factor": form_factor}))?;
+        Cmd::Create { name, device_type, runtime, platform, system_image, form_factor } => {
+            let params = json!({"name": name, "device_type": device_type, "runtime": runtime, "platform": platform,
+                "system_image": system_image, "form_factor": form_factor});
+            let d = call("create", params)?;
             println!("{}", text(&d["udid"]));
         }
         Cmd::Delete { device } => drop(call("delete", json!({"device": device}))?),
@@ -278,6 +305,19 @@ fn main() -> Result<()> {
             drop(call("privacy", json!({"device": device, "action": action, "service": service, "bundle_id": bundle_id}))?)
         }
         Cmd::MemoryWarning { device } => drop(call("memory_warning", json!({"device": device}))?),
+        Cmd::Rotate { device } => drop(call("rotate", json!({"device": device}))?),
+        Cmd::Fold { device, posture } => {
+            let params = match posture.parse::<f64>() {
+                Ok(angle) => json!({"device": device, "angle": angle}),
+                Err(_) => json!({"device": device, "posture": posture}),
+            };
+            let r = call("fold", params)?;
+            println!("{} ({}°)", text(&r["posture"]), r["angle"]);
+        }
+        Cmd::Rotary { device, ticks } => drop(call("rotary", json!({"device": device, "ticks": ticks}))?),
+        Cmd::Console { device, command } => {
+            items(&call("console", json!({"device": device, "command": command.join(" ")}))?).iter().for_each(|l| println!("{}", text(l)));
+        }
         Cmd::Serve { .. } | Cmd::Call { .. } => unreachable!("handled above"),
         Cmd::Exec { device, env, program, args } => {
             let env: serde_json::Map<String, Value> =
@@ -386,7 +426,7 @@ mod tests {
         for m in ["button", "type", "key", "open_url", "install", "uninstall", "launch", "terminate", "apps", "appearance"] {
             assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
         }
-        for m in ["location", "privacy", "memory_warning", "exec"] {
+        for m in ["location", "privacy", "memory_warning", "exec", "rotate", "fold", "rotary", "console"] {
             assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
         }
     }

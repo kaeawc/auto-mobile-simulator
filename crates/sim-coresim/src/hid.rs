@@ -104,8 +104,9 @@ impl Hid {
 
     /// Presses or releases a hardware button.
     pub fn button(&self, button: Button, direction: Direction) -> Result<()> {
+        let source = button.apple_source().ok_or_else(|| Error::Invalid(format!("the {} button doesn't exist on iOS", button.as_str())))?;
         // SAFETY: plain integer arguments; returns a malloc'd message or null.
-        self.send(unsafe { (self.button)(button.source(), raw(direction), TARGET_HARDWARE) })
+        self.send(unsafe { (self.button)(source, raw(direction), TARGET_HARDWARE) })
     }
 
     /// Presses or releases a keyboard key by HID usage.

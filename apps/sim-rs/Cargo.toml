@@ -1,6 +1,6 @@
 [package]
 name = "sim-rs"
-description = "sim-rs CLI: create, boot and drive simulated devices; capture the screen; inject input."
+description = "sim-rs CLI: create, boot and drive iOS simulator and Android emulator devices; capture the screen; inject input."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
