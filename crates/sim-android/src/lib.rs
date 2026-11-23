@@ -538,9 +538,31 @@ fn booted(r: &Running, adb: Option<&Path>) -> bool {
     }
 }
 
-/// The last `n` lines of a device's guest console (`<avd>/emu-rs/console.log`).
+/// The last `n` lines of a device's guest console (`<avd>/emu-rs/console.log`). Reads from the
+/// end, 64 KiB at a time, until it has them: the log grows to megabytes of kernel output, and
+/// the desktop asks every two seconds. Bytes that aren't UTF-8 show as U+FFFD.
 pub fn console_log_tail(avd_dir: &Path, n: usize) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(avd_dir.join("emu-rs/console.log")) else { return Vec::new() };
+    use std::io::{Read, Seek, SeekFrom};
+    const STEP: u64 = 64 * 1024;
+    let Ok(mut f) = std::fs::File::open(avd_dir.join("emu-rs/console.log")) else { return Vec::new() };
+    let Ok(len) = f.metadata().map(|m| m.len()) else { return Vec::new() };
+    let mut window = STEP.min(len);
+    let tail = loop {
+        let mut buf = Vec::new();
+        if f.seek(SeekFrom::Start(len - window)).and_then(|_| f.by_ref().take(window).read_to_end(&mut buf)).is_err() {
+            return Vec::new();
+        }
+        // More newlines than lines wanted: even after dropping the partial first line, enough.
+        if window == len || buf.iter().filter(|&&b| b == b'\n').count() > n {
+            if window < len {
+                let first = buf.iter().position(|&b| b == b'\n').map_or(0, |i| i + 1);
+                buf.drain(..first);
+            }
+            break buf;
+        }
+        window = (window * 2).min(len);
+    };
+    let text = String::from_utf8_lossy(&tail);
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].iter().map(|l| (*l).to_owned()).collect()
 }
@@ -717,6 +739,34 @@ mod tests {
         let glasses = f.android.device("glasses").expect("glasses");
         assert_eq!(glasses.touchpad_swipe((0, 0), (1542, 10), Duration::ZERO), Err("the touchpad is 1542x297".into()));
         assert_eq!(glasses.touchpad(1, 1, "tap"), Err("glasses isn't running; boot it first".into()));
+    }
+
+    #[test]
+    fn console_log_tail_reads_only_the_end() {
+        let dir = std::env::temp_dir().join(format!("sa-tail-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("emu-rs")).expect("dir");
+        let log = dir.join("emu-rs/console.log");
+        let naive = |n: usize| -> Vec<String> {
+            let text = String::from_utf8_lossy(&std::fs::read(&log).expect("read")).into_owned();
+            let lines: Vec<&str> = text.lines().collect();
+            lines[lines.len().saturating_sub(n)..].iter().map(|l| (*l).to_owned()).collect()
+        };
+        assert!(console_log_tail(&dir, 5).is_empty(), "no log yet");
+        // Long, with lines of every length, CRLFs and a non-UTF-8 byte.
+        let mut text = Vec::new();
+        for i in 0..200_000u32 {
+            text.extend(format!("[{i:>8}] {}{}", "x".repeat((i % 97) as usize), if i % 7 == 0 { "\r\n" } else { "\n" }).bytes());
+        }
+        text.extend(b"bad \xff byte\nno newline at the end");
+        std::fs::write(&log, &text).expect("write");
+        for n in [0, 1, 2, 200, 5000] {
+            assert_eq!(console_log_tail(&dir, n), naive(n), "last {n}");
+        }
+        assert_eq!(console_log_tail(&dir, 1), ["no newline at the end"]);
+        assert_eq!(console_log_tail(&dir, 2)[0], "bad \u{fffd} byte", "kept, not an empty panel");
+        std::fs::write(&log, "one\ntwo\n").expect("short");
+        assert_eq!(console_log_tail(&dir, 200), ["one", "two"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

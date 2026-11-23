@@ -43,18 +43,26 @@ impl Chain {
 
     /// Copies the device-readable part of the chain into a buffer, up to `max` bytes.
     pub fn read_all(&self, mem: &GuestRam, max: usize) -> Result<Vec<u8>, QueueError> {
+        let mut out = Vec::new();
+        self.read_all_into(mem, max, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`Chain::read_all`] into `out` (cleared first), reusing its allocation: devices keep one
+    /// buffer for every request instead of allocating per request.
+    pub fn read_all_into(&self, mem: &GuestRam, max: usize, out: &mut Vec<u8>) -> Result<(), QueueError> {
+        out.clear();
         let total: usize = self.readable().map(|d| d.len as usize).sum::<usize>().min(max);
-        let mut out = Vec::with_capacity(total);
+        out.reserve(total);
         for d in self.readable() {
             let take = (d.len as usize).min(max - out.len());
-            mem.read_append(d.addr, take, &mut out).map_err(|_| QueueError::BadAddress(d.addr))?;
+            mem.read_append(d.addr, take, out).map_err(|_| QueueError::BadAddress(d.addr))?;
             if out.len() == max {
                 break;
             }
         }
-        Ok(out)
+        Ok(())
     }
-
     /// Copies `data` into the device-writable buffers; returns bytes written.
     pub fn write_all(&self, mem: &GuestRam, mut data: &[u8]) -> Result<u32, QueueError> {
         let mut total = 0u32;
