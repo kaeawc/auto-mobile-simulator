@@ -64,7 +64,7 @@ jobs:
             cargo llvm-cov report --profile ci --summary-only
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          cargo llvm-cov report --profile ci --lcov --output-path lcov.info --fail-under-lines 84
+          cargo llvm-cov report --profile ci --lcov --output-path lcov.info --fail-under-lines 85
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-linux
