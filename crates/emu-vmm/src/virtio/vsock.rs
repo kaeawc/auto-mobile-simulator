@@ -529,7 +529,222 @@ enum RxWork {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
     use super::*;
+    use crate::irq::TestLine;
+    use crate::pipe::{HostMsg, PipeService};
+    use crate::virtio::queue::tests::{Driver, RAM_BASE};
+
+    const GUEST_CID: u64 = 77;
+    const RX_BUFS: u64 = RAM_BASE + 0x10_0000;
+    const BUF: u32 = 4096;
+
+    /// Echoes guest bytes back, and remembers the latest context and whether it was closed.
+    #[derive(Default)]
+    struct Echo {
+        ctx: Mutex<Option<PipeCtx>>,
+        closed: Arc<Mutex<u32>>,
+    }
+
+    struct EchoPipe(Arc<Mutex<u32>>);
+
+    impl PipeHandler for EchoPipe {
+        fn guest_data(&mut self, data: &[u8], to_guest: &mut Vec<u8>) -> bool {
+            to_guest.extend_from_slice(data);
+            data != b"bye"
+        }
+        fn host_msg(&mut self, msg: HostMsg, to_guest: &mut Vec<u8>) -> bool {
+            match msg {
+                HostMsg::Data(d) => {
+                    to_guest.extend(d);
+                    true
+                }
+                _ => false,
+            }
+        }
+        fn closed(&mut self) {
+            *self.0.lock().expect("closed") += 1;
+        }
+    }
+
+    impl PipeService for Arc<Echo> {
+        fn open(&self, name: &str, ctx: PipeCtx) -> Option<Box<dyn PipeHandler>> {
+            (name == "echo").then(|| {
+                *self.ctx.lock().expect("ctx") = Some(ctx);
+                Box::new(EchoPipe(self.closed.clone())) as Box<dyn PipeHandler>
+            })
+        }
+    }
+
+    /// The guest's virtio-vsock driver: rx buffers posted up front, tx packets one per chain.
+    struct Guest {
+        mem: Arc<GuestRam>,
+        dev: Vsock,
+        rx: Driver,
+        tx: Driver,
+        rx_seen: u16,
+        tx_next: u64,
+        echo: Arc<Echo>,
+    }
+
+    fn guest() -> Guest {
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x40_0000).expect("ram"));
+        let echo = Arc::new(Echo::default());
+        let mut registry = PipeRegistry::default();
+        registry.register("echo", Box::new(echo.clone()));
+        let (events, rx_events) = event_channel();
+        let mut dev = Vsock::new(GUEST_CID, Arc::new(registry), events, rx_events);
+        let (mut rx, tx) = (Driver::at(RAM_BASE + 0x1000, 64), Driver::at(RAM_BASE + 0x8000, 64));
+        for i in 0..32 {
+            rx.push(&mem, &[(RX_BUFS + i * u64::from(BUF), BUF, true)]);
+        }
+        let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+        dev.activate(Activation { mem: mem.clone(), irq, queues: vec![Some(rx.cfg), Some(tx.cfg), None], features: 0 }).expect("activate");
+        Guest { mem, dev, rx, tx, rx_seen: 0, tx_next: RAM_BASE + 0x20_0000, echo }
+    }
+
+    impl Guest {
+        fn send(&mut self, op: u16, src_port: u32, dst_port: u32, payload: &[u8]) {
+            let h = Hdr {
+                src_cid: GUEST_CID,
+                dst_cid: HOST_CID,
+                src_port,
+                dst_port,
+                len: payload.len() as u32,
+                typ: TYPE_STREAM,
+                op,
+                flags: 0,
+                buf_alloc: 64 * 1024,
+                fwd_cnt: 0,
+            };
+            let mut pkt = h.encode().to_vec();
+            pkt.extend_from_slice(payload);
+            self.mem.write(self.tx_next, &pkt).expect("tx buf");
+            self.tx.push(&self.mem, &[(self.tx_next, pkt.len() as u32, false)]);
+            self.tx_next += 0x1000;
+            self.dev.notify(TXQ as u16);
+        }
+
+        /// The next packet the device puts in an rx buffer.
+        fn recv(&mut self) -> (Hdr, Vec<u8>) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.rx.used_idx(&self.mem) == self.rx_seen {
+                assert!(Instant::now() < deadline, "no rx packet");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let (id, len) = self.rx.used(&self.mem, self.rx_seen);
+            self.rx_seen += 1;
+            let mut b = vec![0u8; len as usize];
+            self.mem.read(RX_BUFS + u64::from(id) * u64::from(BUF), &mut b).expect("rx buf");
+            let h = Hdr::parse(&b).expect("header");
+            (h, b[HDR..HDR + h.len as usize].to_vec())
+        }
+
+        fn quiet(&self) -> bool {
+            std::thread::sleep(Duration::from_millis(50));
+            self.rx.used_idx(&self.mem) == self.rx_seen
+        }
+    }
+
+    #[test]
+    fn a_guest_pipe_connects_names_its_service_and_echoes() {
+        let mut g = guest();
+        let mut cfg = [0u8; 8];
+        g.dev.read_config(0, &mut cfg);
+        assert_eq!(u64::from_le_bytes(cfg), GUEST_CID);
+
+        g.send(OP_REQUEST, 1024, PIPE_PORT, &[]);
+        let (h, _) = g.recv();
+        assert_eq!((h.op, h.src_cid, h.dst_cid, h.src_port, h.dst_port), (OP_RESPONSE, HOST_CID, GUEST_CID, PIPE_PORT, 1024));
+        // The name may arrive split, and data may follow it in the same packet.
+        g.send(OP_RW, 1024, PIPE_PORT, b"pipe:ec");
+        g.send(OP_RW, 1024, PIPE_PORT, b"ho\0hello");
+        let (h, data) = g.recv();
+        assert_eq!((h.op, data.as_slice()), (OP_RW, &b"hello"[..]));
+        assert_eq!(h.fwd_cnt, 15, "everything the guest sent counts as forwarded");
+
+        // The host side talks through the context the service got.
+        let ctx = g.echo.ctx.lock().expect("ctx").clone().expect("opened");
+        assert!(ctx.send(HostMsg::Data(b"from host".to_vec())));
+        let (_, data) = g.recv();
+        assert_eq!(data, b"from host");
+
+        // The handler ending the conversation resets the connection and closes the pipe.
+        g.send(OP_RW, 1024, PIPE_PORT, b"bye");
+        let (h, data) = g.recv();
+        assert_eq!((h.op, data.as_slice()), (OP_RST, &[][..]));
+        assert_eq!(*g.echo.closed.lock().expect("closed"), 1);
+        g.send(OP_RW, 1024, PIPE_PORT, b"late");
+        assert_eq!(g.recv().0.op, OP_RST, "a closed connection is reset");
+    }
+
+    #[test]
+    fn unknown_pipes_ports_and_peers_are_reset() {
+        let mut g = guest();
+        g.send(OP_REQUEST, 1, 1234, &[]);
+        assert_eq!(g.recv().0.op, OP_RST, "only the pipe port listens");
+        g.send(OP_REQUEST, 2, PIPE_PORT, &[]);
+        assert_eq!(g.recv().0.op, OP_RESPONSE);
+        g.send(OP_REQUEST, 2, PIPE_PORT, &[]);
+        assert_eq!(g.recv().0.op, OP_RST, "a second request on a live connection");
+        g.send(OP_RW, 3, PIPE_PORT, b"pipe:nope\0");
+        assert_eq!(g.recv().0.op, OP_RST, "data on no connection");
+        g.send(OP_REQUEST, 4, PIPE_PORT, &[]);
+        assert_eq!(g.recv().0.op, OP_RESPONSE);
+        g.send(OP_RW, 4, PIPE_PORT, b"pipe:nope\0");
+        assert_eq!(g.recv().0.op, OP_RST, "no such service");
+        g.send(OP_RST, 9, PIPE_PORT, &[]);
+        assert!(g.quiet(), "a reset is never answered");
+        g.send(OP_SHUTDOWN, 2, PIPE_PORT, &[]);
+        assert_eq!(g.recv().0.op, OP_RST, "shutdown closes");
+    }
+
+    #[test]
+    fn credit_requests_are_answered() {
+        let mut g = guest();
+        g.send(OP_REQUEST, 5, PIPE_PORT, &[]);
+        g.recv();
+        g.send(OP_RW, 5, PIPE_PORT, b"pipe:echo\0");
+        g.send(OP_CREDIT_REQUEST, 5, PIPE_PORT, &[]);
+        let (h, _) = g.recv();
+        assert_eq!((h.op, h.fwd_cnt, h.buf_alloc), (OP_CREDIT_UPDATE, 10, BUF_ALLOC));
+    }
+
+    #[test]
+    fn host_connections_start_once_the_guest_answers() {
+        let mut g = guest();
+        let made = Arc::new(Mutex::new(Vec::new()));
+        let refused = Arc::new(Mutex::new(0));
+        let connect = |g: &Guest, port: u32| {
+            let (made, refused) = (made.clone(), refused.clone());
+            let make: crate::pipe::MakeHandler = Box::new(move |ctx: PipeCtx| {
+                made.lock().expect("made").push(ctx.conn);
+                Box::new(EchoPipe(Arc::default())) as Box<dyn PipeHandler>
+            });
+            let refused: Box<dyn FnOnce() + Send> = Box::new(move || *refused.lock().expect("refused") += 1);
+            g.dev.events.send(WorkerEvent::Connect { guest_port: port, make, refused }).expect("connect");
+        };
+        connect(&g, 5555);
+        let (h, _) = g.recv();
+        assert_eq!((h.op, h.dst_port, h.src_port), (OP_REQUEST, 5555, 50_000));
+        assert!(made.lock().expect("made").is_empty(), "no host I/O before the guest accepts");
+        g.send(OP_RESPONSE, 5555, 50_000, &[]);
+        g.send(OP_RW, 5555, 50_000, b"ping");
+        assert_eq!(g.recv().1, b"ping");
+        assert_eq!(made.lock().expect("made").len(), 1);
+
+        connect(&g, 6000);
+        let (h, _) = g.recv();
+        g.send(OP_RST, 6000, h.src_port, &[]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while *refused.lock().expect("refused") == 0 {
+            assert!(Instant::now() < deadline, "refusal not reported");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(g.quiet(), "a refused request isn't reset back");
+    }
 
     #[test]
     fn header_round_trip() {

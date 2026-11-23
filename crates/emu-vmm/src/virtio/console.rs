@@ -324,7 +324,148 @@ impl Worker {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
+    use crate::irq::TestLine;
+    use crate::virtio::queue::tests::{Driver, RAM_BASE};
+
+    /// A modem-like backend: greets on open, answers each write.
+    struct Modem(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl PortBackend for Modem {
+        fn guest_data(&mut self, data: &[u8]) -> Vec<u8> {
+            self.0.lock().expect("log").push(String::from_utf8_lossy(data).into_owned());
+            b"OK\r\n".to_vec()
+        }
+        fn guest_open(&mut self, open: bool) -> Vec<u8> {
+            self.0.lock().expect("log").push(format!("open={open}"));
+            if open { b"READY\r\n".to_vec() } else { Vec::new() }
+        }
+    }
+
+    /// The guest's virtio_console driver for two ports: receive queues get buffers up front.
+    struct Guest {
+        mem: Arc<GuestRam>,
+        dev: Console,
+        q: Vec<Driver>,
+        seen: Vec<u16>,
+        tx_next: u64,
+        host: Vec<PortHandle>,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    const BUFS: u64 = RAM_BASE + 0x10_0000;
+
+    fn guest() -> Guest {
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x40_0000).expect("ram"));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut dev, host) = Console::new(vec![
+            PortSpec { name: String::new(), backend: Box::new(Sink) },
+            PortSpec { name: "modem".into(), backend: Box::new(Modem(log.clone())) },
+        ]);
+        let mut q: Vec<Driver> = (0..6).map(|i| Driver::at(RAM_BASE + 0x1000 + i * 0x2000, 16)).collect();
+        // Receive queues (port 0, control, port 1): eight 64-byte buffers each.
+        for rx in [0usize, CTL_RX, rx_queue(1)] {
+            for b in 0..8u64 {
+                q[rx].push(&mem, &[(BUFS + (rx as u64 * 8 + b) * 64, 64, true)]);
+            }
+        }
+        let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+        dev.activate(Activation { mem: mem.clone(), irq, queues: q.iter().map(|d| Some(d.cfg)).collect(), features: F_MULTIPORT })
+            .expect("activate");
+        Guest { mem, dev, q, seen: vec![0; 6], tx_next: RAM_BASE + 0x20_0000, host, log }
+    }
+
+    impl Guest {
+        fn send(&mut self, queue: usize, bytes: &[u8]) {
+            self.mem.write(self.tx_next, bytes).expect("tx");
+            self.q[queue].push(&self.mem, &[(self.tx_next, bytes.len() as u32, false)]);
+            self.tx_next += 0x100;
+            self.dev.notify(queue as u16);
+        }
+        fn control(&mut self, id: u32, event: u16, value: u16) {
+            self.send(CTL_TX, &ctl_msg(id, event, value, &[]));
+        }
+        /// The next buffer the device filled on receive queue `rx`.
+        fn recv(&mut self, rx: usize) -> Vec<u8> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.q[rx].used_idx(&self.mem) == self.seen[rx] {
+                assert!(Instant::now() < deadline, "nothing on queue {rx}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let (id, len) = self.q[rx].used(&self.mem, self.seen[rx]);
+            self.seen[rx] += 1;
+            let mut b = vec![0u8; len as usize];
+            self.mem.read(BUFS + (rx as u64 * 8 + u64::from(id) % 8) * 64, &mut b).expect("rx");
+            b
+        }
+        fn idle(&self, rx: usize) -> bool {
+            std::thread::sleep(Duration::from_millis(50));
+            self.q[rx].used_idx(&self.mem) == self.seen[rx]
+        }
+    }
+
+    #[test]
+    fn multiport_bring_up_names_the_modem_and_carries_data_both_ways() {
+        let mut g = guest();
+        g.host[1].send(b"+CREG: 1\r\n".to_vec()); // before the guest opens the port: held
+        g.control(0, ctl::DEVICE_READY, 1);
+        assert_eq!(g.recv(CTL_RX), ctl_msg(0, ctl::DEVICE_ADD, 0, &[]));
+        assert_eq!(g.recv(CTL_RX), ctl_msg(1, ctl::DEVICE_ADD, 0, &[]));
+        g.control(0, ctl::PORT_READY, 1);
+        assert_eq!(g.recv(CTL_RX), ctl_msg(0, ctl::CONSOLE_PORT, 1, &[]));
+        assert_eq!(g.recv(CTL_RX), ctl_msg(0, ctl::PORT_OPEN, 1, &[]));
+        g.control(1, ctl::PORT_READY, 1);
+        assert_eq!(g.recv(CTL_RX), ctl_msg(1, ctl::PORT_NAME, 1, b"modem"));
+        assert_eq!(g.recv(CTL_RX), ctl_msg(1, ctl::PORT_OPEN, 1, &[]));
+        assert!(g.idle(rx_queue(1)), "nothing until the guest opens the port");
+
+        g.control(1, ctl::PORT_OPEN, 1);
+        let mut got = Vec::new();
+        while got.len() < b"+CREG: 1\r\nREADY\r\n".len() {
+            got.extend(g.recv(rx_queue(1)));
+        }
+        assert_eq!(got, b"+CREG: 1\r\nREADY\r\n", "held bytes, then the greeting");
+        g.send(tx_queue(1), b"AT+CSQ\r");
+        assert_eq!(g.recv(rx_queue(1)), b"OK\r\n");
+        g.send(tx_queue(0), b"console output");
+        assert!(g.idle(0), "port 0 is a sink");
+
+        g.control(1, ctl::PORT_OPEN, 0);
+        g.host[1].send(b"dropped".to_vec());
+        assert!(g.idle(rx_queue(1)), "a closed port gets nothing");
+        assert_eq!(*g.log.lock().expect("log"), ["open=true", "AT+CSQ\r", "open=false"]);
+        g.control(9, ctl::PORT_READY, 1); // no such port: ignored
+        g.send(CTL_TX, &[1, 2, 3]); // runt message: ignored
+        assert!(g.idle(CTL_RX));
+    }
+
+    #[test]
+    fn host_bytes_wait_for_receive_buffers() {
+        let mut g = guest();
+        g.control(1, ctl::PORT_OPEN, 1);
+        let _ = g.recv(rx_queue(1)); // READY
+        // 8 buffers of 64 bytes are posted; send more than fits, then add buffers.
+        let big = vec![b'x'; 64 * 10];
+        let posted_before = g.q[rx_queue(1)].used_idx(&g.mem);
+        g.host[1].send(big.clone());
+        let mut got = Vec::new();
+        for _ in posted_before..8 {
+            got.extend(g.recv(rx_queue(1)));
+        }
+        assert!(g.idle(rx_queue(1)), "out of buffers");
+        for b in 0..4u64 {
+            let addr = BUFS + (rx_queue(1) as u64 * 8 + b) * 64;
+            g.q[rx_queue(1)].push(&g.mem, &[(addr, 64, true)]);
+        }
+        g.host[1].send(Vec::new()); // empty sends are dropped; the next kick flushes
+        g.dev.notify(0);
+        while got.len() < big.len() {
+            got.extend(g.recv(rx_queue(1)));
+        }
+        assert_eq!(got, big);
+    }
 
     #[test]
     fn control_messages_and_queue_numbers() {

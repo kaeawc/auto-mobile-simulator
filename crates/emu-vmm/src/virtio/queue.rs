@@ -233,7 +233,11 @@ pub(crate) mod tests {
 
     impl Driver {
         pub fn new(size: u16) -> Driver {
-            let desc = RAM_BASE + 0x1000;
+            Driver::at(RAM_BASE + 0x1000, size)
+        }
+
+        /// A queue whose rings start at `desc` (devices with several queues need each apart).
+        pub fn at(desc: u64, size: u16) -> Driver {
             let avail = desc + u64::from(size) * 16;
             let used = (avail + 6 + u64::from(size) * 2 + 3) & !3;
             Driver { cfg: QueueConfig { size, desc, avail, used }, next_desc: 0, avail_idx: 0 }

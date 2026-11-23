@@ -45,3 +45,20 @@ impl DisplaySink for FrameStore {
         s.frames += 1;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_the_latest_frame_and_counts_them() {
+        let store = FrameStore::default();
+        assert_eq!((store.frames(), store.snapshot().pixels.len()), (0, 0));
+        store.present(2, 1, 8, 1, &[1; 8]);
+        store.present(1, 1, 4, 2, &[7, 7, 7, 7]);
+        let f = store.snapshot();
+        assert_eq!((f.width, f.height, f.stride, f.format, f.frames), (1, 1, 4, 2, 2));
+        assert_eq!(f.pixels, [7, 7, 7, 7], "replaced, not appended");
+        assert_eq!(store.frames(), 2);
+    }
+}

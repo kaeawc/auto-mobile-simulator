@@ -235,3 +235,220 @@ impl MmioDevice for MmioTransport {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::irq::TestLine;
+
+    /// What the transport told the device, for assertions.
+    #[derive(Default)]
+    struct Seen {
+        activations: Vec<(u64, Vec<Option<QueueConfig>>)>,
+        notified: Vec<u16>,
+        config_writes: Vec<(u64, Vec<u8>)>,
+        resets: u32,
+    }
+
+    struct FakeDevice {
+        seen: Arc<Mutex<Seen>>,
+        fail: bool,
+    }
+
+    const FEATURE_A: u64 = 1 << 3;
+
+    impl VirtioDevice for FakeDevice {
+        fn device_id(&self) -> u32 {
+            42
+        }
+        fn features(&self) -> u64 {
+            FEATURE_A | F_RING_EVENT_IDX
+        }
+        fn num_queues(&self) -> usize {
+            2
+        }
+        fn queue_max_size(&self) -> u16 {
+            128
+        }
+        fn read_config(&self, offset: u64, data: &mut [u8]) {
+            for (i, b) in data.iter_mut().enumerate() {
+                *b = (offset as u8).wrapping_add(i as u8);
+            }
+        }
+        fn write_config(&mut self, offset: u64, data: &[u8]) {
+            self.seen.lock().expect("seen").config_writes.push((offset, data.to_vec()));
+        }
+        fn activate(&mut self, act: super::super::Activation) -> Result<(), String> {
+            if self.fail {
+                return Err("no".into());
+            }
+            self.seen.lock().expect("seen").activations.push((act.features, act.queues));
+            Ok(())
+        }
+        fn notify(&mut self, queue: u16) {
+            self.seen.lock().expect("seen").notified.push(queue);
+        }
+        fn reset(&mut self) {
+            self.seen.lock().expect("seen").resets += 1;
+        }
+        fn shm_region(&self, id: u8) -> Option<(u64, u64)> {
+            (id == 1).then_some((0x1_2345_6000, 0x8000_0000))
+        }
+    }
+
+    struct Slot {
+        t: MmioTransport,
+        seen: Arc<Mutex<Seen>>,
+        line: Arc<TestLine>,
+    }
+
+    fn slot(fail: bool) -> Slot {
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let line = Arc::new(TestLine::default());
+        let mem = Arc::new(GuestRam::new(0x4000_0000, 0x10000).expect("ram"));
+        let dev: Box<dyn VirtioDevice> = Box::new(FakeDevice { seen: seen.clone(), fail });
+        Slot { t: MmioTransport::new(Some(dev), Arc::new(Interrupt::new(line.clone())), mem), seen, line }
+    }
+
+    impl Slot {
+        fn r(&self, offset: u64) -> u32 {
+            let mut b = [0u8; 4];
+            self.t.read(offset, &mut b);
+            u32::from_le_bytes(b)
+        }
+        fn w(&self, offset: u64, v: u32) {
+            self.t.write(offset, &v.to_le_bytes());
+        }
+        /// The Linux driver's bring-up up to FEATURES_OK, accepting `features`.
+        fn negotiate(&self, features: u64) {
+            self.w(0x070, 0);
+            self.w(0x070, STATUS_ACKNOWLEDGE);
+            self.w(0x070, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+            for sel in 0..2 {
+                self.w(0x024, sel);
+                self.w(0x020, (features >> (32 * sel)) as u32);
+            }
+            self.w(0x070, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
+        }
+        fn queue(&self, sel: u32, num: u32, base: u64) {
+            self.w(0x030, sel);
+            self.w(0x038, num);
+            for (lo, addr) in [(0x080, base), (0x090, base + 0x1000), (0x0a0, base + 0x2000)] {
+                self.w(lo, addr as u32);
+                self.w(lo + 4, (addr >> 32) as u32);
+            }
+            self.w(0x044, 1);
+        }
+    }
+
+    #[test]
+    fn identifies_like_a_qemu_virtio_mmio_v2_slot() {
+        let s = slot(false);
+        assert_eq!([s.r(0x000), s.r(0x004), s.r(0x008), s.r(0x00c)], [MAGIC, 2, 42, VENDOR]);
+        s.w(0x014, 0);
+        assert_eq!(s.r(0x010), (FEATURE_A | F_RING_EVENT_IDX) as u32);
+        s.w(0x014, 1);
+        assert_eq!(s.r(0x010), 1, "VERSION_1 in the high word");
+        s.w(0x014, 2);
+        assert_eq!(s.r(0x010), 0);
+        s.w(0x030, 1);
+        assert_eq!(s.r(0x034), 128, "queue 1 exists");
+        s.w(0x030, 2);
+        assert_eq!(s.r(0x034), 0, "queue 2 doesn't");
+    }
+
+    #[test]
+    fn empty_slots_answer_device_id_zero() {
+        let mem = Arc::new(GuestRam::new(0x4000_0000, 0x4000).expect("ram"));
+        let t = MmioTransport::new(None, Arc::new(Interrupt::new(Arc::new(TestLine::default()))), mem);
+        let mut b = [0xffu8; 4];
+        t.read(0x008, &mut b);
+        assert_eq!(b, [0; 4]);
+        t.read(0x100, &mut b);
+        assert_eq!(b, [0; 4], "no config space");
+        t.write(0x070, &4u32.to_le_bytes()); // DRIVER_OK on nothing: ignored
+    }
+
+    #[test]
+    fn bring_up_activates_with_the_negotiated_features_and_ready_queues() {
+        let s = slot(false);
+        // Features the device never offered are dropped.
+        s.negotiate(FEATURE_A | (1 << 7) | F_VERSION_1);
+        assert_ne!(s.r(0x070) & STATUS_FEATURES_OK, 0, "accepted");
+        s.queue(0, 64, 0x4000_0000);
+        s.w(0x030, 1);
+        s.w(0x038, 100); // not a power of two
+        s.w(0x044, 1);
+        assert_eq!(s.r(0x044), 0, "a queue without a valid size never becomes ready");
+        s.w(0x050, 0);
+        assert!(s.seen.lock().expect("seen").notified.is_empty(), "no notifications before DRIVER_OK");
+        s.w(0x070, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
+        {
+            let seen = s.seen.lock().expect("seen");
+            let [(features, queues)] = seen.activations.as_slice() else { panic!("one activation: {}", seen.activations.len()) };
+            assert_eq!(*features, FEATURE_A | F_VERSION_1);
+            assert_eq!(queues.len(), 2);
+            let q = queues[0].as_ref().expect("queue 0");
+            assert_eq!((q.size, q.desc, q.avail, q.used), (64, 0x4000_0000, 0x4000_1000, 0x4000_2000));
+            assert!(queues[1].is_none());
+        }
+        s.w(0x070, 0xf);
+        assert_eq!(s.seen.lock().expect("seen").activations.len(), 1, "activates once");
+        s.w(0x050, 1);
+        assert_eq!(s.seen.lock().expect("seen").notified, [1]);
+    }
+
+    #[test]
+    fn features_ok_needs_version_1() {
+        let s = slot(false);
+        s.negotiate(FEATURE_A);
+        assert_eq!(s.r(0x070) & STATUS_FEATURES_OK, 0, "a legacy driver is refused");
+    }
+
+    #[test]
+    fn a_failed_activation_sets_failed() {
+        let s = slot(true);
+        s.negotiate(F_VERSION_1);
+        s.w(0x070, 0xf);
+        assert_ne!(s.r(0x070) & STATUS_FAILED, 0);
+    }
+
+    #[test]
+    fn interrupts_are_level_until_acknowledged_and_reset_clears_everything() {
+        let s = slot(false);
+        s.negotiate(F_VERSION_1);
+        s.queue(0, 16, 0x4000_4000);
+        s.w(0x070, 0xf);
+        s.t.irq.raise(super::super::INT_USED_RING | super::super::INT_CONFIG);
+        assert!(s.line.level());
+        assert_eq!(s.r(0x060), 3);
+        s.w(0x064, super::super::INT_USED_RING);
+        assert!(s.line.level(), "still asserted while a bit is set");
+        s.w(0x064, super::super::INT_CONFIG);
+        assert!(!s.line.level());
+
+        s.t.irq.raise(super::super::INT_USED_RING);
+        s.w(0x070, 0);
+        assert!(!s.line.level(), "reset drops the line");
+        assert_eq!([s.r(0x070), s.r(0x044)], [0, 0]);
+        assert_eq!(s.seen.lock().expect("seen").resets, 2, "negotiate's reset and this one");
+        s.w(0x050, 0);
+        assert!(s.seen.lock().expect("seen").notified.is_empty(), "no notifications after reset");
+    }
+
+    #[test]
+    fn config_space_and_shared_memory_reach_the_device() {
+        let s = slot(false);
+        let mut b = [0u8; 2];
+        s.t.read(0x104, &mut b);
+        assert_eq!(b, [4, 5]);
+        s.t.write(0x108, &[9, 8, 7]);
+        assert_eq!(s.seen.lock().expect("seen").config_writes, [(8, vec![9, 8, 7])]);
+        s.w(0x0ac, 1);
+        assert_eq!([s.r(0x0b0), s.r(0x0b4), s.r(0x0b8), s.r(0x0bc)], [0x8000_0000, 0, 0x2345_6000, 1]);
+        s.w(0x0ac, 0);
+        assert_eq!(s.r(0x0b0), u32::MAX, "no region 0");
+    }
+}
