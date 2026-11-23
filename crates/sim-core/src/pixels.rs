@@ -143,16 +143,17 @@ fn downscale_banded(width: u32, height: u32, rgba: &[u8], factor: u32, out: &mut
     (ow, oh)
 }
 
-/// Input bytes per band: starting a thread costs 20–100 µs, so each must have a few
-/// hundred microseconds of work.
-const BAND_BYTES: usize = 4 << 20;
+/// Input bytes below which one thread does the whole frame: starting a thread costs 20–100 µs,
+/// and on a host with SMT two threads can share one core (measured slower than one there). A
+/// tablet-sized frame (2480x1740, 17 MB) splits; a phone's (1080x2400, 10 MB) doesn't.
+const BAND_MIN_BYTES: usize = 16 << 20;
 /// Most threads one frame uses: the emulator's vCPUs and renderer need the rest of the machine.
 const MAX_BANDS: usize = 4;
 
 fn bands_for(in_bytes: usize) -> usize {
     static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
-    (in_bytes / BAND_BYTES).clamp(1, cores.clamp(1, MAX_BANDS))
+    if in_bytes < BAND_MIN_BYTES { 1 } else { cores.clamp(1, MAX_BANDS) }
 }
 
 /// The box filter for a factor known at compile time (the display stream's usual 2–4), one output

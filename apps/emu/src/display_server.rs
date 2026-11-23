@@ -144,6 +144,7 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
     let mut rows = Vec::new();
     let mut ring: Option<Ring> = None;
     let mut ring_failed = false;
+    let mut stats = std::env::var_os("EMU_FRAME_STATS").is_some().then(Stats::default);
     while !wants.done.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
         // At most one frame per MIN_INTERVAL; then wait for a new one (woken by the frame, or
         // every 100 ms to notice the client or the emulator going away).
@@ -156,6 +157,7 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
         if mw == 0 || n == sent {
             continue;
         }
+        let started = Instant::now();
         let frame = if wants.shared.load(Ordering::Relaxed) && !ring_failed {
             shared_frame(display, mw, n, &mut ring, dir).unwrap_or_else(|e| {
                 // No ring: this client gets its frames on the socket from the next one.
@@ -171,7 +173,8 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
             last = Instant::now();
             continue;
         };
-        let result = match frame {
+        let captured = started.elapsed();
+        let result = match &frame {
             Out::Socket(header) => {
                 sent = header.frame;
                 out.write_all(&header.encode()).and_then(|()| out.write_all(&rows))
@@ -184,7 +187,7 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
                     msg.extend(Record::Ring { path_len: p.len() as u32 }.encode());
                     msg.extend_from_slice(p);
                 }
-                msg.extend(Record::Shared { header, slot }.encode());
+                msg.extend(Record::Shared { header: *header, slot: *slot }.encode());
                 out.write_all(&msg)
             }
         };
@@ -192,6 +195,50 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
             break;
         }
         last = Instant::now();
+        if let Some(line) = stats.as_mut().and_then(|s| s.add(&frame, captured, last - started - captured)) {
+            eprintln!("emu: display: {line}");
+        }
+    }
+}
+
+/// `EMU_FRAME_STATS=1`: each stream reports, every [`Stats::EVERY`] frames, how long getting a
+/// frame (readback when it's new, then scaling it into the ring or the socket buffer) and sending
+/// it took, for measuring on a running guest.
+#[derive(Default)]
+struct Stats {
+    capture: Vec<f64>,
+    send: Vec<f64>,
+}
+
+impl Stats {
+    const EVERY: usize = 100;
+
+    fn add(&mut self, frame: &Out, capture: Duration, send: Duration) -> Option<String> {
+        self.capture.push(capture.as_secs_f64() * 1000.0);
+        self.send.push(send.as_secs_f64() * 1000.0);
+        if self.capture.len() < Self::EVERY {
+            return None;
+        }
+        let (header, how) = match frame {
+            Out::Socket(h) => (h, "socket"),
+            Out::Shared { header, .. } => (header, "ring"),
+        };
+        let summary = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            let s = format!("median {:.2} ms, max {:.2} ms", v[v.len() / 2], v[v.len() - 1]);
+            v.clear();
+            s
+        };
+        Some(format!(
+            "{} frames of {}x{} (device {}x{}) by {how}: capture+scale {}; send {}",
+            Self::EVERY,
+            header.width,
+            header.height,
+            header.device_width,
+            header.device_height,
+            summary(&mut self.capture),
+            summary(&mut self.send)
+        ))
     }
 }
 
@@ -540,6 +587,21 @@ mod tests {
         rig.store.posted(4, 4);
         assert!(std::io::Read::read(&mut r, &mut [0u8; 1]).is_err());
         assert_eq!(rig.reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn frame_stats_report_every_hundred_frames() {
+        let mut stats = Stats::default();
+        let header = FrameHeader::new(2, 1, 4, 2, 1).expect("size");
+        for i in 1..Stats::EVERY {
+            assert_eq!(stats.add(&Out::Socket(header), Duration::from_millis(i as u64), Duration::ZERO), None);
+        }
+        let line = stats.add(&Out::Shared { header, slot: 0, announce: None }, Duration::from_millis(100), Duration::ZERO).expect("report");
+        assert_eq!(
+            line,
+            "100 frames of 2x1 (device 4x2) by ring: capture+scale median 51.00 ms, max 100.00 ms; send median 0.00 ms, max 0.00 ms"
+        );
+        assert!(stats.capture.is_empty() && stats.send.is_empty(), "starts over");
     }
 
     #[test]
