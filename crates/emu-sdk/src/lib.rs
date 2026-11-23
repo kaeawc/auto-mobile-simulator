@@ -168,15 +168,17 @@ impl Sdk {
     }
 
     fn run(&self, cmd: &mut Command) -> Result<std::process::ExitStatus> {
-        cmd.status().map_err(|e| {
-            let program = Path::new(cmd.get_program());
-            if e.kind() == std::io::ErrorKind::NotFound {
-                let name = program.file_name().unwrap_or(program.as_os_str()).to_string_lossy();
-                Error::Command(format!("`{}` not found: install {name} (e.g. `apt install {name}`)", program.display()))
-            } else {
-                Error::Command(format!("{}: {e}", program.display()))
-            }
-        })
+        cmd.status().map_err(|e| self.tool_error(Path::new(cmd.get_program()), e))
+    }
+
+    /// Why a host tool couldn't run; a missing one says what to install.
+    fn tool_error(&self, program: &Path, e: std::io::Error) -> Error {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            let name = program.file_name().unwrap_or(program.as_os_str()).to_string_lossy();
+            Error::Command(format!("`{}` not found: install {name} (e.g. `apt install {name}`)", program.display()))
+        } else {
+            Error::Command(format!("{}: {e}", program.display()))
+        }
     }
 
     /// Fetches (or reads from the daily cache) and parses a manifest.
@@ -259,7 +261,25 @@ impl Sdk {
     /// already there; callers skip installed packages with [`Sdk::is_installed`].
     pub fn install(&self, d: &Download) -> Result<PathBuf> {
         let part = self.fetch_verified(d)?;
-        let tmp = self.unpack(d, false, |dest| vec!["-q".into(), part.clone().into(), "-d".into(), dest.into()])?;
+        // Disk images stream out of the archive into sparse files: most of a system image is
+        // zeros (8.1 of TV 34's 8.6 GB), which unzip would write out in full. Everything else
+        // unzips as usual.
+        let images: Vec<String> = self.archive_members(&part)?.into_iter().filter(|m| m.ends_with(".img")).collect();
+        let tmp = self.unpack(d, false, |dest| {
+            let mut args: Vec<OsString> = vec!["-q".into(), part.clone().into(), "-d".into(), dest.into()];
+            if !images.is_empty() {
+                args.push("-x".into());
+                args.extend(images.iter().map(OsString::from));
+            }
+            args
+        })?;
+        for member in &images {
+            let out = tmp.0.join(member);
+            let (len, data) = self.unzip_sparse(&part, member, &out)?;
+            if len > data {
+                self.say(&format!("{member}: {} written, {} of zeros left as holes", format_size(data), format_size(len - data)));
+            }
+        }
         let entries: Vec<PathBuf> = std::fs::read_dir(&tmp.0)
             .map_err(io(&tmp.0))?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -272,8 +292,6 @@ impl Sdk {
         if !top.join("source.properties").is_file() {
             self.say(&format!("warning: {} has no source.properties", d.file_name()));
         }
-        self.sparsify_images(&top);
-
         let dest = self.root.join(d.install_dir());
         replace_dir(&top, &dest)?;
         // The unpacked package is the cache; a system image archive is close to 2 GB.
@@ -339,22 +357,37 @@ impl Sdk {
         Ok(part)
     }
 
-    /// Punches holes in the zero blocks of a package's disk images (`*.img`): unzip writes them
-    /// out in full, and most of a system image is zeros (8.1 of TV 34's 8.6 GB `system.img`).
-    /// Reads still return zeros there. Best effort: a filesystem without holes keeps the file.
-    fn sparsify_images(&self, dir: &Path) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for path in entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "img") && p.is_file()) {
-            match sparsify(&path) {
-                Ok(0) => {}
-                Ok(freed) => self.say(&format!(
-                    "{}: {} of zeros made sparse",
-                    path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
-                    format_size(freed)
-                )),
-                Err(e) => self.say(&format!("warning: {} stays dense: {e}", path.display())),
-            }
+    /// The archive's member paths (`unzip -Z1`), directories excluded.
+    fn archive_members(&self, archive: &Path) -> Result<Vec<String>> {
+        let out = Command::new(&self.unzip).arg("-Z1").arg(archive).output().map_err(|e| self.tool_error(&self.unzip, e))?;
+        if !out.status.success() {
+            return Err(Error::Command(format!("listing {} failed ({})", archive.display(), out.status)));
         }
+        Ok(String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.is_empty() && !l.ends_with('/')).map(str::to_owned).collect())
+    }
+
+    /// Unzips one member to `out` (`unzip -p`), writing only its non-zero 4 KiB blocks: zero runs
+    /// stay holes, which read back as zeros. Returns the file's length and the bytes written.
+    fn unzip_sparse(&self, archive: &Path, member: &str, out: &Path) -> Result<(u64, u64)> {
+        if let Some(dir) = out.parent() {
+            std::fs::create_dir_all(dir).map_err(io(dir))?;
+        }
+        let mut child = Command::new(&self.unzip)
+            .arg("-p")
+            .arg(archive)
+            .arg(member)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| self.tool_error(&self.unzip, e))?;
+        let stdout = child.stdout.take().ok_or_else(|| Error::Command("unzip gave no output pipe".into()))?;
+        let file = std::fs::File::create(out).map_err(io(out))?;
+        let written = write_sparse(stdout, &file).map_err(io(out));
+        let status = child.wait().map_err(io(out))?;
+        let (len, data) = written?;
+        if !status.success() {
+            return Err(Error::Command(format!("unzip of {member} from {} failed ({status})", archive.display())));
+        }
+        Ok((len, data))
     }
 
     /// Runs unzip with the arguments `args` builds for a fresh temporary directory under the
@@ -404,47 +437,47 @@ impl Sdk {
 #[cfg(test)]
 mod tests;
 
-/// Deallocates every all-zero, block-aligned run of `path` (4 KiB blocks, the APFS and ext4
-/// block size) and returns how many bytes it freed. Contents read back unchanged.
-pub fn sparsify(path: &Path) -> std::io::Result<u64> {
-    use std::io::Read;
+/// Copies `src` into the empty file `dst`, writing only blocks that aren't all zeros (4 KiB, the
+/// APFS and ext4 block size): zero runs are never allocated and read back as zeros. Returns the
+/// length and how many bytes were written.
+pub fn write_sparse(mut src: impl std::io::Read, dst: &std::fs::File) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::FileExt;
     const BLOCK: usize = 4096;
-    let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
-    let mut reader = std::io::BufReader::with_capacity(4 << 20, &file);
-    let mut block = vec![0u8; BLOCK];
-    let (mut offset, mut run_start, mut freed) = (0u64, None::<u64>, 0u64);
-    let mut punch = |start: u64, end: u64| -> std::io::Result<()> {
-        emu_hvf::host::punch_hole(&file, start, end - start)?;
-        freed += end - start;
-        Ok(())
-    };
+    let mut buf = vec![0u8; 1 << 20];
+    let (mut offset, mut written) = (0u64, 0u64);
     loop {
         let mut n = 0;
-        while n < BLOCK {
-            match reader.read(&mut block[n..]) {
+        while n < buf.len() {
+            match src.read(&mut buf[n..]) {
                 Ok(0) => break,
                 Ok(k) => n += k,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
         }
-        // A short final block stays allocated: holes cover whole blocks only.
-        let zero = n == BLOCK && block.iter().all(|&b| b == 0);
-        match (zero, run_start) {
-            (true, None) => run_start = Some(offset),
-            (false, Some(start)) => {
-                punch(start, offset)?;
-                run_start = None;
+        // Each run of non-zero blocks goes out in one write.
+        let mut run: Option<usize> = None;
+        for (i, block) in buf[..n].chunks(BLOCK).enumerate() {
+            let zero = block.iter().all(|&b| b == 0);
+            match (zero, run) {
+                (false, None) => run = Some(i * BLOCK),
+                (true, Some(start)) => {
+                    dst.write_all_at(&buf[start..i * BLOCK], offset + start as u64)?;
+                    written += (i * BLOCK - start) as u64;
+                    run = None;
+                }
+                _ => {}
             }
-            _ => {}
+        }
+        if let Some(start) = run {
+            dst.write_all_at(&buf[start..n], offset + start as u64)?;
+            written += (n - start) as u64;
         }
         offset += n as u64;
-        if n < BLOCK {
+        if n < buf.len() {
             break;
         }
     }
-    if let Some(start) = run_start {
-        punch(start, offset)?;
-    }
-    Ok(freed)
+    dst.set_len(offset)?;
+    Ok((offset, written))
 }

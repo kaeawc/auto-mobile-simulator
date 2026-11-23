@@ -111,9 +111,11 @@ emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a -lcd
 always macOS/arm64's), downloads it with the system's `/usr/bin/curl` (resumable, into `$ANDROID_HOME/.downloads`),
 checks size and sha1, unpacks it with `/usr/bin/unzip` and moves it into the standard SDK layout.
 Installed packages are skipped, manifests are cached for a day, and the archive is deleted once
-unpacked. unzip writes disk images out in full, so the zero blocks of each `*.img` are then
-punched out (`F_PUNCHHOLE` on macOS, `fallocate` on Linux): TV 34's `system.img` takes 1.4 GB
-instead of 8.1 GB, reading back unchanged. The SDK is `$ANDROID_SDK_ROOT`/`$ANDROID_HOME`, else Android Studio's default
+unpacked. Disk images (`*.img`) don't go through a plain unzip: each streams out of the archive
+(`unzip -p`) into a file where only non-zero 4 KiB blocks are written, so zero runs stay holes.
+Most of a system image is zeros: TV 34's 8.6 GB `system.img` takes 1.4 GB and reads back
+byte-identical. Unpacking TV 34 took 64 s instead of 4 min 48 s (unzip writing 8.6 GB, then a pass
+reading it back to punch holes) on a Linux VM, against a 40 s floor for inflating it at all. The SDK is `$ANDROID_SDK_ROOT`/`$ANDROID_HOME`, else Android Studio's default
 (`~/Library/Android/sdk` on macOS, `~/Android/Sdk` on Linux). An API level a tag publishes only
 at extension levels (Automotive's API 34 and 35) resolves to the newest of them. Provisioning
 works on Linux too, for preparing images and AVDs; there `-provision` skips the renderer, since

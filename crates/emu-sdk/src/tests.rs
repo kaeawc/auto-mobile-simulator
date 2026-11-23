@@ -162,20 +162,16 @@ fn sha1_known_values() {
 }
 
 /// The whole install path, offline: curl fetches a `file://` URL, the archive is verified,
-/// unpacked and moved into place. Needs macOS's `/usr/bin/zip` to build the archive.
+/// unpacked and moved into place.
 #[test]
 fn installs_from_a_local_archive() {
-    if !Path::new("/usr/bin/zip").is_file() || !Path::new("/usr/bin/curl").is_file() || !Path::new("/usr/bin/unzip").is_file() {
-        return;
-    }
     let work = scratch("install");
-    let src = work.join("src/platform-tools");
-    std::fs::create_dir_all(&src).expect("mkdir");
-    std::fs::write(src.join("source.properties"), "Pkg.Revision=37.0.3\n").expect("write");
-    std::fs::write(src.join("adb"), "#!/bin/sh\necho fake adb\n").expect("write");
     let zip = work.join("platform-tools_r37.0.3-darwin.zip");
-    let ok = Command::new("/usr/bin/zip").current_dir(work.join("src")).arg("-qr").arg(&zip).arg("platform-tools").status().expect("zip");
-    assert!(ok.success());
+    let archive = stored_zip(&[
+        ("platform-tools/source.properties", b"Pkg.Revision=37.0.3\n"),
+        ("platform-tools/adb", b"#!/bin/sh\necho fake adb\n"),
+    ]);
+    std::fs::write(&zip, &archive).expect("write zip");
     let bytes = std::fs::read(&zip).expect("read zip");
 
     let mut sdk = Sdk::new(work.join("sdk")).expect("sdk");
@@ -481,26 +477,115 @@ fn a_missing_host_tool_says_what_to_install() {
 }
 
 #[test]
-fn sparsify_frees_zero_blocks_and_keeps_contents() {
+fn write_sparse_skips_zero_blocks_and_keeps_contents() {
     use std::os::unix::fs::MetadataExt;
     let path = std::env::temp_dir().join(format!("emu-sdk-sparse-{}.img", std::process::id()));
-    let mut data = vec![0u8; 64 * 4096 + 100];
-    data[5 * 4096 + 7] = 1; // block 5 stays
-    data[40 * 4096..41 * 4096].fill(0xff); // block 40 stays
-    std::fs::write(&path, &data).expect("write");
-    let before = std::fs::metadata(&path).expect("meta").blocks();
-    let freed = match sparsify(&path) {
-        Ok(f) => f,
-        // tmpfs and some overlay filesystems have no holes.
-        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => return,
-        Err(e) => panic!("{e}"),
-    };
-    let after = std::fs::read(&path).expect("read");
+    // 3 MiB: crosses the copy buffer, with data at a buffer edge and a short non-zero tail.
+    let mut data = vec![0u8; 3 * (1 << 20) + 100];
+    data[5 * 4096 + 7] = 1;
+    data[(1 << 20) - 1] = 2; // the last byte of the first buffer
+    data[1 << 20] = 3; // the first of the second
+    data[3 << 20..].fill(0xff);
+    let file = std::fs::File::create(&path).expect("create");
+    let (len, written) = write_sparse(&data[..], &file).expect("write");
+    drop(file);
+    let back = std::fs::read(&path).expect("read");
     let blocks = std::fs::metadata(&path).expect("meta").blocks();
     let _ = std::fs::remove_file(&path);
-    assert_eq!(after, data, "contents unchanged");
-    assert_eq!(freed, 62 * 4096, "every whole zero block; the short tail stays");
-    assert!(blocks < before, "allocation shrank: {before} -> {blocks} sectors");
+    assert_eq!(back, data, "contents unchanged");
+    assert_eq!((len, written), (data.len() as u64, 3 * 4096 + 100), "only the four non-zero blocks");
+    assert!(blocks * 512 < 64 * 1024, "{blocks} sectors allocated for 3 MiB");
+
+    let empty = std::env::temp_dir().join(format!("emu-sdk-sparse-empty-{}.img", std::process::id()));
+    let (len, written) = write_sparse(&[][..], &std::fs::File::create(&empty).expect("create")).expect("empty");
+    let _ = std::fs::remove_file(&empty);
+    assert_eq!((len, written), (0, 0));
+}
+
+/// A zip of stored (uncompressed) entries, which unzip reads like any other.
+fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let (mut out, mut central) = (Vec::new(), Vec::new());
+    for (name, data) in entries {
+        let mut crc = flate2::Crc::new();
+        crc.update(data);
+        let header = |sig: u32, central: bool, offset: u32| {
+            let mut h = sig.to_le_bytes().to_vec();
+            if central {
+                h.extend(20u16.to_le_bytes()); // made by
+            }
+            for v in [20u16, 0, 0, 0, 0x21] {
+                h.extend(v.to_le_bytes()); // version, flags, stored, time, date
+            }
+            for v in [crc.sum(), data.len() as u32, data.len() as u32] {
+                h.extend(v.to_le_bytes());
+            }
+            h.extend((name.len() as u16).to_le_bytes());
+            h.extend(0u16.to_le_bytes()); // extra
+            if central {
+                for v in [0u16, 0, 0] {
+                    h.extend(v.to_le_bytes()); // comment, disk, internal attributes
+                }
+                h.extend(0o100644u32.wrapping_shl(16).to_le_bytes());
+                h.extend(offset.to_le_bytes());
+            }
+            h.extend(name.as_bytes());
+            h
+        };
+        central.extend(header(0x0201_4b50, true, out.len() as u32));
+        out.extend(header(0x0403_4b50, false, 0));
+        out.extend(*data);
+    }
+    let start = out.len() as u32;
+    out.extend(&central);
+    out.extend(0x0605_4b50u32.to_le_bytes());
+    for v in [0u16, 0, entries.len() as u16, entries.len() as u16] {
+        out.extend(v.to_le_bytes());
+    }
+    out.extend((central.len() as u32).to_le_bytes());
+    out.extend(start.to_le_bytes());
+    out.extend(0u16.to_le_bytes());
+    out
+}
+
+/// A system image installs with its disk images sparse and everything else as unzip leaves it.
+#[test]
+fn installs_system_images_with_sparse_disks() {
+    if !Path::new(&Sdk::new(std::env::temp_dir()).expect("sdk").unzip).is_absolute() && Command::new("unzip").arg("-v").output().is_err() {
+        return; // no unzip on this host
+    }
+    let work = scratch("sparse-install");
+    let mut system = vec![0u8; 2 << 20];
+    system[4096..8192].fill(7);
+    let zip = stored_zip(&[
+        ("arm64-v8a/source.properties", b"Pkg.Revision=3\n"),
+        ("arm64-v8a/data/misc/x.xml", b"<x/>"),
+        ("arm64-v8a/system.img", &system),
+        ("arm64-v8a/vendor.img", b"tiny"),
+    ]);
+    let path = work.join("img.zip");
+    std::fs::write(&path, &zip).expect("zip");
+    let mut sdk = Sdk::new(work.join("sdk")).expect("sdk");
+    sdk.quiet = true;
+    let d = Download {
+        path: "system-images;android-34;android-tv;arm64-v8a".into(),
+        revision: Revision { major: 3, minor: 0, micro: 0, preview: None },
+        api_level: Some("34".into()),
+        tags: Vec::new(),
+        url: format!("file://{}", path.display()),
+        size: zip.len() as u64,
+        sha1: sha1_hex(&zip),
+    };
+    let dest = sdk.install(&d).expect("install");
+    assert_eq!(dest, sdk.root().join("system-images/android-34/android-tv/arm64-v8a"));
+    assert_eq!(std::fs::read(dest.join("system.img")).expect("system"), system);
+    assert_eq!(std::fs::read(dest.join("vendor.img")).expect("vendor"), b"tiny");
+    assert_eq!(std::fs::read(dest.join("data/misc/x.xml")).expect("data"), b"<x/>");
+    use std::os::unix::fs::MetadataExt;
+    let blocks = std::fs::metadata(dest.join("system.img")).expect("meta").blocks();
+    let leftovers: Vec<_> = std::fs::read_dir(sdk.downloads()).expect("ls").flatten().collect();
+    let _ = std::fs::remove_dir_all(&work);
+    assert!(blocks * 512 < 1 << 20, "a 2 MiB image with one data block takes {blocks} sectors");
+    assert!(leftovers.is_empty(), "no archive or temp dirs left: {leftovers:?}");
 }
 
 #[test]
