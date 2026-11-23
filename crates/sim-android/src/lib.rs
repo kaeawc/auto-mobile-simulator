@@ -67,9 +67,20 @@ impl Android {
         self.env.list_avds().into_iter().map(|name| self.describe(&name, &running).info).collect()
     }
 
-    /// Resolves a UDID-or-name query (`booted` is the only running device) to a device.
+    /// Whether an AVD is named exactly `name` (its UDID), without loading any. Compared with the
+    /// directory's own names, not by opening `<name>.ini`: on a case-insensitive filesystem
+    /// (APFS) `Pixel.ini` opens `pixel.ini`.
+    pub fn has_avd(&self, name: &str) -> bool {
+        !name.is_empty() && self.env.list_avds().iter().any(|n| n == name)
+    }
+
+    /// Resolves a UDID-or-name query (`booted` is the only running device) to a device. An exact
+    /// AVD name loads just that AVD.
     pub fn device(&self, query: &str) -> Result<Device, String> {
         let running = self.running();
+        if self.has_avd(query) {
+            return Ok(self.describe(query, &running));
+        }
         let devices: Vec<Device> = self.env.list_avds().into_iter().map(|name| self.describe(&name, &running)).collect();
         let infos: Vec<DeviceInfo> = devices.iter().map(|d| d.info.clone()).collect();
         match select(&infos, query) {
@@ -706,6 +717,19 @@ mod tests {
         let glasses = f.android.device("glasses").expect("glasses");
         assert_eq!(glasses.touchpad_swipe((0, 0), (1542, 10), Duration::ZERO), Err("the touchpad is 1542x297".into()));
         assert_eq!(glasses.touchpad(1, 1, "tap"), Err("glasses isn't running; boot it first".into()));
+    }
+
+    #[test]
+    fn exact_avd_names_resolve_without_a_scan() {
+        let f = fixture("exact");
+        f.android.create("pixel", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        assert!(f.android.has_avd("pixel"));
+        for not in ["", "pix", "../avd/pixel", "pixel/"] {
+            assert!(!f.android.has_avd(not), "{not:?}");
+        }
+        assert_eq!(f.android.device("pixel").expect("exact").info.udid, "pixel");
+        assert!(!f.android.has_avd("Pixel"), "exact case, whatever the filesystem");
+        assert_eq!(f.android.device("Pixel").map(|d| d.info.udid), Ok("pixel".into()), "the scan still matches names loosely");
     }
 
     #[test]

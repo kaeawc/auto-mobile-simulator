@@ -217,6 +217,11 @@ pub fn platforms(method: &str) -> &'static [Platform] {
 fn resolve(s: &mut Session, p: &Value) -> Result<(Platform, String), String> {
     let query = str_param(p, "device").unwrap_or("booted");
     let only = opt_platform(p)?;
+    // An AVD's name is its UDID: resolve it without listing every device on both platforms
+    // (AVD names have no spaces, simulator names usually do; `platform` decides otherwise).
+    if only != Some(Platform::Ios) && s.android.backend().has_avd(query) {
+        return Ok((Platform::Android, query.to_owned()));
+    }
     let android = if only == Some(Platform::Ios) { Vec::new() } else { s.android.devices() };
     if android.is_empty() && only != Some(Platform::Android) {
         return Ok((Platform::Ios, query.to_owned()));
@@ -474,6 +479,38 @@ mod tests {
         assert_eq!(err(&mut s, "key", json!({"device": "fold"})), "missing number parameter `usage`");
         assert!(err(&mut s, "fold", json!({"device": "fold"})).starts_with("give `angle`"));
         assert!(err(&mut s, "rotate", json!({"device": "fold", "orientation": "portrait"})).contains("iOS-only"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Per-call cost of a device method among many AVDs (the API resolves `device` on every call).
+    ///     cargo test --release -p sim-api api_call_latency -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn api_call_latency() {
+        use sim_android::testing::fake_emulator;
+        let root = std::path::PathBuf::from("/tmp").join(format!("sa-bench-{}", std::process::id()));
+        let sdk = root.join("sdk/system-images/android-36/google_apis/arm64-v8a");
+        std::fs::create_dir_all(&sdk).expect("image dir");
+        std::fs::write(sdk.join("system.img"), b"s").expect("system.img");
+        std::fs::write(sdk.join("source.properties"), "AndroidVersion.ApiLevel=36\nSystemImage.TagId=google_apis\n").expect("props");
+        let env = emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") };
+        let mut android = sim_android::Android::new(env);
+        android.running_dir = Some(root.join("running"));
+        for i in 0..20 {
+            android.create(&format!("avd{i:02}"), "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        }
+        let _fake = fake_emulator(&android, "avd07");
+        let mut s = Session::with_android(android);
+        let n = 200;
+        for (method, params) in
+            [("screen", json!({"device": "avd07"})), ("touch", json!({"device": "avd07", "x": 1, "y": 2, "phase": "down"}))]
+        {
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                call(&mut s, method, &params).expect(method);
+            }
+            println!("api {method:<6}: {:.3} ms per call (20 AVDs)", start.elapsed().as_secs_f64() * 1000.0 / f64::from(n));
+        }
         std::fs::remove_dir_all(root).ok();
     }
 
