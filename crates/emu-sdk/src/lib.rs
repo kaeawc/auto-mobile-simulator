@@ -234,6 +234,7 @@ impl Sdk {
         if !top.join("source.properties").is_file() {
             self.say(&format!("warning: {} has no source.properties", d.file_name()));
         }
+        self.sparsify_images(&top);
 
         let dest = self.root.join(d.install_dir());
         replace_dir(&top, &dest)?;
@@ -300,6 +301,24 @@ impl Sdk {
         Ok(part)
     }
 
+    /// Punches holes in the zero blocks of a package's disk images (`*.img`): unzip writes them
+    /// out in full, and most of a system image is zeros (8.1 of TV 34's 8.6 GB `system.img`).
+    /// Reads still return zeros there. Best effort: a filesystem without holes keeps the file.
+    fn sparsify_images(&self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for path in entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "img") && p.is_file()) {
+            match sparsify(&path) {
+                Ok(0) => {}
+                Ok(freed) => self.say(&format!(
+                    "{}: {} of zeros made sparse",
+                    path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+                    format_size(freed)
+                )),
+                Err(e) => self.say(&format!("warning: {} stays dense: {e}", path.display())),
+            }
+        }
+    }
+
     /// Runs unzip with the arguments `args` builds for a fresh temporary directory under the
     /// download cache, and returns that directory. Exit status 11 (a pattern matched nothing) is
     /// accepted when `allow_unmatched`; the caller then checks for the files it needs.
@@ -346,3 +365,48 @@ impl Sdk {
 
 #[cfg(test)]
 mod tests;
+
+/// Deallocates every all-zero, block-aligned run of `path` (4 KiB blocks, the APFS and ext4
+/// block size) and returns how many bytes it freed. Contents read back unchanged.
+pub fn sparsify(path: &Path) -> std::io::Result<u64> {
+    use std::io::Read;
+    const BLOCK: usize = 4096;
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let mut reader = std::io::BufReader::with_capacity(4 << 20, &file);
+    let mut block = vec![0u8; BLOCK];
+    let (mut offset, mut run_start, mut freed) = (0u64, None::<u64>, 0u64);
+    let mut punch = |start: u64, end: u64| -> std::io::Result<()> {
+        emu_hvf::host::punch_hole(&file, start, end - start)?;
+        freed += end - start;
+        Ok(())
+    };
+    loop {
+        let mut n = 0;
+        while n < BLOCK {
+            match reader.read(&mut block[n..]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        // A short final block stays allocated: holes cover whole blocks only.
+        let zero = n == BLOCK && block.iter().all(|&b| b == 0);
+        match (zero, run_start) {
+            (true, None) => run_start = Some(offset),
+            (false, Some(start)) => {
+                punch(start, offset)?;
+                run_start = None;
+            }
+            _ => {}
+        }
+        offset += n as u64;
+        if n < BLOCK {
+            break;
+        }
+    }
+    if let Some(start) = run_start {
+        punch(start, offset)?;
+    }
+    Ok(freed)
+}

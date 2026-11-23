@@ -479,3 +479,26 @@ fn a_missing_host_tool_says_what_to_install() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(err.contains("`/nonexistent/curl` not found: install curl"), "{err}");
 }
+
+#[test]
+fn sparsify_frees_zero_blocks_and_keeps_contents() {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::env::temp_dir().join(format!("emu-sdk-sparse-{}.img", std::process::id()));
+    let mut data = vec![0u8; 64 * 4096 + 100];
+    data[5 * 4096 + 7] = 1; // block 5 stays
+    data[40 * 4096..41 * 4096].fill(0xff); // block 40 stays
+    std::fs::write(&path, &data).expect("write");
+    let before = std::fs::metadata(&path).expect("meta").blocks();
+    let freed = match sparsify(&path) {
+        Ok(f) => f,
+        // tmpfs and some overlay filesystems have no holes.
+        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => return,
+        Err(e) => panic!("{e}"),
+    };
+    let after = std::fs::read(&path).expect("read");
+    let blocks = std::fs::metadata(&path).expect("meta").blocks();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(after, data, "contents unchanged");
+    assert_eq!(freed, 62 * 4096, "every whole zero block; the short tail stays");
+    assert!(blocks < before, "allocation shrank: {before} -> {blocks} sectors");
+}
