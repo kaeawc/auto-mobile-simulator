@@ -102,10 +102,12 @@ dependencies = [
  "emu-avd",
  "emu-ext4",
  "emu-gfxstream",
+ "emu-hvf",
  "emu-sdk",
  "emu-vmm",
  "libc",
  "rustix",
+ "sim-android",
  "sim-core",
 ]
 

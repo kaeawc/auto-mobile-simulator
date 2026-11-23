@@ -1,6 +1,9 @@
 //! A live Android device: frames from its display socket (`<avd>/emu-rs/display.sock`) stream into
 //! a [`Pixels`], which wakes only the window showing it; touches and key taps go back as stream
-//! lines. The emulator runs in its own process, so a crashed guest can't take the window down.
+//! lines. Frames come through the emulator's shared frame ring (only a 32-byte notice per frame
+//! crosses the socket; the pixels are read from the ring straight into the buffer handed to
+//! `Pixels`), or on the socket from an emulator without one. The emulator runs in its own process,
+//! so a crashed guest can't take the window down.
 //! What the socket doesn't carry (typing with shift, rotation, the hinge) goes over the console
 //! through `sim-android`.
 
@@ -25,14 +28,15 @@ impl Screen {
     /// Connects and asks for frames at most `max_width` pixels wide.
     pub fn connect(udid: &str, avd_dir: PathBuf, max_width: u32) -> Result<Screen, String> {
         let mut display = sim_android::display::Display::connect(&avd_dir)?;
+        display.request_shared()?;
         display.send(&Input::Hello { max_width })?;
-        let mut reader = display.try_clone()?;
+        let mut frames = sim_android::display::Frames::new(display.try_clone()?);
         let (pixels, device, alive) = (Pixels::new(), Arc::new((AtomicU32::new(0), AtomicU32::new(0))), Arc::new(AtomicBool::new(true)));
         let (p, d, a) = (pixels.clone(), device.clone(), alive.clone());
         std::thread::Builder::new()
             .name("sim-rs-android-frames".into())
             .spawn(move || {
-                while let Ok((header, rgba)) = sim_android::display::read_frame(&mut reader) {
+                while let Ok((header, rgba)) = frames.next_frame() {
                     d.0.store(header.device_width, Ordering::Relaxed);
                     d.1.store(header.device_height, Ordering::Relaxed);
                     p.set(header.width, header.height, rgba);

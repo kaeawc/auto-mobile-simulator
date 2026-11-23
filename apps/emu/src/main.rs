@@ -8,7 +8,8 @@ mod args;
 // The VMM, the renderer and everything that drives them exist only on Apple silicon Macs (the
 // Hypervisor.framework); elsewhere `emu` still lists, creates and provisions AVDs.
 mod console;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+// Builds and tests everywhere; only an Apple silicon boot serves it.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 mod display_server;
 mod instance;
 mod provision;

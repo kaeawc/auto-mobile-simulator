@@ -12,8 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use emu_vmm::Inputs;
-use sim_core::frame::{Frame, encode_png};
-use sim_core::pixels::{PixelFormat, to_rgba};
+use sim_core::frame::encode_rgba;
 
 pub struct ConsoleInfo {
     pub avd_name: String,
@@ -149,37 +148,21 @@ fn event(info: &ConsoleInfo, words: &[&str]) -> String {
     }
 }
 
-/// `screenshot [path]`: the latest scanout frame as PNG.
+/// `screenshot [path]`: the latest scanout frame as PNG. Encoded straight from the capture the
+/// display stream shares, so a screenshot of a frame already streamed reads nothing back.
 fn screenshot(info: &ConsoleInfo, path: Option<&str>) -> String {
     let Some(display) = &info.display else { return "KO: no display (started with -gpu off?)".into() };
-    let (width, height, frames) = display.geometry();
-    if frames == 0 {
+    if display.frames() == 0 {
         return "KO: no frame presented yet".into();
     }
-    // The renderer's own capture of the last posted frame; the post-callback copy (cloned only
-    // then) is the fallback.
-    let rgba = renderer_capture(width, height).or_else(|| {
-        let f = display.snapshot();
-        let format = PixelFormat::from_virtio_gpu(f.format).unwrap_or(PixelFormat::Rgba);
-        to_rgba(&f.pixels, f.width as usize, f.height as usize, f.stride as usize, format)
-            .filter(|_| (f.width, f.height) == (width, height))
-    });
-    let Some(rgba) = rgba else { return "KO: the scanout frame's geometry is inconsistent".into() };
+    let Some(shot) = display.latest(|c| (c.width, c.height, c.frame, encode_rgba(c.width, c.height, &c.rgba))) else {
+        return "KO: the scanout frame couldn't be read".into();
+    };
+    let (width, height, frame, png) = shot;
     let path = path.map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join(format!("emu-rs-{}.png", std::process::id())));
-    match encode_png(&Frame { width, height, rgba }).and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string())) {
-        Ok(()) => format!("{} ({}x{}, frame {})\r\nOK", path.display(), width, height, frames),
+    match png.and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string())) {
+        Ok(()) => format!("{} ({}x{}, frame {})\r\nOK", path.display(), width, height, frame),
         Err(e) => format!("KO: {e}"),
-    }
-}
-
-/// The renderer's capture of its last posted frame (Apple silicon only; elsewhere there's none).
-fn renderer_capture(width: u32, height: u32) -> Option<Vec<u8>> {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    return emu_vmm::renderer_screenshot(width, height);
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    {
-        let _ = (width, height);
-        None
     }
 }
 
@@ -983,5 +966,19 @@ mod tests {
         assert_eq!(reply, format!("{} (2x1, frame 1)\r\nOK", path.display()));
         assert_eq!(sim_core::frame::png_size(&png), Some((2, 1)));
         assert_eq!(run(&info, "frames"), "1\r\nOK");
+        // A posted frame is read back through the renderer, once for the stream and the shot.
+        let posted = Arc::new(emu_vmm::display::FrameStore::default());
+        info.display = Some(posted.clone());
+        posted.posted(1, 1);
+        assert_eq!(run(&info, &format!("screenshot {}", path.display())), "KO: the scanout frame couldn't be read");
+        posted.set_readback(Box::new(|_, _, buf| {
+            buf.fill(7);
+            true
+        }));
+        let reply = run(&info, &format!("screenshot {}", path.display()));
+        let png = std::fs::read(&path).expect("written");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(reply, format!("{} (1x1, frame 1)\r\nOK", path.display()));
+        assert_eq!(sim_core::frame::png_size(&png), Some((1, 1)));
     }
 }

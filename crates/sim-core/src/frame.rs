@@ -12,12 +12,18 @@ pub struct Frame {
 /// nearly every automated step. `Fast` (fdeflate) encodes a 2480x1740 screen in 11 ms against
 /// `Balanced`'s 74, for a file 1.7x larger (`examples/frame_bench.rs`).
 pub fn encode_png(frame: &Frame) -> Result<Vec<u8>, String> {
+    encode_rgba(frame.width, frame.height, &frame.rgba)
+}
+
+/// [`encode_png`] for RGBA rows held elsewhere (a capture shared with the display stream), with no
+/// copy into a [`Frame`] first.
+pub fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    let mut encoder = png::Encoder::new(&mut out, frame.width, frame.height);
+    let mut encoder = png::Encoder::new(&mut out, width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_compression(png::Compression::Fast);
-    encoder.write_header().and_then(|mut w| w.write_image_data(&frame.rgba)).map_err(|e| e.to_string())?;
+    encoder.write_header().and_then(|mut w| w.write_image_data(rgba)).map_err(|e| e.to_string())?;
     Ok(out)
 }
 
@@ -57,5 +63,7 @@ mod tests {
     #[test]
     fn rejects_a_short_buffer() {
         assert!(encode_png(&Frame { width: 2, height: 2, rgba: vec![0; 4] }).is_err());
+        assert!(encode_rgba(2, 2, &[0; 4]).is_err());
+        assert_eq!(encode_rgba(1, 1, &[1, 2, 3, 4]), encode_png(&Frame { width: 1, height: 1, rgba: vec![1, 2, 3, 4] }));
     }
 }
