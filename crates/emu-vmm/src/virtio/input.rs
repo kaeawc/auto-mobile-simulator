@@ -437,9 +437,11 @@ mod tests {
             assert_eq!(info, [0u32, 32767, 0, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
         }
         assert!(cfg(&mut dev, CFG_ABS_INFO, ABS_MT_POSITION_X as u8).is_empty());
-        // The other kinds keep their own ids.
-        let (mut kbd, _k) = Input::new(Kind::Keyboard, "virtio_input_keyboard");
-        assert_eq!(cfg(&mut kbd, CFG_ID_DEVIDS, 0), [0x06, 0, 0xd1, 0x18, 0x01, 0, 0x01, 0]);
+        // The keyboard has stock's `qwerty2` ids; the rotary keeps emu-rs's.
+        let (mut kbd, _k) = Input::new(Kind::Keyboard, "qwerty2");
+        assert_eq!(cfg(&mut kbd, CFG_ID_DEVIDS, 0), [0x06, 0, 0x27, 0x06, 0x01, 0, 0x01, 0]);
+        let (mut rotary, _r) = Input::new(Kind::Rotary, "virtio_input_rotary");
+        assert_eq!(cfg(&mut rotary, CFG_ID_DEVIDS, 0), [0x06, 0, 0xd1, 0x18, 0x01, 0, 0x01, 0]);
     }
 
     #[test]
