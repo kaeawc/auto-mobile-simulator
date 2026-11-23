@@ -9,6 +9,7 @@ use sim_android::Android;
 use sim_core::device::DeviceInfo;
 use sim_core::form_factor::Posture;
 use sim_core::hid::Direction;
+use sim_core::xr::XrCommand;
 
 use crate::params::{button, need_str, opt_u64, screenshot_result, str_param, swipe_samples, tap_samples, touch_sample};
 
@@ -108,6 +109,10 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
         "rotary" => {
             let ticks = p.get("ticks").and_then(Value::as_i64).ok_or("missing number parameter `ticks`")?;
             null(d.rotary(i32::try_from(ticks).map_err(|e| e.to_string())?))
+        }
+        "xr" => {
+            let command: XrCommand = serde_json::from_value(p.clone()).map_err(|e| format!("xr: {e} ({})", sim_core::xr::USAGE))?;
+            d.xr(&command).map(|lines| json!(lines))
         }
         other => Err(format!("`{other}` isn't implemented for Android devices")),
     }

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 pub use bootconfig::BootConfig;
 pub use ini::parse_ini;
-use sim_core::form_factor::{Density, FormFactor, Profile, android_profile};
+use sim_core::form_factor::{ANDROID_GLASSES_SCREEN, Density, FormFactor, Profile, android_profile};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -257,6 +257,12 @@ impl NewAvd {
                 kv("hw.sensor.hinge_angles_posture_definitions", "0-30, 30-150, 150-180".into()),
             ];
         }
+        // Android XR, as the SDK defines its devices: the headset has 4 GiB, the display glasses
+        // (`ai_glasses_device`) 2; both are landscape.
+        if profile.kind.form_factor == FormFactor::Vision {
+            spec.ram_mb = if spec.lcd == ANDROID_GLASSES_SCREEN { 2048 } else { 4096 };
+            spec.extra.push(("hw.initialOrientation".to_owned(), "landscape".to_owned()));
+        }
         spec
     }
 }
@@ -461,6 +467,20 @@ mod tests {
         env.create_avd(&watch).expect("create watch");
         let w = env.load("watch").expect("load watch").profile();
         assert_eq!((w.kind.sub_platform.as_str(), w.shape), ("wearos", sim_core::form_factor::Shape::Round));
+
+        // Android XR: the headset's screen, 4 GiB and landscape; glasses get theirs and 2 GiB.
+        let xr_sys = sdk.join("system-images/android-34/google-xr/arm64-v8a");
+        std::fs::create_dir_all(&xr_sys).expect("mkdir");
+        std::fs::write(xr_sys.join("system.img"), b"s").expect("write");
+        let xr = sim_core::form_factor::Kind::new(sim_core::platform::Platform::Android, FormFactor::Vision).expect("Android XR");
+        let spec = NewAvd::for_profile("headset", "system-images/android-34/google-xr/arm64-v8a", &xr.profile());
+        assert_eq!((spec.lcd, spec.ram_mb), ((2560, 2558, 240), 4096));
+        env.create_avd(&spec).expect("create headset");
+        let made = env.load("headset").expect("load headset");
+        assert_eq!((made.get("hw.initialOrientation"), made.ram_bytes()), (Some("landscape"), 4 << 30));
+        assert_eq!(made.profile().kind.label(), "Android XR · Vision");
+        let glasses = NewAvd::for_profile("glasses", "system-images/android-36/ai-glasses/arm64-v8a", &xr.image_profile("ai-glasses"));
+        assert_eq!((glasses.lcd, glasses.ram_mb), ((450, 450, 160), 2048));
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

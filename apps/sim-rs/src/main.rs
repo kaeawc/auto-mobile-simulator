@@ -173,6 +173,13 @@ enum Cmd {
     },
     /// Set an Android foldable's hinge: a posture (closed, half-opened, opened) or an angle (0-180).
     Fold { device: String, posture: String },
+    /// Android XR: recenter, rotate X Y Z (radians), move DX DY DZ (metres), options day|night
+    /// PASSTHROUGH (0-1), input mouse|hand|eye, viewport pan|zoom|rotate, pointer X Y [PHASE].
+    Xr {
+        device: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
     /// Turn a watch's crown (Wear OS rotary input, Apple Watch Digital Crown) by some ticks
     /// (negative turns back).
     #[command(allow_negative_numbers = true)]
@@ -352,6 +359,9 @@ fn main() -> Result<()> {
             let r = call("fold", params)?;
             println!("{} ({}°)", text(&r["posture"]), r["angle"]);
         }
+        Cmd::Xr { device, command } => {
+            items(&call("xr", xr_params(&device, &command)?)?).iter().for_each(|l| println!("{}", text(l)));
+        }
         Cmd::Rotary { device, ticks, delta } => {
             call("rotary", json!({"device": device, "ticks": ticks, "delta": delta}))?;
             flush();
@@ -436,6 +446,15 @@ fn form_factors_text(rows: &Value) -> String {
     out
 }
 
+/// The `xr` method's parameters for `sim-rs xr DEVICE WORDS...` (the console's `xr` syntax).
+fn xr_params(device: &str, words: &[String]) -> Result<Value> {
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let command = sim_core::xr::XrCommand::parse(&words).map_err(anyhow::Error::msg)?;
+    let mut params = serde_json::to_value(command)?;
+    params["device"] = Value::from(device);
+    Ok(params)
+}
+
 /// HID messages are delivered asynchronously; give the last one time to leave before exiting.
 fn flush() {
     sleep(Duration::from_millis(100));
@@ -498,8 +517,32 @@ mod tests {
             "watch_gesture",
             "remote_swipe",
             "carplay",
+            "xr",
         ] {
             assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
         }
+    }
+
+    #[test]
+    fn xr_words_become_method_parameters() {
+        let words = |s: &str| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            xr_params("headset", &words("rotate 0 -0.5 0")).expect("rotate"),
+            json!({"device": "headset", "action": "rotate", "x": 0.0, "y": -0.5, "z": 0.0})
+        );
+        assert_eq!(
+            xr_params("headset", &words("options night 0.25")).expect("options"),
+            json!({"device": "headset", "action": "options", "environment": "night", "passthrough": 0.25})
+        );
+        assert!(xr_params("headset", &words("fly")).expect_err("unknown").to_string().starts_with("usage: xr recenter"));
+    }
+
+    #[test]
+    fn android_xr_is_listed_as_a_vision_form_factor() {
+        let mut s = sim_api::Session::default();
+        let rows = sim_api::call_method(&mut s, "form_factors", &json!({"platform": "android"})).expect("rows");
+        let out = form_factors_text(&rows);
+        assert!(out.contains("vision    android  Android XR · Vision (inputs: Eye tracking, Hand tracking, Keyboard)"), "{out}");
+        assert!(!out.contains("unsupported"), "{out}");
     }
 }

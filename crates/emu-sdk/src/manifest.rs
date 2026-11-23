@@ -115,6 +115,9 @@ pub struct RemotePackage {
     pub channel: String,
     /// `type-details/api-level` for platform-specific packages.
     pub api_level: Option<String>,
+    /// A system image's `type-details/tag/id`s, which can differ from the tag in its path
+    /// (`system-images;android-34;google-xr;arm64-v8a` is tagged `android-xr`).
+    pub tags: Vec<String>,
     pub archives: Vec<Archive>,
 }
 
@@ -124,6 +127,8 @@ pub struct Download {
     pub path: String,
     pub revision: Revision,
     pub api_level: Option<String>,
+    /// System image tags (see [`RemotePackage::tags`]).
+    pub tags: Vec<String>,
     /// Absolute URL.
     pub url: String,
     pub size: u64,
@@ -204,11 +209,19 @@ impl Manifest {
                     })
                 })
                 .collect();
+            let details = child(pkg, "type-details");
+            let tags = details
+                .into_iter()
+                .flat_map(|d| d.children().filter(|c| c.has_tag_name("tag")))
+                .filter_map(|t| text(t, "id"))
+                .map(String::from)
+                .collect();
             packages.push(RemotePackage {
                 path: path.to_string(),
                 revision,
                 channel: channel.to_string(),
-                api_level: child(pkg, "type-details").and_then(|d| text(d, "api-level")).map(String::from),
+                api_level: details.and_then(|d| text(d, "api-level")).map(String::from),
+                tags,
                 archives,
             });
         }
@@ -225,6 +238,7 @@ impl Manifest {
                 path: p.path.clone(),
                 revision: p.revision,
                 api_level: p.api_level.clone(),
+                tags: p.tags.clone(),
                 url: self.absolute(&a.url),
                 size: a.size,
                 sha1: a.sha1.clone(),
@@ -257,14 +271,18 @@ impl Manifest {
         best.into_values().collect()
     }
 
-    /// System images for `abi` (and exactly `tag`, if given) with a stable archive for `host`,
-    /// newest per package, ordered by API level.
+    /// System images for `abi` (and `tag`, if given) with a stable archive for `host`, newest per
+    /// package, ordered by API level. `tag` is the tag in the package path; when no path carries it,
+    /// the packages' own tags (`-tag android-xr` finds the `google-xr` images).
     pub fn system_images(&self, host: Host, tag: Option<&str>, abi: &str) -> Vec<Download> {
-        let mut out: Vec<Download> = self
-            .latest(host)
-            .into_iter()
-            .filter(|d| SysImagePath::parse(&d.path).is_some_and(|s| s.abi == abi && tag.is_none_or(|t| s.tag == t)))
-            .collect();
+        let images: Vec<Download> =
+            self.latest(host).into_iter().filter(|d| SysImagePath::parse(&d.path).is_some_and(|s| s.abi == abi)).collect();
+        let in_path = |d: &Download, t: &str| SysImagePath::parse(&d.path).is_some_and(|s| s.tag == t);
+        let mut out: Vec<Download> = match tag {
+            None => images,
+            Some(t) if images.iter().any(|d| in_path(d, t)) => images.into_iter().filter(|d| in_path(d, t)).collect(),
+            Some(t) => images.into_iter().filter(|d| d.tags.iter().any(|x| x == t)).collect(),
+        };
         let key = |d: &Download| SysImagePath::parse(&d.path).map(|s| s.api_key());
         out.sort_by(|a, b| key(a).cmp(&key(b)).then_with(|| a.path.cmp(&b.path)));
         out

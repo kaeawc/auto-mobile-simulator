@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use emu_avd::{Avd, BootConfig};
 use emu_vmm::layout::slots;
 use emu_vmm::{DiskMode, DiskSpec, MachineConfig};
+use sim_core::platform::{AndroidOs, SubPlatform};
 
 use crate::args::Opts;
 
@@ -38,6 +39,8 @@ pub struct Instance {
     pub gps: std::sync::Arc<emu_vmm::pipe::gps::Gps>,
     pub battery: std::sync::Arc<emu_vmm::devices::goldfish_battery::Battery>,
     pub telephony: std::sync::Arc<emu_vmm::telephony::Telephony>,
+    /// Android XR images: the guest's XR service link (and, with it, the dual-mode mouse).
+    pub xr: Option<std::sync::Arc<emu_vmm::pipe::xr::Xr>>,
     _lock: Option<File>,
 }
 
@@ -134,6 +137,7 @@ impl Instance {
             gps: Default::default(),
             battery: Default::default(),
             telephony: Default::default(),
+            xr: (avd.profile().kind.sub_platform == SubPlatform::Android(AndroidOs::Xr)).then(Default::default),
             _lock: lock,
         })
     }
@@ -239,6 +243,7 @@ impl Instance {
             }),
             boot_props: self.boot_props(),
             input: Some((self.avd.lcd().0, self.avd.lcd().1)),
+            xr: self.xr.clone(),
             sensors: self.sensors.clone(),
             clipboard: self.clipboard.clone(),
             fingerprint: self.fingerprint.clone(),

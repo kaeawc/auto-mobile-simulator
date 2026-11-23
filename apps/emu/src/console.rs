@@ -22,6 +22,8 @@ pub struct ConsoleInfo {
     pub gps: Arc<emu_vmm::pipe::gps::Gps>,
     pub battery: Arc<emu_vmm::devices::goldfish_battery::Battery>,
     pub telephony: Arc<emu_vmm::telephony::Telephony>,
+    /// The `qemud:xr_service` link, on Android XR images.
+    pub xr: Option<Arc<emu_vmm::pipe::xr::Xr>>,
 }
 
 /// `sensor set <name> <v[:v...]>` / `sensor get <name>` (stock syntax).
@@ -306,6 +308,49 @@ fn gsm(info: &ConsoleInfo, words: &[&str]) -> String {
     }
 }
 
+/// `xr ...` (emu-rs extension, Android XR images): what the stock emulator's XR controls send the
+/// guest over `qemud:xr_service` (stock reaches them only through gRPC), the dual-mode mouse as a
+/// pointer at device pixels, and `xr status`. Syntax: [`sim_core::xr::USAGE`].
+fn xr(info: &ConsoleInfo, words: &[&str]) -> String {
+    use emu_vmm::virtio::input::Kind;
+    use sim_core::xr::{XrCommand, XrPointer, XrResponse, pointer_abs};
+    let Some(xr) = &info.xr else { return "KO: not an Android XR device".into() };
+    if words == ["status"] {
+        let reply = match xr.last_reply() {
+            None => "none".to_owned(),
+            Some(r) => XrResponse::decode(&r).map_or_else(|| format!("{} undecodable bytes", r.len()), |r| r.to_string()),
+        };
+        let guest = if xr.connected() { "connected" } else { "not connected" };
+        return format!("xr_service: {guest}\r\nlast reply: {reply}\r\nOK");
+    }
+    let command = match XrCommand::parse(words) {
+        Ok(c) => c,
+        Err(e) => return format!("KO: {e}"),
+    };
+    if let XrCommand::Pointer { x, y, phase } = command {
+        let guard = info.inputs.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(inputs) = guard.as_ref() else { return "KO: no input devices".into() };
+        let (Some(mouse), Kind::Touch { width, height }) = (&inputs.mouse, inputs.touch.kind) else {
+            return "KO: no dual-mode mouse".into();
+        };
+        let (ax, ay) = (pointer_abs(x, width), pointer_abs(y, height));
+        match phase {
+            XrPointer::Move => mouse.pointer(ax, ay, None),
+            XrPointer::Down => mouse.pointer(ax, ay, Some(true)),
+            XrPointer::Up => mouse.pointer(ax, ay, Some(false)),
+            XrPointer::Click => {
+                mouse.pointer(ax, ay, Some(true));
+                mouse.pointer(ax, ay, Some(false));
+            }
+        }
+        return "OK".into();
+    }
+    match command.request() {
+        Some(request) if !xr.send(&request) => "KO: the guest's XR service isn't connected (still booting?)".into(),
+        _ => "OK".into(),
+    }
+}
+
 /// Commands this console implements (stock names first, then emu-rs extensions).
 const HELP: &[(&str, &str)] = &[
     ("help|h|?", "print a list of commands"),
@@ -325,6 +370,7 @@ const HELP: &[(&str, &str)] = &[
     ("touch", "touch the screen at x y (emu-rs)"),
     ("clipboard", "get or set the guest clipboard (emu-rs)"),
     ("frames", "number of frames presented (emu-rs)"),
+    ("xr", "Android XR head pose, room, input mode and pointer (emu-rs)"),
 ];
 
 fn token_path() -> Option<PathBuf> {
@@ -412,6 +458,7 @@ fn session(stream: TcpStream, info: &ConsoleInfo) -> std::io::Result<()> {
             ("power", true) => power(info, &words[1..]),
             ("sms", true) => sms(info, &words[1..]),
             ("gsm", true) => gsm(info, &words[1..]),
+            ("xr", true) => xr(info, &words[1..]),
             // Stock: rotate the device 90° clockwise. Gravity in device coordinates turns the
             // other way, and the guest's auto-rotation follows the accelerometer.
             ("rotate", true) => match info.sensors.get("acceleration").as_deref() {

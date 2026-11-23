@@ -2,8 +2,7 @@
 //! and what a device of each kind looks like (screen, density, shape, fold) and takes as input.
 //!
 //! A [`Kind`] is a validated (platform, form factor) pair; [`Kind::new`] rejects combinations no
-//! platform offers (a foldable iPhone, an Android headset) with the reason, so callers never fall
-//! into a silent gap.
+//! platform offers (a foldable iPhone) with the reason, so callers never fall into a silent gap.
 
 use std::fmt;
 
@@ -98,7 +97,7 @@ pub fn sub_platform(platform: Platform, form_factor: FormFactor) -> Result<SubPl
         (Platform::Android, F::Watch) => Ok(SubPlatform::Android(AndroidOs::WearOs)),
         (Platform::Android, F::Tv) => Ok(SubPlatform::Android(AndroidOs::Tv)),
         (Platform::Android, F::Auto) => Ok(SubPlatform::Android(AndroidOs::Automotive)),
-        (Platform::Android, F::Vision) => Err(unsupported("the Android backend has no headset system image; vision is visionOS-only")),
+        (Platform::Android, F::Vision) => Ok(SubPlatform::Android(AndroidOs::Xr)),
     }
 }
 
@@ -151,18 +150,46 @@ impl Kind {
             (Platform::Android, F::Watch) => (454, 454, Density::Dpi(320), Shape::Round),
             (Platform::Android, F::Tv) => (1920, 1080, Density::Dpi(320), Shape::Rectangle),
             (Platform::Android, F::Auto) => (1024, 768, Density::Dpi(160), Shape::Rectangle),
+            // The SDK's `xr_headset_device` (landscape).
+            (Platform::Android, F::Vision) => (2560, 2558, Density::Dpi(240), Shape::Rectangle),
             (Platform::Ios, F::Phone) => (1206, 2622, Density::Scale(3), Shape::Rounded),
             (Platform::Ios, F::Tablet) => (1668, 2420, Density::Scale(2), Shape::Rounded),
             (Platform::Ios, F::Watch) => (416, 496, Density::Scale(2), Shape::Rounded),
             (Platform::Ios, F::Tv) => (1920, 1080, Density::Scale(1), Shape::Rectangle),
             (Platform::Ios, F::Vision) => (2732, 2048, Density::Scale(2), Shape::Rectangle),
             (Platform::Ios, F::Auto) => (800, 480, Density::Scale(2), Shape::Rectangle),
-            // `Kind::new` never builds these.
-            (Platform::Ios, F::Foldable) | (Platform::Android, F::Vision) => (0, 0, Density::Scale(1), Shape::Rectangle),
+            // `Kind::new` never builds this.
+            (Platform::Ios, F::Foldable) => (0, 0, Density::Scale(1), Shape::Rectangle),
         };
         let fold = (self.form_factor == F::Foldable).then_some(Fold { angle: 180.0, folded_width: 1080, folded_height: 2092 });
         Profile { kind: *self, width, height, density, shape, fold, inputs: self.inputs().to_vec() }
     }
+
+    /// The reference profile for a new device booting the system image tagged `image_tag`: an
+    /// Android XR image tagged `ai-glasses` gets the SDK's display glasses (`ai_glasses_device`)
+    /// rather than the headset.
+    pub fn image_profile(&self, image_tag: &str) -> Profile {
+        let profile = self.profile();
+        if self.sub_platform == SubPlatform::Android(AndroidOs::Xr) && is_glasses_tag(image_tag) {
+            let (w, h, dpi) = ANDROID_GLASSES_SCREEN;
+            return profile.with_screen(w, h, Density::Dpi(dpi));
+        }
+        profile
+    }
+}
+
+/// The SDK's display glasses (`ai_glasses_device`, landscape): width, height, dpi.
+pub const ANDROID_GLASSES_SCREEN: (u32, u32, u32) = (450, 450, 160);
+
+/// Android XR system image tags: headsets (`google-xr`, `android-xr`, `android-xr-v3-playstore`,
+/// `android-xr-preview-playstore`) and glasses (`ai-glasses`).
+pub fn is_xr_tag(tag: &str) -> bool {
+    tag.starts_with("android-xr") || tag == "google-xr" || is_glasses_tag(tag)
+}
+
+/// The AI glasses system image tag (`system-images;android-36;ai-glasses;arm64-v8a`).
+pub fn is_glasses_tag(tag: &str) -> bool {
+    tag == "ai-glasses"
 }
 
 /// Screen density: Android reports dots per inch, Apple a point-to-pixel scale.
@@ -254,9 +281,9 @@ pub enum InputMethod {
     DPad,
     /// Car head-unit controls: rotary controller and hardware keys.
     HeadUnit,
-    /// visionOS: look at a target.
+    /// Look at a target: visionOS gaze, Android XR eye tracking.
     Gaze,
-    /// visionOS: pinch to select.
+    /// Pinch to select: visionOS, Android XR hand tracking.
     Pinch,
 }
 
@@ -274,8 +301,10 @@ impl InputMethod {
             (Self::DPad, Platform::Android) => "D-pad remote",
             (Self::HeadUnit, Platform::Ios) => "CarPlay head unit",
             (Self::HeadUnit, Platform::Android) => "Automotive head unit",
-            (Self::Gaze, _) => "Gaze",
-            (Self::Pinch, _) => "Pinch",
+            (Self::Gaze, Platform::Ios) => "Gaze",
+            (Self::Gaze, Platform::Android) => "Eye tracking",
+            (Self::Pinch, Platform::Ios) => "Pinch",
+            (Self::Pinch, Platform::Android) => "Hand tracking",
         }
     }
 }
@@ -350,20 +379,24 @@ pub fn apple_family_form_factor(product_family: &str) -> Option<FormFactor> {
 }
 
 /// An Android virtual device's profile, from its `config.ini` (`get` looks a key up). The system
-/// image tag decides watch, TV and automotive; a hinge sensor (or a `fold` device name) makes a
-/// foldable; a smallest width of 600 dp or more (Android's own tablet threshold) makes a tablet.
+/// image tag decides watch, TV, automotive and XR; a hinge sensor (or a `fold` device name) makes
+/// a foldable; a smallest width of 600 dp or more (Android's own tablet threshold) makes a tablet.
 pub fn android_profile(get: impl Fn(&str) -> Option<String>) -> Profile {
     let flag = |k: &str| get(k).is_some_and(|v| matches!(v.trim(), "yes" | "true"));
     let num = |k: &str, d: u32| get(k).and_then(|v| v.trim().parse().ok()).unwrap_or(d);
     let tags = format!("{},{}", get("tag.id").unwrap_or_default(), get("tag.ids").unwrap_or_default()).to_ascii_lowercase();
+    // 16 KB page-size variants (`google-tv-ps16k`, `google_apis_ps16k`) count as their base tag.
+    let tags: Vec<&str> = tags.split(',').map(|t| t.trim().trim_end_matches("-ps16k").trim_end_matches("_ps16k")).collect();
     let device = get("hw.device.name").unwrap_or_default().to_ascii_lowercase();
     let (w, h, dpi) = (num("hw.lcd.width", 1080), num("hw.lcd.height", 2400), num("hw.lcd.density", 420).max(1));
     let smallest_dp = w.min(h) * 160 / dpi;
-    let form_factor = if tags.contains("wear") {
+    let form_factor = if tags.iter().any(|t| is_xr_tag(t)) {
+        FormFactor::Vision
+    } else if tags.iter().any(|t| t.contains("wear")) {
         FormFactor::Watch
-    } else if tags.split(',').any(|t| t.ends_with("-tv") || t == "tv") {
+    } else if tags.iter().any(|t| t.ends_with("-tv") || *t == "tv") {
         FormFactor::Tv
-    } else if tags.contains("automotive") {
+    } else if tags.iter().any(|t| t.contains("automotive")) {
         FormFactor::Auto
     } else if flag("hw.sensor.hinge") || device.contains("fold") {
         FormFactor::Foldable
@@ -408,13 +441,14 @@ mod tests {
             (FormFactor::Watch, Platform::Android, Some("wearos")),
             (FormFactor::Tv, Platform::Android, Some("androidtv")),
             (FormFactor::Auto, Platform::Android, Some("automotive")),
-            (FormFactor::Vision, Platform::Android, None),
+            (FormFactor::Vision, Platform::Android, Some("androidxr")),
         ];
         for (f, p, sub) in expect {
             assert_eq!(Kind::new(p, f).ok().map(|k| k.sub_platform.as_str()), sub, "{f:?} on {p:?}");
         }
         assert_eq!(matrix().len(), 14);
-        assert_eq!(matrix().iter().filter(|(.., k)| k.is_err()).count(), 2);
+        // A foldable iPhone is the only gap.
+        assert_eq!(matrix().iter().filter(|(.., k)| k.is_err()).count(), 1);
     }
 
     #[test]
@@ -424,8 +458,7 @@ mod tests {
             e.to_string(),
             "foldable is not supported on iOS: no Apple device or simulator runtime folds; foldables are Android-only"
         );
-        let e = Kind::new(Platform::Android, FormFactor::Vision).expect_err("no Android headset");
-        assert!(e.to_string().starts_with("vision is not supported on Android: "), "{e}");
+        assert_eq!(Kind::new(Platform::Android, FormFactor::Vision).map(|k| k.label()), Ok("Android XR · Vision".to_owned()));
     }
 
     #[test]
@@ -515,5 +548,47 @@ mod tests {
         assert_eq!(avd(&[("tag.id", "android-tv")]).kind.form_factor, FormFactor::Tv);
         assert_eq!(avd(&[("tag.ids", "android-automotive-playstore")]).kind.sub_platform.as_str(), "automotive");
         assert_eq!(avd(&[]).kind.form_factor, FormFactor::Phone);
+        // Tags auto-mobile recognises: signed and China Wear OS images, 16 KB page-size Google TV.
+        assert_eq!(avd(&[("tag.id", "android-wear-signed")]).kind.form_factor, FormFactor::Watch);
+        assert_eq!(avd(&[("tag.id", "android-wear-cn")]).kind.form_factor, FormFactor::Watch);
+        assert_eq!(avd(&[("tag.id", "google-tv-ps16k")]).kind.form_factor, FormFactor::Tv);
+        assert_eq!(avd(&[("tag.id", "google_apis_ps16k")]).kind.form_factor, FormFactor::Phone);
+    }
+
+    #[test]
+    fn android_xr_images_are_vision_devices() {
+        // What avdmanager writes for the SDK's XR headset, and the image directory tags emu-rs and
+        // sim-rs write (`google-xr`, `android-xr-v3-playstore`, `android-xr-preview-playstore`).
+        let headset = avd(&[
+            ("tag.id", "android-xr"),
+            ("tag.ids", "android-xr,google_apis_playstore"),
+            ("hw.device.name", "xr_headset_device"),
+            ("hw.lcd.width", "2560"),
+            ("hw.lcd.height", "2558"),
+            ("hw.lcd.density", "240"),
+        ]);
+        assert_eq!((headset.kind.form_factor, headset.kind.sub_platform.as_str()), (FormFactor::Vision, "androidxr"));
+        assert_eq!((headset.width, headset.height, headset.density), (2560, 2558, Density::Dpi(240)));
+        for tag in ["google-xr", "android-xr-v3-playstore", "android-xr-preview-playstore", "ai-glasses"] {
+            assert_eq!(avd(&[("tag.id", tag)]).kind.label(), "Android XR · Vision", "{tag}");
+        }
+        assert!(!is_xr_tag("google_apis_playstore") && !is_glasses_tag("google-xr"));
+    }
+
+    #[test]
+    fn android_xr_profiles_and_inputs() {
+        let xr = Kind::new(Platform::Android, FormFactor::Vision).expect("Android XR");
+        let headset = xr.profile();
+        assert_eq!((headset.width, headset.height, headset.density, headset.shape), (2560, 2558, Density::Dpi(240), Shape::Rectangle));
+        assert_eq!(xr.image_profile("google-xr"), headset);
+        let glasses = xr.image_profile("ai-glasses");
+        assert_eq!((glasses.width, glasses.height, glasses.density), (450, 450, Density::Dpi(160)));
+        // Only Android XR has glasses; other kinds ignore the tag.
+        let phone = Kind::new(Platform::Android, FormFactor::Phone).expect("phone");
+        assert_eq!(phone.image_profile("ai-glasses"), phone.profile());
+        let labels: Vec<&str> = xr.inputs().iter().map(|i| i.label(Platform::Android)).collect();
+        assert_eq!(labels, ["Eye tracking", "Hand tracking", "Keyboard"]);
+        let vision = Kind::new(Platform::Ios, FormFactor::Vision).expect("visionOS");
+        assert_eq!(vision.inputs().iter().map(|i| i.label(Platform::Ios)).collect::<Vec<_>>(), ["Gaze", "Pinch", "Keyboard"]);
     }
 }

@@ -1,14 +1,19 @@
 //! Which controls a device gets, by platform and form factor: iOS devices get their hardware
 //! buttons and appearance; Android devices get Back/Home/Recents and power, a foldable its hinge
-//! postures, a watch its rotary input, a TV its D-pad, a head unit only what it has.
+//! postures, a watch its rotary input, a TV its D-pad, an XR headset head turns and recentering,
+//! a head unit only what it has.
 
 use rune::Icon;
 use sim_core::device::DeviceInfo;
 use sim_core::form_factor::{FormFactor, Posture};
 use sim_core::hid::Button;
 use sim_core::platform::Platform;
+use sim_core::xr::XrCommand;
 
 use crate::{Action, icons};
+
+/// One head turn from the Android XR toolbar, in radians (15°).
+const LOOK_STEP: f32 = std::f32::consts::PI / 12.0;
 
 /// One toolbar control.
 pub struct Control {
@@ -61,7 +66,14 @@ pub fn for_device(d: &DeviceInfo) -> Vec<Control> {
                     out.push(button("dpad-right", &icons::CHEVRON_RIGHT, "D-pad right", Button::DpadRight));
                     out.push(button("dpad-select", &icons::SELECT, "Select", Button::DpadCenter));
                 }
-                FormFactor::Auto | FormFactor::Vision => {}
+                // Android XR: turn the head 15° (about +y is to the left) and recenter.
+                FormFactor::Vision => {
+                    let turn = |y| Action::Xr(XrCommand::Rotate { x: 0.0, y, z: 0.0 });
+                    out.push(control("xr-look-left", &icons::CHEVRON_LEFT, "Look left", turn(LOOK_STEP)));
+                    out.push(control("xr-recenter", &icons::SELECT, "Recenter", Action::Xr(XrCommand::Recenter)));
+                    out.push(control("xr-look-right", &icons::CHEVRON_RIGHT, "Look right", turn(-LOOK_STEP)));
+                }
+                FormFactor::Auto => {}
             }
         }
     }
@@ -114,8 +126,21 @@ mod tests {
         assert!(android(FormFactor::Watch).contains(&"crown-up") && !android(FormFactor::Watch).contains(&"recents-button"));
         assert!(android(FormFactor::Tv).contains(&"dpad-select") && !android(FormFactor::Tv).contains(&"rotate-button"));
         assert_eq!(android(FormFactor::Auto), ["back-button", "home-button", "screenshot-button", "shutdown-button"]);
+        assert_eq!(
+            android(FormFactor::Vision),
+            [
+                "back-button",
+                "home-button",
+                "lock-button",
+                "xr-look-left",
+                "xr-recenter",
+                "xr-look-right",
+                "screenshot-button",
+                "shutdown-button"
+            ]
+        );
         // Every Android button control names a button Android has.
-        for f in [FormFactor::Phone, FormFactor::Tablet, FormFactor::Foldable, FormFactor::Watch, FormFactor::Tv, FormFactor::Auto] {
+        for f in FormFactor::ALL {
             for c in for_device(&device(Platform::Android, f)) {
                 if let Action::Button(b) = c.action {
                     assert!(b.android_key().is_some(), "{f:?}: {b:?}");

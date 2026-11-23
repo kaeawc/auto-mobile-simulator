@@ -10,6 +10,7 @@ pub mod gps;
 pub mod misc;
 pub mod qemud;
 pub mod sensors;
+pub mod xr;
 
 use std::net::TcpStream;
 use std::sync::mpsc::Sender;

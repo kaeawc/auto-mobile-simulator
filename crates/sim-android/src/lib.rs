@@ -23,8 +23,9 @@ use sim_core::form_factor::{FormFactor, InputMethod, Kind, Profile, android_prof
 use sim_core::frame::Frame;
 use sim_core::gesture::{Phase, Sample};
 use sim_core::hid::{Button, Direction, KEY_LEFT_SHIFT, KeyStroke, keystroke, linux_keycode};
-use sim_core::platform::Platform;
+use sim_core::platform::{AndroidOs, Platform, SubPlatform};
 use sim_core::stream::Input;
+use sim_core::xr::XrCommand;
 
 /// The Android backend over one SDK and AVD home.
 #[derive(Clone, Debug)]
@@ -145,7 +146,7 @@ impl Android {
             let label = Kind::new(Platform::Android, image).map(|k| k.label()).unwrap_or_default();
             return Err(format!("system image `{system_image}` (tag `{tag}`) boots {label} devices, not {}", wanted.as_str()));
         }
-        self.env.create_avd(&NewAvd::for_profile(name, &sysdir, &kind.profile())).map_err(|e| e.to_string())?;
+        self.env.create_avd(&NewAvd::for_profile(name, &sysdir, &kind.image_profile(&tag))).map_err(|e| e.to_string())?;
         Ok(self.describe(name, &[]).info)
     }
 
@@ -389,6 +390,16 @@ impl Device {
         self.require(InputMethod::Rotary, "rotary input")?;
         display::Display::connect(&self.avd()?.dir)?.send(&Input::Wheel(ticks))
     }
+
+    /// An XR control (head pose, environment, input mode, pointer) through emu-rs's `xr` console
+    /// command; returns its reply lines. Android XR devices only.
+    pub fn xr(&self, command: &XrCommand) -> Result<Vec<String>, String> {
+        match self.info.kind() {
+            Some(k) if k.sub_platform == SubPlatform::Android(AndroidOs::Xr) => self.console(&[command.console()]),
+            Some(k) => Err(format!("XR controls need an Android XR device; {} is {}", self.info.name, k.label())),
+            None => Err(format!("XR controls: {}'s form factor is unknown", self.info.name)),
+        }
+    }
 }
 
 /// Whether a running instance has finished booting.
@@ -514,7 +525,7 @@ mod tests {
         let err = f.android.create("t", wear, Some(FormFactor::Tablet)).expect_err("tablet from a Wear image");
         assert_eq!(err, format!("system image `{wear}` (tag `android-wear`) boots Wear OS · Watch devices, not tablet"));
         let err = f.android.create("v", "system-images;android-36;google_apis;arm64-v8a", Some(FormFactor::Vision)).expect_err("vision");
-        assert!(err.starts_with("vision is not supported on Android"), "{err}");
+        assert!(err.ends_with("(tag `google_apis`) boots Android · Phone devices, not vision"), "{err}");
         assert!(f.android.create("x", "android-36", None).expect_err("bad image").contains("should look like"));
         assert!(f.android.devices().is_empty(), "nothing was written");
     }
@@ -637,6 +648,44 @@ mod tests {
         assert_eq!(wait_for(&fake.display, 2), ["touch 100 200 down", "touch 100 200 up"]);
         assert!(d.rotary(1).expect_err("not a watch").starts_with("rotary input needs a device with Rotary input"));
         assert!(f.android.delete(&d).expect_err("running").contains("is running"));
+    }
+
+    /// Adds an installed system image under the fixture's SDK.
+    fn add_image(f: &Fixture, dir: &str, image_tag: &str) {
+        let d = f.root.join("sdk/system-images").join(dir);
+        std::fs::create_dir_all(&d).expect("image dir");
+        std::fs::write(d.join("system.img"), b"s").expect("system.img");
+        std::fs::write(d.join("source.properties"), format!("AndroidVersion.ApiLevel=34\nSystemImage.TagId={image_tag}\n")).expect("props");
+    }
+
+    #[test]
+    fn android_xr_images_make_headsets_and_glasses() {
+        let f = fixture("xr");
+        add_image(&f, "android-34/google-xr/arm64-v8a", "android-xr");
+        add_image(&f, "android-36/ai-glasses/arm64-v8a", "ai-glasses");
+        let headset = f.android.create("headset", "system-images;android-34;google-xr;arm64-v8a", None).expect("headset");
+        assert_eq!((headset.form_factor, headset.label()), (Some(FormFactor::Vision), "Android XR · Vision".to_owned()));
+        let d = f.android.device("headset").expect("headset");
+        assert_eq!(d.screen_size(), Ok((2560, 2558)));
+        assert_eq!(d.avd.as_ref().and_then(|a| a.get("hw.initialOrientation")), Some("landscape"));
+        let glasses =
+            f.android.create("glasses", "system-images;android-36;ai-glasses;arm64-v8a", Some(FormFactor::Vision)).expect("glasses");
+        assert_eq!(glasses.sub_platform.map(|s| s.as_str()), Some("androidxr"));
+        assert_eq!(f.android.device("glasses").expect("glasses").screen_size(), Ok((450, 450)));
+        let err = f.android.create("p", "system-images;android-34;google-xr;arm64-v8a", Some(FormFactor::Phone)).expect_err("phone");
+        assert!(err.ends_with("boots Android XR · Vision devices, not phone"), "{err}");
+
+        // XR controls are for Android XR devices, and go to a running one's console.
+        let rotate = XrCommand::Rotate { x: 0.0, y: 0.5, z: 0.0 };
+        assert_eq!(d.xr(&rotate), Err("headset isn't running; boot it first".into()));
+        f.android.create("watch", "system-images;android-34;android-wear;arm64-v8a", None).expect("watch");
+        let watch = f.android.device("watch").expect("watch");
+        assert_eq!(watch.xr(&rotate), Err("XR controls need an Android XR device; watch is Wear OS · Watch".into()));
+        let fake = fake_emulator(&f, "headset");
+        let d = f.android.device("headset").expect("running headset");
+        d.xr(&rotate).expect("rotate");
+        d.xr(&XrCommand::Recenter).expect("recenter");
+        assert_eq!(wait_for(&fake.console, 2), ["xr rotate 0 0.5 0", "xr recenter"]);
     }
 
     #[test]

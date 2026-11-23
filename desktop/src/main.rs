@@ -56,6 +56,8 @@ pub enum Action {
     Fold(Posture),
     /// Android watches: turn the rotary input.
     Rotary(i32),
+    /// Android XR: head pose and recentering.
+    Xr(sim_core::xr::XrCommand),
     Debug(debug::DebugAction),
 }
 
@@ -522,6 +524,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             Action::Rotate => android_action(s, sim_android::Device::rotate),
             Action::Fold(posture) => android_action(s, |d| d.fold(posture.angle())),
             Action::Rotary(ticks) => s.screen.iter().for_each(|sc| sc.wheel(ticks)),
+            Action::Xr(command) => android_action(s, |d| d.xr(&command).map(drop)),
             Action::Debug(a) => {
                 if let Some(udid) = s.live.as_ref().map(|l| l.udid.clone())
                     && let Some(msg) = s.debug.perform(&udid, a)

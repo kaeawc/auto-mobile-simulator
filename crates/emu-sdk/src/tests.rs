@@ -94,6 +94,31 @@ fn lists_system_images_for_host() {
 }
 
 #[test]
+fn lists_android_xr_images_by_path_or_package_tag() {
+    let m =
+        Manifest::parse(include_str!("../testdata/sys-img-google_xr.xml"), "https://dl.google.com/android/repository/sys-img/google_xr/")
+            .expect("parse XR fixture");
+    let paths =
+        |tag| m.system_images(HOST, tag, "arm64-v8a").into_iter().map(|d| format!("{} r{}", d.path, d.revision)).collect::<Vec<_>>();
+    // The dev-channel r8 of google-xr isn't stable.
+    let all = [
+        "system-images;android-34;android-xr-v3-playstore;arm64-v8a r3",
+        "system-images;android-34;google-xr;arm64-v8a r7",
+        "system-images;android-36;ai-glasses;arm64-v8a r6",
+    ];
+    assert_eq!(paths(None), all);
+    // No path says `android-xr`: the headsets carry it as a package tag.
+    assert_eq!(paths(Some("android-xr")), all[..2]);
+    assert_eq!(paths(Some("google-xr")), all[1..2]);
+    assert_eq!(paths(Some("ai-glasses")), all[2..]);
+    let d = m.resolve("system-images;android-34;google-xr;arm64-v8a", HOST).expect("google-xr");
+    assert_eq!(
+        (d.tags.as_slice(), d.file_name()),
+        (["android-xr".to_owned(), "google_apis_playstore".to_owned()].as_slice(), "xr-arm64-v8a-playstore-34_r07.zip")
+    );
+}
+
+#[test]
 fn revisions_order_and_print() {
     let r = |major, minor, micro, preview| Revision { major, minor, micro, preview };
     assert!(r(38, 0, 0, Some(1)) < r(38, 0, 0, None));
@@ -116,6 +141,9 @@ fn site_list_and_urls() {
     assert_eq!(sys_img_url("default"), format!("{REPO_URL}sys-img/android/sys-img2-3.xml"));
     assert_eq!(sys_img_url("google_apis_ps16k"), format!("{REPO_URL}sys-img/google_apis/sys-img2-3.xml"));
     assert_eq!(sys_img_url("android-tv"), format!("{REPO_URL}sys-img/android-tv/sys-img2-3.xml"));
+    for xr in ["google-xr", "android-xr", "android-xr-v3-playstore", "android-xr-preview-playstore", "ai-glasses"] {
+        assert_eq!(sys_img_url(xr), format!("{REPO_URL}sys-img/google_xr/sys-img2-3.xml"), "{xr}");
+    }
     assert_eq!(system_image_path("android-36.1", "google_apis", "arm64-v8a"), "system-images;android-36.1;google_apis;arm64-v8a");
     assert!(Manifest::parse("<not xml", REPO_URL).is_err());
 }
@@ -156,6 +184,7 @@ fn installs_from_a_local_archive() {
         path: "platform-tools".into(),
         revision: Revision { major: 37, minor: 0, micro: 3, preview: None },
         api_level: None,
+        tags: Vec::new(),
         url: format!("file://{}", zip.display()),
         size: bytes.len() as u64,
         sha1: sha1_hex(&bytes),
@@ -291,6 +320,7 @@ fn zip_emulator(work: &Path, src: &str, rev: &str) -> Download {
         path: renderer::PACKAGE.into(),
         revision: rev.parse().expect("rev"),
         api_level: None,
+        tags: Vec::new(),
         url: format!("file://{}", zip.display()),
         size: bytes.len() as u64,
         sha1: sha1_hex(&bytes),
