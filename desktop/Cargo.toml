@@ -1,6 +1,6 @@
 [package]
 name = "sim-rs-desktop"
-description = "sim-rs desktop app: a live, interactive device window rendered with Rune."
+description = "sim-rs desktop app: one live, interactive window for iOS simulator and Android emulator devices, rendered with Rune."
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
@@ -20,10 +20,10 @@ sim-core = { path = "../crates/sim-core" }
 sim-coresim = { path = "../crates/sim-coresim" }
 sim-debug = { path = "../crates/sim-debug" }
 sim-api = { path = "../crates/sim-api" }
+sim-android = { path = "../crates/sim-android" }
 sim-netshape = { path = "../crates/sim-netshape" }
 serde = "1"
 serde_json = "1"
-png = { version = "0.18", default-features = false }
 rune = { git = "https://github.com/anomalyco/rune", rev = "7a707454fbfb8d3fd200723c65778fb7b98fd31e" }
 
 [features]

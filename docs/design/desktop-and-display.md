@@ -1,8 +1,12 @@
 # Desktop app and display pipeline
 
-The design for the display, input and debugging side of emu-rs. It reuses what works in
-`auto-mobile-simulator` (sim-rs) and fixes its known gaps. Rune is pinned at `7a70745`, the same
-rev sim-rs and the template use.
+The design for the display, input and debugging side of emu-rs, written before emu-rs joined
+sim-rs. It now describes the Android half of sim-rs's one window (`desktop/`): the window is a
+separate process from each `emu`, frames arrive over `<avd>/emu-rs/display.sock` (the protocol is
+`sim_core::stream`), and input goes back as stream lines or console commands. What is built and
+what isn't: zero-copy IOSurface frames (step 2 below) and the frame HUD are not yet; the socket
+stream with downscaling, touch, keys, the rotary wheel and the console pane are. Rune is pinned at
+`7a70745`, the same rev sim-rs uses.
 
 ## Display: zero-copy, double- or triple-buffered
 

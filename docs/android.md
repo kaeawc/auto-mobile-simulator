@@ -1,6 +1,12 @@
-# emu-rs
+# The Android backend: emu-rs
 
-An Android emulator written from scratch in Rust for Apple silicon. It boots the SDK's
+sim-rs's Android devices run on emu-rs, imported from
+[kaeawc/auto-mobile-emulator](https://github.com/kaeawc/auto-mobile-emulator) at `f0ccf83`. This
+page is that project's README, kept for its status, provisioning, benchmark and performance notes;
+paths are this repository's. How it fits the combined project: [architecture.md](architecture.md);
+which Android form factors work: [form-factors.md](form-factors.md).
+
+emu-rs is an Android emulator written from scratch in Rust for Apple silicon. It boots the SDK's
 unmodified arm64 system images on Hypervisor.framework and presents the same board, ports and
 control surfaces as the official emulator, so existing tooling (`adb`, `adb emu`, test
 harnesses such as [AutoMobile](https://github.com/kaeawc/auto-mobile)) can drive it unchanged.
@@ -23,7 +29,7 @@ to use fewer resources.
 | Telephony | AT modem on a virtio-console `modem` port: the radio HAL registers on LTE with a loaded SIM; incoming SMS and calls from the console |
 | Images | Phone API 35, 36, 37 and Wear boot (5–8 s warm; Wear gets stock's +512 MB below 1 GB). Automotive needs the vehicle HAL (`qemud:car`) and its audio HAL; Bluetooth needs a controller (in progress) |
 | AutoMobile | API 37: 38 of 44 harness tools pass; open: network shaping, gRPC audio, VM snapshots |
-| Desktop app | Rune app (`desktop/`): AVD list, start/stop, live guest console, live screen with touch and Back/Home/Power over `<avd>/emu-rs/display.sock` |
+| Desktop app | sim-rs's window (`desktop/`), shared with iOS devices: AVD list, start/stop, live guest console, live screen with touch and form-factor controls (Back/Home/Recents/Power, rotate, hinge, rotary, D-pad) over `<avd>/emu-rs/display.sock` |
 
 ## Quick start
 
@@ -33,7 +39,8 @@ cargo run -p emu -- -avd <name> -show-kernel -verbose   # first boot formats and
 adb -s emulator-5554 shell                              # once adbd is up
 adb -s emulator-5554 emu kill
 make shim && export ANDROID_HOME=~/.emu-rs/sdk          # make tools launch emu-rs as "emulator"
-cd desktop && cargo run                                 # desktop app
+cd desktop && cargo run                                 # the desktop window (iOS and Android)
+sim-rs list --platform android                          # the same AVDs through sim-rs
 ```
 
 `cargo run` signs binaries with the `com.apple.security.hypervisor` entitlement
@@ -48,14 +55,15 @@ ignored for now.
 
 | Path | What |
 | --- | --- |
-| `crates/emu-hvf` | Safe wrappers over Hypervisor.framework: VM, vCPUs, GIC, guest RAM with zero-copy file I/O. **The only crate with `unsafe`.** |
+| `crates/emu-hvf` | Safe wrappers over Hypervisor.framework: VM, vCPUs, GIC, guest RAM with zero-copy file I/O. One of the few crates allowed `unsafe` (see AGENTS.md). |
 | `crates/emu-vmm` | The machine: memory map (`layout.rs`), device tree (`board.rs`), vCPU loop and PSCI (`vcpu.rs`), MMIO bus, PL011/PL031, virtio-mmio transport, blk, rng, vsock, host pipe services (adb bridge, `qemud:boot-properties`) |
-| `crates/emu-avd` | AVD discovery and config (`~/.android/avd`, `config.ini`, system image), bootconfig encoding |
+| `crates/emu-avd` | AVD discovery and config (`~/.android/avd`, `config.ini`, system image), form factor (`Avd::profile`), running-instance advertisements, bootconfig encoding |
 | `crates/emu-sdk` | Java-free SDK provisioning: repository manifests, verified downloads, unpacking, the on-demand renderer (`emu -provision`, `-provision-renderer`) |
 | `crates/emu-ext4` | Native ext4 formatter for first-boot userdata: writes only metadata, so a fresh 10 GiB image takes under 1 MB on disk |
 | `crates/emu-fdt` | Flattened device tree writer |
-| `apps/emu` | The `emu` CLI: SDK-emulator-compatible flags, per-AVD instance state, console server |
-| `desktop/` | Rune desktop app, its own workspace |
+| `apps/emu` | The `emu` CLI: SDK-emulator-compatible flags, per-AVD instance state, console server, display server |
+| `crates/sim-android` | The client front ends use: AVDs as devices, starting `emu`, the console and display-socket clients |
+| `desktop/` | sim-rs's Rune window (both platforms), its own workspace |
 | `docs/` | [Stock board reference](docs/reference/stock-board.md), [desktop and display design](docs/design/desktop-and-display.md), [roadmap](docs/roadmap-android.md) |
 | `scripts/` | Cargo runner that signs with the hypervisor entitlement, SDK overlay (`make shim`), AutoMobile harness (`make harness-android DEVICE=emulator-5554`) |
 

@@ -128,14 +128,19 @@ scripts/automobile-harness-android.sh emulator-5554
   running-instance file), `display_server.rs` (frames and input on `display.sock`),
   `provision.rs` (`-provision`, `-list-images`). Boots only on Apple silicon; elsewhere it lists,
   creates and provisions AVDs.
-- `desktop/` — Rune app: `device.rs` (the live device facade; a stub where there's no simulator
-  service, so the window builds and tests on Linux), `ios.rs` (live iOS device, capture thread;
-  macOS), `surface.rs` (zero-copy IOSurface bridge; macOS), `debug.rs` (debug panel: tabs, API worker thread, views), `icons.rs` (SVG
+- `desktop/` — Rune app, one window for both platforms: `device.rs` (the live iOS device facade; a
+  stub where there's no simulator service, so the window builds and tests on Linux), `ios.rs`
+  (live iOS device, capture thread; macOS), `surface.rs` (zero-copy IOSurface bridge; macOS),
+  `android.rs` (live Android device: frames and input over `display.sock`), `controls.rs` (the
+  toolbar each platform and form factor gets), `debug.rs` (debug panel: tabs, API worker thread, views), `icons.rs` (SVG
   icons), `keys.rs` (host keys → HID), `view.rs`, `main.rs` (state, actions, poll, tests).
-  Headless `--snap` needs a debug build (release builds lack Rune's tooling feature).
+  Headless `--snap` needs a debug build (release builds lack Rune's tooling feature); scenes:
+  demo, android, foldable, watch, tv, empty. On Linux it renders with Mesa's lavapipe.
 - `scripts/` — `parity.sh`, `automobile-harness.sh`, `pf-shape.sh` (pf/dummynet, needs sudo);
   Android: `sign-run.sh` (the cargo runner: hypervisor entitlement), `sdk-shim.sh` (SDK overlay
   whose `emulator` is emu-rs), `automobile-harness-android.sh`, `android-bench.sh`.
 - `docs/research/` — `network-shaping.md`, `audio-camera.md`; `docs/automobile-tool-matrix.md`.
+  `docs/architecture.md` (layers, process model, shared logic, the conflict decisions),
+  `docs/form-factors.md` (support matrix, profiles, inference, launching each kind, known gaps).
   Android: `docs/android.md` (status, provisioning, benchmarks, performance notes),
   `docs/reference/stock-board.md`, `docs/design/desktop-and-display.md`, `docs/roadmap-android.md`.

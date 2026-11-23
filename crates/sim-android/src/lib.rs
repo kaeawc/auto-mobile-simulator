@@ -22,7 +22,7 @@ use sim_core::device::{DeviceInfo, DeviceState, RuntimeInfo, Selection, select};
 use sim_core::form_factor::{FormFactor, InputMethod, Kind, Profile, android_profile};
 use sim_core::frame::Frame;
 use sim_core::gesture::{Phase, Sample};
-use sim_core::hid::{Button, Direction, KEY_LEFT_SHIFT, keystroke, linux_keycode};
+use sim_core::hid::{Button, Direction, KEY_LEFT_SHIFT, KeyStroke, keystroke, linux_keycode};
 use sim_core::platform::Platform;
 use sim_core::stream::Input;
 
@@ -334,11 +334,19 @@ impl Device {
 
     /// Types text on the hardware keyboard (US layout), in one console session.
     pub fn type_text(&self, text: &str) -> Result<(), String> {
+        let strokes = text
+            .chars()
+            .map(|c| keystroke(c).ok_or_else(|| format!("no key for {c:?} on the US layout")))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.strokes(&strokes)
+    }
+
+    /// Presses each key stroke (HID usage, with shift if set), in one console session.
+    pub fn strokes(&self, strokes: &[KeyStroke]) -> Result<(), String> {
         let shift = linux_keycode(KEY_LEFT_SHIFT).unwrap_or(42);
-        let mut commands = Vec::new();
-        for c in text.chars() {
-            let stroke = keystroke(c).ok_or_else(|| format!("no key for {c:?} on the US layout"))?;
-            let code = linux_keycode(stroke.usage).ok_or_else(|| format!("no Android key for {c:?}"))?;
+        let mut commands = Vec::with_capacity(strokes.len());
+        for stroke in strokes {
+            let code = linux_keycode(stroke.usage).ok_or_else(|| format!("HID usage {:#x} has no Android key", stroke.usage))?;
             commands.push(if stroke.shift {
                 format!("event send EV_KEY:{shift}:1 EV_KEY:{code}:1 EV_KEY:{code}:0 EV_KEY:{shift}:0")
             } else {
@@ -408,6 +416,13 @@ fn booted(r: &Running, adb: Option<&Path>) -> bool {
             .and_then(|l| l.first().and_then(|n| n.trim().parse::<u64>().ok()))
             .is_some_and(|n| n > 0),
     }
+}
+
+/// The last `n` lines of a device's guest console (`<avd>/emu-rs/console.log`).
+pub fn console_log_tail(avd_dir: &Path, n: usize) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(avd_dir.join("emu-rs/console.log")) else { return Vec::new() };
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].iter().map(|l| (*l).to_owned()).collect()
 }
 
 /// Decodes an 8-bit RGBA PNG (what the emulator's `screenshot` writes).

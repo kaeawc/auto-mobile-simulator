@@ -1,52 +1,163 @@
 # sim-rs
 
-A from-scratch iOS simulator front end in Rust. It talks to the host's simulator service directly
-to create, boot and drive simulated iOS devices, stream their screen, and inject touches, hardware
-buttons and keyboard input. No stock simulator app runs: devices boot headless, and the optional
-desktop window (built with [Rune](https://github.com/anomalyco/rune)) shows the live screen.
+iOS simulator and Android emulator devices from one Rust core: one CLI, one JSON socket API and one
+desktop window for both, with every device, method and control labelled with its platform and form
+factor.
 
-The aim is to behave exactly like Apple's simulator first, then go beyond it (scriptable everything,
-headless by default, zero-copy display).
+- **iOS** devices are driven through the host's simulator service directly (lifecycle, apps,
+  framebuffer, HID input). No stock Simulator app runs: devices boot headless.
+- **Android** devices run on **emu-rs**, an Android emulator written from scratch on
+  Hypervisor.framework. It boots the SDK's unmodified arm64 system images and presents the stock
+  emulator's board, ports and console, so `adb`, `adb emu` and harnesses such as
+  [AutoMobile](https://github.com/kaeawc/auto-mobile) drive it unchanged
+  ([docs/android.md](docs/android.md)).
+
+The aim is to behave exactly like the stock tools first, then go beyond them: scriptable
+everything, headless by default, fast, and easy to debug.
+
+![The desktop window with iOS and Android devices](docs/desktop.png)
+
+## Architecture
+
+```text
+            sim-rs CLI        desktop window (Rune)        scripts, AutoMobile
+                 \                    |                        /
+                  +----------- sim-api: one method table ------+   (JSON lines on a unix socket)
+                  |                                            |
+        iOS backend (macOS)                          Android backend
+   sim-coresim: CoreSimulator, HID,          sim-android: AVDs, `emu` processes,
+   IOSurface framebuffer; sim-debug,         console client, display-socket client
+   sim-netshape, sim-audio                              |
+                  |                           emu (one process per device): emu-vmm,
+          launchd_sim per device              emu-hvf, emu-gfxstream, emu-avd, emu-sdk
+                  \                                    /
+                   +-------- sim-core: shared, pure ----+
+     devices and selection, platforms and form factors, frames and PNG, pixel formats,
+     gestures, keys and buttons (HID and Linux codes), the display stream protocol
+```
+
+Shared logic lives once, in `sim-core` and `sim-api`; each backend keeps only what is specific to
+its platform. Devices of both platforms run outside the window and API processes (iOS under its own
+`launchd_sim`, Android in its own `emu`), so a crashed device never takes a front end down.
+Details, and the decisions behind them: [docs/architecture.md](docs/architecture.md).
+
+## Platforms and form factors
+
+| Form factor | Android | iOS (Apple) | Inputs |
+| --- | --- | --- | --- |
+| phone | Android | iOS | touch, keyboard, buttons |
+| tablet | Android | iPadOS | touch, keyboard, buttons |
+| foldable | Android | unsupported: no Apple device folds | touch, keyboard, buttons, hinge |
+| watch | Wear OS | watchOS | touch, rotary input / Digital Crown, buttons |
+| tv | Android TV | tvOS | D-pad remote / Siri Remote, keyboard |
+| auto | Android Automotive | CarPlay | touch, head unit |
+| vision | unsupported: no Android headset image | visionOS | gaze, pinch, keyboard |
+
+`sim-rs form-factors` prints this matrix (and `call form_factors` returns it with reference
+screen sizes, densities, shapes and fold states). Unsupported combinations are rejected with the
+reason, wherever they come up: `create`, `devices` filters, the desktop's controls. What each form
+factor can do today, and what is still a gap: [docs/form-factors.md](docs/form-factors.md).
 
 ## Requirements
 
-- macOS on Apple silicon with Xcode installed (`xcode-select -p` must point at it, or set
-  `DEVELOPER_DIR`) and at least one iOS simulator runtime.
+- macOS on Apple silicon to run devices: Xcode (`xcode-select -p`, or `DEVELOPER_DIR`) with at
+  least one simulator runtime for iOS; for Android, an SDK system image (`emu -provision` fetches
+  one, no Java needed).
 - Rust 1.99.1 (pinned in `rust-toolchain.toml`).
+- On Linux the shared core, the API, the CLI and the desktop window build and test (CI runs them
+  there); there are no devices to run, since both runtimes need macOS.
 
-## CLI
+## Quick start
 
 ```bash
 cargo build
 alias sim-rs=target/debug/sim-rs
 
-sim-rs list [--booted] [--json]          # devices, grouped by runtime, labelled [iPadOS · Tablet]
-sim-rs list --platform ios --form-factor watch
-sim-rs form-factors [--platform android] # which form factors each platform offers, and why not
-sim-rs runtimes | device-types           # what can be created
-sim-rs create "My Phone" "iPhone 17" "iOS 26.5"   # prints the UDID
-sim-rs create "Pad" "iPad Pro 11-inch (M4)" "iOS 26.5" --form-factor tablet  # checked against the type
-sim-rs boot <device>                     # waits until the device finishes booting
-sim-rs screenshot <device> out.png       # full-resolution PNG from the framebuffer
-sim-rs tap <device> 600 1300             # pixels from the top-left of the screen
-sim-rs swipe <device> 600 2000 600 900 --duration 300 [--settle]
-sim-rs button <device> home|lock|side|siri|apple-pay
-sim-rs type <device> 'Hello, World!'     # hardware keyboard, US layout
-sim-rs key <device> 40                   # HID usage (40 = Return)
-sim-rs install|uninstall|launch|terminate|apps ...
-sim-rs open-url <device> https://example.com
-sim-rs appearance <device> dark
-sim-rs location <device> 37.33 -122.03
-sim-rs privacy <device> grant photos com.example.app
-sim-rs memory-warning <device>
-sim-rs shutdown|erase|delete <device>
+sim-rs list                                   # every device, grouped by runtime, labelled
+sim-rs list --platform android --form-factor watch
+sim-rs form-factors
 ```
 
-`<device>` is a UDID, an exact name, or `booted`.
+### iOS
 
-## Debug surface and socket API
+```bash
+sim-rs runtimes | device-types                # what can be created
+sim-rs create "My Phone" "iPhone 17" "iOS 26.5"                                   # phone (iOS)
+sim-rs create "Pad" "iPad Pro 11-inch (M4)" "iOS 26.5" --form-factor tablet       # iPadOS
+sim-rs create "Watch" "Apple Watch Series 10 (46mm)" "watchOS 26.0" --form-factor watch
+sim-rs create "TV" "Apple TV 4K (3rd generation)" "tvOS 26.0" --form-factor tv
+sim-rs create "Vision" "Apple Vision Pro" "visionOS 26.0" --form-factor vision
+sim-rs boot <device>                          # waits until the device finishes booting
+```
 
-Because a simulated device's processes run on the host under their own `launchd_sim`, and its
+`--form-factor` is checked against the device type (an iPhone is not a tablet). CarPlay is an
+external display of an iPhone simulator rather than a device type; attaching it isn't implemented
+yet, and `--form-factor auto` says so.
+
+### Android
+
+```bash
+emu -provision 36 -tag google_apis            # platform-tools, the image and the renderer
+emu -list-images -tag android-wear            # other image families: android-tv, google-tv,
+                                              # android-automotive, ...
+sim-rs create Pixel   --platform android --system-image "system-images;android-36;google_apis;arm64-v8a"
+sim-rs create Tablet  --platform android --system-image "system-images;android-36;google_apis;arm64-v8a" --form-factor tablet
+sim-rs create Fold    --platform android --system-image "system-images;android-36;google_apis;arm64-v8a" --form-factor foldable
+sim-rs create Wear    --platform android --system-image "system-images;android-34;android-wear;arm64-v8a"
+sim-rs create TV      --platform android --system-image "system-images;android-34;google-tv;arm64-v8a"
+sim-rs create Car     --platform android --system-image "system-images;android-34;android-automotive;arm64-v8a"
+sim-rs boot Pixel                             # starts emu; waits for sys.boot_completed
+adb -s emulator-5554 shell                    # it is an ordinary emulator to every tool
+sim-rs fold Fold half-opened                  # the hinge (foldables only)
+sim-rs rotary Wear 3                          # the rotary input (watches only)
+sim-rs console Pixel sensor get acceleration  # anything the emulator console speaks
+sim-rs shutdown Pixel
+```
+
+The form factor comes from the image (Wear OS, TV and Automotive images) or `--form-factor`
+(phone, tablet or foldable from a mobile image, which also sizes the screen and adds a foldable's
+hinge). An image can't boot another family's form factor, and the error says which it boots.
+`emu` itself stays a drop-in for the SDK's `emulator` (`emu -avd <name>`, `make shim`); see
+[docs/android.md](docs/android.md).
+
+### Both
+
+```bash
+sim-rs screenshot <device> out.png            # full-resolution PNG
+sim-rs tap <device> 600 1300                  # pixels from the top-left of the screen
+sim-rs swipe <device> 600 2000 600 900 --duration 300 [--settle]
+sim-rs button <device> home|lock              # iOS: side|siri|apple-pay; Android: back|recents|
+                                              # volume-up|volume-down|menu|up|down|left|right|select
+sim-rs type <device> 'Hello, World!'          # hardware keyboard, US layout, on both platforms
+sim-rs key <device> 40                        # HID usage (40 = Return)
+sim-rs location <device> 37.33 -122.03
+sim-rs shutdown|delete <device>
+```
+
+`<device>` is a UDID (an Android device's is its AVD name), an exact name, or `booted`.
+iOS-only commands: `install|uninstall|launch|terminate|apps`, `open-url`, `appearance`, `privacy`,
+`memory-warning`, `erase`, `exec`; Android-only: `rotate`, `fold`, `rotary`, `console`. Using one
+on the other platform's device fails with the platforms it works on.
+
+## Socket API
+
+Everything above is a method in `sim-api`'s table, served as JSON lines on a unix socket; the CLI
+and the desktop window call the same table.
+
+```bash
+sim-rs serve                                   # $SIM_RS_SOCKET or $TMPDIR/sim-rs.sock
+sim-rs call help                               # every method, with the platforms it supports
+sim-rs call devices '{"platform":"android"}'
+sim-rs call fold '{"device":"Fold","posture":"half-opened"}'
+sim-rs call ca_debug '{"device":"booted","option":"blended-layers","on":true}'
+```
+
+The desktop window serves the same API on `$TMPDIR/sim-rs-desktop.sock`. Full reference:
+[docs/api.md](docs/api.md).
+
+## iOS debug surface
+
+Because a simulated iOS device's processes run on the host under their own `launchd_sim`, and its
 filesystem is a host directory, sim-rs can expose far more than the stock simulator:
 
 | Area | What you get |
@@ -65,20 +176,17 @@ filesystem is a host directory, sim-rs can expose far more than the stock simula
 All of it is available three ways: the CLI, the desktop panel, and a JSON-lines unix socket API.
 
 ```bash
-sim-rs serve                                   # $SIM_RS_SOCKET or $TMPDIR/sim-rs.sock
-sim-rs call help                               # every method
 sim-rs call processes '{"device":"booted"}'
-sim-rs call ca_debug '{"device":"booted","option":"blended-layers","on":true}'
 sim-rs call push '{"device":"booted","bundle_id":"com.example.app","payload":{"aps":{"alert":"hi"}}}'
 sim-rs exec booted launchctl list              # run a program inside the device
 ```
 
-The desktop window serves the same API on `$TMPDIR/sim-rs-desktop.sock`. Full reference:
-[docs/api.md](docs/api.md).
+Android devices' equivalents go through adb (`adb shell`, logcat) and the emulator console
+(`sim-rs console`); the desktop shows their guest console.
 
-## Network shaping (no root)
+## iOS network shaping (no root)
 
-sim-rs shapes a device's network without root, MDM or a network extension:
+sim-rs shapes an iOS device's network without root, MDM or a network extension:
 
 ```bash
 sim-rs boot <device> --shaped            # or: sim-rs call network_shape '{"device":"…","inject":"boot"}'
@@ -99,9 +207,9 @@ sim-rs call network_clear '{"device":"…"}'
 
 Measured coverage and limits: [docs/research/network-shaping.md](docs/research/network-shaping.md).
 
-## Audio (no driver)
+## iOS audio (no driver)
 
-A device's processes are ordinary clients of the host's Core Audio server, so sim-rs captures or
+An iOS device's processes are ordinary clients of the host's Core Audio server, so sim-rs captures or
 silences exactly one device with a Core Audio process tap (macOS 14.2+), no loopback driver needed:
 
 ```bash
@@ -118,25 +226,27 @@ Microphone injection still needs a loopback device. Details: [docs/research/audi
 ```bash
 cd desktop
 cargo run --release                     # SIM_RS_DEVICE=<udid|name|booted> preselects a device
-cargo run -- --snap shot.png --scene demo   # headless render
+cargo run -- --snap shot.png --scene demo   # headless render; scenes: demo, android, foldable,
+                                            # watch, tv, empty
 ```
 
-Pick a device on the left (boot it if needed). Click and drag on the screen for touches; type to
-use the device keyboard. ⌘⇧H is Home, ⌘L Lock, ⌘S saves a screenshot to the Desktop. Frames go to
-the GPU without copying: the device's framebuffer IOSurface is sampled directly.
+Devices are listed under iOS and Android, each with its sub-platform. Pick one (boot it if
+needed): click and drag on the screen for touches; type to use the device keyboard. ⌘⇧H is Home,
+⌘L Lock/Power, ⌘S saves a screenshot to the Desktop. The toolbar follows the form factor:
 
-The panel on the right has five tabs (Device, Network, Storage, Processes, Logs) covering the
-debug surface above; every control has an SVG icon (`desktop/src/icons.rs`).
+| Device | Controls |
+| --- | --- |
+| iOS | Home, Lock, Appearance |
+| Android phone / tablet | Back, Home, Recents, Power, Rotate |
+| Android foldable | the above, plus Fold closed / Half open / Open flat |
+| Wear OS watch (round screen) | Back, Home, Power, Rotary up / down |
+| Android TV | Back, Home, Power, D-pad and Select |
+| Android Automotive | Back, Home |
 
-## Portability
-
-sim-rs itself is portable Rust, but the iOS runtime it drives is Apple's: iOS userland built for the
-host's XNU kernel, running under a per-device `launchd_sim`, rendering through Metal into IOSurfaces.
-That only runs on macOS, and Apple's license limits the runtimes to Apple hardware. What can be
-portable: the desktop window (Rune runs on Linux and Windows) and the socket API, with a Mac
-running `sim-rs serve` as the device host. The shared core, the API and the CLI already build and
-test on Linux (CI runs them there); the macOS-only crates compile to nothing on other hosts, and
-device methods report that iOS devices need a macOS host.
+iOS frames go to the GPU without copying (the framebuffer IOSurface is sampled directly) and the
+right-hand panel has five debug tabs (Device, Network, Storage, Processes, Logs). Android frames
+stream from the emulator's display socket, and the panel shows the device and its live guest
+console.
 
 ## Harness
 
@@ -150,6 +260,11 @@ simulator APIs and is the reference for behavior. Three layers check sim-rs agai
 | `SIM_RS_E2E_UDID=<udid> cargo nextest run -p sim-rs --test e2e` | sim-rs commands on a real device; identity matches `simctl` |
 | `scripts/parity.sh <udid>` | identity, screenshot size and pixels, and app list match `simctl` |
 | `scripts/automobile-harness.sh <udid>` | auto-mobile acquires, observes and drives a sim-rs-booted device (private daemon; touches no other daemon) |
+
+Android checks (Apple silicon): `cargo run -p emu -- -avd <name> -show-kernel -verbose`, then
+`adb -s emulator-5554 shell getprop sys.boot_completed`;
+`SIM_RS_E2E_AVD=<avd> cargo nextest run -p sim-rs --test e2e_android`;
+`scripts/automobile-harness-android.sh emulator-5554` (AutoMobile's tools against emu-rs).
 
 ## Layout
 
