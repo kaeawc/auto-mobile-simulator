@@ -442,8 +442,8 @@ mod tests;
 /// taking space. Returns the length and how many bytes were written.
 ///
 /// ext4 leaves skipped ranges as holes by itself; APFS allocates them (zero-filled) whether the
-/// file grows by a write past its end or by truncating, so each zero run is punched out
-/// explicitly, which on ext4 is a no-op. A filesystem without holes keeps the file dense.
+/// file grows by a write past its end or by truncating, so on macOS each zero run is punched out
+/// explicitly. A filesystem without holes keeps the file dense.
 pub fn write_sparse(mut src: impl std::io::Read, dst: &std::fs::File) -> std::io::Result<(u64, u64)> {
     use std::os::unix::fs::FileExt;
     const BLOCK: usize = 4096;
@@ -451,9 +451,12 @@ pub fn write_sparse(mut src: impl std::io::Read, dst: &std::fs::File) -> std::io
     let (mut offset, mut written) = (0u64, 0u64);
     // Where the current zero run started (file offset), across chunks.
     let mut zeros: Option<u64> = None;
+    // Best effort: the range already reads as zeros either way. Linux filesystems leave skipped
+    // ranges as holes by themselves, and each punch is a journal transaction there, so only APFS.
     let punch = |start: u64, end: u64| {
-        // Best effort: the range already reads as zeros either way.
-        let _ = emu_hvf::host::punch_hole(dst, start, end - start);
+        if cfg!(target_os = "macos") {
+            let _ = emu_hvf::host::punch_hole(dst, start, end - start);
+        }
     };
     loop {
         let mut n = 0;
