@@ -455,6 +455,9 @@ pub fn write_sparse(mut src: impl std::io::Read, dst: &std::fs::File) -> std::io
                 Err(e) => return Err(e),
             }
         }
+        // Grow the file first, then write inside it: APFS zero-fills a gap that a write past the
+        // end leaves (ext4 leaves a hole), while space added by truncating is a hole on both.
+        dst.set_len(offset + n as u64)?;
         // Each run of non-zero blocks goes out in one write.
         let mut run: Option<usize> = None;
         for (i, block) in buf[..n].chunks(BLOCK).enumerate() {
@@ -478,6 +481,5 @@ pub fn write_sparse(mut src: impl std::io::Read, dst: &std::fs::File) -> std::io
             break;
         }
     }
-    dst.set_len(offset)?;
     Ok((offset, written))
 }
