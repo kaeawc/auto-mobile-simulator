@@ -250,7 +250,8 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   queued, and packets are written straight from the queue into the guest's descriptors
   (`Chain::write_parts`). Host→guest through one pipe with the guest posting Linux's 4 KiB
   receive buffers (`cargo test --release -p emu-vmm vsock_throughput -- --ignored`): median of 5,
-  284 → 512 MiB/s on a 4-core Linux VM.
+  284 → 512 MiB/s on a 4-core Linux VM. Guest→host (`vsock_throughput_to_host`, 64 KiB
+  packets) runs at about 4 GiB/s, so host→guest's limit is the guest's small receive buffers.
 
 ## Development
 

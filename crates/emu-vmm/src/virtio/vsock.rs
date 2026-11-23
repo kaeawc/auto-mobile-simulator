@@ -749,6 +749,102 @@ mod tests {
         println!("vsock host->guest: {} MiB in {:.3} s = {:.0} MiB/s", TOTAL >> 20, secs, (TOTAL >> 20) as f64 / secs);
     }
 
+    /// Guest → host throughput through one pipe, as `adb pull`/`exec-out` stream: the guest
+    /// sends 64 KiB packets (Linux's largest) into a sink.
+    ///     cargo test --release -p emu-vmm vsock_throughput_to_host -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn vsock_throughput_to_host() {
+        struct Count(Arc<std::sync::atomic::AtomicUsize>);
+        impl PipeHandler for Count {
+            fn guest_data(&mut self, data: &[u8], _to_guest: &mut Vec<u8>) -> bool {
+                self.0.fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            fn host_msg(&mut self, _msg: HostMsg, _to_guest: &mut Vec<u8>) -> bool {
+                true
+            }
+        }
+        struct Sink(Arc<std::sync::atomic::AtomicUsize>);
+        impl PipeService for Sink {
+            fn open(&self, name: &str, _ctx: PipeCtx) -> Option<Box<dyn PipeHandler>> {
+                (name == "sink").then(|| Box::new(Count(self.0.clone())) as Box<dyn PipeHandler>)
+            }
+        }
+        const TOTAL: usize = 256 << 20;
+        const PKT: usize = 64 * 1024;
+        let got = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x200_0000).expect("ram"));
+        let mut registry = PipeRegistry::default();
+        registry.register("sink", Box::new(Sink(got.clone())));
+        let (events, rx_events) = event_channel();
+        let mut dev = Vsock::new(GUEST_CID, Arc::new(registry), events, rx_events);
+        let size = 64u16;
+        let (mut rx, mut tx) = (Driver::at(RAM_BASE + 0x1000, size), Driver::at(RAM_BASE + 0x8000, size));
+        for i in 0..size {
+            rx.push(&mem, &[(RX_BUFS + u64::from(i) * u64::from(BUF), BUF, true)]);
+        }
+        let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+        dev.activate(Activation { mem: mem.clone(), irq, queues: vec![Some(rx.cfg), Some(tx.cfg), None], features: 0 }).expect("activate");
+        // Packets prebuilt in guest RAM, one slot per descriptor, reused as the ring wraps.
+        let slot = |i: u16| RAM_BASE + 0x40_0000 + u64::from(i) * (HDR + PKT) as u64;
+        let packet = |payload: &[u8], fwd: u32| {
+            let h = Hdr {
+                src_cid: GUEST_CID,
+                dst_cid: HOST_CID,
+                src_port: 1,
+                dst_port: PIPE_PORT,
+                len: payload.len() as u32,
+                typ: TYPE_STREAM,
+                op: OP_RW,
+                flags: 0,
+                buf_alloc: 256 * 1024,
+                fwd_cnt: fwd,
+            };
+            let mut p = h.encode().to_vec();
+            p.extend_from_slice(payload);
+            p
+        };
+        let mut req = packet(&[], 0);
+        req[30] = OP_REQUEST as u8;
+        mem.write(slot(0), &req).expect("req");
+        tx.push(&mem, &[(slot(0), HDR as u32, false)]);
+        let name = packet(b"pipe:sink\0", 0);
+        mem.write(slot(1), &name).expect("name");
+        tx.push(&mem, &[(slot(1), name.len() as u32, false)]);
+        dev.notify(TXQ as u16);
+        // The request and name must be read before their slots are reused.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tx.used_idx(&mem) < 2 {
+            assert!(Instant::now() < deadline, "the connection never opened");
+            std::thread::yield_now();
+        }
+        let data = packet(&vec![0xa5u8; PKT], 0);
+        for i in 0..size {
+            mem.write(slot(i), &data).expect("slot");
+        }
+        let start = Instant::now();
+        let mut sent = 0usize;
+        let mut pushed = 2u16;
+        while sent < TOTAL {
+            // Keep the ring full: as many packets in flight as the queue holds.
+            while pushed.wrapping_sub(tx.used_idx(&mem)) < size && sent < TOTAL {
+                tx.push(&mem, &[(slot(pushed % size), (HDR + PKT) as u32, false)]);
+                pushed = pushed.wrapping_add(1);
+                sent += PKT;
+            }
+            dev.notify(TXQ as u16);
+            std::thread::yield_now();
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while got.load(std::sync::atomic::Ordering::Relaxed) < TOTAL {
+            assert!(Instant::now() < deadline, "only {} bytes arrived", got.load(std::sync::atomic::Ordering::Relaxed));
+            std::thread::yield_now();
+        }
+        let secs = start.elapsed().as_secs_f64();
+        println!("vsock guest->host: {} MiB in {:.3} s = {:.0} MiB/s", TOTAL >> 20, secs, (TOTAL >> 20) as f64 / secs);
+    }
+
     #[test]
     fn a_guest_pipe_connects_names_its_service_and_echoes() {
         let mut g = guest();
