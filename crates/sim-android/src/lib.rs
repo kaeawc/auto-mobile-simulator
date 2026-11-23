@@ -331,7 +331,7 @@ impl Device {
 
     /// Plays touch samples (device pixels) over one display connection.
     pub fn play(&self, samples: &[Sample]) -> Result<(), String> {
-        let mut display = display::Display::connect(&self.touch_screen()?.dir)?;
+        let mut display = self.display(self.touch_screen()?)?;
         for s in samples {
             sleep(s.delay);
             display.send(&Input::Touch { x: s.point.x as f32, y: s.point.y as f32, phase: s.phase })?;
@@ -341,7 +341,7 @@ impl Device {
 
     /// One touch sample at device pixels.
     pub fn touch(&self, x: f64, y: f64, phase: Phase) -> Result<(), String> {
-        display::Display::connect(&self.touch_screen()?.dir)?.send(&Input::Touch { x: x as f32, y: y as f32, phase })
+        self.display(self.touch_screen()?)?.send(&Input::Touch { x: x as f32, y: y as f32, phase })
     }
 
     /// A touch on the touchpad beside the screen (`hw.touchpad0`: Android XR display glasses), in
@@ -375,6 +375,12 @@ impl Device {
         self.avd()?
             .touchpad()
             .ok_or_else(|| format!("{} has no touchpad (hw.touchpad0; Android XR display glasses have one)", self.info.name))
+    }
+
+    /// A connection to the running emulator's display socket (frames and input).
+    fn display(&self, avd: &Avd) -> Result<display::Display, String> {
+        self.running()?;
+        display::Display::connect(&avd.dir)
     }
 
     /// The AVD, if its screen takes touch (an SDK TV's says `hw.screen=no-touch`).
@@ -455,7 +461,7 @@ impl Device {
     /// scales to stock's 15 units per click (`sim_core::stream::wheel_units`). Watches only.
     pub fn rotary(&self, ticks: i32) -> Result<(), String> {
         self.require(InputMethod::Rotary, "rotary input")?;
-        display::Display::connect(&self.avd()?.dir)?.send(&Input::Wheel(ticks))
+        self.display(self.avd()?)?.send(&Input::Wheel(ticks))
     }
 
     /// An XR control (head pose, environment, input mode, pointer) through emu-rs's `xr` console
@@ -629,6 +635,8 @@ mod tests {
         f.android.create("watch", "system-images;android-34;android-wear;arm64-v8a", None).expect("watch");
         let d = f.android.device("watch").expect("watch");
         assert_eq!(d.rotate(), Err("watch isn't running; boot it first".into()));
+        assert_eq!(d.touch(1.0, 1.0, Phase::Down), Err("watch isn't running; boot it first".into()), "not a socket error");
+        assert_eq!(d.rotary(1), Err("watch isn't running; boot it first".into()));
         assert!(d.fold(90.0).expect_err("not a foldable").starts_with("folding needs a device with Hinge; watch is Wear OS · Watch"));
         assert!(d.button(Button::Siri, Direction::Down).expect_err("no Siri").contains("doesn't exist on Android"));
         f.android.delete(&d).expect("delete");

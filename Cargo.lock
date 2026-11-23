@@ -449,8 +449,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "emu-avd",
  "png",
  "serde_json",
+ "sim-android",
  "sim-api",
  "sim-core",
 ]
