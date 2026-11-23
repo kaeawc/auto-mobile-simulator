@@ -339,39 +339,55 @@ mod tests {
         assert_eq!(out, [3, 2, 1, 4, 7, 6, 5, 8], "unchanged on failure");
     }
 
-    /// The display stream's downscale on a tablet frame and a phone frame, old against new.
-    ///     cargo test --release -p sim-core downscale_cost -- --ignored --nocapture
-    #[test]
-    #[ignore = "benchmark"]
-    fn downscale_cost() {
-        for (w, h) in [(2480u32, 1740u32), (1080, 2400)] {
+    /// The display stream's downscale at each size and factor, old against new (one thread and
+    /// banded), the median of `runs`; one line each.
+    fn downscale_bench(sizes: &[(u32, u32)], factors: &[u32], runs: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        for &(w, h) in sizes {
             let rgba: Vec<u8> = (0..w * h * 4).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
-            for factor in [1, 2, 3] {
+            for &factor in factors {
                 let (ow, oh) = downscaled_size(w, h, factor);
                 let mut out = vec![0; ow as usize * oh as usize * 4];
                 let median = |f: &mut dyn FnMut()| {
-                    let mut runs: Vec<f64> = (0..9)
+                    let mut times: Vec<f64> = (0..runs)
                         .map(|_| {
                             let t = std::time::Instant::now();
                             f();
                             t.elapsed().as_secs_f64() * 1000.0
                         })
                         .collect();
-                    runs.sort_by(f64::total_cmp);
-                    runs[runs.len() / 2]
+                    times.sort_by(f64::total_cmp);
+                    times[times.len() / 2]
                 };
-                let old = median(&mut || {
-                    std::hint::black_box(if factor == 1 { rgba.clone() } else { naive_box(w, h, &rgba, factor) });
-                });
+                let mut old_out = Vec::new();
+                let old = median(&mut || old_out = if factor == 1 { rgba.clone() } else { naive_box(w, h, &rgba, factor) });
                 let one = median(&mut || {
                     downscale_banded(w, h, &rgba, factor, &mut out, 1);
                 });
                 let new = median(&mut || {
                     downscale_into(w, h, &rgba, factor, &mut out);
                 });
+                assert_eq!(old_out[..out.len()], out[..], "the same pixels");
                 let bands = bands_for(oh as usize * factor as usize * w as usize * 4);
-                println!("{w}x{h} /{factor}: old {old:.2} ms, new 1 thread {one:.2} ms, new {bands} bands {new:.2} ms");
+                lines.push(format!("{w}x{h} /{factor}: old {old:.2} ms, new 1 thread {one:.2} ms, new {bands} bands {new:.2} ms"));
             }
+        }
+        lines
+    }
+
+    #[test]
+    fn the_benchmark_runs_and_agrees_with_the_old_filter() {
+        let lines = downscale_bench(&[(24, 18)], &[1, 2, 3, 4], 1);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+    }
+
+    /// The display stream's downscale on a tablet frame and a phone frame, old against new.
+    ///     cargo test --release -p sim-core downscale_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn downscale_cost() {
+        for l in downscale_bench(&[(2480, 1740), (1080, 2400)], &[1, 2, 3], 9) {
+            println!("{l}");
         }
     }
 

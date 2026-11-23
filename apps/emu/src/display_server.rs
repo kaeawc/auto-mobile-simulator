@@ -236,9 +236,14 @@ fn shared_frame(display: &FrameStore, max_width: u32, frame: u64, ring: &mut Opt
     } else {
         ring.publish(&header, |dst| {
             // The capture may hold a newer frame than `frame` by now: it's at least as new.
-            ok = display
-                .latest(|cap| (cap.width, cap.height) == (width, height) && (downscale_into(width, height, &cap.rgba, factor, dst), true).1)
-                .unwrap_or(false);
+            let scaled = display.latest(|cap| {
+                let same = (cap.width, cap.height) == (width, height);
+                if same {
+                    downscale_into(width, height, &cap.rgba, factor, dst);
+                }
+                same
+            });
+            ok = scaled == Some(true);
         })
     };
     // A slot that wasn't filled is never announced; a client still reading an older frame there
@@ -336,7 +341,8 @@ fn remove_stale_rings(dir: &Path) {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    use emu_vmm::display::DisplaySink;
+    use emu_vmm::display::{DisplaySink, Readback};
+    use emu_vmm::virtio::input::{EV_KEY, EV_REL, InputEvent, Kind, REL_WHEEL};
     use sim_android::display::{Display, Frames, read_frame};
     use sim_core::pixels::downscale;
 
@@ -345,6 +351,16 @@ mod tests {
     /// A frame's pixels, distinct per frame number.
     fn pixels(w: u32, h: u32, frame: u64) -> Vec<u8> {
         (0..w * h * 4).map(|i| (u64::from(i).wrapping_mul(2_654_435_761) >> 7) as u8 ^ frame as u8).collect()
+    }
+
+    /// A short directory (a unix socket address is at most 104 bytes on macOS), in memory where
+    /// there's a tmpfs, so rings aren't timed against disk writeback.
+    fn scratch(tag: &str) -> PathBuf {
+        let root = ["/dev/shm", "/tmp"].into_iter().map(PathBuf::from).find(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir);
+        let dir = root.join(format!("emu-ds-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("emu-rs")).expect("dir");
+        dir
     }
 
     struct Rig {
@@ -358,23 +374,26 @@ mod tests {
     impl Rig {
         /// A display server over a store whose readback produces [`pixels`] for the latest frame.
         fn new(tag: &str) -> Rig {
-            // A short path (a unix socket address is at most 104 bytes on macOS), in memory where
-            // there's a tmpfs, so the ring isn't timed against disk writeback.
-            let root = ["/dev/shm", "/tmp"].into_iter().map(PathBuf::from).find(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir);
-            let dir = root.join(format!("emu-ds-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(dir.join("emu-rs")).expect("dir");
+            Rig::with(tag, None, None)
+        }
+
+        /// With these input devices, and this readback instead of [`pixels`].
+        fn with(tag: &str, inputs: Option<emu_vmm::Inputs>, readback: Option<Readback>) -> Rig {
+            let dir = scratch(tag);
             let store = Arc::new(FrameStore::default());
             let reads = Arc::new(AtomicUsize::new(0));
             let (counter, frames) = (reads.clone(), Arc::downgrade(&store));
-            store.set_readback(Box::new(move |w, h, buf| {
-                counter.fetch_add(1, Ordering::Relaxed);
-                let n = frames.upgrade().map_or(0, |s| s.frames());
-                buf.copy_from_slice(&pixels(w, h, n));
-                true
+            store.set_readback(readback.unwrap_or_else(|| {
+                Box::new(move |w, h, buf| {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    let n = frames.upgrade().map_or(0, |s| s.frames());
+                    buf.copy_from_slice(&pixels(w, h, n));
+                    true
+                })
             }));
             let stop = Arc::new(AtomicBool::new(false));
-            let server = start(&dir, store.clone(), Arc::new(Mutex::new(None)), stop.clone());
+            let server = start(&dir, store.clone(), Arc::new(Mutex::new(inputs)), stop.clone());
+            assert!(server.is_some(), "serving");
             Rig { dir, store, reads, stop, server }
         }
 
@@ -390,12 +409,9 @@ mod tests {
         }
 
         fn rings(&self) -> Vec<String> {
-            let mut names: Vec<String> = std::fs::read_dir(self.dir.join("emu-rs"))
-                .expect("dir")
-                .flatten()
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| n.ends_with(".ring"))
-                .collect();
+            let Ok(entries) = std::fs::read_dir(self.dir.join("emu-rs")) else { return Vec::new() };
+            let mut names: Vec<String> =
+                entries.flatten().filter_map(|e| e.file_name().into_string().ok()).filter(|n| n.ends_with(".ring")).collect();
             names.sort();
             names
         }
@@ -470,9 +486,65 @@ mod tests {
     }
 
     #[test]
-    fn input_only_connections_get_no_frames_and_stale_rings_go() {
-        let dir = PathBuf::from("/tmp").join(format!("emu-ds-stale-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("emu-rs")).expect("dir");
+    fn without_a_ring_shared_clients_get_frames_on_the_socket() {
+        let rig = Rig::new("noring");
+        let (_d, reader) = rig.connect(true, 4096);
+        let mut frames = Frames::new(reader);
+        std::thread::sleep(Duration::from_millis(50));
+        // Nowhere to make a ring: the stream says so and falls back to the socket.
+        std::fs::remove_dir_all(rig.dir.join("emu-rs")).expect("rm");
+        rig.store.posted(3, 2);
+        let (h, rgba) = frames.next_frame().expect("frame");
+        assert_eq!((h.width, h.height, h.frame, rgba), (3, 2, 1, pixels(3, 2, 1)));
+        assert!(rig.rings().is_empty());
+    }
+
+    #[test]
+    fn input_lines_reach_the_devices() {
+        let (touch, th) = emu_vmm::virtio::input::Input::new(Kind::Touch { width: 720, height: 1280 }, "touch");
+        let (keyboard, kh) = emu_vmm::virtio::input::Input::new(Kind::Keyboard, "keyboard");
+        let (rotary, rh) = emu_vmm::virtio::input::Input::new(Kind::Rotary, "rotary");
+        let inputs = emu_vmm::Inputs { screen: (720, 1280), touch: Some(th), keyboard: kh, rotary: rh, mouse: None, touchpad: None };
+        let rig = Rig::with("input", Some(inputs), None);
+        let mut d = Display::connect(&rig.dir).expect("connect");
+        for input in [
+            Input::Touch { x: 1.0, y: 2.0, phase: Phase::Up }, // no finger down: dropped
+            Input::Touch { x: 10.0, y: 20.0, phase: Phase::Down },
+            Input::Touch { x: 11.0, y: 21.0, phase: Phase::Move },
+            Input::Touch { x: 12.0, y: 22.0, phase: Phase::Up },
+            Input::Key("HOME".into()),
+            Input::Key("NOT_A_KEY".into()),
+            Input::Wheel(2),
+        ] {
+            d.send(&input).expect("send");
+        }
+        // Lines are handled in order: once the wheel is in, everything before it is too.
+        let start = Instant::now();
+        let wheel = loop {
+            let got = rotary.take_queued();
+            if !got.is_empty() {
+                break got;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "no wheel");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(wheel, [vec![InputEvent::new(EV_REL, REL_WHEEL, 30), InputEvent::syn()]], "2 clicks, 15 units each");
+        assert_eq!(touch.take_queued().len(), 3, "down, move, up; the stray up dropped");
+        let home = sim_core::goldfish::keycode("HOME").expect("HOME");
+        let keys: Vec<InputEvent> = keyboard.take_queued().into_iter().flatten().collect();
+        assert!(keys.iter().any(|e| e.typ == EV_KEY && e.code == home), "{keys:?}");
+        assert!(keys.iter().all(|e| e.typ != EV_KEY || e.code == home), "the unknown key sent nothing: {keys:?}");
+        // No frames without hello.
+        let mut r = d.try_clone().expect("clone");
+        r.set_read_timeout(Some(Duration::from_millis(100))).expect("timeout");
+        rig.store.posted(4, 4);
+        assert!(std::io::Read::read(&mut r, &mut [0u8; 1]).is_err());
+        assert_eq!(rig.reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn stale_rings_go() {
+        let dir = scratch("stale");
         // PIDs never reach this (Linux caps them at 2^22, macOS at 99999); our own ring stays.
         let mine = format!("frames-{}-0.ring", std::process::id());
         for name in ["frames-2147483646-0.ring", mine.as_str(), "frames-x-1.ring", "frames-2147483646-0.png"] {
@@ -484,17 +556,6 @@ mod tests {
         left.sort();
         assert_eq!(left, ["frames-2147483646-0.png", mine.as_str(), "frames-x-1.ring"]);
         std::fs::remove_dir_all(&dir).ok();
-
-        let rig = Rig::new("input");
-        let mut d = Display::connect(&rig.dir).expect("connect");
-        d.send(&Input::Key("HOME".into())).expect("key");
-        d.send(&Input::Touch { x: 1.0, y: 2.0, phase: Phase::Up }).expect("touch");
-        rig.store.posted(4, 4);
-        let mut r = d.try_clone().expect("clone");
-        r.set_read_timeout(Some(Duration::from_millis(200))).expect("timeout");
-        let mut buf = [0u8; 1];
-        assert!(std::io::Read::read(&mut r, &mut buf).is_err(), "no frames without hello");
-        assert_eq!(rig.reads.load(Ordering::Relaxed), 0);
     }
 
     fn median(mut v: Vec<f64>) -> f64 {
@@ -502,157 +563,147 @@ mod tests {
         v[v.len() / 2]
     }
 
-    /// Moving one frame's RGBA rows from the emulator to a client, on the socket (as before) and
-    /// through the ring: the emulator's time, the client's time, and both, per frame.
-    ///     cargo test --release -p emu transport_cost -- --ignored --nocapture
-    #[test]
-    #[ignore = "benchmark"]
-    fn transport_cost() {
-        // The ring on disk (macOS has no tmpfs; rings live in the AVD directory) and, where
-        // there is one, in memory.
-        let roots: Vec<PathBuf> = [std::env::temp_dir(), PathBuf::from("/dev/shm")].into_iter().filter(|d| d.is_dir()).collect();
+    fn ms(d: Duration) -> f64 {
+        d.as_secs_f64() * 1000.0
+    }
+
+    /// Moves `runs` frames of each size from this side to a client, on the socket (as before)
+    /// and through a ring in each of `roots`, `pause` apart; one line per root and size.
+    fn transport_bench(roots: &[PathBuf], sizes: &[(u32, u32)], runs: usize, pause: Duration) -> Vec<String> {
+        let mut lines = Vec::new();
         for root in roots {
             let dir = root.join(format!("emu-transport-{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("dir");
-            println!("ring in {}:", root.display());
-            for (w, h) in [(2480u32, 1740u32), (1080, 2400), (826, 580), (360, 800)] {
+            for &(w, h) in sizes {
                 let px = pixels(w, h, 1);
                 let header = FrameHeader::new(w, h, w, h, 1).expect("size");
-                let runs = 11;
                 // Socket: header and rows written, read into a fresh Vec.
-                let (mut tx, rx) = UnixStream::pair().expect("pair");
+                let (mut tx, mut rx) = UnixStream::pair().expect("pair");
                 let reader = std::thread::spawn(move || {
-                    let mut rx = rx;
-                    (0..runs)
-                        .map(|_| {
-                            let (h, v) = read_frame(&mut rx).expect("frame");
-                            (Instant::now(), h.len as usize == v.len())
-                        })
-                        .collect::<Vec<_>>()
+                    (0..runs).map(|_| (read_frame(&mut rx).expect("frame").1.len(), Instant::now())).collect::<Vec<_>>()
                 });
-                let mut send = Vec::new();
-                let mut starts = Vec::new();
+                let (mut write, mut starts) = (Vec::new(), Vec::new());
                 for _ in 0..runs {
-                    std::thread::sleep(Duration::from_millis(20));
+                    std::thread::sleep(pause);
                     let t = Instant::now();
                     starts.push(t);
                     tx.write_all(&header.encode()).and_then(|()| tx.write_all(&px)).expect("write");
-                    send.push(t.elapsed().as_secs_f64() * 1000.0);
+                    write.push(ms(t.elapsed()));
                 }
-                let done = reader.join().expect("reader");
-                let socket_total = median(
-                    done.iter()
-                        .zip(&starts)
-                        .map(|((d, ok), s)| {
-                            assert!(ok);
-                            d.duration_since(*s).as_secs_f64() * 1000.0
-                        })
-                        .collect(),
-                );
-                // Ring: rows copied into a slot (a factor-1 frame; downscaled frames are written there
-                // by the downscale itself), a 32-byte notice, the client's pread.
+                let got = reader.join().expect("reader");
+                assert!(got.iter().all(|(n, _)| *n == px.len()));
+                let socket = median(got.iter().zip(&starts).map(|((_, d), s)| ms(d.duration_since(*s))).collect());
+                // Ring: rows copied into a slot (what a full-size readback writes there; a
+                // downscale writes its output there), a 32-byte notice, the client's pread.
                 let mut ring = Ring::create(&dir, u64::from(header.len)).expect("ring");
                 let (mut tx, rx) = UnixStream::pair().expect("pair");
                 let path = ring.path.as_os_str().as_encoded_bytes().to_vec();
-                let mut announce = Record::Ring { path_len: path.len() as u32 }.encode().to_vec();
-                announce.extend(&path);
-                tx.write_all(&announce).expect("announce");
+                tx.write_all(&[Record::Ring { path_len: path.len() as u32 }.encode().as_slice(), &path].concat()).expect("announce");
                 let reader = std::thread::spawn(move || {
                     let mut frames = Frames::new(rx);
-                    (0..runs)
-                        .map(|_| {
-                            let t = Instant::now();
-                            let (h, v) = frames.next_frame().expect("frame");
-                            (Instant::now(), t, h.len as usize == v.len())
-                        })
-                        .collect::<Vec<_>>()
+                    (0..runs).map(|_| (frames.next_frame().expect("frame").1.len(), Instant::now())).collect::<Vec<_>>()
                 });
                 let (mut publish, mut starts) = (Vec::new(), Vec::new());
                 for n in 0..runs {
-                    std::thread::sleep(Duration::from_millis(20));
+                    std::thread::sleep(pause);
                     let t = Instant::now();
                     starts.push(t);
                     let header = FrameHeader { frame: n as u64 + 1, ..header };
                     let slot = ring.publish(&header, |dst| dst.copy_from_slice(&px));
                     tx.write_all(&Record::Shared { header, slot }.encode()).expect("notice");
-                    publish.push(t.elapsed().as_secs_f64() * 1000.0);
+                    publish.push(ms(t.elapsed()));
                 }
-                let done = reader.join().expect("reader");
-                let ring_total = median(
-                    done.iter()
-                        .zip(&starts)
-                        .map(|((d, _, ok), s)| {
-                            assert!(ok);
-                            d.duration_since(*s).as_secs_f64() * 1000.0
-                        })
-                        .collect(),
-                );
-                let client = median(
-                    done.iter()
-                        .map(|(d, _, _)| *d)
-                        .zip(starts.iter())
-                        .map(|(d, s)| d.duration_since(*s).as_secs_f64() * 1000.0)
-                        .collect::<Vec<_>>(),
-                ) - median(publish.clone());
-                println!(
-                    "{w}x{h} ({:.1} MB): socket write {:.2} ms, write->read {socket_total:.2} ms | ring publish+notice {:.2} ms, ->client has it {ring_total:.2} ms (client ~{client:.2} ms)",
+                let got = reader.join().expect("reader");
+                assert!(got.iter().all(|(n, _)| *n == px.len()));
+                let ring_total = median(got.iter().zip(&starts).map(|((_, d), s)| ms(d.duration_since(*s))).collect());
+                lines.push(format!(
+                    "ring in {}: {w}x{h} ({:.1} MB): socket write {:.2} ms, write->read {socket:.2} ms | ring copy+notice {:.2} ms, ->client has it {ring_total:.2} ms",
+                    root.display(),
                     f64::from(header.len) / 1e6,
-                    median(send),
+                    median(write),
                     median(publish),
-                );
+                ));
             }
             std::fs::remove_dir_all(dir).ok();
         }
+        lines
     }
 
-    /// Post to client-has-the-pixels, through the display server, for the desktop's request
-    /// (`hello 1080`) and a full-size one, on the socket and through the ring. The readback is a
-    /// memcpy of the frame (the last step of the renderer's own; its GPU copy isn't modelled).
+    /// Post to client-has-the-pixels through the display server, `runs` frames `pause` apart, for
+    /// each (frame width, frame height, max width, shared) case. The readback is a memcpy of the
+    /// frame (the last step of the renderer's own; its GPU copy isn't modelled). One line each,
+    /// with every sample when `samples`.
+    fn latency_bench(cases: &[(u32, u32, u32, bool)], runs: usize, pause: Duration, samples: bool) -> Vec<String> {
+        let mut lines = Vec::new();
+        for &(w, h, max_width, shared) in cases {
+            let src = pixels(w, h, 0);
+            let rig = Rig::with(
+                &format!("lat{w}{max_width}{shared}"),
+                None,
+                Some(Box::new(move |_, _, buf| {
+                    buf.copy_from_slice(&src);
+                    true
+                })),
+            );
+            let (_d, reader) = rig.connect(shared, max_width);
+            let mut frames = Frames::new(reader);
+            std::thread::sleep(Duration::from_millis(50));
+            let mut lat = Vec::new();
+            for _ in 0..runs {
+                std::thread::sleep(pause);
+                let t = Instant::now();
+                rig.store.posted(w, h);
+                std::hint::black_box(frames.next_frame().expect("frame"));
+                lat.push(ms(t.elapsed()));
+            }
+            let all = if samples { format!(" {lat:.1?}") } else { String::new() };
+            let way = if shared { "ring  " } else { "socket" };
+            lines.push(format!("{w}x{h} hello {max_width} {way}: post -> client has pixels {:.2} ms (median of {runs}){all}", median(lat)));
+        }
+        lines
+    }
+
+    #[test]
+    fn the_benchmarks_run() {
+        let lines = transport_bench(&[scratch("bench")], &[(8, 4)], 3, Duration::ZERO);
+        assert!(lines.len() == 1 && lines[0].contains("8x4"), "{lines:?}");
+        let lines = latency_bench(&[(16, 8, 8, true), (16, 8, 8, false)], 3, MIN_INTERVAL, true);
+        assert!(lines.len() == 2 && lines.iter().all(|l| l.contains("median of 3")), "{lines:?}");
+    }
+
+    /// Moving one frame's RGBA rows from the emulator to a client, on the socket and through the
+    /// ring, on disk and (where there's one) on a tmpfs.
+    ///     cargo test --release -p emu transport_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn transport_cost() {
+        let roots: Vec<PathBuf> = [std::env::temp_dir(), PathBuf::from("/dev/shm")].into_iter().filter(|d| d.is_dir()).collect();
+        for l in transport_bench(&roots, &[(2480, 1740), (1080, 2400), (826, 580), (360, 800)], 11, Duration::from_millis(20)) {
+            println!("{l}");
+        }
+    }
+
+    /// Post to client-has-the-pixels for the desktop's request (`hello 1080`) and a full-size
+    /// one, on the socket and through the ring. `CASE=<w>,<max_width>,<shared>` runs one case
+    /// alone (a long run of many rigs drifts); `SAMPLES=1` prints every sample (each ring's first
+    /// three frames include its slots' first page faults).
     ///     cargo test --release -p emu frame_path_latency -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn frame_path_latency() {
+        let case = std::env::var("CASE").ok();
+        let mut cases = Vec::new();
         for (w, h) in [(2480u32, 1740u32), (1080, 2400)] {
             for max_width in [1080, 4096] {
                 for shared in [false, true] {
-                    let rig = Rig::new(&format!("lat{w}{max_width}{shared}"));
-                    let src = Arc::new(pixels(w, h, 0));
-                    let store = Arc::new(FrameStore::default());
-                    let s = src.clone();
-                    store.set_readback(Box::new(move |_, _, buf| {
-                        buf.copy_from_slice(&s);
-                        true
-                    }));
-                    let server = start(&rig.dir.join("x"), store.clone(), Arc::new(Mutex::new(None)), rig.stop.clone());
-                    assert!(server.is_none(), "no such dir");
-                    std::fs::create_dir_all(rig.dir.join("y/emu-rs")).expect("dir");
-                    let _server = start(&rig.dir.join("y"), store.clone(), Arc::new(Mutex::new(None)), rig.stop.clone()).expect("server");
-                    let mut d = Display::connect(&rig.dir.join("y")).expect("connect");
-                    if shared {
-                        d.request_shared().expect("shm");
+                    if case.as_ref().is_none_or(|c| *c == format!("{w},{max_width},{shared}")) {
+                        cases.push((w, h, max_width, shared));
                     }
-                    d.send(&Input::Hello { max_width }).expect("hello");
-                    let mut frames = Frames::new(d.try_clone().expect("clone"));
-                    std::thread::sleep(Duration::from_millis(50));
-                    let mut lat = Vec::new();
-                    for _ in 0..11 {
-                        std::thread::sleep(Duration::from_millis(40));
-                        let t = Instant::now();
-                        store.posted(w, h);
-                        let (_, rgba) = frames.next_frame().expect("frame");
-                        std::hint::black_box(rgba);
-                        lat.push(t.elapsed().as_secs_f64() * 1000.0);
-                    }
-                    if std::env::var_os("SAMPLES").is_some() {
-                        println!("{lat:.1?}");
-                    }
-                    println!(
-                        "{w}x{h} hello {max_width} {}: post -> client has pixels {:.2} ms (median of 11)",
-                        if shared { "ring  " } else { "socket" },
-                        median(lat)
-                    );
                 }
             }
+        }
+        for l in latency_bench(&cases, 11, Duration::from_millis(40), std::env::var_os("SAMPLES").is_some()) {
+            println!("{l}");
         }
     }
 }

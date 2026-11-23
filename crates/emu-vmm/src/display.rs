@@ -155,7 +155,14 @@ impl FrameStore {
         if self.readback.get().is_some_and(|r| r(width, height, dst)) {
             return true;
         }
-        self.latest(|c| (c.width, c.height) == (width, height) && (dst.copy_from_slice(&c.rgba), true).1).unwrap_or(false)
+        let copied = self.latest(|c| {
+            let same = (c.width, c.height) == (width, height);
+            if same {
+                dst.copy_from_slice(&c.rgba);
+            }
+            same
+        });
+        copied == Some(true)
     }
 
     /// The presented pixels of a `width` x `height` frame, as RGBA.
@@ -202,17 +209,17 @@ impl DisplaySink for FrameStore {
         });
     }
 
-    /// Straight into the kept buffer, overwriting the previous frame in place. A failed fill
-    /// leaves no pixels rather than a partly written frame (the frame count stays).
+    /// Straight into the kept buffer, reused in place. The fill (a renderer readback) runs with
+    /// the store unlocked: the renderer may take its FrameBuffer lock, which a render thread holds
+    /// while it posts here. Meanwhile the store has no pixels, and a failed fill leaves none rather
+    /// than a partly written frame (the frame count stays).
     fn present_with(&self, width: u32, height: u32, stride: u32, format: u32, fill: &mut dyn FnMut(&mut [u8]) -> bool) {
-        let len = stride as usize * height as usize;
+        let mut buf = std::mem::take(&mut lock(&self.inner).pixels);
+        buf.resize(stride as usize * height as usize, 0);
+        let filled = fill(&mut buf);
         self.update(width, height, stride, format, |kept| {
-            kept.resize(len, 0);
-            if fill(kept) {
-                return true;
-            }
-            kept.clear();
-            false
+            *kept = if filled { buf } else { Vec::new() };
+            filled
         });
     }
 
@@ -251,33 +258,49 @@ mod tests {
         assert_eq!(store.wait_newer(0, Duration::ZERO), 1, "already newer: no wait");
     }
 
-    /// A frame posted bottom-up, as host composition posts them (2480x1740 BGRA).
+    /// A frame posted bottom-up, as host composition posts them (BGRA), `n` times at each size:
+    /// flipped and copied (the first version), copied row by row (the last), and posted (size
+    /// only, now). One line per size.
+    fn present_bench(sizes: &[(u32, u32)], n: u32) -> Vec<String> {
+        let mut lines = Vec::new();
+        for &(w, h) in sizes {
+            let px: Vec<u8> = (0..w * h * 4).map(|i| i as u8).collect();
+            let store = FrameStore::default();
+            let time = |f: &mut dyn FnMut()| {
+                let t = std::time::Instant::now();
+                for _ in 0..n {
+                    f();
+                }
+                t.elapsed().as_secs_f64() * 1000.0 / f64::from(n)
+            };
+            let row = w as usize * 4;
+            let old = time(&mut || {
+                let flipped: Vec<u8> = px.chunks(row).rev().flatten().copied().collect();
+                store.present(w, h, w * 4, 1, &flipped);
+            });
+            let copied = time(&mut || store.present_bottom_up(w, h, 1, &px));
+            let posted = time(&mut || store.posted(w, h));
+            assert_eq!(store.frames(), 3 * u64::from(n));
+            lines.push(format!(
+                "{w}x{h} frame into the store: {old:.2} ms (flip, then copy) -> {copied:.2} ms (copy) -> {posted:.4} ms (posted: size only)"
+            ));
+        }
+        lines
+    }
+
+    #[test]
+    fn the_benchmark_runs() {
+        assert_eq!(present_bench(&[(4, 3)], 2).len(), 1);
+    }
+
+    /// Posts at a tablet's and a phone's size.
     ///     cargo test --release -p emu-vmm present_cost -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn present_cost() {
-        let (w, h) = (2480u32, 1740u32);
-        let px: Vec<u8> = (0..w * h * 4).map(|i| i as u8).collect();
-        let store = FrameStore::default();
-        let n = 30;
-        let old = std::time::Instant::now();
-        for _ in 0..n {
-            let row = w as usize * 4;
-            let flipped: Vec<u8> = px.chunks(row).rev().flatten().copied().collect();
-            store.present(w, h, w * 4, 1, &flipped);
+        for l in present_bench(&[(2480, 1740), (1080, 2400)], 30) {
+            println!("{l}");
         }
-        let old = old.elapsed().as_secs_f64() * 1000.0 / f64::from(n);
-        let copied = std::time::Instant::now();
-        for _ in 0..n {
-            store.present_bottom_up(w, h, 1, &px);
-        }
-        let copied = copied.elapsed().as_secs_f64() * 1000.0 / f64::from(n);
-        let posted = std::time::Instant::now();
-        for _ in 0..n {
-            store.posted(w, h);
-        }
-        let posted = posted.elapsed().as_secs_f64() * 1000.0 / f64::from(n);
-        println!("frame into the store: {old:.2} ms (flip, then copy) -> {copied:.2} ms (copy) -> {posted:.4} ms (posted: size only)");
     }
 
     #[test]
@@ -335,6 +358,14 @@ mod tests {
         });
         assert_eq!((store.frames(), store.snapshot().pixels.len()), (1, 0), "no new frame, and no half-written pixels");
         assert_eq!(store.latest(|c| c.rgba[0]), Some(3), "the frame captured before stays");
+        // The fill runs with the store unlocked: a renderer readback may wait on a render thread
+        // that is posting here (this would deadlock on the store's own lock otherwise).
+        store.present_with(1, 1, 4, 67, &mut |b| {
+            store.posted(1, 1);
+            b.copy_from_slice(&[5, 6, 7, 8]);
+            store.geometry().2 == 2
+        });
+        assert_eq!((store.frames(), store.snapshot().pixels), (3, vec![5, 6, 7, 8]));
     }
 
     #[test]

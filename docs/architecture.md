@@ -23,6 +23,7 @@ including where the two projects it grew from (sim-rs and emu-rs) disagreed.
  sim-rs serve┘   └─ JSON lines socket  └─ emu (one process per Android device)
                                               ├─ console port (stock text protocol)
                                               ├─ <avd>/emu-rs/display.sock (sim_core::stream)
+                                              │    └─ frames-<pid>-<n>.ring (shared frame ring)
                                               └─ adb bridge (console port + 1)
 ```
 

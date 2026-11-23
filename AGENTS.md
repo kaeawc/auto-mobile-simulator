@@ -31,7 +31,7 @@ for both is to match the stock tools exactly and then exceed them.
 - Android: measure before optimizing. `emu -verbose` prints per-vCPU exit counts; `sample <pid> 5`
   shows host time per thread. Record results that change a design decision in docs/android.md.
 - Android: never modify the stock emulator's files in an AVD directory; emu-rs state lives in
-  `<avd>/emu-rs/` (console.log, emu.log, display.sock).
+  `<avd>/emu-rs/` (console.log, emu.log, display.sock, `frames-<pid>-<n>.ring` frame rings).
 - Android: one emulator process per device (Hypervisor.framework allows one VM per process). Start
   guests with a recorded PID and stop them with `kill -INT <pid>`, `adb -s emulator-<port> emu kill`
   or `sim-rs shutdown <avd>`; don't kill by name (other emulators may be running).
@@ -113,7 +113,8 @@ scripts/automobile-harness-android.sh emulator-5554
 - `crates/sim-android` — the Android backend's client: AVDs as labelled devices, system images as
   runtimes, AVD creation shaped by form factor, starting `emu` and waiting for boot, the console
   client (`console.rs`) and the display socket client (`display.rs`). No FFI.
-- `crates/emu-hvf` — `Vm` (GIC, RAM mapping, SPIs), `Vcpu` (run/regs/vtimer), `GuestRam`. `GuestRam` and
+- `crates/emu-hvf` — `Vm` (GIC, RAM mapping, SPIs), `Vcpu` (run/regs/vtimer), `GuestRam`,
+  `SharedMap` (a file mapped shared: the display server's frame ring). `GuestRam`, `SharedMap` and
   `host` (hole punching) build on any unix host; the hypervisor (`hv.rs`) is Apple silicon only.
 - `crates/emu-vmm` — `machine.rs` (`run`), `layout.rs`, `board.rs` (DT), `vcpu.rs` (exits, PSCI,
   wakers), `bus.rs`, `devices/` (PL011, PL031, goldfish), `virtio/` (mmio transport, queue, blk,
@@ -139,7 +140,8 @@ scripts/automobile-harness-android.sh emulator-5554
 - `apps/emu` — the Android emulator binary, a drop-in for the SDK's `emulator`: `args.rs` (SDK
   flags), `instance.rs` (disks, bootconfig, boot props), `console.rs` (console server,
   running-instance file; its commands build and test on any host), `display_server.rs` (frames
-  and input on `display.sock`),
+  and input on `display.sock`, frames through a shared ring for clients that ask; builds and
+  tests on any host),
   `provision.rs` (`-provision`, `-list-images`). Boots only on Apple silicon; elsewhere it lists,
   creates and provisions AVDs.
 - `desktop/` — Rune app, one window for both platforms: `device.rs` (the live iOS device facade; a
