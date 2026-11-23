@@ -58,6 +58,9 @@ pub struct FrameStore {
     readback: OnceLock<Readback>,
     /// The last frame read back or converted, shared by every reader.
     capture: Mutex<Capture>,
+    /// The buffer the next guest-composed frame is read into while the last one stays
+    /// readable (double buffering for [`DisplaySink::present_with`]).
+    spare: Mutex<Vec<u8>>,
 }
 
 #[derive(Default, Clone)]
@@ -70,6 +73,9 @@ pub struct FrameState {
     /// The presented frame's pixels; empty for a posted frame, whose pixels the renderer keeps.
     pub pixels: Vec<u8>,
     pub frames: u64,
+    /// The latest frame was posted to the renderer (its pixels come from the [`Readback`]), not
+    /// presented as pixels.
+    pub posted: bool,
 }
 
 /// The latest frame as tightly packed RGBA, top row first.
@@ -115,17 +121,23 @@ impl FrameStore {
     /// runs; the guest's posts never wait. `None` before the first frame, or when the frame can't
     /// be read.
     pub fn latest<R>(&self, f: impl FnOnce(&Capture) -> R) -> Option<R> {
-        let (width, height, frame) = self.geometry();
+        let (width, height, frame, posted) = self.state();
         if frame == 0 || width == 0 || height == 0 {
             return None;
         }
         let mut cap = lock(&self.capture);
         if (cap.frame, cap.width, cap.height) != (frame, width, height) {
             let len = width as usize * height as usize * 4;
-            let read = self.readback.get().is_some_and(|r| {
-                cap.rgba.resize(len, 0);
-                r(width, height, &mut cap.rgba)
-            }) || self.presented_rgba(width, height, &mut cap.rgba);
+            // A posted frame is the renderer's; a presented one is only in the store (the renderer
+            // would answer with whatever it posted last, maybe before a guest reboot).
+            let read = if posted {
+                self.readback.get().is_some_and(|r| {
+                    cap.rgba.resize(len, 0);
+                    r(width, height, &mut cap.rgba)
+                })
+            } else {
+                self.presented_rgba(width, height, &mut cap.rgba)
+            };
             if !read {
                 cap.frame = 0;
                 return None;
@@ -152,8 +164,9 @@ impl FrameStore {
                 return true;
             }
         }
-        if self.readback.get().is_some_and(|r| r(width, height, dst)) {
-            return true;
+        let (_, _, _, posted) = self.state();
+        if posted {
+            return self.readback.get().is_some_and(|r| r(width, height, dst));
         }
         let copied = self.latest(|c| {
             let same = (c.width, c.height) == (width, height);
@@ -163,6 +176,11 @@ impl FrameStore {
             same
         });
         copied == Some(true)
+    }
+
+    fn state(&self) -> (u32, u32, u64, bool) {
+        let s = lock(&self.inner);
+        (s.width, s.height, s.frames, s.posted)
     }
 
     /// The presented pixels of a `width` x `height` frame, as RGBA.
@@ -175,12 +193,12 @@ impl FrameStore {
         to_rgba_into(&s.pixels, width as usize, height as usize, s.stride as usize, format, out)
     }
 
-    fn update(&self, width: u32, height: u32, stride: u32, format: u32, fill: impl FnOnce(&mut Vec<u8>) -> bool) {
+    fn update(&self, width: u32, height: u32, stride: u32, format: u32, posted: bool, fill: impl FnOnce(&mut Vec<u8>) -> bool) {
         let mut s = lock(&self.inner);
         if !fill(&mut s.pixels) {
             return;
         }
-        (s.width, s.height, s.stride, s.format) = (width, height, stride, format);
+        (s.width, s.height, s.stride, s.format, s.posted) = (width, height, stride, format, posted);
         s.frames += 1;
         self.posted.notify_all();
     }
@@ -188,7 +206,7 @@ impl FrameStore {
 
 impl DisplaySink for FrameStore {
     fn present(&self, width: u32, height: u32, stride: u32, format: u32, pixels: &[u8]) {
-        self.update(width, height, stride, format, |kept| {
+        self.update(width, height, stride, format, false, |kept| {
             kept.clear();
             kept.extend_from_slice(pixels);
             true
@@ -198,7 +216,7 @@ impl DisplaySink for FrameStore {
     /// Row by row, reversed, straight into the kept buffer: one copy, each row a `memcpy`.
     fn present_bottom_up(&self, width: u32, height: u32, format: u32, pixels: &[u8]) {
         let row = width as usize * 4;
-        self.update(width, height, width * 4, format, |kept| {
+        self.update(width, height, width * 4, format, false, |kept| {
             kept.clear();
             if row > 0 {
                 for r in pixels.chunks_exact(row).rev() {
@@ -209,22 +227,24 @@ impl DisplaySink for FrameStore {
         });
     }
 
-    /// Straight into the kept buffer, reused in place. The fill (a renderer readback) runs with
-    /// the store unlocked: the renderer may take its FrameBuffer lock, which a render thread holds
-    /// while it posts here. Meanwhile the store has no pixels, and a failed fill leaves none rather
-    /// than a partly written frame (the frame count stays).
+    /// Into a spare buffer that then trades places with the kept one: one copy, and the last
+    /// frame stays readable meanwhile. The fill (a renderer readback) runs with the store
+    /// unlocked: the renderer may take its FrameBuffer lock, which a render thread holds while it
+    /// posts here. A failed fill presents nothing.
     fn present_with(&self, width: u32, height: u32, stride: u32, format: u32, fill: &mut dyn FnMut(&mut [u8]) -> bool) {
-        let mut buf = std::mem::take(&mut lock(&self.inner).pixels);
-        buf.resize(stride as usize * height as usize, 0);
-        let filled = fill(&mut buf);
-        self.update(width, height, stride, format, |kept| {
-            *kept = if filled { buf } else { Vec::new() };
-            filled
+        let mut spare = lock(&self.spare);
+        spare.resize(stride as usize * height as usize, 0);
+        if !fill(&mut spare) {
+            return;
+        }
+        self.update(width, height, stride, format, false, |kept| {
+            std::mem::swap(kept, &mut spare);
+            true
         });
     }
 
     fn posted(&self, width: u32, height: u32) {
-        self.update(width, height, width * 4, PixelFormat::RGBA_VIRTIO, |kept| {
+        self.update(width, height, width * 4, PixelFormat::RGBA_VIRTIO, true, |kept| {
             kept.clear();
             true
         });
@@ -340,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn presents_straight_into_the_store_and_never_serves_a_failed_fill() {
+    fn presents_through_a_spare_buffer_and_keeps_the_last_frame_on_failure() {
         let store = FrameStore::default();
         store.present_with(1, 2, 8, 2, &mut |b| {
             assert_eq!(b.len(), 16, "stride x height");
@@ -356,8 +376,9 @@ mod tests {
             b.fill(9);
             false
         });
-        assert_eq!((store.frames(), store.snapshot().pixels.len()), (1, 0), "no new frame, and no half-written pixels");
-        assert_eq!(store.latest(|c| c.rgba[0]), Some(3), "the frame captured before stays");
+        let f = store.snapshot();
+        assert_eq!((f.frames, f.pixels), (1, vec![1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 7, 8, 0, 0, 0, 0]), "the last frame, untouched");
+        assert_eq!(store.latest(|c| c.rgba[0]), Some(3));
         // The fill runs with the store unlocked: a renderer readback may wait on a render thread
         // that is posting here (this would deadlock on the store's own lock otherwise).
         store.present_with(1, 1, 4, 67, &mut |b| {
@@ -365,7 +386,33 @@ mod tests {
             b.copy_from_slice(&[5, 6, 7, 8]);
             store.geometry().2 == 2
         });
-        assert_eq!((store.frames(), store.snapshot().pixels), (3, vec![5, 6, 7, 8]));
+        let f = store.snapshot();
+        assert_eq!((f.frames, f.pixels, f.posted), (3, vec![5, 6, 7, 8], false));
+        // The frame being filled doesn't hide the last one from readers.
+        store.present_with(1, 1, 4, 67, &mut |b| {
+            assert_eq!(store.latest(|c| c.rgba.clone()), Some(vec![5, 6, 7, 8]));
+            b.fill(1);
+            true
+        });
+        assert_eq!(store.latest(|c| c.rgba.clone()), Some(vec![1; 4]));
+    }
+
+    #[test]
+    fn presented_frames_never_come_from_the_renderer() {
+        // After a guest reboot, or with guest composition, the renderer still holds an old post.
+        let store = FrameStore::default();
+        store.set_readback(Box::new(|_, _, buf| {
+            buf.fill(0xEE);
+            true
+        }));
+        store.present(1, 1, 4, 67, &[1, 2, 3, 4]);
+        assert_eq!(store.latest(|c| c.rgba.clone()), Some(vec![1, 2, 3, 4]));
+        let mut dst = [0; 4];
+        store.present(1, 1, 4, 67, &[5, 6, 7, 8]);
+        assert!(store.read_into(1, 1, 2, &mut dst));
+        assert_eq!(dst, [5, 6, 7, 8]);
+        store.posted(1, 1);
+        assert_eq!(store.latest(|c| c.rgba.clone()), Some(vec![0xEE; 4]), "posted: the renderer's");
     }
 
     #[test]

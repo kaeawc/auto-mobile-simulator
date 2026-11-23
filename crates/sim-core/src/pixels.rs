@@ -250,6 +250,21 @@ impl Reciprocal {
     }
 }
 
+/// Whether two readbacks of this RGBA frame agreeing proves they share a layout: some pixel's
+/// first and third bytes differ (so a red/blue swap would show) and some row differs from its
+/// mirror row (so a vertical flip would). A black boot screen proves nothing.
+pub fn reveals_layout(rgba: &[u8], width: u32, height: u32) -> bool {
+    let row = width as usize * 4;
+    let Some(px) = rgba.get(..row * height as usize) else { return false };
+    if row == 0 {
+        return false;
+    }
+    let swaps = px.as_chunks::<4>().0.iter().any(|p| p[0] != p[2]);
+    let rows: Vec<&[u8]> = px.chunks_exact(row).collect();
+    let flips = rows.iter().zip(rows.iter().rev()).any(|(a, b)| a != b);
+    swaps && flips
+}
+
 /// The smallest whole factor that brings `width` down to at most `max_width` (at least 1).
 pub fn downscale_factor(width: u32, max_width: u32) -> u32 {
     width.div_ceil(max_width.max(1)).max(1)
@@ -454,6 +469,20 @@ mod tests {
             assert_eq!(to_rgba(&px, 1, 1, 4, format), Some(rgba.to_vec()), "format {code}");
         }
         assert_eq!(PixelFormat::from_virtio_gpu(999), None);
+    }
+
+    #[test]
+    fn only_asymmetric_colorful_frames_reveal_a_layout() {
+        let black = [0, 0, 0, 255].repeat(4);
+        assert!(!reveals_layout(&black, 2, 2), "uniform");
+        let grey_rows = [[9, 9, 9, 255].repeat(2), [1, 1, 1, 255].repeat(2)].concat();
+        assert!(!reveals_layout(&grey_rows, 2, 2), "no red/blue difference");
+        let symmetric = [[255, 0, 0, 255].repeat(2), [255, 0, 0, 255].repeat(2)].concat();
+        assert!(!reveals_layout(&symmetric, 2, 2), "rows mirror each other");
+        let telling = [[255, 0, 0, 255].repeat(2), [0, 0, 255, 255].repeat(2)].concat();
+        assert!(reveals_layout(&telling, 2, 2));
+        assert!(!reveals_layout(&telling[..4], 2, 2), "short");
+        assert!(!reveals_layout(&[], 0, 0));
     }
 
     #[test]

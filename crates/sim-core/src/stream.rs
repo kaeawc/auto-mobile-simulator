@@ -5,6 +5,7 @@
 //! Client → server, one text line each ([`Input`]):
 //! - `hello <max_width>`: start streaming, downscaled by a whole factor to at most that width;
 //! - `shm`: send frames through a shared-memory ring instead of the socket (see below);
+//! - `socket`: send frames on the socket again (a client that couldn't open the ring);
 //! - `touch <x> <y> down|move|up` in device pixels;
 //! - `key <name>`: press and release a key by its console name (`HOME`, `BACK`, `POWER`, `A`, ...);
 //! - `wheel <ticks>` on the rotary / scroll device.
@@ -290,6 +291,8 @@ pub enum Input {
     },
     /// Frames through the shared ring ([`ring`]) rather than the socket.
     Shared,
+    /// Frames on the socket (after [`Input::Shared`], when the client can't open the ring).
+    Socket,
     Touch {
         x: f32,
         y: f32,
@@ -305,6 +308,7 @@ impl Input {
         match self {
             Self::Hello { max_width } => format!("hello {max_width}"),
             Self::Shared => "shm".into(),
+            Self::Socket => "socket".into(),
             Self::Touch { x, y, phase } => {
                 let phase = match phase {
                     Phase::Down => "down",
@@ -324,6 +328,7 @@ impl Input {
         Some(match w.as_slice() {
             ["hello", mw] => Self::Hello { max_width: mw.parse().unwrap_or(0) },
             ["shm"] => Self::Shared,
+            ["socket"] => Self::Socket,
             ["touch", x, y, phase] => Self::Touch {
                 x: x.parse().ok()?,
                 y: y.parse().ok()?,
@@ -422,6 +427,7 @@ mod tests {
         let inputs = [
             Input::Hello { max_width: 720 },
             Input::Shared,
+            Input::Socket,
             Input::Touch { x: 10.0, y: 20.0, phase: Phase::Down },
             Input::Touch { x: 11.0, y: 21.0, phase: Phase::Move },
             Input::Touch { x: 12.0, y: 22.0, phase: Phase::Up },

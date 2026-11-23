@@ -263,8 +263,8 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   copies, the stand-in readback (a memcpy of the frame) and the client's copy into the buffer it
   hands to `Pixels` (its `pread` costs what a socket read did). What the ring removes is the
   emulator's work: no payload writes, and frames are scaled (or read back) straight into shared
-  memory. A ring's first frame in each of its 3 slots also pays for that slot's first page faults
-  (20–30 ms here, once per ring). Frames scale on one thread below 16 MiB of input and in up to 4
+  memory. A new ring is written out in full when it's made (so a full disk is an error rather than a
+  `SIGBUS`), which costs its first frames 20–60 ms here, once per ring. Frames scale on one thread below 16 MiB of input and in up to 4
   bands above: two threads were slower than one on this VM (likely SMT siblings), four faster.
   Rings live in `<avd>/emu-rs/`, a disk-backed file on macOS whose dirty pages the system writes
   back periodically (benchmark rigs on Linux use `/dev/shm`). The direct Vulkan readback is checked

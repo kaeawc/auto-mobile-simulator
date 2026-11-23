@@ -771,8 +771,9 @@ impl Renderer {
     /// FrameBuffer lock the guest's render threads need (the renderer's own readbacks, the post
     /// callback and `getScreenshot`, skip the sync and return stale pixels). The direct path
     /// ([`VkRead`]) reads the Vulkan image once, without that lock. It is used once its first
-    /// frames match the exported path's byte for byte, and never if they don't
-    /// (`EMU_READBACK=gl` turns it off).
+    /// frames that could show a difference (some red/blue difference, not vertically symmetric)
+    /// match the exported path's byte for byte, and never if they don't (`EMU_READBACK=gl` turns
+    /// it off).
     pub fn read_last_posted_into(&self, width: u32, height: u32, px: &mut Vec<u8>) -> Result<()> {
         px.resize(width as usize * height as usize * 4, 0);
         self.read_last_posted_to(width, height, px)
@@ -801,25 +802,31 @@ impl Renderer {
         match (vk, VkTrust::from(self.vk_trust.load(Ordering::Relaxed))) {
             (Some(vk), VkTrust::Trusted) if vk.read(cb, width, height, px) => return Ok(()),
             (Some(vk), VkTrust::Unchecked) => {
-                Self::read_through_gl(&f, fb, cb, width, height, px);
-                let mut direct = vec![0u8; px.len()];
-                let same = vk.read(cb, width, height, &mut direct) && *direct == *px;
-                self.vk_checked(same);
+                Self::read_through_gl(&f, fb, cb, width, height, px)?;
+                // Only a frame where a channel swap or a flip would show tells the paths apart.
+                if sim_core::pixels::reveals_layout(px, width, height) {
+                    let mut direct = vec![0u8; px.len()];
+                    let same = vk.read(cb, width, height, &mut direct) && *direct == *px;
+                    self.vk_checked(same);
+                }
                 return Ok(());
             }
             _ => {}
         }
-        Self::read_through_gl(&f, fb, cb, width, height, px);
-        Ok(())
+        Self::read_through_gl(&f, fb, cb, width, height, px)
     }
 
-    fn read_through_gl(f: &FbApi, fb: *mut c_void, cb: u32, width: u32, height: u32, px: &mut [u8]) {
+    fn read_through_gl(f: &FbApi, fb: *mut c_void, cb: u32, width: u32, height: u32, px: &mut [u8]) -> Result<()> {
         // SAFETY: member functions with `this` first (Itanium ABI); readColorBuffer writes at
         // most the size we pass, which is `px`'s length.
         unsafe {
-            (f.flush)(fb, cb);
+            // GL holds stale pixels unless the Vulkan image made it there.
+            if !(f.flush)(fb, cb) {
+                return Err(Error::Call("FrameBuffer::flushColorBufferFromVk", 0));
+            }
             (f.read)(fb, cb, 0, 0, width as i32, height as i32, GFXSTREAM_RGBA8, px.as_mut_ptr().cast(), px.len() as u64);
         }
+        Ok(())
     }
 
     /// Records one comparison of the direct readback against the exported one: trusted after
@@ -829,12 +836,12 @@ impl Renderer {
         static MATCHES: AtomicU8 = AtomicU8::new(0);
         static MISMATCHES: AtomicU8 = AtomicU8::new(0);
         let (count, then) = if same { (&MATCHES, VkTrust::Trusted) } else { (&MISMATCHES, VkTrust::Off) };
-        if count.fetch_add(1, Ordering::Relaxed) + 1 >= VK_CHECKS {
-            self.vk_trust.store(then as u8, Ordering::Relaxed);
-            if VERBOSE.load(Ordering::Relaxed) || then == VkTrust::Off {
-                let what = if same { "direct Vulkan readback on" } else { "direct Vulkan readback differs from GL's; reading through GL" };
-                eprintln!("emu: {what}");
-            }
+        // Decided once: a late comparison never flips a verdict.
+        let decided = count.fetch_add(1, Ordering::Relaxed) + 1 >= VK_CHECKS
+            && self.vk_trust.compare_exchange(VkTrust::Unchecked as u8, then as u8, Ordering::Relaxed, Ordering::Relaxed).is_ok();
+        if decided && (VERBOSE.load(Ordering::Relaxed) || then == VkTrust::Off) {
+            let what = if same { "direct Vulkan readback on" } else { "direct Vulkan readback differs from GL's; reading through GL" };
+            eprintln!("emu: {what}");
         }
     }
 
@@ -908,6 +915,12 @@ impl VkRead {
         if std::env::var("EMU_READBACK").is_ok_and(|v| v == "gl") {
             return None;
         }
+        // The file the symbols come from must be the image that's loaded (not, say, a renderer
+        // updated in place since).
+        let file_uuid = macho::image_uuid(&macho::load_commands(backend).ok()?)?;
+        if loaded_uuid(handle)? != file_uuid {
+            return None;
+        }
         let found = macho::symbols(backend, &[GET_FB, HAS_EMULATION_VK, READ_COLOR_BUFFER_VK]).ok()?;
         let [Some(get_fb), Some(has_vk), Some(read)] = found[..] else { return None };
         let live = |name: &str| {
@@ -939,9 +952,11 @@ impl VkRead {
             return None;
         }
         let read = read.wrapping_add(slide) as usize;
-        // SAFETY: the address of `readColorBufferToBytes(unsigned x5, void*, unsigned long long)`
-        // in the loaded image (its symbol, slid like the image); the mangled name fixes the
-        // signature, and `this` goes first (Itanium ABI).
+        // SAFETY: the address of `VkEmulation::readColorBufferToBytes(unsigned x5, void*,
+        // unsigned long long)` in the loaded image (its symbol in the same build, checked by UUID,
+        // slid like the image). The mangled name fixes the parameter types but not whether it's a
+        // static member; gfxstream declares it an instance method (`this` first, Itanium ABI),
+        // and a call that didn't match would fail the frame comparison before it's trusted.
         let read = unsafe { std::mem::transmute::<usize, ReadColorBufferVk>(read) };
         Some(VkRead { emulation, read })
     }
@@ -953,6 +968,35 @@ impl VkRead {
         // 4-byte RGBA, the size of `out`, and the first frames are checked against GL's).
         unsafe { (self.read)(self.emulation, cb, 0, 0, width, height, out.as_mut_ptr().cast(), out.len() as u64) }
     }
+}
+
+/// The `LC_UUID` of the image `handle` loaded, read from its Mach-O header in memory.
+fn loaded_uuid(handle: *mut c_void) -> Option<[u8; 16]> {
+    let c = CString::new(GET_FB).ok()?;
+    // SAFETY: dlsym with a live handle and a NUL-terminated name.
+    let sym = unsafe { libc::dlsym(handle, c.as_ptr()) };
+    if sym.is_null() {
+        return None;
+    }
+    // SAFETY: an all-zero Dl_info is a valid out-parameter; dladdr fills it for an address inside
+    // a loaded image.
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    // SAFETY: `sym` is an address in a loaded image and `info` a live out-pointer.
+    if unsafe { libc::dladdr(sym, &mut info) } == 0 || info.dli_fbase.is_null() {
+        return None;
+    }
+    let base = info.dli_fbase.cast::<u8>().cast_const();
+    // SAFETY: `dli_fbase` is the image's mach header, mapped readable with its load commands
+    // right after it; 32 bytes of header first, then `sizeofcmds` (bounded) more.
+    let image = unsafe {
+        let header = std::slice::from_raw_parts(base, 32);
+        let cmds = u32::from_le_bytes(header[20..24].try_into().ok()?) as usize;
+        if cmds > 1 << 20 {
+            return None;
+        }
+        std::slice::from_raw_parts(base, 32 + cmds)
+    };
+    macho::image_uuid(image)
 }
 
 /// Resolves a guest-physical address to the host address backing it (null if unmapped).

@@ -13,6 +13,7 @@ doctest = false
 [dependencies]
 emu-hvf.workspace = true
 libc.workspace = true
+sim-core.workspace = true
 thiserror.workspace = true
 
 # FFI crate: unsafe is allowed here (every block carries a SAFETY comment), denied elsewhere.

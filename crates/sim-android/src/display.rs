@@ -71,13 +71,23 @@ fn read_exactly(r: &mut impl Read, len: usize) -> std::io::Result<Vec<u8>> {
 pub struct Frames<R> {
     reader: R,
     ring: Option<Ring>,
-    /// Frames announced in the ring but overwritten before they could be read.
+    /// Where to ask for socket frames when an announced ring can't be opened.
+    fallback: Option<UnixStream>,
+    /// Frames announced in the ring but overwritten before they could be read (or in a ring
+    /// that couldn't be opened).
     pub torn: u64,
 }
 
 impl<R: Read> Frames<R> {
     pub fn new(reader: R) -> Frames<R> {
-        Frames { reader, ring: None, torn: 0 }
+        Frames { reader, ring: None, fallback: None, torn: 0 }
+    }
+
+    /// When an announced ring can't be opened (another user's file, a sandbox), ask for frames on
+    /// the socket through `writer` (the connection's write side) instead of skipping them.
+    pub fn with_fallback(mut self, writer: UnixStream) -> Frames<R> {
+        self.fallback = Some(writer);
+        self
     }
 
     /// The next whole frame: its header and RGBA rows. Ring announcements are followed, and a
@@ -91,9 +101,14 @@ impl<R: Read> Frames<R> {
                 Record::Frame(header) => return Ok((header, read_exactly(&mut self.reader, header.len as usize)?)),
                 Record::Ring { path_len } => {
                     let path = read_exactly(&mut self.reader, path_len as usize)?;
-                    // A ring that can't be opened leaves none: its frames are skipped until the
-                    // next announcement.
+                    // A ring that can't be opened leaves none: its frames are skipped, and the
+                    // server is asked to send frames on the socket if there's a way to ask.
                     self.ring = String::from_utf8(path).ok().and_then(|p| Ring::open(Path::new(&p)).ok());
+                    if self.ring.is_none()
+                        && let Some(w) = self.fallback.as_mut()
+                    {
+                        w.write_all(format!("{}\n", Input::Socket.to_line()).as_bytes())?;
+                    }
                 }
                 Record::Shared { header, slot } => match self.ring.as_ref().map(|r| r.read(slot, &header)) {
                     Some(Ok(Some(rgba))) => return Ok((header, rgba)),
@@ -133,9 +148,13 @@ impl Ring {
         if before.len != header.len || !before.read_is_whole(before.seq, header.frame) {
             return Ok(None);
         }
+        // The seqlock reader's barriers: the pixels are read after the header, and the second
+        // read of the sequence number after the pixels (the syscalls order them in practice).
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         let mut f = &self.file;
         f.seek(SeekFrom::Start(self.layout.slot_data_offset(slot)))?;
         let rgba = read_exactly(&mut f, header.len as usize)?;
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         let mut seq = [0u8; 8];
         self.file.read_exact_at(&mut seq, at)?;
         Ok(before.read_is_whole(u64::from_le_bytes(seq), header.frame).then_some(rgba))
@@ -231,9 +250,13 @@ mod tests {
         stream.extend(Record::Ring { path_len: g.len() as u32 }.encode());
         stream.extend(g);
         stream.extend(Record::Shared { header: header(1), slot: 0 }.encode());
-        let mut frames = Frames::new(std::io::Cursor::new(stream));
+        let (asks, server) = UnixStream::pair().expect("pair");
+        let mut frames = Frames::new(std::io::Cursor::new(stream)).with_fallback(asks);
         assert!(frames.next_frame().is_err());
         assert_eq!(frames.torn, 1);
+        let mut line = String::new();
+        BufReader::new(server).read_line(&mut line).expect("line");
+        assert_eq!(line, "socket\n", "asked for socket frames");
         std::fs::remove_dir_all(dir).ok();
     }
 }

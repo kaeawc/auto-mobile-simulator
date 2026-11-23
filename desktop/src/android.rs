@@ -30,7 +30,7 @@ impl Screen {
         let mut display = sim_android::display::Display::connect(&avd_dir)?;
         display.request_shared()?;
         display.send(&Input::Hello { max_width })?;
-        let mut frames = sim_android::display::Frames::new(display.try_clone()?);
+        let mut frames = sim_android::display::Frames::new(display.try_clone()?).with_fallback(display.try_clone()?);
         let (pixels, device, alive) = (Pixels::new(), Arc::new((AtomicU32::new(0), AtomicU32::new(0))), Arc::new(AtomicBool::new(true)));
         let (p, d, a) = (pixels.clone(), device.clone(), alive.clone());
         std::thread::Builder::new()

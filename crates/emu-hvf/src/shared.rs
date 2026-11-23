@@ -16,8 +16,8 @@ pub struct SharedMap {
     len: usize,
 }
 
-// SAFETY: the mapping is plain bytes with no interior references; `&mut self` gates every write
-// but the atomic stores, which are safe to share.
+// SAFETY: the mapping is plain bytes with no interior references; every write in this process
+// takes `&mut self`, so shared references only ever read.
 unsafe impl Send for SharedMap {}
 // SAFETY: as above.
 unsafe impl Sync for SharedMap {}
@@ -60,19 +60,20 @@ impl SharedMap {
     }
 
     /// Stores `value` at `offset` (8-byte aligned, in bounds) with release ordering: every
-    /// write made before it is visible to a reader that sees it. A seqlock's sequence number.
-    pub fn store_u64(&self, offset: usize, value: u64) {
+    /// write made before it is visible to a reader that sees it (another process's). A seqlock's
+    /// sequence number. `&mut self`, like every write, so no shared view of the bytes is alive.
+    pub fn store_u64(&mut self, offset: usize, value: u64) {
         assert!(offset.is_multiple_of(8) && offset + 8 <= self.len, "u64 at {offset} outside the mapping");
-        // SAFETY: in bounds and 8-byte aligned (the mapping is page-aligned); the location is only
-        // ever accessed atomically while a `&self` exists, since writes through `as_mut_slice`
-        // need `&mut self`.
+        // SAFETY: in bounds and 8-byte aligned (the mapping is page-aligned); `&mut self` means
+        // no reference into the mapping is alive in this process while it's written.
         unsafe { AtomicU64::from_ptr(self.ptr.as_ptr().add(offset).cast::<u64>()) }.store(value, Ordering::Release);
     }
 
     /// Loads the u64 at `offset` (8-byte aligned, in bounds) with acquire ordering.
     pub fn load_u64(&self, offset: usize) -> u64 {
         assert!(offset.is_multiple_of(8) && offset + 8 <= self.len, "u64 at {offset} outside the mapping");
-        // SAFETY: as in `store_u64`.
+        // SAFETY: in bounds and aligned, as in `store_u64`; with `&self` nothing in this process
+        // writes the location, so this read races no write here.
         unsafe { AtomicU64::from_ptr(self.ptr.as_ptr().add(offset).cast::<u64>()) }.load(Ordering::Acquire)
     }
 }
@@ -121,7 +122,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("emu-hvf-shared-oob-{}", std::process::id()));
         let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).expect("file");
         std::fs::remove_file(&path).ok();
-        let map = SharedMap::new(&file, 4096).expect("map");
+        let mut map = SharedMap::new(&file, 4096).expect("map");
         map.store_u64(4096, 1);
     }
 }

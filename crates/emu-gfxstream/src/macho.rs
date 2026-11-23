@@ -18,6 +18,7 @@ const LC_REEXPORT_DYLIB: u32 = 0x1f | LC_REQ_DYLD;
 const LC_LAZY_LOAD_DYLIB: u32 = 0x20;
 const LC_LOAD_UPWARD_DYLIB: u32 = 0x23 | LC_REQ_DYLD;
 const LC_SYMTAB: u32 = 0x2;
+const LC_UUID: u32 = 0x1b;
 
 /// `nlist_64.n_type` bits: debugger entries, and the type field's "defined in a section".
 const N_STAB: u8 = 0xe0;
@@ -122,6 +123,45 @@ pub fn symbols(path: &Path, names: &[&str]) -> std::io::Result<Vec<Option<u64>>>
     let syms = read_at(symoff, nsyms as usize * NLIST_64)?;
     let strs = read_at(stroff, strsize as usize)?;
     Ok(find_symbols(&syms, &strs, names))
+}
+
+/// The image's `LC_UUID`, from a Mach-O header plus its load commands (a file's, or a loaded
+/// image's in memory): two images with the same UUID are the same build.
+pub fn image_uuid(image: &[u8]) -> Option<[u8; 16]> {
+    if u32_at(image, 0, false)? != MH_MAGIC_64 {
+        return None;
+    }
+    let ncmds = u32_at(image, 16, false)? as usize;
+    let mut off = MACH_HEADER_64;
+    for _ in 0..ncmds {
+        let cmd = u32_at(image, off, false)?;
+        let size = u32_at(image, off + 4, false)? as usize;
+        if size < 8 {
+            return None;
+        }
+        if cmd == LC_UUID {
+            return image.get(off + 8..off + 24)?.try_into().ok();
+        }
+        off += size;
+    }
+    None
+}
+
+/// The arm64 slice's header and load commands, read from `path` (empty if it isn't one).
+pub fn load_commands(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut f = std::fs::File::open(path)?;
+    let mut head = vec![0u8; 4096];
+    let n = read_up_to(&mut f, &mut head)?;
+    head.truncate(n);
+    let Some(slice) = arm64_slice(&head) else { return Ok(Vec::new()) };
+    f.seek(SeekFrom::Start(slice))?;
+    let mut header = [0u8; MACH_HEADER_64];
+    f.read_exact(&mut header)?;
+    let Some(cmds_len) = u32_at(&header, 20, false) else { return Ok(Vec::new()) };
+    let mut image = header.to_vec();
+    image.resize(MACH_HEADER_64 + cmds_len as usize, 0);
+    f.read_exact(&mut image[MACH_HEADER_64..])?;
+    Ok(image)
 }
 
 /// `LC_SYMTAB`'s symbol table offset and count, string table offset and size.
@@ -296,6 +336,30 @@ pub(crate) mod tests {
         assert!(dylib_deps(&path).expect("deps").is_empty());
         std::fs::write(&path, b"#!/bin/sh\n").expect("write");
         assert!(symbols(&path, &["private"]).expect("not mach-o").is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reads_an_image_uuid() {
+        let mut image = fake_dylib("@rpath/libu.dylib", &[]);
+        assert_eq!(image_uuid(&image), None, "no LC_UUID");
+        let cmds_end = MACH_HEADER_64 + u32_at(&image, 20, false).expect("cmds") as usize;
+        let mut cmd = Vec::new();
+        cmd.extend_from_slice(&LC_UUID.to_le_bytes());
+        cmd.extend_from_slice(&24u32.to_le_bytes());
+        cmd.extend_from_slice(&[7; 16]);
+        image.splice(cmds_end..cmds_end, cmd);
+        let ncmds = u32_at(&image, 16, false).expect("ncmds") + 1;
+        let size = u32_at(&image, 20, false).expect("size") + 24;
+        image[16..20].copy_from_slice(&ncmds.to_le_bytes());
+        image[20..24].copy_from_slice(&size.to_le_bytes());
+        assert_eq!(image_uuid(&image), Some([7; 16]));
+        assert_eq!(image_uuid(b"not mach-o"), None);
+        let dir = std::env::temp_dir().join(format!("emu-gfxstream-uuid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("libu.dylib");
+        std::fs::write(&path, &image).expect("write");
+        assert_eq!(image_uuid(&load_commands(&path).expect("load")), Some([7; 16]));
         let _ = std::fs::remove_dir_all(dir);
     }
 

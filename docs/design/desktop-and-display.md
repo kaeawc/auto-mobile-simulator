@@ -27,7 +27,10 @@ pinned at `7a70745`, the same rev sim-rs uses.
 4. **Transport.** A client that sends `shm` gets a ring file (`<avd>/emu-rs/frames-<pid>-<n>.ring`,
    3 page-aligned slots, a seqlock per slot): each frame is written into a slot and announced with
    a 32-byte `EMUS` record; the client `pread`s the slot (no mapping, no `unsafe` on its side) and
-   checks the slot's sequence number. Other clients get `EMUF` frames on the socket as before.
+   checks the slot's sequence number; one that can't open the ring sends `socket` and gets socket
+   frames. A ring is announced with the first frame sent from it, written out in full when made,
+   and removed with its stream or when the emulator exits. Other clients get `EMUF` frames on the
+   socket as before.
 5. **Window.** The desktop reads each frame into the buffer it hands to `Pixels`.
 6. **Screenshots.** The console's `screenshot` encodes the shared capture directly.
 

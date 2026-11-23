@@ -31,8 +31,20 @@ pub struct DisplayServer {
 }
 
 impl Drop for DisplayServer {
+    /// Removes the socket and this process's rings: streams still running when the emulator
+    /// exits never drop theirs.
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        if let Some(dir) = self.path.parent()
+            && let Ok(entries) = std::fs::read_dir(dir)
+        {
+            let prefix = ring_prefix();
+            for e in entries.flatten() {
+                if e.file_name().to_str().is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".ring")) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
     }
 }
 
@@ -93,6 +105,7 @@ fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<e
                 }
             }
             (Input::Shared, _) => wants.shared.store(true, Ordering::Relaxed),
+            (Input::Socket, _) => wants.shared.store(false, Ordering::Relaxed),
             (Input::Touch { x, y, phase }, Some(emu_vmm::Inputs { touch: Some(touch), .. })) => match phase {
                 Phase::Down | Phase::Move => {
                     finger_down = true;
@@ -266,15 +279,12 @@ fn shared_frame(display: &FrameStore, max_width: u32, frame: u64, ring: &mut Opt
     let factor = downscale_factor(width, max_width);
     let (w, h) = downscaled_size(width, height, factor);
     let Some(header) = FrameHeader::new(w, h, width, height, frame) else { return Ok(None) };
-    let mut announce = None;
     let ring = match ring {
         Some(r) if r.fits(header.len) => r,
         _ => {
-            // A new size (or the first frame): a new ring, announced with this frame.
+            // A new size (or the first frame): a new ring.
             *ring = None;
-            let r = ring.insert(Ring::create(dir, u64::from(header.len))?);
-            announce = Some(r.path.clone());
-            r
+            ring.insert(Ring::create(dir, u64::from(header.len))?)
         }
     };
     let mut ok = false;
@@ -294,8 +304,14 @@ fn shared_frame(display: &FrameStore, max_width: u32, frame: u64, ring: &mut Opt
         })
     };
     // A slot that wasn't filled is never announced; a client still reading an older frame there
-    // sees its sequence number move and skips it.
-    Ok(ok.then_some(Out::Shared { header, slot, announce }))
+    // sees its sequence number move and skips it. The ring itself is announced with the first
+    // frame that is sent from it, however many tries that takes.
+    if !ok {
+        return Ok(None);
+    }
+    let announce = (!ring.announced).then(|| ring.path.clone());
+    ring.announced = true;
+    Ok(Some(Out::Shared { header, slot, announce }))
 }
 
 /// A frame ring this process writes (layout in `sim_core::stream::ring`): a private file in the
@@ -305,28 +321,63 @@ struct Ring {
     map: SharedMap,
     layout: ring::Layout,
     next: u32,
+    /// Its path has gone to the client.
+    announced: bool,
 }
 
 static RING_IDS: AtomicU64 = AtomicU64::new(0);
 
+/// This process's ring names start with this.
+fn ring_prefix() -> String {
+    format!("frames-{}-", std::process::id())
+}
+
 impl Ring {
     /// A new ring for frames of up to `frame_bytes`, named for this process
     /// (`frames-<pid>-<n>.ring`) so a crashed emulator's rings can be found and removed.
+    ///
+    /// The file is written out in full before it's mapped: its blocks are allocated (a full disk
+    /// is an error here, not a `SIGBUS` when a frame lands in a hole) and its pages are resident
+    /// before the first frame.
     fn create(dir: &Path, frame_bytes: u64) -> std::io::Result<Ring> {
-        let name = format!("frames-{}-{}.ring", std::process::id(), RING_IDS.fetch_add(1, Ordering::Relaxed));
-        let path = dir.join(name);
         let layout = ring::Layout::new(RING_SLOTS, frame_bytes);
-        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path)?;
-        match SharedMap::new(&file, layout.file_len() as usize) {
+        let (path, file) = Ring::open_new(dir)?;
+        let ring = Ring::fill_zero(&file, layout.file_len()).and_then(|()| SharedMap::new(&file, layout.file_len() as usize));
+        match ring {
             Ok(mut map) => {
                 map.as_mut_slice()[..ring::FILE_HEADER_LEN].copy_from_slice(&layout.encode());
-                Ok(Ring { path, map, layout, next: 0 })
+                Ok(Ring { path, map, layout, next: 0, announced: false })
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&path);
                 Err(e)
             }
         }
+    }
+
+    /// A fresh private file `frames-<pid>-<n>.ring`, skipping names a previous process with this
+    /// PID left behind.
+    fn open_new(dir: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+        let mut tries = 0;
+        loop {
+            let path = dir.join(format!("{}{}.ring", ring_prefix(), RING_IDS.fetch_add(1, Ordering::Relaxed)));
+            match std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 16 => tries += 1,
+                other => return other.map(|f| (path, f)),
+            }
+        }
+    }
+
+    fn fill_zero(file: &std::fs::File, len: u64) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let zeros = vec![0u8; 1 << 20];
+        let mut at = 0;
+        while at < len {
+            let n = (len - at).min(zeros.len() as u64) as usize;
+            file.write_all_at(&zeros[..n], at)?;
+            at += n as u64;
+        }
+        Ok(())
     }
 
     fn fits(&self, len: u32) -> bool {
@@ -530,6 +581,64 @@ mod tests {
         assert_eq!(rig.store.latest(|c| c.frame), Some(1));
         assert_eq!(rig.reads.load(Ordering::Relaxed), 1, "two streams and a capture, one readback");
         assert!(rig.rings().len() == 1, "only the shared client has a ring");
+    }
+
+    #[test]
+    fn a_ring_is_announced_with_the_first_frame_sent_from_it() {
+        // The first readback fails after the ring is made: the announcement waits for a frame.
+        let tries = Arc::new(AtomicUsize::new(0));
+        let t = tries.clone();
+        let rig = Rig::with(
+            "announce",
+            None,
+            Some(Box::new(move |w, h, buf| {
+                if t.fetch_add(1, Ordering::Relaxed) == 0 {
+                    return false;
+                }
+                buf.copy_from_slice(&pixels(w, h, 9));
+                true
+            })),
+        );
+        let (_d, reader) = rig.connect(true, 4096);
+        let mut frames = Frames::new(reader);
+        std::thread::sleep(Duration::from_millis(50));
+        rig.store.posted(5, 3);
+        let (h, rgba) = frames.next_frame().expect("frame");
+        assert_eq!((h.width, h.height, rgba), (5, 3, pixels(5, 3, 9)));
+        assert!(tries.load(Ordering::Relaxed) >= 2, "the first try failed");
+        assert_eq!(frames.torn, 0);
+    }
+
+    #[test]
+    fn rings_skip_taken_names_and_the_server_removes_its_own() {
+        let rig = Rig::new("names");
+        let dir = rig.dir.join("emu-rs");
+        // Names a previous process with this PID left behind.
+        let next = RING_IDS.load(Ordering::Relaxed);
+        for id in next..next + 3 {
+            std::fs::write(dir.join(format!("{}{id}.ring", ring_prefix())), b"old").expect("write");
+        }
+        let ring = Ring::create(&dir, 100).expect("ring");
+        assert!(std::fs::read(&ring.path).expect("ring").len() as u64 == ring.layout.file_len(), "written out in full");
+        let other = dir.join("frames-1-0.ring");
+        std::fs::write(&other, b"").expect("write");
+        std::mem::forget(ring); // a stream still running at exit never drops its ring
+        let mut rig = rig;
+        drop(rig.server.take());
+        assert!(rig.rings() == ["frames-1-0.ring"], "{:?}", rig.rings());
+    }
+
+    #[test]
+    fn a_client_can_go_back_to_socket_frames() {
+        let rig = Rig::new("back");
+        let (mut d, mut reader) = rig.connect(true, 4096);
+        d.send(&Input::Socket).expect("socket");
+        std::thread::sleep(Duration::from_millis(50));
+        rig.store.posted(3, 2);
+        // The header-only decoder: an EMUR or EMUS here would be an error.
+        let (h, rgba) = read_frame(&mut reader).expect("socket frame");
+        assert_eq!((h.width, rgba), (3, pixels(3, 2, 1)));
+        assert!(rig.rings().is_empty());
     }
 
     #[test]
