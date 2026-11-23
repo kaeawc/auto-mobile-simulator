@@ -33,16 +33,6 @@ pub struct GpuSpec {
 
 static RENDERER: std::sync::OnceLock<Arc<emu_gfxstream::Renderer>> = std::sync::OnceLock::new();
 
-/// The last frame the renderer posted, `width` x `height` RGBA, read by the renderer.
-pub fn renderer_screenshot(width: u32, height: u32) -> Option<Vec<u8>> {
-    RENDERER.get()?.read_last_posted(width, height).ok()
-}
-
-/// [`renderer_screenshot`] into `px`, reusing its allocation (the display stream's per frame).
-pub fn renderer_screenshot_into(width: u32, height: u32, px: &mut Vec<u8>) -> bool {
-    RENDERER.get().is_some_and(|r| r.read_last_posted_into(width, height, px).is_ok())
-}
-
 /// The renderer is process-wide: loaded and initialized once, reused across guest reboots.
 fn renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     if let Some(r) = RENDERER.get() {
@@ -67,21 +57,33 @@ fn renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     }
     r.init_with_features(spec.width, spec.height, flags, Some(&features), spec.verbose, virtio::gpu::fence_handler())
         .context("initializing the gfxstream renderer")?;
-    // Host composition posts frames to the renderer's display; read them back for emu-rs's
-    // display sink (screenshots, desktop, streaming).
+    // Host composition posts frames to the renderer's display. A post is only a notice: the
+    // callback's pixels come from the renderer's GL readback, which is stale under Vulkan
+    // composition (and unfilled with async readback), so they're copied only when the renderer
+    // can't be read directly. Otherwise the post records the frame's size, and its pixels are
+    // read back from the renderer when a stream or screenshot wants them, once per frame.
     let display = spec.display.clone();
+    let direct = r.can_read_last_posted();
+    if direct {
+        display.set_readback(Box::new(|w, h, buf| RENDERER.get().is_some_and(|r| r.read_last_posted_to(w, h, buf).is_ok())));
+    }
     let primary = std::sync::atomic::AtomicU32::new(u32::MAX);
     let posted = r.set_post_callback(Box::new(move |f| {
         // The first display that posts is the primary one.
         let _ = primary.compare_exchange(u32::MAX, f.display, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed);
-        if f.display == primary.load(std::sync::atomic::Ordering::Relaxed) {
-            // 0x80E1 = GL_BGRA → virtio-gpu B8G8R8A8 (1); GL_RGBA → R8G8B8A8 (67).
-            let format = if f.gl_format == 0x80e1 { 1 } else { 67 };
-            if f.top_down {
-                display.present(f.width, f.height, f.width * 4, format, f.pixels);
-            } else {
-                display.present_bottom_up(f.width, f.height, format, f.pixels);
-            }
+        if f.display != primary.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        if direct {
+            display.posted(f.width, f.height);
+            return;
+        }
+        // 0x80E1 = GL_BGRA → virtio-gpu B8G8R8A8 (1); GL_RGBA → R8G8B8A8 (67).
+        let format = if f.gl_format == 0x80e1 { 1 } else { 67 };
+        if f.top_down {
+            display.present(f.width, f.height, f.width * 4, format, f.pixels);
+        } else {
+            display.present_bottom_up(f.width, f.height, format, f.pixels);
         }
     }));
     if let Err(e) = posted {

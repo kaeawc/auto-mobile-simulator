@@ -18,12 +18,14 @@ emu-sdk.workspace = true
 emu-ext4.workspace = true
 emu-vmm.workspace = true
 emu-gfxstream.workspace = true
+emu-hvf.workspace = true
 libc.workspace = true
 rustix.workspace = true
 sim-core.workspace = true
 
 [dev-dependencies]
 emu-sdk = { workspace = true, features = ["testing"] }
+sim-android.workspace = true
 
 # `deny`, not the workspace's `forbid`: `shutdown_signals` (signal masks) opts back in, and is the
 # only unsafe code in this crate.

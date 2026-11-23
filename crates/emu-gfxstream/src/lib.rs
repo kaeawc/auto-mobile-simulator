@@ -13,7 +13,7 @@ mod macho;
 use std::collections::HashSet;
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
 pub use emu_hvf::HostRange;
@@ -256,9 +256,16 @@ fn ok(name: &'static str, rc: c_int) -> Result<()> {
 pub struct Renderer {
     api: Api,
     handle: *mut c_void,
+    /// The backend library, for symbols `dlsym` can't see.
+    backend: PathBuf,
     /// FrameBuffer members, resolved on first use (readback per streamed frame, release per
     /// freed buffer), not per call.
     fb: std::sync::OnceLock<std::result::Result<FbApi, &'static str>>,
+    /// The direct Vulkan readback, resolved on first use; `None` when this renderer doesn't have
+    /// it in the expected shape.
+    vk: std::sync::OnceLock<Option<VkRead>>,
+    /// [`VkTrust`] of the direct readback, as a u8.
+    vk_trust: AtomicU8,
 }
 
 // SAFETY: the dlopen handle is only used for dlsym, which is thread-safe.
@@ -301,8 +308,16 @@ impl Renderer {
         for dep in bundled_deps(lib64, BACKEND) {
             dlopen(&dep, true)?;
         }
-        let h = dlopen(&lib64.join(BACKEND), false)?;
-        Ok(Renderer { api: Api::load(h)?, handle: h, fb: std::sync::OnceLock::new() })
+        let backend = lib64.join(BACKEND);
+        let h = dlopen(&backend, false)?;
+        Ok(Renderer {
+            api: Api::load(h)?,
+            handle: h,
+            backend,
+            fb: std::sync::OnceLock::new(),
+            vk: std::sync::OnceLock::new(),
+            vk_trust: AtomicU8::new(VkTrust::Unchecked as u8),
+        })
     }
 
     /// Initializes the renderer for a `width`×`height` primary display. `on_fence` runs on a
@@ -734,36 +749,100 @@ impl Renderer {
         api.map_err(Error::Symbol)
     }
 
+    /// Whether [`Renderer::read_last_posted_into`] can work: the renderer exports the
+    /// FrameBuffer members it uses.
+    pub fn can_read_last_posted(&self) -> bool {
+        self.fb_api().is_ok()
+    }
+
     /// The last color buffer the renderer posted (host composition's output), read back as
-    /// RGBA, `width` x `height`, top row first. Composition runs in Vulkan, and reads go
-    /// through GL, so the Vulkan image is synced to GL first; the renderer's own readback
-    /// paths (post callback, `getScreenshot`) skip that and return stale or garbage pixels.
+    /// RGBA, `width` x `height`, top row first.
     pub fn read_last_posted(&self, width: u32, height: u32) -> Result<Vec<u8>> {
         let mut px = Vec::new();
         self.read_last_posted_into(width, height, &mut px)?;
         Ok(px)
     }
 
-    /// [`Renderer::read_last_posted`] into `px`, reusing its allocation (one per stream, not
+    /// [`Renderer::read_last_posted`] into `px`, reusing its allocation (one per capture, not
     /// one per frame).
+    ///
+    /// Composition runs in Vulkan. The exported path reads through GL: the Vulkan image is
+    /// copied to host memory, uploaded into the GL texture, and read back again, under the
+    /// FrameBuffer lock the guest's render threads need (the renderer's own readbacks, the post
+    /// callback and `getScreenshot`, skip the sync and return stale pixels). The direct path
+    /// ([`VkRead`]) reads the Vulkan image once, without that lock. It is used once its first
+    /// frames that could show a difference (some red/blue difference, not vertically symmetric)
+    /// match the exported path's byte for byte, and never if they don't (`EMU_READBACK=gl` turns
+    /// it off).
     pub fn read_last_posted_into(&self, width: u32, height: u32, px: &mut Vec<u8>) -> Result<()> {
-        let f = self.fb_api()?;
         px.resize(width as usize * height as usize * 4, 0);
-        // SAFETY: member functions with `this` first (Itanium ABI); readColorBuffer writes at
-        // most the size we pass, which is `px`'s length.
-        unsafe {
+        self.read_last_posted_to(width, height, px)
+    }
+
+    /// [`Renderer::read_last_posted_into`] into `px`, exactly `width * height * 4` bytes (a slot
+    /// in shared memory).
+    pub fn read_last_posted_to(&self, width: u32, height: u32, px: &mut [u8]) -> Result<()> {
+        if px.len() != width as usize * height as usize * 4 {
+            return Err(Error::Call("read_last_posted_to: buffer size", -22));
+        }
+        let f = self.fb_api()?;
+        // SAFETY: getFB returns the renderer's singleton or null; getLastPostedColorBuffer is a
+        // member function taking `this` first (Itanium ABI).
+        let (fb, cb) = unsafe {
             let fb = (f.get_fb)();
             if fb.is_null() {
                 return Err(Error::Call("FrameBuffer::getFB", 0));
             }
-            let cb = (f.last)(fb);
-            if cb == 0 {
-                return Err(Error::Call("FrameBuffer::getLastPostedColorBuffer", 0));
+            (fb, (f.last)(fb))
+        };
+        if cb == 0 {
+            return Err(Error::Call("FrameBuffer::getLastPostedColorBuffer", 0));
+        }
+        let vk = self.vk.get_or_init(|| VkRead::resolve(self.handle, &self.backend, fb));
+        match (vk, VkTrust::from(self.vk_trust.load(Ordering::Relaxed))) {
+            (Some(vk), VkTrust::Trusted) if vk.read(cb, width, height, px) => return Ok(()),
+            (Some(vk), VkTrust::Unchecked) => {
+                Self::read_through_gl(&f, fb, cb, width, height, px)?;
+                // Only a frame where a channel swap or a flip would show tells the paths apart.
+                if sim_core::pixels::reveals_layout(px, width, height) {
+                    let mut direct = vec![0u8; px.len()];
+                    let same = vk.read(cb, width, height, &mut direct) && *direct == *px;
+                    self.vk_checked(same);
+                }
+                return Ok(());
             }
-            (f.flush)(fb, cb);
+            _ => {}
+        }
+        Self::read_through_gl(&f, fb, cb, width, height, px)
+    }
+
+    fn read_through_gl(f: &FbApi, fb: *mut c_void, cb: u32, width: u32, height: u32, px: &mut [u8]) -> Result<()> {
+        // SAFETY: member functions with `this` first (Itanium ABI); readColorBuffer writes at
+        // most the size we pass, which is `px`'s length.
+        unsafe {
+            // GL holds stale pixels unless the Vulkan image made it there.
+            if !(f.flush)(fb, cb) {
+                return Err(Error::Call("FrameBuffer::flushColorBufferFromVk", 0));
+            }
             (f.read)(fb, cb, 0, 0, width as i32, height as i32, GFXSTREAM_RGBA8, px.as_mut_ptr().cast(), px.len() as u64);
         }
         Ok(())
+    }
+
+    /// Records one comparison of the direct readback against the exported one: trusted after
+    /// [`VK_CHECKS`] matches, off after as many mismatches (a frame that changed between the two
+    /// reads can mismatch once; a different pixel layout always does).
+    fn vk_checked(&self, same: bool) {
+        static MATCHES: AtomicU8 = AtomicU8::new(0);
+        static MISMATCHES: AtomicU8 = AtomicU8::new(0);
+        let (count, then) = if same { (&MATCHES, VkTrust::Trusted) } else { (&MISMATCHES, VkTrust::Off) };
+        // Decided once: a late comparison never flips a verdict.
+        let decided = count.fetch_add(1, Ordering::Relaxed) + 1 >= VK_CHECKS
+            && self.vk_trust.compare_exchange(VkTrust::Unchecked as u8, then as u8, Ordering::Relaxed, Ordering::Relaxed).is_ok();
+        if decided && (VERBOSE.load(Ordering::Relaxed) || then == VkTrust::Off) {
+            let what = if same { "direct Vulkan readback on" } else { "direct Vulkan readback differs from GL's; reading through GL" };
+            eprintln!("emu: {what}");
+        }
     }
 
     /// Frees color buffer `handle` once its last guest reference is gone (the guest's
@@ -782,6 +861,142 @@ impl Renderer {
         }
         Ok(())
     }
+}
+
+/// Comparisons a direct Vulkan readback needs before it's trusted (or turned off).
+const VK_CHECKS: u8 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum VkTrust {
+    Unchecked = 0,
+    Trusted = 1,
+    Off = 2,
+}
+
+impl From<u8> for VkTrust {
+    fn from(v: u8) -> Self {
+        match v {
+            0 => VkTrust::Unchecked,
+            1 => VkTrust::Trusted,
+            _ => VkTrust::Off,
+        }
+    }
+}
+
+/// `VkEmulation::readColorBufferToBytes(handle, x, y, w, h, out, out_size)`: reads a color
+/// buffer's Vulkan image into `out` (one GPU copy into the renderer's staging buffer, one memcpy
+/// out) under the Vulkan emulation's own lock, not the FrameBuffer's.
+type ReadColorBufferVk = unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32, u32, *mut c_void, u64) -> bool;
+
+/// The renderer's direct Vulkan readback. gfxstream doesn't export it, so it is found the way a
+/// debugger would: the function's address from the backend's symbol table (private symbols are
+/// listed there, at unslid addresses, slid by the same amount as the exported `getFB`), and the
+/// `VkEmulation` it's called on through the two loads of the exported
+/// `FrameBuffer::hasEmulationVk()`, which is decoded and used only if it is exactly that
+/// accessor ([`macho::pointer_test_offsets`]).
+struct VkRead {
+    emulation: *mut c_void,
+    read: ReadColorBufferVk,
+}
+
+// SAFETY: `emulation` is the renderer's process-wide VkEmulation, which lives as long as the
+// renderer and serializes its own calls with its mutex.
+unsafe impl Send for VkRead {}
+// SAFETY: as above.
+unsafe impl Sync for VkRead {}
+
+const GET_FB: &str = "_ZN9gfxstream4host11FrameBuffer5getFBEv";
+const HAS_EMULATION_VK: &str = "_ZNK9gfxstream4host11FrameBuffer14hasEmulationVkEv";
+const READ_COLOR_BUFFER_VK: &str = "_ZN9gfxstream4host2vk11VkEmulation22readColorBufferToBytesEjjjjjPvy";
+
+impl VkRead {
+    fn resolve(handle: *mut c_void, backend: &Path, fb: *mut c_void) -> Option<VkRead> {
+        if std::env::var("EMU_READBACK").is_ok_and(|v| v == "gl") {
+            return None;
+        }
+        // The file the symbols come from must be the image that's loaded (not, say, a renderer
+        // updated in place since).
+        let file_uuid = macho::image_uuid(&macho::load_commands(backend).ok()?)?;
+        if loaded_uuid(handle)? != file_uuid {
+            return None;
+        }
+        let found = macho::symbols(backend, &[GET_FB, HAS_EMULATION_VK, READ_COLOR_BUFFER_VK]).ok()?;
+        let [Some(get_fb), Some(has_vk), Some(read)] = found[..] else { return None };
+        let live = |name: &str| {
+            let c = CString::new(name).ok()?;
+            // SAFETY: dlsym with a live handle and a NUL-terminated name.
+            let p = unsafe { libc::dlsym(handle, c.as_ptr()) };
+            (!p.is_null()).then_some(p as u64)
+        };
+        // The image's slide, agreed on by two exported symbols.
+        let slide = live(GET_FB)?.wrapping_sub(get_fb);
+        let has_vk_live = live(HAS_EMULATION_VK)?;
+        if has_vk_live.wrapping_sub(has_vk) != slide {
+            return None;
+        }
+        // SAFETY: the address is the entry of an exported function in the loaded image, whose
+        // code pages are mapped readable; 20 bytes stay inside its text segment.
+        let code: [u32; 5] = unsafe { std::ptr::read_unaligned(has_vk_live as usize as *const [u32; 5]) };
+        let (to_impl, to_vk) = macho::pointer_test_offsets(code)?;
+        // SAFETY: the same two loads `hasEmulationVk()` does on the live FrameBuffer: its
+        // implementation pointer, then that object's VkEmulation pointer (null without Vulkan).
+        let emulation = unsafe {
+            let imp = std::ptr::read((fb as usize + to_impl) as *const *mut c_void);
+            if imp.is_null() {
+                return None;
+            }
+            std::ptr::read((imp as usize + to_vk) as *const *mut c_void)
+        };
+        if emulation.is_null() {
+            return None;
+        }
+        let read = read.wrapping_add(slide) as usize;
+        // SAFETY: the address of `VkEmulation::readColorBufferToBytes(unsigned x5, void*,
+        // unsigned long long)` in the loaded image (its symbol in the same build, checked by UUID,
+        // slid like the image). The mangled name fixes the parameter types but not whether it's a
+        // static member; gfxstream declares it an instance method (`this` first, Itanium ABI),
+        // and a call that didn't match would fail the frame comparison before it's trusted.
+        let read = unsafe { std::mem::transmute::<usize, ReadColorBufferVk>(read) };
+        Some(VkRead { emulation, read })
+    }
+
+    /// Reads color buffer `cb` (`width` x `height`, its full extent) into `out`.
+    fn read(&self, cb: u32, width: u32, height: u32, out: &mut [u8]) -> bool {
+        // SAFETY: a live VkEmulation and its member function; it writes at most `out.len()` bytes
+        // (it copies min(image bytes, size given) for packed formats; posted color buffers are
+        // 4-byte RGBA, the size of `out`, and the first frames are checked against GL's).
+        unsafe { (self.read)(self.emulation, cb, 0, 0, width, height, out.as_mut_ptr().cast(), out.len() as u64) }
+    }
+}
+
+/// The `LC_UUID` of the image `handle` loaded, read from its Mach-O header in memory.
+fn loaded_uuid(handle: *mut c_void) -> Option<[u8; 16]> {
+    let c = CString::new(GET_FB).ok()?;
+    // SAFETY: dlsym with a live handle and a NUL-terminated name.
+    let sym = unsafe { libc::dlsym(handle, c.as_ptr()) };
+    if sym.is_null() {
+        return None;
+    }
+    // SAFETY: an all-zero Dl_info is a valid out-parameter; dladdr fills it for an address inside
+    // a loaded image.
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    // SAFETY: `sym` is an address in a loaded image and `info` a live out-pointer.
+    if unsafe { libc::dladdr(sym, &mut info) } == 0 || info.dli_fbase.is_null() {
+        return None;
+    }
+    let base = info.dli_fbase.cast::<u8>().cast_const();
+    // SAFETY: `dli_fbase` is the image's mach header, mapped readable with its load commands
+    // right after it; 32 bytes of header first, then `sizeofcmds` (bounded) more.
+    let image = unsafe {
+        let header = std::slice::from_raw_parts(base, 32);
+        let cmds = u32::from_le_bytes(header[20..24].try_into().ok()?) as usize;
+        if cmds > 1 << 20 {
+            return None;
+        }
+        std::slice::from_raw_parts(base, 32 + cmds)
+    };
+    macho::image_uuid(image)
 }
 
 /// Resolves a guest-physical address to the host address backing it (null if unmapped).

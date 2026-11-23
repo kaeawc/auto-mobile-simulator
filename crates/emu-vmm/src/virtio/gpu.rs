@@ -166,7 +166,6 @@ impl VirtioDevice for Gpu {
             resources: HashMap::new(),
             scanout: None,
             pending: Vec::new(),
-            frame: Vec::new(),
             req: Vec::new(),
         };
         let handle = std::thread::Builder::new()
@@ -269,7 +268,6 @@ struct Worker {
     resources: HashMap<u32, Resource>,
     scanout: Option<Scanout>,
     pending: Vec<Pending>,
-    frame: Vec<u8>,
     /// The current control request, reused across requests (command streams are KBs to MBs).
     req: Vec<u8>,
 }
@@ -675,13 +673,14 @@ impl Worker {
         out
     }
 
+    /// Reads the flushed scanout straight into the display's buffer: one copy, not a readback
+    /// into a staging frame and a second copy into the store.
     fn present(&mut self, s: Scanout) {
         let stride = if s.stride == 0 { s.width * 4 } else { s.stride };
-        let size = stride as usize * s.height as usize;
-        self.frame.resize(size, 0);
         let b = Box3 { x: 0, y: 0, z: 0, w: s.width, h: s.height, d: 1 };
-        if self.cfg.renderer.read_into(s.resource, stride, b, &mut self.frame).is_ok() {
-            self.cfg.display.present(s.width, s.height, stride, s.format, &self.frame);
-        }
+        let renderer = &self.cfg.renderer;
+        self.cfg
+            .display
+            .present_with(s.width, s.height, stride, s.format, &mut |buf| renderer.read_into(s.resource, stride, b, buf).is_ok());
     }
 }

@@ -248,6 +248,31 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   to read its size. The display socket's per-frame downscale (a box filter) went from 22.7 to
   7.2 ms at factor 2 (16.4 to 7.5 ms at 3): const-generic kernels for factors 2–4 and division by
   a reciprocal, identical output.
+- **The frame path: no copy per post, one readback per frame, a shared-memory ring.** The path
+  is described in [the display design](design/desktop-and-display.md#frame-path-built). Stage by
+  stage for the desktop's stream (`hello 1080`) on a 4-core Linux VM (memcpy 5.4 GB/s), medians,
+  tablet 2480×1740 / phone 1080×2400:
+
+  | Stage | Before | After | Benchmark (`--ignored --nocapture`) |
+  | --- | --- | --- | --- |
+  | Post callback (renderer thread) | 3.9 / 1.6 ms copy | 0.0002 ms (size only) | `cargo test --release -p emu-vmm present_cost` |
+  | Readback | per stream and per screenshot: Vulkan → CPU → GL → CPU under the FrameBuffer lock | once per frame, shared by streams and screenshots (a full-size ring stream reads straight into its slot): Vulkan → CPU | needs a Mac (below) |
+  | Scale (/3 / /1) | 8.0 ms / 1.8 ms copy | 2.0 ms (2.8 on one thread) / none | `cargo test --release -p sim-core downscale_cost` |
+  | Emulator → socket (1.9 / 10.4 MB) | 0.86 / 3.7 ms of writes | a 32-byte notice | `cargo test --release -p emu transport_cost` |
+  | Emulator CPU per frame besides the readback | ≈12.8 / ≈7.1 ms | ≈2.0 / ≈0 ms | sum of the above |
+  | Post → client holds the pixels | — | 8.1–9.0 / 8.0–8.8 ms (ring), 7.8–10.3 / 8.5–9.3 ms (socket), across runs | `CASE=2480,1080,true cargo test --release -p emu frame_path_latency` |
+
+  End to end the ring and the socket tie on this VM: the latency is mostly two memory-bound
+  copies, the stand-in readback (a memcpy of the frame) and the client's copy into the buffer it
+  hands to `Pixels` (its `pread` costs what a socket read did). What the ring removes is the
+  emulator's work: no payload writes, and frames are scaled (or read back) straight into shared
+  memory. A new ring is written out in full when it's made (so a full disk is an error rather than a
+  `SIGBUS`), which costs its first frames 20–60 ms here, once per ring. Frames scale on one thread below 16 MiB of input and in up to 4
+  bands above: two threads were slower than one on this VM (likely SMT siblings), four faster.
+  Rings live in `<avd>/emu-rs/`, a disk-backed file on macOS whose dirty pages the system writes
+  back periodically (benchmark rigs on Linux use `/dev/shm`). The direct Vulkan readback is checked
+  against the GL one on its first 3 frames and turned off if they differ (`EMU_READBACK=gl` turns
+  it off outright).
 - **vsock without intermediate copies.** adb (and every qemud pipe) rides vsock. Host bytes were
   copied into the connection's queue, out of it into a packet `Vec`, and then into the guest's
   buffer; now the adb forwarder hands its buffer over, the worker takes it over when nothing is

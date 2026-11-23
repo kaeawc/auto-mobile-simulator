@@ -3,12 +3,50 @@
 The design for the display, input and debugging side of emu-rs, written before emu-rs joined
 sim-rs. It now describes the Android half of sim-rs's one window (`desktop/`): the window is a
 separate process from each `emu`, frames arrive over `<avd>/emu-rs/display.sock` (the protocol is
-`sim_core::stream`), and input goes back as stream lines or console commands. What is built and
-what isn't: zero-copy IOSurface frames (step 2 below) and the frame HUD are not yet; the socket
-stream with downscaling, touch, keys, the rotary wheel and the console pane are. Rune is pinned at
-`7a70745`, the same rev sim-rs uses.
+`sim_core::stream`) or through a shared frame ring it announces, and input goes back as stream
+lines or console commands. What is built and what isn't: the frame path below (one readback per
+frame, a shared-memory ring, downscaling), touch, keys, the rotary wheel and the console pane are;
+zero-copy IOSurface frames (step 2 of the plan after it) and the frame HUD are not yet. Rune is
+pinned at `7a70745`, the same rev sim-rs uses.
 
-## Display: zero-copy, double- or triple-buffered
+## Frame path (built)
+
+1. **Post.** Host composition posts a color buffer; the renderer's post callback only records the
+   frame's size and number (`DisplaySink::posted`). Its pixels aren't copied: the renderer's GL
+   readback that feeds them is stale under Vulkan composition (and not even filled with async
+   readback). They're copied only when the renderer can't be read directly.
+2. **Readback, once per frame.** `FrameStore::latest` reads the posted color buffer back when a
+   stream or screenshot first wants that frame and keeps it as RGBA, so streams and screenshots of
+   one frame share one readback. The renderer reads the Vulkan image directly
+   (`VkEmulation::readColorBufferToBytes`, a private symbol found through the backend's symbol
+   table, checked against the exported GL path on the first frames) instead of copying it to GL and
+   reading GL back under the FrameBuffer lock. A full-size stream skips the capture and reads back
+   straight into its ring slot (`FrameStore::read_into`).
+3. **Scale.** `sim_core::pixels::downscale_into` box-filters straight into the destination,
+   in vectorizable row passes, in bands across up to 4 threads for large frames.
+4. **Transport.** A client that sends `shm` gets a ring file (`<avd>/emu-rs/frames-<pid>-<n>.ring`,
+   3 page-aligned slots, a seqlock per slot): each frame is written into a slot and announced with
+   a 32-byte `EMUS` record; the client `pread`s the slot (no mapping, no `unsafe` on its side) and
+   checks the slot's sequence number; one that can't open the ring sends `socket` and gets socket
+   frames. A ring is announced with the first frame sent from it, written out in full when made,
+   and removed with its stream or when the emulator exits. Other clients get `EMUF` frames on the
+   socket as before.
+5. **Window.** The desktop reads each frame into the buffer it hands to `Pixels`.
+6. **Screenshots.** The console's `screenshot` encodes the shared capture directly.
+
+Guest-composed scanouts (virtio-gpu `RESOURCE_FLUSH`) are read straight into the store
+(`DisplaySink::present_with`). Numbers and what's left: [android.md](../android.md#performance-notes).
+
+**What zero-copy still needs.** gfxstream allocates color buffers in MoltenVK `MTLHeap`s, which
+can't cross processes, and exports neither an IOSurface nor its Metal objects
+(`exportColorBuffer` returns nothing in Metal mode). Showing frames without a CPU copy needs either
+a renderer that creates its display color buffers on IOSurfaces (`VK_EXT_metal_objects`'
+`VkImportMetalIOSurfaceInfoEXT`) or a GPU blit, on MoltenVK's queue, from the posted image into an
+IOSurface ring; then the surfaces' Mach ports to the window (a bootstrap rendezvous, as Chromium
+does) and `PixelBuffer::from_iosurface` there (BGRA). The ring protocol stays the fallback and the
+Linux path.
+
+## Display: zero-copy, double- or triple-buffered (planned)
 
 1. **Scanout.** virtio-gpu scanout (or the gfxstream composer's output) renders into IOSurfaces
    in the VMM process, two or three of them in a ring.

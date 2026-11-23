@@ -5,9 +5,10 @@
 //! - [`GuestRam`]: host memory mapped into the guest, with bounds-checked accessors,
 //! - [`Vcpu`]: a virtual CPU, pinned to the thread that created it,
 //! - [`VcpuHandle`]: a sendable token used to kick a vCPU out of the guest,
-//! - [`host`]: host file syscalls std doesn't wrap (hole punching).
+//! - [`host`]: host file syscalls std doesn't wrap (hole punching),
+//! - [`SharedMap`]: a file mapped shared, which the display server's frame ring lives in.
 //!
-//! Guest RAM and [`host`] build on any unix host, so the device models above them build and test
+//! Guest RAM, [`host`] and [`SharedMap`] build on any unix host, so the device models above them build and test
 //! on Linux; the hypervisor itself is Apple silicon only.
 #![cfg(unix)]
 
@@ -17,10 +18,12 @@ pub mod host;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod hv;
 mod ram;
+mod shared;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use hv::*;
 pub use ram::{GuestRam, HostRange, MemError};
+pub use shared::SharedMap;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

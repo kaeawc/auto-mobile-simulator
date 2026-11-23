@@ -15,6 +15,9 @@ pub enum PixelFormat {
 }
 
 impl PixelFormat {
+    /// `VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM`: RGBA bytes in memory.
+    pub const RGBA_VIRTIO: u32 = 67;
+
     /// A virtio-gpu format code (`VIRTIO_GPU_FORMAT_*`, whose names list bytes in memory order).
     pub fn from_virtio_gpu(code: u32) -> Option<Self> {
         Some(match code {
@@ -34,11 +37,19 @@ impl PixelFormat {
 /// Converts a framebuffer with `stride` bytes per row into tightly packed RGBA. Returns `None`
 /// when `src` is too short for the described geometry.
 pub fn to_rgba(src: &[u8], width: usize, height: usize, stride: usize, format: PixelFormat) -> Option<Vec<u8>> {
-    let row_bytes = width.checked_mul(4)?;
-    if stride < row_bytes || (height > 0 && src.len() < stride.checked_mul(height - 1)?.checked_add(row_bytes)?) {
-        return None;
+    let mut out = Vec::new();
+    to_rgba_into(src, width, height, stride, format, &mut out).then_some(out)
+}
+
+/// [`to_rgba`] into `out`, reusing its allocation (a capture kept across frames). Returns false,
+/// leaving `out` unchanged, when `src` is too short for the described geometry.
+pub fn to_rgba_into(src: &[u8], width: usize, height: usize, stride: usize, format: PixelFormat, out: &mut Vec<u8>) -> bool {
+    let Some(row_bytes) = width.checked_mul(4) else { return false };
+    let fits = || Some(height == 0 || src.len() >= stride.checked_mul(height - 1)?.checked_add(row_bytes)?);
+    if stride < row_bytes || fits() != Some(true) {
+        return false;
     }
-    let mut out = vec![0u8; row_bytes * height];
+    out.resize(row_bytes * height, 0);
     // One loop per format, so the byte shuffle is a fixed permutation the compiler vectorizes.
     let convert: fn(&[u8], &mut [u8]) = match format {
         PixelFormat::Rgba => |src, dst| dst.copy_from_slice(src),
@@ -53,7 +64,7 @@ pub fn to_rgba(src: &[u8], width: usize, height: usize, stride: usize, format: P
     for (row, dst) in out.chunks_exact_mut(row_bytes.max(1)).enumerate().take(height) {
         convert(&src[row * stride..row * stride + row_bytes], dst);
     }
-    Some(out)
+    true
 }
 
 #[inline(always)]
@@ -72,59 +83,156 @@ pub fn bgra_to_rgba(src: &[u8], width: usize, height: usize, stride: usize) -> O
 /// Shrinks tightly packed RGBA by a whole `factor`, averaging each `factor` x `factor` block.
 /// Factors of 0 and 1 return the image unchanged.
 pub fn downscale(width: u32, height: u32, rgba: &[u8], factor: u32) -> (u32, u32, Vec<u8>) {
-    if factor <= 1 {
-        return (width, height, rgba.to_vec());
-    }
-    let out = match factor {
-        2 => box_filter::<2>(width, height, rgba),
-        3 => box_filter::<3>(width, height, rgba),
-        4 => box_filter::<4>(width, height, rgba),
-        f => box_filter_any(width, height, rgba, f as usize),
-    };
-    (width / factor, height / factor, out)
+    let (w, h) = downscaled_size(width, height, factor);
+    let mut out = vec![0; w as usize * h as usize * 4];
+    downscale_into(width, height, rgba, factor, &mut out);
+    (w, h, out)
 }
 
-/// `downscale` for a factor known at compile time (the display socket's usual 2–4), so each
-/// block's loops unroll.
-fn box_filter<const F: usize>(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
-    let (ow, oh, in_row) = (width as usize / F, height as usize / F, width as usize * 4);
-    let mut out = Vec::with_capacity(ow * oh * 4);
-    let div = Reciprocal::new((F * F) as u32);
-    for oy in 0..oh {
-        let rows: [&[u8]; F] = std::array::from_fn(|dy| &rgba[(oy * F + dy) * in_row..][..ow * F * 4]);
-        for ox in 0..ow {
-            let mut acc = [0u32; 4];
+/// The size [`downscale`] produces.
+pub fn downscaled_size(width: u32, height: u32, factor: u32) -> (u32, u32) {
+    let f = factor.max(1);
+    (width / f, height / f)
+}
+
+/// [`downscale`] into `out`, which must hold at least the downscaled frame (see
+/// [`downscaled_size`]): straight into a shared-memory slot, with no intermediate frame. Large
+/// frames are split into bands of rows across a few threads. Returns the downscaled size.
+pub fn downscale_into(width: u32, height: u32, rgba: &[u8], factor: u32, out: &mut [u8]) -> (u32, u32) {
+    let (_, oh) = downscaled_size(width, height, factor);
+    let read = oh as usize * factor.max(1) as usize * width as usize * 4;
+    downscale_banded(width, height, rgba, factor, out, bands_for(read))
+}
+
+fn downscale_banded(width: u32, height: u32, rgba: &[u8], factor: u32, out: &mut [u8], bands: usize) -> (u32, u32) {
+    let (ow, oh) = downscaled_size(width, height, factor);
+    let f = factor.max(1) as usize;
+    let (in_row, out_row) = (width as usize * 4, ow as usize * 4);
+    let out = &mut out[..out_row * oh as usize];
+    if out.is_empty() {
+        return (ow, oh);
+    }
+    // Rows per band: whole output rows, so each band reads only its own input rows.
+    let rows_per_band = (oh as usize).div_ceil(bands.max(1));
+    let bands = (oh as usize).div_ceil(rows_per_band);
+    let band = |(i, out): (usize, &mut [u8])| {
+        let first = i * rows_per_band;
+        let src = &rgba[first * f * in_row..];
+        match f {
+            1 => out.copy_from_slice(&src[..out.len()]),
+            2 => box_rows::<2, 8>(src, in_row, out, out_row),
+            3 => box_rows::<3, 12>(src, in_row, out, out_row),
+            4 => box_rows::<4, 16>(src, in_row, out, out_row),
+            f => box_rows_any(src, in_row, out, out_row, f),
+        }
+    };
+    if bands == 1 {
+        band((0, out));
+    } else {
+        std::thread::scope(|s| {
+            let mut parts = out.chunks_mut(rows_per_band * out_row).enumerate();
+            let first = parts.next();
+            for part in parts {
+                s.spawn(move || band(part));
+            }
+            if let Some(part) = first {
+                band(part);
+            }
+        });
+    }
+    (ow, oh)
+}
+
+/// Input bytes below which one thread does the whole frame: starting a thread costs 20–100 µs,
+/// and on a host with SMT two threads can share one core (measured slower than one there). A
+/// tablet-sized frame (2480x1740, 17 MB) splits; a phone's (1080x2400, 10 MB) doesn't.
+const BAND_MIN_BYTES: usize = 16 << 20;
+/// Most threads one frame uses: the emulator's vCPUs and renderer need the rest of the machine.
+const MAX_BANDS: usize = 4;
+
+fn bands_for(in_bytes: usize) -> usize {
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
+    if in_bytes < BAND_MIN_BYTES { 1 } else { cores.clamp(1, MAX_BANDS) }
+}
+
+/// The box filter for a factor known at compile time (the display stream's usual 2–4), one output
+/// row at a time, in passes that each run straight along a row (so the compiler vectorizes them):
+/// 1. the `F` input rows are summed column by column into 16-bit lanes;
+/// 2. each lane gets the next `F - 1` same-channel lanes (one pixel apart) added and is divided,
+///    which is the block average wherever a block starts;
+/// 3. every `F`th pixel of that row is the output.
+fn box_rows<const F: usize, const W: usize>(src: &[u8], in_row: usize, out: &mut [u8], out_row: usize) {
+    debug_assert_eq!(W, 4 * F);
+    let used = out_row * F;
+    // Lanes where a whole block of F pixels starts at or after them.
+    let starts = used - 4 * (F - 1);
+    let mut acc = vec![0u16; used];
+    let mut avg = vec![0u8; starts];
+    let div = Reciprocal16::new((F * F) as u32);
+    for (oy, out) in out.chunks_exact_mut(out_row).enumerate() {
+        let rows: [&[u8]; F] = std::array::from_fn(|dy| &src[(oy * F + dy) * in_row..][..used]);
+        let (blocks, tail) = acc.as_chunks_mut::<16>();
+        for (i, a) in blocks.iter_mut().enumerate() {
+            let mut s = [0u16; 16];
             for row in rows {
-                for px in row[ox * F * 4..][..F * 4].as_chunks::<4>().0 {
-                    for c in 0..4 {
-                        acc[c] += u32::from(px[c]);
-                    }
+                for (k, v) in row[i * 16..][..16].iter().enumerate() {
+                    s[k] += u16::from(*v);
                 }
             }
-            out.extend(acc.map(|v| div.of(v)));
+            *a = s;
+        }
+        let done = blocks.len() * 16;
+        for (k, a) in tail.iter_mut().enumerate() {
+            *a = rows.iter().map(|r| u16::from(r[done + k])).sum();
+        }
+        let shifted: [&[u16]; F] = std::array::from_fn(|dx| &acc[dx * 4..][..starts]);
+        for (i, a) in avg.iter_mut().enumerate() {
+            let mut v = 0u16;
+            for lanes in shifted {
+                v += lanes[i];
+            }
+            *a = div.of(v);
+        }
+        for (o, block) in out.as_chunks_mut::<4>().0.iter_mut().zip(avg.chunks(W)) {
+            o.copy_from_slice(&block[..4]);
         }
     }
-    out
 }
 
-fn box_filter_any(width: u32, height: u32, rgba: &[u8], f: usize) -> Vec<u8> {
-    let (ow, oh, in_row) = (width as usize / f, height as usize / f, width as usize * 4);
-    let mut out = Vec::with_capacity(ow * oh * 4);
+fn box_rows_any(src: &[u8], in_row: usize, out: &mut [u8], out_row: usize, f: usize) {
     let div = Reciprocal::new((f * f) as u32);
-    for oy in 0..oh {
-        for ox in 0..ow {
+    for (oy, out) in out.chunks_exact_mut(out_row).enumerate() {
+        for (ox, o) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let mut acc = [0u32; 4];
             for dy in 0..f {
-                for px in rgba[(oy * f + dy) * in_row + ox * f * 4..][..f * 4].as_chunks::<4>().0 {
+                for px in src[(oy * f + dy) * in_row + ox * f * 4..][..f * 4].as_chunks::<4>().0 {
                     for c in 0..4 {
                         acc[c] += u32::from(px[c]);
                     }
                 }
             }
-            out.extend(acc.map(|v| div.of(v)));
+            *o = acc.map(|v| div.of(v));
         }
     }
-    out
+}
+
+/// Division by a fixed `2 <= n <= 16` in 16-bit arithmetic: `v * r >> 16` with
+/// `r = ceil(2^16 / n)` (a 16-bit multiply-high, one instruction per vector) is exact (`v / n`,
+/// rounded down) for box sums (`v <= 255 * n`) when `n * n < 2^16 / 255`, i.e. `n <= 16`:
+/// factors 2 to 4.
+#[derive(Clone, Copy)]
+struct Reciprocal16(u16);
+
+impl Reciprocal16 {
+    fn new(n: u32) -> Reciprocal16 {
+        debug_assert!((2..=16).contains(&n));
+        Reciprocal16((1u32 << 16).div_ceil(n) as u16)
+    }
+
+    fn of(self, v: u16) -> u8 {
+        ((u32::from(v) * u32::from(self.0)) >> 16) as u8
+    }
 }
 
 /// Division by a fixed `n` as a multiply and shift: exact (`v / n`, rounded down) for the sums
@@ -140,6 +248,21 @@ impl Reciprocal {
     fn of(self, v: u32) -> u8 {
         ((u64::from(v) * self.0) >> 32) as u8
     }
+}
+
+/// Whether two readbacks of this RGBA frame agreeing proves they share a layout: some pixel's
+/// first and third bytes differ (so a red/blue swap would show) and some row differs from its
+/// mirror row (so a vertical flip would). A black boot screen proves nothing.
+pub fn reveals_layout(rgba: &[u8], width: u32, height: u32) -> bool {
+    let row = width as usize * 4;
+    let Some(px) = rgba.get(..row * height as usize) else { return false };
+    if row == 0 {
+        return false;
+    }
+    let swaps = px.as_chunks::<4>().0.iter().any(|p| p[0] != p[2]);
+    let rows: Vec<&[u8]> = px.chunks_exact(row).collect();
+    let flips = rows.iter().zip(rows.iter().rev()).any(|(a, b)| a != b);
+    swaps && flips
 }
 
 /// The smallest whole factor that brings `width` down to at most `max_width` (at least 1).
@@ -191,6 +314,127 @@ mod tests {
                 assert_eq!(u32::from(r.of(v)), v / n, "{v} / {n}");
             }
         }
+        for n in 2..=16u32 {
+            let r = Reciprocal16::new(n);
+            for v in 0..=255 * n {
+                assert_eq!(u32::from(r.of(v as u16)), v / n, "16-bit: {v} / {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn banded_downscale_matches_the_reference_into_a_larger_buffer() {
+        let (w, h) = (53u32, 47u32);
+        let rgba: Vec<u8> = (0..w * h * 4).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+        for factor in 1..=5 {
+            let (ow, oh) = downscaled_size(w, h, factor);
+            let want = if factor == 1 { rgba.clone() } else { naive(w, h, &rgba, factor) };
+            for bands in [1, 2, 3, 4, 7, 100] {
+                // A slot larger than the frame: only the frame's bytes are written.
+                let mut out = vec![0xAB; ow as usize * oh as usize * 4 + 9];
+                assert_eq!(downscale_banded(w, h, &rgba, factor, &mut out, bands), (ow, oh));
+                assert_eq!(&out[..want.len()], want.as_slice(), "factor {factor}, {bands} bands");
+                assert!(out[want.len()..].iter().all(|&b| b == 0xAB), "nothing past the frame");
+            }
+        }
+        // The public entry picks its own bands and agrees.
+        let mut out = vec![0; (w / 3 * (h / 3) * 4) as usize];
+        assert_eq!(downscale_into(w, h, &rgba, 3, &mut out), (w / 3, h / 3));
+        assert_eq!(out, naive(w, h, &rgba, 3));
+        assert_eq!(downscale_into(2, 2, &rgba, 3, &mut []), (0, 0), "nothing left at this factor");
+        assert_eq!(bands_for(0), 1);
+        assert!((1..=MAX_BANDS).contains(&bands_for(usize::MAX / 2)));
+    }
+
+    #[test]
+    fn converts_into_a_reused_buffer() {
+        let mut out = vec![9; 64];
+        assert!(to_rgba_into(&[1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 7, 8], 1, 2, 8, PixelFormat::Bgra, &mut out));
+        assert_eq!(out, [3, 2, 1, 4, 7, 6, 5, 8]);
+        assert!(!to_rgba_into(&[1, 2, 3], 1, 1, 4, PixelFormat::Rgba, &mut out), "too short");
+        assert_eq!(out, [3, 2, 1, 4, 7, 6, 5, 8], "unchanged on failure");
+    }
+
+    /// The display stream's downscale at each size and factor, old against new (one thread and
+    /// banded), the median of `runs`; one line each.
+    fn downscale_bench(sizes: &[(u32, u32)], factors: &[u32], runs: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        for &(w, h) in sizes {
+            let rgba: Vec<u8> = (0..w * h * 4).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+            for &factor in factors {
+                let (ow, oh) = downscaled_size(w, h, factor);
+                let mut out = vec![0; ow as usize * oh as usize * 4];
+                let median = |f: &mut dyn FnMut()| {
+                    let mut times: Vec<f64> = (0..runs)
+                        .map(|_| {
+                            let t = std::time::Instant::now();
+                            f();
+                            t.elapsed().as_secs_f64() * 1000.0
+                        })
+                        .collect();
+                    times.sort_by(f64::total_cmp);
+                    times[times.len() / 2]
+                };
+                let mut old_out = Vec::new();
+                let old = median(&mut || old_out = if factor == 1 { rgba.clone() } else { naive_box(w, h, &rgba, factor) });
+                let one = median(&mut || {
+                    downscale_banded(w, h, &rgba, factor, &mut out, 1);
+                });
+                let new = median(&mut || {
+                    downscale_into(w, h, &rgba, factor, &mut out);
+                });
+                assert_eq!(old_out[..out.len()], out[..], "the same pixels");
+                let bands = bands_for(oh as usize * factor as usize * w as usize * 4);
+                lines.push(format!("{w}x{h} /{factor}: old {old:.2} ms, new 1 thread {one:.2} ms, new {bands} bands {new:.2} ms"));
+            }
+        }
+        lines
+    }
+
+    #[test]
+    fn the_benchmark_runs_and_agrees_with_the_old_filter() {
+        let lines = downscale_bench(&[(24, 18)], &[1, 2, 3, 4], 1);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+    }
+
+    /// The display stream's downscale on a tablet frame and a phone frame, old against new.
+    ///     cargo test --release -p sim-core downscale_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn downscale_cost() {
+        for l in downscale_bench(&[(2480, 1740), (1080, 2400)], &[1, 2, 3], 9) {
+            println!("{l}");
+        }
+    }
+
+    /// The previous implementation (const-generic per-pixel blocks into a new Vec), for the
+    /// benchmark's before column.
+    fn naive_box(width: u32, height: u32, rgba: &[u8], factor: u32) -> Vec<u8> {
+        fn imp<const F: usize>(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+            let (ow, oh, in_row) = (width as usize / F, height as usize / F, width as usize * 4);
+            let mut out = Vec::with_capacity(ow * oh * 4);
+            let div = Reciprocal::new((F * F) as u32);
+            for oy in 0..oh {
+                let rows: [&[u8]; F] = std::array::from_fn(|dy| &rgba[(oy * F + dy) * in_row..][..ow * F * 4]);
+                for ox in 0..ow {
+                    let mut acc = [0u32; 4];
+                    for row in rows {
+                        for px in row[ox * F * 4..][..F * 4].as_chunks::<4>().0 {
+                            for c in 0..4 {
+                                acc[c] += u32::from(px[c]);
+                            }
+                        }
+                    }
+                    out.extend(acc.map(|v| div.of(v)));
+                }
+            }
+            out
+        }
+        match factor {
+            2 => imp::<2>(width, height, rgba),
+            3 => imp::<3>(width, height, rgba),
+            _ => imp::<4>(width, height, rgba),
+        }
     }
 
     #[test]
@@ -225,6 +469,20 @@ mod tests {
             assert_eq!(to_rgba(&px, 1, 1, 4, format), Some(rgba.to_vec()), "format {code}");
         }
         assert_eq!(PixelFormat::from_virtio_gpu(999), None);
+    }
+
+    #[test]
+    fn only_asymmetric_colorful_frames_reveal_a_layout() {
+        let black = [0, 0, 0, 255].repeat(4);
+        assert!(!reveals_layout(&black, 2, 2), "uniform");
+        let grey_rows = [[9, 9, 9, 255].repeat(2), [1, 1, 1, 255].repeat(2)].concat();
+        assert!(!reveals_layout(&grey_rows, 2, 2), "no red/blue difference");
+        let symmetric = [[255, 0, 0, 255].repeat(2), [255, 0, 0, 255].repeat(2)].concat();
+        assert!(!reveals_layout(&symmetric, 2, 2), "rows mirror each other");
+        let telling = [[255, 0, 0, 255].repeat(2), [0, 0, 255, 255].repeat(2)].concat();
+        assert!(reveals_layout(&telling, 2, 2));
+        assert!(!reveals_layout(&telling[..4], 2, 2), "short");
+        assert!(!reveals_layout(&[], 0, 0));
     }
 
     #[test]
