@@ -108,6 +108,13 @@ impl Profile {
         })
     }
 
+    /// The upload (`up`) or download rate limit for `host` in kbit/s (0 = none), without building
+    /// its whole profile.
+    pub fn rate_kbps(&self, host: &str, up: bool) -> u32 {
+        let rule = self.rules.iter().find(|r| r.matches(host));
+        if up { rule.and_then(|r| r.up_kbps).unwrap_or(self.up_kbps) } else { rule.and_then(|r| r.down_kbps).unwrap_or(self.down_kbps) }
+    }
+
     /// The profile in effect for connections to `host`.
     pub fn for_host(&self, host: &str) -> Profile {
         let mut p = self.clone();
@@ -280,6 +287,20 @@ pub fn launch_env(udid: &str, dylib: &Path) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rates_match_the_hosts_profile() {
+        let p = Profile {
+            down_kbps: 780,
+            up_kbps: 330,
+            rules: vec![Rule { pattern: "example.com".into(), down_kbps: Some(50), ..Rule::default() }],
+            ..Profile::default()
+        };
+        for host in ["example.com", "api.example.com", "other.org"] {
+            let full = p.for_host(host);
+            assert_eq!((p.rate_kbps(host, true), p.rate_kbps(host, false)), (full.up_kbps, full.down_kbps), "{host}");
+        }
+    }
 
     #[test]
     fn conf_round_trips_and_presets_exist() {
