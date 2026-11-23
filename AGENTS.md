@@ -62,7 +62,10 @@ cargo fmt --all
 cd desktop && cargo test     # Rune headless view tests
 ```
 
-After any change: `cargo c && cargo lint && cargo t`. On a non-macOS host, also lint the macOS
+After any change: `cargo c && cargo lint && cargo t`. Before pushing: `scripts/check.sh` (CI's
+checks, fastest first: fmt, clippy for this host and for the other platform's target, the tests,
+the desktop when it changed; a few seconds warm). `scripts/install-hooks.sh` makes it the
+pre-push hook. On a non-macOS host, also lint the macOS
 code (no linking needed): `rustup target add aarch64-apple-darwin` once, then
 `cargo clippy --target aarch64-apple-darwin --all-targets -- -D warnings`.
 

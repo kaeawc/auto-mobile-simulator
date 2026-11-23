@@ -24,9 +24,9 @@ esac
 
 base=$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo HEAD)
 changed=$( (git diff --name-only "$base"...HEAD; git diff --name-only HEAD; git ls-files --others --exclude-standard) 2>/dev/null | sort -u)
-touches() { [[ $mode == all ]] || grep -qE "$1" <<<"$changed"; }
+touches() { [[ $mode == all ]] || command grep -qE "$1" <<<"$changed"; }
 
-if [[ $mode == changed && -n $changed ]] && ! grep -qvE '\.md$|^docs/|\.png$' <<<"$changed"; then
+if [[ $mode == changed && -n $changed ]] && ! command grep -qvE '\.md$|^docs/|\.png$' <<<"$changed"; then
   echo "check: only docs changed; nothing to build"
   exit 0
 fi
@@ -45,7 +45,7 @@ step() {
   fi
 }
 
-installed_target() { rustup target list --installed 2>/dev/null | grep -qx "$1"; }
+installed_target() { rustup target list --installed 2>/dev/null | command grep -qx "$1"; }
 
 step fmt cargo fmt --all --check
 step "fmt (desktop)" rustfmt --check --edition 2024 desktop/src/main.rs
