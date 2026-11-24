@@ -1,8 +1,8 @@
 //! The machine: builds the board, its devices and vCPUs, and runs the guest (Apple silicon only).
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -220,7 +220,54 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     b
 }
 
-/// Boots the machine and blocks until it powers off, resets, faults, or `stop` becomes true.
+/// The running machine's vCPUs, so [`request_stop`] reaches its stop loop directly instead of
+/// the loop polling the flag. One machine per process (Hypervisor.framework allows one VM).
+static RUNNING: Mutex<Option<Weak<Cpus>>> = Mutex::new(None);
+
+/// Asks the machine [`run`] is running (or the next one it starts) to stop: sets `stop`, the flag
+/// passed to `run`, and wakes the running machine's stop loop. Callable from any thread,
+/// including a signal-watching one.
+pub fn request_stop(stop: &AtomicBool) {
+    stop.store(true, Ordering::SeqCst);
+    // The lock is held throughout: the upgraded reference must not outlive the machine's own, or
+    // this thread could end up dropping its devices after the VM and RAM. (`Cpus::request_stop`
+    // never takes `RUNNING`.)
+    let running = RUNNING.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(cpus) = running.as_ref().and_then(Weak::upgrade) {
+        cpus.request_stop(StopReason::Requested);
+    }
+}
+
+/// How often the stop loop wakes on its own to look at the flag: a stop set without
+/// [`request_stop`] costs at most this long, not a hang.
+const STOP_BACKSTOP: Duration = Duration::from_secs(1);
+
+/// Blocks until `cpus` stop: they power off, reset or fault, or a stop is requested.
+/// [`request_stop`] wakes it at once; a bare `stop.store(true)` is seen within
+/// [`STOP_BACKSTOP`]. Returns the reason and how many times the thread woke (for tests).
+fn wait_for_stop(cpus: &Arc<Cpus>, stop: &AtomicBool) -> (StopReason, u32) {
+    *RUNNING.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::downgrade(cpus));
+    // A request made before the machine was published set the flag without reaching it. (The
+    // mutex orders the two: either this sees the flag or `request_stop` saw the machine.)
+    if stop.load(Ordering::SeqCst) {
+        cpus.request_stop(StopReason::Requested);
+    }
+    let mut wakes = 0;
+    let reason = loop {
+        wakes += 1;
+        if let Some(r) = cpus.wait_stop(STOP_BACKSTOP) {
+            break r;
+        }
+        if stop.load(Ordering::SeqCst) {
+            cpus.request_stop(StopReason::Requested);
+        }
+    };
+    *RUNNING.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    (reason, wakes)
+}
+
+/// Boots the machine and blocks until it powers off, resets, faults, or a stop is requested.
+/// Stop it with [`request_stop`]`(&stop)`; setting `stop` alone takes up to [`STOP_BACKSTOP`].
 /// On an error, an early renderer init ([`start_renderer`]) has finished before this returns.
 pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     settled(boot_and_run(cfg, stop))
@@ -471,14 +518,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         );
     }
 
-    let reason = loop {
-        if let Some(r) = cpus.wait_stop(Duration::from_millis(100)) {
-            break r;
-        }
-        if stop.load(Ordering::SeqCst) {
-            cpus.request_stop(StopReason::Requested);
-        }
-    };
+    let (reason, _) = wait_for_stop(&cpus, &stop);
     cpus.request_stop(reason.clone());
     for t in threads {
         let _ = t.join();
@@ -501,6 +541,83 @@ mod tests {
 
     fn spec(lib64: PathBuf) -> GpuSpec {
         GpuSpec { lib64, width: 720, height: 1280, verbose: true, display: Arc::new(crate::display::FrameStore::default()) }
+    }
+
+    fn idle_cpus() -> Arc<Cpus> {
+        let wakers = Arc::new(Wakers::new(1, HvVcpus::new(1), WakeMode::from_env()));
+        Arc::new(Cpus::new(Bus::new(), wakers, 0))
+    }
+
+    /// Serializes the tests that use the process-wide `RUNNING` slot.
+    static RUNNING_SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_stop_request_wakes_the_idle_stop_loop() {
+        let _slot = RUNNING_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        let cpus = idle_cpus();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn({
+            let (cpus, stop) = (cpus.clone(), stop.clone());
+            move || {
+                let r = wait_for_stop(&cpus, &stop);
+                tx.send(Instant::now()).expect("send");
+                r
+            }
+        });
+        // Idle for 300 ms: the old loop woke three times here; this one sleeps (its backstop is 1 s).
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(rx.try_recv().is_err(), "still waiting");
+        let asked = Instant::now();
+        request_stop(&stop);
+        let stopped = rx.recv_timeout(Duration::from_secs(5)).expect("stopped");
+        let (reason, wakes) = waiter.join().expect("waiter");
+        assert!(matches!(reason, StopReason::Requested), "{reason:?}");
+        assert!(stopped.duration_since(asked) < Duration::from_millis(100), "took {:?}", stopped.duration_since(asked));
+        assert_eq!(wakes, 1, "slept through the idle period");
+        assert!(RUNNING.lock().expect("running").is_none(), "unpublished after stopping");
+    }
+
+    #[test]
+    fn a_bare_flag_still_stops_within_the_backstop() {
+        let _slot = RUNNING_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        let cpus = idle_cpus();
+        let stop = Arc::new(AtomicBool::new(false));
+        let setter = stop.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            setter.store(true, Ordering::SeqCst);
+            Instant::now()
+        });
+        let (reason, wakes) = wait_for_stop(&cpus, &stop);
+        let took = t.join().expect("setter").elapsed();
+        assert!(matches!(reason, StopReason::Requested), "{reason:?}");
+        assert!(took <= STOP_BACKSTOP + Duration::from_millis(200), "took {took:?}");
+        assert_eq!(wakes, 2, "one backstop wake");
+    }
+
+    #[test]
+    fn stops_requested_before_the_loop_or_from_the_guest_still_end_it() {
+        let _slot = RUNNING_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        // Requested before the machine was published (between resets, say): seen at the start.
+        let stop = AtomicBool::new(false);
+        request_stop(&stop);
+        let (reason, _) = wait_for_stop(&idle_cpus(), &stop);
+        assert!(matches!(reason, StopReason::Requested), "{reason:?}");
+        // The guest's own reset or power-off, with no stop requested: that reason, unchanged.
+        let cpus = idle_cpus();
+        let guest = cpus.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            guest.request_stop(StopReason::Reset);
+        });
+        let (reason, _) = wait_for_stop(&cpus, &AtomicBool::new(false));
+        t.join().expect("guest");
+        assert!(matches!(reason, StopReason::Reset), "{reason:?}");
+        // A request with no machine running only sets the flag.
+        let idle = AtomicBool::new(false);
+        request_stop(&idle);
+        assert!(idle.load(Ordering::SeqCst));
     }
 
     /// Serializes the tests that use the process-wide `PENDING` slot.

@@ -133,7 +133,9 @@ impl Vm {
         const RWX: u64 = 0b111;
         // SAFETY: `ram` owns a page-aligned mapping of exactly `len` bytes that outlives the VM
         // mapping as long as callers keep it alive, which `Machine` does (it holds an Arc).
-        check("hv_vm_map", unsafe { ffi::hv_vm_map(ram.host_ptr().cast(), ram.base(), ram.len() as usize, RWX) })
+        check("hv_vm_map", unsafe { ffi::hv_vm_map(ram.host_ptr().cast(), ram.base(), ram.len() as usize, RWX) })?;
+        ram.set_hv_mapped(RWX);
+        Ok(())
     }
 
     /// Maps host memory the VMM doesn't own as guest memory (e.g. a GPU renderer's

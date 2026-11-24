@@ -6,8 +6,17 @@
 //! many streams and screenshots want it ([`FrameStore::latest`]). Guest-composed scanouts
 //! (virtio-gpu `RESOURCE_FLUSH`) arrive as pixels ([`DisplaySink::present`]), read straight into
 //! the store ([`DisplaySink::present_with`]).
+//!
+//! While frames are being read, every buffer is reused: no allocation per frame. A store nobody
+//! has read for [`IDLE`] gives its frame-sized buffers back (about 10 MB each at 1080x2400): the
+//! capture, the spare buffer, and the kept pixels of a posted frame (which never needs them). A
+//! stream waiting in [`FrameStore::wait_newer`] counts as a reader, so a connected stream on a
+//! static screen keeps its buffers. The check runs on the next post, so it needs no thread or
+//! timer of its own. Unread guest-composed frames are then read in place into the kept buffer,
+//! one buffer instead of three.
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sim_core::pixels::{PixelFormat, to_rgba_into};
 
@@ -49,8 +58,19 @@ pub trait DisplaySink: Send + Sync {
     }
 }
 
+/// How long a store goes unread before it frees its frame-sized buffers.
+pub const IDLE: Duration = Duration::from_secs(5);
+
+/// Longest a reader waits for an unread frame being filled in place (see [`FrameStore`]).
+const FILL_WAIT: Duration = Duration::from_secs(1);
+
+/// Milliseconds since the first call in this process, plus one (0 means "never").
+fn now_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
 /// Keeps the latest frame (for screenshots and the desktop app) and counts frames.
-#[derive(Default)]
 pub struct FrameStore {
     inner: Mutex<FrameState>,
     /// Signalled on every new frame, so streams wake per frame rather than poll.
@@ -61,6 +81,16 @@ pub struct FrameStore {
     /// The buffer the next guest-composed frame is read into while the last one stays
     /// readable (double buffering for [`DisplaySink::present_with`]).
     spare: Mutex<Vec<u8>>,
+    /// When a reader last asked for pixels ([`now_ms`]; 0: never).
+    last_read: AtomicU64,
+    /// How long unread before the buffers go ([`IDLE`]; shorter in tests).
+    idle_ms: u64,
+}
+
+impl Default for FrameStore {
+    fn default() -> Self {
+        FrameStore::with_idle(IDLE)
+    }
 }
 
 #[derive(Default, Clone)]
@@ -76,6 +106,10 @@ pub struct FrameState {
     /// The latest frame was posted to the renderer (its pixels come from the [`Readback`]), not
     /// presented as pixels.
     pub posted: bool,
+    /// Bumped by [`FrameStore::wake`]: ends every [`FrameStore::wait_newer`] in progress.
+    pub wakes: u64,
+    /// An unread frame is being read into `pixels` in place (taken out meanwhile); readers wait.
+    pub filling: bool,
 }
 
 /// The latest frame as tightly packed RGBA, top row first.
@@ -93,6 +127,19 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl FrameStore {
+    /// A store that frees its buffers after `idle` without a reader.
+    pub fn with_idle(idle: Duration) -> FrameStore {
+        FrameStore {
+            inner: Mutex::default(),
+            posted: Condvar::new(),
+            readback: OnceLock::new(),
+            capture: Mutex::default(),
+            spare: Mutex::default(),
+            last_read: AtomicU64::new(0),
+            idle_ms: idle.as_millis() as u64,
+        }
+    }
+
     pub fn snapshot(&self) -> FrameState {
         lock(&self.inner).clone()
     }
@@ -103,12 +150,61 @@ impl FrameStore {
         (s.width, s.height, s.frames)
     }
 
-    /// Blocks until a frame newer than number `seen` is presented or `timeout` passes; returns the
-    /// latest frame number either way.
+    /// Blocks until a frame newer than number `seen` is presented, [`FrameStore::wake`] is
+    /// called, or `timeout` passes; returns the latest frame number either way. A waiter counts
+    /// as a reader: the store keeps its buffers for the frame it's waiting for.
     pub fn wait_newer(&self, seen: u64, timeout: Duration) -> u64 {
+        self.mark_read();
         let s = lock(&self.inner);
-        let (s, _) = self.posted.wait_timeout_while(s, timeout, |s| s.frames <= seen).unwrap_or_else(|e| e.into_inner());
+        let wakes = s.wakes;
+        let (s, _) =
+            self.posted.wait_timeout_while(s, timeout, |s| s.frames <= seen && s.wakes == wakes).unwrap_or_else(|e| e.into_inner());
+        // A long wait: still reading when it ends.
+        self.mark_read();
         s.frames
+    }
+
+    /// Ends every [`FrameStore::wait_newer`] in progress now (a stream's client went away, or the
+    /// server is stopping), whatever frame it waits for.
+    pub fn wake(&self) {
+        lock(&self.inner).wakes += 1;
+        self.posted.notify_all();
+    }
+
+    fn mark_read(&self) {
+        self.last_read.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// Nobody has read a frame for `idle_ms` (or ever).
+    fn idle(&self) -> bool {
+        let last = self.last_read.load(Ordering::Relaxed);
+        last == 0 || now_ms().saturating_sub(last) >= self.idle_ms
+    }
+
+    /// Frees the capture and the spare buffer if the store has gone unread. Never waits: a
+    /// buffer someone holds is in use, so it stays.
+    fn release_if_idle(&self) {
+        if !self.idle() {
+            return;
+        }
+        if let Ok(mut cap) = self.capture.try_lock()
+            && cap.rgba.capacity() > 0
+        {
+            cap.rgba = Vec::new();
+            cap.frame = 0;
+        }
+        if let Ok(mut spare) = self.spare.try_lock()
+            && spare.capacity() > 0
+        {
+            *spare = Vec::new();
+        }
+    }
+
+    /// Bytes of frame buffers the store holds (kept pixels, capture, spare), for tests and
+    /// diagnostics.
+    pub fn buffered_bytes(&self) -> usize {
+        let pixels = lock(&self.inner).pixels.capacity();
+        pixels + lock(&self.capture).rgba.capacity() + lock(&self.spare).capacity()
     }
 
     pub fn frames(&self) -> u64 {
@@ -121,6 +217,7 @@ impl FrameStore {
     /// runs; the guest's posts never wait. `None` before the first frame, or when the frame can't
     /// be read.
     pub fn latest<R>(&self, f: impl FnOnce(&Capture) -> R) -> Option<R> {
+        self.mark_read();
         let (width, height, frame, posted) = self.state();
         if frame == 0 || width == 0 || height == 0 {
             return None;
@@ -157,6 +254,7 @@ impl FrameStore {
         if dst.len() != width as usize * height as usize * 4 || frame == 0 {
             return false;
         }
+        self.mark_read();
         {
             let cap = lock(&self.capture);
             if (cap.frame, cap.width, cap.height) == (frame, width, height) {
@@ -186,6 +284,7 @@ impl FrameStore {
     /// The presented pixels of a `width` x `height` frame, as RGBA.
     fn presented_rgba(&self, width: u32, height: u32, out: &mut Vec<u8>) -> bool {
         let s = lock(&self.inner);
+        let (s, _) = self.posted.wait_timeout_while(s, FILL_WAIT, |s| s.filling).unwrap_or_else(|e| e.into_inner());
         if (s.width, s.height) != (width, height) || s.pixels.is_empty() {
             return false;
         }
@@ -200,7 +299,38 @@ impl FrameStore {
         }
         (s.width, s.height, s.stride, s.format, s.posted) = (width, height, stride, format, posted);
         s.frames += 1;
+        drop(s);
         self.posted.notify_all();
+        self.release_if_idle();
+    }
+
+    /// [`DisplaySink::present_with`] for a store nobody reads: the frame is read straight into
+    /// the kept buffer (taken out of the store meanwhile, so the fill still runs unlocked), and
+    /// no spare is kept. A reader that arrives during the fill waits for it. A failed fill
+    /// leaves no readable pixels, since it may have overwritten them.
+    fn present_in_place(&self, width: u32, height: u32, stride: u32, format: u32, fill: &mut dyn FnMut(&mut [u8]) -> bool) {
+        let mut buf = {
+            let mut s = lock(&self.inner);
+            s.filling = true;
+            std::mem::take(&mut s.pixels)
+        };
+        buf.resize(stride as usize * height as usize, 0);
+        let ok = fill(&mut buf);
+        let mut s = lock(&self.inner);
+        s.filling = false;
+        if ok {
+            s.pixels = buf;
+            (s.width, s.height, s.stride, s.format, s.posted) = (width, height, stride, format, false);
+            s.frames += 1;
+        } else if !s.posted {
+            // Torn by the failed fill: nothing to show until the next frame. (A post that landed
+            // during the fill doesn't need the pixels.)
+            buf.clear();
+            s.pixels = buf;
+        }
+        drop(s);
+        self.posted.notify_all();
+        self.release_if_idle();
     }
 }
 
@@ -232,6 +362,9 @@ impl DisplaySink for FrameStore {
     /// unlocked: the renderer may take its FrameBuffer lock, which a render thread holds while it
     /// posts here. A failed fill presents nothing.
     fn present_with(&self, width: u32, height: u32, stride: u32, format: u32, fill: &mut dyn FnMut(&mut [u8]) -> bool) {
+        if self.idle() {
+            return self.present_in_place(width, height, stride, format, fill);
+        }
         let mut spare = lock(&self.spare);
         spare.resize(stride as usize * height as usize, 0);
         if !fill(&mut spare) {
@@ -243,9 +376,13 @@ impl DisplaySink for FrameStore {
         });
     }
 
+    /// Records the size only; kept pixels from an earlier presented frame are freed, since a
+    /// posted frame's pixels come from the renderer.
     fn posted(&self, width: u32, height: u32) {
         self.update(width, height, width * 4, PixelFormat::RGBA_VIRTIO, true, |kept| {
-            kept.clear();
+            if kept.capacity() > 0 {
+                *kept = Vec::new();
+            }
             true
         });
     }
@@ -261,6 +398,128 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn wake_ends_a_wait_without_a_frame() {
+        let store = Arc::new(FrameStore::default());
+        let waker = store.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let woke = std::time::Instant::now();
+            waker.wake();
+            woke
+        });
+        assert_eq!(store.wait_newer(0, Duration::from_secs(10)), 0, "no frame, still the latest number");
+        let returned = std::time::Instant::now();
+        let woke = t.join().expect("waker");
+        assert!(returned.duration_since(woke) < Duration::from_millis(100), "returned {:?} after wake", returned.duration_since(woke));
+        // A wake ends only waits in progress, not the next one.
+        let start = std::time::Instant::now();
+        assert_eq!(store.wait_newer(0, Duration::from_millis(30)), 0);
+        assert!(start.elapsed() >= Duration::from_millis(30), "a later wait still times out");
+    }
+
+    const IDLE_TEST: Duration = Duration::from_millis(60);
+
+    #[test]
+    fn unread_buffers_are_freed_after_the_idle_period() {
+        // Guest composition: a reader makes the store keep pixels, capture and spare.
+        let store = FrameStore::with_idle(IDLE_TEST);
+        let frame = |store: &FrameStore, v: u8| {
+            store.present_with(4, 4, 16, 2, &mut |b| {
+                b.fill(v);
+                true
+            })
+        };
+        store.mark_read();
+        frame(&store, 1);
+        assert_eq!(store.latest(|c| c.rgba.len()), Some(64));
+        frame(&store, 2);
+        assert_eq!(store.buffered_bytes(), 3 * 64, "pixels, capture, spare");
+        std::thread::sleep(IDLE_TEST + Duration::from_millis(20));
+        // The next post frees the capture and the spare, and reads the frame in place.
+        frame(&store, 3);
+        assert_eq!(store.buffered_bytes(), 64, "only the kept frame");
+        assert_eq!(store.latest(|c| c.rgba[0]), Some(3), "still readable");
+        // Host composition: an unread store keeps nothing at all.
+        let posted = FrameStore::with_idle(IDLE_TEST);
+        posted.set_readback(Box::new(|_, _, b| {
+            b.fill(7);
+            true
+        }));
+        posted.present(4, 4, 16, 2, &[1; 64]);
+        posted.posted(4, 4);
+        assert_eq!(posted.latest(|c| c.rgba[0]), Some(7));
+        assert_eq!(posted.buffered_bytes(), 64, "the capture; posted frames keep no pixels");
+        std::thread::sleep(IDLE_TEST + Duration::from_millis(20));
+        posted.posted(4, 4);
+        assert_eq!(posted.buffered_bytes(), 0, "freed on the next post");
+        assert_eq!(posted.latest(|c| c.rgba[0]), Some(7), "read back again on demand");
+    }
+
+    #[test]
+    fn a_waiting_stream_keeps_the_buffers_on_a_static_screen() {
+        let store = FrameStore::with_idle(IDLE_TEST);
+        store.set_readback(Box::new(|_, _, b| {
+            b.fill(7);
+            true
+        }));
+        store.posted(4, 4);
+        assert_eq!(store.latest(|c| c.rgba[0]), Some(7));
+        // A stream waits out more than the idle period with nothing new on screen.
+        assert_eq!(store.wait_newer(1, IDLE_TEST + Duration::from_millis(20)), 1);
+        store.posted(4, 4);
+        assert_eq!(store.buffered_bytes(), 64, "still a reader: the capture stays");
+    }
+
+    #[test]
+    fn steady_reading_reuses_every_buffer() {
+        // 50 guest-composed frames, each read: the buffers trade places but none is allocated.
+        let store = FrameStore::with_idle(IDLE_TEST);
+        store.mark_read();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..50u8 {
+            store.present_with(8, 8, 32, 2, &mut |b| {
+                seen.insert(b.as_ptr() as usize);
+                b.fill(i);
+                true
+            });
+            let (v, capture) = store.latest(|c| (c.rgba[0], c.rgba.as_ptr() as usize)).expect("frame");
+            assert_eq!(v, i);
+            seen.insert(capture);
+        }
+        assert!(seen.len() <= 3, "{} distinct buffers for 50 frames", seen.len());
+        assert_eq!(store.buffered_bytes(), 3 * 256);
+    }
+
+    #[test]
+    fn a_reader_waits_for_an_unread_frame_filled_in_place() {
+        let store = Arc::new(FrameStore::with_idle(IDLE_TEST));
+        store.present_with(1, 1, 4, 67, &mut |b| {
+            b.copy_from_slice(&[1, 2, 3, 4]);
+            true
+        });
+        std::thread::sleep(IDLE_TEST + Duration::from_millis(20));
+        let reader = store.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        store.present_with(1, 1, 4, 67, &mut |b| {
+            let reader = reader.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || tx.send(reader.latest(|c| c.rgba.clone())).expect("send"));
+            std::thread::sleep(Duration::from_millis(30));
+            b.copy_from_slice(&[5, 6, 7, 8]);
+            true
+        });
+        assert_eq!(rx.recv().expect("reader"), Some(vec![5, 6, 7, 8]), "the new frame, after the fill");
+        // A failed in-place fill shows nothing rather than a torn frame.
+        std::thread::sleep(IDLE_TEST + Duration::from_millis(20));
+        store.present_with(1, 1, 4, 67, &mut |b| {
+            b[0] = 9;
+            false
+        });
+        assert_eq!(store.frames(), 2);
+        assert_eq!(store.latest(|_| ()), None);
+    }
 
     #[test]
     fn waiters_wake_on_the_next_frame() {

@@ -22,7 +22,7 @@ mod shared;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use hv::*;
-pub use ram::{GuestRam, HostRange, MemError};
+pub use ram::{DISCARD_GRANULE, GuestRam, HostRange, MemError, phys_footprint};
 pub use shared::SharedMap;
 
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +35,10 @@ pub enum Error {
     Mmap(usize),
     #[error("{0}")]
     Invalid(&'static str),
+    /// [`GuestRam::discard`] unmapped `len` bytes at `ipa` from the guest and couldn't map them
+    /// back: the guest can no longer reach that range, so it must not be handed out again.
+    #[error("{len} bytes at guest {ipa:#x} are no longer mapped into the guest (hv_vm_map: {})", describe(*.code))]
+    GuestHole { ipa: u64, len: usize, code: i32 },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

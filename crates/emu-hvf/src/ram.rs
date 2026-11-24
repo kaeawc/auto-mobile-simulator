@@ -1,4 +1,6 @@
 //! Guest RAM: an anonymous host mapping addressed by guest physical address.
+use std::sync::atomic::AtomicU64;
+
 use crate::{Error, Result};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -57,7 +59,15 @@ pub struct GuestRam {
     ptr: *mut u8,
     len: u64,
     base: u64,
+    /// The `hv_vm_map` permission flags this RAM is mapped into the VM with, or 0 when it
+    /// isn't: [`GuestRam::discard`] has to replace the guest's view of the pages too.
+    #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+    hv_flags: AtomicU64,
 }
+
+/// [`GuestRam::discard`] works in host pages; 16 KiB is the host page size on Apple silicon and a
+/// multiple of it elsewhere, and the alignment [`GuestRam::new`] requires.
+pub const DISCARD_GRANULE: u64 = 0x4000;
 
 // SAFETY: the mapping is plain bytes with no interior references; all access goes through
 // copying accessors (see the type docs).
@@ -79,7 +89,7 @@ impl GuestRam {
         if ptr == libc::MAP_FAILED {
             return Err(Error::Mmap(len as usize));
         }
-        Ok(GuestRam { ptr: ptr.cast(), len, base })
+        Ok(GuestRam { ptr: ptr.cast(), len, base, hv_flags: AtomicU64::new(0) })
     }
 
     pub fn base(&self) -> u64 {
@@ -102,6 +112,67 @@ impl GuestRam {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn host_ptr(&self) -> *mut u8 {
         self.ptr
+    }
+
+    /// Records that `Vm::map_ram` mapped this RAM into the guest with `flags`.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn set_hv_mapped(&self, flags: u64) {
+        self.hv_flags.store(flags, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Gives the host pages behind guest `[addr, addr + len)` back to the host, rounded inward to
+    /// whole [`DISCARD_GRANULE`]s, and returns how many bytes that covered. Afterwards the range
+    /// reads as zeroes from both the host and the guest, and its pages commit again lazily when
+    /// either side touches them.
+    ///
+    /// The host mapping is replaced with fresh anonymous memory (`mmap(MAP_FIXED)`). For RAM the
+    /// VM maps, the guest's view is replaced with it: `hv_vm_unmap`, the new mapping, `hv_vm_map`.
+    /// Measured on Apple silicon (`tests/discard_probe.rs`), the alternatives don't work:
+    /// `madvise(MADV_DONTNEED | MADV_FREE)` neither lowers `phys_footprint` nor zeroes;
+    /// `MADV_FREE_REUSABLE` lowers it only for host-touched pages and keeps the old data (no
+    /// zero on read, so the guest could see a freed buffer's contents);
+    /// `mmap(MAP_FIXED)` alone leaves the guest on the old pages, no longer shared with the host.
+    ///
+    /// The guest must not use the range while it is discarded (it has freed it): for the
+    /// microseconds the range is unmapped from the VM, a vCPU access exits as an access to an
+    /// unmapped address. Host threads may keep copying in and out; they see old data or zeroes.
+    pub fn discard(&self, addr: u64, len: u64) -> Result<u64> {
+        let off = self.offset(addr, len as usize).map_err(|_| Error::Invalid("discard range outside guest RAM"))? as u64;
+        let start = off.next_multiple_of(DISCARD_GRANULE);
+        let end = (off + len) / DISCARD_GRANULE * DISCARD_GRANULE;
+        if end <= start {
+            return Ok(0);
+        }
+        let n = (end - start) as usize;
+        // SAFETY: `start + n` is inside the mapping (checked and rounded inward above).
+        let host = unsafe { self.ptr.add(start as usize) };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let flags = self.hv_flags.load(std::sync::atomic::Ordering::Acquire);
+            if flags != 0 {
+                let ipa = self.base + start;
+                // SAFETY: plain FFI call; unmapping only affects the guest's view of the range.
+                let rc = unsafe { crate::ffi::hv_vm_unmap(ipa, n) };
+                if rc != 0 {
+                    return Err(Error::Hv { call: "hv_vm_unmap", code: rc });
+                }
+                let replaced = replace_pages(host, n);
+                // SAFETY: `host..host + n` is part of this RAM's live mapping (the new pages or,
+                // if replacing failed, the old ones), which outlives the VM mapping as
+                // `Vm::map_ram` requires.
+                let map = || unsafe { crate::ffi::hv_vm_map(host.cast(), ipa, n, flags) };
+                // Once more on failure: a range left unmapped is a hole in guest memory.
+                let rc = match map() {
+                    0 => 0,
+                    _ => map(),
+                };
+                if rc != 0 {
+                    return Err(Error::GuestHole { ipa, len: n, code: rc });
+                }
+                return replaced.map(|()| n as u64);
+            }
+        }
+        replace_pages(host, n).map(|()| n as u64)
     }
 
     /// The host address range behind guest `[addr, addr + len)`, for native code that DMAs
@@ -327,6 +398,63 @@ impl GuestRam {
     }
 }
 
+impl GuestRam {
+    /// How many bytes of the host pages behind guest `[addr, addr + len)` are resident
+    /// (`mincore`), counting whole host pages; `None` when the range is outside the RAM or the
+    /// call fails. Tells whether freed memory really went back to the host.
+    pub fn resident(&self, addr: u64, len: u64) -> Option<u64> {
+        let off = self.offset(addr, len as usize).ok()?;
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = usize::try_from(page).ok().filter(|&p| p > 0)?;
+        let start = off / page * page;
+        let n = (off + len as usize).next_multiple_of(page).min(self.len as usize) - start;
+        let mut vec = vec![0u8; n.div_ceil(page)];
+        // SAFETY: `start..start + n` lies inside the mapping (page-aligned start, end clamped to
+        // the mapping, whose length is a page multiple) and `vec` holds one byte per page.
+        let rc = unsafe { libc::mincore(self.ptr.add(start).cast(), n, vec.as_mut_ptr().cast()) };
+        (rc == 0).then(|| vec.iter().filter(|&&v| v & 1 != 0).count() as u64 * page as u64)
+    }
+}
+
+/// Replaces `n` bytes of anonymous memory at `host` with fresh zero-fill-on-demand pages, which
+/// releases the old ones. On failure the old pages stay mapped.
+fn replace_pages(host: *mut u8, n: usize) -> Result<()> {
+    // SAFETY: `host..host + n` is page aligned and lies inside a private anonymous mapping this
+    // module owns; MAP_FIXED replaces exactly that range in place, so no other mapping is touched
+    // and the accessors keep pointing at mapped memory.
+    let p = unsafe {
+        libc::mmap(host.cast(), n, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED, -1, 0)
+    };
+    if p == libc::MAP_FAILED {
+        return Err(Error::Mmap(n));
+    }
+    Ok(())
+}
+
+/// The calling process's `phys_footprint` in bytes (Activity Monitor's Memory column, what jetsam
+/// limits), for measuring what [`GuestRam::discard`] gives back. Measured caveat
+/// (`tests/discard_probe.rs`): a page of VM-mapped RAM that both the host and the guest touched
+/// counts twice.
+#[cfg(target_os = "macos")]
+pub fn phys_footprint() -> Option<u64> {
+    // SAFETY: rusage_info_v2 is plain integers, for which all-zeroes is valid.
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    // SAFETY: the buffer is a live rusage_info_v2, the size RUSAGE_INFO_V2 writes.
+    let rc = unsafe { libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, (&mut info as *mut libc::rusage_info_v2).cast()) };
+    (rc == 0).then_some(info.ri_phys_footprint)
+}
+
+/// Resident set size of the calling process in bytes, from `/proc/self/statm`.
+#[cfg(not(target_os = "macos"))]
+pub fn phys_footprint() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    Some(pages * page.max(0) as u64)
+}
+
 impl MemError {
     fn clone_err(&self) -> MemError {
         MemError { addr: self.addr, len: self.len }
@@ -421,6 +549,53 @@ mod tests {
         assert!(ram.write_vectored_to_file(&segs, &file, 0).is_err());
         assert_eq!(std::fs::read(&path).expect("read"), [9u8; 64], "nothing written");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn discard_zeroes_whole_granules_inside_the_range_only() {
+        const B: u64 = 0x4000_0000;
+        let ram = GuestRam::new(B, 0x10_0000).expect("alloc");
+        ram.write(B, &vec![0x5a; 0x10_0000]).expect("fill");
+        // 0x2000..0x1_2000 rounds inward to 0x4000..0x1_0000.
+        assert_eq!(ram.discard(B + 0x2000, 0x1_0000).expect("discard"), 0xc000);
+        let mut back = vec![0u8; 0x10_0000];
+        ram.read(B, &mut back).expect("read");
+        assert!(back[..0x4000].iter().all(|&b| b == 0x5a), "partial head granule kept");
+        assert!(back[0x4000..0x1_0000].iter().all(|&b| b == 0), "whole granules read zero");
+        assert!(back[0x1_0000..].iter().all(|&b| b == 0x5a), "tail kept");
+        // The discarded range is ordinary memory again.
+        ram.write(B + 0x8000, b"again").expect("write");
+        assert_eq!(ram.read_u32(B + 0x8000), Ok(u32::from_le_bytes(*b"agai")));
+        assert_eq!(ram.discard(B + 0x100, 0x3000).expect("small"), 0, "no whole granule");
+        assert!(ram.discard(B + 0xf_c000, 0x8000).is_err(), "past the end");
+    }
+
+    #[test]
+    fn discard_returns_pages_to_the_host() {
+        const B: u64 = 0x4000_0000;
+        const LEN: u64 = 64 << 20;
+        let ram = GuestRam::new(B, LEN).expect("alloc");
+        let before = phys_footprint().expect("footprint");
+        ram.write(B, &vec![1u8; LEN as usize]).expect("touch");
+        let touched = phys_footprint().expect("footprint");
+        assert_eq!(ram.discard(B, LEN).expect("discard"), LEN);
+        let after = phys_footprint().expect("footprint");
+        assert!(touched >= before + LEN * 3 / 4, "touching commits: {before} -> {touched}");
+        assert!(after + LEN * 3 / 4 <= touched, "discard releases: {touched} -> {after}");
+        assert_eq!(ram.resident(B, LEN), Some(0), "no page of the range is resident");
+        assert_eq!(ram.read_u64(B + LEN / 2), Ok(0));
+        assert!(ram.resident(B, LEN).is_some_and(|r| r > 0 && r <= 0x4000), "one page back after a read");
+    }
+
+    #[test]
+    fn resident_counts_touched_pages() {
+        const B: u64 = 0x4000_0000;
+        let ram = GuestRam::new(B, 0x10_0000).expect("alloc");
+        assert_eq!(ram.resident(B, 0x10_0000), Some(0), "untouched");
+        ram.write(B + 0x8000, &[1u8; 0x8000]).expect("touch");
+        let r = ram.resident(B, 0x10_0000).expect("resident");
+        assert!((0x8000..=0x10000).contains(&r), "{r:#x}");
+        assert_eq!(ram.resident(B, 0x20_0000), None, "outside the RAM");
     }
 
     #[test]
