@@ -215,7 +215,7 @@ fn boot(
         let stop = stop.clone();
         std::thread::spawn(move || {
             if signals.recv().is_ok() {
-                stop.store(true, Ordering::SeqCst);
+                emu_vmm::request_stop(&stop);
                 // Device threads blocked in native code (e.g. a wedged renderer) can stall an
                 // orderly teardown; don't let that keep the process alive.
                 std::thread::sleep(std::time::Duration::from_secs(5));

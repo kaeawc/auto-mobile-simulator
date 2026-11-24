@@ -11,13 +11,15 @@
 //! still in it). Allocations take clean space; a background thread clears dirty space in chunks
 //! with the lock released. Only when no clean extent fits does an allocation clear memory
 //! itself, still with the lock released. Both kinds are indexed by size: a lookup is a best fit
-//! in O(log n), not a scan. Clearing is plain stores into the mapping the guest already sees, so
-//! it relies on nothing about how the hypervisor maps the area.
+//! in O(log n), not a scan. The thread gives runs of 1 MiB or more back to the host
+//! ([`GuestRam::discard`]: fresh zero pages for both the host and the guest) and zeroes what's
+//! left with plain stores, so freed gralloc buffers stop costing host memory. Allocations that
+//! clear for themselves zero in place: that memory goes straight back into use.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
-use emu_hvf::GuestRam;
+use emu_hvf::{DISCARD_GRANULE, GuestRam};
 
 use crate::bus::{MmioDevice, le_value, set_le};
 
@@ -61,6 +63,45 @@ mod hma {
 /// Bytes cleared per trip through the lock: an allocation that waits on one stalls for a
 /// fraction of a millisecond, not for a whole freed buffer.
 const CLEAR_CHUNK: u64 = 2 << 20;
+
+/// Freed runs at least this long go back to the host instead of being zeroed in place.
+const DISCARD_MIN: u64 = 1 << 20;
+
+/// Makes `[off, off + len)` of the area read as zero. Long runs give their whole host pages back
+/// ([`GuestRam::discard`]) and zero only the partial pages at the ends; anything shorter, or a
+/// discard that fails, is zeroed in place. Only for free space: the guest must not be using it.
+/// False when the run must never be handed out again: the discard left it unmapped from the
+/// guest ([`emu_hvf::Error::GuestHole`]), so a buffer there would be unreachable.
+#[cfg(test)]
+fn clear(area: &GuestRam, off: u64, len: u64) -> bool {
+    clear_with(area, off, len, GuestRam::discard)
+}
+
+/// How freed runs go back to the host: [`GuestRam::discard`], or a stand-in in tests.
+type Discard = fn(&GuestRam, u64, u64) -> emu_hvf::Result<u64>;
+
+fn clear_with(area: &GuestRam, off: u64, len: u64, discard: Discard) -> bool {
+    let (start, end) = (area.base() + off, area.base() + off + len);
+    if len >= DISCARD_MIN {
+        let (lo, hi) = (start.next_multiple_of(DISCARD_GRANULE), end / DISCARD_GRANULE * DISCARD_GRANULE);
+        if hi > lo {
+            match discard(area, lo, hi - lo) {
+                Ok(_) => {
+                    let _ = area.zero(start, (lo - start) as usize);
+                    let _ = area.zero(hi, (end - hi) as usize);
+                    return true;
+                }
+                Err(e @ emu_hvf::Error::GuestHole { .. }) => {
+                    eprintln!("emu: address space: leaking {len:#x} bytes at offset {off:#x}: {e}");
+                    return false;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    let _ = area.zero(start, len as usize);
+    true
+}
 
 /// Free extents of one kind, indexed by offset (to merge neighbours) and by size (best fit).
 /// Adjacent extents are always merged, so no two touch.
@@ -155,6 +196,7 @@ struct Shared {
     work: Condvar,
     /// Wakes allocations waiting for a chunk someone else is clearing.
     cleared: Condvar,
+    discard: Discard,
 }
 
 impl Shared {
@@ -167,10 +209,13 @@ impl Shared {
         let Some((off, len)) = s.dirty.take_front(CLEAR_CHUNK) else { return s };
         s.clearing += len;
         drop(s);
-        let _ = self.area.zero(self.area.base() + off, len as usize);
+        let reusable = clear_with(&self.area, off, len, self.discard);
         let mut s = self.lock();
         s.clearing -= len;
-        s.clean.insert(off, len);
+        // A run the guest can no longer reach stays out of the allocator for good.
+        if reusable {
+            s.clean.insert(off, len);
+        }
         self.cleared.notify_all();
         s
     }
@@ -197,10 +242,14 @@ impl GoldfishAddressSpace {
     }
 
     fn build(mem: Arc<GuestRam>, area: Arc<GuestRam>, clearer: bool) -> GoldfishAddressSpace {
+        Self::build_with(mem, area, clearer, GuestRam::discard)
+    }
+
+    fn build_with(mem: Arc<GuestRam>, area: Arc<GuestRam>, clearer: bool, discard: Discard) -> GoldfishAddressSpace {
         let mut st = State { page_size: 4096, next_handle: 1, ..Default::default() };
         // The whole area starts untouched, so it all reads as zero.
         st.clean.insert(0, area.len());
-        let shared = Arc::new(Shared { state: Mutex::new(st), area, work: Condvar::new(), cleared: Condvar::new() });
+        let shared = Arc::new(Shared { state: Mutex::new(st), area, work: Condvar::new(), cleared: Condvar::new(), discard });
         let clearer = clearer
             .then(|| {
                 let sh = shared.clone();
@@ -570,6 +619,107 @@ mod tests {
         wr(d, REG_BLOCK_OFFSET_HIGH, (off >> 32) as u32);
         wr(d, REG_COMMAND, CMD_DEALLOCATE_BLOCK);
         rd(d, REG_STATUS) == 0
+    }
+
+    /// Allocates, fills and frees `n` blocks of `size`, then lets the clearing thread finish:
+    /// returns the area's resident bytes with the blocks full and after they were cleared.
+    fn churn(clearer: bool, n: u64, size: u64) -> (u64, u64, Arc<GuestRam>) {
+        let mem = Arc::new(GuestRam::new(RAM, 0x10_0000).expect("ram"));
+        let area = Arc::new(GuestRam::new(AREA, n * size + (1 << 20)).expect("area"));
+        let d = GoldfishAddressSpace::build(mem, area.clone(), clearer);
+        let blocks: Vec<u64> = (0..n).map(|_| block(&d, size).expect("block")).collect();
+        for &off in &blocks {
+            area.write(AREA + off, &vec![0x5a; size as usize]).expect("fill");
+        }
+        let full = area.resident(AREA, area.len()).expect("resident");
+        for &off in &blocks {
+            assert!(unblock(&d, off));
+        }
+        d.settle();
+        let cleared = area.resident(AREA, area.len()).expect("resident");
+        (full, cleared, area)
+    }
+
+    #[test]
+    fn freed_runs_go_back_to_the_host() {
+        // 16 gralloc-sized 4 MiB buffers, freed: the clearer releases their pages.
+        let (full, cleared, area) = churn(true, 16, 4 << 20);
+        assert!(full >= 64 << 20, "filled blocks are resident: {full}");
+        assert_eq!(cleared, 0, "cleared runs went back to the host");
+        assert!(reads_zero(&area, 0, 64 << 20), "and read as zero");
+    }
+
+    #[test]
+    fn short_runs_and_partial_pages_are_zeroed_in_place() {
+        // One freed run shorter than DISCARD_MIN: zeroed with stores, so its pages stay.
+        let (full, cleared, area) = churn(true, 1, 0x8_0000);
+        assert!(full >= 0x8_0000);
+        assert_eq!(cleared, full, "nothing discarded");
+        assert!(reads_zero(&area, 0, 0x8_0000));
+        // A long run that starts and ends inside host pages: those partial pages are zeroed and
+        // stay resident, the whole pages between go back.
+        let a = GuestRam::new(AREA, 4 << 20).expect("area");
+        a.write(AREA, &vec![0x77; 4 << 20]).expect("fill");
+        clear(&a, 0x1000, (2 << 20) + 0x1000);
+        // Measured before reading the run back, which commits pages again.
+        let resident = a.resident(AREA, 4 << 20).expect("resident");
+        assert!(resident <= (2 << 20) + 2 * DISCARD_GRANULE, "inner pages released: {resident:#x}");
+        assert!(reads_zero(&a, 0x1000, (2 << 20) + 0x1000));
+        let mut edge = [0u8; 2];
+        a.read(AREA + 0xfff, &mut edge[..1]).expect("r");
+        a.read(AREA + (2 << 20) + 0x2000, &mut edge[1..]).expect("r");
+        assert_eq!(edge, [0x77, 0x77], "bytes outside the run untouched");
+    }
+
+    #[test]
+    fn a_run_left_unmapped_from_the_guest_is_never_reused() {
+        let a = GuestRam::new(AREA, 4 << 20).expect("area");
+        a.write(AREA, &vec![0x77; 4 << 20]).expect("fill");
+        fn hole(_: &GuestRam, ipa: u64, len: u64) -> emu_hvf::Result<u64> {
+            Err(emu_hvf::Error::GuestHole { ipa, len: len as usize, code: -1 })
+        }
+        fn other(_: &GuestRam, _: u64, _: u64) -> emu_hvf::Result<u64> {
+            Err(emu_hvf::Error::Mmap(0))
+        }
+        assert!(!clear_with(&a, 0, 2 << 20, hole), "leaked");
+        assert!(clear_with(&a, 2 << 20, 2 << 20, other), "any other failure: zeroed in place");
+        assert!(reads_zero(&a, 2 << 20, 2 << 20));
+        // In the device: the clearing thread leaves the run out of the allocator for good.
+        let mem = Arc::new(GuestRam::new(RAM, 0x10_0000).expect("ram"));
+        let area = Arc::new(GuestRam::new(AREA, 4 << 20).expect("area"));
+        let d = GoldfishAddressSpace::build_with(mem, area, true, hole);
+        let off = block(&d, 2 << 20).expect("block");
+        assert_eq!(off, 0);
+        assert!(unblock(&d, off));
+        d.settle();
+        let s = d.shared.lock();
+        assert_eq!(s.clean.by_off, BTreeMap::from([(2 << 20, 2 << 20)]), "only the untouched half");
+        assert!(s.dirty.is_empty() && s.clearing == 0);
+        drop(s);
+        assert_eq!(block(&d, 3 << 20), None, "the hole is never handed out");
+        assert_eq!(block(&d, 2 << 20), Some(2 << 20));
+    }
+
+    /// Before/after numbers: host memory a freed 64 MiB of gralloc buffers keeps, zeroed in place
+    /// (the old clearer) or cleared with `clear`.
+    #[test]
+    #[ignore = "bench: prints numbers"]
+    fn clear_cost() {
+        for (name, discard) in [("zero in place", false), ("clear (discard)", true)] {
+            let a = GuestRam::new(AREA, 64 << 20).expect("area");
+            a.write(AREA, &vec![0x5a; 64 << 20]).expect("fill");
+            let t = std::time::Instant::now();
+            for off in (0..64u64 << 20).step_by(CLEAR_CHUNK as usize) {
+                if discard {
+                    clear(&a, off, CLEAR_CHUNK);
+                } else {
+                    a.zero(AREA + off, CLEAR_CHUNK as usize).expect("zero");
+                }
+            }
+            let took = t.elapsed();
+            let resident = a.resident(AREA, 64 << 20).expect("resident");
+            println!("{name}: 64 MiB in {took:?}, {} MiB still resident", resident >> 20);
+        }
     }
 
     fn reads_zero(area: &GuestRam, off: u64, len: u64) -> bool {

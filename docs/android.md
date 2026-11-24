@@ -346,6 +346,30 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   `-logcat TAGS` or `-logcat-output FILE` is given (through a bounded queue that drops rather
   than stall the console worker; FILE rolls over at 4 MiB). sim-android starts emu with
   `-logcat '*:I' -logcat-output <avd>/simee/logcat.txt`, which the desktop's Android panel shows.
+- **Giving guest memory back to the host.** `GuestRam::discard` uses `hv_vm_unmap`, then
+  `mmap(MAP_FIXED)`, then `hv_vm_map` on whole 16 KiB pages. It is the only method measured that
+  both lowers `phys_footprint` and reads back as zeroes. Measured with a VM in a test (64 MiB,
+  half written by the host, half by the guest; Apple M3 Max, macOS 26.6.2, 2026-11-24; run each
+  with `cargo test -p emu-hvf --test discard_probe -- --ignored --nocapture --exact <name>`):
+
+  | Method | Footprint | Guest reads after | Host reads after | Host and guest share pages after |
+  |---|---|---|---|---|
+  | `madvise(MADV_DONTNEED)` | 66.1 → 66.1 MiB | old data | old data | yes |
+  | `madvise(MADV_FREE)` | 66.1 → 66.1 MiB | old data | old data | yes |
+  | `madvise(MADV_FREE_REUSABLE)` | 66.1 → 34.1 MiB | old data | old data | yes |
+  | `mmap(MAP_FIXED)` alone | 66.1 → 34.1 MiB | old data | zeroes | **no** |
+  | `hv_vm_unmap` + `mmap(MAP_FIXED)` + `hv_vm_map` | 66.1 → 2.0 MiB | zeroes | zeroes | yes |
+
+  - The shipped method costs 30–80 µs per MiB and 0.6–1.9 ms for 32 MiB (`guest_ram_discard_in_a_vm`).
+  - A page that both the host and the guest touched counts twice in `phys_footprint`: the host
+    reading the guest-written half raised it from 66 to 98 MiB, with nothing discarded.
+  - The goldfish address space's clearing thread now discards freed runs of 1 MiB or more. In a
+    model of the device (no guest), freeing 64 MiB of buffers left 64 MiB resident before this
+    change and 0 MiB after (`cargo test -p emu-vmm --lib clear_cost -- --ignored --nocapture`).
+    Not yet measured with real gralloc traffic.
+  - A virtio-balloon or free-page reporting would have to use the same unmap and remap path.
+    `madvise` alone either keeps the old data or doesn't lower the footprint of pages the guest
+    touched.
 
 ## Development
 
