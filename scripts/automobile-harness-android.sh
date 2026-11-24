@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Drives a simee device with AutoMobile through a private daemon (its own socket, PID file and
-# state directories), so no other AutoMobile daemon on the machine is touched. Prints a
+# Drives a simee device with AutoMobile through a private daemon (scripts/automobile-daemon.sh):
+# its own one, or the shared one AM_DAEMON_ENV names (scripts/automobile-farm.sh). Prints a
 # pass/fail line per tool and writes the matrix to <logs>/coverage.tsv.
 #
 #   scripts/automobile-harness-android.sh emulator-5554 [auto-mobile checkout]   # attach to a running simee
@@ -12,18 +12,6 @@ set -euo pipefail
 target=${1:?usage: scripts/automobile-harness-android.sh <emulator-PORT|@avd> [auto-mobile checkout]}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 am_dir=$(cd "${2:-$repo/../auto-mobile}" && pwd)
-entry="$am_dir/src/index.ts"
-[ -f "$entry" ] || { echo "no $entry: not an auto-mobile checkout" >&2; exit 2; }
-
-root=$(mktemp -d "${TMPDIR:-/tmp}/simee-am.XXXXXX")
-sock=$(mktemp -d /tmp/ers-am.XXXX)
-export AUTOMOBILE_DATA_DIR="$root/data" AUTOMOBILE_LOG_DIR="$root/logs" AUTOMOBILE_DB_DIR="$root/db" \
-  AUTOMOBILE_COORDINATION_DIR="$root/coordination" AUTOMOBILE_ADB_SERVER_COORDINATION_DIR="$root/adb" \
-  AUTOMOBILE_AUX_SOCKET_DIR="$sock" AUTOMOBILE_DAEMON_SOCKET_PATH="$sock/d.sock" \
-  AUTOMOBILE_DAEMON_PID_FILE_PATH="$root/daemon.pid" AUTOMOBILE_DAEMON_LOCK_FILE_PATH="$root/daemon.lock" \
-  AUTOMOBILE_DAEMON_TOKEN_FILE_PATH="$root/daemon.token" AUTOMOBILE_DAEMON_LAUNCH_LOG_PATH="$root/launch.log" \
-  AUTOMOBILE_PRIVATE_DAEMON_ORPHAN_IDLE_MS=0 AUTOMOBILE_APPEARANCE_SYNC=off AUTOMOBILE_PROJECT_ROOT="$am_dir"
-mkdir -p "$AUTOMOBILE_DATA_DIR" "$AUTOMOBILE_LOG_DIR" "$AUTOMOBILE_DB_DIR" "$AUTOMOBILE_COORDINATION_DIR" "$AUTOMOBILE_ADB_SERVER_COORDINATION_DIR"
 
 if [[ "$target" == @* ]]; then
   # Let AutoMobile launch the AVD itself; the SDK overlay makes its "emulator" simee.
@@ -35,23 +23,16 @@ else
   acquire=(getAndroid --device-id "$target")
 fi
 
-am() { (cd "$root" && bun "$entry" --cli "$@"); }
+log=$(mktemp -d "${TMPDIR:-/tmp}/simee-am-run.XXXXXX")
+. "$repo/scripts/automobile-daemon.sh"
+session=
 cleanup() {
-  # Stop the private daemon through its own socket, PID and lock paths (still exported) before
-  # its socket directory goes: removing the directory doesn't stop it, and an orphan keeps one of
-  # AutoMobile's 3000-3010 ports. The PID file is JSON; its pid is the fallback if stop fails.
-  if [ -f "$AUTOMOBILE_DAEMON_PID_FILE_PATH" ]; then
-    (cd "$root" && bun "$entry" --daemon stop) </dev/null >>"$root/daemon-stop.log" 2>&1 || true
-    pid=$(jq -r '.pid // empty' "$AUTOMOBILE_DAEMON_PID_FILE_PATH" 2>/dev/null || true)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-      echo "daemon $pid didn't stop on request; sent SIGTERM" >&2
-    fi
-  fi
-  rm -rf "$sock"
-  echo "logs: $root (coverage: $root/coverage.tsv)"
+  am_release "$session"
+  am_daemon_down
+  echo "logs: $log (coverage: $log/coverage.tsv)"
 }
 trap cleanup EXIT
+am_daemon_up "$am_dir"
 
 echo "== ${acquire[*]}"
 out=$(am "${acquire[@]}" 2>&1) || { echo "$out" | tail -30; echo "acquire failed" >&2; exit 1; }
@@ -106,7 +87,7 @@ tools=(
   "deviceSnapshot --action capture --snapshotName simee-harness"
 )
 pass=0; fail=0
-printf 'tool\tresult\n' > "$root/coverage.tsv"
+printf 'tool\tresult\n' > "$log/coverage.tsv"
 for line in "${tools[@]}"; do
   # HARNESS_ONLY=<regex> runs just the matching tools.
   if [ -n "${HARNESS_ONLY:-}" ] && ! [[ "$line" =~ $HARNESS_ONLY ]]; then continue; fi
@@ -115,10 +96,10 @@ for line in "${tools[@]}"; do
     result=pass; pass=$((pass + 1))
   else
     result=fail; fail=$((fail + 1))
-    echo "$out" | tail -8 > "$root/fail-$(printf '%s' "$line" | tr -c 'A-Za-z0-9' _).log"
+    echo "$out" | tail -8 > "$log/fail-$(printf '%s' "$line" | tr -c 'A-Za-z0-9' _).log"
   fi
   printf '%-40s %s\n' "$line" "$result"
-  printf '%s\t%s\n' "$line" "$result" >> "$root/coverage.tsv"
+  printf '%s\t%s\n' "$line" "$result" >> "$log/coverage.tsv"
 done
 echo "== $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
