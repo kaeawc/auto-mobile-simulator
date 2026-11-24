@@ -7,7 +7,7 @@ fn cache_file(lib64: &Path) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let stamp = std::fs::metadata(lib64.join("libgfxstream_backend.dylib")).and_then(|m| m.modified()).ok()?;
     let secs = stamp.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    Some(PathBuf::from(home).join(format!("Library/Caches/emu-rs/moltenvk-{secs}")))
+    Some(PathBuf::from(home).join(format!("Library/Caches/simee/moltenvk-{secs}")))
 }
 
 /// Cached verdict, probing (≈1 s, once) when unknown.

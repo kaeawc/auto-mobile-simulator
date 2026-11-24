@@ -3319,21 +3319,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sim-rs-desktop"
-version = "0.1.0"
-dependencies = [
- "rune",
- "serde",
- "serde_json",
- "sim-android",
- "sim-api",
- "sim-core",
- "sim-coresim",
- "sim-debug",
- "sim-netshape",
-]
-
-[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3354,6 +3339,21 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "simee-desktop"
+version = "0.1.0"
+dependencies = [
+ "rune",
+ "serde",
+ "serde_json",
+ "sim-android",
+ "sim-api",
+ "sim-core",
+ "sim-coresim",
+ "sim-debug",
+ "sim-netshape",
+]
 
 [[package]]
 name = "simplecss"

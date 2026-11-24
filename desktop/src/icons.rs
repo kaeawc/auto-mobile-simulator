@@ -4,7 +4,7 @@ use rune::Icon;
 
 macro_rules! icons {
     ($($name:ident = $id:literal, $body:literal;)*) => {
-        $(pub static $name: Icon = Icon { name: concat!("sim-rs-", $id), view: 24.0, body: $body };)*
+        $(pub static $name: Icon = Icon { name: concat!("simee-", $id), view: 24.0, body: $body };)*
     };
 }
 

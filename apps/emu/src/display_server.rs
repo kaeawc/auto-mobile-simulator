@@ -1,10 +1,10 @@
 //! Live display and input for local front ends (the desktop app) over a unix socket at
-//! `<avd>/emu-rs/display.sock`. The protocol (frame records one way, input lines the other) is
+//! `<avd>/simee/display.sock`. The protocol (frame records one way, input lines the other) is
 //! `sim_core::stream`, shared with the clients that read it. A frame goes out when the guest posted
 //! a new one, at most every `MIN_INTERVAL`, read back once however many clients and screenshots
 //! want it ([`FrameStore::latest`]).
 //!
-//! A client that sends `shm` gets its frames through a shared ring: a file in `<avd>/emu-rs/`
+//! A client that sends `shm` gets its frames through a shared ring: a file in `<avd>/simee/`
 //! this process maps, writes each frame into (downscaled straight into its slot), and announces
 //! with a 32-byte record; only that record crosses the socket. Other clients get the RGBA rows on
 //! the socket, as before.
@@ -55,7 +55,7 @@ pub fn start(
     inputs: Arc<Mutex<Option<emu_vmm::Inputs>>>,
     stop: Arc<AtomicBool>,
 ) -> Option<DisplayServer> {
-    let dir = avd_dir.join("emu-rs");
+    let dir = emu_avd::state_dir(avd_dir);
     remove_stale_rings(&dir);
     let path = dir.join("display.sock");
     let _ = std::fs::remove_file(&path);
@@ -315,7 +315,7 @@ fn shared_frame(display: &FrameStore, max_width: u32, frame: u64, ring: &mut Opt
 }
 
 /// A frame ring this process writes (layout in `sim_core::stream::ring`): a private file in the
-/// AVD's `emu-rs/`, removed when the ring is dropped.
+/// AVD's `simee/`, removed when the ring is dropped.
 struct Ring {
     path: PathBuf,
     map: SharedMap,
@@ -457,7 +457,7 @@ mod tests {
         let root = ["/dev/shm", "/tmp"].into_iter().map(PathBuf::from).find(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir);
         let dir = root.join(format!("emu-ds-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("emu-rs")).expect("dir");
+        std::fs::create_dir_all(dir.join("simee")).expect("dir");
         dir
     }
 
@@ -507,7 +507,7 @@ mod tests {
         }
 
         fn rings(&self) -> Vec<String> {
-            let Ok(entries) = std::fs::read_dir(self.dir.join("emu-rs")) else { return Vec::new() };
+            let Ok(entries) = std::fs::read_dir(self.dir.join("simee")) else { return Vec::new() };
             let mut names: Vec<String> =
                 entries.flatten().filter_map(|e| e.file_name().into_string().ok()).filter(|n| n.ends_with(".ring")).collect();
             names.sort();
@@ -612,7 +612,7 @@ mod tests {
     #[test]
     fn rings_skip_taken_names_and_the_server_removes_its_own() {
         let rig = Rig::new("names");
-        let dir = rig.dir.join("emu-rs");
+        let dir = rig.dir.join("simee");
         // Names a previous process with this PID left behind.
         let next = RING_IDS.load(Ordering::Relaxed);
         for id in next..next + 3 {
@@ -652,7 +652,7 @@ mod tests {
         let mut frames = Frames::new(reader);
         std::thread::sleep(Duration::from_millis(50));
         // Nowhere to make a ring: the stream says so and falls back to the socket.
-        std::fs::remove_dir_all(rig.dir.join("emu-rs")).expect("rm");
+        std::fs::remove_dir_all(rig.dir.join("simee")).expect("rm");
         rig.store.posted(3, 2);
         let (h, rgba) = frames.next_frame().expect("frame");
         assert_eq!((h.width, h.height, h.frame, rgba), (3, 2, 1, pixels(3, 2, 1)));
@@ -723,11 +723,11 @@ mod tests {
         // PIDs never reach this (Linux caps them at 2^22, macOS at 99999); our own ring stays.
         let mine = format!("frames-{}-0.ring", std::process::id());
         for name in ["frames-2147483646-0.ring", mine.as_str(), "frames-x-1.ring", "frames-2147483646-0.png"] {
-            std::fs::write(dir.join("emu-rs").join(name), b"").expect("write");
+            std::fs::write(dir.join("simee").join(name), b"").expect("write");
         }
-        remove_stale_rings(&dir.join("emu-rs"));
+        remove_stale_rings(&dir.join("simee"));
         let mut left: Vec<String> =
-            std::fs::read_dir(dir.join("emu-rs")).expect("dir").flatten().filter_map(|e| e.file_name().into_string().ok()).collect();
+            std::fs::read_dir(dir.join("simee")).expect("dir").flatten().filter_map(|e| e.file_name().into_string().ok()).collect();
         left.sort();
         assert_eq!(left, ["frames-2147483646-0.png", mine.as_str(), "frames-x-1.ring"]);
         std::fs::remove_dir_all(&dir).ok();

@@ -1,18 +1,18 @@
-# auto-mobile tool matrix on a sim-rs-booted device
+# auto-mobile tool matrix on a simee-booted device
 
-Date: 2026-11-22. Device: `sim-rs-harness` (D678D16A-EEDB-4AC6-BD22-FEE35C863FC8), iPhone 17, iOS 26.5,
-booted headless by sim-rs. auto-mobile 0.0.95+g9064fa8e989a run from source (`bun src/index.ts --cli`)
+Date: 2026-11-22. Device: `simee-harness` (D678D16A-EEDB-4AC6-BD22-FEE35C863FC8), iPhone 17, iOS 26.5,
+booted headless by simee. auto-mobile 0.0.95+g9064fa8e989a run from source (`bun src/index.ts --cli`)
 through one private daemon (its own socket, PID, lock, token, data, log and DB paths, same setup as
 `scripts/automobile-harness.sh`), with Xcode 26.6. The host load average ran from 470 to 730 during the sweep.
 
 Target app: auto-mobile's `ios/Playground`, built Debug for the simulator into a scratch DerivedData
-folder, installed with `sim-rs install`, launched with `sim-rs launch` and `launchApp`. The build used
+folder, installed with `simee install`, launched with `simee launch` and `launchApp`. The build used
 `xcodebuild` directly, with the same flags as `scripts/ios/xcode-build.sh` (generic iOS Simulator
 destination, `CODE_SIGNING_ALLOWED=NO`, `ARCHS=arm64`, `ONLY_ACTIVE_ARCH=YES`,
 `COMPILER_INDEX_STORE_ENABLE=NO`). The script itself was not run because it regenerates every tracked
 `ios/*/project.pbxproj` with xcodegen.
 
-Comparison: a temporary `sim-rs-compare` device (iPhone 17, iOS 26.5) booted with `xcrun simctl boot`,
+Comparison: a temporary `simee-compare` device (iPhone 17, iOS 26.5) booted with `xcrun simctl boot`,
 with Playground installed by `simctl install` and acquired in the same private daemon. Every failure
 that could plausibly depend on how the device was booted was re-run there. The device was deleted afterwards.
 
@@ -23,23 +23,23 @@ that could plausibly depend on how the device was booted was re-run there. The d
 | Result | Count |
 | --- | --- |
 | pass | 67 |
-| partial (some actions pass, the rest fail for reasons unrelated to sim-rs) | 1 |
+| partial (some actions pass, the rest fail for reasons unrelated to simee) | 1 |
 | refused on iOS by design (platform or form factor) | 6 |
-| fail (host setup, the target app, CLI limits or auto-mobile; none caused by sim-rs) | 11 |
+| fail (host setup, the target app, CLI limits or auto-mobile; none caused by simee) | 11 |
 | skipped (Android-only, or would create or delete devices) | 24 |
 
-**No failure was caused by the device being booted or driven by sim-rs.** Every failure that was
+**No failure was caused by the device being booted or driven by simee.** Every failure that was
 re-run on the simctl-booted device failed the same way, with the same error text.
 
 ## Matrix
 
-"Same on simctl" means the tool was re-run on `sim-rs-compare` with the same result.
+"Same on simctl" means the tool was re-run on `simee-compare` with the same result.
 
 ### Observation and inspection
 
 | Tool | Params | Result | Notes / cause |
 | --- | --- | --- | --- |
-| getApple | `--udid <harness>` | pass | `automationReady` (bootCompleted, runnerReady, sessionBound) in 36 s on first acquire, 34 s after a fresh `sim-rs boot`. The simctl device took 13 s (host load varies; not attributed). |
+| getApple | `--udid <harness>` | pass | `automationReady` (bootCompleted, runnerReady, sessionBound) in 36 s on first acquire, 34 s after a fresh `simee boot`. The simctl device took 13 s (host load varies; not attributed). |
 | observe | default; `--waitFor {"for":"appear","text":"Biometrics"}`; `--layer prototype` | pass | Screen 402x874 pt, SDK safe-area insets (top 62, bottom 34), `screenIdentity` from the SDK. |
 | hitTest | `--x 200 --y 300` | pass | First candidate: `Preferences` UITableViewCell. |
 | listApps | default | pass | 38 apps, Playground included. |
@@ -51,13 +51,13 @@ re-run on the simctl-booted device failed the same way, with the same error text
 | getDeepLinks | Playground; `com.apple.mobilesafari` | pass | Playground has no URL schemes. Safari lists http/https/etc. |
 | getAppPermissions | Playground; `["photos"]` | pass | |
 | getNotificationPolicy | Playground | pass | Warns that the app never requested authorization. |
-| getLogs | `--maxLines 20`; `--buffers ["crash"] --since {"seconds":1800}` | pass | `--since sessionStart` timed out twice when the session was about 50 min old: `Unified log collection timed out after 20000ms`. On the simctl device, with a 63 s old session, it passed. Cause: log window size plus host load, not sim-rs. |
+| getLogs | `--maxLines 20`; `--buffers ["crash"] --since {"seconds":1800}` | pass | `--since sessionStart` timed out twice when the session was about 50 min old: `Unified log collection timed out after 20000ms`. On the simctl device, with a 63 s old session, it passed. Cause: log window size plus host load, not simee. |
 | compareScreenshot | `record`, then `compare` baseline `simrs-home` | pass | 1206x2622, diffRatio 0. |
 | snapshotOf | `--rectangle {16,100,386,300}` | pass | 1110x600 PNG. |
 | accessibility | read; `--voiceover true`; `--voiceover false` | pass | VoiceOver turned on and then off; read back as `voiceover` / `unknown`. |
 | accessibilityAudit | `--appId Playground --maxIssues 5` | pass | engine xcuitest, 2 issues. `--failOn` is rejected for this engine (usage error). |
 | doctor | `--ios true` | pass | The harness CtrlProxy runner is `compatible`. Warnings concern only the developer account and host fleet pressure. |
-| getSessionRequirementCapability | ios requirement | fail | `This daemon is not running the session broker; start it in session-broker mode.` Daemon configuration, not sim-rs. |
+| getSessionRequirementCapability | ios requirement | fail | `This daemon is not running the session broker; start it in session-broker mode.` Daemon configuration, not simee. |
 
 ### Gestures and input
 
@@ -74,15 +74,15 @@ re-run on the simctl-booted device failed the same way, with the same error text
 | multiTouch | 2-finger tap at 50%/50% | pass | |
 | shake | default | pass | |
 | rotate | landscape, then portrait | pass | "Successfully rotated from portrait to landscape" and back. |
-| sendKeys | type `Héllo sim-rs 123` into Name; clear + type + tab | pass | Unicode typed and read back (`verified: true`). |
+| sendKeys | type `Héllo simee 123` into Name; clear + type + tab | pass | Unicode typed and read back (`verified: true`). |
 | selectAllText | focused Name field | pass | |
 | keyboard | `detect`, `close`, `listProfiles` | pass | detect and close pass. listProfiles is Android-only, by design. |
 | clipboard | `copy`, `get`, `clear` | pass | `get` returned "simrs clip". |
-| pressButton | home, back, volume_up, volume_down, power, action, camera | pass (partial) | home/back/volume/power pass. home failed once right after recentApps (foreground verification looked for the App Switcher) and passed on retry. **action**: `Button press outcome is indeterminate ... (Press button timed out after 5000ms)`. **camera**: `camera button requires a device with Camera Control`. Both are the same on simctl, so this is auto-mobile/runner behavior, not sim-rs. |
+| pressButton | home, back, volume_up, volume_down, power, action, camera | pass (partial) | home/back/volume/power pass. home failed once right after recentApps (foreground verification looked for the App Switcher) and passed on retry. **action**: `Button press outcome is indeterminate ... (Press button timed out after 5000ms)`. **camera**: `camera button requires a device with Camera Control`. Both are the same on simctl, so this is auto-mobile/runner behavior, not simee. |
 | wakeAndUnlock | default | pass | "no swipe was needed". |
 | homeScreen | default | pass | |
-| recentApps | default | pass | Passed twice on the sim-rs device. **Failed twice on the simctl device** (`iOS App Switcher was not detected after the gesture`). An auto-mobile flake, not a sim-rs gap. |
-| highlight | `--text Discover` | fail | `Expected one visible Simulator or Device Hub window named sim-rs-harness, found 0.` Same on simctl (`... named sim-rs-compare, found 0`). Needs a visible Simulator.app window. See gaps. |
+| recentApps | default | pass | Passed twice on the simee device. **Failed twice on the simctl device** (`iOS App Switcher was not detected after the gesture`). An auto-mobile flake, not a simee gap. |
+| highlight | `--text Discover` | fail | `Expected one visible Simulator or Device Hub window named simee-harness, found 0.` Same on simctl (`... named simee-compare, found 0`). Needs a visible Simulator.app window. See gaps. |
 | systemAlerts | `get`, `setPolicy allow`, `clear` | pass | |
 | siri | `--phrase "What time is it"` | pass | |
 
@@ -95,8 +95,8 @@ re-run on the simctl-booted device failed the same way, with the same error text
 | terminateApp | Playground | pass | |
 | appLifecycle | `background`, then `killBackgrounded` | pass | |
 | crashApp | Playground | pass | "via ios_simulator_sigabrt (OS crash confirmed)". |
-| uninstallApp | Playground | pass | `sim-rs apps` confirmed it was gone. |
-| installApp | Playground.app from DerivedData | pass | `sim-rs apps` confirmed it was back. |
+| uninstallApp | Playground | pass | `simee apps` confirmed it was gone. |
+| installApp | Playground.app from DerivedData | pass | `simee apps` confirmed it was back. |
 | putAppFile | app_containers/documents `simrs/a.log` | pass | |
 | resetAppLogs | documents `["simrs/a.log"]` | pass | |
 | executePlan | `--platform ios`, 3 steps (launchApp, tapOn Settings, tapOn Discover) | pass | 3/3 steps. `platform` is required on the CLI. |
@@ -123,7 +123,7 @@ re-run on the simctl-booted device failed the same way, with the same error text
 | setPosture | `--posture closed` | refused | "This iOS simulator is not a foldable device." |
 | setActiveDevice | `--deviceId <harness> --platform ios` | pass | |
 | setToolEnabled | `--toolName highlight --enabled true` | pass | |
-| killDevice | `{"name":"sim-rs-harness",...}` | pass | Shut the device down. `sim-rs boot` brought it back in 10 s. getApple, launchApp, tapOn, observe and `sim-rs screenshot` all worked afterwards. |
+| killDevice | `{"name":"simee-harness",...}` | pass | Shut the device down. `simee boot` brought it back in 10 s. getApple, launchApp, tapOn, observe and `simee screenshot` all worked afterwards. |
 
 ### Notifications, biometrics, telephony, audio, performance, recording, prototypes
 
@@ -139,8 +139,8 @@ re-run on the simctl-booted device failed the same way, with the same error text
 | captureAudio | `--seconds 2` | fail | `The host default output 'MacBook Pro Speakers' is not a loopback device`. Host setup. |
 | performanceTrace | `start --template hitches` | fail | `xctrace with Xcode 26.6 never finishes saving a trace on an iOS 26.5 simulator ... Run AutoMobile with Xcode 27.x`. Host toolchain; auto-mobile gates it on the version. |
 | performanceAudit | `--appId Playground` | refused | `On-demand audits run on Android only.` |
-| videoRecording | start (maxDuration 30), drive with `sim-rs swipe` and `sim-rs tap`, stop | pass | MP4 1206x2622, 200 frames, 2.7 MB. sim-rs input during recording was captured. |
-| prototype | `show` text spec, `status`, `dismiss` | pass | Required `launchApp --prototype true`. `observe --layer prototype` saw "Hello sim-rs". |
+| videoRecording | start (maxDuration 30), drive with `simee swipe` and `simee tap`, stop | pass | MP4 1206x2622, 200 frames, 2.7 MB. simee input during recording was captured. |
+| prototype | `show` text spec, `status`, `dismiss` | pass | Required `launchApp --prototype true`. `observe --layer prototype` saw "Hello simee". |
 | exportPrototypeWeb | `--id simrs` | pass | 26 KB HTML. |
 | focusNavigate | `--until {"text":"Biometrics"}` | refused | Android and tvOS only. |
 | rotateCrown | `--delta 0.25` | refused | watchOS only. |
@@ -153,20 +153,20 @@ re-run on the simctl-booted device failed the same way, with the same error text
 | rotaryScroll, ambient, wearSurface, glassesInput | Wear OS / Android XR only |
 | getAndroid | Android acquisition |
 | provisionDevice | Creates devices; out of scope (would add to the shared device inventory) |
-| deleteDevice | Permanently deletes a device; not run on the harness device, which other sim-rs work expects to exist |
+| deleteDevice | Permanently deletes a device; not run on the harness device, which other simee work expects to exist |
 
-## sim-rs cross-check
+## simee cross-check
 
-After the auto-mobile sweep, every sim-rs command still worked on the device: `terminate`, `launch`
+After the auto-mobile sweep, every simee command still worked on the device: `terminate`, `launch`
 (printed a pid), `tap` (the Files tab opened), `screenshot`, `type`, `button home`, `appearance`,
-`location`, `open-url`, `privacy grant camera`, `memory-warning`. `sim-rs install` was the only install
-path for the first Playground install, and `sim-rs boot` re-booted the device after `killDevice`.
-auto-mobile then acquired and drove the freshly sim-rs-booted device without problems. Inputs sent with
-sim-rs during an auto-mobile `videoRecording` showed up in the recording.
+`location`, `open-url`, `privacy grant camera`, `memory-warning`. `simee install` was the only install
+path for the first Playground install, and `simee boot` re-booted the device after `killDevice`.
+auto-mobile then acquired and drove the freshly simee-booted device without problems. Inputs sent with
+simee during an auto-mobile `videoRecording` showed up in the recording.
 
-## sim-rs gaps found
+## simee gaps found
 
-No auto-mobile capability failed on the sim-rs-booted device and passed on the simctl-booted one.
+No auto-mobile capability failed on the simee-booted device and passed on the simctl-booted one.
 `getApple` returned the same capability inventory for both devices. After the daemon had seen
 both, it also returned the same enabled and gated tool lists; the difference on first acquire came
 from daemon state, and re-acquiring the harness gave the same lists as the compare device.
@@ -174,19 +174,19 @@ from daemon state, and re-acquiring the harness gave the same lists as the compa
 Differences worth tracking:
 
 1. **No Simulator-window equivalent for `highlight`.** auto-mobile draws highlights over a visible
-   Simulator.app (or Device Hub) window that has the device's name. A headless sim-rs device has none:
-   `Expected one visible Simulator or Device Hub window named sim-rs-harness, found 0.` A headless
-   simctl-booted device fails the same way, so this is not specific to sim-rs. But if sim-rs is meant to
-   replace Simulator.app, then the sim-rs desktop window, or a headless overlay hook, would need to be
-   something auto-mobile can find. Not tested with the sim-rs desktop window open.
+   Simulator.app (or Device Hub) window that has the device's name. A headless simee device has none:
+   `Expected one visible Simulator or Device Hub window named simee-harness, found 0.` A headless
+   simctl-booted device fails the same way, so this is not specific to simee. But if simee is meant to
+   replace Simulator.app, then the simee desktop window, or a headless overlay hook, would need to be
+   something auto-mobile can find. Not tested with the simee desktop window open.
 2. **Acquisition time (unconfirmed).** `getApple` reached `automationReady` in 36 s and 34 s on the
-   sim-rs device and 13 s on the simctl device. The host load average was 470 to 730 and changed
+   simee device and 13 s on the simctl device. The host load average was 470 to 730 and changed
    minute to minute, and the CtrlProxy runner state differed. One sample each, so this is not
-   attributed to sim-rs. Worth re-measuring on a quiet host.
+   attributed to simee. Worth re-measuring on a quiet host.
 
-Things that worked the same on both, or that sim-rs did better:
-- Observe insets: the sim-rs device reported SDK safe-area insets (top 62, bottom 34). The simctl device, right after `simctl install` + `launchApp`, reported `insets.available: false` (heuristic, all zero) on two reads. This is probably SDK connection timing on the new device, not a sim-rs effect.
-- `recentApps` passed on sim-rs and failed twice on simctl (auto-mobile flake).
+Things that worked the same on both, or that simee did better:
+- Observe insets: the simee device reported SDK safe-area insets (top 62, bottom 34). The simctl device, right after `simctl install` + `launchApp`, reported `insets.available: false` (heuristic, all zero) on two reads. This is probably SDK connection timing on the new device, not a simee effect.
+- `recentApps` passed on simee and failed twice on simctl (auto-mobile flake).
 
 ## Reproducing
 

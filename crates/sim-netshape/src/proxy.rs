@@ -106,7 +106,7 @@ impl Proxy {
             connections: AtomicU64::new(0),
         });
         let accept = shared.clone();
-        std::thread::Builder::new().name("sim-rs-proxy".into()).spawn(move || {
+        std::thread::Builder::new().name("simee-proxy".into()).spawn(move || {
             for stream in listener.incoming() {
                 if accept.stop.load(Ordering::Relaxed) {
                     break;

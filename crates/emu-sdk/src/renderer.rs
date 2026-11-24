@@ -1,7 +1,7 @@
 //! The host renderer (gfxstream), fetched on demand from the SDK's `emulator` package.
 //!
 //! Only the renderer's `lib64` is unpacked (minus the stock emulator's Qt UI libraries), into
-//! `<sdk>/emu-rs/renderer/<revision>/lib64`, never `<sdk>/emulator`: sdkmanager keeps tracking
+//! `<sdk>/simee/renderer/<revision>/lib64`, never `<sdk>/emulator`: sdkmanager keeps tracking
 //! its own packages, and a later real emulator install doesn't collide with this one. A marker
 //! file records what was installed; `current` links to the newest revision so a build-time rpath
 //! (`apps/emu/build.rs`) can name a stable path.
@@ -28,12 +28,12 @@ pub const MARKER: &str = "renderer.properties";
 /// Symlink to the newest installed revision.
 pub const CURRENT: &str = "current";
 
-/// `<sdk>/emu-rs/renderer`.
+/// `<sdk>/simee/renderer`.
 pub fn root(sdk_root: &Path) -> PathBuf {
-    sdk_root.join("emu-rs/renderer")
+    sdk_root.join("simee/renderer")
 }
 
-/// `<sdk>/emu-rs/renderer/<revision>`.
+/// `<sdk>/simee/renderer/<revision>`.
 pub fn dir(sdk_root: &Path, revision: Revision) -> PathBuf {
     root(sdk_root).join(revision.to_string())
 }
@@ -88,7 +88,7 @@ impl FromStr for Marker {
     }
 }
 
-/// A renderer installed under `<sdk>/emu-rs/renderer`.
+/// A renderer installed under `<sdk>/simee/renderer`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Installed {
     pub dir: PathBuf,

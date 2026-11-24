@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Boot one AVD and measure it, the same way for emu-rs and the stock emulator, so results compare.
+# Boot one AVD and measure it, the same way for simee and the stock emulator, so results compare.
 #
 #   scripts/android-bench.sh <label> <avd> [emu|stock] [extra args...]   -> one key=value line, also in bench/<label>.result
 #

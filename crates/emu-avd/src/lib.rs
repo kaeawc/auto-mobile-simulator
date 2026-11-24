@@ -103,7 +103,7 @@ pub struct Avd {
     pub config: BTreeMap<String, String>,
     pub sysdir: PathBuf,
     /// The SDK the image came from (holds the gfxstream renderer in `emulator/lib64` or
-    /// `emu-rs/renderer/<revision>/lib64`).
+    /// `simee/renderer/<revision>/lib64`).
     pub sdk_root: Option<PathBuf>,
 }
 
@@ -454,6 +454,15 @@ impl Env {
     }
 }
 
+/// emu's own state under an AVD or SDK directory: `<avd>/simee/` (disks, logs, display socket,
+/// frame rings) and `<sdk>/simee/renderer/`.
+pub const STATE_DIR: &str = "simee";
+
+/// `<avd>/simee`: an AVD's emu state.
+pub fn state_dir(avd_dir: &Path) -> PathBuf {
+    avd_dir.join(STATE_DIR)
+}
+
 /// Where running emulators advertise themselves (`pid_<pid>.ini`), as the SDK tools look for them.
 pub fn running_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Caches/TemporaryItems/avd/running"))
@@ -467,8 +476,8 @@ pub struct Running {
     pub console_port: u16,
     pub adb_port: u16,
     pub avd_dir: Option<PathBuf>,
-    /// emu-rs wrote it (the stock emulator writes the same file without `emulator=emu-rs`).
-    pub emu_rs: bool,
+    /// simee wrote it (the stock emulator writes the same file without `emulator=simee`).
+    pub simee: bool,
 }
 
 impl Running {
@@ -488,7 +497,7 @@ impl Running {
             console_port,
             adb_port: kv.get("port.adb").and_then(|p| p.parse().ok()).unwrap_or(console_port + 1),
             avd_dir: kv.get("avd.dir").map(PathBuf::from),
-            emu_rs: kv.get("emulator").is_some_and(|e| e == "emu-rs"),
+            simee: kv.get("emulator").is_some_and(|e| e == "simee"),
         })
     }
 
@@ -575,13 +584,13 @@ mod tests {
 
     #[test]
     fn running_advertisements_parse() {
-        let text = "port.serial=5554\nport.adb=5555\navd.name=pixel\navd.dir=/a/pixel.avd\nemulator=emu-rs\n";
+        let text = "port.serial=5554\nport.adb=5555\navd.name=pixel\navd.dir=/a/pixel.avd\nemulator=simee\n";
         let r = Running::parse("pid_42.ini", text).expect("parsed");
-        assert_eq!((r.pid, r.avd_name.as_str(), r.console_port, r.adb_port, r.emu_rs), (42, "pixel", 5554, 5555, true));
+        assert_eq!((r.pid, r.avd_name.as_str(), r.console_port, r.adb_port, r.simee), (42, "pixel", 5554, 5555, true));
         assert_eq!(r.serial(), "emulator-5554");
         assert_eq!(r.avd_dir.as_deref(), Some(Path::new("/a/pixel.avd")));
         let stock = Running::parse("pid_7.ini", "port.serial=5556\navd.name=other\n").expect("stock");
-        assert_eq!((stock.adb_port, stock.emu_rs), (5557, false));
+        assert_eq!((stock.adb_port, stock.simee), (5557, false));
         assert_eq!(Running::parse("notes.txt", text), None);
         assert_eq!(Running::parse("pid_1.ini", "avd.name=x\n"), None);
         let me = Running { pid: std::process::id() as i32, ..r };

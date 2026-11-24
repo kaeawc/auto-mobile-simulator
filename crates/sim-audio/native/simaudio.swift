@@ -1,4 +1,4 @@
-// sim-rs host audio helper (built on demand by sim-audio; macOS 14.2+ public Core Audio only).
+// simee host audio helper (built on demand by sim-audio; macOS 14.2+ public Core Audio only).
 //
 //   simaudio devices
 //       JSON: every host audio device (id, uid, name, input/output channels).
@@ -142,13 +142,13 @@ func tap(root: pid_t, out: String?, mute: Bool) {
     }
     func start(_ procs: [AudioObjectID]) -> Session? {
         let desc = CATapDescription(stereoMixdownOfProcesses: procs)
-        desc.name = "sim-rs device tap"
+        desc.name = "simee device tap"
         desc.isPrivate = true
         desc.muteBehavior = mute ? .muted : .unmuted
         let s = Session()
         guard AudioHardwareCreateProcessTap(desc, &s.tap) == 0 else { return nil }
         let agg: [String: Any] = [
-            kAudioAggregateDeviceNameKey: "sim-rs device tap", kAudioAggregateDeviceUIDKey: "sim-rs-tap-\(UUID().uuidString)",
+            kAudioAggregateDeviceNameKey: "simee device tap", kAudioAggregateDeviceUIDKey: "simee-tap-\(UUID().uuidString)",
             kAudioAggregateDeviceIsPrivateKey: true, kAudioAggregateDeviceTapAutoStartKey: true,
             kAudioAggregateDeviceTapListKey: [[kAudioSubTapUIDKey: str(s.tap, kAudioTapPropertyUID), kAudioSubTapDriftCompensationKey: true]],
         ]

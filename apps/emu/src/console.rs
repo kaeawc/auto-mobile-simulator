@@ -30,7 +30,7 @@ pub struct ConsoleInfo {
     pub car: Option<Arc<emu_vmm::pipe::car::Car>>,
 }
 
-/// emu-rs extension (stock has no console command for the vehicle HAL; its car controls live
+/// simee extension (stock has no console command for the vehicle HAL; its car controls live
 /// in the UI and gRPC): `car set <property> [<area>] <value>`, `car get <property> [<area>]`,
 /// `car list` (every property's current value, from the guest) and `car names`. Properties
 /// are VHAL names (`GEAR_SELECTION`, or short `gear`, `speed`, `ignition`, `night`,
@@ -159,7 +159,7 @@ fn screenshot(info: &ConsoleInfo, path: Option<&str>) -> String {
         return "KO: the scanout frame couldn't be read".into();
     };
     let (width, height, frame, png) = shot;
-    let path = path.map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join(format!("emu-rs-{}.png", std::process::id())));
+    let path = path.map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join(format!("simee-{}.png", std::process::id())));
     match png.and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string())) {
         Ok(()) => format!("{} ({}x{}, frame {})\r\nOK", path.display(), width, height, frame),
         Err(e) => format!("KO: {e}"),
@@ -266,7 +266,7 @@ fn power(info: &ConsoleInfo, words: &[&str]) -> String {
 }
 
 /// `sms send <phonenumber> <message>` delivers an SMS to the guest (stock syntax); `sms list`
-/// (emu-rs) shows what the guest sent.
+/// (simee) shows what the guest sent.
 fn sms(info: &ConsoleInfo, words: &[&str]) -> String {
     match words {
         ["send", from, text @ ..] if !text.is_empty() => match info.telephony.sms_deliver(from, &text.join(" ")) {
@@ -332,7 +332,7 @@ fn gsm(info: &ConsoleInfo, words: &[&str]) -> String {
     }
 }
 
-/// `xr ...` (emu-rs extension, Android XR images): what the stock emulator's XR controls send the
+/// `xr ...` (simee extension, Android XR images): what the stock emulator's XR controls send the
 /// guest over `qemud:xr_service` (stock reaches them only through gRPC), the dual-mode mouse as a
 /// pointer at device pixels, and `xr status`. Syntax: [`sim_core::xr::USAGE`].
 fn xr(info: &ConsoleInfo, words: &[&str]) -> String {
@@ -375,7 +375,7 @@ fn xr(info: &ConsoleInfo, words: &[&str]) -> String {
 
 const NO_TOUCH: &str = "KO: this device has no touch screen (hw.screen=no-touch)";
 
-/// Commands this console implements (stock names first, then emu-rs extensions).
+/// Commands this console implements (stock names first, then simee extensions).
 const HELP: &[(&str, &str)] = &[
     ("help|h|?", "print a list of commands"),
     ("kill", "kill the emulator instance"),
@@ -391,12 +391,12 @@ const HELP: &[(&str, &str)] = &[
     ("ping", "check if the emulator is alive"),
     ("sensor", "manage emulator sensors"),
     ("screenshot", "take a screenshot of the display"),
-    ("touch", "touch the screen at x y (emu-rs)"),
-    ("touchpad", "touch the touchpad at x y, display glasses (emu-rs)"),
-    ("clipboard", "get or set the guest clipboard (emu-rs)"),
-    ("frames", "number of frames presented (emu-rs)"),
-    ("xr", "Android XR head pose, room, input mode and pointer (emu-rs)"),
-    ("car", "get or set vehicle HAL properties on Automotive images (emu-rs)"),
+    ("touch", "touch the screen at x y (simee)"),
+    ("touchpad", "touch the touchpad at x y, display glasses (simee)"),
+    ("clipboard", "get or set the guest clipboard (simee)"),
+    ("frames", "number of frames presented (simee)"),
+    ("xr", "Android XR head pose, room, input mode and pointer (simee)"),
+    ("car", "get or set vehicle HAL properties on Automotive images (simee)"),
 ];
 
 fn token_path() -> Option<PathBuf> {
@@ -488,7 +488,7 @@ fn session(stream: TcpStream, info: &ConsoleInfo) -> std::io::Result<()> {
 fn command(info: &ConsoleInfo, words: &[&str]) -> String {
     let Some(&cmd) = words.first() else { return String::new() };
     match cmd {
-        // Lists what emu-rs implements, in stock's format (tools probe it, e.g. for "finger").
+        // Lists what simee implements, in stock's format (tools probe it, e.g. for "finger").
         "help" | "h" | "?" => {
             let mut s = String::from("Android console commands:\r\n\r\n");
             for (name, what) in HELP {
@@ -528,7 +528,7 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
             }
             _ => "KO: usage: finger touch <fingerid> | finger remove".into(),
         },
-        // emu-rs extension: `clipboard get` / `clipboard set <text>`.
+        // simee extension: `clipboard get` / `clipboard set <text>`.
         "clipboard" => match words.get(1).copied() {
             Some("get") => format!("{}\r\nOK", String::from_utf8_lossy(&info.clipboard.get())),
             Some("set") => {
@@ -538,7 +538,7 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
             _ => "KO: usage: clipboard get|set <text>".into(),
         },
         "touch" => {
-            // emu-rs extension: `touch <x> <y> [down|up|tap]` in device pixels.
+            // simee extension: `touch <x> <y> [down|up|tap]` in device pixels.
             let g = info.inputs.lock().unwrap_or_else(|e| e.into_inner());
             match (g.as_ref(), words.get(1).and_then(|v| v.parse().ok()), words.get(2).and_then(|v| v.parse().ok())) {
                 (Some(Inputs { touch: None, .. }), _, _) => NO_TOUCH.to_string(),
@@ -556,7 +556,7 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
                 _ => "KO: usage: touch <x> <y> [down|up|tap]".to_string(),
             }
         }
-        // emu-rs extension: `touchpad <x> <y> [down|up|tap]` in touchpad units (display glasses).
+        // simee extension: `touchpad <x> <y> [down|up|tap]` in touchpad units (display glasses).
         "touchpad" => {
             let g = info.inputs.lock().unwrap_or_else(|e| e.into_inner());
             match (g.as_ref(), words.get(1).and_then(|v| v.parse().ok()), words.get(2).and_then(|v| v.parse().ok())) {
@@ -588,9 +588,9 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
             Some("name") => format!("{}\r\nOK", info.avd_name),
             Some("status") => "virtual device is running\r\nOK".to_string(),
             Some("id") => format!("{}\r\nOK", info.avd_name),
-            _ => "KO: unsupported 'avd' subcommand in emu-rs".to_string(),
+            _ => "KO: unsupported 'avd' subcommand in simee".to_string(),
         },
-        other => format!("KO: '{other}' is not implemented in emu-rs yet"),
+        other => format!("KO: '{other}' is not implemented in simee yet"),
     }
 }
 
@@ -607,7 +607,7 @@ impl Advertisement {
         let path = dir.join(format!("pid_{}.ini", std::process::id()));
         let cmdline: Vec<String> = std::env::args().collect();
         let body = format!(
-            "port.serial={console_port}\nport.adb={}\navd.name={avd_name}\navd.id={avd_name}\navd.dir={}\ncmdline=\"{}\"\nemulator=emu-rs\n",
+            "port.serial={console_port}\nport.adb={}\navd.name={avd_name}\navd.id={avd_name}\navd.dir={}\ncmdline=\"{}\"\nemulator=simee\n",
             console_port + 1,
             avd_dir.display(),
             cmdline.join("\" \"")
@@ -617,7 +617,7 @@ impl Advertisement {
     }
 }
 
-/// Removes emu-rs advertisements whose process is gone (a teardown that hit the hard-exit
+/// Removes simee advertisements whose process is gone (a teardown that hit the hard-exit
 /// timer skips the Drop below). Stale entries claim ports and confuse discovery tools.
 /// Stock emulator files are left alone.
 fn prune_stale(dir: &std::path::Path) {
@@ -625,7 +625,7 @@ fn prune_stale(dir: &std::path::Path) {
     for e in entries.flatten() {
         let Some(name) = e.file_name().to_str().map(str::to_owned) else { continue };
         let Some(running) = std::fs::read_to_string(e.path()).ok().and_then(|t| emu_avd::Running::parse(&name, &t)) else { continue };
-        if running.emu_rs && !running.alive() {
+        if running.simee && !running.alive() {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -709,7 +709,7 @@ mod tests {
         command(info, &line.split_whitespace().collect::<Vec<_>>())
     }
 
-    /// Round trips through the real console server, as `adb emu` and sim-rs make them: one TCP
+    /// Round trips through the real console server, as `adb emu` and simee make them: one TCP
     /// session per call, pipelined commands, then `quit`.
     ///     cargo test --release -p emu console_latency -- --ignored --nocapture
     #[test]
@@ -752,7 +752,7 @@ mod tests {
         }
         assert_eq!(run(&info, "ping"), "I am alive!\r\nOK");
         assert_eq!(run(&info, "avd name"), "Test_AVD\r\nOK");
-        assert_eq!(run(&info, "network status"), "KO: 'network' is not implemented in emu-rs yet");
+        assert_eq!(run(&info, "network status"), "KO: 'network' is not implemented in simee yet");
     }
 
     #[test]

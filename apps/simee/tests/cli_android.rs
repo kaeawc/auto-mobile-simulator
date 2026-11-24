@@ -1,5 +1,5 @@
-//! The CLI end to end against Android devices, on any host: `sim-rs` runs as a subprocess with
-//! its own SDK, AVD home and `$HOME`, and a fake emu-rs (`sim_android::testing`) stands in for
+//! The CLI end to end against Android devices, on any host: `simee` runs as a subprocess with
+//! its own SDK, AVD home and `$HOME`, and a fake simee (`sim_android::testing`) stands in for
 //! the running emulator: its console records commands, its display socket records input.
 
 use std::path::{Path, PathBuf};
@@ -41,28 +41,28 @@ impl Env {
     }
 
     fn cmd(&self) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_sim-rs"));
+        let mut c = Command::new(env!("CARGO_BIN_EXE_simee"));
         c.env("HOME", self.root.join("home"))
             .env("ANDROID_HOME", self.root.join("sdk"))
             .env("ANDROID_AVD_HOME", self.root.join("avd"))
-            .env("SIM_RS_SOCKET", self.root.join("api.sock"))
+            .env("SIMEE_SOCKET", self.root.join("api.sock"))
             .env_remove("ANDROID_SDK_ROOT");
         c
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        self.cmd().args(args).output().expect("sim-rs runs")
+        self.cmd().args(args).output().expect("simee runs")
     }
 
     fn ok(&self, args: &[&str]) -> String {
         let out = self.run(args);
-        assert!(out.status.success(), "sim-rs {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "simee {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
     fn err(&self, args: &[&str]) -> String {
         let out = self.run(args);
-        assert!(!out.status.success(), "sim-rs {args:?} should fail");
+        assert!(!out.status.success(), "simee {args:?} should fail");
         String::from_utf8_lossy(&out.stderr).into_owned()
     }
 

@@ -1,5 +1,5 @@
 //! The live display stream between a device process and a front end: frames one way, input lines
-//! the other. The Android emulator serves it on `<avd>/emu-rs/display.sock`; the desktop window
+//! the other. The Android emulator serves it on `<avd>/simee/display.sock`; the desktop window
 //! reads it.
 //!
 //! Client → server, one text line each ([`Input`]):

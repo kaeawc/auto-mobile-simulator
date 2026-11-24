@@ -1,11 +1,11 @@
 # The stock emulator's arm64 board (API 36, emulator 37.2)
 
 Captured from a running stock instance (`/sys/firmware/fdt`, `/proc/iomem`, `/proc/interrupts`,
-`/sys/block`, `getprop`). emu-rs reproduces the parts the system image depends on.
+`/sys/block`, `getprop`). simee reproduces the parts the system image depends on.
 
 ## Memory map
 
-| Address | Device | Interrupt (SPI → INTID) | emu-rs |
+| Address | Device | Interrupt (SPI → INTID) | simee |
 | --- | --- | --- | --- |
 | `0x0800_0000` | GICv2 distributor (+ CPU iface `0x0801_0000`, v2m MSI `0x0802_0000`) | — | GICv3 in-kernel: dist `0x0800_0000`, redist `0x080a_0000` |
 | `0x0900_0000` | PL011 UART (`ttyAMA0`) | 1 → 33, level | same |
@@ -34,7 +34,7 @@ Captured from a running stock instance (`/sys/firmware/fdt`, `/proc/iomem`, `/pr
 | 30 | `a003c00` | blk: encryptionkey.img (GPT: metadata) mounted by path on `/metadata` | vdd |
 | 31 | `a003e00` | blk: vendor.img (GPT: vendor) | vde |
 
-emu-rs adds vsock at slot 24 and, for Automotive and XR images only, virtio-snd at slot 18
+simee adds vsock at slot 24 and, for Automotive and XR images only, virtio-snd at slot 18
 (stock puts both on PCI; the guest drivers bind on either transport).
 
 ## PCI devices (stock)

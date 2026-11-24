@@ -1,6 +1,6 @@
 //! What the Android emulator's guest (goldfish/ranchu) expects from the host, as stock decides
 //! it: console key names, the keys the `qwerty2` keyboard reports, and the sensors a device
-//! advertises. Shared by emu-rs's VMM and console and by front ends.
+//! advertises. Shared by simee's VMM and console and by front ends.
 use crate::form_factor::FormFactor;
 
 /// The stock console's `KEY_*` names (android/emu/hardware/include/android/hw-events.h, prefix

@@ -1,6 +1,6 @@
-# sim-rs API reference
+# simee API reference
 
-Generated from `sim-rs call help`. Transport: unix socket, one JSON request per line, one JSON response per line.
+Generated from `simee call help`. Transport: unix socket, one JSON request per line, one JSON response per line.
 
 ```text
 → {"id": 1, "method": "tap", "params": {"device": "booted", "x": 600, "y": 1300}}
@@ -89,7 +89,7 @@ Generated from `sim-rs call help`. Transport: unix socket, one JSON request per 
 | `xr` | Android | device, action(recenter \| rotate\|move: x, y, z \| options: environment(day\|night), passthrough(0-1) \| input: mode(mouse\|hand\|eye) \| viewport: mode(pan\|zoom\|rotate) \| pointer: x, y, phase?(move\|down\|up\|click) \| hand\|eye: x, y, press?(aim\|press) \| gesture: gesture(left-pinch\|left-grab\|left-poke\|right-pinch\|right-grab\|right-poke)) | Android XR: turn (radians) or move (metres) the head, recenter, set the room and passthrough, the input mode, aim or pinch the hand ray and look or select with gaze at pixels (stock's gRPC hand and eye events), a hand gesture, or point the dual-mode mouse |
 | `touchpad` | Android | device, x, y, phase?(down\|move\|up\|tap) \| x, y, to_x, to_y, duration_ms? (a swipe) | Touch or swipe the touchpad beside the screen, in touchpad units (Android XR display glasses: `hw.touchpad0`) |
 | `rotary` | Android, iOS | device, ticks \| delta (Digital Crown units; iOS) | Turn a watch's rotary input: the Wear OS crown or bezel, the Apple Watch Digital Crown |
-| `vehicle` | Android | device, property?(VHAL name or id: GEAR_SELECTION, gear, speed, 0x11600207, ...), area_id?, value? | Android Automotive's vehicle HAL: list every property's value, read one, or set one when `value` is given (typed by the property: drive, 12.5, true); through the emulator console's `car` command (emu-rs) |
+| `vehicle` | Android | device, property?(VHAL name or id: GEAR_SELECTION, gear, speed, 0x11600207, ...), area_id?, value? | Android Automotive's vehicle HAL: list every property's value, read one, or set one when `value` is given (typed by the property: drive, 12.5, true); through the emulator console's `car` command (simee) |
 | `watch_gesture` | iOS | device, gesture(double-tap\|wrist-flick) | An Apple Watch hand gesture |
 | `remote_swipe` | iOS | device, direction(up\|down\|left\|right), duration_ms? | Swipe on the Siri Remote's touch surface (Apple TV) |
 | `carplay` | iOS | device, on | Attach (or detach) the CarPlay display to a booted iPhone (iOS 26 runtimes); then tap/swipe/screenshot with display=carplay |

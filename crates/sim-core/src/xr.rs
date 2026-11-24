@@ -4,7 +4,7 @@
 //! The stock emulator drives the guest's XR service over the `qemud:xr_service` pipe: qemud
 //! framing around one `xr_emulator_proto.EmulatorRequest` per message (`xr_emulator_conn.proto`
 //! in the emulator's sources), which the guest may answer with an `EmulatorResponse`. Stock
-//! reaches it only through gRPC; emu-rs adds an `xr` console command, whose words
+//! reaches it only through gRPC; simee adds an `xr` console command, whose words
 //! [`XrCommand::parse`] reads and [`XrCommand::console`] writes. The messages are proto2 and tiny,
 //! so they are encoded by hand: every field that is set is written, defaults included.
 

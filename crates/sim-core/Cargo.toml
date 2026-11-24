@@ -1,6 +1,6 @@
 [package]
 name = "sim-core"
-description = "Pure sim-rs building blocks: device models, platforms and form factors, geometry, frames and pixel conversion, HID usages, gestures."
+description = "Pure simee building blocks: device models, platforms and form factors, geometry, frames and pixel conversion, HID usages, gestures."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

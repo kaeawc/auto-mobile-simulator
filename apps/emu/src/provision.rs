@@ -1,4 +1,4 @@
-//! `-provision`, `-provision-renderer` and `-list-images`: install what emu-rs needs
+//! `-provision`, `-provision-renderer` and `-list-images`: install what simee needs
 //! (platform-tools, a system image and the gfxstream renderer) straight from Google's
 //! repository, with no Java, sdkmanager or avdmanager.
 use std::path::PathBuf;

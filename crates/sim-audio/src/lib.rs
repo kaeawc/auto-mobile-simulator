@@ -7,7 +7,7 @@
 //! - **Route / volume:** each device reads its host devices and volume from
 //!   `<data>/var/run/simulatoraudio/audiosettings.plist` when an audio client starts.
 //!
-//! Capture needs the System Audio Recording permission for the app that runs sim-rs.
+//! Capture needs the System Audio Recording permission for the app that runs simee.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -28,7 +28,7 @@ fn fnv1a(text: &str) -> u64 {
 /// Builds (or reuses) the helper and returns its path.
 pub fn helper() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME").map_or_else(std::env::temp_dir, PathBuf::from);
-    let dir = home.join("Library/Caches/sim-rs/audio");
+    let dir = home.join("Library/Caches/simee/audio");
     let out = dir.join(format!("simaudio-{:016x}", fnv1a(HELPER_SOURCE)));
     if out.is_file() {
         return Ok(out);

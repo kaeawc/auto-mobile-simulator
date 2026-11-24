@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Kernel-level shaping (pf + dummynet) for simulator traffic. Needs root: run with sudo.
 #
-# Targets flows by source port: the sim-rs socket shaper binds shaped sockets to a port range
-# when the profile sets `port_base`/`port_count` (sim-rs call network_shape '{"device":"…",
+# Targets flows by source port: the simee socket shaper binds shaped sockets to a port range
+# when the profile sets `port_base`/`port_count` (simee call network_shape '{"device":"…",
 # "inject":true,"port_base":41000,"port_count":1000}'), so only that device's (or app's) traffic
 # hits these pipes. Kernel shaping gives real packet loss, jitter-free delay and queueing, for TCP,
 # UDP and QUIC alike, which the userspace shaper only approximates.
 #
-# Rules load into the `com.apple/sim-rs` anchor that macOS's stock /etc/pf.conf already includes
+# Rules load into the `com.apple/simee` anchor that macOS's stock /etc/pf.conf already includes
 # (`anchor "com.apple/*"` and `dummynet-anchor "com.apple/*"`), so the main ruleset is never
 # flushed. pf is enabled with a reference token that `remove` releases.
 #
@@ -15,10 +15,10 @@
 #   sudo scripts/pf-shape.sh status
 #   sudo scripts/pf-shape.sh remove
 set -euo pipefail
-ANCHOR=com.apple/sim-rs
+ANCHOR=com.apple/simee
 PIPE_OUT=41001
 PIPE_IN=41002
-STATE=/var/run/sim-rs-pf.token
+STATE=/var/run/simee-pf.token
 cmd=${1:-}; shift || true
 ports=41000:41999 latency=0 down=0 up=0 loss=0
 while [ $# -gt 0 ]; do

@@ -174,7 +174,7 @@ fn spawn_capture(
     waker: rune::Waker,
 ) -> Result<JoinHandle<()>, String> {
     std::thread::Builder::new()
-        .name("sim-rs-capture".into())
+        .name("simee-capture".into())
         .spawn(move || {
             let display = match Context::new().and_then(|c| c.device(&udid)).and_then(|d| d.display()) {
                 Ok(d) => d,

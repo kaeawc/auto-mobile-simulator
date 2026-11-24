@@ -1,6 +1,6 @@
 [package]
 name = "emu"
-description = "emu-rs CLI: a drop-in for the Android SDK `emulator` binary."
+description = "simee CLI: a drop-in for the Android SDK `emulator` binary."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

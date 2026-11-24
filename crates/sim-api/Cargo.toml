@@ -1,6 +1,6 @@
 [package]
 name = "sim-api"
-description = "sim-rs unix socket API: a JSON-lines protocol over every device control and debug surface, for iOS and Android devices."
+description = "simee unix socket API: a JSON-lines protocol over every device control and debug surface, for iOS and Android devices."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -159,13 +159,13 @@ cc -std=gnu11 -O2 -pthread -o /tmp/netshape_test crates/sim-netshape/native/nets
 
 1. `cargo nextest run -p sim-netshape`, which runs the C tests with Apple clang, then the benchmark
    above, both on the host.
-2. Build and boot-inject: `sim-rs serve &`, then
-   `sim-rs call network_shape '{"device":"<udid>","inject":"boot","preset":"none"}'`. This builds the
+2. Build and boot-inject: `simee serve &`, then
+   `simee call network_shape '{"device":"<udid>","inject":"boot","preset":"none"}'`. This builds the
    dylib with the iOS-simulator SDK (a link failure would name the symbol; `close$NOCANCEL` and
    `guarded_close_np` are new). The device reboots because SpringBoard maps the old build.
-   `sim-rs call network_state '{"device":"<udid>"}'` should show `"boot_injected": true`.
+   `simee call network_state '{"device":"<udid>"}'` should show `"boot_injected": true`.
 3. SpringBoard stability: use the device for a few minutes (home screen, Safari, Settings), then
-   check that SpringBoard's PID hasn't changed (`sim-rs call processes '{"device":"<udid>"}'`) and
+   check that SpringBoard's PID hasn't changed (`simee call processes '{"device":"<udid>"}'`) and
    that there are no new `SpringBoard*.ips` crash reports.
 4. Shaping unchanged: run `docs/research/network-shaping-matrix.py` with the `boot` mode as in
    [network-shaping.md](network-shaping.md) (probe `network-shaping-bench.m`, servers

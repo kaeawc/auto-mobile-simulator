@@ -61,7 +61,7 @@ impl Android {
         self.running_dir.as_deref().map(emu_avd::running_instances_in).unwrap_or_default()
     }
 
-    /// Every AVD, labelled with its form factor; running ones (emu-rs or stock) are `Booted`.
+    /// Every AVD, labelled with its form factor; running ones (simee or stock) are `Booted`.
     pub fn devices(&self) -> Vec<DeviceInfo> {
         let running = self.running();
         self.env.list_avds().into_iter().map(|name| self.describe(&name, &running).info).collect()
@@ -255,13 +255,13 @@ impl Device {
 
     /// Starts `emu` for this AVD (unless it's running) and waits until it has booted: until
     /// `sys.boot_completed` is 1 when adb is available, else until the display has a frame.
-    /// The emulator's own output goes to `<avd>/emu-rs/emu.log`.
+    /// The emulator's own output goes to `<avd>/simee/emu.log`.
     pub fn boot(&self, android: &Android, timeout: Duration) -> Result<(), String> {
         let avd = self.avd()?;
         let deadline = Instant::now() + timeout;
         let mut child = None;
         if self.running.is_none() {
-            let log_dir = avd.dir.join("emu-rs");
+            let log_dir = emu_avd::state_dir(&avd.dir);
             std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
             let log = std::fs::File::create(log_dir.join("emu.log")).map_err(|e| e.to_string())?;
             let bin = emu_binary();
@@ -282,7 +282,7 @@ impl Device {
             if let Some(c) = child.as_mut()
                 && let Ok(Some(status)) = c.try_wait()
             {
-                let log = avd.dir.join("emu-rs/emu.log");
+                let log = emu_avd::state_dir(&avd.dir).join("emu.log");
                 let tail = std::fs::read_to_string(&log).unwrap_or_default();
                 let last = tail.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_owned();
                 return Err(format!("emu exited ({status}) before booting: {last} (log: {})", log.display()));
@@ -357,7 +357,7 @@ impl Device {
     }
 
     /// A touch on the touchpad beside the screen (`hw.touchpad0`: Android XR display glasses), in
-    /// touchpad units: `phase` is down, move, up or tap. Through emu-rs's console `touchpad`.
+    /// touchpad units: `phase` is down, move, up or tap. Through simee's console `touchpad`.
     pub fn touchpad(&self, x: u32, y: u32, phase: &str) -> Result<(), String> {
         self.touchpad_size()?;
         self.console(&[format!("touchpad {x} {y} {phase}")]).map(drop)
@@ -508,7 +508,7 @@ impl Device {
         self.with_display(self.avd()?, |d| d.send(&Input::Wheel(ticks)))
     }
 
-    /// An XR control (head pose, environment, input mode, pointer) through emu-rs's `xr` console
+    /// An XR control (head pose, environment, input mode, pointer) through simee's `xr` console
     /// command; returns its reply lines. Android XR devices only.
     pub fn xr(&self, command: &XrCommand) -> Result<Vec<String>, String> {
         match self.info.kind() {
@@ -518,7 +518,7 @@ impl Device {
         }
     }
 
-    /// Sets a vehicle HAL property through the emulator's `car` console command (an emu-rs
+    /// Sets a vehicle HAL property through the emulator's `car` console command (an simee
     /// extension). `property` is a VHAL name (`GEAR_SELECTION`, `gear`) or id; `value` is typed
     /// by the property (`drive`, `12.5`, `true`). Automotive devices only.
     pub fn vehicle_set(&self, property: &str, area_id: i32, value: &str) -> Result<(), String> {
@@ -571,13 +571,13 @@ fn booted(r: &Running, adb: Option<&Path>) -> bool {
     }
 }
 
-/// The last `n` lines of a device's guest console (`<avd>/emu-rs/console.log`). Reads from the
+/// The last `n` lines of a device's guest console (`<avd>/simee/console.log`). Reads from the
 /// end, 64 KiB at a time, until it has them: the log grows to megabytes of kernel output, and
 /// the desktop asks every two seconds. Bytes that aren't UTF-8 show as U+FFFD.
 pub fn console_log_tail(avd_dir: &Path, n: usize) -> Vec<String> {
     use std::io::{Read, Seek, SeekFrom};
     const STEP: u64 = 64 * 1024;
-    let Ok(mut f) = std::fs::File::open(avd_dir.join("emu-rs/console.log")) else { return Vec::new() };
+    let Ok(mut f) = std::fs::File::open(emu_avd::state_dir(avd_dir).join("console.log")) else { return Vec::new() };
     let Ok(len) = f.metadata().map(|m| m.len()) else { return Vec::new() };
     let mut window = STEP.min(len);
     let tail = loop {
@@ -777,8 +777,8 @@ mod tests {
     #[test]
     fn console_log_tail_reads_only_the_end() {
         let dir = std::env::temp_dir().join(format!("sa-tail-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("emu-rs")).expect("dir");
-        let log = dir.join("emu-rs/console.log");
+        std::fs::create_dir_all(dir.join("simee")).expect("dir");
+        let log = dir.join("simee/console.log");
         let naive = |n: usize| -> Vec<String> {
             let text = String::from_utf8_lossy(&std::fs::read(&log).expect("read")).into_owned();
             let lines: Vec<&str> = text.lines().collect();

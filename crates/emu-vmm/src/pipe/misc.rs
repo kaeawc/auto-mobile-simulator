@@ -50,7 +50,7 @@ impl PipeHandler for MiscPipe {
 }
 
 /// Accepts a pipe and never sends anything: for guest services that must open their pipe but
-/// only hear from the host on events emu-rs doesn't generate (e.g. `multidisplay`, whose JNI
+/// only hear from the host on events simee doesn't generate (e.g. `multidisplay`, whose JNI
 /// crashes on a refused open; with one display the host has nothing to say).
 pub struct Silent(pub &'static str);
 

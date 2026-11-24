@@ -1,8 +1,8 @@
-# sim-rs
+# simee
 
 iOS simulator and Android emulator devices from one Rust core. The iOS backend drives the host's
 simulator service directly (device lifecycle, apps, framebuffer, HID input) with no stock simulator
-app; the Android backend is emu-rs, an Android emulator on Hypervisor.framework that boots
+app; the Android backend is `emu`, simee's own Android emulator on Hypervisor.framework that boots
 unmodified SDK system images and matches the stock emulator's board, ports and console. The goal
 for both is to match the stock tools exactly and then exceed them.
 
@@ -30,13 +30,13 @@ for both is to match the stock tools exactly and then exceed them.
   Change it only with evidence from a running stock emulator.
 - Android: measure before optimizing. `emu -verbose` prints per-vCPU exit counts; `sample <pid> 5`
   shows host time per thread. Record results that change a design decision in docs/android.md.
-- Android: never modify the stock emulator's files in an AVD directory; emu-rs state lives in
-  `<avd>/emu-rs/` (console.log, emu.log, display.sock, `frames-<pid>-<n>.ring` frame rings).
+- Android: never modify the stock emulator's files in an AVD directory; simee state lives in
+  `<avd>/simee/` (console.log, emu.log, display.sock, `frames-<pid>-<n>.ring` frame rings).
 - Android: one emulator process per device (Hypervisor.framework allows one VM per process). Start
   guests with a recorded PID and stop them with `kill -INT <pid>`, `adb -s emulator-<port> emu kill`
-  or `sim-rs shutdown <avd>`; don't kill by name (other emulators may be running).
+  or `simee shutdown <avd>`; don't kill by name (other emulators may be running).
 - Front ends drive Android devices the way any tool can: the console port (stock text protocol)
-  and `<avd>/emu-rs/display.sock` (`sim_core::stream`). `sim-android` is that client; it never
+  and `<avd>/simee/display.sock` (`sim_core::stream`). `sim-android` is that client; it never
   links the VMM.
 - Pure logic (device selection, gestures, key maps, pixel conversion, frames and PNG encoding,
   geometry) goes in `crates/sim-core` with unit tests; FFI crates stay thin.
@@ -74,13 +74,13 @@ Unit tests never need a device or the hypervisor. Against a real device (see "Ha
 README.md):
 
 ```bash
-SIM_RS_E2E_UDID=<udid> cargo nextest run -p sim-rs --test e2e
-scripts/parity.sh <udid>                 # sim-rs vs simctl
-scripts/automobile-harness.sh <udid>     # auto-mobile drives a sim-rs device
+SIMEE_E2E_UDID=<udid> cargo nextest run -p simee --test e2e
+scripts/parity.sh <udid>                 # simee vs simctl
+scripts/automobile-harness.sh <udid>     # auto-mobile drives a simee device
 # Android (Apple silicon; cargo signs emu with the hypervisor entitlement via scripts/sign-run.sh)
 cargo run -p emu -- -avd <name> -show-kernel -verbose
 adb -s emulator-5554 shell getprop sys.boot_completed      # after VMM changes, boot an AVD and check
-SIM_RS_E2E_AVD=<avd> cargo nextest run -p sim-rs --test e2e_android
+SIMEE_E2E_AVD=<avd> cargo nextest run -p simee --test e2e_android
 scripts/automobile-harness-android.sh emulator-5554
 ```
 
@@ -135,9 +135,9 @@ scripts/automobile-harness-android.sh emulator-5554
   non-macOS hosts `ios_unavailable.rs`), the Android backend's methods (`android.rs`), server
   and client (`lib.rs`). The CLI, the socket and the
   desktop panel all go through it; add a capability here once and every surface gets it.
-- `apps/sim-rs` — CLI: argument parsing and output formatting over `sim-api`'s methods;
-  `tests/e2e.rs` runs against a booted iOS device when `SIM_RS_E2E_UDID` is set,
-  `tests/e2e_android.rs` against a running AVD when `SIM_RS_E2E_AVD` is.
+- `apps/simee` — CLI: argument parsing and output formatting over `sim-api`'s methods;
+  `tests/e2e.rs` runs against a booted iOS device when `SIMEE_E2E_UDID` is set,
+  `tests/e2e_android.rs` against a running AVD when `SIMEE_E2E_AVD` is.
 - `apps/emu` — the Android emulator binary, a drop-in for the SDK's `emulator`: `args.rs` (SDK
   flags), `instance.rs` (disks, bootconfig, boot props), `console.rs` (console server,
   running-instance file; its commands build and test on any host), `display_server.rs` (frames
@@ -155,7 +155,7 @@ scripts/automobile-harness-android.sh emulator-5554
   demo, android, foldable, watch, tv, empty. On Linux it renders with Mesa's lavapipe.
 - `scripts/` — `parity.sh`, `automobile-harness.sh`, `pf-shape.sh` (pf/dummynet, needs sudo);
   Android: `sign-run.sh` (the cargo runner: hypervisor entitlement), `sdk-shim.sh` (SDK overlay
-  whose `emulator` is emu-rs), `automobile-harness-android.sh`, `android-bench.sh`,
+  whose `emulator` is simee), `automobile-harness-android.sh`, `android-bench.sh`,
   `inspect-image.py` (what a system image expects of the board, unpacked without booting: fstab,
   modules, input names, vendor HALs).
 - `docs/research/` — `network-shaping.md`, `audio-camera.md`; `docs/automobile-tool-matrix.md`.

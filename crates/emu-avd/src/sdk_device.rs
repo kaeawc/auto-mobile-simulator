@@ -43,7 +43,7 @@ pub struct SdkDevice {
 
 use Sensor::*;
 
-/// `wear.xml`: the large round watch, the size emu-rs's Wear profile has (454x454).
+/// `wear.xml`: the large round watch, the size simee's Wear profile has (454x454).
 pub const WEAR_LARGE_ROUND: SdkDevice = SdkDevice {
     id: "wearos_large_round",
     sensors: &[Accelerometer, Barometer, Compass, Gps, Gyroscope, Light, Proximity],

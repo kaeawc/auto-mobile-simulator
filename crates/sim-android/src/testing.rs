@@ -1,6 +1,6 @@
-//! A stand-in for a running emu-rs, for tests here and in crates that drive Android devices
+//! A stand-in for a running simee, for tests here and in crates that drive Android devices
 //! (feature `testing`): an advertisement naming this process, a console that records commands
-//! and answers like emu-rs, and a display socket that records input lines.
+//! and answers like simee, and a display socket that records input lines.
 use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
@@ -61,8 +61,8 @@ pub fn fake_emulator(android: &Android, avd: &str) -> FakeEmulator {
         }
     });
     let display = Arc::new(Mutex::new(Vec::new()));
-    let dir = android.env.avd_home.join(format!("{avd}.avd/emu-rs"));
-    std::fs::create_dir_all(&dir).expect("emu-rs dir");
+    let dir = android.env.avd_home.join(format!("{avd}.avd/simee"));
+    std::fs::create_dir_all(&dir).expect("simee dir");
     let socket = std::os::unix::net::UnixListener::bind(dir.join("display.sock")).expect("display");
     let lines = display.clone();
     std::thread::spawn(move || {
@@ -77,7 +77,7 @@ pub fn fake_emulator(android: &Android, avd: &str) -> FakeEmulator {
     });
     let running = android.running_dir.clone().expect("running dir");
     std::fs::create_dir_all(&running).expect("running");
-    let ad = format!("port.serial={port}\nport.adb={}\navd.name={avd}\nemulator=emu-rs\n", port + 1);
+    let ad = format!("port.serial={port}\nport.adb={}\navd.name={avd}\nemulator=simee\n", port + 1);
     std::fs::write(running.join(format!("pid_{}.ini", std::process::id())), ad).expect("advertise");
     FakeEmulator { console, display }
 }

@@ -1,23 +1,23 @@
-//! End-to-end tests against a real booted device. Skipped unless `SIM_RS_E2E_UDID` names one:
+//! End-to-end tests against a real booted device. Skipped unless `SIMEE_E2E_UDID` names one:
 //!
 //! ```text
-//! SIM_RS_E2E_UDID=$(sim-rs create e2e "iPhone 17" "iOS 26.5") && sim-rs boot $SIM_RS_E2E_UDID
-//! SIM_RS_E2E_UDID=... cargo nextest run -p sim-rs --test e2e
+//! SIMEE_E2E_UDID=$(simee create e2e "iPhone 17" "iOS 26.5") && simee boot $SIMEE_E2E_UDID
+//! SIMEE_E2E_UDID=... cargo nextest run -p simee --test e2e
 //! ```
 
 use std::process::{Command, Output};
 
 fn udid() -> Option<String> {
-    std::env::var("SIM_RS_E2E_UDID").ok().filter(|s| !s.is_empty())
+    std::env::var("SIMEE_E2E_UDID").ok().filter(|s| !s.is_empty())
 }
 
 fn sim(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_sim-rs")).args(args).output().expect("sim-rs runs")
+    Command::new(env!("CARGO_BIN_EXE_simee")).args(args).output().expect("simee runs")
 }
 
 fn ok(args: &[&str]) -> String {
     let out = sim(args);
-    assert!(out.status.success(), "sim-rs {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "simee {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -43,7 +43,7 @@ fn device_is_listed_as_booted_with_the_same_identity_simctl_reports() {
 #[test]
 fn screenshot_matches_the_device_type_resolution() {
     let Some(udid) = udid() else { return };
-    let dir = std::env::temp_dir().join(format!("sim-rs-e2e-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("simee-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("tmp");
     let path = dir.join("screen.png");
     ok(&["screenshot", &udid, path.to_str().expect("utf8")]);

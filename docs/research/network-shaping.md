@@ -1,6 +1,6 @@
 # Network shaping for simulated iOS devices without root
 
-What sim-rs can do to a simulated device's network with no root, no MDM profile and no network
+What simee can do to a simulated device's network with no root, no MDM profile and no network
 extension, measured per protocol; plus the kernel (pf/dummynet) and network-extension paths for
 comparison.
 
@@ -9,16 +9,16 @@ comparison.
 - Bench: an in-device client (`network-shaping-bench.m`) against host echo servers on the LAN address
   (`network-shaping-servers.py`: TCP, UDP, WebSocket, HTTP) and public endpoints (example.com,
   cloudflare-quic.com for HTTP/3, ws.postman-echo.com for WSS). `network-shaping-matrix.py` drives
-  every probe under every mechanism and profile through the sim-rs socket API.
+  every probe under every mechanism and profile through the simee socket API.
 
 ## Summary
 
 | Mechanism | How | Covers | Doesn't cover | Needs |
 | --- | --- | --- | --- | --- |
-| **Boot injection** (recommended) | sim-rs reboots the device with its socket/DNS shaper (`netshape.dylib`) in launchd's environment (`network_shape {inject:"boot"}`, `sim-rs boot --shaped`); every process loads it | Everything tested: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WS/WSS, raw TCP/UDP, Network.framework TCP/UDP, DNS, **WebKit** (Safari verified), system daemons. Per-host rules by hostname or CIDR. Live changes (profile file re-read within 250 ms) | Kernel-exact queueing; HTTP/2 setup latency is overcounted (below) | A reboot of the device (about 10 s warm) |
+| **Boot injection** (recommended) | simee reboots the device with its socket/DNS shaper (`netshape.dylib`) in launchd's environment (`network_shape {inject:"boot"}`, `simee boot --shaped`); every process loads it | Everything tested: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WS/WSS, raw TCP/UDP, Network.framework TCP/UDP, DNS, **WebKit** (Safari verified), system daemons. Per-host rules by hostname or CIDR. Live changes (profile file re-read within 250 ms) | Kernel-exact queueing; HTTP/2 setup latency is overcounted (below) | A reboot of the device (about 10 s warm) |
 | **Launch injection** | The shaper in one app's launch environment (`launch {shaped:true}`, `network_env` for `SIMCTL_CHILD_*`) | The app's own sockets and DNS (URLSession, Network.framework, BSD sockets) | WebKit (separate ExtensionKit process), system daemons acting for the app | Nothing |
 | **launchd setenv** | `launchctl setenv DYLD_INSERT_LIBRARIES` inside the device (`inject:true`) | Processes started afterwards | Running processes; ExtensionKit extensions (sanitized environment) | Nothing |
-| **Device proxy** | A shaping HTTP/SOCKS proxy in the sim-rs process, set in the device's own `configd_sim` (`proxy:true`) | Proxy-aware HTTPS/WSS to public hosts, including WebKit; per-host log (`network_flows`) without decryption | Private/LAN addresses (CFNetwork bypasses the proxy), QUIC (forced down to HTTP/2), raw TCP/UDP and Network.framework (SOCKS is ignored), DNS | Nothing |
+| **Device proxy** | A shaping HTTP/SOCKS proxy in the simee process, set in the device's own `configd_sim` (`proxy:true`) | Proxy-aware HTTPS/WSS to public hosts, including WebKit; per-host log (`network_flows`) without decryption | Private/LAN addresses (CFNetwork bypasses the proxy), QUIC (forced down to HTTP/2), raw TCP/UDP and Network.framework (SOCKS is ignored), DNS | Nothing |
 | **pf + dummynet** | `scripts/pf-shape.sh` pipes for the shaper's source-port range | Kernel-exact delay, bandwidth and random loss for TCP, UDP and QUIC | — | sudo (not run here) |
 | **Network extension** | auto-mobile's `NEFilterDataProvider` system extension (`ios/network-filter`) | Per-flow offline; latency/bandwidth by pausing flows | Precise shaping; headless CI | Developer ID signing, user approval in System Settings or an MDM profile |
 
@@ -30,7 +30,7 @@ matters, add pf/dummynet on runners that allow sudo (hosted macOS runners do).
 
 `crates/sim-netshape/native/netshape.c` is interposed into iOS-simulator processes with
 `DYLD_INSERT_LIBRARIES`. It shapes only sockets whose peer isn't loopback, so local control channels
-(XCTest runners, sim-rs) are untouched.
+(XCTest runners, simee) are untouched.
 
 - **Offline:** `connect`/`connectx` fail with `ENETUNREACH`; DNS lookups fail; datagram sends fail;
   `nw_path_get_status` reports *unsatisfied* and `SCNetworkReachabilityGetFlags` reports not
@@ -81,7 +81,7 @@ matters, add pf/dummynet on runners that allow sudo (hosted macOS runners do).
 ## Kernel shaping: pf + dummynet
 
 `scripts/pf-shape.sh apply --ports 41000:41999 --latency-ms 200 --down-kbps 1000 --up-kbps 500
---loss-pct 5` (as root) configures two dummynet pipes and loads rules into the `com.apple/sim-rs`
+--loss-pct 5` (as root) configures two dummynet pipes and loads rules into the `com.apple/simee`
 anchor that macOS's stock `/etc/pf.conf` already includes, so the main ruleset is never flushed; pf
 is enabled with a reference token that `remove` releases. Targeting uses source ports: run the
 device's shaper with `port_base`/`port_count` (verified: a shaped socket bound to port 41000).
@@ -95,16 +95,16 @@ simulator processes through audit tokens and the `launchd_sim` tree, and applies
 bandwidth by pausing and resuming flows. Activation needs Developer ID signing with the content
 filter entitlement and approval in System Settings, or an MDM profile with the system-extension and
 web-content-filter payloads. That rules it out for headless CI without MDM. A content filter also
-can't shape precisely (it pauses flows instead of pacing bytes). sim-rs's boot injection covers the
+can't shape precisely (it pauses flows instead of pacing bytes). simee's boot injection covers the
 same surface without any of that.
 
 ## How auto-mobile would drive it
 
-- `networkCondition` on a sim-rs device: call `network_shape` over the sim-rs socket with
+- `networkCondition` on a simee device: call `network_shape` over the simee socket with
   `inject:"boot"` once per session (one device reboot), then change profiles live with
   `network_shape {preset | fields | rules}`; `network_clear` to reset.
-- Without sim-rs owning the device: launch the app with `SIMCTL_CHILD_DYLD_INSERT_LIBRARIES` and
-  `SIMCTL_CHILD_SIM_RS_NETSHAPE` from `network_env` (app-level coverage, no WebKit).
+- Without simee owning the device: launch the app with `SIMCTL_CHILD_DYLD_INSERT_LIBRARIES` and
+  `SIMCTL_CHILD_SIMEE_NETSHAPE` from `network_env` (app-level coverage, no WebKit).
 - Verification: `connections` / `traffic` show per-process sockets and bytes without any extension;
   `network_flows` lists the hosts a device contacted through the proxy.
 

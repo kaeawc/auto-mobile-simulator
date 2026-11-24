@@ -196,10 +196,10 @@ impl Profile {
     }
 }
 
-/// Where sim-rs keeps the built dylib and per-device profiles.
+/// Where simee keeps the built dylib and per-device profiles.
 pub fn cache_dir() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(std::env::temp_dir, PathBuf::from);
-    home.join("Library/Caches/sim-rs/netshape")
+    home.join("Library/Caches/simee/netshape")
 }
 
 /// The profile file for a device.
@@ -278,10 +278,7 @@ fn run(cmd: &mut Command) -> Result<(), String> {
 
 /// The environment that makes a launched simulator process shaped by `udid`'s profile.
 pub fn launch_env(udid: &str, dylib: &Path) -> Vec<(String, String)> {
-    vec![
-        ("DYLD_INSERT_LIBRARIES".into(), dylib.display().to_string()),
-        ("SIM_RS_NETSHAPE".into(), profile_path(udid).display().to_string()),
-    ]
+    vec![("DYLD_INSERT_LIBRARIES".into(), dylib.display().to_string()), ("SIMEE_NETSHAPE".into(), profile_path(udid).display().to_string())]
 }
 
 #[cfg(test)]

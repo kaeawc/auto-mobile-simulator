@@ -221,7 +221,7 @@ fn resolves_emulator_for_host() {
     assert_eq!(d.url, "https://dl.google.com/android/repository/emulator-darwin_aarch64-16970787.zip");
     assert_eq!(d.size, 420_629_851);
     assert_eq!(d.sha1, "3ec739595d44092e835f006d806dd380bc8d6dd7");
-    assert_eq!(renderer::dir(Path::new("/sdk"), d.revision), PathBuf::from("/sdk/emu-rs/renderer/37.3.10"));
+    assert_eq!(renderer::dir(Path::new("/sdk"), d.revision), PathBuf::from("/sdk/simee/renderer/37.3.10"));
     let intel = Host { os: "macosx", arch: "x64" };
     assert!(repo().resolve(renderer::PACKAGE, intel).expect("x64").url.ends_with("darwin_x64-16970787.zip"));
 }
@@ -264,7 +264,7 @@ fn renderer_unzip_patterns() {
     assert!("Pkg.Revision=37\n".parse::<renderer::Marker>().is_err());
 }
 
-/// A fake renderer install: `<sdk>/emu-rs/renderer/<name>` with a marker for `rev` (if any).
+/// A fake renderer install: `<sdk>/simee/renderer/<name>` with a marker for `rev` (if any).
 fn fake_renderer(sdk: &Path, name: &str, rev: Option<&str>, backend: bool) -> PathBuf {
     let dir = renderer::root(sdk).join(name);
     std::fs::create_dir_all(dir.join("lib64")).expect("mkdir");
@@ -298,7 +298,7 @@ fn renderer_lookup_preference() {
     let emu_lib64 = sdk.join("emulator/lib64");
     std::fs::create_dir_all(&emu_lib64).expect("mkdir");
     assert_eq!(renderer::find_lib64(&sdk), Some(newest.join("lib64")));
-    // ...one with it wins over emu-rs's own copies.
+    // ...one with it wins over simee's own copies.
     std::fs::write(emu_lib64.join(renderer::BACKEND), b"").expect("write");
     assert_eq!(renderer::sdk_emulator_lib64(&sdk), Some(emu_lib64.clone()));
     assert_eq!(renderer::find_lib64(&sdk), Some(emu_lib64));
@@ -391,7 +391,7 @@ fn installs_renderer_from_a_local_archive() {
     fake_emulator_tree(&work, "r1", true);
     let d = zip_emulator(&work, "r1", "37.3.10");
     let inst = sdk.install_renderer(&d).expect("install renderer");
-    assert_eq!(inst.dir, sdk.root().join("emu-rs/renderer/37.3.10"));
+    assert_eq!(inst.dir, sdk.root().join("simee/renderer/37.3.10"));
     assert_eq!((inst.marker.revision, inst.marker.sha1.as_str(), inst.marker.url.as_str()), (d.revision, d.sha1.as_str(), d.url.as_str()));
     assert_eq!(
         tree(&inst.dir),

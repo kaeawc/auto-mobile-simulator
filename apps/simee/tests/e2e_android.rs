@@ -1,24 +1,24 @@
-//! End-to-end tests against a real running Android device (an AVD booted by emu-rs). Skipped
-//! unless `SIM_RS_E2E_AVD` names one; needs an Apple silicon Mac:
+//! End-to-end tests against a real running Android device (an AVD booted by simee). Skipped
+//! unless `SIMEE_E2E_AVD` names one; needs an Apple silicon Mac:
 //!
 //! ```text
-//! sim-rs create e2e --platform android --system-image "system-images;android-36;google_apis;arm64-v8a"
-//! sim-rs boot e2e && SIM_RS_E2E_AVD=e2e cargo nextest run -p sim-rs --test e2e_android
+//! simee create e2e --platform android --system-image "system-images;android-36;google_apis;arm64-v8a"
+//! simee boot e2e && SIMEE_E2E_AVD=e2e cargo nextest run -p simee --test e2e_android
 //! ```
 
 use std::process::{Command, Output};
 
 fn avd() -> Option<String> {
-    std::env::var("SIM_RS_E2E_AVD").ok().filter(|s| !s.is_empty())
+    std::env::var("SIMEE_E2E_AVD").ok().filter(|s| !s.is_empty())
 }
 
 fn sim(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_sim-rs")).args(args).output().expect("sim-rs runs")
+    Command::new(env!("CARGO_BIN_EXE_simee")).args(args).output().expect("simee runs")
 }
 
 fn ok(args: &[&str]) -> String {
     let out = sim(args);
-    assert!(out.status.success(), "sim-rs {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "simee {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -34,7 +34,7 @@ fn device_is_listed_as_a_booted_android_device() {
 #[test]
 fn screenshot_matches_the_avd_screen() {
     let Some(avd) = avd() else { return };
-    let dir = std::env::temp_dir().join(format!("sim-rs-e2e-android-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("simee-e2e-android-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("tmp");
     let path = dir.join("screen.png");
     ok(&["screenshot", &avd, path.to_str().expect("utf8")]);

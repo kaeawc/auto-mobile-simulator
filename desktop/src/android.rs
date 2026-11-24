@@ -1,4 +1,4 @@
-//! A live Android device: frames from its display socket (`<avd>/emu-rs/display.sock`) stream into
+//! A live Android device: frames from its display socket (`<avd>/simee/display.sock`) stream into
 //! a [`Pixels`], which wakes only the window showing it; touches and key taps go back as stream
 //! lines. Frames come through the emulator's shared frame ring (only a 32-byte notice per frame
 //! crosses the socket; the pixels are read from the ring straight into the buffer handed to
@@ -34,7 +34,7 @@ impl Screen {
         let (pixels, device, alive) = (Pixels::new(), Arc::new((AtomicU32::new(0), AtomicU32::new(0))), Arc::new(AtomicBool::new(true)));
         let (p, d, a) = (pixels.clone(), device.clone(), alive.clone());
         std::thread::Builder::new()
-            .name("sim-rs-android-frames".into())
+            .name("simee-android-frames".into())
             .spawn(move || {
                 while let Ok((header, rgba)) = frames.next_frame() {
                     d.0.store(header.device_width, Ordering::Relaxed);
@@ -96,9 +96,9 @@ mod tests {
     fn frames_from_the_shared_ring_reach_the_window() {
         let dir = PathBuf::from("/tmp").join(format!("rs-android-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("emu-rs")).expect("dir");
+        std::fs::create_dir_all(dir.join("simee")).expect("dir");
         let listener = UnixListener::bind(sim_android::display::socket(&dir)).expect("bind");
-        let ring_path = dir.join("emu-rs/frames-1-0.ring");
+        let ring_path = dir.join("simee/frames-1-0.ring");
         let rp = ring_path.clone();
         let (done, finished) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {

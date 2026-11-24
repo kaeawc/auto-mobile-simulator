@@ -1,8 +1,8 @@
 # Architecture
 
-sim-rs runs iOS simulator devices and Android emulator devices behind one core: one device model,
+simee runs iOS simulator devices and Android emulator devices behind one core: one device model,
 one method table, one CLI, one desktop window. This page explains how it is put together and why,
-including where the two projects it grew from (sim-rs and emu-rs) disagreed.
+including where the two projects it grew from (sim-rs and emu-rs, together renamed simee) disagreed.
 
 ## Layers
 
@@ -13,16 +13,16 @@ including where the two projects it grew from (sim-rs and emu-rs) disagreed.
 | iOS backend | `sim-coresim`, `sim-debug`, `sim-netshape`, `sim-audio` | macOS (`sim-coresim` compiles to nothing elsewhere) | CoreSimulator through the Objective-C runtime, HID input, the IOSurface framebuffer; host-side debugging, network shaping, audio |
 | Android backend, client | `sim-android` | everywhere | AVDs as devices, starting and stopping `emu`, the console client and the display-socket client |
 | Android backend, emulator | `apps/emu`, `emu-vmm`, `emu-hvf`, `emu-gfxstream`, `emu-avd`, `emu-sdk`, `emu-ext4`, `emu-fdt` | VMM on Apple silicon Macs; the rest everywhere | The emulator itself: Hypervisor.framework VM, stock board, virtio devices, gfxstream renderer, console and display servers, AVD files, Java-free provisioning |
-| Front ends | `apps/sim-rs`, `desktop/` | everywhere (devices only on macOS) | The CLI and the Rune window, both clients of `sim-api` |
+| Front ends | `apps/simee`, `desktop/` | everywhere (devices only on macOS) | The CLI and the Rune window, both clients of `sim-api` |
 
 ## Process model
 
 ```text
- sim-rs CLI ─┐                         ┌─ CoreSimulator ─ launchd_sim (one per iOS device)
+ simee CLI ─┐                         ┌─ CoreSimulator ─ launchd_sim (one per iOS device)
  desktop ────┼─ sim-api (in process) ──┤
- sim-rs serve┘   └─ JSON lines socket  └─ emu (one process per Android device)
+ simee serve┘   └─ JSON lines socket  └─ emu (one process per Android device)
                                               ├─ console port (stock text protocol)
-                                              ├─ <avd>/emu-rs/display.sock (sim_core::stream)
+                                              ├─ <avd>/simee/display.sock (sim_core::stream)
                                               │    └─ frames-<pid>-<n>.ring (shared frame ring)
                                               └─ adb bridge (console port + 1)
 ```
@@ -103,5 +103,5 @@ See [form-factors.md](form-factors.md).
 | `cargo clippy --target aarch64-apple-darwin` | any host | type-checks and lints the macOS-only code without linking |
 | CI `lint-test` | macOS 26 | everything above plus the iOS backend and the VMM's unit tests (modem, virtio, ...), and links the release `emu` |
 | CI `desktop`, `desktop-linux` | macOS, Linux | the window's headless view tests |
-| `SIM_RS_E2E_UDID`, `scripts/parity.sh`, the iOS AutoMobile harness | a Mac with a booted simulator | real iOS devices |
-| `SIM_RS_E2E_AVD`, booting an AVD, the Android AutoMobile harness | an Apple silicon Mac | real Android devices (hosted runners can't nest the hypervisor) |
+| `SIMEE_E2E_UDID`, `scripts/parity.sh`, the iOS AutoMobile harness | a Mac with a booted simulator | real iOS devices |
+| `SIMEE_E2E_AVD`, booting an AVD, the Android AutoMobile harness | an Apple silicon Mac | real Android devices (hosted runners can't nest the hypervisor) |

@@ -20,7 +20,7 @@ pub struct Host {
 }
 
 impl Host {
-    /// Apple silicon, the only host emu-rs boots guests on (and so the renderer's host).
+    /// Apple silicon, the only host simee boots guests on (and so the renderer's host).
     pub const MACOS_ARM64: Host = Host { os: "macosx", arch: "aarch64" };
 
     /// The machine this binary runs on, for host tools such as platform-tools.

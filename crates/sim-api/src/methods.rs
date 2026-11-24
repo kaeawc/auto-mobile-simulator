@@ -149,7 +149,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "vehicle",
         "device, property?(VHAL name or id: GEAR_SELECTION, gear, speed, 0x11600207, ...), area_id?, value?",
         "Android Automotive's vehicle HAL: list every property's value, read one, or set one when `value` is given \
-         (typed by the property: drive, 12.5, true); through the emulator console's `car` command (emu-rs)",
+         (typed by the property: drive, 12.5, true); through the emulator console's `car` command (simee)",
     ),
     ("watch_gesture", "device, gesture(double-tap|wrist-flick)", "An Apple Watch hand gesture"),
     ("remote_swipe", "device, direction(up|down|left|right), duration_ms?", "Swipe on the Siri Remote's touch surface (Apple TV)"),

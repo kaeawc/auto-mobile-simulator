@@ -1,4 +1,4 @@
-//! Per-AVD runtime state: disk images under `<avd>/emu-rs/`, the instance lock, boot config.
+//! Per-AVD runtime state: disk images under `<avd>/simee/`, the instance lock, boot config.
 //!
 //! The stock emulator's own files in the AVD directory (qcow2 overlays, snapshots) are never
 //! touched, so the same AVD keeps working with both. What a boot involves is decided first, with
@@ -55,7 +55,7 @@ pub struct Instance {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Instance {
     pub fn prepare(avd: &Avd, opts: &Opts) -> Result<Instance> {
-        let dir = avd.dir.join("emu-rs");
+        let dir = emu_avd::state_dir(&avd.dir);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let lock = if opts.read_only {
             None
@@ -102,7 +102,7 @@ impl Instance {
         let gpu_lib64 = renderer(avd, opts);
         if gpu_lib64.is_none() && !gpu_off(opts) {
             eprintln!(
-                "emu: no gfxstream renderer in the SDK (emulator/lib64 or emu-rs/renderer); booting without graphics \
+                "emu: no gfxstream renderer in the SDK (emulator/lib64 or simee/renderer); booting without graphics \
                  (install it with emu -provision-renderer)"
             );
         }
@@ -125,7 +125,7 @@ impl Instance {
                 }
             };
             // The launcher directory is the parent of lib64: the SDK's `emulator/` or
-            // `<sdk>/emu-rs/renderer/<revision>/`; gfxstream finds `lib64/vulkan` and
+            // `<sdk>/simee/renderer/<revision>/`; gfxstream finds `lib64/vulkan` and
             // `lib64/gles_*` under it.
             emu_gfxstream::link_beside_exe(lib64);
             emu_gfxstream::configure_environment(emulator_dir, icd);
@@ -304,7 +304,7 @@ pub struct BootPlan {
 
 impl BootPlan {
     pub fn new(avd: &Avd, opts: &Opts, renderer: Option<PathBuf>) -> BootPlan {
-        let dir = avd.dir.join("emu-rs");
+        let dir = emu_avd::state_dir(&avd.dir);
         let user_mode = if opts.read_only { DiskMode::Ephemeral } else { DiskMode::Persistent };
         let disk = |slot, path: PathBuf, mode, serial: &str| DiskSpec { slot, path, mode, serial: serial.to_string() };
         let mut cmdline = String::from(BASE_CMDLINE);
@@ -345,10 +345,10 @@ impl BootPlan {
         plan
     }
 
-    /// Image files the boot reads that aren't there. The AVD's own disks under `emu-rs/` are
+    /// Image files the boot reads that aren't there. The AVD's own disks under `simee/` are
     /// created at boot, so only the image's are checked.
     pub fn missing(&self) -> Vec<&Path> {
-        let image = self.disks.iter().filter(|d| d.mode == DiskMode::Ephemeral && !d.path.starts_with(self.emu_rs_dir()));
+        let image = self.disks.iter().filter(|d| d.mode == DiskMode::Ephemeral && !d.path.starts_with(self.state_dir()));
         [self.kernel.as_path(), self.ramdisk.as_path()]
             .into_iter()
             .chain(image.map(|d| d.path.as_path()))
@@ -356,7 +356,7 @@ impl BootPlan {
             .collect()
     }
 
-    fn emu_rs_dir(&self) -> PathBuf {
+    fn state_dir(&self) -> PathBuf {
         self.disks.iter().find(|d| d.serial == "userdata").and_then(|d| d.path.parent()).map(Path::to_path_buf).unwrap_or_default()
     }
 

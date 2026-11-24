@@ -18,7 +18,7 @@ reads go by DMA into shared-slot address-space memory, resolved through the rend
 CGL backend hangs creating a display context); composition stays in Vulkan (GL composition
 deadlocks SurfaceFlinger) and host screenshots sync the posted buffer from Vulkan to GL before
 reading it. Guest GLES uses the virtio-gpu pipe stream (`ro.hardware.egl=emulation`), whose
-blocking reads serialize all contexts on the one control queue, so emu-rs boots the guest with
+blocking reads serialize all contexts on the one control queue, so simee boots the guest with
 `ro.hardware.egl=angle` (address-space graphics everywhere): warm boots went from 14–28 s with
 boot-time ANRs to 5–8 s. `EMU_GUEST_EGL=emulation` restores the pipe stream.
 
@@ -48,11 +48,11 @@ SurfaceFlinger needs a host renderer. Two routes, both backed by gfxstream:
 The renderer on a Java-free install — done (2026-11-22): `emu -provision` (or
 `-provision-renderer` alone) fetches the `emulator` package on demand and unpacks only its
 `lib64` minus Qt (498 MB of the 1.32 GB package, from a 420.6 MB download) into
-`<sdk>/emu-rs/renderer/<revision>/`. emu prefers the SDK's own `emulator/lib64` when present.
+`<sdk>/simee/renderer/<revision>/`. emu prefers the SDK's own `emulator/lib64` when present.
 `Renderer::load` preloads the backend's `@rpath` dependencies leaves-first, so the location
 needs no rpath; bare-name `dlopen`s (`libshadertranslator.dylib`) still go through the
 executable's rpaths, hence the `lib64` link beside the binary and the
-`emu-rs/renderer/current/lib64` rpath. Open: without `-gpu`, `ANDROID_EMU_VK_ICD` is unset and
+`simee/renderer/current/lib64` rpath. Open: without `-gpu`, `ANDROID_EMU_VK_ICD` is unset and
 gfxstream finds no Vulkan ICD ("Failed to create Vulkan instance", Vulkan disabled) with either
 renderer location; `moltenvk` and `lavapipe` initialize cleanly, while `swiftshader` aborts
 during init (both 37.2.13 and 37.3.10).
@@ -70,12 +70,12 @@ not. The SDK's renderer refuses `stream_renderer_snapshot` ("Snapshot save reque
 support": built without the snapshot frontend), its internal `RendererImpl::save` needs C++
 `Stream`/`ITextureSaver` objects and misses the virtio-gpu frontend's state, and current images
 ship no guest software renderer to fall back to. Options: build gfxstream with snapshot support
-(the frontend snapshot is meant for all-Vulkan guests, which emu-rs now runs via guest ANGLE), or
+(the frontend snapshot is meant for all-Vulkan guests, which simee now runs via guest ANGLE), or
 report snapshots as unsupported so tools fall back to app-level state.
 
 ## 3. AutoMobile harness parity
 
-Point AutoMobile at emu-rs through the SDK overlay (`make shim`, `ANDROID_HOME=~/.emu-rs/sdk`)
+Point AutoMobile at simee through the SDK overlay (`make shim`, `ANDROID_HOME=~/.simee/sdk`)
 and run its tools one by one, fixing whatever breaks:
 
 - **Console commands:** `geo fix`, `sms send`, `gsm`, `sensor set|get`, `finger touch|remove`,
@@ -84,7 +84,7 @@ and run its tools one by one, fixing whatever breaks:
 - **Pipe services:** sensors, battery, camera, QemuMiscPipe (boot-complete signal).
 - **virtio devices:** virtio-console (logcat on `hvc1`, modem vport), virtio-snd, virtio-net or
   wifi with a user-mode NAT.
-- **gRPC `EmulatorController`:** audio injection and streaming, and `streamInputEvent`'s XR fields (`xr_hand_event`, `xr_eye_event`, head pose, recenter), which auto-mobile's `xrHeadsetInput` sends; emu-rs already puts the same messages on `qemud:xr_service` (console `xr`).
+- **gRPC `EmulatorController`:** audio injection and streaming, and `streamInputEvent`'s XR fields (`xr_hand_event`, `xr_eye_event`, head pose, recenter), which auto-mobile's `xrHeadsetInput` sends; simee already puts the same messages on `qemud:xr_service` (console `xr`).
 - **Process and launch contract:** the launch-success markers and `qemu-system-*` process
   naming the harness's stop fallback expects.
 

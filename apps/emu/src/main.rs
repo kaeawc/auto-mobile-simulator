@@ -1,4 +1,4 @@
-//! `emu`: boots an Android Virtual Device with the emu-rs VMM.
+//! `emu`: boots an Android Virtual Device with the simee VMM.
 //!
 //! Accepts the SDK `emulator` command line (single-dash flags, `-avd NAME` or `@NAME`) so
 //! existing tooling can launch it unchanged; flags that don't apply yet are accepted and
@@ -118,7 +118,7 @@ fn real_main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if opts.version {
-        println!("emu-rs {}", env!("CARGO_PKG_VERSION"));
+        println!("simee {}", env!("CARGO_PKG_VERSION"));
         return Ok(ExitCode::SUCCESS);
     }
     if opts.list_avds {
@@ -149,7 +149,7 @@ fn real_main() -> Result<ExitCode> {
             println!("accel:\n0\nHypervisor.framework (arm64) is usable\naccel");
             return Ok(ExitCode::SUCCESS);
         }
-        println!("accel:\n1\nemu-rs needs Hypervisor.framework on an Apple silicon Mac\naccel");
+        println!("accel:\n1\nsimee needs Hypervisor.framework on an Apple silicon Mac\naccel");
         return Ok(ExitCode::FAILURE);
     }
     let name = opts.avd.clone().context("no AVD given (use -avd NAME, or -list-avds)")?;
@@ -175,7 +175,7 @@ fn dry_run(env: &emu_avd::Env, name: &str, opts: &args::Opts) -> Result<ExitCode
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn boot(_: &emu_avd::Env, name: &str, _: &args::Opts, _: std::sync::mpsc::Receiver<i32>) -> Result<ExitCode> {
-    anyhow::bail!("cannot boot {name}: emu-rs needs Hypervisor.framework on an Apple silicon Mac")
+    anyhow::bail!("cannot boot {name}: simee needs Hypervisor.framework on an Apple silicon Mac")
 }
 
 /// Boots the AVD and runs it until the guest powers off or a signal arrives.
@@ -223,7 +223,7 @@ fn boot(env: &emu_avd::Env, name: &str, opts: &args::Opts, signals: std::sync::m
         },
     )?;
     let _advert = console::Advertisement::write(&avd.name, &avd.dir, inst.console_port);
-    // Live display + input for the desktop app (<avd>/emu-rs/display.sock).
+    // Live display + input for the desktop app (<avd>/simee/display.sock).
     let _display = inst.display.clone().and_then(|d| display_server::start(&avd.dir, d, inst.inputs.clone(), stop.clone()));
     // On stdout: launchers watch for the first line and the `emulator-<port>` serial.
     println!("emu: {} on emulator-{} (adb port {})", avd.name, inst.console_port, inst.console_port + 1);

@@ -1,7 +1,7 @@
 //! Native ext4 formatter.
 //!
 //! Writes an empty ext4 filesystem (root directory, `lost+found`, an internal jbd2 journal) the
-//! way `mke2fs -t ext4 -b 4096` lays one out, so emu-rs needs no external `mkfs.ext4`. Only
+//! way `mke2fs -t ext4 -b 4096` lays one out, so simee needs no external `mkfs.ext4`. Only
 //! metadata is written: the image is truncated first and every block the formatter doesn't touch
 //! (inode tables, the journal body, data) reads as zero from the sparse file, so a fresh 10 GiB
 //! image takes well under a megabyte on disk.
