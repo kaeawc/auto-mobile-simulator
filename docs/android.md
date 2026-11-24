@@ -21,7 +21,7 @@ to use fewer resources.
 | VM core | vCPUs, the framework's in-kernel GICv3, PSCI (SMP, power off and reset), arch timer, PL011 console, PL031 RTC |
 | Board | Stock memory map and virtio-mmio slots, so the unmodified fstab and first-stage init find `vda`–`vde` and their by-name paths |
 | Storage | virtio-blk with indirect descriptors, event-idx, and discard/write-zeroes (hole punching). System and vendor are copy-on-write in memory; userdata, cache and metadata persist per AVD. Userdata is created by a native ext4 formatter (no `mkfs.ext4`) |
-| Boot | Full Android boot to `sys.boot_completed` in about 11–20 s on a warm boot (stock, cold: 51 s); first boot formats and encrypts `/data` |
+| Boot | Full Android boot to `sys.boot_completed`: 9.5 s cold, 3.5 s warm (stock: 22.9 s and 17.1 s; [benchmarks](benchmarks.md)); first boot formats and encrypts `/data` |
 | adb | virtio-vsock with a host bridge on `console port + 1`, announced to the adb server. `adb shell`/`root`/`push` work, and the device shows up about 8 s after launch on a warm boot |
 | Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot`, plus simee's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
 | Discovery | `-list-avds`, `pid_<pid>.ini` running-instance file, `emulator-<port>` serial on stdout |
@@ -68,25 +68,16 @@ ignored for now.
 | `apps/emu` | The `emu` CLI: SDK-emulator-compatible flags, per-AVD instance state, console server, display server |
 | `crates/sim-android` | The client front ends use: AVDs as devices, starting `emu`, the console and display-socket clients |
 | `desktop/` | simee's Rune window (both platforms), its own workspace |
-| `docs/` | [Stock board reference](docs/reference/stock-board.md), [desktop and display design](docs/design/desktop-and-display.md), [roadmap](docs/roadmap-android.md) |
+| `docs/` | [Stock board reference](reference/stock-board.md), [desktop and display design](design/desktop-and-display.md), [roadmap](roadmap-android.md) |
 | `scripts/` | Cargo runner that signs with the hypervisor entitlement, SDK overlay (`make shim`), AutoMobile harness (`make harness-android DEVICE=emulator-5554`) |
 
 ## Benchmarks
 
-`scripts/android-bench.sh` boots an AVD the same way under either emulator and measures it. Results
-below are from one API 36 `google_apis` AVD (4 vCPU, 2 GB) on an M-series Mac, 2026-11-22. Stock
-was cold-booted (`-no-snapshot-load`).
+`scripts/android-bench.sh` boots an AVD the same way under either emulator and measures it. The
+current numbers, cold and warm, and how they were taken are in [benchmarks.md](benchmarks.md).
 
-| | simee | stock |
-| --- | --- | --- |
-| launch → `adb device` | **14.5 s** | 25.8 s |
-| peak RSS (process tree) | **1.67 GB** | 5.09 GB |
-| `adb shell echo` (median of 3) | **0.41 s** | 0.80 s |
-| guest CPU: shell loop / 4× md5 | 0.74 s / 0.96 s | 0.72 s / 0.89 s |
-| `sys.boot_completed` | not yet (needs graphics) | 51 s |
-
-Guest CPU speed is equal, as expected: both run guest code natively. The differences are in
-the VMM: no userspace GIC, fewer device threads, and RAM that is only committed when touched.
+Both run guest code natively on the CPU. The differences are in the VMM: no
+userspace GIC, fewer device threads, and RAM that is only committed when touched.
 
 ## Provisioning without Java
 

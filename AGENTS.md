@@ -52,6 +52,31 @@ for both is to match the stock tools exactly and then exceed them.
 - `desktop/` is a separate workspace (Rune is a large git dependency). Bump the Rune `rev` and every
   `[patch.crates-io]` entry together, and commit `desktop/Cargo.lock`.
 
+## Benchmarks and public docs
+
+The README and `docs/comparison.md` are how people decide whether to adopt this project. They
+argue with measured numbers against the stock tools, so keep the numbers current:
+
+- `docs/benchmarks.md` is the one source of numbers. Every row has the value for this project,
+  the value for the stock tool where one exists, the date, the machine, and the command that
+  reproduces it. The README and `docs/comparison.md` quote rows from it and never carry a number
+  it doesn't have.
+- A change that moves a published number updates its row in the same PR. A performance PR with
+  no row to update adds one, or says in its description why the win isn't user-visible.
+- Compare like with like: the same AVD or device type, host and day, both tools cold or both
+  warm, median of at least 3 runs. Say what was run (`scripts/android-bench.sh`, `hyperfine`, a
+  `--ignored` bench). A number measured on a different machine (a Linux VM bench) is labelled so.
+- Never publish an estimate, a number from memory, or a comparison that wasn't run. An
+  unmeasured claim goes under "Not yet measured" in `docs/benchmarks.md` until it is.
+- Re-run the stock comparison when the README's headline rows are more than about a month old,
+  or when the stock tools ship a new release, and update the date.
+- Lead with what a user feels (time to a usable device, memory per device, time per automation
+  step, what can be inspected), then link to the mechanism (`docs/android.md` "Performance
+  notes"). State limits plainly in "Not yet": a reader who hits an undisclosed gap leaves.
+- Keep the README short: what it is, the comparison, a quick start, links. Reference material
+  lives in `docs/`. Write specific claims in plain sentences; no slogans, no superlatives
+  without a number beside them.
+
 ## Build & validate
 
 ```bash
@@ -70,8 +95,8 @@ fails under its `--fail-under-lines` floor; raise the floor with coverage, never
 code (no linking needed): `rustup target add aarch64-apple-darwin` once, then
 `cargo clippy --target aarch64-apple-darwin --all-targets -- -D warnings`.
 
-Unit tests never need a device or the hypervisor. Against a real device (see "Harness" in
-README.md):
+Unit tests never need a device or the hypervisor. Against a real device (see
+docs/development.md):
 
 ```bash
 SIMEE_E2E_UDID=<udid> cargo nextest run -p simee --test e2e

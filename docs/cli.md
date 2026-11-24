@@ -1,0 +1,107 @@
+# CLI
+
+Every command is a method in the [socket API](api.md); the CLI formats its output. `<device>` is a
+UDID (an Android device's is its AVD name), an exact name, or `booted`.
+
+```bash
+cargo build
+alias simee=target/debug/simee
+
+simee list                                   # every device, grouped by runtime, labelled
+simee list --platform android --form-factor watch
+simee form-factors
+```
+
+## iOS
+
+```bash
+simee runtimes | device-types                # what can be created
+simee create "My Phone" "iPhone 17" "iOS 26.5"                                   # phone (iOS)
+simee create "Pad" "iPad Pro 11-inch (M4)" "iOS 26.5" --form-factor tablet       # iPadOS
+simee create "Watch" "Apple Watch Series 10 (46mm)" "watchOS 26.0" --form-factor watch
+simee create "TV" "Apple TV 4K (3rd generation)" "tvOS 26.0" --form-factor tv
+simee create "Vision" "Apple Vision Pro" "visionOS 26.0" --form-factor vision
+simee boot <device>                          # waits until the device finishes booting
+simee rotate Phone --orientation landscape-left   # or 90° clockwise without --orientation
+simee carplay Phone on                       # CarPlay display on a booted iPhone (iOS 26 runtimes)
+simee tap Phone 400 240 --display carplay    # ...then touch and screenshot it
+simee rotary Watch 3                         # the Digital Crown (--delta for raw crown units)
+simee watch-gesture Watch double-tap         # or wrist-flick
+simee button TV select                       # the Siri Remote: select, menu, home, play-pause, arrows
+simee remote-swipe TV left                   # its touch surface
+```
+
+`--form-factor` is checked against the device type (an iPhone is not a tablet). CarPlay is an
+external display of an iPhone simulator rather than a device type: `--form-factor auto` says so,
+and `carplay on` attaches it. See [docs/form-factors.md](form-factors.md) for how each
+Apple input is sent.
+
+## Android
+
+```bash
+emu -provision 36 -tag google_apis            # platform-tools, the image and the renderer
+emu -list-images -tag android-wear            # other image families: android-tv, google-tv,
+                                              # android-automotive, ...
+simee create Pixel   --platform android --system-image "system-images;android-36;google_apis;arm64-v8a"
+simee create Tablet  --platform android --system-image "system-images;android-36;google_apis;arm64-v8a" --form-factor tablet
+simee create Fold    --platform android --system-image "system-images;android-36;google_apis;arm64-v8a" --form-factor foldable
+simee create Wear    --platform android --system-image "system-images;android-34;android-wear;arm64-v8a"
+simee create TV      --platform android --system-image "system-images;android-34;google-tv;arm64-v8a"
+simee create Car     --platform android --system-image "system-images;android-34-ext9;android-automotive;arm64-v8a"
+simee create XR      --platform android --system-image "system-images;android-34;google-xr;arm64-v8a"
+simee boot Pixel                             # starts emu; waits for sys.boot_completed
+adb -s emulator-5554 shell                    # it is an ordinary emulator to every tool
+simee fold Fold half-opened                  # the hinge (foldables only)
+simee rotary Wear 3                          # the rotary input (watches only)
+simee xr XR recenter                         # Android XR head pose, options, pointer
+simee vehicle Car gear drive                 # a vehicle HAL property (Automotive only)
+simee console Pixel sensor get acceleration  # anything the emulator console speaks
+simee shutdown Pixel
+```
+
+The form factor comes from the image (Wear OS, TV and Automotive images) or `--form-factor`
+(phone, tablet or foldable from a mobile image, which also sizes the screen and adds a foldable's
+hinge). An image can't boot another family's form factor, and the error says which it boots.
+`emu` itself stays a drop-in for the SDK's `emulator` (`emu -avd <name>`, `make shim`); see
+[docs/android.md](android.md).
+
+## Both
+
+```bash
+simee screenshot <device> out.png            # full-resolution PNG
+simee tap <device> 600 1300                  # pixels from the top-left of the screen
+simee swipe <device> 600 2000 600 900 --duration 300 [--settle]
+simee button <device> home|lock              # iOS: side|siri|apple-pay|action; Android: back|recents|
+                                              # volume-up|volume-down|menu; TVs: up|down|left|right|
+                                              # select|play-pause (menu|back on the Siri Remote)
+simee rotate <device>                        # 90° clockwise (iOS: --orientation too)
+simee rotary <device> 3                      # a watch's crown (Wear OS or Apple Watch)
+simee type <device> 'Hello, World!'          # hardware keyboard, US layout, on both platforms
+simee key <device> 40                        # HID usage (40 = Return)
+simee location <device> 37.33 -122.03
+simee shutdown|delete <device>
+```
+
+`<device>` is a UDID (an Android device's is its AVD name), an exact name, or `booted`.
+iOS-only commands: `install|uninstall|launch|terminate|apps`, `open-url`, `appearance`, `privacy`,
+`memory-warning`, `erase`, `exec`, `carplay`, `watch-gesture`, `remote-swipe`; Android-only:
+`fold`, `console`, `xr`. Using one
+on the other platform's device fails with the platforms it works on.
+
+
+## Socket API
+
+Everything above is a method in `sim-api`'s table, served as JSON lines on a unix socket; the CLI
+and the desktop window call the same table.
+
+```bash
+simee serve                                   # $SIMEE_SOCKET or $TMPDIR/simee.sock
+simee call help                               # every method, with the platforms it supports
+simee call devices '{"platform":"android"}'
+simee call fold '{"device":"Fold","posture":"half-opened"}'
+simee call ca_debug '{"device":"booted","option":"blended-layers","on":true}'
+```
+
+The desktop window serves the same API on `$TMPDIR/simee-desktop.sock`. Full reference:
+[docs/api.md](api.md).
+
