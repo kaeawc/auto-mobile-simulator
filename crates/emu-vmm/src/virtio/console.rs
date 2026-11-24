@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
-use super::queue::Queue;
+use super::mmio::F_RING_EVENT_IDX;
+use super::queue::{Chain, Queue};
 use super::{Activation, INT_USED_RING, Interrupt, VirtioDevice};
 use emu_hvf::GuestRam;
 
@@ -190,8 +191,10 @@ impl VirtioDevice for Console {
     fn device_id(&self) -> u32 {
         ID_CONSOLE
     }
+    /// Event-idx: transmit queues are drained with kicks off, and the guest kicks a receive
+    /// queue only once the device has taken all its buffers.
     fn features(&self) -> u64 {
-        F_MULTIPORT
+        F_MULTIPORT | F_RING_EVENT_IDX
     }
     fn num_queues(&self) -> usize {
         2 + 2 * self.nr_ports as usize
@@ -215,8 +218,10 @@ impl VirtioDevice for Console {
             p.guest_open = false;
             p.pending.clear();
         }
-        let queues = act.queues.iter().map(|q| q.map(|c| Queue::new(c, false))).collect();
-        let mut w = Worker { mem: act.mem, irq: act.irq, queues, ports, ctl_out: VecDeque::new() };
+        let event_idx = act.features & F_RING_EVENT_IDX != 0;
+        let queues: Vec<Option<Queue>> = act.queues.iter().map(|q| q.map(|c| Queue::new(c, event_idx))).collect();
+        let used = vec![false; queues.len()];
+        let mut w = Worker { mem: act.mem, irq: act.irq, queues, used, ports, ctl_out: VecDeque::new() };
         let h = std::thread::Builder::new()
             .name("virtio-console".into())
             .spawn(move || {
@@ -270,6 +275,8 @@ struct Worker {
     mem: Arc<GuestRam>,
     irq: Arc<Interrupt>,
     queues: Vec<Option<Queue>>,
+    /// Queues given used entries since the last interrupt check (by queue index).
+    used: Vec<bool>,
     ports: Vec<Port>,
     /// Control messages waiting for control receive buffers.
     ctl_out: VecDeque<Vec<u8>>,
@@ -277,17 +284,19 @@ struct Worker {
 
 impl Worker {
     /// Drains every transmit queue (guest → host), then delivers what's pending.
+    /// Transmit queues are drained with kicks off ([`Queue::pop_draining`]), so what the guest
+    /// writes meanwhile costs it no exit.
     fn service(&mut self) {
-        let mut used = false;
+        let mut c = Chain::default();
         // Control messages from the guest.
         let mut incoming = Vec::new();
         if let Some(q) = self.queues.get_mut(CTL_TX).and_then(Option::as_mut) {
-            while let Ok(Some(c)) = q.pop(&self.mem) {
+            while let Ok(true) = q.pop_draining(&self.mem, &mut c) {
                 if let Ok(b) = c.read_all(&self.mem, 4096) {
                     incoming.push(b);
                 }
                 let _ = q.add_used(&self.mem, c.head, 0);
-                used = true;
+                self.used[CTL_TX] = true;
             }
         }
         for m in incoming {
@@ -296,13 +305,14 @@ impl Worker {
         // Port data from the guest.
         for port in 0..self.ports.len() as u32 {
             let mut data = Vec::new();
-            if let Some(q) = self.queues.get_mut(tx_queue(port)).and_then(Option::as_mut) {
-                while let Ok(Some(c)) = q.pop(&self.mem) {
+            let qi = tx_queue(port);
+            if let Some(q) = self.queues.get_mut(qi).and_then(Option::as_mut) {
+                while let Ok(true) = q.pop_draining(&self.mem, &mut c) {
                     if let Ok(b) = c.read_all(&self.mem, 1 << 16) {
                         data.extend_from_slice(&b);
                     }
                     let _ = q.add_used(&self.mem, c.head, 0);
-                    used = true;
+                    self.used[qi] = true;
                 }
             }
             if !data.is_empty() {
@@ -311,9 +321,7 @@ impl Worker {
                 p.pending.extend(reply);
             }
         }
-        if used {
-            self.irq.raise(INT_USED_RING);
-        }
+        // The flush raises one interrupt for both directions.
         self.flush();
     }
 
@@ -355,14 +363,13 @@ impl Worker {
 
     /// Fills guest receive buffers: control first, then each open port's pending bytes.
     fn flush(&mut self) {
-        let mut used = false;
         if let Some(q) = self.queues.get_mut(CTL_RX).and_then(Option::as_mut) {
             while let Some(m) = self.ctl_out.front() {
                 let Ok(Some(c)) = q.pop(&self.mem) else { break };
                 let n = c.write_all(&self.mem, m).unwrap_or(0);
                 let _ = q.add_used(&self.mem, c.head, n);
                 self.ctl_out.pop_front();
-                used = true;
+                self.used[CTL_RX] = true;
             }
         }
         for port in 0..self.ports.len() as u32 {
@@ -370,7 +377,8 @@ impl Worker {
             if !p.guest_open || p.pending.is_empty() {
                 continue;
             }
-            let Some(q) = self.queues.get_mut(rx_queue(port)).and_then(Option::as_mut) else { continue };
+            let qi = rx_queue(port);
+            let Some(q) = self.queues.get_mut(qi).and_then(Option::as_mut) else { continue };
             while !p.pending.is_empty() {
                 let Ok(Some(c)) = q.pop(&self.mem) else { break };
                 let room: usize = c.writable().map(|d| d.len as usize).sum();
@@ -378,10 +386,18 @@ impl Worker {
                 let chunk: Vec<u8> = p.pending.drain(..take).collect();
                 let n = c.write_all(&self.mem, &chunk).unwrap_or(0);
                 let _ = q.add_used(&self.mem, c.head, n);
-                used = true;
+                self.used[qi] = true;
             }
         }
-        if used {
+        // Every queue that got used entries is asked (each records the check), and the guest
+        // gets one interrupt if any wants it.
+        let mut raise = false;
+        for (q, used) in self.queues.iter_mut().zip(self.used.iter_mut()) {
+            if let (true, Some(q)) = (std::mem::take(used), q.as_mut()) {
+                raise |= q.should_notify(&self.mem);
+            }
+        }
+        if raise {
             self.irq.raise(INT_USED_RING);
         }
     }
@@ -418,6 +434,9 @@ mod tests {
         tx_next: u64,
         host: Vec<PortHandle>,
         log: Arc<std::sync::Mutex<Vec<String>>>,
+        event_idx: bool,
+        /// Kicks sent (MMIO exits on a real guest).
+        kicks: u32,
     }
 
     const BUFS: u64 = RAM_BASE + 0x10_0000;
@@ -437,17 +456,28 @@ mod tests {
             }
         }
         let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
-        dev.activate(Activation { mem: mem.clone(), irq, queues: q.iter().map(|d| Some(d.cfg)).collect(), features: F_MULTIPORT })
-            .expect("activate");
-        Guest { mem, dev, q, seen: vec![0; 6], tx_next: RAM_BASE + 0x20_0000, host, log }
+        let features = dev.features();
+        dev.activate(Activation { mem: mem.clone(), irq, queues: q.iter().map(|d| Some(d.cfg)).collect(), features }).expect("activate");
+        let event_idx = features & F_RING_EVENT_IDX != 0;
+        Guest { mem, dev, q, seen: vec![0; 6], tx_next: RAM_BASE + 0x20_0000, host, log, event_idx, kicks: 0 }
     }
 
     impl Guest {
+        /// Publishes `bytes` on `queue`, kicking only when the device asked for it.
         fn send(&mut self, queue: usize, bytes: &[u8]) {
             self.mem.write(self.tx_next, bytes).expect("tx");
+            let old = self.q[queue].avail_idx();
             self.q[queue].push(&self.mem, &[(self.tx_next, bytes.len() as u32, false)]);
             self.tx_next += 0x100;
-            self.dev.notify(queue as u16);
+            self.kick_if_asked(queue, old);
+        }
+        fn kick_if_asked(&mut self, queue: usize, old: u16) -> bool {
+            let kick = self.q[queue].needs_kick(&self.mem, old, self.event_idx);
+            if kick {
+                self.kicks += 1;
+                self.dev.notify(queue as u16);
+            }
+            kick
         }
         fn control(&mut self, id: u32, event: u16, value: u16) {
             self.send(CTL_TX, &ctl_msg(id, event, value, &[]));
@@ -520,16 +550,110 @@ mod tests {
             got.extend(g.recv(rx_queue(1)));
         }
         assert!(g.idle(rx_queue(1)), "out of buffers");
+        let old = g.q[rx_queue(1)].avail_idx();
         for b in 0..4u64 {
             let addr = BUFS + (rx_queue(1) as u64 * 8 + b) * 64;
             g.q[rx_queue(1)].push(&g.mem, &[(addr, 64, true)]);
         }
         g.host[1].send(Vec::new()); // empty sends are dropped; the next kick flushes
-        g.dev.notify(0);
+        assert!(g.kick_if_asked(rx_queue(1), old), "a device out of buffers asks for the refill");
         while got.len() < big.len() {
             got.extend(g.recv(rx_queue(1)));
         }
         assert_eq!(got, big);
+    }
+
+    /// A backend whose first write blocks the worker (mid-drain) until the test lets it go.
+    struct Gate(Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>);
+
+    impl PortBackend for Gate {
+        fn guest_data(&mut self, _data: &[u8]) -> Vec<u8> {
+            if let Some((entered, release)) = self.0.take() {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
+            Vec::new()
+        }
+    }
+
+    /// What the guest writes while the worker is busy costs it at most one kick per pass.
+    #[test]
+    fn writes_while_the_worker_drains_cost_no_kicks() {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x40_0000).expect("ram"));
+        let (mut dev, _host) =
+            Console::new(vec![PortSpec { name: String::new(), backend: Box::new(Gate(Some((entered_tx, release_rx)))) }]);
+        let mut q: Vec<Driver> = (0..4).map(|i| Driver::at(RAM_BASE + 0x1000 + i * 0x2000, 16)).collect();
+        let features = dev.features();
+        assert!(features & F_RING_EVENT_IDX != 0, "the device offers event-idx");
+        let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+        dev.activate(Activation { mem: mem.clone(), irq, queues: q.iter().map(|d| Some(d.cfg)).collect(), features }).expect("activate");
+        // Dropped before the device, so a failing assertion releases the worker.
+        let release = release;
+        let tx = tx_queue(0);
+        let mut kicks = 0;
+        let mut write = |q: &mut Driver, i: u64| {
+            let at = RAM_BASE + 0x20_0000 + i * 0x100;
+            mem.write(at, b"log line").expect("tx");
+            let old = q.avail_idx();
+            q.push(&mem, &[(at, 8, false)]);
+            let kick = q.needs_kick(&mem, old, true);
+            if kick {
+                dev.notify(tx as u16);
+            }
+            u32::from(kick)
+        };
+        kicks += write(&mut q[tx], 0);
+        entered.recv_timeout(Duration::from_secs(5)).expect("the worker took the first write");
+        for i in 1..12 {
+            kicks += write(&mut q[tx], i);
+        }
+        // The worker hands a port its data after draining the queue, so the gate holds it
+        // with kicks back on: the next write kicks once, and the rest none until it catches up.
+        assert_eq!(kicks, 2, "12 writes while the worker is busy: 2 kicks (12 with the flags)");
+        release.send(()).expect("release");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while q[tx].used_idx(&mem) != 12 {
+            assert!(Instant::now() < deadline, "the worker never took the writes");
+            std::thread::yield_now();
+        }
+    }
+
+    /// The lost-wakeup window on a transmit queue: the guest writes after the worker's last pop
+    /// came back empty but before kicks are back on, so it doesn't kick; the worker's recheck
+    /// still takes the write.
+    #[test]
+    fn a_write_as_kicks_come_back_on_is_still_taken() {
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x40_0000).expect("ram"));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ports = vec![Port { name: "modem".into(), backend: Box::new(Modem(log.clone())), guest_open: false, pending: VecDeque::new() }];
+        let tx = Arc::new(std::sync::Mutex::new(Driver::at(RAM_BASE + 0x3000, 16)));
+        let txcfg = tx.lock().expect("tx").cfg;
+        let mut txq = Queue::new(txcfg, true);
+        let write = |mem: &GuestRam, d: &mut Driver, at: u64, b: &[u8]| {
+            mem.write(at, b).expect("tx");
+            let old = d.avail_idx();
+            d.push(mem, &[(at, b.len() as u32, false)]);
+            d.needs_kick(mem, old, true)
+        };
+        write(&mem, &mut tx.lock().expect("tx"), RAM_BASE + 0x20_0000, b"AT");
+        let (m, t, missed) = (mem.clone(), tx.clone(), Arc::new(std::sync::Mutex::new(Vec::new())));
+        let missed2 = missed.clone();
+        let mut fired = false;
+        txq.on_empty = Some(Box::new(move || {
+            if !std::mem::replace(&mut fired, true) {
+                let kicked = write(&m, &mut t.lock().expect("tx"), RAM_BASE + 0x20_0100, b"+CSQ");
+                missed2.lock().expect("missed").push(!kicked);
+            }
+        }));
+        let queues = vec![None, Some(txq)];
+        let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+        let mut w = Worker { mem: mem.clone(), irq, used: vec![false; queues.len()], queues, ports, ctl_out: VecDeque::new() };
+        w.service();
+        assert_eq!(*missed.lock().expect("missed"), [true], "the guest skipped its kick");
+        assert_eq!(tx.lock().expect("tx").used_idx(&mem), 2, "both writes taken");
+        assert_eq!(*log.lock().expect("log"), ["AT+CSQ"]);
     }
 
     /// A `Write` the test can read back.

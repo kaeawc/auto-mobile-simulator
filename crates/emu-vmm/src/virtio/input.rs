@@ -18,7 +18,8 @@ use std::thread::JoinHandle;
 use emu_hvf::GuestRam;
 use sim_core::goldfish::keyboard_has;
 
-use super::queue::Queue;
+use super::mmio::F_RING_EVENT_IDX;
+use super::queue::{Chain, Queue};
 use super::{Activation, INT_USED_RING, Interrupt, VirtioDevice};
 
 pub const ID_INPUT: u32 = 18;
@@ -387,8 +388,11 @@ impl VirtioDevice for Input {
     fn device_id(&self) -> u32 {
         ID_INPUT
     }
+    /// Event-idx: Linux's driver kicks after refilling the event queue on every interrupt;
+    /// under event-idx it kicks only when the device had taken every buffer, which a 64-entry
+    /// queue fed one event per buffer rarely is. The status queue is drained with kicks off.
     fn features(&self) -> u64 {
-        0
+        F_RING_EVENT_IDX
     }
     fn num_queues(&self) -> usize {
         2
@@ -421,7 +425,8 @@ impl VirtioDevice for Input {
         let statusq = act.queues.get(1).copied().flatten();
         self.stop_worker();
         let rx = self.rx.take().ok_or("input worker receiver missing")?;
-        let w = Worker::new(act.mem, act.irq, Queue::new(eventq, false), statusq.map(|q| Queue::new(q, false)));
+        let event_idx = act.features & F_RING_EVENT_IDX != 0;
+        let w = Worker::new(act.mem, act.irq, Queue::new(eventq, event_idx), statusq.map(|q| Queue::new(q, event_idx)));
         let h = std::thread::Builder::new().name(format!("input-{}", self.name)).spawn(move || w.run(rx)).map_err(|e| e.to_string())?;
         self.worker = Some(h);
         Ok(())
@@ -520,14 +525,16 @@ impl Worker {
         }
     }
 
+    /// Takes the guest's status writes (LEDs), with kicks off while it does.
     fn drain_status(&mut self) {
         let Some(q) = self.statusq.as_mut() else { return };
         let mut used = false;
-        while let Ok(Some(c)) = q.pop(&self.mem) {
+        let mut c = Chain::default();
+        while let Ok(true) = q.pop_draining(&self.mem, &mut c) {
             let _ = q.add_used(&self.mem, c.head, 0);
             used = true;
         }
-        if used {
+        if used && q.should_notify(&self.mem) {
             self.irq.raise(INT_USED_RING);
         }
     }
@@ -550,7 +557,9 @@ impl Worker {
             self.queued -= 1;
             used = true;
         }
-        if used {
+        // A driver that turned callbacks off (NO_INTERRUPT, or a `used_event` not yet
+        // reached) gets no interrupt.
+        if used && self.eventq.should_notify(&self.mem) {
             self.irq.raise(INT_USED_RING);
         }
     }
@@ -685,26 +694,38 @@ mod tests {
         w: Worker,
         posted: u64,
         read: u16,
+        event_idx: bool,
+        kicks: u32,
     }
 
     impl Rig {
         fn new(bufs: u64) -> Rig {
+            Rig::with(bufs, false)
+        }
+
+        /// A rig whose queue runs with event-idx (`event_idx`) or the flags.
+        fn with(bufs: u64, event_idx: bool) -> Rig {
             let mem = Arc::new(GuestRam::new(RAM_BASE, 0x10_0000).expect("ram"));
             let raises = Arc::new(Raises::default());
             let irq = Arc::new(Interrupt::new(raises.clone()));
             let drv = Driver::new(64);
-            let w = Worker::new(mem.clone(), irq.clone(), Queue::new(drv.cfg, false), None);
-            let mut rig = Rig { mem, drv, irq, raises, w, posted: 0, read: 0 };
+            let w = Worker::new(mem.clone(), irq.clone(), Queue::new(drv.cfg, event_idx), None);
+            let mut rig = Rig { mem, drv, irq, raises, w, posted: 0, read: 0, event_idx, kicks: 0 };
             rig.post(bufs);
             rig
         }
 
-        /// The guest posts `n` more one-event buffers (descriptors recycled in order).
-        fn post(&mut self, n: u64) {
+        /// The guest posts `n` more one-event buffers (descriptors recycled in order), then
+        /// kicks if the device asked for it (Linux's `virtqueue_kick_prepare`); returns whether.
+        fn post(&mut self, n: u64) -> bool {
+            let old = self.drv.avail_idx();
             for _ in 0..n {
                 self.drv.push(&self.mem, &[(BUFS + (self.posted % 64) * 8, 8, true)]);
                 self.posted += 1;
             }
+            let kick = n > 0 && self.drv.needs_kick(&self.mem, old, self.event_idx);
+            self.kicks += u32::from(kick);
+            kick
         }
 
         /// The events the guest got since the last call; acks the interrupt like the driver.
@@ -719,6 +740,8 @@ mod tests {
                 self.read = self.read.wrapping_add(1);
             }
             self.irq.ack(INT_USED_RING);
+            // As Linux's `virtqueue_get_buf`: interrupt at the next used entry.
+            self.drv.enable_cb(&self.mem, self.read, self.event_idx);
             out
         }
 
@@ -732,6 +755,60 @@ mod tests {
         fn raised(&self) -> usize {
             self.raises.0.load(std::sync::atomic::Ordering::SeqCst)
         }
+    }
+
+    /// The guest refills the event queue after every interrupt, as Linux's driver does. With
+    /// event-idx a device that never ran out of buffers asks for no kick, so a drag costs the
+    /// guest no exits; with the flags every refill kicks. Interrupts are one per flush either way.
+    #[test]
+    fn refills_cost_no_kicks_under_event_idx() {
+        let (dev, _h) = Input::new(Kind::Touch { width: 1080, height: 2400 }, "t");
+        assert!(dev.features() & F_RING_EVENT_IDX != 0, "the device offers event-idx");
+        for (event_idx, want) in [(true, 0), (false, 100)] {
+            let mut rig = Rig::with(64, event_idx);
+            rig.send([touch(10, 20, true)]);
+            let n = rig.take().len() as u64;
+            rig.post(n);
+            let kicks = rig.kicks;
+            for i in 0..100 {
+                rig.send([touch(11 + i, 21 + i, true)]);
+                let n = rig.take().len() as u64;
+                rig.post(n);
+            }
+            assert_eq!(rig.kicks - kicks, want, "event_idx={event_idx}");
+            assert_eq!(rig.raised(), 101, "event_idx={event_idx}: an interrupt per move");
+        }
+    }
+
+    /// A device that ran out of buffers mid-batch asks for the refill: the guest's next post
+    /// kicks (the lost-wakeup case for a queue the device fills), and the rest of the batch goes.
+    #[test]
+    fn a_device_out_of_buffers_asks_for_the_refill() {
+        for event_idx in [true, false] {
+            let mut rig = Rig::with(2, event_idx);
+            rig.send([touch(10, 20, true)]);
+            let first = rig.take();
+            assert_eq!(first.len(), 2);
+            assert!(rig.post(1), "event_idx={event_idx}: the refill kicks");
+            rig.w.flush();
+            assert_eq!(rig.take().len(), 1);
+            assert!(rig.post(64), "event_idx={event_idx}: out again, so the refill kicks again");
+            rig.w.flush();
+            assert_eq!(rig.take().len(), 6, "the rest of the down");
+            assert!(!rig.post(6) || !event_idx, "buffers to spare: no kick under event-idx");
+        }
+    }
+
+    /// Interrupts follow the driver's suppression: none while it has callbacks off.
+    #[test]
+    fn no_interrupt_while_the_driver_has_callbacks_off() {
+        let mut rig = Rig::with(64, false);
+        rig.mem.write_u16(rig.drv.cfg.avail, 1).expect("NO_INTERRUPT");
+        rig.send([touch(10, 20, true)]);
+        assert_eq!((rig.raised(), rig.drv.used_idx(&rig.mem)), (0, 9), "delivered, not raised");
+        rig.mem.write_u16(rig.drv.cfg.avail, 0).expect("callbacks on");
+        rig.send([touch(11, 21, true)]);
+        assert_eq!(rig.raised(), 1);
     }
 
     fn touch(x: i32, y: i32, down: bool) -> Msg {
