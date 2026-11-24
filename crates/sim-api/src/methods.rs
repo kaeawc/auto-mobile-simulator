@@ -34,8 +34,27 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("delete", "device", "Delete a device"),
     (
         "boot",
-        "device, timeout_s?, env?, shaped?",
-        "Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; Android: starts emu)",
+        "device, timeout_s?, env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, profile?(slim)",
+        "Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; settle also waits \
+         until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s and returns the timings; \
+         profile turns off a named set of daemons; Android: starts emu)",
+    ),
+    (
+        "boot_many",
+        "devices, concurrency?, timeout_s?, env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, profile?",
+        "Boot several simulators, at most `concurrency` at once (default: a quarter of the host's CPUs, at least 2), each as `boot` \
+         does; returns each device's timings or error, and the time until all were done",
+    ),
+    (
+        "settle",
+        "device, cpu_pct?, window_s?, timeout_s?",
+        "Wait until a booted simulator is quiet: its processes under cpu_pct (10) % of a core for window_s (10) s, SpringBoard running",
+    ),
+    (
+        "clone",
+        "device, name",
+        "Create a simulator as a copy of a shut-down one (data, settings, apps; APFS clones of its files): a booted-once template's \
+         copies skip the first-boot work",
     ),
     ("shutdown", "device", "Shut down"),
     ("erase", "device", "Erase content and settings (shut down first)"),
@@ -312,6 +331,22 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
                 }
             }
         }
+        // Needs no device: resolving the default `booted` would fail with two simulators booted.
+        "device_types" => crate::ios::call(&mut s.ios, method, p),
+        "boot_many" => {
+            // Every device must be a simulator: Android devices boot one `boot` at a time.
+            let mut udids = Vec::new();
+            for q in crate::params::strings(p, "devices") {
+                let (platform, udid) = resolve(s, &json!({"device": q, "platform": p.get("platform")}))?;
+                if platform != Platform::Ios {
+                    return Err(format!("`boot_many` boots iOS simulators; `{q}` is an {} device: boot it with `boot`", platform.label()));
+                }
+                udids.push(Value::String(udid));
+            }
+            let mut p = p.clone();
+            p["devices"] = Value::Array(udids);
+            crate::ios::call(&mut s.ios, method, &p)
+        }
         m if METHODS.iter().any(|(name, ..)| *name == m) => {
             let (platform, udid) = resolve(s, p)?;
             if !platforms(m).contains(&platform) {
@@ -519,6 +554,23 @@ mod tests {
                 call(&mut s, method, &params).expect(method);
             }
             println!("api {method:<6}: {:.3} ms per call (20 AVDs)", start.elapsed().as_secs_f64() * 1000.0 / f64::from(n));
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn boot_many_boots_simulators_only() {
+        let (mut s, root) = android_session("boot-many");
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        call(&mut s, "create", &json!({"platform": "android", "name": "pixel", "system_image": mobile})).expect("pixel");
+        let err = call(&mut s, "boot_many", &json!({"devices": ["pixel"]})).expect_err("an AVD");
+        assert_eq!(err, "`boot_many` boots iOS simulators; `pixel` is an Android device: boot it with `boot`");
+        // A listing resolves no device (it resolved the default `booted`, which fails with two booted).
+        assert!(call(&mut s, "device_types", &Value::Null).is_ok_and(|t| t.is_array()));
+        let help = call(&mut s, "help", &Value::Null).expect("help");
+        for m in ["boot_many", "settle", "clone"] {
+            let row = help.as_array().and_then(|a| a.iter().find(|x| x["method"] == m)).expect(m);
+            assert_eq!(row["platforms"], json!(["ios"]), "{m}");
         }
         std::fs::remove_dir_all(root).ok();
     }

@@ -245,6 +245,18 @@ impl Context {
         Ok(Device { obj: created.map_err(|e| rt::service_error("create", &e))?, kit: self.kit })
     }
 
+    /// Creates a device named `name` as a copy of `device` (shut down): its type, runtime and the
+    /// whole data directory, settings and installed apps included. The service copies the data
+    /// with APFS clones (`simctl clone`), so a copy costs little disk until either device writes.
+    pub fn clone_device(&self, device: &Device, name: &str) -> Result<Device> {
+        rt::require(&self.set, sel!(cloneDevice:name:error:))?;
+        // SAFETY: the method exists (checked) and takes (SimDevice, NSString, NSError**), returning
+        // the new SimDevice (nil with the error set on failure).
+        let cloned: std::result::Result<Obj, Retained<NSError>> =
+            unsafe { msg_send![&*self.set, cloneDevice: &*device.obj, name: &*rt::nsstring(name), error: _] };
+        Ok(Device { obj: cloned.map_err(|e| rt::service_error("clone", &e))?, kit: self.kit })
+    }
+
     /// Deletes a device and its data.
     pub fn delete(&self, device: &Device) -> Result<()> {
         rt::require(&self.set, sel!(deleteDevice:error:))?;

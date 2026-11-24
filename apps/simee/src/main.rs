@@ -23,6 +23,11 @@ struct Cli {
     /// (also `SIMEE_IN_PROCESS=1`).
     #[arg(long)]
     in_process: bool,
+    /// Say on stderr where each command runs and, when not on the server, why (also
+    /// `SIMEE_VERBOSE=1`). `SIMEE_REQUIRE_SERVER=1` makes a command that could have gone to a
+    /// server fail instead of running here.
+    #[arg(long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Cmd,
 }
@@ -96,7 +101,42 @@ enum Cmd {
         /// Seconds to wait for the first frame.
         #[arg(long, default_value_t = 120)]
         timeout: u64,
+        /// iOS: also wait until the device is quiet (its processes under 10 % of a core for 10 s)
+        /// and print the timings.
+        #[arg(long)]
+        settle: bool,
+        /// iOS: turn off a named set of daemons once booted (`slim`).
+        #[arg(long)]
+        profile: Option<String>,
     },
+    /// iOS: boot several simulators, a few at a time, and print each one's timings.
+    BootMany {
+        #[arg(required = true)]
+        devices: Vec<String>,
+        /// Boots in flight at once (default: a quarter of the host's CPUs, at least 2).
+        #[arg(short = 'j', long)]
+        concurrency: Option<u64>,
+        /// Seconds each device may take.
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// Also wait until each device is quiet.
+        #[arg(long)]
+        settle: bool,
+        /// Turn off a named set of daemons on each device (`slim`).
+        #[arg(long)]
+        profile: Option<String>,
+        /// Print the result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// iOS: wait until a booted simulator is quiet; prints how long that took.
+    Settle {
+        device: String,
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+    },
+    /// iOS: create a simulator as a copy of a shut-down one; prints its UDID.
+    Clone { template: String, name: String },
     /// Shut a device down.
     Shutdown { device: String },
     /// Erase all content and settings (device must be shut down).
@@ -287,10 +327,17 @@ fn main() -> Result<()> {
         }
         _ => {}
     }
-    let in_process = cli.in_process || std::env::var_os("SIMEE_IN_PROCESS").is_some_and(|v| !v.is_empty() && v != "0");
+    let in_process = cli.in_process || flag("SIMEE_IN_PROCESS");
     let mut transport = if in_process { Transport::local() } else { Transport::open(&sim_api::default_socket()) };
+    transport.verbose = cli.verbose || flag("SIMEE_VERBOSE");
+    transport.require = flag("SIMEE_REQUIRE_SERVER");
     let (stdout, stderr) = (std::io::stdout(), std::io::stderr());
     run(cli.command, &mut transport, &mut stdout.lock(), &mut stderr.lock())
+}
+
+/// Whether an on/off environment variable is on (set, not empty, not `0`).
+fn flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 /// Where a command's method runs: a matching server already listening, or this process.
@@ -299,35 +346,63 @@ fn main() -> Result<()> {
 /// and the other methods whose child processes or state belong to the caller never are), with a
 /// handshake: it must answer `identity` within `sim_api::HANDSHAKE_TIMEOUT` with this build's,
 /// this executable's and this environment's identity. Otherwise (no server, a stale socket, an
-/// older or newer build, a suspended or wedged server) the method runs here, silently.
+/// older or newer build, a suspended or wedged server) the method runs here: silently, or with the
+/// reason on stderr (`--verbose`), or not at all (`SIMEE_REQUIRE_SERVER=1`: a farm that counts on
+/// the server's warm connections would rather fail than run several times slower).
 struct Transport {
     /// The socket still to try.
     socket: Option<std::path::PathBuf>,
     server: Option<sim_api::Client>,
+    /// Why the server isn't used, once the handshake has failed (or none was tried: in-process).
+    unused: Option<String>,
     /// This process's session, made when a method first runs here.
     local: Option<Box<sim_api::Session>>,
+    verbose: bool,
+    require: bool,
 }
 
 impl Transport {
     fn local() -> Transport {
-        Transport { socket: None, server: None, local: None }
+        Transport {
+            socket: None,
+            server: None,
+            unused: Some("in-process was asked for".into()),
+            local: None,
+            verbose: false,
+            require: false,
+        }
     }
 
     /// The server on `socket` if it answers the handshake; else this process.
     fn open(socket: &std::path::Path) -> Transport {
-        Transport { socket: Some(socket.to_owned()), ..Transport::local() }
+        Transport { socket: Some(socket.to_owned()), unused: None, ..Transport::local() }
     }
 
     /// Whether methods that may be forwarded go to a server (handshaking first if not yet tried).
     fn connected(&mut self) -> bool {
         if let Some(socket) = self.socket.take() {
-            self.server = sim_api::Client::handshake(&socket, sim_api::HANDSHAKE_TIMEOUT).ok();
+            match sim_api::Client::handshake(&socket, sim_api::HANDSHAKE_TIMEOUT) {
+                Ok(client) => self.server = Some(client),
+                Err(e) => self.unused = Some(format!("the server on {} can't be used: {e}", socket.display())),
+            }
         }
         self.server.is_some()
     }
 
     fn call(&mut self, method: &str, params: Value) -> Result<Value> {
-        let forward = sim_api::forwards(method) && self.connected();
+        let forwards = sim_api::forwards(method);
+        let forward = forwards && self.connected();
+        if forwards && !forward {
+            let why = self.unused.as_deref().unwrap_or("no server");
+            if self.require {
+                anyhow::bail!("SIMEE_REQUIRE_SERVER is set and `{method}` would run in this process: {why}");
+            }
+            if self.verbose {
+                eprintln!("simee: `{method}` runs in this process: {why}");
+            }
+        } else if self.verbose {
+            eprintln!("simee: `{method}` runs {}", if forward { "on the server" } else { "in this process (it always does)" });
+        }
         let result = match (&mut self.server, forward) {
             (Some(client), true) => client.call(method, &params),
             _ => sim_api::call_method(self.local.get_or_insert_with(Box::default), method, &params),
@@ -410,10 +485,45 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             writeln!(out, "{}", text(&d["udid"]))?;
         }
         Cmd::Delete { device } => drop(call("delete", json!({"device": device}))?),
-        Cmd::Boot { device, timeout, env, shaped } => {
+        Cmd::Boot { device, timeout, env, shaped, settle, profile } => {
             let env: serde_json::Map<String, Value> =
                 env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), Value::from(v))).collect();
-            call("boot", json!({"device": device, "timeout_s": timeout, "env": env, "shaped": shaped}))?;
+            let mut params = json!({"device": device, "timeout_s": timeout, "env": env, "shaped": shaped});
+            // Only when asked, so `boot` sends what it always has to an Android device.
+            if settle {
+                params["settle"] = json!(true);
+            }
+            if let Some(profile) = profile {
+                params["profile"] = json!(profile);
+            }
+            let timed = call("boot", params)?;
+            if !timed.is_null() {
+                writeln!(out, "{}", boot_line(&timed))?;
+            }
+        }
+        Cmd::BootMany { devices, concurrency, timeout, settle, profile, json } => {
+            let params =
+                json!({"devices": devices, "concurrency": concurrency, "timeout_s": timeout, "settle": settle, "profile": profile});
+            let r = call("boot_many", params)?;
+            if json {
+                writeln!(out, "{}", serde_json::to_string_pretty(&r)?)?;
+            } else {
+                for d in items(&r["devices"]) {
+                    writeln!(out, "{}", boot_line(d))?;
+                }
+                writeln!(out, "all_s={} concurrency={} failed={}", r["all_s"], r["concurrency"], r["failed"])?;
+            }
+            if r["failed"].as_u64().unwrap_or(0) > 0 {
+                anyhow::bail!("{} of {} devices failed to boot", r["failed"], devices.len());
+            }
+        }
+        Cmd::Settle { device, timeout } => {
+            let r = call("settle", json!({"device": device, "timeout_s": timeout}))?;
+            writeln!(out, "settle_s={} procs={} cpu_pct={}", r["settle_s"], r["procs"], r["cpu_pct"])?;
+        }
+        Cmd::Clone { template, name } => {
+            let d = call("clone", json!({"device": template, "name": name}))?;
+            writeln!(out, "{}", text(&d["udid"]))?;
         }
         Cmd::Shutdown { device } => drop(call("shutdown", json!({"device": device}))?),
         Cmd::Erase { device } => drop(call("erase", json!({"device": device}))?),
@@ -528,6 +638,23 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
         transport.flush();
     }
     Ok(())
+}
+
+/// One device's boot timings as `key=value` words (or its error).
+fn boot_line(d: &Value) -> String {
+    if let Some(e) = d.get("error") {
+        return format!("device={} error={}", text(&d["device"]), text(e));
+    }
+    let mut line = format!("device={} boot_s={}", text(&d["device"]), d["boot_s"]);
+    for key in ["settle_s", "procs", "cpu_pct", "started_s", "done_s"] {
+        if let Some(v) = d.get(key) {
+            line.push_str(&format!(" {key}={v}"));
+        }
+    }
+    if let Some(p) = d.get("profile") {
+        line.push_str(&format!(" profile={} disabled={} profile_s={}", text(&p["name"]), p["disabled"], p["took_s"]));
+    }
+    line
 }
 
 /// Prints each element of a JSON array on its own line.
@@ -747,6 +874,37 @@ mod tests {
         assert!(!Transport::open(&socket).connected());
         assert!(start.elapsed() < Duration::from_secs(1), "no wait on a stale socket");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_required_server_that_cant_be_used_fails_the_command_with_why() {
+        let root = android_root("require");
+        let socket = root.join("api.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind"));
+        let mut transport = Transport { require: true, ..Transport::open(&socket) };
+        let (out, _, err) = outputs(&mut transport, &["form-factors"]);
+        assert_eq!(out, "", "nothing ran here");
+        let err = err.expect("fails instead of running here");
+        assert!(err.starts_with("SIMEE_REQUIRE_SERVER is set and `form_factors` would run in this process: the server on "), "{err}");
+        assert!(err.contains("api.sock can't be used: "), "{err}");
+        // Without the requirement the same command runs here, and the reason stays known.
+        let mut transport = Transport::open(&socket);
+        assert!(outputs(&mut transport, &["form-factors"]).2.is_none());
+        assert!(transport.unused.as_deref().is_some_and(|u| u.contains("can't be used")), "{:?}", transport.unused);
+        // A matching server satisfies it.
+        let live = root.join("live.sock");
+        sim_api::serve_in_background(live.clone()).expect("serve");
+        let mut transport = Transport { require: true, ..Transport::open(&live) };
+        assert!(outputs(&mut transport, &["form-factors"]).2.is_none());
+        assert!(transport.server.is_some());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn boot_timings_print_as_words() {
+        let ok = json!({"device": "U", "boot_s": 1.5, "settle_s": 9.0, "procs": 280, "cpu_pct": 3.2, "profile": {"name": "slim", "disabled": 61, "took_s": 4.5}});
+        assert_eq!(boot_line(&ok), "device=U boot_s=1.5 settle_s=9.0 procs=280 cpu_pct=3.2 profile=slim disabled=61 profile_s=4.5");
+        assert_eq!(boot_line(&json!({"device": "V", "error": "no device matches `V`"})), "device=V error=no device matches `V`");
     }
 
     /// A fake server's reply to a method: its result or its error.

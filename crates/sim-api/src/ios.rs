@@ -455,6 +455,267 @@ fn boot(device: &Device, timeout: Duration) -> Result<(), String> {
     Err(format!("device did not finish booting within {}s", timeout.as_secs()))
 }
 
+/// What a boot waits for and changes beyond the service's own "booted" (`boot` and `boot_many`).
+#[derive(Clone, Debug)]
+struct BootPlan {
+    timeout: Duration,
+    env: Vec<(String, String)>,
+    /// Inject the network shaper (its environment names the device).
+    shaped: bool,
+    /// Wait until the device is quiet too (see [`crate::settle`]).
+    settle: Option<crate::settle::Rule>,
+    /// Daemons to turn off once booted (a named profile).
+    profile: Option<&'static Profile>,
+}
+
+/// A named set of in-device launchd jobs a farm device runs without.
+#[derive(Debug)]
+pub struct Profile {
+    pub name: &'static str,
+    /// launchd labels (in the device's `system` domain) disabled and stopped.
+    pub disabled: &'static [&'static str],
+}
+
+/// Profiles `boot {profile}` applies. Each job is disabled in the device's own launchd database
+/// and booted out (stopped now). A clone of the device doesn't keep the disables (measured): apply
+/// the profile on every boot; doing it again is harmless.
+pub const PROFILES: &[Profile] = &[Profile { name: "slim", disabled: SLIM }];
+
+/// The `slim` profile: daemons that burn CPU or memory on an idle booted device and that no
+/// AutoMobile tool needs (measured on iOS 27.2, iPhone 17; see docs/farm.md).
+///
+/// Kept on purpose: SpringBoard, backboardd, InputUI (the keyboard), AccessibilityUIServer and
+/// the accessibility daemons (AutoMobile reads the screen through accessibility), installd,
+/// lsd and runningboardd (install, launch), tccd (privacy), usernotificationsd, locationd
+/// (`location`), sharingd, webbookmarksd (Safari, `open_url`), assetsd (the photo library),
+/// syslogd/logd (`logs`), configd_sim and nsurlsessiond (networking).
+const SLIM: &[&str] = &[
+    // Lock and home screen wallpapers: PosterBoard and the ~15 poster extensions it keeps alive.
+    "com.apple.PosterBoard",
+    // Widgets.
+    "com.apple.chronod",
+    // Siri, dictation and suggestions.
+    "com.apple.assistantd",
+    "com.apple.assistant_cdmd",
+    "com.apple.siriactionsd",
+    "com.apple.siriinferenced",
+    "com.apple.siriknowledged",
+    "com.apple.sirittsd",
+    "com.apple.siri.context.service",
+    "com.apple.corespeechd",
+    "com.apple.voicebankingd",
+    "com.apple.suggestd",
+    "com.apple.textunderstandingd",
+    "com.apple.generativeexperiencesd",
+    "com.apple.spotlightknowledged.updater",
+    "com.apple.parsecd",
+    // Photo and media analysis.
+    "com.apple.photoanalysisd",
+    "com.apple.mediaanalysisd",
+    // Health, home, fitness, sleep.
+    "com.apple.healthd",
+    "com.apple.homed",
+    "com.apple.homeeventsd",
+    "com.apple.fitnesscoachingd",
+    "com.apple.fitnessintelligenced",
+    "com.apple.sleepd",
+    // Store, iCloud sync, mail, news, weather, wallet, games, finance.
+    "com.apple.appstored",
+    "com.apple.itunesstored",
+    "com.apple.itunescloudd",
+    "com.apple.amsengagementd",
+    "com.apple.ap.adprivacyd",
+    "com.apple.ap.promotedcontentd",
+    "com.apple.cloudd",
+    "com.apple.email.maild",
+    "com.apple.icloudmailagent",
+    "com.apple.newsd",
+    "com.apple.weatherd",
+    "com.apple.passd",
+    "com.apple.financed",
+    "com.apple.gamed",
+    "com.apple.SafariBookmarksSyncAgent",
+    "com.apple.followupd",
+    "com.apple.remindd",
+    // Location history, maps analytics, CarPlay, people and social.
+    "com.apple.routined",
+    "com.apple.geoanalyticsd",
+    "com.apple.navd",
+    "com.apple.carkitd",
+    "com.apple.peopled",
+    "com.apple.sociallayerd",
+    // Screen Time.
+    "com.apple.ScreenTimeAgent",
+    "com.apple.UsageTrackingAgent",
+    "com.apple.FamilyControlsAgent",
+    // Paired-watch and Find My companions.
+    "com.apple.NPKCompanionAgent",
+    "com.apple.companionappd",
+    "com.apple.wcd",
+    "com.apple.brook.brookcompaniond",
+    "com.apple.findmy.findmylocated",
+    // Experiments, ML hosting and asset prefetch.
+    "com.apple.triald",
+    "com.apple.mlhostd",
+    "com.apple.jetpackassetd",
+    "com.apple.replicatord",
+    "com.apple.diagnosticextensionsd",
+];
+
+fn profile(name: &str) -> Result<&'static Profile, String> {
+    PROFILES.iter().find(|p| p.name == name).ok_or_else(|| {
+        let names: Vec<&str> = PROFILES.iter().map(|p| p.name).collect();
+        format!("unknown profile `{name}` ({})", names.join(", "))
+    })
+}
+
+/// The settle rule from `cpu_key` and `window_key` (the defaults where absent).
+fn settle_rule(p: &Value, cpu_key: &str, window_key: &str) -> crate::settle::Rule {
+    let mut rule = crate::settle::Rule::default();
+    if let Some(pct) = p.get(cpu_key).and_then(Value::as_f64) {
+        rule.cpu_pct = pct;
+    }
+    if let Some(s) = opt_u64(p, window_key) {
+        rule.window = Duration::from_secs(s);
+    }
+    rule
+}
+
+fn boot_plan(p: &Value) -> Result<BootPlan, String> {
+    let settle = match p.get("settle") {
+        None | Some(Value::Bool(false) | Value::Null) => None,
+        Some(Value::Bool(true)) => Some(settle_rule(p, "settle_cpu_pct", "settle_window_s")),
+        Some(other) => return Err(format!("settle must be true or false, not {other}")),
+    };
+    Ok(BootPlan {
+        timeout: Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)),
+        env: pairs(p, "env"),
+        shaped: p.get("shaped").and_then(Value::as_bool).unwrap_or(false),
+        settle,
+        profile: str_param(p, "profile").map(profile).transpose()?,
+    })
+}
+
+/// Boots `device` by `plan`: the boot, then the profile, then the settle wait, each timed.
+fn boot_device(device: &Device, plan: &BootPlan) -> Result<Value, String> {
+    let start = std::time::Instant::now();
+    let deadline = start + plan.timeout;
+    let udid = device.info().udid;
+    let mut env = plan.env.clone();
+    if plan.shaped {
+        env.extend(sim_netshape::launch_env(&udid, &sim_netshape::dylib()?));
+    }
+    let was_booted = device.state() == DeviceState::Booted;
+    if !was_booted && !env.is_empty() {
+        device.boot_with_env(&env).map_err(err)?;
+    }
+    boot(device, plan.timeout)?;
+    let boot_s = start.elapsed().as_secs_f64();
+    let mut result = json!({"device": udid, "boot_s": round(boot_s), "was_booted": was_booted});
+    if let Some(profile) = plan.profile {
+        let t = std::time::Instant::now();
+        apply_profile(device, profile)?;
+        result["profile"] = json!({"name": profile.name, "disabled": profile.disabled.len(), "took_s": round(t.elapsed().as_secs_f64())});
+    }
+    if let Some(rule) = plan.settle {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let (_, s) = wait_settled(&udid, rule, left)?;
+        // From the start of the boot call, the profile included.
+        result["settle_s"] = json!(round(start.elapsed().as_secs_f64()));
+        result["procs"] = json!(s.procs());
+        result["cpu_pct"] = json!(s.cpu_pct().map(round));
+    }
+    Ok(result)
+}
+
+fn round(x: f64) -> f64 {
+    (x * 10.0).round() / 10.0
+}
+
+/// Disables and stops each of the profile's jobs (`launchctl bootout` reports failure in a
+/// simulator even when it stops the job, so its result isn't read: `processes` shows the effect).
+fn apply_profile(device: &Device, profile: &Profile) -> Result<(), String> {
+    // One in-device shell for every job: a spawn per launchctl call costs ~0.4 s under load, two
+    // per job. The shell runs the runtime's launchctl by its host path (a bare `launchctl` would
+    // be the host's, see AGENTS.md); the labels are this file's constants (no quoting needed).
+    let launchctl = device.runtime_root().ok().and_then(|root| {
+        ["/bin/launchctl", "/usr/bin/launchctl", "/sbin/launchctl"]
+            .iter()
+            .map(|p| format!("{root}{p}"))
+            .find(|p| Path::new(p).is_file() && !p.contains('\''))
+    });
+    if let Some(lc) = launchctl {
+        let script: String =
+            profile.disabled.iter().map(|l| format!("'{lc}' disable system/{l}; '{lc}' bootout system/{l} 2>/dev/null;")).collect();
+        if device.exec("sh", &["-c".to_owned(), script], &[]).is_ok() {
+            return Ok(());
+        }
+    }
+    for label in profile.disabled {
+        let target = format!("system/{label}");
+        device.exec("launchctl", &["disable".to_owned(), target.clone()], &[]).map_err(err)?;
+        device.exec("launchctl", &["bootout".to_owned(), target], &[]).map_err(err)?;
+    }
+    Ok(())
+}
+
+/// One `ps` listing of every process on the host.
+fn ps_rows() -> Result<Vec<crate::settle::Row>, String> {
+    let out = std::process::Command::new("/bin/ps").args(crate::settle::PS_ARGS).output().map_err(|e| format!("ps: {e}"))?;
+    Ok(crate::settle::parse_ps(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Waits until the booted device `udid` is settled by `rule`, sampling its process tree once a
+/// second; returns how long that took and the settler (its last CPU figure and process count).
+fn wait_settled(udid: &str, rule: crate::settle::Rule, timeout: Duration) -> Result<(f64, crate::settle::Settler), String> {
+    let start = std::time::Instant::now();
+    let mut settler = crate::settle::Settler::new(rule);
+    loop {
+        let t = start.elapsed().as_secs_f64();
+        if let Some(Some(tree)) = crate::settle::trees(&ps_rows()?, &[udid]).pop()
+            && settler.push(t, tree)
+        {
+            return Ok((t, settler));
+        }
+        if start.elapsed() >= timeout {
+            let pct = settler.cpu_pct().map_or_else(|| "no process tree".to_owned(), |p| format!("{p:.0} % of a core"));
+            return Err(format!("device did not settle within {}s ({pct} over the last {}s)", timeout.as_secs(), rule.window.as_secs()));
+        }
+        sleep(Duration::from_secs(1));
+    }
+}
+
+/// Boots `udids` with at most `concurrency` boots (and settle waits) in flight; one result per
+/// device, in order: the `boot_device` timings, or `{device, error}`.
+fn boot_many(udids: &[String], concurrency: usize, plan: &BootPlan) -> Vec<Value> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results = std::sync::Mutex::new(vec![Value::Null; udids.len()]);
+    let start = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..concurrency.clamp(1, udids.len().max(1)) {
+            scope.spawn(|| {
+                // Each thread has its own service connection: the service's objects stay on the
+                // thread that made them.
+                let ctx = Context::new().map_err(err);
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(udid) = udids.get(i) else { break };
+                    let queued_s = start.elapsed().as_secs_f64();
+                    let result = sim_coresim::autoreleasepool(|| {
+                        let device = ctx.as_ref().map_err(Clone::clone)?.device(udid).map_err(err)?;
+                        boot_device(&device, plan)
+                    });
+                    let mut value = result.unwrap_or_else(|e| json!({"device": udid, "error": e}));
+                    value["started_s"] = json!(round(queued_s));
+                    value["done_s"] = json!(round(start.elapsed().as_secs_f64()));
+                    results.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[i] = value;
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn pids(udid: &str) -> Result<Vec<i32>, String> {
     Ok(sim_debug::process::collect(udid)?.iter().map(|p| p.pid).collect())
 }
@@ -502,15 +763,47 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             ok(s.ctx()?.delete(&d))
         }
         "boot" => {
+            let plan = boot_plan(p)?;
+            let timed = boot_device(&s.device(p)?, &plan)?;
+            // Without settle or a profile, `boot` answers as it always has.
+            Ok(if plan.settle.is_some() || plan.profile.is_some() { timed } else { Value::Null })
+        }
+        "boot_many" => {
+            let udids = strings(p, "devices");
+            if udids.is_empty() {
+                return Err("give `devices`: a list of UDIDs or names".into());
+            }
+            let plan = boot_plan(p)?;
+            let concurrency = match opt_u64(p, "concurrency") {
+                Some(0) => return Err("concurrency must be at least 1".into()),
+                Some(k) => k as usize,
+                None => crate::settle::default_concurrency(std::thread::available_parallelism().map_or(4, usize::from)),
+            };
+            let mut exact = Vec::with_capacity(udids.len());
+            for q in &udids {
+                exact.push(s.ctx()?.resolve(q).map(|(_, info)| info.udid).map_err(err)?);
+            }
+            let start = std::time::Instant::now();
+            let results = boot_many(&exact, concurrency, &plan);
+            let failed = results.iter().filter(|r| r.get("error").is_some()).count();
+            Ok(json!({"concurrency": concurrency, "all_s": round(start.elapsed().as_secs_f64()), "failed": failed, "devices": results}))
+        }
+        "settle" => {
             let d = s.device(p)?;
-            let mut env = pairs(p, "env");
-            if p.get("shaped").and_then(Value::as_bool).unwrap_or(false) {
-                env.extend(sim_netshape::launch_env(&d.info().udid, &sim_netshape::dylib()?));
+            if d.state() != DeviceState::Booted {
+                return Err(format!("{} isn't booted", d.info().name));
             }
-            if d.state() != DeviceState::Booted && !env.is_empty() {
-                d.boot_with_env(&env).map_err(err)?;
+            let rule = settle_rule(p, "cpu_pct", "window_s");
+            let (settle_s, settler) = wait_settled(&d.info().udid, rule, Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)))?;
+            Ok(json!({"settle_s": round(settle_s), "procs": settler.procs(), "cpu_pct": settler.cpu_pct().map(round)}))
+        }
+        "clone" => {
+            let template = s.device(p)?;
+            if template.state() != DeviceState::Shutdown {
+                return Err(format!("{} must be shut down to clone it", template.info().name));
             }
-            boot(&d, Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300))).map(|()| Value::Null)
+            let d = s.ctx()?.clone_device(&template, need_str(p, "name")?).map_err(err)?;
+            serde_json::to_value(d.info()).map_err(err)
         }
         "shutdown" => ok(s.device(p)?.shutdown()),
         "erase" => ok(s.device(p)?.erase()),
@@ -861,6 +1154,35 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_slim_profile_keeps_what_automobile_needs() {
+        let slim = profile("slim").expect("slim");
+        let mut seen = std::collections::HashSet::new();
+        for label in slim.disabled {
+            assert!(seen.insert(label), "{label} twice");
+            assert!(label.starts_with("com.apple.") && !label.contains(['\'', ' ', ';']), "{label}");
+        }
+        for kept in [
+            "com.apple.SpringBoard",
+            "com.apple.backboardd",
+            "com.apple.InputUI",
+            "com.apple.AccessibilityUIServer",
+            "com.apple.mobile.installd",
+            "com.apple.lsd",
+            "com.apple.runningboardd",
+            "com.apple.tccd",
+            "com.apple.locationd",
+            "com.apple.sharingd",
+            "com.apple.WebBookmarks.webbookmarksd",
+            "com.apple.assetsd",
+            "com.apple.syslogd",
+            "com.apple.usernotificationsd",
+        ] {
+            assert!(!slim.disabled.contains(&kept), "{kept} is needed");
+        }
+        assert_eq!(profile("tiny").expect_err("unknown"), "unknown profile `tiny` (slim)");
+    }
 
     #[test]
     fn a_missing_udid_is_reported_as_typed() {

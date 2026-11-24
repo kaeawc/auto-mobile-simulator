@@ -19,17 +19,25 @@ server's HID client outlives the command). The output is byte for byte the same.
 
 - **Handshake.** Before forwarding, the CLI calls `identity` with a 1 s deadline for connecting and
   answering. It forwards only when the answer equals its own: the same build (crate version and a
-  hash of the method table), the same executable file unchanged since the server started (path,
-  inode, size, mtime: a rebuilt CLI doesn't use an older server, nor a different binary such as the
-  desktop window's), and the same environment (a hash of `ANDROID_SDK_ROOT`, `ANDROID_HOME`,
-  `ANDROID_AVD_HOME`, `ANDROID_EMULATOR_HOME`, `ANDROID_USER_HOME`, `ANDROID_ADB_SERVER_PORT`,
-  `ANDROID_EMULATOR_LAUNCHER_DIR`, `DEVELOPER_DIR`, `EMU_BIN`, `HOME`, `PATH`, `TMPDIR`).
+  hash of the method table), the same executable (on macOS its Mach-O `LC_UUID`, which the linker
+  derives from the linked code: changed code never matches, a relink or copy of the same code
+  does; elsewhere path, inode, size and mtime unchanged since the server started), and the same
+  environment (a hash of every `ANDROID_*`, `EMU_*` and `SIMEE_*` variable, `DEVELOPER_DIR`,
+  `HOME`, `TMPDIR`, and the `adb` that `PATH` finds, which the Android backend falls back to). `PATH`
+  itself is not part of it (a pyenv shim or an extra directory changed it without changing any
+  result), nor are the client's own switches (`SIMEE_SOCKET`, `SIMEE_IN_PROCESS`,
+  `SIMEE_REQUIRE_SERVER`, `SIMEE_VERBOSE`, `SIMEE_E2E_*`).
 - **Fallback.** No server, a stale socket file, another build or environment, a server from before
   the handshake (it answers "unknown method"), or one that doesn't answer in time (suspended,
-  wedged): the command runs in the CLI's own process, silently. A forwarded command has no timeout
-  after the handshake (a boot can take minutes). `--in-process` (or `SIMEE_IN_PROCESS=1`) skips the
-  server altogether.
-- **Never forwarded** (`sim_api::IN_CALLER`): `boot` (on Android it starts `emu` as a child of the
+  wedged): the command runs in the CLI's own process. A forwarded command has no timeout after the
+  handshake (a boot can take minutes). `--in-process` (or `SIMEE_IN_PROCESS=1`) skips the server
+  altogether. Running here costs several times more per call (screenshot 150 ms instead of 30 ms,
+  tap 316 ms instead of 78 ms, measured), so a farm can see or forbid it: `--verbose` (or
+  `SIMEE_VERBOSE=1`) prints where each command ran and why the server wasn't used
+  (`simee: `tap` runs in this process: the server on … can't be used: the server is another build
+  or environment: …`), and `SIMEE_REQUIRE_SERVER=1` makes such a command fail with that reason
+  instead of running here (methods that never forward still run here).
+- **Never forwarded** (`sim_api::IN_CALLER`): `boot` and `boot_many` (on Android `boot` starts `emu` as a child of the
   calling process; on a server it would be the server's child, in its process group, killed by
   Ctrl-C on `simee serve` and never reaped), `network_shape`, `network_state`, `network_flows`,
   `network_clear` (the shaping proxy is a thread of the process that starts it),
@@ -52,7 +60,10 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `device_types` | iOS | — | List device types |
 | `create` | Android, iOS | name, platform?(ios\|android), form_factor?; iOS: device_type, runtime; Android: system_image | Create a device. form_factor is checked against the device type (iOS) or the system image (Android) and shapes a new AVD |
 | `delete` | Android, iOS | device | Delete a device |
-| `boot` | Android, iOS | device, timeout_s?, env?, shaped? | Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; Android: starts emu) |
+| `boot` | Android, iOS | device, timeout_s?, env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, profile?(slim) | Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; settle also waits until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s and returns the timings; profile turns off a named set of daemons; Android: starts emu) |
+| `boot_many` | iOS | devices, concurrency?, timeout_s?, env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, profile? | Boot several simulators, at most `concurrency` at once (default: a quarter of the host's CPUs, at least 2), each as `boot` does; returns each device's timings or error, and the time until all were done |
+| `settle` | iOS | device, cpu_pct?, window_s?, timeout_s? | Wait until a booted simulator is quiet: its processes under cpu_pct (10) % of a core for window_s (10) s, SpringBoard running |
+| `clone` | iOS | device, name | Create a simulator as a copy of a shut-down one (data, settings, apps; APFS clones of its files): a booted-once template's copies skip the first-boot work |
 | `shutdown` | Android, iOS | device | Shut down |
 | `erase` | iOS | device | Erase content and settings (shut down first) |
 | `screen` | Android, iOS | device, display?(main\|carplay) | Screen size in pixels |
