@@ -19,6 +19,9 @@ wall times are noisy; exit counts, console bytes and disk sizes are not). Image:
   emulator runs the AVD: one advertised for it in the running directory (stock writes the same
   file), or a held lock file in its directory (simee's `simee/instance.lock`, stock's
   `multiinstance.lock`, or `hardware-qemu.ini.lock` naming a live PID).
+- Through the API and CLI: `clone {device: <golden>, name}` (`simee clone <golden> <name>`) and
+  `boot_many {devices, concurrency?, timeout_s?, first_port?}` (`simee boot-many <avd>… -j K
+  --first-port P`), the same methods as iOS's (docs/farm.md, docs/api.md).
 - `sim_android::Android::boot_many(avds, concurrency, timeout, first_port)`: boots up to K at a
   time, each on a console port handed out by one allocator (`allocate_ports`: even ports whose
   console and adb ports no running emulator advertises, whose claim no starting simee holds

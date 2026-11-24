@@ -102,29 +102,44 @@ enum Cmd {
         #[arg(long, default_value_t = 120)]
         timeout: u64,
         /// iOS: also wait until the device is quiet (its processes under 10 % of a core for 10 s)
-        /// and print the timings.
+        /// and print the timings. A device booted but not settled in time prints "booted, not
+        /// settled" and still exits 0.
         #[arg(long)]
         settle: bool,
+        /// iOS: seconds the settle wait may take after the boot (default 600).
+        #[arg(long)]
+        settle_timeout: Option<u64>,
         /// iOS: turn off a named set of daemons once booted (`slim`).
         #[arg(long)]
         profile: Option<String>,
     },
-    /// iOS: boot several simulators, a few at a time, and print each one's timings.
+    /// Boot several devices of one platform, a few at a time, and print each one's timings.
+    /// Exits non-zero only when a device failed to boot (one that booted but didn't settle in
+    /// time is counted in `unsettled`).
     BootMany {
         #[arg(required = true)]
         devices: Vec<String>,
         /// Boots in flight at once (default: a quarter of the host's CPUs, at least 2).
         #[arg(short = 'j', long)]
         concurrency: Option<u64>,
-        /// Seconds each device may take.
+        /// Seconds each device's boot may take.
         #[arg(long, default_value_t = 300)]
         timeout: u64,
-        /// Also wait until each device is quiet.
-        #[arg(long)]
+        /// iOS: wait until each device is quiet (the default; kept for older scripts).
+        #[arg(long, hide = true, conflicts_with = "no_settle")]
         settle: bool,
-        /// Turn off a named set of daemons on each device (`slim`).
+        /// iOS: don't wait until each device is quiet (a slot then bounds only the boot call).
+        #[arg(long)]
+        no_settle: bool,
+        /// iOS: seconds each settle wait may take after the boot (default 600, more above K=4).
+        #[arg(long)]
+        settle_timeout: Option<u64>,
+        /// iOS: turn off a named set of daemons on each device (`slim`).
         #[arg(long)]
         profile: Option<String>,
+        /// Android: the first console port to hand out (default 5554).
+        #[arg(long)]
+        first_port: Option<u16>,
         /// Print the result as JSON.
         #[arg(long)]
         json: bool,
@@ -132,10 +147,19 @@ enum Cmd {
     /// iOS: wait until a booted simulator is quiet; prints how long that took.
     Settle {
         device: String,
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, default_value_t = 600)]
         timeout: u64,
     },
-    /// iOS: create a simulator as a copy of a shut-down one; prints its UDID.
+    /// iOS: turn a named set of daemons off on a booted simulator (`slim`), or back on with --undo.
+    Profile {
+        device: String,
+        name: String,
+        /// Re-enable the profile's daemons (they run again from the next boot).
+        #[arg(long)]
+        undo: bool,
+    },
+    /// Create a device as a copy of a shut-down one (iOS: a simulator; Android: an AVD from a
+    /// golden booted once under simee); prints its UDID (an AVD's name).
     Clone { template: String, name: String },
     /// Shut a device down.
     Shutdown { device: String },
@@ -485,13 +509,17 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             writeln!(out, "{}", text(&d["udid"]))?;
         }
         Cmd::Delete { device } => drop(call("delete", json!({"device": device}))?),
-        Cmd::Boot { device, timeout, env, shaped, settle, profile } => {
+        Cmd::Boot { device, timeout, env, shaped, settle, settle_timeout, profile } => {
             let env: serde_json::Map<String, Value> =
                 env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), Value::from(v))).collect();
             let mut params = json!({"device": device, "timeout_s": timeout, "env": env, "shaped": shaped});
-            // Only when asked, so `boot` sends what it always has to an Android device.
+            // Only when asked, so `boot` sends what it always has to an Android device (which
+            // rejects these with the reason).
             if settle {
                 params["settle"] = json!(true);
+            }
+            if let Some(s) = settle_timeout {
+                params["settle_timeout_s"] = json!(s);
             }
             if let Some(profile) = profile {
                 params["profile"] = json!(profile);
@@ -499,27 +527,39 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             let timed = call("boot", params)?;
             if !timed.is_null() {
                 writeln!(out, "{}", boot_line(&timed))?;
+                if timed["settled"] == json!(false) {
+                    writeln!(err, "{}", not_settled_line(&timed))?;
+                }
             }
         }
-        Cmd::BootMany { devices, concurrency, timeout, settle, profile, json } => {
-            let params =
-                json!({"devices": devices, "concurrency": concurrency, "timeout_s": timeout, "settle": settle, "profile": profile});
-            let r = call("boot_many", params)?;
-            if json {
-                writeln!(out, "{}", serde_json::to_string_pretty(&r)?)?;
-            } else {
-                for d in items(&r["devices"]) {
-                    writeln!(out, "{}", boot_line(d))?;
+        Cmd::BootMany { devices, concurrency, timeout, settle: _, no_settle, settle_timeout, profile, first_port, json } => {
+            let mut params = json!({"devices": devices, "concurrency": concurrency, "timeout_s": timeout});
+            // Each only when given: the backend has the defaults (iOS settles; Android has no
+            // settle and rejects iOS-only parameters).
+            for (key, v) in [
+                ("settle", no_settle.then_some(json!(false))),
+                ("settle_timeout_s", settle_timeout.map(Value::from)),
+                ("profile", profile.map(Value::from)),
+                ("first_port", first_port.map(Value::from)),
+            ] {
+                if let Some(v) = v {
+                    params[key] = v;
                 }
-                writeln!(out, "all_s={} concurrency={} failed={}", r["all_s"], r["concurrency"], r["failed"])?;
             }
-            if r["failed"].as_u64().unwrap_or(0) > 0 {
-                anyhow::bail!("{} of {} devices failed to boot", r["failed"], devices.len());
-            }
+            let r = call("boot_many", params)?;
+            print_boot_many(&r, devices.len(), json, out, err)?;
         }
         Cmd::Settle { device, timeout } => {
             let r = call("settle", json!({"device": device, "timeout_s": timeout}))?;
             writeln!(out, "settle_s={} procs={} cpu_pct={}", r["settle_s"], r["procs"], r["cpu_pct"])?;
+        }
+        Cmd::Profile { device, name, undo } => {
+            let r = call("profile", json!({"device": device, "name": name, "undo": undo}))?;
+            let changed = if undo { ("enabled", &r["enabled"]) } else { ("disabled", &r["disabled"]) };
+            writeln!(out, "profile={} {}={} failed={}", text(&r["name"]), changed.0, changed.1, items(&r["failed"]).len())?;
+            for l in items(&r["failed"]) {
+                writeln!(err, "simee: {} not {}", text(l), changed.0)?;
+            }
         }
         Cmd::Clone { template, name } => {
             let d = call("clone", json!({"device": template, "name": name}))?;
@@ -646,15 +686,47 @@ fn boot_line(d: &Value) -> String {
         return format!("device={} error={}", text(&d["device"]), text(e));
     }
     let mut line = format!("device={} boot_s={}", text(&d["device"]), d["boot_s"]);
-    for key in ["settle_s", "procs", "cpu_pct", "started_s", "done_s"] {
+    for key in ["settled", "settle_s", "waited_s", "procs", "cpu_pct", "started_s", "done_s", "console_port", "serial"] {
         if let Some(v) = d.get(key) {
-            line.push_str(&format!(" {key}={v}"));
+            line.push_str(&format!(" {key}={}", text(v)));
         }
     }
     if let Some(p) = d.get("profile") {
-        line.push_str(&format!(" profile={} disabled={} profile_s={}", text(&p["name"]), p["disabled"], p["took_s"]));
+        line.push_str(&format!(" profile={}", text(&p["name"])));
+        match p.get("error") {
+            Some(e) => line.push_str(&format!(" profile_error={}", text(e))),
+            None => line.push_str(&format!(" disabled={} failed={}", p["disabled"], items(&p["failed"]).len())),
+        }
+        line.push_str(&format!(" profile_s={}", p["took_s"]));
     }
     line
+}
+
+/// `boot-many`'s output for result `r` of `n` devices: a line per device and a summary (or the
+/// JSON), a note per device that booted but didn't settle; an error only when one failed to boot.
+fn print_boot_many(r: &Value, n: usize, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
+    if json {
+        writeln!(out, "{}", serde_json::to_string_pretty(r)?)?;
+    } else {
+        for d in items(&r["devices"]) {
+            writeln!(out, "{}", boot_line(d))?;
+        }
+        let unsettled = r["unsettled"].as_u64().unwrap_or(0);
+        writeln!(out, "all_s={} concurrency={} failed={} unsettled={unsettled}", r["all_s"], r["concurrency"], r["failed"])?;
+    }
+    for d in items(&r["devices"]).iter().filter(|d| d["settled"] == json!(false)) {
+        writeln!(err, "{}", not_settled_line(d))?;
+    }
+    if r["failed"].as_u64().unwrap_or(0) > 0 {
+        anyhow::bail!("{} of {n} devices failed to boot", r["failed"]);
+    }
+    Ok(())
+}
+
+/// What `boot --settle` and `boot-many` say about a device that booted but didn't settle in time.
+fn not_settled_line(d: &Value) -> String {
+    let after = d.get("waited_s").map_or_else(String::new, |s| format!(" after {s} s"));
+    format!("simee: {}: booted, not settled{after} ({})", text(&d["device"]), text(&d["settle_error"]))
 }
 
 /// Prints each element of a JSON array on its own line.
@@ -780,6 +852,10 @@ mod tests {
             "xr",
             "vehicle",
             "touchpad",
+            "boot_many",
+            "settle",
+            "profile",
+            "clone",
         ] {
             assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
         }
@@ -902,9 +978,48 @@ mod tests {
 
     #[test]
     fn boot_timings_print_as_words() {
-        let ok = json!({"device": "U", "boot_s": 1.5, "settle_s": 9.0, "procs": 280, "cpu_pct": 3.2, "profile": {"name": "slim", "disabled": 61, "took_s": 4.5}});
-        assert_eq!(boot_line(&ok), "device=U boot_s=1.5 settle_s=9.0 procs=280 cpu_pct=3.2 profile=slim disabled=61 profile_s=4.5");
+        let ok = json!({"device": "U", "boot_s": 1.5, "settled": true, "settle_s": 9.0, "procs": 280, "cpu_pct": 3.2,
+            "profile": {"name": "slim", "disabled": 60, "failed": [], "took_s": 4.5}});
+        assert_eq!(
+            boot_line(&ok),
+            "device=U boot_s=1.5 settled=true settle_s=9.0 procs=280 cpu_pct=3.2 profile=slim disabled=60 failed=0 profile_s=4.5"
+        );
         assert_eq!(boot_line(&json!({"device": "V", "error": "no device matches `V`"})), "device=V error=no device matches `V`");
+        let avd = json!({"device": "farm-1", "boot_s": 12.3, "console_port": 5556, "serial": "emulator-5556"});
+        assert_eq!(boot_line(&avd), "device=farm-1 boot_s=12.3 console_port=5556 serial=emulator-5556");
+        let broken = json!({"device": "W", "boot_s": 2.0, "profile": {"name": "slim", "error": "no launchctl", "took_s": 0.0}});
+        assert_eq!(boot_line(&broken), "device=W boot_s=2.0 profile=slim profile_error=no launchctl profile_s=0.0");
+    }
+
+    #[test]
+    fn a_device_that_booted_but_didnt_settle_is_not_a_boot_failure() {
+        let late = json!({"device": "U", "boot_s": 3.0, "settled": false, "waited_s": 603.2, "procs": 250, "cpu_pct": 40.0,
+            "settle_error": "device did not settle within 600s (40 % of a core over the last 10s)"});
+        assert_eq!(
+            not_settled_line(&late),
+            "simee: U: booted, not settled after 603.2 s (device did not settle within 600s (40 % of a core over the last 10s))"
+        );
+        let r = json!({"concurrency": 2, "all_s": 610.0, "failed": 0, "unsettled": 1,
+            "devices": [late, {"device": "V", "boot_s": 2.0, "settled": true, "settle_s": 80.0}]});
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        print_boot_many(&r, 2, false, &mut out, &mut err).expect("unsettled exits 0");
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(out.ends_with("all_s=610.0 concurrency=2 failed=0 unsettled=1\n"), "{out}");
+        assert!(String::from_utf8(err).expect("utf-8").contains("U: booted, not settled after 603.2 s"));
+        let mut failed = r.clone();
+        failed["failed"] = json!(1);
+        let e = print_boot_many(&failed, 2, true, &mut Vec::new(), &mut Vec::new()).expect_err("a failed boot fails");
+        assert_eq!(e.to_string(), "1 of 2 devices failed to boot");
+    }
+
+    #[test]
+    fn boot_many_sends_only_what_was_asked() {
+        // `--settle` is the default now (kept for scripts); `--no-settle` turns it off.
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        assert!(matches!(parse(&["boot-many", "a", "--settle"]), Ok(Cmd::BootMany { no_settle: false, .. })));
+        assert!(matches!(parse(&["boot-many", "a", "--no-settle"]), Ok(Cmd::BootMany { no_settle: true, .. })));
+        assert!(parse(&["boot-many", "a", "--settle", "--no-settle"]).is_err());
+        assert!(matches!(parse(&["boot-many", "a", "--first-port", "5600"]), Ok(Cmd::BootMany { first_port: Some(5600), .. })));
     }
 
     /// A fake server's reply to a method: its result or its error.
@@ -989,6 +1104,24 @@ mod tests {
         assert!(seen.lock().expect("lock").is_empty(), "boot doesn't even handshake");
         assert_eq!(transport.call("devices", json!({"platform": "android"})).expect("devices"), json!([]));
         assert_eq!(*seen.lock().expect("lock"), ["identity", "devices"]);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn ios_only_boot_flags_are_refused_on_android_with_the_reason() {
+        let root = android_root("boot-flags");
+        let mut local = Transport { local: Some(Box::new(android_session(&root))), ..Transport::local() };
+        let image = "system-images;android-36;google_apis;arm64-v8a";
+        assert_eq!(outputs(&mut local, &["create", "pixel", "--platform", "android", "--system-image", image]).0, "pixel\n");
+        for (flags, key) in [(&["--settle"][..], "settle"), (&["--profile", "slim"], "profile"), (&["--shaped"], "shaped")] {
+            let args: Vec<&str> = ["boot", "pixel"].into_iter().chain(flags.iter().copied()).collect();
+            let (out, _, err) = outputs(&mut local, &args);
+            assert_eq!(out, "");
+            let err = err.expect("refused");
+            assert!(err.starts_with(&format!("`boot` takes `{key}` for iOS devices only (")), "{err}");
+        }
+        let (_, _, err) = outputs(&mut local, &["boot-many", "pixel", "--profile", "slim"]);
+        assert!(err.expect("refused").starts_with("`boot_many` takes `profile` for iOS devices only"));
         std::fs::remove_dir_all(root).ok();
     }
 

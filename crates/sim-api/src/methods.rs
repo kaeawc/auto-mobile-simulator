@@ -34,27 +34,37 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("delete", "device", "Delete a device"),
     (
         "boot",
-        "device, timeout_s?, env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, profile?(slim)",
+        "device, timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, settle_timeout_s?, profile?(slim)",
         "Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; settle also waits \
-         until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s and returns the timings; \
-         profile turns off a named set of daemons; Android: starts emu)",
+         up to settle_timeout_s (600) until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s \
+         and returns the timings, settled false if it ran out of time; profile turns off a named set of daemons; Android: starts emu and \
+         waits for sys.boot_completed)",
     ),
     (
         "boot_many",
-        "devices, concurrency?, timeout_s?, env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, profile?",
-        "Boot several simulators, at most `concurrency` at once (default: a quarter of the host's CPUs, at least 2), each as `boot` \
-         does; returns each device's timings or error, and the time until all were done",
+        "devices, concurrency?, timeout_s?; iOS: env?, shaped?, settle?(default true), settle_cpu_pct?, settle_window_s?, \
+         settle_timeout_s?, profile?; Android: first_port?(5554)",
+        "Boot several devices of one platform, at most `concurrency` at once (default: a quarter of the host's CPUs, at least 2), each as \
+         `boot` does (iOS: a slot is held until the device settles, unless settle is false); returns each device's timings or error, \
+         failed and unsettled counts, and the time until all were done. Android: each on its own console port from first_port up",
     ),
     (
         "settle",
-        "device, cpu_pct?, window_s?, timeout_s?",
+        "device, cpu_pct?, window_s?, timeout_s?(600)",
         "Wait until a booted simulator is quiet: its processes under cpu_pct (10) % of a core for window_s (10) s, SpringBoard running",
+    ),
+    (
+        "profile",
+        "device, name(slim), undo?",
+        "Turn a named set of daemons off on a booted simulator (disabled in its launchd database and stopped: stays off across reboots), \
+         or with undo back on (from the next boot); returns how many changed, those that failed and those that weren't loaded",
     ),
     (
         "clone",
         "device, name",
-        "Create a simulator as a copy of a shut-down one (data, settings, apps; APFS clones of its files): a booted-once template's \
-         copies skip the first-boot work",
+        "Create a device as a copy of a shut-down one. iOS: a simulator (data, settings, apps; APFS clones of its files); Android: an AVD \
+         from a golden that has booted under simee (copy-on-write clones of its disks). A booted-once template's copies skip the \
+         first-boot work",
     ),
     ("shutdown", "device", "Shut down"),
     ("erase", "device", "Erase content and settings (shut down first)"),
@@ -208,6 +218,8 @@ const ALL_PLATFORMS: &[&str] = &[
     "create",
     "delete",
     "boot",
+    "boot_many",
+    "clone",
     "shutdown",
     "screen",
     "screenshot",
@@ -334,18 +346,32 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         // Needs no device: resolving the default `booted` would fail with two simulators booted.
         "device_types" => crate::ios::call(&mut s.ios, method, p),
         "boot_many" => {
-            // Every device must be a simulator: Android devices boot one `boot` at a time.
+            // One platform per call: each backend boots its own devices its own way.
             let mut udids = Vec::new();
+            let mut first: Option<(Platform, String)> = None;
             for q in crate::params::strings(p, "devices") {
                 let (platform, udid) = resolve(s, &json!({"device": q, "platform": p.get("platform")}))?;
-                if platform != Platform::Ios {
-                    return Err(format!("`boot_many` boots iOS simulators; `{q}` is an {} device: boot it with `boot`", platform.label()));
+                match &first {
+                    None => first = Some((platform, q.clone())),
+                    Some((other, q0)) if *other != platform => {
+                        return Err(format!(
+                            "`boot_many` boots one platform's devices per call: `{q0}` is an {} device and `{q}` an {} one",
+                            other.label(),
+                            platform.label()
+                        ));
+                    }
+                    Some(_) => {}
                 }
-                udids.push(Value::String(udid));
+                udids.push(udid);
             }
-            let mut p = p.clone();
-            p["devices"] = Value::Array(udids);
-            crate::ios::call(&mut s.ios, method, &p)
+            match first.map(|(platform, _)| platform) {
+                Some(Platform::Android) => crate::android::boot_many(&mut s.android, p, &udids),
+                _ => {
+                    let mut p = p.clone();
+                    p["devices"] = udids.into_iter().map(Value::String).collect();
+                    crate::ios::call(&mut s.ios, method, &p)
+                }
+            }
         }
         m if METHODS.iter().any(|(name, ..)| *name == m) => {
             let (platform, udid) = resolve(s, p)?;
@@ -389,7 +415,17 @@ mod tests {
 
     /// An SDK with a mobile, a Wear OS and an Android XR image, and an empty AVD home.
     fn android_session(tag: &str) -> (Session, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!("sim-api-android-{tag}-{}", std::process::id()));
+        android_session_in(&std::env::temp_dir(), tag)
+    }
+
+    /// [`android_session`] under `/tmp`, for a fake emulator: its display socket's path must fit
+    /// a unix socket address (104 bytes on macOS).
+    fn short_android_session(tag: &str) -> (Session, std::path::PathBuf) {
+        android_session_in(std::path::Path::new("/tmp"), tag)
+    }
+
+    fn android_session_in(base: &std::path::Path, tag: &str) -> (Session, std::path::PathBuf) {
+        let root = base.join(format!("sim-api-android-{tag}-{}", std::process::id()));
         let sdk = root.join("sdk");
         for (dir, image_tag) in [
             ("android-36/google_apis/arm64-v8a", "google_apis"),
@@ -558,20 +594,123 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// An `adb` in the session's SDK that says every device has booted (no real adb runs).
+    fn fake_adb(root: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = root.join("sdk/platform-tools");
+        std::fs::create_dir_all(&dir).expect("platform-tools");
+        let adb = dir.join("adb");
+        std::fs::write(&adb, "#!/bin/sh\necho 1\n").expect("adb");
+        std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
     #[test]
-    fn boot_many_boots_simulators_only() {
+    fn boot_many_and_clone_work_on_both_platforms_and_settle_on_ios() {
         let (mut s, root) = android_session("boot-many");
         let mobile = "system-images;android-36;google_apis;arm64-v8a";
         call(&mut s, "create", &json!({"platform": "android", "name": "pixel", "system_image": mobile})).expect("pixel");
-        let err = call(&mut s, "boot_many", &json!({"devices": ["pixel"]})).expect_err("an AVD");
-        assert_eq!(err, "`boot_many` boots iOS simulators; `pixel` is an Android device: boot it with `boot`");
         // A listing resolves no device (it resolved the default `booted`, which fails with two booted).
         assert!(call(&mut s, "device_types", &Value::Null).is_ok_and(|t| t.is_array()));
         let help = call(&mut s, "help", &Value::Null).expect("help");
-        for m in ["boot_many", "settle", "clone"] {
-            let row = help.as_array().and_then(|a| a.iter().find(|x| x["method"] == m)).expect(m);
-            assert_eq!(row["platforms"], json!(["ios"]), "{m}");
+        let row = |m: &str| help.as_array().and_then(|a| a.iter().find(|x| x["method"] == m)).cloned().expect(m);
+        for m in ["boot_many", "clone"] {
+            assert_eq!(row(m)["platforms"], json!(["android", "ios"]), "{m}");
         }
+        for m in ["settle", "profile"] {
+            assert_eq!(row(m)["platforms"], json!(["ios"]), "{m}");
+        }
+        let err = call(&mut s, "settle", &json!({"device": "pixel"})).expect_err("iOS-only");
+        assert_eq!(err, "`settle` isn't available on Android devices (it works on iOS)");
+        let err = call(&mut s, "profile", &json!({"device": "pixel", "name": "slim"})).expect_err("iOS-only");
+        assert_eq!(err, "`profile` isn't available on Android devices (it works on iOS)");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn android_boot_many_checks_its_parameters_before_starting_anything() {
+        let (mut s, root) = android_session("boot-many-params");
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        call(&mut s, "create", &json!({"platform": "android", "name": "pixel", "system_image": mobile})).expect("pixel");
+        let many = |extra: Value| {
+            let mut p = json!({"devices": ["pixel"]});
+            p.as_object_mut().expect("object").extend(extra.as_object().expect("object").clone());
+            p
+        };
+        for (extra, want) in [
+            (json!({"settle": true}), "`boot_many` takes `settle` for iOS devices only (a settle wait reads a simulator's process tree"),
+            (json!({"profile": "slim"}), "`boot_many` takes `profile` for iOS devices only"),
+            (json!({"env": {"A": "1"}}), "`boot_many` takes `env` for iOS devices only"),
+            (json!({"concurrency": 0}), "concurrency must be at least 1"),
+            (json!({"first_port": 80}), "first_port must be a console port from 5554 to 5682"),
+        ] {
+            let err = call(&mut s, "boot_many", &many(extra.clone())).expect_err("refused");
+            assert!(err.starts_with(want), "{extra}: {err}");
+        }
+        let err = call(&mut s, "boot_many", &json!({"devices": ["pixel", "nope"]})).expect_err("unknown");
+        assert_eq!(err, "no device matches `nope`");
+        let err = call(&mut s, "boot", &json!({"device": "pixel", "settle": true})).expect_err("iOS-only parameter");
+        assert!(err.starts_with("`boot` takes `settle` for iOS devices only"), "{err}");
+        let err = call(&mut s, "boot", &json!({"device": "pixel", "profile": "slim"})).expect_err("iOS-only parameter");
+        assert!(err.starts_with("`boot` takes `profile` for iOS devices only"), "{err}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn android_boot_many_reports_each_device_like_ios() {
+        use sim_android::testing::fake_emulator;
+        let (mut s, root) = short_android_session("bm-run");
+        fake_adb(&root);
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        call(&mut s, "create", &json!({"platform": "android", "name": "pixel", "system_image": mobile})).expect("pixel");
+        // Running already: boot_many waits for it (console and adb answer) and starts nothing.
+        let _fake = fake_emulator(s.android.backend(), "pixel");
+        let r = call(&mut s, "boot_many", &json!({"devices": ["pixel"], "concurrency": 2, "timeout_s": 20})).expect("boot_many");
+        assert_eq!((r["concurrency"].as_u64(), r["failed"].as_u64(), r["unsettled"].as_u64()), (Some(2), Some(0), Some(0)), "{r}");
+        let d = &r["devices"][0];
+        assert_eq!(d["device"], "pixel");
+        let port = d["console_port"].as_u64().expect("port");
+        assert_eq!(d["serial"], json!(format!("emulator-{port}")));
+        assert!(d["boot_s"].as_f64().is_some_and(|s| s < 20.0), "{d}");
+        assert!(d.get("error").is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn boot_many_takes_one_platform_per_call() {
+        let (mut s, root) = android_session("boot-many-mixed");
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        call(&mut s, "create", &json!({"platform": "android", "name": "pixel", "system_image": mobile})).expect("pixel");
+        let ios = crate::ios::selection_infos(&mut s.ios).unwrap_or_default();
+        if let Some(sim) = ios.first() {
+            let err = call(&mut s, "boot_many", &json!({"devices": ["pixel", sim.udid]})).expect_err("mixed");
+            assert_eq!(
+                err,
+                format!("`boot_many` boots one platform's devices per call: `pixel` is an Android device and `{}` an iOS one", sim.udid)
+            );
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn android_clones_come_from_a_stopped_golden() {
+        let (mut s, root) = short_android_session("clone");
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        call(&mut s, "create", &json!({"platform": "android", "name": "golden", "system_image": mobile})).expect("golden");
+        let err = call(&mut s, "clone", &json!({"device": "golden", "name": "farm-1"})).expect_err("never booted");
+        assert_eq!(err, "golden has no simee user data yet (boot it once with emu, then stop it)");
+        // As if it had booted under simee once and stopped.
+        let disks = emu_avd::state_dir(&root.join("avd/golden.avd"));
+        std::fs::create_dir_all(&disks).expect("simee");
+        std::fs::write(disks.join("userdata.img"), b"settled").expect("userdata");
+        let clone = call(&mut s, "clone", &json!({"device": "golden", "name": "farm-1"})).expect("clone");
+        assert_eq!((clone["udid"].as_str(), clone["platform"].as_str()), (Some("farm-1"), Some("android")));
+        assert_eq!(std::fs::read(emu_avd::state_dir(&root.join("avd/farm-1.avd")).join("userdata.img")).expect("cloned"), b"settled");
+        assert!(call(&mut s, "clone", &json!({"device": "golden"})).expect_err("no name").contains("name"));
+        // A running golden is refused before anything is copied.
+        let _fake = sim_android::testing::fake_emulator(s.android.backend(), "golden");
+        let err = call(&mut s, "clone", &json!({"device": "golden", "name": "farm-2"})).expect_err("running");
+        assert_eq!(err, "golden must be shut down to clone it");
+        call(&mut s, "delete", &json!({"device": "farm-1"})).expect("delete the clone");
         std::fs::remove_dir_all(root).ok();
     }
 

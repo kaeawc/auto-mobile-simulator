@@ -17,8 +17,14 @@ simee boot "$T" --settle --timeout 600 && simee shutdown "$T"
 # Per farm: clones (APFS: ~15 MB of disk each), booted four at a time, each waited for until quiet,
 # optionally with the slim profile (applied per device: a clone doesn't inherit it).
 for i in 1 2 3 4 5 6 7 8; do simee clone "$T" farm-$i; done
-simee boot-many farm-1 farm-2 farm-3 farm-4 farm-5 farm-6 farm-7 farm-8 --settle --profile slim
+simee boot-many farm-1 farm-2 farm-3 farm-4 farm-5 farm-6 farm-7 farm-8 --profile slim
 ```
+
+`boot-many` waits for each device to settle by default (`--no-settle` doesn't); `--settle` is
+still accepted. It exits non-zero only when a device failed to boot: one that booted but didn't
+settle in time is printed as `settled=false` (with a `booted, not settled after N s` note on
+stderr) and counted in `unsettled=`. `boot --settle` likewise exits 0 for a device that booted
+but didn't settle, and prints the note.
 
 Name runtimes by identifier (`com.apple.CoreSimulator.SimRuntime.iOS-27-2`): a host with an
 Xcode beta can have two runtimes called "iOS 27.2".
@@ -37,6 +43,17 @@ CPU is each process's accumulated CPU time from `ps`, so it is exact over the wi
 that exits doesn't make the tree look quieter. The threshold comes from the measurements: an idle
 device runs at 1-6 % (no client attached), so 10 % separates "storm over" from "idle" with room
 for one busy daemon; 5 % (the research brief's guess) never fired on some idle devices.
+
+The settle wait has its own budget, `settle_timeout_s` (`--settle-timeout`), counted from the end
+of the boot, separate from `timeout_s` (the boot call). Its default is 600 s, and in `boot_many`
+150 s per device in flight above K = 4 (K = 8: 1200 s): settle times measured 250-537 s per device
+under load, and K storms at once make each one longer. A wait that runs out is not a failed boot:
+the result says `settled: false` with `settle_error` (the CPU over the last window), `waited_s`,
+`procs` and `cpu_pct`, and the device stays booted. The standalone `settle` method still fails
+when it runs out of time (waiting is all it does), with the same 600 s default.
+
+Every settle wait in one process shares one `ps` listing per second (`settle::Sampler`): N
+concurrent waits cost one host-wide listing a second, not N.
 
 Settled is not forever. Deferred work starts two to four minutes after boot (process count
 190 → 240 on a clone, with 100-700 % bursts), so a device that settled at 60 s can be busy again
@@ -77,6 +94,17 @@ itself returns in ~1-20 s). K sweep, 8 clones, time until all settled:
 K = 8 starts eight storms at once and every device takes longer than four would in sequence; K = 2
 leaves the host idle. The default is a quarter of the logical CPUs, at least 2 (4 here).
 
+A slot is held through the profile and the settle wait, not just the boot call: what K bounds is
+the number of boot storms in flight, which is what the sweep measured. Without the settle wait a
+slot would be freed when the service's `boot` returns (1-20 s), long before the storm is over, so
+K would bound only those calls and the storms of all N devices would overlap. That is why
+`boot_many` settles by default (`settle: false`, `--no-settle`, opts out for a caller that only
+wants the service's "booted"); `boot` still settles only when asked, since a single boot has no
+slot to hold.
+
+The shaper (`shaped`) is resolved once per `boot_many` call, on the caller's thread, before any
+worker starts: K workers building it at once would race on the same cache files.
+
 ### Clones: no first boot per device
 
 `clone` (CoreSimulator's `-[SimDeviceSet cloneDevice:name:error:]`, what `simctl clone` does)
@@ -86,7 +114,8 @@ that has done its first boot skips the data migration and indexing storm.
 
 ### The `slim` profile
 
-`boot --profile slim` disables (in the device's own launchd database) and stops 61 daemons no AutoMobile tool needs: PosterBoard and the
+`boot --profile slim` (or `simee profile <device> slim` on a booted one) disables (in the
+device's own launchd database) and stops 59 daemons no AutoMobile tool and no simee method needs: PosterBoard and the
 ~15 poster extensions it keeps alive (~30-45 MB footprint each), widgets (chronod), Siri and
 suggestions, photo and media analysis, Health, Home, fitness, the Store, iCloud sync, Mail, News,
 Weather, Wallet, Game Center, Screen Time, watch and Find My companions, experiments and ML hosts.
@@ -98,10 +127,27 @@ The list and what was kept on purpose is `SLIM` in `crates/sim-api/src/ios.rs`.
 | footprint (dirty memory, shared once) | 2.6-2.8 GB | 2.0-2.2 GB | 1.07-1.2 GB |
 | CPU of 8 devices together, 60 s after settle | 869 % | 25 % | 7 % |
 
-Applying the profile takes 24-66 s per device (one in-device shell running `launchctl disable`
-and `bootout` for each job; longer under load), counted in `settle_s`. A clone doesn't inherit the
-disables (`clone` resets them: a clone of a slimmed template came up with 221 processes), so the
-profile is applied on each boot; applying it again is harmless.
+Applying the profile takes ~20 s on a quiet host, 24-66 s under load (the runtime has no shell, so
+`launchctl disable` and `bootout` are a spawn each per job), counted in `settle_s`. The result
+reports what launchd did, not what was asked: `disabled` counts the labels `launchctl
+print-disabled system` lists as disabled afterwards, `failed` names the others (and any whose
+`disable` printed an error; the "Please switch to user/foreground/…" warning a running job's
+`disable` prints is not one), `not_loaded` the labels `launchctl list` didn't show before (already
+stopped, or not a job in this runtime: `launchctl disable` accepts any label, so a mistyped one
+shows up here).
+
+The disables survive a plain reboot (measured, iOS 27.2: a slimmed device shut down and booted
+without `--profile` came up with 133 processes, its sampled jobs still listed disabled and none
+loaded). A clone doesn't inherit them (`clone` resets them: a clone of a slimmed template came up
+with 221 processes), so apply the profile on each clone's first boot; applying it again is
+harmless. `simee profile <device> slim --undo` (`profile {name, undo: true}`) enables the same
+jobs again; they run from the next boot (measured: 59 enabled in 13 s; after a reboot the sampled
+jobs were loaded again and none listed disabled, 209 processes at settle against 133 slim).
+
+`com.apple.carkitd` is not in the profile: `carplay` needs it. The kept jobs are pinned by a test
+per simee method that reaches into the device (`carplay`, `location`, `privacy`, `push`,
+`appearance`, the keyboard, `open_url`, `biometric`, `status_bar`, `notify`, `reset_keychain`,
+`defaults_*`, install and launch, `logs`, network shaping, audio).
 
 Kept: SpringBoard, backboardd, InputUI (keyboard), the accessibility server and daemons
 (AutoMobile reads the screen through accessibility), installd, lsd, runningboardd, tccd,
@@ -134,3 +180,27 @@ One `key=value` line per N and round in `bench/`: wall time until `boot` returne
 were settled, each device's settle time, memory (system-wide `vm_stat` delta and `footprint` of the
 devices' processes), processes per device, the devices' CPU at settle and 60 s later, disk per
 device, failures. Devices are named `perffarm-<label>-<i>`, created for the run and deleted after.
+
+## Android emulators
+
+The same methods drive an AVD farm, with the same names and result shapes:
+
+```bash
+# Once: a golden AVD booted under simee and stopped (its settled disks are what clones copy).
+simee boot golden && simee shutdown golden
+for i in 1 2 3 4; do simee clone golden farm-$i; done   # copy-on-write disks, no first boot
+simee boot-many farm-1 farm-2 farm-3 farm-4 -j 2 --first-port 5554
+```
+
+`boot_many` on AVDs (`sim_android::Android::boot_many`) starts at most `concurrency` emulators at
+once, each on its own console/adb port pair handed out from `first_port` (default 5554) by one
+allocator, and waits for each to report `sys.boot_completed`. Each device's result is `device`,
+`boot_s`, `console_port` and `serial` (`emulator-<port>`), or `error`; `failed` counts errors and
+`unsettled` is always 0. It runs in the calling process (`IN_CALLER`): the emulators are its
+children. One call boots one platform's devices.
+
+There is no Android `settle`: sim-android has no settle rule in Rust (the Android bench script,
+`scripts/farm-bench-android.sh`, judges it from the host: `sys.boot_completed`, then the emu
+process under 60 % of a core for 5 s). `boot` and `boot_many` refuse
+the iOS-only `settle`, `settle_*`, `profile`, `shaped` and `env` on an AVD with the reason,
+instead of ignoring them.

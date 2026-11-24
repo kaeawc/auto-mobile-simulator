@@ -30,6 +30,15 @@ pub fn opt_u64(p: &Value, key: &str) -> Option<u64> {
     p.get(key).and_then(Value::as_u64)
 }
 
+/// `boot_many`'s `concurrency`: at least 1; by default a quarter of the host's CPUs, at least 2.
+pub fn concurrency(p: &Value) -> Result<usize, String> {
+    match opt_u64(p, "concurrency") {
+        Some(0) => Err("concurrency must be at least 1".into()),
+        Some(k) => Ok(k as usize),
+        None => Ok(crate::settle::default_concurrency(std::thread::available_parallelism().map_or(4, usize::from))),
+    }
+}
+
 // Only iOS methods read this so far.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn need_bool(p: &Value, key: &str) -> Result<bool, String> {

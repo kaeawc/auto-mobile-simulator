@@ -37,7 +37,7 @@ server's HID client outlives the command). The output is byte for byte the same.
   (`simee: `tap` runs in this process: the server on … can't be used: the server is another build
   or environment: …`), and `SIMEE_REQUIRE_SERVER=1` makes such a command fail with that reason
   instead of running here (methods that never forward still run here).
-- **Never forwarded** (`sim_api::IN_CALLER`): `boot` and `boot_many` (on Android `boot` starts `emu` as a child of the
+- **Never forwarded** (`sim_api::IN_CALLER`): `boot` and `boot_many` (on Android both start `emu` as a child of the
   calling process; on a server it would be the server's child, in its process group, killed by
   Ctrl-C on `simee serve` and never reaped), `network_shape`, `network_state`, `network_flows`,
   `network_clear` (the shaping proxy is a thread of the process that starts it),
@@ -60,10 +60,11 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `device_types` | iOS | — | List device types |
 | `create` | Android, iOS | name, platform?(ios\|android), form_factor?; iOS: device_type, runtime; Android: system_image | Create a device. form_factor is checked against the device type (iOS) or the system image (Android) and shapes a new AVD |
 | `delete` | Android, iOS | device | Delete a device |
-| `boot` | Android, iOS | device, timeout_s?, env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, profile?(slim) | Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; settle also waits until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s and returns the timings; profile turns off a named set of daemons; Android: starts emu) |
-| `boot_many` | iOS | devices, concurrency?, timeout_s?, env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, profile? | Boot several simulators, at most `concurrency` at once (default: a quarter of the host's CPUs, at least 2), each as `boot` does; returns each device's timings or error, and the time until all were done |
-| `settle` | iOS | device, cpu_pct?, window_s?, timeout_s? | Wait until a booted simulator is quiet: its processes under cpu_pct (10) % of a core for window_s (10) s, SpringBoard running |
-| `clone` | iOS | device, name | Create a simulator as a copy of a shut-down one (data, settings, apps; APFS clones of its files): a booted-once template's copies skip the first-boot work |
+| `boot` | Android, iOS | device, timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, settle_timeout_s?, profile?(slim) | Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; settle also waits up to settle_timeout_s (600) until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s and returns the timings, settled false if it ran out of time; profile turns off a named set of daemons; Android: starts emu and waits for sys.boot_completed) |
+| `boot_many` | Android, iOS | devices, concurrency?, timeout_s?; iOS: env?, shaped?, settle?(default true), settle_cpu_pct?, settle_window_s?, settle_timeout_s?, profile?; Android: first_port?(5554) | Boot several devices of one platform, at most `concurrency` at once (default: a quarter of the host's CPUs, at least 2), each as `boot` does (iOS: a slot is held until the device settles, unless settle is false); returns each device's timings or error, failed and unsettled counts, and the time until all were done. Android: each on its own console port from first_port up |
+| `settle` | iOS | device, cpu_pct?, window_s?, timeout_s?(600) | Wait until a booted simulator is quiet: its processes under cpu_pct (10) % of a core for window_s (10) s, SpringBoard running |
+| `profile` | iOS | device, name(slim), undo? | Turn a named set of daemons off on a booted simulator (disabled in its launchd database and stopped: stays off across reboots), or with undo back on (from the next boot); returns how many changed, those that failed and those that weren't loaded |
+| `clone` | Android, iOS | device, name | Create a device as a copy of a shut-down one. iOS: a simulator (data, settings, apps; APFS clones of its files); Android: an AVD from a golden that has booted under simee (copy-on-write clones of its disks). A booted-once template's copies skip the first-boot work |
 | `shutdown` | Android, iOS | device | Shut down |
 | `erase` | iOS | device | Erase content and settings (shut down first) |
 | `screen` | Android, iOS | device, display?(main\|carplay) | Screen size in pixels |

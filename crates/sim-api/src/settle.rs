@@ -182,6 +182,51 @@ pub fn default_concurrency(cpus: usize) -> usize {
     (cpus / 4).max(2)
 }
 
+/// How long a settle wait may take by default with `concurrent` devices booting at once: 600 s,
+/// and 150 s per device beyond four. Measured settle times under load were 250-537 s per device
+/// (docs/farm.md), and K storms at once make each one longer.
+pub fn default_settle_timeout(concurrent: usize) -> Duration {
+    Duration::from_secs(600.max(150 * concurrent as u64))
+}
+
+/// One host-wide `ps` listing shared by every settle wait in the process: a wait asks for a
+/// listing at most `max_age` old and gets the latest one, or takes a new one (while the others
+/// wait for it). N concurrent waits polling once a second cost one listing a second, not N.
+pub struct Sampler {
+    last: std::sync::Mutex<Option<(std::time::Instant, std::sync::Arc<Vec<Row>>)>>,
+}
+
+impl Sampler {
+    pub const fn new() -> Sampler {
+        Sampler { last: std::sync::Mutex::new(None) }
+    }
+
+    /// The latest listing if it is younger than `max_age`, else a new one from `take`; with when
+    /// it was taken (a wait times its sample by the listing, not by when it asked).
+    pub fn rows(
+        &self,
+        max_age: Duration,
+        take: impl FnOnce() -> Result<Vec<Row>, String>,
+    ) -> Result<(std::time::Instant, std::sync::Arc<Vec<Row>>), String> {
+        let mut last = self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, rows)) = last.as_ref()
+            && at.elapsed() < max_age
+        {
+            return Ok((*at, rows.clone()));
+        }
+        let rows = std::sync::Arc::new(take()?);
+        let at = std::time::Instant::now();
+        *last = Some((at, rows.clone()));
+        Ok((at, rows))
+    }
+}
+
+impl Default for Sampler {
+    fn default() -> Self {
+        Sampler::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +312,54 @@ mod tests {
             assert!(!s.push(f64::from(t), quiet.clone()));
         }
         assert!(s.push(5.0, tree("0:01.00")), "SpringBoard up and quiet");
+    }
+
+    #[test]
+    fn concurrent_waits_share_one_listing_per_interval() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sampler = Sampler::new();
+        let taken = AtomicUsize::new(0);
+        let (waiters, polls) = (16, 5);
+        let take = || {
+            taken.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(5));
+            Ok(parse_ps(&listing("0:01.00", "")))
+        };
+        std::thread::scope(|s| {
+            for _ in 0..waiters {
+                s.spawn(|| {
+                    let mut last = None;
+                    for _ in 0..polls {
+                        let (at, rows) = sampler.rows(Duration::from_millis(90), take).expect("rows");
+                        assert_eq!(trees(&rows, &[UDID])[0].as_ref().map(Tree::procs), Some(3));
+                        assert!(last.is_none_or(|l| at >= l), "listings only move forward");
+                        last = Some(at);
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                });
+            }
+        });
+        let n = taken.load(Ordering::SeqCst);
+        // One listing per poll interval serves every waiter (a few more where intervals straddle).
+        assert!(n <= 2 * polls, "{n} listings for {waiters} waiters × {polls} polls");
+        assert!(n >= polls - 1, "{n}");
+    }
+
+    #[test]
+    fn a_failed_listing_is_not_kept() {
+        let sampler = Sampler::new();
+        assert_eq!(sampler.rows(Duration::from_secs(60), || Err("ps: no".into())).map(|_| ()), Err("ps: no".into()));
+        let (_, rows) = sampler.rows(Duration::from_secs(60), || Ok(parse_ps(&listing("0:01.00", "")))).expect("retried");
+        assert_eq!(rows.len(), 5);
+        let (_, again) = sampler.rows(Duration::from_secs(60), || Err("not called".into())).expect("cached");
+        assert!(std::sync::Arc::ptr_eq(&rows, &again));
+    }
+
+    #[test]
+    fn the_settle_timeout_covers_loaded_hosts_and_grows_with_k() {
+        assert_eq!(default_settle_timeout(1), Duration::from_secs(600));
+        assert_eq!(default_settle_timeout(4), Duration::from_secs(600));
+        assert_eq!(default_settle_timeout(8), Duration::from_secs(1200));
     }
 
     #[test]

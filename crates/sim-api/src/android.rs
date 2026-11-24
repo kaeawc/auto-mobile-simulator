@@ -35,6 +35,77 @@ impl Session {
     }
 }
 
+/// `boot` and `boot_many` parameters only iOS devices take, and why.
+const IOS_BOOT_PARAMS: &[(&str, &str)] = &[
+    ("settle", "a settle wait reads a simulator's process tree; an Android boot waits for sys.boot_completed"),
+    ("settle_cpu_pct", "it tunes the settle wait"),
+    ("settle_window_s", "it tunes the settle wait"),
+    ("settle_timeout_s", "it tunes the settle wait"),
+    ("profile", "profiles are sets of a simulator's launchd jobs"),
+    ("shaped", "the network shaper is injected into a simulator's processes"),
+    ("env", "it is a simulator launchd's environment"),
+];
+
+/// Rejects iOS-only boot parameters that ask for something (a `false`, `null`, empty or absent
+/// one asks for nothing), naming the platform that has them.
+fn reject_ios_boot_params(method: &str, p: &Value) -> Result<(), String> {
+    for (key, why) in IOS_BOOT_PARAMS {
+        let asks = match p.get(*key) {
+            None | Some(Value::Null | Value::Bool(false)) => false,
+            Some(Value::Object(m)) => !m.is_empty(),
+            Some(Value::Array(a)) => !a.is_empty(),
+            Some(_) => true,
+        };
+        if asks {
+            return Err(format!("`{method}` takes `{key}` for iOS devices only ({why})"));
+        }
+    }
+    Ok(())
+}
+
+/// The first console port `boot_many` hands out: `first_port` (default 5554), even and in the
+/// emulators' range.
+fn first_port(p: &Value) -> Result<u16, String> {
+    let ports = sim_android::emu_ports();
+    match opt_u64(p, "first_port") {
+        None => Ok(*ports.start()),
+        Some(n) => u16::try_from(n)
+            .ok()
+            .filter(|n| ports.contains(n))
+            .ok_or_else(|| format!("first_port must be a console port from {} to {}", ports.start(), ports.end())),
+    }
+}
+
+/// One device's [`sim_android::BootOutcome`] in `boot_many`'s result: the same shape as an iOS
+/// device's (`device`, `boot_s`, or `error`), with the console port and adb serial.
+fn outcome_json(o: &sim_android::BootOutcome) -> Value {
+    let serial = format!("emulator-{}", o.console_port);
+    match &o.result {
+        Ok(took) => {
+            json!({"device": o.avd, "boot_s": (took.as_secs_f64() * 10.0).round() / 10.0, "console_port": o.console_port, "serial": serial})
+        }
+        Err(e) => json!({"device": o.avd, "console_port": o.console_port, "error": e}),
+    }
+}
+
+/// `boot_many` for AVDs (`udids`, already resolved): [`Android::boot_many`], at most
+/// `concurrency` emulators starting at once, each on its own console port.
+pub fn boot_many(s: &mut Session, p: &Value, udids: &[String]) -> Result<Value, String> {
+    reject_ios_boot_params("boot_many", p)?;
+    if udids.is_empty() {
+        return Err("give `devices`: a list of AVD names".into());
+    }
+    let concurrency = crate::params::concurrency(p)?;
+    let timeout = Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300));
+    let first = first_port(p)?;
+    let start = std::time::Instant::now();
+    let outcomes = s.backend().boot_many(udids, concurrency, timeout, first)?;
+    let devices: Vec<Value> = outcomes.iter().map(outcome_json).collect();
+    let failed = outcomes.iter().filter(|o| o.result.is_err()).count();
+    Ok(json!({"concurrency": concurrency, "all_s": (start.elapsed().as_secs_f64() * 10.0).round() / 10.0, "failed": failed,
+        "unsettled": 0, "devices": devices}))
+}
+
 /// Dispatches one device method for the AVD named `udid`.
 pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Value, String> {
     let android = s.backend().clone();
@@ -45,7 +116,17 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
     let null = |r: Result<(), String>| r.map(|()| Value::Null);
     match method {
         "delete" => null(android.delete(&d)),
-        "boot" => null(d.boot(&android, Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)))),
+        "boot" => {
+            reject_ios_boot_params(method, p)?;
+            null(d.boot(&android, Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300))))
+        }
+        "clone" => {
+            if d.running.is_some() {
+                return Err(format!("{} must be shut down to clone it", d.info.name));
+            }
+            let info = android.clone_avd(&d.info.udid, need_str(p, "name")?)?;
+            serde_json::to_value(info).map_err(|e| e.to_string())
+        }
         "shutdown" => null(d.shutdown()),
         "screen" => d.screen_size().map(|(w, h)| json!({"width": w, "height": h})),
         // The emulator's own PNG, passed through: with `path` it writes the file itself.
