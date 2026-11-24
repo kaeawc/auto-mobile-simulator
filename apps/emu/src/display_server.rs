@@ -768,7 +768,10 @@ mod tests {
         let mut left: Vec<String> =
             std::fs::read_dir(dir.join("simee")).expect("dir").flatten().filter_map(|e| e.file_name().into_string().ok()).collect();
         left.sort();
-        assert_eq!(left, ["frames-2147483646-0.png", mine.as_str(), "frames-x-1.ring"]);
+        // Sorted the same way: where our own ring falls depends on the digits of our pid.
+        let mut want = vec!["frames-2147483646-0.png".to_owned(), mine, "frames-x-1.ring".to_owned()];
+        want.sort();
+        assert_eq!(left, want);
         std::fs::remove_dir_all(&dir).ok();
     }
 
