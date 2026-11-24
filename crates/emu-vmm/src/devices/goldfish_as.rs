@@ -253,7 +253,15 @@ impl GoldfishAddressSpace {
         let clearer = clearer
             .then(|| {
                 let sh = shared.clone();
-                std::thread::Builder::new().name("addrspace-clear".into()).spawn(move || sh.clear_loop()).ok()
+                std::thread::Builder::new()
+                    .name("addrspace-clear".into())
+                    .spawn(move || {
+                        // Housekeeping: an allocation that finds nothing cleared zeroes for itself,
+                        // so the guest never waits on this thread.
+                        emu_hvf::host::set_qos(emu_hvf::host::Qos::Utility);
+                        sh.clear_loop()
+                    })
+                    .ok()
             })
             .flatten();
         GoldfishAddressSpace { shared, mem, clearer }

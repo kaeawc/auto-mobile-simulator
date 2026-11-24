@@ -169,6 +169,8 @@ fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<e
         }
     }
     wants.done.store(true, Ordering::Relaxed);
+    // Its frame thread may be waiting for a frame on a static screen: end that wait now.
+    display.wake();
 }
 
 /// One frame, ready to send once the capture is released.
@@ -192,10 +194,10 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
     let mut ring_failed = false;
     let mut stats = std::env::var_os("EMU_FRAME_STATS").is_some().then(Stats::default);
     while !wants.done.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
-        // Wait for a new frame (woken by the frame, or every 100 ms to notice the client or the
-        // emulator going away); then, if it's early, wait until it may go and send the newest by
-        // then. A client that was idle gets it at once.
-        let n = display.wait_newer(sent, Duration::from_millis(100));
+        // Wait for a new frame (woken by the frame, or by `wake` when the client goes away; the
+        // 1 s timeout only notices the emulator stopping); then, if it's early, wait until it may
+        // go and send the newest by then. A client that was idle gets it at once.
+        let n = display.wait_newer(sent, Duration::from_secs(1));
         let mw = wants.max_width.load(Ordering::Relaxed);
         if mw == 0 || n == sent {
             continue;
@@ -602,6 +604,23 @@ mod tests {
         // The ring goes when the client does.
         drop((frames, _d));
         wait_until("the ring's removal", || rig.rings().is_empty());
+    }
+
+    /// On a static screen a stream's frame thread waits with a 1 s backstop; a client going away
+    /// wakes it, so its ring goes at once, not up to a second later.
+    #[test]
+    fn a_closed_client_ends_its_stream_at_once_on_a_static_screen() {
+        let rig = Rig::new("close");
+        let (d, reader) = rig.connect(true, 720);
+        let mut frames = Frames::new(reader);
+        rig.store.posted(1440, 200);
+        frames.next_frame().expect("frame");
+        // Let the frame thread go back to waiting for a frame that won't come.
+        std::thread::sleep(Duration::from_millis(50));
+        let closed = Instant::now();
+        drop((frames, d));
+        wait_until("the ring's removal", || rig.rings().is_empty());
+        assert!(closed.elapsed() < Duration::from_millis(500), "took {:?}", closed.elapsed());
     }
 
     #[test]
