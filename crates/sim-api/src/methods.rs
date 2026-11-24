@@ -34,24 +34,26 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("delete", "device", "Delete a device"),
     (
         "boot",
-        "device, timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, settle_timeout_s?, profile?(slim)",
+        "device, timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, settle_foreground?, settle_timeout_s?, profile?(slim)",
         "Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; settle also waits \
          up to settle_timeout_s (600) until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s \
-         and returns the timings, settled false if it ran out of time; profile turns off a named set of daemons; Android: starts emu and \
+         (settle_foreground: counting only foreground-QoS CPU) and returns the timings with cpu_pct, foreground_cpu_pct and \
+         background_cpu_pct, settled false if it ran out of time; profile turns off a named set of daemons; Android: starts emu and \
          waits for sys.boot_completed)",
     ),
     (
         "boot_many",
         "devices, concurrency?, timeout_s?; iOS: env?, shaped?, settle?(default true), settle_cpu_pct?, settle_window_s?, \
-         settle_timeout_s?, profile?; Android: first_port?(5554)",
+         settle_foreground?, settle_timeout_s?, profile?; Android: first_port?(5554)",
         "Boot several devices of one platform, at most `concurrency` at once (default: a quarter of the host's CPUs, at least 2), each as \
          `boot` does (iOS: a slot is held until the device settles, unless settle is false); returns each device's timings or error, \
          failed and unsettled counts, and the time until all were done. Android: each on its own console port from first_port up",
     ),
     (
         "settle",
-        "device, cpu_pct?, window_s?, timeout_s?(600)",
-        "Wait until a booted simulator is quiet: its processes under cpu_pct (10) % of a core for window_s (10) s, SpringBoard running",
+        "device, cpu_pct?, window_s?, foreground?, timeout_s?(600)",
+        "Wait until a booted simulator is quiet: its processes under cpu_pct (10) % of a core for window_s (10) s (foreground: only \
+         foreground-QoS CPU counts), SpringBoard running; returns settle_s, cpu_pct, foreground_cpu_pct and background_cpu_pct",
     ),
     (
         "profile",
