@@ -20,8 +20,12 @@ use crate::rt::{self, CGSize, Library, Obj};
 
 const CORE_SIMULATOR: &str = "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/CoreSimulator";
 
-/// The active developer directory: `DEVELOPER_DIR`, else `xcode-select -p` (run once per process:
-/// every context, API connection, capture and boot thread asks).
+/// Where `xcode-select -s` records the selected developer directory.
+const XCODE_SELECT_LINK: &str = "/var/db/xcode_select_link";
+
+/// The active developer directory: `DEVELOPER_DIR`, else the directory `xcode-select -s` linked,
+/// else `xcode-select -p` (read once per process: every context, API connection, capture and boot
+/// thread asks). Reading the link spares each CLI run a process spawn.
 pub fn developer_dir() -> Result<String> {
     if let Ok(dir) = std::env::var("DEVELOPER_DIR")
         && !dir.is_empty()
@@ -31,12 +35,70 @@ pub fn developer_dir() -> Result<String> {
     static SELECTED: std::sync::OnceLock<std::result::Result<String, String>> = std::sync::OnceLock::new();
     SELECTED
         .get_or_init(|| {
+            if let Some(dir) = linked_dir(std::fs::read_link(XCODE_SELECT_LINK).ok(), |p| p.is_dir()) {
+                return Ok(dir);
+            }
             let out = Command::new("/usr/bin/xcode-select").arg("-p").output().map_err(|e| format!("xcode-select -p: {e}"))?;
             let dir = String::from_utf8_lossy(&out.stdout).trim().to_owned();
             if out.status.success() && !dir.is_empty() { Ok(dir) } else { Err("xcode-select -p returned nothing".to_owned()) }
         })
         .clone()
         .map_err(Error::Unavailable)
+}
+
+/// The developer directory the selection link names, when it is usable as is: an absolute path to
+/// an existing directory, as `xcode-select -p` would print it. Anything else (no link, a relative
+/// or dangling target) leaves the answer to `xcode-select -p` itself.
+fn linked_dir(target: Option<std::path::PathBuf>, is_dir: impl Fn(&std::path::Path) -> bool) -> Option<String> {
+    let target = target?;
+    let dir = target.to_str()?.trim_end_matches('/');
+    (target.is_absolute() && !dir.is_empty() && is_dir(&target)).then(|| dir.to_owned())
+}
+
+#[cfg(test)]
+mod developer_dir_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn the_selection_link_is_used_only_when_it_names_a_directory() {
+        let xcode = PathBuf::from("/Applications/Xcode.app/Contents/Developer");
+        assert_eq!(linked_dir(Some(xcode.clone()), |_| true).as_deref(), Some("/Applications/Xcode.app/Contents/Developer"));
+        assert_eq!(
+            linked_dir(Some(PathBuf::from("/Library/Developer/CommandLineTools/")), |_| true).as_deref(),
+            Some("/Library/Developer/CommandLineTools")
+        );
+        assert_eq!(linked_dir(Some(xcode), |_| false), None, "a removed Xcode: ask xcode-select");
+        assert_eq!(linked_dir(Some(PathBuf::from("Xcode.app/Contents/Developer")), |_| true), None, "relative");
+        assert_eq!(linked_dir(Some(PathBuf::from("/")), |_| true), None);
+        assert_eq!(linked_dir(None, |_| true), None, "no link");
+    }
+
+    /// The link against the spawn this replaces (no simulator service is touched).
+    ///     cargo test --release -p sim-coresim developer_dir_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn developer_dir_cost() {
+        let median = |f: &dyn Fn() -> String| {
+            let mut runs: Vec<(f64, String)> = (0..15)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    let dir = f();
+                    (t.elapsed().as_secs_f64() * 1000.0, dir)
+                })
+                .collect();
+            runs.sort_by(|a, b| a.0.total_cmp(&b.0));
+            runs.swap_remove(runs.len() / 2)
+        };
+        let (spawn, printed) = median(&|| {
+            let out = Command::new("/usr/bin/xcode-select").arg("-p").output().expect("xcode-select");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        });
+        let (link, linked) = median(&|| linked_dir(std::fs::read_link(XCODE_SELECT_LINK).ok(), |p| p.is_dir()).unwrap_or_default());
+        assert_eq!(linked, printed, "the link names what xcode-select prints");
+        println!("developer dir: xcode-select -p {spawn:.3} ms, link {link:.3} ms ({linked})");
+    }
 }
 
 /// Status bar overrides. Raw values follow the service's enums: data network 0 = hidden, 1 = Wi-Fi,
@@ -114,16 +176,40 @@ impl Context {
 
     /// Resolves a UDID, a name, or `booted`, with the device's info (read while selecting).
     pub fn resolve(&self, query: &str) -> Result<(Device, DeviceInfo)> {
-        // Unsorted, and each device's info read once (it's several Objective-C calls): `select`
-        // doesn't depend on order.
+        let mut devices = self.unsorted_devices()?;
+        // `select` reads only the UDID, name and state, and doesn't depend on order: read just
+        // those of every device (the UDID alone when it names one), then the full info of the
+        // match.
+        let mut udids: Vec<String> = Vec::with_capacity(devices.len());
+        let by_udid = devices.iter().position(|d| {
+            udids.push(d.udid());
+            udids.last().is_some_and(|u| u.eq_ignore_ascii_case(query))
+        });
+        let i = match by_udid {
+            Some(i) => i,
+            None => {
+                let keys: Vec<DeviceInfo> = devices.iter().zip(udids).map(|(d, udid)| d.selection_info_with(udid)).collect();
+                match select(&keys, query) {
+                    Selection::One(i) => i,
+                    Selection::None => return Err(Error::NotFound(query.to_owned())),
+                    Selection::Ambiguous => return Err(Error::Ambiguous(query.to_owned())),
+                }
+            }
+        };
+        let device = devices.swap_remove(i);
+        let info = device.info();
+        Ok((device, info))
+    }
+
+    /// The devices to select from: [`select`] keys (UDID, name and state) only, unsorted; the
+    /// API resolves a query across platforms with these.
+    pub fn selection_infos(&self) -> Result<Vec<DeviceInfo>> {
+        Ok(self.unsorted_devices()?.iter().map(Device::selection_info).collect())
+    }
+
+    fn unsorted_devices(&self) -> Result<Vec<Device>> {
         let list = rt::object_prop(&self.set, sel!(devices))?;
-        let mut devices: Vec<Device> = rt::array_items(&list).into_iter().map(|obj| Device { obj, kit: self.kit }).collect();
-        let mut infos: Vec<DeviceInfo> = devices.iter().map(Device::info).collect();
-        match select(&infos, query) {
-            Selection::One(i) => Ok((devices.swap_remove(i), infos.swap_remove(i))),
-            Selection::None => Err(Error::NotFound(query.to_owned())),
-            Selection::Ambiguous => Err(Error::Ambiguous(query.to_owned())),
-        }
+        Ok(rt::array_items(&list).into_iter().map(|obj| Device { obj, kit: self.kit }).collect())
     }
 
     /// Installed runtimes.
@@ -251,11 +337,35 @@ macro_rules! device_call {
 }
 
 impl Device {
+    /// The device's UDID.
+    pub fn udid(&self) -> String {
+        rt::object_prop(&self.obj, sel!(UDID)).map(|u| rt::string_prop(&u, sel!(UUIDString))).unwrap_or_default()
+    }
+
+    /// What [`select`] reads, the UDID, name and state, read as [`Device::info`] reads them; the
+    /// rest left empty (an iOS device of no known kind).
+    pub fn selection_info(&self) -> DeviceInfo {
+        self.selection_info_with(self.udid())
+    }
+
+    fn selection_info_with(&self, udid: String) -> DeviceInfo {
+        DeviceInfo {
+            udid,
+            name: rt::string_prop(&self.obj, sel!(name)),
+            state: self.state(),
+            runtime_id: String::new(),
+            device_type_id: String::new(),
+            available: false,
+            platform: Platform::Ios,
+            form_factor: None,
+            sub_platform: None,
+        }
+    }
+
     /// A snapshot of the device's identity and state.
     pub fn info(&self) -> DeviceInfo {
         let d = &*self.obj;
-        // SAFETY: `UDID` returns an NSUUID and `UUIDString` its string form.
-        let udid = rt::object_prop(d, sel!(UDID)).map(|u| rt::string_prop(&u, sel!(UUIDString))).unwrap_or_default();
+        let udid = self.udid();
         let runtime_id = rt::string_prop(d, sel!(runtimeIdentifier));
         let device_type_id = rt::string_prop(d, sel!(deviceTypeIdentifier));
         let kind = apple_kind(&device_type_id, &runtime_id);

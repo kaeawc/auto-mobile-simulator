@@ -2,7 +2,12 @@
 //!
 //! Every device command is a call into the API's method table (`sim-api`), the same code the
 //! socket server and the desktop window run; this file only parses arguments and prints results.
+//! When a server (`simee serve`) of this build and environment answers on the default socket,
+//! commands go to it, so they reuse its service connection and per-device input connections;
+//! otherwise (and always for `boot`, see `sim_api::IN_CALLER`) they run in this process. The
+//! output is the same either way.
 
+use std::io::Write;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -14,6 +19,10 @@ use sim_core::device::DeviceInfo;
 #[derive(Parser)]
 #[command(name = "simee", version, about = "Create, boot and drive iOS simulator and Android emulator devices")]
 struct Cli {
+    /// Run the command in this process even when a server is listening on the default socket
+    /// (also `SIMEE_IN_PROCESS=1`).
+    #[arg(long)]
+    in_process: bool,
     #[command(subcommand)]
     command: Cmd,
 }
@@ -278,50 +287,119 @@ fn main() -> Result<()> {
         }
         _ => {}
     }
-    let mut session = sim_api::Session::default();
-    let mut call = |method: &str, params: Value| sim_api::call_method(&mut session, method, &params).map_err(anyhow::Error::msg);
-    match cli.command {
+    let in_process = cli.in_process || std::env::var_os("SIMEE_IN_PROCESS").is_some_and(|v| !v.is_empty() && v != "0");
+    let mut transport = if in_process { Transport::local() } else { Transport::open(&sim_api::default_socket()) };
+    let (stdout, stderr) = (std::io::stdout(), std::io::stderr());
+    run(cli.command, &mut transport, &mut stdout.lock(), &mut stderr.lock())
+}
+
+/// Where a command's method runs: a matching server already listening, or this process.
+///
+/// The server is tried on the first method that may be forwarded (`sim_api::forwards`; `boot`
+/// and the other methods whose child processes or state belong to the caller never are), with a
+/// handshake: it must answer `identity` within `sim_api::HANDSHAKE_TIMEOUT` with this build's,
+/// this executable's and this environment's identity. Otherwise (no server, a stale socket, an
+/// older or newer build, a suspended or wedged server) the method runs here, silently.
+struct Transport {
+    /// The socket still to try.
+    socket: Option<std::path::PathBuf>,
+    server: Option<sim_api::Client>,
+    /// This process's session, made when a method first runs here.
+    local: Option<Box<sim_api::Session>>,
+}
+
+impl Transport {
+    fn local() -> Transport {
+        Transport { socket: None, server: None, local: None }
+    }
+
+    /// The server on `socket` if it answers the handshake; else this process.
+    fn open(socket: &std::path::Path) -> Transport {
+        Transport { socket: Some(socket.to_owned()), ..Transport::local() }
+    }
+
+    /// Whether methods that may be forwarded go to a server (handshaking first if not yet tried).
+    fn connected(&mut self) -> bool {
+        if let Some(socket) = self.socket.take() {
+            self.server = sim_api::Client::handshake(&socket, sim_api::HANDSHAKE_TIMEOUT).ok();
+        }
+        self.server.is_some()
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        let forward = sim_api::forwards(method) && self.connected();
+        let result = match (&mut self.server, forward) {
+            (Some(client), true) => client.call(method, &params),
+            _ => sim_api::call_method(self.local.get_or_insert_with(Box::default), method, &params),
+        };
+        result.map_err(anyhow::Error::msg)
+    }
+
+    /// HID messages are delivered asynchronously: a command that ran in this process gives the
+    /// last one time to leave before the process (and its HID client) exits. A server keeps its
+    /// client, so there is nothing to wait for.
+    fn flush(&self) {
+        if self.local.is_some() {
+            sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// A path parameter made absolute here, so a server with another working directory reads and
+/// writes the same file this process would.
+fn absolute(path: &str) -> String {
+    std::path::absolute(path).map_or_else(|_| path.to_owned(), |p| p.display().to_string())
+}
+
+/// Runs one device command and prints its result to `out` (and an in-device program's stderr to
+/// `err`).
+fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
+    let mut call = |method: &str, params: Value| transport.call(method, params);
+    let mut input = false;
+    match command {
         Cmd::List { json, booted, platform, form_factor } => {
             let devices = call("devices", json!({"booted": booted, "platform": platform, "form_factor": form_factor}))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&devices)?);
+                writeln!(out, "{}", serde_json::to_string_pretty(&devices)?)?;
             } else {
-                print!("{}", list_text(&serde_json::from_value::<Vec<DeviceInfo>>(devices)?));
+                write!(out, "{}", list_text(&serde_json::from_value::<Vec<DeviceInfo>>(devices)?))?;
             }
         }
         Cmd::FormFactors { json, platform } => {
             let rows = call("form_factors", json!({"platform": platform}))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&rows)?);
+                writeln!(out, "{}", serde_json::to_string_pretty(&rows)?)?;
             } else {
-                print!("{}", form_factors_text(&rows));
+                write!(out, "{}", form_factors_text(&rows))?;
             }
         }
         Cmd::Runtimes { json } => {
             let runtimes = call("runtimes", json!({}))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&runtimes)?);
+                writeln!(out, "{}", serde_json::to_string_pretty(&runtimes)?)?;
             } else {
                 for r in items(&runtimes) {
                     let note = if r["available"] == true { "" } else { " (unavailable)" };
-                    println!("{} ({} - {}) - {}{note}", text(&r["name"]), text(&r["version"]), text(&r["build"]), text(&r["identifier"]));
+                    let (name, version, build, id) = (text(&r["name"]), text(&r["version"]), text(&r["build"]), text(&r["identifier"]));
+                    writeln!(out, "{name} ({version} - {build}) - {id}{note}")?;
                 }
             }
         }
         Cmd::DeviceTypes { json } => {
             let types = call("device_types", json!({}))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&types)?);
+                writeln!(out, "{}", serde_json::to_string_pretty(&types)?)?;
             } else {
                 for t in items(&types) {
-                    println!(
+                    writeln!(
+                        out,
                         "{} ({}) {}x{} @{}x",
                         text(&t["name"]),
                         text(&t["identifier"]),
                         number(&t["screen_width"]),
                         number(&t["screen_height"]),
                         number(&t["screen_scale"])
-                    );
+                    )?;
                 }
             }
         }
@@ -329,7 +407,7 @@ fn main() -> Result<()> {
             let params = json!({"name": name, "device_type": device_type, "runtime": runtime, "platform": platform,
                 "system_image": system_image, "form_factor": form_factor});
             let d = call("create", params)?;
-            println!("{}", text(&d["udid"]));
+            writeln!(out, "{}", text(&d["udid"]))?;
         }
         Cmd::Delete { device } => drop(call("delete", json!({"device": device}))?),
         Cmd::Boot { device, timeout, env, shaped } => {
@@ -339,35 +417,39 @@ fn main() -> Result<()> {
         }
         Cmd::Shutdown { device } => drop(call("shutdown", json!({"device": device}))?),
         Cmd::Erase { device } => drop(call("erase", json!({"device": device}))?),
-        Cmd::Screenshot { device, path, display } => drop(call("screenshot", json!({"device": device, "path": path, "display": display}))?),
+        Cmd::Screenshot { device, path, display } => {
+            drop(call("screenshot", json!({"device": device, "path": absolute(&path), "display": display}))?)
+        }
         Cmd::Tap { device, x, y, hold, display } => {
             call("tap", json!({"device": device, "x": x, "y": y, "hold_ms": hold, "display": display}))?;
-            flush();
+            input = true;
         }
         Cmd::Swipe { device, x1, y1, x2, y2, duration, settle, display } => {
             let params = json!({"device": device, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": duration, "settle": settle,
                 "display": display});
             call("swipe", params)?;
-            flush();
+            input = true;
         }
         Cmd::Button { device, button, hold } => {
             call("button", json!({"device": device, "button": button, "hold_ms": hold}))?;
-            flush();
+            input = true;
         }
         Cmd::Type { device, text } => {
             call("type", json!({"device": device, "text": text}))?;
-            flush();
+            input = true;
         }
         Cmd::Key { device, usage } => {
             call("key", json!({"device": device, "usage": usage}))?;
-            flush();
+            input = true;
         }
         Cmd::OpenUrl { device, url } => drop(call("open_url", json!({"device": device, "url": url}))?),
-        Cmd::Install { device, path } => drop(call("install", json!({"device": device, "path": path}))?),
+        Cmd::Install { device, path } => drop(call("install", json!({"device": device, "path": absolute(&path)}))?),
         Cmd::Uninstall { device, bundle_id } => drop(call("uninstall", json!({"device": device, "bundle_id": bundle_id}))?),
-        Cmd::Launch { device, bundle_id } => println!("{}", call("launch", json!({"device": device, "bundle_id": bundle_id}))?["pid"]),
+        Cmd::Launch { device, bundle_id } => {
+            writeln!(out, "{}", call("launch", json!({"device": device, "bundle_id": bundle_id}))?["pid"])?
+        }
         Cmd::Terminate { device, bundle_id } => drop(call("terminate", json!({"device": device, "bundle_id": bundle_id}))?),
-        Cmd::Apps { device } => items(&call("apps", json!({"device": device}))?).iter().for_each(|id| println!("{}", text(id))),
+        Cmd::Apps { device } => lines(out, &call("apps", json!({"device": device}))?)?,
         Cmd::Appearance { device, mode } => drop(call("appearance", json!({"device": device, "mode": mode}))?),
         Cmd::Location { device, latitude, longitude } => {
             drop(call("location", json!({"device": device, "latitude": latitude, "longitude": longitude}))?)
@@ -379,7 +461,7 @@ fn main() -> Result<()> {
         Cmd::Rotate { device, orientation } => {
             let r = call("rotate", json!({"device": device, "orientation": orientation}))?;
             if let Some(o) = r["orientation"].as_str() {
-                println!("{o}");
+                writeln!(out, "{o}")?;
             }
         }
         Cmd::Fold { device, posture } => {
@@ -388,11 +470,9 @@ fn main() -> Result<()> {
                 Err(_) => json!({"device": device, "posture": posture}),
             };
             let r = call("fold", params)?;
-            println!("{} ({}°)", text(&r["posture"]), r["angle"]);
+            writeln!(out, "{} ({}°)", text(&r["posture"]), r["angle"])?;
         }
-        Cmd::Xr { device, command } => {
-            items(&call("xr", xr_params(&device, &command)?)?).iter().for_each(|l| println!("{}", text(l)));
-        }
+        Cmd::Xr { device, command } => lines(out, &call("xr", xr_params(&device, &command)?)?)?,
         Cmd::Touchpad { device, x, y, phase, to, duration_ms } => {
             let params = match to.as_deref() {
                 Some([tx, ty]) => json!({"device": device, "x": x, "y": y, "to_x": tx, "to_y": ty, "duration_ms": duration_ms}),
@@ -402,15 +482,15 @@ fn main() -> Result<()> {
         }
         Cmd::Rotary { device, ticks, delta } => {
             call("rotary", json!({"device": device, "ticks": ticks, "delta": delta}))?;
-            flush();
+            input = true;
         }
         Cmd::WatchGesture { device, gesture } => {
             call("watch_gesture", json!({"device": device, "gesture": gesture}))?;
-            flush();
+            input = true;
         }
         Cmd::RemoteSwipe { device, direction } => {
             call("remote_swipe", json!({"device": device, "direction": direction}))?;
-            flush();
+            input = true;
         }
         Cmd::Carplay { device, state } => {
             let on = match state.as_str() {
@@ -420,31 +500,40 @@ fn main() -> Result<()> {
             };
             let r = call("carplay", json!({"device": device, "on": on}))?;
             if on {
-                println!("CarPlay display {}x{}", number(&r["width"]), number(&r["height"]));
+                writeln!(out, "CarPlay display {}x{}", number(&r["width"]), number(&r["height"]))?;
             }
         }
         Cmd::Vehicle { device, property, value, area, json } => {
             let r = call("vehicle", json!({"device": device, "property": property, "value": value, "area_id": area}))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&r)?);
+                writeln!(out, "{}", serde_json::to_string_pretty(&r)?)?;
             } else if !r.is_null() {
                 let readings = if r.is_array() { items(&r).to_vec() } else { vec![r] };
                 for v in readings {
-                    println!("{} area {}: {}", text(&v["property"]), v["area_id"], text(&v["value"]));
+                    writeln!(out, "{} area {}: {}", text(&v["property"]), v["area_id"], text(&v["value"]))?;
                 }
             }
         }
-        Cmd::Console { device, command } => {
-            items(&call("console", json!({"device": device, "command": command.join(" ")}))?).iter().for_each(|l| println!("{}", text(l)));
-        }
-        Cmd::Serve { .. } | Cmd::Call { .. } => unreachable!("handled above"),
+        Cmd::Console { device, command } => lines(out, &call("console", json!({"device": device, "command": command.join(" ")}))?)?,
+        Cmd::Serve { .. } | Cmd::Call { .. } => anyhow::bail!("`serve` and `call` don't run through a transport"),
         Cmd::Exec { device, env, program, args } => {
             let env: serde_json::Map<String, Value> =
                 env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), Value::from(v))).collect();
-            let out = call("exec", json!({"device": device, "program": program, "args": args, "env": env}))?;
-            print!("{}", text(&out["stdout"]));
-            eprint!("{}", text(&out["stderr"]));
+            let result = call("exec", json!({"device": device, "program": program, "args": args, "env": env}))?;
+            write!(out, "{}", text(&result["stdout"]))?;
+            write!(err, "{}", text(&result["stderr"]))?;
         }
+    }
+    if input {
+        transport.flush();
+    }
+    Ok(())
+}
+
+/// Prints each element of a JSON array on its own line.
+fn lines(out: &mut dyn Write, v: &Value) -> Result<()> {
+    for line in items(v) {
+        writeln!(out, "{}", text(line))?;
     }
     Ok(())
 }
@@ -502,11 +591,6 @@ fn xr_params(device: &str, words: &[String]) -> Result<Value> {
     let mut params = serde_json::to_value(command)?;
     params["device"] = Value::from(device);
     Ok(params)
-}
-
-/// HID messages are delivered asynchronously; give the last one time to leave before exiting.
-fn flush() {
-    sleep(Duration::from_millis(100));
 }
 
 #[cfg(test)]
@@ -586,6 +670,175 @@ mod tests {
             json!({"device": "headset", "action": "options", "environment": "night", "passthrough": 0.25})
         );
         assert!(xr_params("headset", &words("fly")).expect_err("unknown").to_string().starts_with("usage: xr recenter"));
+    }
+
+    /// An SDK with a phone image and an AVD home under a fresh temp dir; a session for it.
+    fn android_root(tag: &str) -> std::path::PathBuf {
+        let root = std::path::PathBuf::from("/tmp").join(format!("simee-cli-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let image = root.join("sdk/system-images/android-36/google_apis/arm64-v8a");
+        std::fs::create_dir_all(&image).expect("image dir");
+        std::fs::write(image.join("system.img"), b"s").expect("system.img");
+        std::fs::write(image.join("source.properties"), "AndroidVersion.ApiLevel=36\nSystemImage.TagId=google_apis\n").expect("props");
+        root
+    }
+
+    fn android_session(root: &std::path::Path) -> sim_api::Session {
+        let env = emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") };
+        let mut android = sim_android::Android::new(env);
+        android.running_dir = Some(root.join("running"));
+        sim_api::Session::with_android(android)
+    }
+
+    /// A command's stdout, stderr and error, run through `transport`.
+    fn outputs(transport: &mut Transport, args: &[&str]) -> (String, String, Option<String>) {
+        let cli = Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).expect("arguments");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = run(cli.command, transport, &mut out, &mut err);
+        (String::from_utf8(out).expect("utf-8"), String::from_utf8(err).expect("utf-8"), result.err().map(|e| e.to_string()))
+    }
+
+    #[test]
+    fn a_server_and_this_process_print_the_same_bytes() {
+        let root = android_root("forward");
+        let socket = root.join("api.sock");
+        let server_root = root.clone();
+        sim_api::serve_in_background_with(socket.clone(), move || android_session(&server_root)).expect("serve");
+        let mut local = Transport { local: Some(Box::new(android_session(&root))), ..Transport::local() };
+        let mut server = Transport::open(&socket);
+        assert!(server.connected(), "a listening server of this build is used");
+        let image = "system-images;android-36;google_apis;arm64-v8a";
+        assert_eq!(outputs(&mut local, &["create", "pixel", "--platform", "android", "--system-image", image]).0, "pixel\n");
+        assert_eq!(
+            outputs(&mut server, &["create", "fold", "--platform", "android", "--system-image", image, "--form-factor", "foldable"]).0,
+            "fold\n"
+        );
+        for args in [
+            &["list", "--platform", "android"][..],
+            &["list", "--platform", "android", "--json"],
+            &["list", "--platform", "android", "--form-factor", "foldable", "--booted"],
+            &["form-factors"],
+            &["form-factors", "--json", "--platform", "android"],
+            &["tap", "fold", "10", "20"],
+            &["screenshot", "pixel", "shot.png"],
+            &["fold", "pixel", "closed"],
+            &["fold", "fold", "ajar"],
+            &["console", "fold", "ping"],
+            &["vehicle", "pixel"],
+        ] {
+            let (here, there) = (outputs(&mut local, args), outputs(&mut server, args));
+            assert_eq!(here, there, "simee {args:?}");
+        }
+        let listed = outputs(&mut server, &["list", "--platform", "android"]).0;
+        assert!(listed.contains("    fold (fold) (Shutdown) [Android · Foldable]\n"), "{listed}");
+        drop(server);
+        std::fs::remove_file(&socket).ok();
+        assert!(!Transport::open(&socket).connected(), "no server: this process");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_stale_socket_falls_back_to_this_process() {
+        let root = android_root("stale");
+        let socket = root.join("api.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind"));
+        assert!(socket.exists(), "the socket file outlives its listener");
+        let start = std::time::Instant::now();
+        assert!(!Transport::open(&socket).connected());
+        assert!(start.elapsed() < Duration::from_secs(1), "no wait on a stale socket");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A fake server's reply to a method: its result or its error.
+    type Answer = fn(&str) -> std::result::Result<Value, String>;
+
+    /// A server on `socket` that records each method it is sent and answers with `answer`; `None`
+    /// never answers (a wedged server).
+    fn fake_server(socket: &std::path::Path, answer: Option<Answer>) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        use std::io::BufRead;
+        let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let record = record.clone();
+                std::thread::spawn(move || {
+                    let mut writer = stream.try_clone().expect("clone");
+                    for line in std::io::BufReader::new(stream).lines().map_while(Result::ok) {
+                        let req: Value = serde_json::from_str(&line).expect("request");
+                        let method = req["method"].as_str().unwrap_or("").to_owned();
+                        record.lock().expect("lock").push(method.clone());
+                        match answer {
+                            Some(answer) => {
+                                let reply = match answer(&method) {
+                                    Ok(result) => json!({"id": req["id"], "ok": true, "result": result}),
+                                    Err(error) => json!({"id": req["id"], "ok": false, "error": error}),
+                                };
+                                writeln!(writer, "{reply}").expect("write");
+                            }
+                            None => std::thread::park(),
+                        }
+                    }
+                });
+            }
+        });
+        seen
+    }
+
+    #[test]
+    fn a_server_that_never_answers_runs_the_command_here() {
+        let root = android_root("wedged");
+        let socket = root.join("api.sock");
+        let seen = fake_server(&socket, None);
+        let mut local = Transport::local();
+        let expected = outputs(&mut local, &["form-factors"]);
+        let start = std::time::Instant::now();
+        let mut transport = Transport::open(&socket);
+        assert_eq!(outputs(&mut transport, &["form-factors"]), expected);
+        assert!(start.elapsed() < Duration::from_millis(1500), "{:?}", start.elapsed());
+        assert!(!transport.connected());
+        assert_eq!(*seen.lock().expect("lock"), ["identity"], "only the handshake reached it");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn another_build_or_an_old_server_runs_the_command_here() {
+        let root = android_root("skew");
+        let mut local = Transport::local();
+        let expected = outputs(&mut local, &["form-factors", "--json"]);
+        // An older build has no `identity` (it answers an error); another build answers another one.
+        let old: Answer = |m| Err(format!("unknown method `{m}`; call `help`"));
+        let other: Answer = |_| Ok(json!({"build": "0.0.0+0", "exe": "elsewhere", "env": "0"}));
+        for (tag, answer) in [("old", old), ("other", other)] {
+            let socket = root.join(format!("{tag}.sock"));
+            let seen = fake_server(&socket, Some(answer));
+            let mut transport = Transport::open(&socket);
+            assert_eq!(outputs(&mut transport, &["form-factors", "--json"]), expected, "{tag}");
+            assert_eq!(*seen.lock().expect("lock"), ["identity"], "{tag}: nothing forwarded");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn boot_runs_here_even_with_a_matching_server() {
+        let root = android_root("boot");
+        let socket = root.join("api.sock");
+        let seen = fake_server(&socket, Some(|m| Ok(if m == "identity" { sim_api::identity().clone() } else { json!([]) })));
+        let mut transport = Transport { local: Some(Box::new(android_session(&root))), ..Transport::open(&socket) };
+        // Resolved and rejected by this process's (empty) AVD home: nothing is started.
+        let err = transport.call("boot", json!({"device": "nope", "platform": "android"})).expect_err("no such AVD");
+        assert_eq!(err.to_string(), "no device matches `nope`");
+        assert!(seen.lock().expect("lock").is_empty(), "boot doesn't even handshake");
+        assert_eq!(transport.call("devices", json!({"platform": "android"})).expect("devices"), json!([]));
+        assert_eq!(*seen.lock().expect("lock"), ["identity", "devices"]);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn path_parameters_are_made_absolute() {
+        let here = std::env::current_dir().expect("cwd");
+        assert_eq!(absolute("shot.png"), here.join("shot.png").display().to_string());
+        assert_eq!(absolute("/tmp/x.png"), "/tmp/x.png");
     }
 
     #[test]

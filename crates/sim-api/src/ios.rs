@@ -176,7 +176,8 @@ const INPUT_METHODS: &[&str] = &["tap", "swipe", "touch", "rotary", "watch_gestu
 
 /// One input worker per device (by UDID), shared by every API connection. A worker keeps its
 /// device's HID client and display between calls (the service's objects stay on the thread that
-/// made them), runs that device's input in order, and lets go after five idle minutes.
+/// made them), runs that device's input in order (main-display `screen` and `screenshot` calls
+/// too, so a capture follows the input sent before it), and lets go after five idle minutes.
 static INPUT: Workers<String, Input> = Workers::new("simee-input", Duration::from_secs(300));
 
 /// A device's input connection, owned by its worker thread: the device, a watch on its state, and
@@ -205,27 +206,26 @@ impl Input {
         result
     }
 
+    /// Runs `with` on the device's main display, reused like the HID client (and dropped, with the
+    /// device, on any failure).
+    fn display<R>(&mut self, udid: &str, with: impl FnOnce(&Display) -> Result<R, String>) -> Result<R, String> {
+        let result = self.try_display(udid, with);
+        if result.is_err() {
+            self.device = None;
+            self.watch = None;
+        }
+        result
+    }
+
+    fn try_display<R>(&mut self, udid: &str, with: impl FnOnce(&Display) -> Result<R, String>) -> Result<R, String> {
+        let Self { ctx, device, changes, watch, display, .. } = self;
+        let (device, key) = connect(ctx, device, changes, watch, udid)?;
+        display.with(key, || device.display().map_err(err), with)
+    }
+
     fn try_run<R>(&mut self, udid: &str, screen: bool, send: impl FnOnce(&Hid, Option<Size>) -> Result<R, String>) -> Result<R, String> {
         let Self { ctx, device, changes, watch, hid, display } = self;
-        let ctx = match ctx {
-            Some(ctx) => ctx,
-            None => ctx.insert(Context::new().map_err(err)?),
-        };
-        let device = match device {
-            Some(device) => device,
-            None => {
-                let found = ctx.device(udid).map_err(err)?;
-                let seen = changes.clone();
-                *watch = found
-                    .watch_state(move || {
-                        seen.fetch_add(1, Ordering::Release);
-                    })
-                    .ok();
-                device.insert(found)
-            }
-        };
-        let changes = watch.as_ref().map(|_| changes.load(Ordering::Acquire));
-        let key = BootKey::of(device.state() == DeviceState::Booted, changes, device.last_booted_at());
+        let (device, key) = connect(ctx, device, changes, watch, udid)?;
         let size = if screen {
             let (w, h) = display.with(key, || device.display().map_err(err), |d| d.size().map_err(err))?;
             Some(Size::new(f64::from(w), f64::from(h)))
@@ -236,11 +236,87 @@ impl Input {
     }
 }
 
+/// The worker's device (found and watched on first use) and the key its connections are reused
+/// under.
+fn connect<'a>(
+    ctx: &'a mut Option<Context>,
+    device: &'a mut Option<Device>,
+    changes: &Arc<AtomicU64>,
+    watch: &mut Option<StateWatch>,
+    udid: &str,
+) -> Result<(&'a Device, Option<BootKey>), String> {
+    let ctx = match ctx {
+        Some(ctx) => ctx,
+        None => ctx.insert(Context::new().map_err(err)?),
+    };
+    let device = match device {
+        Some(device) => device,
+        None => {
+            let found = ctx.device(udid).map_err(err)?;
+            let seen = changes.clone();
+            *watch = found
+                .watch_state(move || {
+                    seen.fetch_add(1, Ordering::Release);
+                })
+                .ok();
+            device.insert(found)
+        }
+    };
+    let changes = watch.as_ref().map(|_| changes.load(Ordering::Acquire));
+    let key = BootKey::of(device.state() == DeviceState::Booted, changes, device.last_booted_at());
+    Ok((device, key))
+}
+
+/// Runs `with` on the device's main display on its input worker, which keeps the display between
+/// calls (and orders a capture after the input sent before it).
+fn on_main_display<R: Send + 'static>(
+    s: &mut Session,
+    p: &Value,
+    with: impl FnOnce(&Display) -> Result<R, String> + Send + 'static,
+) -> Result<R, String> {
+    let udid = s.udid(p)?;
+    let result = INPUT.run(&udid.clone(), move |input| sim_coresim::autoreleasepool(|| input.display(&udid, with)))?;
+    result.map_err(|e| as_typed(e, p))
+}
+
+/// An error about the device the `device` parameter names, with the UDID as the caller typed it
+/// (workers look devices up by the uppercased UDID).
+fn as_typed(error: String, p: &Value) -> String {
+    match str_param(p, "device") {
+        Some(q) if sim_core::device::is_udid(q) && q != q.to_ascii_uppercase() => {
+            error.replace(&format!("`{}`", q.to_ascii_uppercase()), &format!("`{q}`"))
+        }
+        _ => error,
+    }
+}
+
+/// The `display` a method names: its size, or a capture. The main display goes through the
+/// device's worker; the CarPlay screen is looked up per call (attaching it isn't a new boot).
+fn screen_size(s: &mut Session, p: &Value) -> Result<(u32, u32), String> {
+    if on_carplay(p)? {
+        return display_of(&s.device(p)?, p)?.size().map_err(err);
+    }
+    on_main_display(s, p, |d| d.size().map_err(err))
+}
+
+fn capture(s: &mut Session, p: &Value) -> Result<sim_core::frame::Frame, String> {
+    if on_carplay(p)? {
+        return display_of(&s.device(p)?, p)?.capture().map_err(err);
+    }
+    on_main_display(s, p, |d| d.capture().map_err(err))
+}
+
+/// The simulators to resolve a `device` across platforms with: what selection reads of each.
+pub fn selection_infos(s: &mut Session) -> Result<Vec<sim_core::device::DeviceInfo>, String> {
+    s.ctx()?.selection_infos().map_err(err)
+}
+
 /// Runs an input method on its device's worker.
 fn input(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     let udid = s.udid(p)?;
-    let (method, p) = (method.to_owned(), p.clone());
-    INPUT.run(&udid.clone(), move |input| sim_coresim::autoreleasepool(|| input_method(input, &udid, &method, &p)))?
+    let (method, params) = (method.to_owned(), p.clone());
+    let result = INPUT.run(&udid.clone(), move |input| sim_coresim::autoreleasepool(|| input_method(input, &udid, &method, &params)))?;
+    result.map_err(|e| as_typed(e, p))
 }
 
 fn input_method(input: &mut Input, udid: &str, method: &str, p: &Value) -> Result<Value, String> {
@@ -439,10 +515,11 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "shutdown" => ok(s.device(p)?.shutdown()),
         "erase" => ok(s.device(p)?.erase()),
         "screen" => {
-            let (w, h) = display_of(&s.device(p)?, p)?.size().map_err(err)?;
+            let (w, h) = screen_size(s, p)?;
             Ok(json!({"width": w, "height": h}))
         }
-        "screenshot" => screenshot_result(&display_of(&s.device(p)?, p)?.capture().map_err(err)?, p),
+        // Captured on the device's worker, encoded here: the worker is free for input meanwhile.
+        "screenshot" => screenshot_result(&capture(s, p)?, p),
         m if INPUT_METHODS.contains(&m) => input(s, m, p),
         "rotate" => rotate(&s.device(p)?, opt_orientation(p)?),
         "carplay" => {
@@ -778,5 +855,21 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
                 .into())
         }
         other => Err(format!("unknown method `{other}`; call `help`")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_udid_is_reported_as_typed() {
+        let lower = "0000aaaa-bbbb-cccc-dddd-eeeeffff0000";
+        let upper = lower.to_ascii_uppercase();
+        let missing = || format!("no device matches `{upper}`");
+        assert_eq!(as_typed(missing(), &json!({"device": lower})), format!("no device matches `{lower}`"));
+        assert_eq!(as_typed(missing(), &json!({"device": upper})), missing());
+        assert_eq!(as_typed("other".into(), &json!({"device": "booted"})), "other");
+        assert_eq!(as_typed(missing(), &json!({})), missing());
     }
 }

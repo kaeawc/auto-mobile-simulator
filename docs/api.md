@@ -7,6 +7,37 @@ Generated from `simee call help`. Transport: unix socket, one JSON request per l
 ← {"id": 1, "ok": true, "result": null}
 ```
 
+A connection may send any number of requests, each answered before the next is read; keep one open
+rather than connecting per call. Large results (a base64 `screenshot`) are written as one line
+straight from the result, so read up to the newline before parsing.
+
+**The CLI and a server.** When a matching `simee serve` is listening on the default socket
+(`$SIMEE_SOCKET`, else `$TMPDIR/simee.sock`), other `simee` commands run their method on that
+server instead of in their own process: they skip connecting to the simulator service, reuse the
+server's per-device HID and display connections, and drop the CLI's 100 ms post-input wait (the
+server's HID client outlives the command). The output is byte for byte the same.
+
+- **Handshake.** Before forwarding, the CLI calls `identity` with a 1 s deadline for connecting and
+  answering. It forwards only when the answer equals its own: the same build (crate version and a
+  hash of the method table), the same executable file unchanged since the server started (path,
+  inode, size, mtime: a rebuilt CLI doesn't use an older server, nor a different binary such as the
+  desktop window's), and the same environment (a hash of `ANDROID_SDK_ROOT`, `ANDROID_HOME`,
+  `ANDROID_AVD_HOME`, `ANDROID_EMULATOR_HOME`, `ANDROID_USER_HOME`, `ANDROID_ADB_SERVER_PORT`,
+  `ANDROID_EMULATOR_LAUNCHER_DIR`, `DEVELOPER_DIR`, `EMU_BIN`, `HOME`, `PATH`, `TMPDIR`).
+- **Fallback.** No server, a stale socket file, another build or environment, a server from before
+  the handshake (it answers "unknown method"), or one that doesn't answer in time (suspended,
+  wedged): the command runs in the CLI's own process, silently. A forwarded command has no timeout
+  after the handshake (a boot can take minutes). `--in-process` (or `SIMEE_IN_PROCESS=1`) skips the
+  server altogether.
+- **Never forwarded** (`sim_api::IN_CALLER`): `boot` (on Android it starts `emu` as a child of the
+  calling process; on a server it would be the server's child, in its process group, killed by
+  Ctrl-C on `simee serve` and never reaped), `network_shape`, `network_state`, `network_flows`,
+  `network_clear` (the shaping proxy is a thread of the process that starts it),
+  `audio_capture_start`, `audio_capture_stop`, `audio_mute` and `audio_state` (a capture or mute is
+  a helper process its caller owns). These always run in the caller, and need no handshake.
+
+Relative `path` arguments (`screenshot`, `install`) are made absolute before they are sent.
+
 `device` is a UDID (an Android device's UDID is its AVD name), an exact name, or `booted` (the default: the only running device). It is resolved across both platforms; pass `platform` (`ios` or `android`) to look at one. Parameters ending in `?` are optional.
 
 **Platforms** says whose devices a method works on. Calling a method on a device of another platform fails with the platforms it does work on, e.g. `` `status_bar` isn't available on Android devices (it works on iOS) ``. Every device in a result carries `platform`, `form_factor` and `sub_platform`.
@@ -14,6 +45,7 @@ Generated from `simee call help`. Transport: unix socket, one JSON request per l
 | Method | Platforms | Parameters | Description |
 | --- | --- | --- | --- |
 | `help` | Android, iOS | — | List methods with the platforms each supports |
+| `identity` | Android, iOS | — | This process's build, executable and environment (hashed): the CLI forwards a command to a server only when they match its own |
 | `form_factors` | Android, iOS | platform?, form_factor? | Every form factor on every platform: sub-platform, inputs and reference profile, or why it's unsupported |
 | `devices` | Android, iOS | booted?, platform?(android\|ios), form_factor? | List devices with their platform, form factor and sub-platform |
 | `runtimes` | Android, iOS | platform? | List installed runtimes (Android: system images) |

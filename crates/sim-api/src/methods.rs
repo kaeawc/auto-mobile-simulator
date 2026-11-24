@@ -14,6 +14,11 @@ use crate::params::{need_str, opt_form_factor, opt_platform, str_param};
 pub const METHODS: &[(&str, &str, &str)] = &[
     ("help", "", "List methods with the platforms each supports"),
     (
+        "identity",
+        "",
+        "This process's build, executable and environment (hashed): the CLI forwards a command to a server only when they match its own",
+    ),
+    (
         "form_factors",
         "platform?, form_factor?",
         "Every form factor on every platform: sub-platform, inputs and reference profile, or why it's unsupported",
@@ -177,6 +182,7 @@ impl Session {
 /// Methods that work on every platform's devices (or need no device).
 const ALL_PLATFORMS: &[&str] = &[
     "help",
+    "identity",
     "form_factors",
     "devices",
     "runtimes",
@@ -226,7 +232,9 @@ fn resolve(s: &mut Session, p: &Value) -> Result<(Platform, String), String> {
     if android.is_empty() && only != Some(Platform::Android) {
         return Ok((Platform::Ios, query.to_owned()));
     }
-    let mut all = if only == Some(Platform::Android) { Vec::new() } else { ios_list(s, "devices")? };
+    // Only what `select` reads of each simulator (UDID, name, state); the iOS backend reads the
+    // chosen one's full info itself.
+    let mut all = if only == Some(Platform::Android) { Vec::new() } else { crate::ios::selection_infos(&mut s.ios)? };
     all.extend(android);
     match select(&all, query) {
         Selection::One(i) => Ok((all[i].platform, all[i].udid.clone())),
@@ -251,6 +259,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
                 json!({"method": m, "params": params, "doc": doc, "platforms": platforms})
             })
             .collect()),
+        "identity" => Ok(crate::identity().clone()),
         "form_factors" => {
             let (platform, form_factor) = (opt_platform(p)?, opt_form_factor(p)?);
             Ok(matrix()

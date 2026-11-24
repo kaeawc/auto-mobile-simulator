@@ -205,7 +205,12 @@ pub fn screenshot_result(frame: &Frame, p: &Value) -> Result<Value, String> {
 pub fn png_result(width: u32, height: u32, png: &[u8], p: &Value) -> Result<Value, String> {
     match str_param(p, "path") {
         Some(path) => std::fs::write(path, png).map(|()| json!({"path": path, "width": width, "height": height})).map_err(err),
-        None => Ok(json!({"width": width, "height": height, "png": base64::engine::general_purpose::STANDARD.encode(png)})),
+        None => {
+            // The base64 text moves into the result; `json!` would copy it.
+            let mut result = json!({"width": width, "height": height});
+            result["png"] = Value::String(base64::engine::general_purpose::STANDARD.encode(png));
+            Ok(result)
+        }
     }
 }
 
