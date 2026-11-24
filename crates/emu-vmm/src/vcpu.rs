@@ -1,5 +1,5 @@
 //! vCPU threads: entering the guest and handling its exits (MMIO, PSCI, WFI, sysreg traps).
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -87,8 +87,10 @@ impl VcpuControl for HvVcpus {
     }
 }
 
-/// Per-vCPU exit counters.
+/// Per-vCPU exit counters, each vCPU's alone in its cache line (128 bytes on Apple silicon):
+/// one is bumped on every exit, and neighbours sharing the line would bounce it between cores.
 #[derive(Default)]
+#[repr(align(128))]
 pub struct ExitStats {
     pub mmio_read: AtomicU64,
     pub mmio_write: AtomicU64,
@@ -124,7 +126,7 @@ pub struct Cpus {
     stop: Mutex<Option<StopReason>>,
     stop_cv: Condvar,
     unmapped_logged: AtomicU64,
-    sysreg_logged: Mutex<Vec<u64>>,
+    sysreg_logged: SeenOnce,
 }
 
 impl Cpus {
@@ -140,7 +142,7 @@ impl Cpus {
             stop: Mutex::new(None),
             stop_cv: Condvar::new(),
             unmapped_logged: AtomicU64::new(0),
-            sysreg_logged: Mutex::new(Vec::new()),
+            sysreg_logged: SeenOnce::new(),
         }
     }
 
@@ -443,9 +445,7 @@ impl Cpus {
     }
 
     fn log_sysreg(&self, enc: u64, is_read: bool) {
-        let mut seen = self.sysreg_logged.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.len() < 64 && !seen.contains(&enc) {
-            seen.push(enc);
+        if self.sysreg_logged.first_sighting(enc) {
             let (op0, op2, op1, crn, crm) = ((enc >> 20) & 3, (enc >> 17) & 7, (enc >> 14) & 7, (enc >> 10) & 0xf, (enc >> 1) & 0xf);
             eprintln!(
                 "emu: trapped sysreg S{op0}_{op1}_C{crn}_C{crm}_{op2} ({}), treating as RAZ/WI",
@@ -455,7 +455,120 @@ impl Cpus {
     }
 }
 
+/// The first [`SeenOnce::CAP`] distinct values, each reported once. A guest polling a trapped
+/// register (PMU, debug) asks on every exit for a value already seen: that answer is a lock-free
+/// scan; only a new value takes the lock.
+struct SeenOnce {
+    values: [AtomicU64; SeenOnce::CAP],
+    /// Entries below this are written (published with Release after the write).
+    len: AtomicUsize,
+    insert: Mutex<()>,
+}
+
+impl SeenOnce {
+    const CAP: usize = 64;
+
+    fn new() -> SeenOnce {
+        SeenOnce { values: std::array::from_fn(|_| AtomicU64::new(0)), len: AtomicUsize::new(0), insert: Mutex::new(()) }
+    }
+
+    fn contains(&self, value: u64, len: usize) -> bool {
+        self.values[..len].iter().any(|v| v.load(Ordering::Relaxed) == value)
+    }
+
+    /// True the first time `value` is offered, while fewer than `CAP` values have been.
+    fn first_sighting(&self, value: u64) -> bool {
+        let len = self.len.load(Ordering::Acquire);
+        if len >= Self::CAP || self.contains(value, len) {
+            return false;
+        }
+        let _g = self.insert.lock().unwrap_or_else(|e| e.into_inner());
+        let len = self.len.load(Ordering::Acquire);
+        if len >= Self::CAP || self.contains(value, len) {
+            return false;
+        }
+        self.values[len].store(value, Ordering::Relaxed);
+        self.len.store(len + 1, Ordering::Release);
+        true
+    }
+}
+
 enum Flow {
     CpuOff,
     Stop,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    #[test]
+    fn each_value_is_seen_once_up_to_the_cap() {
+        let s = SeenOnce::new();
+        assert!(s.first_sighting(0), "zero is a value like any other");
+        assert!(!s.first_sighting(0));
+        for v in 1..SeenOnce::CAP as u64 {
+            assert!(s.first_sighting(v), "{v}");
+        }
+        assert!(!s.first_sighting(5));
+        assert!(!s.first_sighting(1000), "full");
+    }
+
+    /// vCPU threads trapping on the same registers at once: each is still reported once.
+    #[test]
+    fn racing_sightings_report_each_value_once() {
+        let s = SeenOnce::new();
+        let firsts: Vec<u64> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..8)
+                .map(|_| sc.spawn(|| (0..40u64).flat_map(|_| 0..40u64).filter(|&v| s.first_sighting(v)).collect::<Vec<_>>()))
+                .collect();
+            hs.into_iter().flat_map(|h| h.join().expect("thread")).collect()
+        });
+        let mut sorted = firsts.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..40).collect::<Vec<_>>());
+    }
+
+    fn cpus(n: usize) -> Cpus {
+        Cpus::new(Bus::new(), Arc::new(Wakers::new(n, HvVcpus::new(n), wake::Mode::Targeted)), 0)
+    }
+
+    /// Per-exit bookkeeping with N vCPU threads: each one's exit counter, and the sysreg trap
+    /// log for an encoding already logged (the PMU and debug registers a guest polls).
+    /// `cargo test --release -p emu-vmm exit_bookkeeping_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn exit_bookkeeping_cost() {
+        const ITERS: u32 = 2_000_000;
+        fn worst(c: &Cpus, f: impl Fn(&Cpus, usize) + Sync) -> f64 {
+            let barrier = std::sync::Barrier::new(c.count());
+            std::thread::scope(|s| {
+                let hs: Vec<_> = (0..c.count())
+                    .map(|i| {
+                        let (barrier, f) = (&barrier, &f);
+                        s.spawn(move || {
+                            barrier.wait();
+                            let t = Instant::now();
+                            for _ in 0..ITERS {
+                                f(c, i);
+                            }
+                            t.elapsed().as_nanos() as f64 / f64::from(ITERS)
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().expect("thread")).fold(0.0, f64::max)
+            })
+        }
+        for n in [1usize, 2, 4, 8] {
+            let c = cpus(n);
+            c.log_sysreg(0x30_0000, true);
+            let stats = worst(&c, |c, i| {
+                c.stats[i].sysreg.fetch_add(1, Ordering::Relaxed);
+            });
+            let sysreg = worst(&c, |c, _| c.log_sysreg(0x30_0000, true));
+            println!("exit_bookkeeping {n} vCPUs: {stats:.1} ns per counter bump, {sysreg:.1} ns per logged sysreg trap");
+        }
+    }
 }

@@ -112,6 +112,11 @@ impl MmioTransport {
 
 impl MmioDevice for MmioTransport {
     fn read(&self, offset: u64, data: &mut [u8]) {
+        // The interrupt handler's status read needs nothing of the transport's state.
+        if offset == 0x060 {
+            set_le(data, u64::from(self.irq.status()));
+            return;
+        }
         let s = self.lock();
         if offset >= 0x100 {
             match s.dev.as_ref() {
@@ -152,7 +157,6 @@ impl MmioDevice for MmioTransport {
                     None => u32::MAX,
                 }
             }
-            0x060 => self.irq.status(),
             0x070 => s.status,
             0x0fc => s.config_generation,
             _ => 0,
@@ -161,6 +165,11 @@ impl MmioDevice for MmioTransport {
     }
 
     fn write(&self, offset: u64, data: &[u8]) {
+        // Nor does its acknowledge.
+        if offset == 0x064 {
+            self.irq.ack(le_value(data) as u32);
+            return;
+        }
         let mut s = self.lock();
         if offset >= 0x100 {
             if let Some(d) = s.dev.as_mut() {
@@ -202,7 +211,6 @@ impl MmioDevice for MmioTransport {
                     d.notify(v as u16);
                 }
             }
-            0x064 => self.irq.ack(v),
             0x070 => {
                 if v == 0 {
                     let irq = self.irq.clone();
@@ -436,6 +444,42 @@ mod tests {
         assert_eq!(s.seen.lock().expect("seen").resets, 2, "negotiate's reset and this one");
         s.w(0x050, 0);
         assert!(s.seen.lock().expect("seen").notified.is_empty(), "no notifications after reset");
+    }
+
+    /// A device thread raising and the driver acknowledging (as a worker and a vCPU do) while
+    /// another vCPU reads the interrupt status: what each costs when they meet on the transport.
+    /// `cargo test --release -p emu-vmm isr_under_interrupt_traffic -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn isr_under_interrupt_traffic() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+        const READS: u32 = 2_000_000;
+        let s = slot(false);
+        s.negotiate(F_VERSION_1);
+        s.queue(0, 16, 0x4000_4000);
+        s.w(0x070, 0xf);
+        let done = AtomicBool::new(false);
+        let (reads_ns, cycles) = std::thread::scope(|sc| {
+            let (s, done) = (&s, &done);
+            let traffic = sc.spawn(move || {
+                let mut n = 0u64;
+                while !done.load(Ordering::Relaxed) {
+                    s.t.irq.raise(super::super::INT_USED_RING);
+                    s.w(0x064, super::super::INT_USED_RING);
+                    n += 1;
+                }
+                n
+            });
+            let t = Instant::now();
+            for _ in 0..READS {
+                std::hint::black_box(s.r(0x060));
+            }
+            let el = t.elapsed();
+            done.store(true, Ordering::Relaxed);
+            (el.as_nanos() as f64 / f64::from(READS), traffic.join().expect("thread") as f64 / el.as_secs_f64())
+        });
+        println!("isr: {reads_ns:.1} ns per ISR read, {:.2} M raise+ack per s alongside", cycles / 1e6);
     }
 
     #[test]
