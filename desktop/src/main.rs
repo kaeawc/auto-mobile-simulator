@@ -121,6 +121,8 @@ pub struct State {
     work_done: Arc<AtomicBool>,
     work_error: Arc<Mutex<Option<String>>>,
     sized_for: Option<(u32, u32)>,
+    /// Whether the window shows (not minimised, hidden, or covered where the system says so).
+    visible: bool,
 }
 
 impl State {
@@ -248,6 +250,7 @@ impl State {
                     let console = work::Worker::start("simee-android-console", find, self.outbox.clone());
                     match android::Screen::connect(&info.udid, dir, 1080, console) {
                         Ok(sc) => {
+                            sc.set_visible(self.visible);
                             self.screen = Some(sc);
                             self.status = None;
                         }
@@ -309,6 +312,7 @@ fn init() -> State {
         work_done: Arc::new(AtomicBool::new(false)),
         work_error: Arc::new(Mutex::new(None)),
         sized_for: None,
+        visible: true,
     }
 }
 
@@ -498,6 +502,14 @@ fn setup(s: &mut State, waker: Waker) {
     match sim_api::serve_in_background(socket.clone()) {
         Ok(()) => s.socket = Some(socket.display().to_string()),
         Err(e) => s.status = Some(format!("API socket {}: {e}", socket.display())),
+    }
+}
+
+/// The window went off screen or came back: a hidden window's Android screen reads no frames.
+fn on_visibility(s: &mut State, visible: bool, _: &mut Tx) {
+    s.visible = visible;
+    if let Some(sc) = &s.screen {
+        sc.set_visible(visible);
     }
 }
 
@@ -728,7 +740,7 @@ fn screenshot(s: &State) -> Option<String> {
 }
 
 fn main() {
-    rune::run(AppSpec::<State> {
+    let spec = AppSpec::<State> {
         scenes: &[
             ("demo", demo),
             ("android", android_scene),
@@ -743,7 +755,12 @@ fn main() {
         poll: Some(poll),
         min_size: Some((1000.0, 560.0)),
         ..AppSpec::new("simee", (1240.0, 870.0), init, view::view)
-    });
+    };
+    // Live Rust editing runs the spec its own way, without the visibility hook.
+    #[cfg(feature = "hot")]
+    rune::run(spec);
+    #[cfg(not(feature = "hot"))]
+    rune::App::new(spec).on_visibility(on_visibility).run();
 }
 
 #[cfg(test)]

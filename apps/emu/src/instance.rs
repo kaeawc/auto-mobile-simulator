@@ -75,6 +75,8 @@ pub struct Instance {
     pub xr: Option<std::sync::Arc<emu_vmm::pipe::xr::Xr>>,
     /// The vehicle HAL channel, for Automotive images only (as stock).
     pub car: Option<std::sync::Arc<emu_vmm::pipe::car::Car>>,
+    /// The adb port, bound for the life of the process so a guest reset reboots on it.
+    adb: std::sync::Arc<emu_vmm::pipe::adb::AdbListener>,
     _lock: Option<File>,
     /// This process's claim on its console port ([`claim_port`]).
     _port_claim: File,
@@ -145,6 +147,8 @@ impl Instance {
             File::create(dir.join("console.log")).with_context(|| format!("creating {}", dir.join("console.log").display()))?;
         let logcat =
             logcat_sink(opts).with_context(|| format!("opening -logcat-output {}", opts.logcat_output.as_deref().unwrap_or("")))?;
+        let adb_port = console_port + 1;
+        let adb = emu_vmm::pipe::adb::AdbListener::bind(adb_port).with_context(|| format!("binding adb port {adb_port}"))?;
         let gpu_lib64 = renderer(avd, opts);
         if gpu_lib64.is_none() && !gpu_off(opts) {
             eprintln!(
@@ -191,6 +195,7 @@ impl Instance {
             telephony: Default::default(),
             xr: is_xr(avd).then(Default::default),
             car: avd.is_car().then(Default::default),
+            adb: std::sync::Arc::new(adb),
             _lock: lock,
             _port_claim: port_claim,
             console_log,
@@ -241,7 +246,7 @@ impl Instance {
             disks: plan.disks,
             disk_fsync: opts.disk_fsync,
             rng: true,
-            adb_port: Some(self.console_port + 1),
+            adb: Some(self.adb.clone()),
             gpu: self.gpu_spec(opts),
             boot_props: plan.boot_props,
             input: Some((self.avd.lcd().0, self.avd.lcd().1)),

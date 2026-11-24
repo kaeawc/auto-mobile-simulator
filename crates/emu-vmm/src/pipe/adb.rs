@@ -29,32 +29,96 @@ struct Matchmaker {
     guests: VecDeque<PipeCtx>,
 }
 
-pub struct AdbService {
+/// Where the listener sends host clients: the running machine's vsock worker and legacy pipes.
+#[derive(Default)]
+struct Route {
+    vsock: Option<Sender<WorkerEvent>>,
     mm: Arc<Mutex<Matchmaker>>,
-    pub port: u16,
 }
 
-impl AdbService {
-    /// Listens on 127.0.0.1:`port` (0 picks a free one; `port` says which); `vsock` is the vsock
-    /// worker's event channel.
-    pub fn bind(port: u16, vsock: Sender<WorkerEvent>) -> std::io::Result<AdbService> {
+/// The adb port, bound once per emulator and kept across guest resets (as stock keeps it), so a
+/// rebooting guest comes back on the same port and clients aren't refused meanwhile. Each machine
+/// [`attach`](Self::attach)es to it. Dropping it closes the port.
+pub struct AdbListener {
+    pub port: u16,
+    route: Arc<Mutex<Route>>,
+    closing: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AdbListener {
+    /// How often the accept loop looks for [`Drop`].
+    const POLL: Duration = Duration::from_millis(100);
+
+    /// Listens on 127.0.0.1:`port` (0 picks a free one; `port` says which). Clients arriving
+    /// before a machine attaches are hung up on.
+    pub fn bind(port: u16) -> std::io::Result<AdbListener> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
         let port = listener.local_addr()?.port();
-        let mm = Arc::new(Mutex::new(Matchmaker::default()));
-        let m = mm.clone();
-        std::thread::Builder::new().name("adb-listen".into()).spawn(move || {
-            for stream in listener.incoming().flatten() {
+        listener.set_nonblocking(true)?;
+        let route = Arc::new(Mutex::new(Route::default()));
+        let closing = Arc::new(AtomicBool::new(false));
+        let (r, c) = (route.clone(), closing.clone());
+        let thread = std::thread::Builder::new().name("adb-listen".into()).spawn(move || {
+            while !c.load(Ordering::Relaxed) {
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        let timeout = rustix::event::Timespec { tv_sec: 0, tv_nsec: Self::POLL.as_nanos() as _ };
+                        let _ = rustix::event::poll(&mut [PollFd::new(&listener, PollFlags::IN)], Some(&timeout));
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
+                // macOS hands out accepted sockets with the listener's O_NONBLOCK.
+                let _ = stream.set_nonblocking(false);
                 let _ = stream.set_nodelay(true);
-                let waiting = m.lock().unwrap_or_else(|e| e.into_inner()).guests.pop_front();
-                match waiting {
-                    Some(ctx) => {
+                let (waiting, vsock) = {
+                    let route = r.lock().unwrap_or_else(|e| e.into_inner());
+                    (route.mm.lock().unwrap_or_else(|e| e.into_inner()).guests.pop_front(), route.vsock.clone())
+                };
+                match (waiting, vsock) {
+                    (Some(ctx), _) => {
                         ctx.send(HostMsg::Attach(stream));
                     }
-                    None => connect_vsock(Arc::new(stream), vsock.clone(), port),
+                    (None, Some(vsock)) => connect_vsock(Arc::new(stream), vsock, port),
+                    (None, None) => {}
                 }
             }
         })?;
-        Ok(AdbService { mm, port })
+        Ok(AdbListener { port, route, closing, thread: Some(thread) })
+    }
+
+    /// Sends host clients to a new machine from now on; `vsock` is its vsock worker's event
+    /// channel. The previous machine's waiting legacy pipes are forgotten.
+    pub fn attach(self: &Arc<Self>, vsock: Sender<WorkerEvent>) -> AdbService {
+        let mm = Arc::new(Mutex::new(Matchmaker::default()));
+        *self.route.lock().unwrap_or_else(|e| e.into_inner()) = Route { vsock: Some(vsock), mm: mm.clone() };
+        AdbService { mm, port: self.port, _listener: self.clone() }
+    }
+}
+
+impl Drop for AdbListener {
+    fn drop(&mut self) {
+        self.closing.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// One machine's end of the adb bridge: its legacy `qemud:adb` pipes.
+pub struct AdbService {
+    mm: Arc<Mutex<Matchmaker>>,
+    pub port: u16,
+    _listener: Arc<AdbListener>,
+}
+
+impl AdbService {
+    /// A listener of its own on 127.0.0.1:`port` (0 picks a free one; `port` says which),
+    /// attached to `vsock`, the vsock worker's event channel.
+    pub fn bind(port: u16, vsock: Sender<WorkerEvent>) -> std::io::Result<AdbService> {
+        Ok(Arc::new(AdbListener::bind(port)?).attach(vsock))
     }
 
     /// Tells a running adb server about us (`host:emulator:<port>`), so `adb devices` lists
@@ -572,6 +636,65 @@ mod tests {
         pipe.closed();
         let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, svc.port)).expect("connect");
         assert!(matches!(next(&events), WorkerEvent::Connect { .. }), "no waiting pipe: the client goes to vsock");
+    }
+
+    /// #23: the bridge is rebuilt on the port the previous one just used.
+    #[test]
+    fn a_dropped_listener_frees_its_port_for_the_next() {
+        let port = AdbListener::bind(0).expect("bind").port;
+        let first = AdbListener::bind(port).expect("bind a free port");
+        let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect");
+        assert_eq!(AdbListener::bind(port).err().map(|e| e.kind()), Some(ErrorKind::AddrInUse), "in use while it lives");
+        drop(first);
+        let again = AdbListener::bind(port).expect("rebind the port just in use");
+        let (vsock, events) = channel();
+        let _svc = Arc::new(again).attach(vsock);
+        let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect");
+        assert!(matches!(next(&events), WorkerEvent::Connect { .. }), "the rebuilt bridge serves clients");
+    }
+
+    /// A guest reset attaches a new machine to the same port: clients go to the new one.
+    #[test]
+    fn a_reset_machine_takes_over_the_port() {
+        let listener = Arc::new(AdbListener::bind(0).expect("bind"));
+        let (vsock, before) = channel();
+        let svc = listener.attach(vsock);
+        let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, listener.port)).expect("connect");
+        assert!(matches!(next(&before), WorkerEvent::Connect { .. }));
+        // The first machine stops: its vsock worker and pipe registry go.
+        drop((svc, before));
+
+        let (vsock, after) = channel();
+        let svc = listener.attach(vsock);
+        assert_eq!(svc.port, listener.port);
+        let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, listener.port)).expect("connect");
+        assert!(matches!(next(&after), WorkerEvent::Connect { .. }), "the rebooted guest gets the client");
+    }
+
+    /// A legacy pipe left waiting by the machine before a reset never gets a client.
+    #[test]
+    fn a_reset_forgets_the_old_guests_waiting_pipes() {
+        let listener = Arc::new(AdbListener::bind(0).expect("bind"));
+        let (vsock, _old_events) = channel();
+        let old = listener.attach(vsock);
+        let (pipe_events, old_pipe) = channel();
+        let mut pipe = old.open("qemud:adb", PipeCtx { conn: 5, events: pipe_events }).expect("adb pipe");
+        assert!(pipe.guest_data(b"accept", &mut Vec::new()));
+
+        let (vsock, events) = channel();
+        let _new = listener.attach(vsock);
+        let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, listener.port)).expect("connect");
+        assert!(matches!(next(&events), WorkerEvent::Connect { .. }), "the client goes to the new guest");
+        assert!(old_pipe.try_recv().is_err(), "not to the old guest's pipe");
+    }
+
+    /// Before any machine attaches (or after one's worker is gone) a client is hung up on.
+    #[test]
+    fn a_client_without_a_machine_is_hung_up_on() {
+        let listener = AdbListener::bind(0).expect("bind");
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, listener.port)).expect("connect");
+        client.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+        assert_eq!(client.read(&mut [0u8; 1]).expect("eof"), 0);
     }
 
     /// A forwarder on one end of a loopback connection, the client on the other.

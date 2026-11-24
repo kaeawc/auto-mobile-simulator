@@ -4,13 +4,16 @@
 //! crosses the socket; the pixels are read from the ring straight into the buffer handed to
 //! `Pixels`), or on the socket from an emulator without one. The emulator runs in its own process,
 //! so a crashed guest can't take the window down.
+//! While the window is hidden the frame stream pauses: the emulator is told to stop sending
+//! (`hello 0`, so it stops scaling frames for us too) and the frame thread reads nothing; shown
+//! again, it asks for frames and the emulator sends its newest at once.
 //! What the socket doesn't carry (typing with shift, rotation, the hinge, screenshots) goes over
 //! the console through `sim-android`, on the screen's console worker: a console session can take
 //! seconds on a busy emulator, and the window never waits for one.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use rune::Pixels;
 use sim_core::gesture::Phase;
@@ -47,6 +50,10 @@ pub struct Screen {
     /// The last job queued on `console`, when it is a stroke job: strokes typed behind it join
     /// it (one console session) instead of queueing a session each.
     tail: Mutex<Option<QueuedStrokes>>,
+    max_width: u32,
+    shown: Arc<Shown>,
+    /// Frames read so far.
+    read: Arc<AtomicU64>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -59,6 +66,35 @@ pub fn display_keys(strokes: &[KeyStroke]) -> Option<Vec<String>> {
     strokes.iter().map(|s| if s.shift { None } else { linux_keycode(s.usage).map(|c| c.to_string()) }).collect()
 }
 
+/// Whether the window shows the screen; the frame thread waits on it while it doesn't.
+struct Shown {
+    visible: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Shown {
+    fn get(&self) -> bool {
+        *lock(&self.visible)
+    }
+
+    /// Whether it changed.
+    fn set(&self, visible: bool) -> bool {
+        let mut v = lock(&self.visible);
+        let changed = std::mem::replace(&mut *v, visible) != visible;
+        self.changed.notify_all();
+        changed
+    }
+
+    /// Waits while hidden; false once `alive` says the screen is gone.
+    fn wait(&self, alive: &AtomicBool) -> bool {
+        let mut v = lock(&self.visible);
+        while !*v && alive.load(Ordering::Relaxed) {
+            v = self.changed.wait(v).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        alive.load(Ordering::Relaxed)
+    }
+}
+
 impl Screen {
     /// Connects and asks for frames at most `max_width` pixels wide. Console work for the
     /// device goes to `console`.
@@ -68,12 +104,18 @@ impl Screen {
         display.send(&Input::Hello { max_width })?;
         let mut frames = sim_android::display::Frames::new(display.try_clone()?).with_fallback(display.try_clone()?);
         let (pixels, device, alive) = (Pixels::new(), Arc::new((AtomicU32::new(0), AtomicU32::new(0))), Arc::new(AtomicBool::new(true)));
-        let (p, d, a) = (pixels.clone(), device.clone(), alive.clone());
+        let shown = Arc::new(Shown { visible: Mutex::new(true), changed: Condvar::new() });
+        let read = Arc::new(AtomicU64::new(0));
+        let (p, d, a, sh, r) = (pixels.clone(), device.clone(), alive.clone(), shown.clone(), read.clone());
         std::thread::Builder::new()
             .name("simee-android-frames".into())
             .spawn(move || {
-                // Only the newest announced frame: the window shows nothing older.
-                while let Ok((header, rgba)) = frames.newest_frame() {
+                // Only the newest announced frame (the window shows nothing older), and none
+                // while the window is hidden: one announced just before it hid is passed over.
+                while sh.wait(&a)
+                    && let Ok((header, rgba)) = frames.newest_frame_when(|| sh.get())
+                {
+                    r.fetch_add(1, Ordering::Relaxed);
                     d.0.store(header.device_width, Ordering::Relaxed);
                     d.1.store(header.device_height, Ordering::Relaxed);
                     p.set(header.width, header.height, rgba);
@@ -82,7 +124,22 @@ impl Screen {
             })
             .map_err(|e| e.to_string())?;
         let tail = Mutex::new(None);
-        Ok(Screen { udid: udid.to_owned(), avd_dir, pixels, link: Arc::new(Mutex::new(display)), device, alive, console, tail })
+        let link = Arc::new(Mutex::new(display));
+        Ok(Screen { udid: udid.to_owned(), avd_dir, pixels, link, device, alive, console, tail, max_width, shown, read })
+    }
+
+    /// Pauses the frame stream while the window is hidden (minimised, or covered where the
+    /// system says so) and resumes it with the newest frame when it shows again.
+    pub fn set_visible(&self, visible: bool) {
+        if self.shown.set(visible) {
+            self.send(&Input::Hello { max_width: if visible { self.max_width } else { 0 } });
+        }
+    }
+
+    /// Frames read from the emulator so far.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn frames_read(&self) -> u64 {
+        self.read.load(Ordering::Relaxed)
     }
 
     /// Runs a console job for the device (looked up when the job starts), after the ones already
@@ -144,6 +201,8 @@ impl Screen {
         let mut link = self.link.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if link.send(input).is_err() {
             self.alive.store(false, Ordering::Relaxed);
+            // A frame thread paused for a hidden window finds out too.
+            self.shown.changed.notify_all();
         }
     }
 
@@ -160,6 +219,19 @@ impl Screen {
     /// Turns the rotary input.
     pub fn wheel(&self, ticks: i32) {
         self.send(&Input::Wheel(ticks));
+    }
+}
+
+impl Drop for Screen {
+    /// Ends the frame thread: it holds its own handle on the connection, so it would otherwise
+    /// keep reading (or, paused, keep waiting) after the screen is gone.
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Relaxed);
+        self.shown.changed.notify_all();
+        let link = self.link.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Ok(s) = link.try_clone() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
     }
 }
 
@@ -373,6 +445,126 @@ mod tests {
         assert!(screen.alive());
         done.send(()).expect("done");
         assert_eq!(server.join().expect("server"), ["shm", "hello 1080"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// What the fake emulator saw: the client's lines, frames it announced while asked for none
+    /// (only the one already on its way when the window hid), and the newest frame it made.
+    #[derive(Default)]
+    struct Seen {
+        lines: Mutex<Vec<String>>,
+        sent_paused: AtomicU64,
+        newest: AtomicU64,
+    }
+
+    /// A fake emulator that streams like `emu`'s display server: the guest makes a frame every
+    /// 4 ms, written into a two-slot ring and announced while the client's last `hello` asks for
+    /// frames (a `hello 0` stops it); one frame is announced right after a `hello 0`, as if it
+    /// was already on its way. A frame's pixels are its number.
+    fn fake_emulator(listener: UnixListener, ring_path: PathBuf, seen: Arc<Seen>) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            let (max_width, in_flight, gone) =
+                (Arc::new(AtomicU32::new(0)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+            let (mw, fl, g, s) = (max_width.clone(), in_flight.clone(), gone.clone(), seen.clone());
+            let reader = BufReader::new(conn.try_clone().expect("clone"));
+            std::thread::spawn(move || {
+                for line in reader.lines().map_while(Result::ok) {
+                    if let Some(w) = line.strip_prefix("hello ").and_then(|w| w.parse().ok()) {
+                        mw.store(w, Ordering::Relaxed);
+                        fl.store(w == 0, Ordering::Relaxed);
+                    }
+                    s.lines.lock().expect("lines").push(line);
+                }
+                g.store(true, Ordering::Relaxed);
+            });
+            let layout = ring::Layout::new(2, 8);
+            let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&ring_path).expect("ring");
+            file.set_len(layout.file_len()).expect("len");
+            file.write_all_at(&layout.encode(), 0).expect("header");
+            let mut announced = false;
+            let mut frame = 0u64;
+            while !gone.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(4));
+                frame += 1;
+                seen.newest.store(frame, Ordering::Relaxed);
+                let asked = max_width.load(Ordering::Relaxed) > 0;
+                let on_its_way = in_flight.swap(false, Ordering::Relaxed);
+                if !asked && !on_its_way {
+                    continue;
+                }
+                let n = (frame % 2) as u32;
+                let slot = ring::Slot { seq: 2 * frame, frame, width: 2, height: 1, device_width: 4, device_height: 2, len: 8 };
+                file.write_all_at(&slot.encode(), layout.slot_header_offset(n)).expect("slot");
+                file.write_all_at(&[(frame as u32).to_le_bytes(); 2].concat(), layout.slot_data_offset(n)).expect("pixels");
+                let mut msg = Vec::new();
+                if !announced {
+                    let path = ring_path.to_str().expect("utf8").as_bytes();
+                    msg.extend(Record::Ring { path_len: path.len() as u32 }.encode());
+                    msg.extend(path);
+                    announced = true;
+                }
+                msg.extend(Record::Shared { header: FrameHeader::new(2, 1, 4, 2, frame).expect("size"), slot: n }.encode());
+                if conn.write_all(&msg).is_err() {
+                    break;
+                }
+                if !asked {
+                    seen.sent_paused.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        })
+    }
+
+    fn wait_until(what: &str, f: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !f() {
+            assert!(start.elapsed() < Duration::from_secs(5), "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The frame number the window's pixels show.
+    fn shown(screen: &Screen) -> u64 {
+        let rgba = screen.pixels.rgba();
+        u64::from(u32::from_le_bytes(rgba[..4].try_into().expect("a frame")))
+    }
+
+    /// #21: a hidden window reads no frames, and the emulator stops sending them; shown again,
+    /// the newest frame arrives at once.
+    #[test]
+    fn a_hidden_window_reads_no_frames_and_catches_up_when_shown() {
+        let dir = PathBuf::from("/tmp").join(format!("rs-hidden-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("simee")).expect("dir");
+        let listener = UnixListener::bind(sim_android::display::socket(&dir)).expect("bind");
+        let seen = Arc::new(Seen::default());
+        let server = fake_emulator(listener, dir.join("simee/frames-1-0.ring"), seen.clone());
+        let screen = Screen::connect("pixel", dir.clone(), 1080, console(Outbox::default())).expect("connect");
+        wait_until("frames while shown", || screen.frames_read() >= 3);
+
+        screen.set_visible(false);
+        screen.set_visible(false); // no change: nothing sent
+        wait_until("the emulator to hear the window hid", || seen.lines.lock().expect("lines").len() == 3);
+        // The frame that was on its way goes out (and is passed over).
+        wait_until("the frame on its way", || seen.sent_paused.load(Ordering::Relaxed) == 1);
+        let (read, newest) = (screen.frames_read(), seen.newest.load(Ordering::Relaxed));
+        // Counted in the guest's frames, not wall time: a busy CI runner oversleeps.
+        wait_until("the guest to make frames while hidden", || seen.newest.load(Ordering::Relaxed) - newest >= 20);
+        assert_eq!(screen.frames_read(), read, "no frame read while hidden");
+        assert_eq!(seen.sent_paused.load(Ordering::Relaxed), 1, "only the frame already on its way was announced");
+        let last_shown = shown(&screen);
+
+        let before = seen.newest.load(Ordering::Relaxed);
+        let start = Instant::now();
+        screen.set_visible(true);
+        wait_until("a frame after showing", || screen.frames_read() > read);
+        println!("shown again: newest frame in {:.1} ms (the fake guest makes one every 4 ms)", start.elapsed().as_secs_f64() * 1000.0);
+        wait_until("the newest frame", || shown(&screen) > before);
+        assert!(shown(&screen) > last_shown);
+        assert_eq!(*seen.lines.lock().expect("lines"), ["shm", "hello 1080", "hello 0", "hello 1080"]);
+
+        drop(screen);
+        server.join().expect("server");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

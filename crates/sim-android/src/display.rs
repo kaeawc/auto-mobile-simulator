@@ -84,11 +84,13 @@ pub struct Frames<R> {
     pub torn: u64,
     /// Ring frames skipped unread because a newer one was already announced behind them.
     pub superseded: u64,
+    /// Frames passed over unread because nobody wanted them ([`Frames::next_frame_when`]).
+    pub skipped: u64,
 }
 
 impl<R: Read> Frames<R> {
     pub fn new(reader: R) -> Frames<R> {
-        Frames { reader: BufReader::with_capacity(READ_AHEAD, reader), ring: None, fallback: None, torn: 0, superseded: 0 }
+        Frames { reader: BufReader::with_capacity(READ_AHEAD, reader), ring: None, fallback: None, torn: 0, superseded: 0, skipped: 0 }
     }
 
     /// The ring notice already read ahead behind the current record, if the next record is one.
@@ -115,21 +117,41 @@ impl<R: Read> Frames<R> {
     /// announcements are followed, and a frame the server overwrote before it was read (or that
     /// names a ring this side couldn't open) is skipped for the next one.
     pub fn next_frame(&mut self) -> std::io::Result<(FrameHeader, Vec<u8>)> {
-        self.read_next(false)
+        self.read_next(false, || true)
     }
 
     /// Like [`Frames::next_frame`], but a client that fell behind (a window showing frames) gets
     /// only the newest of the ring frames already announced: the ones before it are skipped
     /// unread (counted in `superseded`). Socket frames and ring announcements are never skipped.
     pub fn newest_frame(&mut self) -> std::io::Result<(FrameHeader, Vec<u8>)> {
-        self.read_next(true)
+        self.read_next(true, || true)
     }
 
-    fn read_next(&mut self, skip_to_newest: bool) -> std::io::Result<(FrameHeader, Vec<u8>)> {
+    /// [`Frames::next_frame`], reading a frame's pixels only if `wanted()` says so when it
+    /// arrives: one nobody wants (its window is hidden) is passed over without reading it from
+    /// the ring (a socket frame's bytes are drained without keeping them).
+    pub fn next_frame_when(&mut self, wanted: impl Fn() -> bool) -> std::io::Result<(FrameHeader, Vec<u8>)> {
+        self.read_next(false, wanted)
+    }
+
+    /// [`Frames::newest_frame`] with [`Frames::next_frame_when`]'s `wanted()`: a shown window gets
+    /// the newest announced frame, a hidden one reads none.
+    pub fn newest_frame_when(&mut self, wanted: impl Fn() -> bool) -> std::io::Result<(FrameHeader, Vec<u8>)> {
+        self.read_next(true, wanted)
+    }
+
+    fn read_next(&mut self, skip_to_newest: bool, wanted: impl Fn() -> bool) -> std::io::Result<(FrameHeader, Vec<u8>)> {
         loop {
             let mut hdr = [0u8; HEADER_LEN];
             self.reader.read_exact(&mut hdr)?;
             match Record::decode(&hdr).map_err(std::io::Error::other)? {
+                Record::Frame(header) if !wanted() => {
+                    let len = u64::from(header.len);
+                    if std::io::copy(&mut (&mut self.reader).take(len), &mut std::io::sink())? != len {
+                        return Err(std::io::ErrorKind::UnexpectedEof.into());
+                    }
+                    self.skipped += 1;
+                }
                 Record::Frame(header) => return Ok((header, read_exactly(&mut self.reader, header.len as usize)?)),
                 Record::Ring { path_len } => {
                     let path = read_exactly(&mut self.reader, path_len as usize)?;
@@ -142,6 +164,7 @@ impl<R: Read> Frames<R> {
                         w.write_all(format!("{}\n", Input::Socket.to_line()).as_bytes())?;
                     }
                 }
+                Record::Shared { .. } if !wanted() => self.skipped += 1,
                 Record::Shared { mut header, mut slot } => {
                     // A client that fell behind reads only the newest of the frames announced
                     // so far: the older ones would be replaced before anything showed them.
@@ -432,6 +455,35 @@ mod tests {
         let mut line = String::new();
         BufReader::new(server).read_line(&mut line).expect("line");
         assert_eq!(line, "socket\n", "asked for socket frames");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn unwanted_frames_are_passed_over_unread() {
+        let dir = std::env::temp_dir().join(format!("sa-unwanted-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("frames.ring");
+        let layout = ring::Layout::new(2, 8);
+        let slot = |frame| ring::Slot { seq: 2, frame, width: 2, height: 1, device_width: 4, device_height: 2, len: 8 };
+        write_ring(&path, layout, &[(0, slot(1), &[1; 8]), (1, slot(2), &[2; 8])]);
+        let header = |frame| FrameHeader::new(2, 1, 4, 2, frame).expect("size");
+        let p = path.to_str().expect("utf8").as_bytes();
+        let mut stream = Vec::new();
+        stream.extend(Record::Ring { path_len: p.len() as u32 }.encode());
+        stream.extend(p);
+        stream.extend(Record::Shared { header: header(1), slot: 0 }.encode());
+        stream.extend(Record::Frame(header(3)).encode());
+        stream.extend([3; 8]);
+        stream.extend(Record::Shared { header: header(2), slot: 1 }.encode());
+        // Wanted again only from the third frame on.
+        let asked = std::cell::Cell::new(0);
+        let wanted = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 2
+        };
+        let mut frames = Frames::new(std::io::Cursor::new(stream));
+        assert_eq!(frames.next_frame_when(wanted).expect("frame"), (header(2), vec![2; 8]), "the socket frame's bytes were drained");
+        assert_eq!((frames.skipped, frames.torn), (2, 0));
         std::fs::remove_dir_all(dir).ok();
     }
 }
