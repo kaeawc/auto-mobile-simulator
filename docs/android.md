@@ -371,6 +371,15 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
     `madvise` alone either keeps the old data or doesn't lower the footprint of pages the guest
     touched.
 
+- **Thread QoS.** A thread doesn't inherit its spawner's QoS class on Darwin, so emu sets one on
+  each thread: user-initiated on vCPUs and device workers, utility on housekeeping (signal
+  handling, adb announcements, the logcat writer, the address-space clearer). Lowering works as
+  documented: utility threads run at priority 20. Raising doesn't always: launched from an agent's
+  shell on this Mac (M3 Max, macOS 26.6.2, 2026-11-24), threads set to user-interactive,
+  user-initiated and default all ran at priority 31 (`ps -M`), so the process's QoS ceiling was
+  default there. Whether vCPUs reach a higher tier when emu is started from Terminal or a
+  launchd job, and whether that changes boot or settle time, is not yet measured.
+
 ## Development
 
 ```bash

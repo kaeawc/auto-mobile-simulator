@@ -137,7 +137,7 @@ launch() {
   pids[i]=$!; ports[i]=$port; state[i]=booting; booted_at[i]=""; settled_at[i]=""
   # Each device gets BOOT_TIMEOUT from its own launch: with K < N, later ones start later.
   launched_at[i]=$(now)
-  deadline[i]=$(awk -v a="${launched_at[i]}" -v b="$boot_timeout" 'BEGIN {print a+b}')
+  deadline[i]=$(awk -v a="${launched_at[i]}" -v b="$boot_timeout" 'BEGIN {printf "%.3f", a+b}')
   echo "$name pid=${pids[i]} port=$port" >> "$run/pids"
   started=$((started + 1))
 }
