@@ -383,7 +383,7 @@ mod tests {
     }
 
     fn socket(tag: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("simee-hs-{tag}-{}.sock", std::process::id()));
+        let path = crate::test_socket(&format!("simee-hs-{tag}-{}.sock", std::process::id()));
         std::fs::remove_file(&path).ok();
         path
     }

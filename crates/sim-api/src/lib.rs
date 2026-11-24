@@ -198,6 +198,16 @@ impl Client {
     }
 }
 
+/// A socket path for tests: under the temp dir when it fits a `sockaddr_un` (104 bytes on macOS),
+/// else under `/tmp`, since build wrappers point `TMPDIR` at long private directories.
+#[cfg(test)]
+pub(crate) fn test_socket(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(name);
+    let path = if path.as_os_str().len() < 100 { path } else { PathBuf::from("/tmp").join(name) };
+    std::fs::remove_file(&path).ok();
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -220,7 +230,7 @@ mod tests {
 
     #[test]
     fn serves_over_a_socket() {
-        let path = std::env::temp_dir().join(format!("simee-api-test-{}.sock", std::process::id()));
+        let path = crate::test_socket(&format!("simee-api-test-{}.sock", std::process::id()));
         serve_in_background(path.clone()).expect("bind");
         let result = call(&path, "help", Value::Null).expect("help");
         assert!(result.as_array().is_some_and(|m| m.iter().any(|x| x["method"] == "tap")));
@@ -261,7 +271,7 @@ mod tests {
     /// A server answering every request with `result` (or `error` for method `fail`), with the
     /// old or the new response path.
     fn fixed_server(tag: &str, result: Value, old: bool) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("simee-api-{tag}-{}.sock", std::process::id()));
+        let path = crate::test_socket(&format!("simee-api-{tag}-{}.sock", std::process::id()));
         let listener = bind(&path).expect("bind");
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -317,7 +327,7 @@ mod tests {
 
     #[test]
     fn a_stale_socket_fails_at_once() {
-        let path = std::env::temp_dir().join(format!("simee-api-stale-{}.sock", std::process::id()));
+        let path = crate::test_socket(&format!("simee-api-stale-{}.sock", std::process::id()));
         drop(UnixListener::bind(&path).expect("bind"));
         let start = std::time::Instant::now();
         assert!(Client::connect(&path).is_err(), "the listener is gone");
