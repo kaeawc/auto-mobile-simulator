@@ -27,7 +27,7 @@ Captured from a running stock instance (`/sys/firmware/fdt`, `/proc/iomem`, `/pr
 | Slot | Address | Device | Block name |
 | --- | --- | --- | --- |
 | 25 | `a003200` | rng | |
-| 26 | `a003400` | net | |
+| 26 | `a003400` | net (simee: virtio-net, link only so far) | |
 | 27 | `a003600` | blk: `system.img` (GPT: vbmeta, super) — `androidboot.boot_devices` | vda |
 | 28 | `a003800` | blk: cache | vdb |
 | 29 | `a003a00` | blk: userdata (fstab mounts `/dev/block/vdc` on `/data`) | vdc |
