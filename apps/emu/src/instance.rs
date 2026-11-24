@@ -49,6 +49,8 @@ pub struct Instance {
     pub xr: Option<std::sync::Arc<emu_vmm::pipe::xr::Xr>>,
     /// The vehicle HAL channel, for Automotive images only (as stock).
     pub car: Option<std::sync::Arc<emu_vmm::pipe::car::Car>>,
+    /// The adb port, bound for the life of the process so a guest reset reboots on it.
+    adb: std::sync::Arc<emu_vmm::pipe::adb::AdbListener>,
     _lock: Option<File>,
 }
 
@@ -99,6 +101,8 @@ impl Instance {
             Some(p) => p,
             None => free_port_pair().context("no free console/adb port pair in 5554..5682")?,
         };
+        let adb_port = console_port + 1;
+        let adb = emu_vmm::pipe::adb::AdbListener::bind(adb_port).with_context(|| format!("binding adb port {adb_port}"))?;
         let gpu_lib64 = renderer(avd, opts);
         if gpu_lib64.is_none() && !gpu_off(opts) {
             eprintln!(
@@ -146,6 +150,7 @@ impl Instance {
             telephony: Default::default(),
             xr: is_xr(avd).then(Default::default),
             car: avd.is_car().then(Default::default),
+            adb: std::sync::Arc::new(adb),
             _lock: lock,
         })
     }
@@ -178,7 +183,7 @@ impl Instance {
             disks: plan.disks,
             disk_fsync: opts.disk_fsync,
             rng: true,
-            adb_port: Some(self.console_port + 1),
+            adb: Some(self.adb.clone()),
             gpu: self.gpu_lib64.as_ref().zip(self.display.as_ref()).map(|(lib64, display)| emu_vmm::GpuSpec {
                 lib64: lib64.clone(),
                 width: self.avd.lcd().0,
