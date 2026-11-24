@@ -137,7 +137,7 @@ pub fn serve_in_background_with(path: PathBuf, make: impl Fn() -> methods::Sessi
     std::thread::Builder::new().name("simee-api-accept".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
             let make = make.clone();
-            std::thread::spawn(move || serve_connection(stream, &*make));
+            let _ = std::thread::Builder::new().name("simee-api".into()).spawn(move || serve_connection(stream, &*make));
         }
     })?;
     Ok(())

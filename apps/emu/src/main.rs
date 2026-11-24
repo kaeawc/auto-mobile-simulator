@@ -39,7 +39,9 @@ fn shutdown_signals() -> std::sync::mpsc::Receiver<i32> {
     // Native libraries may set these signals to SIG_IGN (the GPU renderer does), and ignored
     // signals are discarded even while blocked. Keep their disposition at SIG_DFL: blocked
     // everywhere, the default action never runs, and sigwait receives them.
-    let _ = std::thread::Builder::new().name("signal-guard".into()).spawn(|| {
+    let started = std::time::Instant::now();
+    let _ = std::thread::Builder::new().name("signal-guard".into()).spawn(move || {
+        emu_hvf::host::set_qos(emu_hvf::host::Qos::Utility);
         loop {
             for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
                 // SAFETY: querying and restoring a disposition with zero-initialized sigactions.
@@ -52,11 +54,12 @@ fn shutdown_signals() -> std::sync::mpsc::Receiver<i32> {
                     }
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(signal_guard_interval(started.elapsed()));
         }
     });
     let (tx, rx) = std::sync::mpsc::channel();
     let _ = std::thread::Builder::new().name("signals".into()).spawn(move || {
+        emu_hvf::host::set_qos(emu_hvf::host::Qos::Utility);
         let mut sig = 0;
         // SAFETY: `set` is a valid sigset; sigwait writes the delivered signal number.
         if unsafe { libc::sigwait(&set, &mut sig) } == 0 {
@@ -64,6 +67,18 @@ fn shutdown_signals() -> std::sync::mpsc::Receiver<i32> {
         }
     });
     rx
+}
+
+/// While native libraries may still be installing handlers, the signal guard checks often.
+/// The renderer, which does, initializes in the first seconds (beside kernel load, hundreds of
+/// ms) and once per process (guest resets reuse it); the window leaves room for a cold disk and
+/// the first boot's GPU device setup.
+const SIGNAL_GUARD_FAST: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long the signal guard sleeps between checks, `since_start` after it started: 200 ms in
+/// [`SIGNAL_GUARD_FAST`], then 5 s (an idle emulator's guard wakes 0.2 times a second, not 5).
+fn signal_guard_interval(since_start: std::time::Duration) -> std::time::Duration {
+    if since_start < SIGNAL_GUARD_FAST { std::time::Duration::from_millis(200) } else { std::time::Duration::from_secs(5) }
 }
 
 /// How often a running instance tells the adb server about itself again.
@@ -213,7 +228,8 @@ fn boot(
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = stop.clone();
-        std::thread::spawn(move || {
+        // Without it a SIGINT/SIGTERM would never stop the machine: fail the launch instead.
+        std::thread::Builder::new().name("stop-watch".into()).spawn(move || {
             if signals.recv().is_ok() {
                 stop.store(true, Ordering::SeqCst);
                 // Device threads blocked in native code (e.g. a wedged renderer) can stall an
@@ -222,7 +238,7 @@ fn boot(
                 eprintln!("emu: shutdown took over 5 s; exiting");
                 std::process::exit(0);
             }
-        });
+        })?;
     }
 
     let avd = env.load(name)?;
@@ -235,6 +251,7 @@ fn boot(
         // already has, the server ignores it (one loopback connect and write).
         let adb_port = inst.console_port + 1;
         let _ = std::thread::Builder::new().name("adb-announce".into()).spawn(move || {
+            emu_hvf::host::set_qos(emu_hvf::host::Qos::Utility);
             loop {
                 std::thread::sleep(ADB_REANNOUNCE);
                 emu_vmm::pipe::adb::AdbService::announce_port(adb_port);
@@ -290,6 +307,38 @@ fn boot(
                 return Ok(ExitCode::FAILURE);
             }
             _ => return Ok(ExitCode::SUCCESS),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Checks the guard makes in `[from, to)` of its life, following its own schedule.
+    fn guard_checks(from: Duration, to: Duration) -> usize {
+        let (mut t, mut n) = (Duration::ZERO, 0);
+        while t < to {
+            if t >= from {
+                n += 1;
+            }
+            t += signal_guard_interval(t);
+        }
+        n
+    }
+
+    #[test]
+    fn the_signal_guard_checks_often_at_startup_then_rarely() {
+        // A handler a library installs during startup is undone within 200 ms.
+        assert_eq!(signal_guard_interval(Duration::ZERO), Duration::from_millis(200));
+        assert_eq!(signal_guard_interval(SIGNAL_GUARD_FAST - Duration::from_millis(1)), Duration::from_millis(200));
+        assert_eq!(guard_checks(Duration::from_secs(1), Duration::from_secs(2)), 5);
+        // Idle afterwards: at most one wakeup in any second (it was 5), and it never stops.
+        for start in [SIGNAL_GUARD_FAST, SIGNAL_GUARD_FAST * 2, SIGNAL_GUARD_FAST * 10] {
+            assert!(guard_checks(start, start + Duration::from_secs(1)) <= 1, "{start:?}");
+            assert!(guard_checks(start, start + Duration::from_secs(10)) >= 1, "{start:?}");
         }
     }
 }

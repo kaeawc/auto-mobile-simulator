@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -39,36 +40,55 @@ struct Route {
 /// The adb port, bound once per emulator and kept across guest resets (as stock keeps it), so a
 /// rebooting guest comes back on the same port and clients aren't refused meanwhile. Each machine
 /// [`attach`](Self::attach)es to it. Dropping it closes the port.
+///
+/// The accept thread sleeps in `poll` with no timeout, on the listener and on one end of a socket
+/// pair; [`Drop`] closes the other end, which wakes it to exit. An idle adb port costs no
+/// wakeups (it polled every 100 ms before).
 pub struct AdbListener {
     pub port: u16,
     route: Arc<Mutex<Route>>,
-    closing: Arc<AtomicBool>,
+    /// Closing this wakes the accept thread to exit.
+    wake: Option<UnixStream>,
+    /// Accept-loop iterations, for the idle-wakeup test.
+    #[cfg_attr(not(test), allow(dead_code))]
+    turns: Arc<AtomicUsize>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AdbListener {
-    /// How often the accept loop looks for [`Drop`].
-    const POLL: Duration = Duration::from_millis(100);
-
     /// Listens on 127.0.0.1:`port` (0 picks a free one; `port` says which). Clients arriving
     /// before a machine attaches are hung up on.
     pub fn bind(port: u16) -> std::io::Result<AdbListener> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
         let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
+        let (wake, woken) = UnixStream::pair()?;
         let route = Arc::new(Mutex::new(Route::default()));
-        let closing = Arc::new(AtomicBool::new(false));
-        let (r, c) = (route.clone(), closing.clone());
+        let turns = Arc::new(AtomicUsize::new(0));
+        let (r, t) = (route.clone(), turns.clone());
         let thread = std::thread::Builder::new().name("adb-listen".into()).spawn(move || {
-            while !c.load(Ordering::Relaxed) {
+            loop {
+                t.fetch_add(1, Ordering::Relaxed);
                 let stream = match listener.accept() {
                     Ok((stream, _)) => stream,
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        let timeout = rustix::event::Timespec { tv_sec: 0, tv_nsec: Self::POLL.as_nanos() as _ };
-                        let _ = rustix::event::poll(&mut [PollFd::new(&listener, PollFlags::IN)], Some(&timeout));
-                        continue;
+                    Err(e) => {
+                        // Nothing to accept: sleep until a client or Drop. Any other error
+                        // (EMFILE with a client in the backlog, where the listener stays readable)
+                        // backs off instead of spinning, and still sees Drop.
+                        let backoff = rustix::event::Timespec { tv_sec: 0, tv_nsec: 100_000_000 };
+                        let timeout = (e.kind() != ErrorKind::WouldBlock).then_some(&backoff);
+                        let mut fds = [PollFd::new(&listener, PollFlags::IN), PollFd::new(&woken, PollFlags::IN)];
+                        if e.kind() != ErrorKind::WouldBlock {
+                            // Only the wake end: the listener is readable and would return at once.
+                            fds[0] = PollFd::new(&woken, PollFlags::IN);
+                        }
+                        match rustix::event::poll(&mut fds, timeout) {
+                            // Drop closed the other end (HUP, or IN at EOF): stop.
+                            Ok(_) if !fds[1].revents().is_empty() => return,
+                            Ok(_) | Err(Errno::INTR) => continue,
+                            Err(_) => return,
+                        }
                     }
-                    Err(_) => continue,
                 };
                 // macOS hands out accepted sockets with the listener's O_NONBLOCK.
                 let _ = stream.set_nonblocking(false);
@@ -86,7 +106,7 @@ impl AdbListener {
                 }
             }
         })?;
-        Ok(AdbListener { port, route, closing, thread: Some(thread) })
+        Ok(AdbListener { port, route, wake: Some(wake), turns, thread: Some(thread) })
     }
 
     /// Sends host clients to a new machine from now on; `vsock` is its vsock worker's event
@@ -100,7 +120,7 @@ impl AdbListener {
 
 impl Drop for AdbListener {
     fn drop(&mut self) {
-        self.closing.store(true, Ordering::Relaxed);
+        drop(self.wake.take());
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -151,7 +171,7 @@ fn connect_vsock(stream: Arc<TcpStream>, vsock: Sender<WorkerEvent>, port: u16) 
     let (s1, s2, v) = (stream.clone(), stream, vsock.clone());
     let make: super::MakeHandler = Box::new(move |ctx| Box::new(TcpForward::start(&s1, ctx)) as Box<dyn PipeHandler>);
     let refused = Box::new(move || {
-        std::thread::spawn(move || {
+        let _ = std::thread::Builder::new().name("adb-retry".into()).spawn(move || {
             std::thread::sleep(RETRY);
             if still_open(&s2) {
                 connect_vsock(s2, v, port);
@@ -695,6 +715,33 @@ mod tests {
         let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, listener.port)).expect("connect");
         client.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
         assert_eq!(client.read(&mut [0u8; 1]).expect("eof"), 0);
+    }
+
+    /// The accept thread sleeps until a client or Drop: no timer wakes an idle port.
+    #[test]
+    fn an_idle_listener_does_not_wake() {
+        let listener = AdbListener::bind(0).expect("bind");
+        std::thread::sleep(Duration::from_millis(100));
+        let settled = listener.turns.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_secs(1));
+        let idle = listener.turns.load(Ordering::Relaxed) - settled;
+        assert!(idle <= 2, "{idle} accept-loop turns in 1 s idle");
+        // A client still wakes it (one accept, then back to sleep).
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, listener.port)).expect("connect");
+        client.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+        assert_eq!(client.read(&mut [0u8; 1]).expect("eof"), 0, "served");
+    }
+
+    /// Dropping the listener wakes its blocked accept thread at once and frees the port.
+    #[test]
+    fn dropping_an_idle_listener_returns_promptly() {
+        let listener = AdbListener::bind(0).expect("bind");
+        let port = listener.port;
+        std::thread::sleep(Duration::from_millis(50));
+        let t = std::time::Instant::now();
+        drop(listener);
+        assert!(t.elapsed() < Duration::from_millis(100), "drop took {:?}", t.elapsed());
+        AdbListener::bind(port).expect("port freed");
     }
 
     /// A forwarder on one end of a loopback connection, the client on the other.

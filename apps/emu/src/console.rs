@@ -426,7 +426,7 @@ pub fn serve(port: u16, info: ConsoleInfo) -> Result<()> {
     std::thread::Builder::new().name("console".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
             let info = info.clone();
-            std::thread::spawn(move || {
+            let _ = std::thread::Builder::new().name("console-session".into()).spawn(move || {
                 let _ = session(stream, &info);
             });
         }

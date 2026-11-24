@@ -1,7 +1,67 @@
-//! Host file operations that std and rustix don't wrap.
+//! Host file and thread operations that std and rustix don't wrap.
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
+
+/// A macOS quality-of-service class for a thread. The scheduler places and clocks threads by it:
+/// a process launched from a background-clamped parent (a CI agent, a daemon) otherwise runs
+/// every thread at that parent's QoS, which keeps it on efficiency cores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Qos {
+    UserInteractive,
+    /// Work something waits on: vCPUs and the device workers they start.
+    UserInitiated,
+    /// Housekeeping no guest or client waits on.
+    Utility,
+    /// Never for anything a device waits on: it may not run for long stretches.
+    Background,
+}
+
+#[cfg(target_os = "macos")]
+impl Qos {
+    fn class(self) -> libc::qos_class_t {
+        match self {
+            Qos::UserInteractive => libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
+            Qos::UserInitiated => libc::qos_class_t::QOS_CLASS_USER_INITIATED,
+            Qos::Utility => libc::qos_class_t::QOS_CLASS_UTILITY,
+            Qos::Background => libc::qos_class_t::QOS_CLASS_BACKGROUND,
+        }
+    }
+}
+
+/// Sets the calling thread's QoS class. A no-op off macOS.
+///
+/// It is not inherited: a thread created afterwards with `std::thread::spawn` starts at
+/// `QOS_CLASS_DEFAULT` (`sys/qos.h`: "the default QOS class for threads created by
+/// pthread_create() without an attribute specifying a QOS class"), so each thread that matters
+/// sets its own.
+pub fn set_qos(qos: Qos) {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: plain value arguments; affects only the calling thread's scheduling.
+        let _ = unsafe { libc::pthread_set_qos_class_self_np(qos.class(), 0) };
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = qos;
+}
+
+/// The calling thread's requested QoS class; `None` for `QOS_CLASS_DEFAULT`, unspecified, or off
+/// macOS.
+pub fn qos() -> Option<Qos> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+        let mut prio = 0;
+        // SAFETY: both out-pointers reference live locals; pthread_self is always valid.
+        let rc = unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut prio) };
+        if rc != 0 {
+            return None;
+        }
+        [Qos::UserInteractive, Qos::UserInitiated, Qos::Utility, Qos::Background].into_iter().find(|q| q.class() as u32 == class as u32)
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
+}
 
 /// Deallocates `len` bytes of `file` at `offset` with `fcntl(F_PUNCHHOLE)`. The range reads back
 /// as zeroes and the file's length is unchanged. `offset` and `len` must be multiples of the
@@ -55,6 +115,35 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
 
     use super::*;
+
+    /// A thread's QoS reads back, and a thread it spawns afterwards does NOT inherit it (it starts
+    /// at QOS_CLASS_DEFAULT): device workers started from a vCPU thread must set their own.
+    #[test]
+    fn qos_is_set_per_thread_and_not_inherited() {
+        let (own, child) = std::thread::spawn(|| {
+            set_qos(Qos::UserInitiated);
+            let own = qos();
+            let child = std::thread::spawn(qos).join().expect("child");
+            (own, child)
+        })
+        .join()
+        .expect("thread");
+        if cfg!(target_os = "macos") {
+            assert_eq!(own, Some(Qos::UserInitiated));
+        } else {
+            assert_eq!(own, None, "a no-op off macOS");
+        }
+        assert_eq!(child, None, "a spawned thread starts at QOS_CLASS_DEFAULT");
+        for q in [Qos::UserInteractive, Qos::Utility, Qos::Background] {
+            let back = std::thread::spawn(move || {
+                set_qos(q);
+                qos()
+            })
+            .join()
+            .expect("thread");
+            assert_eq!(back, cfg!(target_os = "macos").then_some(q));
+        }
+    }
 
     #[test]
     fn punched_range_reads_zero_and_keeps_length() {
