@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Compares sim-rs against `xcrun simctl` on one booted device: identity, screenshot geometry and
-# pixels, and app listing. Usage: scripts/parity.sh <udid> [sim-rs binary]
+# Compares simee against `xcrun simctl` on one booted device: identity, screenshot geometry and
+# pixels, and app listing. Usage: scripts/parity.sh <udid> [simee binary]
 set -euo pipefail
-udid=${1:?usage: scripts/parity.sh <udid> [sim-rs]}
-sim=${2:-target/debug/sim-rs}
+udid=${1:?usage: scripts/parity.sh <udid> [simee]}
+sim=${2:-target/debug/simee}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fail=0
-check() { if [ "$2" = "$3" ]; then echo "ok    $1"; else echo "FAIL  $1: sim-rs=$2 simctl=$3"; fail=1; fi; }
+check() { if [ "$2" = "$3" ]; then echo "ok    $1"; else echo "FAIL  $1: simee=$2 simctl=$3"; fail=1; fi; }
 
 ours=$("$sim" list --json | python3 -c "import json,sys;d=[x for x in json.load(sys.stdin) if x['udid']=='$udid'][0];print(d['name'],d['state'],d['runtime_id'],d['device_type_id'],sep='|')")
 theirs=$(xcrun simctl list -j devices | python3 -c "

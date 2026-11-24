@@ -16,7 +16,7 @@ provisioning (no Java or sdkmanager; SDK at $ANDROID_HOME, default ~/Library/And
                     and the gfxstream renderer (unless the SDK already has one)
   -provision-renderer
                     install or update just the renderer: lib64 of the emulator package, into
-                    $ANDROID_HOME/emu-rs/renderer/<revision>
+                    $ANDROID_HOME/simee/renderer/<revision>
   -no-renderer      with -provision: skip the renderer (emu then boots without graphics)
   -tag TAG          default, google_apis (default), google_apis_playstore, android-wear, ...
   -abi ABI          default arm64-v8a

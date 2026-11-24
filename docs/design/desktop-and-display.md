@@ -2,7 +2,7 @@
 
 The design for the display, input and debugging side of emu-rs, written before emu-rs joined
 sim-rs. It now describes the Android half of sim-rs's one window (`desktop/`): the window is a
-separate process from each `emu`, frames arrive over `<avd>/emu-rs/display.sock` (the protocol is
+separate process from each `emu`, frames arrive over `<avd>/simee/display.sock` (the protocol is
 `sim_core::stream`) or through a shared frame ring it announces, and input goes back as stream
 lines or console commands. What is built and what isn't: the frame path below (one readback per
 frame, a shared-memory ring, downscaling), touch, keys, the rotary wheel and the console pane are;
@@ -24,7 +24,7 @@ pinned at `7a70745`, the same rev sim-rs uses.
    straight into its ring slot (`FrameStore::read_into`).
 3. **Scale.** `sim_core::pixels::downscale_into` box-filters straight into the destination,
    in vectorizable row passes, in bands across up to 4 threads for large frames.
-4. **Transport.** A client that sends `shm` gets a ring file (`<avd>/emu-rs/frames-<pid>-<n>.ring`,
+4. **Transport.** A client that sends `shm` gets a ring file (`<avd>/simee/frames-<pid>-<n>.ring`,
    3 page-aligned slots, a seqlock per slot): each frame is written into a slot and announced with
    a 32-byte `EMUS` record; the client `pread`s the slot (no mapping, no `unsafe` on its side) and
    checks the slot's sequence number; one that can't open the ring sends `socket` and gets socket

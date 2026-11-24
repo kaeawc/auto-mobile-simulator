@@ -1,7 +1,7 @@
 // Lets the binary find the gfxstream renderer's libraries at runtime: next to the binary (an SDK
 // overlay installs emu as emulator/emulator; a target/ build gets a lib64 symlink at startup),
 // then in the build machine's SDK, either its emulator package or the renderer that
-// `emu -provision-renderer` keeps under emu-rs/renderer/current. The renderer's @rpath
+// `emu -provision-renderer` keeps under simee/renderer/current. The renderer's @rpath
 // dependencies are preloaded by emu-gfxstream and don't need these; libraries gfxstream
 // dlopens by bare name (libshadertranslator.dylib) do.
 fn main() {
@@ -17,7 +17,7 @@ fn main() {
         .or_else(|_| std::env::var("ANDROID_HOME"))
         .unwrap_or_else(|_| format!("{}/Library/Android/sdk", std::env::var("HOME").unwrap_or_default()));
     println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{sdk}/emulator/lib64");
-    println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{sdk}/emu-rs/renderer/current/lib64");
+    println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{sdk}/simee/renderer/current/lib64");
     println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{sdk}/emulator/lib64/gles_angle");
-    println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{sdk}/emu-rs/renderer/current/lib64/gles_angle");
+    println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{sdk}/simee/renderer/current/lib64/gles_angle");
 }

@@ -54,7 +54,7 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
-    /// A console that greets like emu-rs, answers `ping` and `avd name`, and fails anything else.
+    /// A console that greets like simee, answers `ping` and `avd name`, and fails anything else.
     fn fake_console() -> u16 {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
         let port = listener.local_addr().expect("addr").port();

@@ -12,7 +12,7 @@ int main(int argc, char **argv) {
         Boolean (*rem)(SCRef, CFStringRef) = dlsym(sc, "SCDynamicStoreRemoveValue");
         int (*err)(void) = dlsym(sc, "SCError");
         if (!create || !setv || !getv) { printf("missing SCDynamicStore symbols\n"); return 2; }
-        SCRef store = create(NULL, CFSTR("sim-rs"), NULL, NULL);
+        SCRef store = create(NULL, CFSTR("simee"), NULL, NULL);
         CFStringRef key = CFSTR("State:/Network/Global/Proxies");
         const char *cmd = argc > 1 ? argv[1] : "get";
         if (!strcmp(cmd, "set") && argc > 3) {

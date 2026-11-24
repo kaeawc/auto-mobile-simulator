@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Drives a sim-rs-booted device with auto-mobile, through a private daemon (its own socket, PID file
+# Drives a simee-booted device with auto-mobile, through a private daemon (its own socket, PID file
 # and state directories) so no other auto-mobile daemon on the machine is touched.
 #
 # Usage: scripts/automobile-harness.sh <udid> [auto-mobile checkout]
@@ -11,7 +11,7 @@ am_dir=$(cd "${2:-$(dirname "$0")/../../auto-mobile}" && pwd)
 entry="$am_dir/src/index.ts"
 [ -f "$entry" ] || { echo "no $entry: not an auto-mobile checkout" >&2; exit 2; }
 
-root=$(mktemp -d "${TMPDIR:-/tmp}/sim-rs-am.XXXXXX")
+root=$(mktemp -d "${TMPDIR:-/tmp}/simee-am.XXXXXX")
 sock=$(mktemp -d /tmp/srs-am.XXXX)
 export AUTOMOBILE_DATA_DIR="$root/data" AUTOMOBILE_LOG_DIR="$root/logs" AUTOMOBILE_DB_DIR="$root/db" \
   AUTOMOBILE_COORDINATION_DIR="$root/coordination" AUTOMOBILE_ADB_SERVER_COORDINATION_DIR="$root/adb" \

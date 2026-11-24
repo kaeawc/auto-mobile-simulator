@@ -9,7 +9,7 @@ t = "nextest run"
 tc = "nextest run -p sim-core"
 
 # Hypervisor.framework refuses unsigned callers. Every binary cargo runs (the `emu` emulator, the
-# sim-rs CLI and test binaries) is ad-hoc signed with the hypervisor entitlement first; for
+# simee CLI and test binaries) is ad-hoc signed with the hypervisor entitlement first; for
 # binaries that don't use it the signature changes nothing.
 [target.aarch64-apple-darwin]
 runner = "scripts/sign-run.sh"

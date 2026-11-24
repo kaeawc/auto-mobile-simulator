@@ -1,4 +1,4 @@
-//! The Android backend: device methods on AVDs and running emu-rs instances, through
+//! The Android backend: device methods on AVDs and running simee instances, through
 //! `sim-android`. Builds on every host; booting needs an Apple silicon Mac (the emulator does).
 
 use std::thread::sleep;

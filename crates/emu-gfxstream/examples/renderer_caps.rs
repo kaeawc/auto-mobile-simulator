@@ -1,6 +1,6 @@
 //! Loads and initializes the gfxstream renderer from a `lib64` directory and prints its
 //! capability sets; no VM involved. Checks a renderer install (the SDK's `emulator/lib64`, or
-//! `<sdk>/emu-rs/renderer/<revision>/lib64` from `emu -provision-renderer`):
+//! `<sdk>/simee/renderer/<revision>/lib64` from `emu -provision-renderer`):
 //!
 //! ```text
 //! cargo run -p emu-gfxstream --example renderer_caps -- <lib64> [moltenvk|swiftshader|lavapipe]

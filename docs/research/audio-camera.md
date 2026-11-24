@@ -1,11 +1,11 @@
 # Simulator audio and camera: research
 
-How a simulated iOS device's speaker, microphone and camera reach the host, what sim-rs can
-control without root, a host audio driver or an MDM profile, and the API this suggests for sim-rs and
+How a simulated iOS device's speaker, microphone and camera reach the host, what simee can
+control without root, a host audio driver or an MDM profile, and the API this suggests for simee and
 auto-mobile.
 
 - Host: macOS 26.6.2 (25G83), Xcode 26.6 (17F113), CoreSimulator 1174.21, Apple silicon.
-- Device: `sim-rs-test` (D99E12ED-…), iOS 26.5 runtime (23F77), booted headless by sim-rs, with no
+- Device: `simee-test` (D99E12ED-…), iOS 26.5 runtime (23F77), booted headless by simee, with no
   Simulator.app running.
 - Host audio devices: MacBook Pro Microphone (`BuiltInMicrophoneDevice`), MacBook Pro Speakers
   (`BuiltInSpeakerDevice`) and BlackHole 2ch (`BlackHole2ch_UID`). BlackHole was already installed.
@@ -22,13 +22,13 @@ auto-mobile.
 | Question | Answer |
 | --- | --- |
 | Where does device audio go? | Each in-device process is itself a client of the host's `coreaudiod`. It builds a private per-process aggregate, `iOSSimulatorAudioDevice-<pid>-N`, from the host device UIDs in its settings plist. No CoreSimulator process carries samples. **[verified]** |
-| Can sim-rs be the device's audio endpoint (receive output, supply mic samples) through a private API? | No. No I/O port or SimulatorKit class carries samples. The only audio port (`com.apple.CoreSimulator.Audio.HostRoute`) selects host device UIDs. **[verified port list; inferred: no hidden sample path]** |
+| Can simee be the device's audio endpoint (receive output, supply mic samples) through a private API? | No. No I/O port or SimulatorKit class carries samples. The only audio port (`com.apple.CoreSimulator.Audio.HostRoute`) selects host device UIDs. **[verified port list; inferred: no hidden sample path]** |
 | Driverless output capture | Yes. A Core Audio **process tap** (public, macOS 14.2+) on the device's PIDs captures its output exactly, with no driver. **[verified]** |
 | Driverless per-device "null sink" | Yes, three ways: a muted process tap, `sim_volume = 0`, or pinning output to a silent device. **[verified]** |
 | Driverless microphone injection | No. Pointing the guest at a tap-backed aggregate fails (`AudioQueueStart` -66628), and the router hides such devices. Mic injection needs a real loopback device (driver) or in-app hooking. **[verified failure]** |
 | Per-device pinning to a device the router refuses (BlackHole 2ch) | Works by writing the guest's `audiosettings.plist`, which bypasses the router. Applies to audio clients that start after the write. **[verified]** |
-| Camera | iOS 26.5 exposes no video capture device. CMCapture has only stub `FigCaptureSourceSimulator` / `FigCaptureSessionSimulator`, and no CoreSimulator port or string mentions a camera. **[verified]** Injecting auto-mobile's poster dylib through sim-rs `launch` env works. **[verified]** |
-| Device-wide injection | Boot environment (`sim-rs boot --env DYLD_INSERT_LIBRARIES=…`, or `network_shape {inject:"boot"}`): every process loads the dylib, including WebKit's ExtensionKit processes **[verified, network-shaping test]**. `launchctl setenv`: observed on iOS 26.5 (network-shaping test, see `docs/research/network-shaping.md`): after `launchctl setenv DYLD_INSERT_LIBRARIES <dylib>` inside the device, processes launchd starts afterwards load the dylib (MobileSafari relaunched, `managedappdistributiond`, `mlhostd`). Already-running processes do not until restarted. ExtensionKit extensions (e.g. `com.apple.WebKit.Networking`, `WebContent`) get a sanitized environment and never load it. `launchctl unsetenv` restores the device. |
+| Camera | iOS 26.5 exposes no video capture device. CMCapture has only stub `FigCaptureSourceSimulator` / `FigCaptureSessionSimulator`, and no CoreSimulator port or string mentions a camera. **[verified]** Injecting auto-mobile's poster dylib through simee `launch` env works. **[verified]** |
+| Device-wide injection | Boot environment (`simee boot --env DYLD_INSERT_LIBRARIES=…`, or `network_shape {inject:"boot"}`): every process loads the dylib, including WebKit's ExtensionKit processes **[verified, network-shaping test]**. `launchctl setenv`: observed on iOS 26.5 (network-shaping test, see `docs/research/network-shaping.md`): after `launchctl setenv DYLD_INSERT_LIBRARIES <dylib>` inside the device, processes launchd starts afterwards load the dylib (MobileSafari relaunched, `managedappdistributiond`, `mlhostd`). Already-running processes do not until restarted. ExtensionKit extensions (e.g. `com.apple.WebKit.Networking`, `WebContent`) get a sanitized environment and never load it. `launchctl unsetenv` restores the device. |
 
 ## 1. Audio output
 
@@ -56,7 +56,7 @@ auto-mobile.
 So with no Simulator.app, a headless device's output **plays on the host**: on the host default
 output, or on whichever device the plists name. `sim_volume` is applied inside the guest, so the
 host device volume is unchanged. Measured: 60 gives 0.36× amplitude, 100 gives unity and 0 gives
-silence **[verified]**. **Not reproduced later** (sim-rs `audio_volume`): writing `sim_volume` 60 and 100
+silence **[verified]**. **Not reproduced later** (simee `audio_volume`): writing `sim_volume` 60 and 100
 then playing the same tone through a device pinned to BlackHole gave peak 0.300 both times, and a
 process tap also saw full amplitude. Treat volume as unverified.
 
@@ -109,8 +109,8 @@ and `isDefaultInScopes` (`Q`: 1 input, 2 output, 3 both), `inputChannels` and `o
   `_onQueue_synchronizeSelectedAudioDevices:hostDevices:currentlySelectedDevice:currentlyUsingDefaultDevice:inScope:`
   with its `RecentAudioInputDeviceUIDs` / `RecentAudioOutputDeviceUIDs` preferences. It also has
   `audioVolumeUp:` / `audioVolumeDown:`, which presumably drive `sim_volume`.
-- sim-rs does not need SimulatorKit: the port protocol does everything the client does, and it is
-  in CoreSimulator, which sim-rs already loads.
+- simee does not need SimulatorKit: the port protocol does everything the client does, and it is
+  in CoreSimulator, which simee already loads.
 
 ### Routing behavior on this host **[verified]**
 
@@ -120,7 +120,7 @@ and `isDefaultInScopes` (`Q`: 1 input, 2 output, 3 both), `inputChannels` and `o
   ("a nil UID does not restore default").
 - A route made by one process was still in effect when a second process read it, so the pin
   outlives the client on CoreSimulator 1174.21.
-- The router silently ignores UIDs it does not list. A route to `sim-rs-loopback` (my aggregate)
+- The router silently ignores UIDs it does not list. A route to `simee-loopback` (my aggregate)
   completed with `error=nil`, but it pinned the effective default (`BuiltInMicrophoneDevice`)
   instead.
 - `availableHostDevices` omitted a public aggregate that a plain process could see. The
@@ -183,7 +183,7 @@ When an in-device process records, host `coreaudiod` asks tccd for `kTCCServiceM
 `kTCCServiceAudioCapture` on behalf of the guest PID. The responsible process is
 **`com.apple.CoreSimulator.SimulatorTrampoline`**
 (`CoreSimulator.framework/Versions/A/XPCServices/SimulatorTrampoline.xpc`), not Simulator.app,
-sim-rs or simctl. On this Mac the grant already existed, and real mic noise came through (about
+simee or simctl. On this Mac the grant already existed, and real mic noise came through (about
 -58 dBFS).
 
 On a fresh CI image, the first recording needs SimulatorTrampoline to hold the Microphone grant.
@@ -191,7 +191,7 @@ MDM PPPC profiles can deny but not allow Microphone, so the grant comes from a o
 when the image is built, or from editing TCC.db, which needs SIP off **[inferred]**.
 
 Inside the device, its own TCC also applies. A bare CLI got "Unable to construct an identity to
-kTCCServiceMicrophone" but still recorded. Apps use `sim-rs privacy grant microphone <bundle>`.
+kTCCServiceMicrophone" but still recorded. Apps use `simee privacy grant microphone <bundle>`.
 
 ### Feeding the microphone programmatically
 
@@ -228,14 +228,14 @@ kTCCServiceMicrophone" but still recorded. Apps use `sim-rs privacy grant microp
   CoreSimulator, its simdeviceio bundles and Simulator.app contain no camera or AVCapture strings,
   apart from Simulator.app's unrelated `resetViewportCameraMenuItem`. No private API provides
   frames.
-- **Dylib injection through sim-rs works [verified].** I built auto-mobile's
-  `ios/CameraPosterInjection` into scratch, installed `CameraFixture.app` on sim-rs-test and granted
-  camera. I then ran `sim-rs call launch` with
-  `env: {DYLD_INSERT_LIBRARIES: <libAMCameraPoster.dylib>, AM_CAMERA_POSTER_QR: "sim-rs-probe-42"}`.
-  sim-rs passes `environment` straight into `launchApplicationWithID:options:`, so no `SIMCTL_CHILD_`
+- **Dylib injection through simee works [verified].** I built auto-mobile's
+  `ios/CameraPosterInjection` into scratch, installed `CameraFixture.app` on simee-test and granted
+  camera. I then ran `simee call launch` with
+  `env: {DYLD_INSERT_LIBRARIES: <libAMCameraPoster.dylib>, AM_CAMERA_POSTER_QR: "simee-probe-42"}`.
+  simee passes `environment` straight into `launchApplicationWithID:options:`, so no `SIMCTL_CHILD_`
   prefix is needed. The fixture reported:
   - discovery count 1, default device present, device input created, preview content true;
-  - metadata QR strings `sim-rs-probe-42`;
+  - metadata QR strings `simee-probe-42`;
   - a 1080×1440 photo.
 
   Afterwards I uninstalled the app and revoked the grant.
@@ -258,7 +258,7 @@ kTCCServiceMicrophone" but still recorded. Apps use `sim-rs privacy grant microp
 
 None of these changes the host default devices or affects other simulators.
 
-## Recommended sim-rs API
+## Recommended simee API
 
 All methods go in `crates/sim-api` (socket, CLI and desktop at once). Routing and settings code goes
 in `sim-coresim` (the selector boundary), and tap and Core Audio code in a new FFI module with
@@ -267,16 +267,16 @@ in `sim-coresim` (the selector boundary), and tap and Core Audio code in a new F
 | Method | Params | Mechanism |
 | --- | --- | --- |
 | `audio_state` | device | Reads the HostRoute port (`guest*HostDeviceUID`, `effectiveDefault*`, `availableHostDevices` with scope and channels) and `audiosettings.plist` (UIDs, `sim_volume`). Also returns all host devices from Core Audio, so callers can see devices the router hides. |
-| `audio_route` | device, scope(input\|output), uid \| "default", via?(router\|settings) | `router` (default): `routeGuestDeviceScope:toHostDeviceUID:` with `"default"` → `__sim__hostUseSystemDefaultDeviceUID`, then **read back** and fail with `audio_route_rejected` if the UID differs. `settings`: write `audiosettings.plist` (accepts scope-3 devices like BlackHole) and return a note that only clients started afterwards follow it. sim-rs keeps a per-device desired route and re-applies it after boot and on `availableDevicesChangedCallback`. |
+| `audio_route` | device, scope(input\|output), uid \| "default", via?(router\|settings) | `router` (default): `routeGuestDeviceScope:toHostDeviceUID:` with `"default"` → `__sim__hostUseSystemDefaultDeviceUID`, then **read back** and fail with `audio_route_rejected` if the UID differs. `settings`: write `audiosettings.plist` (accepts scope-3 devices like BlackHole) and return a note that only clients started afterwards follow it. simee keeps a per-device desired route and re-applies it after boot and on `availableDevicesChangedCallback`. |
 | `audio_volume` | device, level(0–100) | Writes `sim_volume`; 100 is unity gain and 0 silences. Read at client start. |
 | `audio_capture_start` | device, path?, sample_rate?, mute?(bool), include_pids? | A process tap of every in-device Core Audio client, kept current by watching `kAudioHardwarePropertyProcessObjectList` and rewriting `kAudioTapPropertyDescription`. Writes float32 or 16-bit PCM (WAV) to `path`. Returns `capture_id`. |
 | `audio_capture_stop` | capture_id | Stops the tap, destroys the tap and private aggregate, and returns `{frames, duration_ms, rms, peak, path}`. |
 | `audio_mute` | device, on | A muted tap that discards samples (null sink). |
 | `audio_inject` | device, path \| pcm_base64, sample_rate?, device_uid | Only with a host loopback device: pin the device's input to `device_uid` (settings mode), play PCM into it, then restore. Otherwise fail with `audio_injection_needs_loopback_device`. |
-| `launch` (existing) | add `inject?: [dylib]` | Merges into `DYLD_INSERT_LIBRARIES`. Plus a per-device registry (`camera_poster {device, image_path \| qr}`) so every sim-rs launch carries the poster env. Device-wide via `launchctl setenv` once the main session's result confirms it. |
+| `launch` (existing) | add `inject?: [dylib]` | Merges into `DYLD_INSERT_LIBRARIES`. Plus a per-device registry (`camera_poster {device, image_path \| qr}`) so every simee launch carries the poster env. Device-wide via `launchctl setenv` once the main session's result confirms it. |
 
 Notes:
-- Long-running captures live in the sim-rs server process, so its responsible app needs the System
+- Long-running captures live in the simee server process, so its responsible app needs the System
   Audio Recording permission. Report `audio_capture_permission` when the tap returns silence or
   errors. Recording any input device, the loopback path, needs Microphone for the guest's
   responsible process, SimulatorTrampoline.
@@ -285,16 +285,16 @@ Notes:
 
 ## How auto-mobile would use it
 
-- **Capture (`captureAudio`, #13629):** call sim-rs `audio_capture_start/stop` over the unix socket
-  (`$SIM_RS_SOCKET`) instead of `audio-loopback-helper capture`. This removes the BlackHole
+- **Capture (`captureAudio`, #13629):** call simee `audio_capture_start/stop` over the unix socket
+  (`$SIMEE_SOCKET`) instead of `audio-loopback-helper capture`. This removes the BlackHole
   requirement and the "capture hears every simulator" limit, and makes concurrent per-simulator
-  capture possible (#13632/#13633). Without sim-rs, the same tap code could ship as an
+  capture possible (#13632/#13633). Without simee, the same tap code could ship as an
   `audio-loopback-helper tap --pid …` mode, since it is all public macOS 14.2+ API.
 - **Inject (`injectAudioInput`, #13628):** keep `audio-loopback-helper play`, but give it an explicit
-  output UID. Pin per device with sim-rs `audio_route via=settings`, which works for BlackHole where
+  output UID. Pin per device with simee `audio_route via=settings`, which works for BlackHole where
   the router does not, and serialize per loopback device. Driverless injection would need an in-app
   audio-input hook dylib (new work, the same shape as CameraPosterInjection).
-- **Camera:** keep CameraPosterInjection. For sim-rs-booted devices, launch through sim-rs
+- **Camera:** keep CameraPosterInjection. For simee-booted devices, launch through simee
   `launch {env}` (verified), or the future `camera_poster` registry, rather than simctl with
   `SIMCTL_CHILD_`. Use device-wide `launchctl setenv` if the main session confirms it works.
 - **Null sink in CI:** `audio_mute` per device, or `audio_volume 0`.

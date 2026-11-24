@@ -1,4 +1,4 @@
-//! A client for a running emulator's display socket (`<avd>/emu-rs/display.sock`, protocol in
+//! A client for a running emulator's display socket (`<avd>/simee/display.sock`, protocol in
 //! `sim_core::stream`): input lines out, frames in. Frames arrive on the socket, or, for a client
 //! that asked ([`Display::request_shared`]), in a shared ring file the emulator writes and this
 //! side reads with `pread` ([`Frames`] takes either).
@@ -13,7 +13,7 @@ use sim_core::stream::{FrameHeader, HEADER_LEN, Input, Record, ring};
 
 /// The display socket of the AVD in `avd_dir`.
 pub fn socket(avd_dir: &Path) -> PathBuf {
-    avd_dir.join("emu-rs/display.sock")
+    emu_avd::state_dir(avd_dir).join("display.sock")
 }
 
 /// One connection to a display socket.
@@ -172,7 +172,7 @@ mod tests {
     fn sends_input_lines_and_reads_frames() {
         // Under /tmp: the socket path must fit a unix socket address (104 bytes on macOS).
         let dir = PathBuf::from("/tmp").join(format!("sa-display-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("emu-rs")).expect("dir");
+        std::fs::create_dir_all(dir.join("simee")).expect("dir");
         let listener = UnixListener::bind(socket(&dir)).expect("bind");
         let server = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().expect("accept");

@@ -1,6 +1,6 @@
 [package]
 name = "sim-android"
-description = "The Android backend's client: lists AVDs as devices, starts and stops emu-rs, drives running instances over their console and display socket."
+description = "The Android backend's client: lists AVDs as devices, starts and stops simee, drives running instances over their console and display socket."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

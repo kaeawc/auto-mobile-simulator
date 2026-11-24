@@ -140,7 +140,7 @@ impl Debug {
         let (tx, rx) = mpsc::channel::<(Tag, &'static str, Value)>();
         let results: Results = Arc::default();
         let out = results.clone();
-        let spawned = std::thread::Builder::new().name("sim-rs-debug".into()).spawn(move || {
+        let spawned = std::thread::Builder::new().name("simee-debug".into()).spawn(move || {
             let mut session = Session::default();
             for (tag, method, params) in rx {
                 let result = call_method(&mut session, method, &params);
@@ -226,7 +226,7 @@ impl Debug {
                 None => {
                     let dir = std::env::var("HOME").map(|h| format!("{h}/Desktop")).unwrap_or_else(|_| "/tmp".into());
                     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                    let path = format!("{dir}/sim-rs-audio-{secs}.wav");
+                    let path = format!("{dir}/simee-audio-{secs}.wav");
                     self.recording = Some((String::new(), path.clone()));
                     self.submit(udid, Tag::RecordStarted, "audio_capture_start", json!({"path": path}));
                 }
@@ -594,7 +594,7 @@ fn storage_tab(s: &State, t: Theme) -> El {
             .gap(4.0)
             .child(icon_button(format!("push-{i}"), &icons::BELL, "Send test push", false, t, {
                 let id = a.bundle_id.clone();
-                act(api("push", "push", json!({"bundle_id": id, "payload": {"aps": {"alert": {"title": "sim-rs", "body": "Test notification"}, "sound": "default"}}})))
+                act(api("push", "push", json!({"bundle_id": id, "payload": {"aps": {"alert": {"title": "simee", "body": "Test notification"}, "sound": "default"}}})))
             }))
             .child(icon_button(format!("reveal-{i}"), &icons::REVEAL, "Reveal in Finder", false, t, act(DebugAction::Reveal(data.clone()))))
             .child(icon_button(format!("clear-{i}"), &icons::TRASH, "Clear app data", false, t, act(DebugAction::Api { label: "clear data", method: "clear_container", params: json!({"path": data}), then: Some(Tag::Containers) })));

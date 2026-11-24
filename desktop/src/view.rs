@@ -95,7 +95,7 @@ fn sidebar(s: &State, t: Theme) -> El {
         .border(1.0, t.card_border)
         // Clear the window's title-bar buttons, which overlap the top-left corner.
         .child(el().h(22.0))
-        .child(row().w_full().center_y().child(text("sim-rs").font(type_::TITLE).color(t.text).grow(1.0)).child(button(
+        .child(row().w_full().center_y().child(text("simee").font(type_::TITLE).color(t.text).grow(1.0)).child(button(
             "refresh-button",
             &icons::REFRESH,
             "Refresh",

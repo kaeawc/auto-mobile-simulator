@@ -1,12 +1,13 @@
-# The Android backend: emu-rs
+# The Android backend: emu
 
-sim-rs's Android devices run on emu-rs, imported from
+simee's Android devices run on `emu`, its own Android emulator (called emu-rs before the project
+was renamed simee), imported from
 [kaeawc/auto-mobile-emulator](https://github.com/kaeawc/auto-mobile-emulator) at `f0ccf83`. This
 page is that project's README, kept for its status, provisioning, benchmark and performance notes;
 paths are this repository's. How it fits the combined project: [architecture.md](architecture.md);
 which Android form factors work: [form-factors.md](form-factors.md).
 
-emu-rs is an Android emulator written from scratch in Rust for Apple silicon. It boots the SDK's
+simee is an Android emulator written from scratch in Rust for Apple silicon. It boots the SDK's
 unmodified arm64 system images on Hypervisor.framework and presents the same board, ports and
 control surfaces as the official emulator, so existing tooling (`adb`, `adb emu`, test
 harnesses such as [AutoMobile](https://github.com/kaeawc/auto-mobile)) can drive it unchanged.
@@ -22,7 +23,7 @@ to use fewer resources.
 | Storage | virtio-blk with indirect descriptors, event-idx, and discard/write-zeroes (hole punching). System and vendor are copy-on-write in memory; userdata, cache and metadata persist per AVD. Userdata is created by a native ext4 formatter (no `mkfs.ext4`) |
 | Boot | Full Android boot to `sys.boot_completed` in about 11–20 s on a warm boot (stock, cold: 51 s); first boot formats and encrypts `/data` |
 | adb | virtio-vsock with a host bridge on `console port + 1`, announced to the adb server. `adb shell`/`root`/`push` work, and the device shows up about 8 s after launch on a warm boot |
-| Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot`, plus emu-rs's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
+| Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot`, plus simee's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
 | Discovery | `-list-avds`, `pid_<pid>.ini` running-instance file, `emulator-<port>` serial on stdout |
 | Graphics | Home screen and apps render. virtio-gpu with gfxstream contexts on the host GPU: GLES through ANGLE on Metal, Vulkan on MoltenVK (lavapipe fallback), Vulkan composition. Host-visible memory via blob mapping; goldfish address space (PCIe, shared-slot allocator) and goldfish pipe (refcounted color buffers) for the ranchu gralloc; guest `screencap` and host screenshots both work |
 | Input & sensors | virtio-input touchscreen, keyboard and rotary, plus stock's dual-mode mouse on XR images. The keyboard is stock's `qwerty2` (0627:0001, stock's key set), so goldfish's `qwerty2.kl` applies: HOME, D-pad centre (`KEY_CENTER`), Recents (580), media and stem keys arrive. The console takes every stock `KEY_*` name and numeric codes. `qemud:sensors` lists the AVD's sensors by stock's rules (`hw.sensor*` flags; heart rate and wrist tilt on Wear OS API 28+; the hinge on foldables) with live values; GNSS over `qemud:gps`; goldfish battery; fingerprint; clipboard |
@@ -30,9 +31,9 @@ to use fewer resources.
 | Images | Phone API 35, 36, 37 and Wear boot (5–8 s warm; Wear gets stock's +512 MB below 1 GB). Automotive: the vehicle HAL channel (`qemud:car`) and a silent virtio-snd card are implemented but not yet booted ([Automotive](#automotive)); Bluetooth needs a controller (in progress). Android XR (`google-xr`, `android-xr-*`, `ai-glasses`; provisioned from the `google_xr` site) gets the dual-mode mouse and `qemud:xr_service` (console `xr`), not yet booted: it gets the virtio-snd card too |
 | Wear OS | New AVDs: 512 MB (booted with stock's +512 MB), `hw.mainKeys=yes`, no D-pad, and for round screens `boot.prop`'s `ro.emulator.circular=true`, which reaches the guest as a `qemu-props` property and bootconfig `androidboot.emulator.circular=1`. The rotary turns 15 units (degrees) per click, like stock; the console's `EV_REL:REL_WHEEL:<n>` stays raw |
 | TV | New AVDs: 2 GB, `hw.mainKeys=yes`, `hw.dPad=yes`. The D-pad keys, centre included, reach the guest through `qwerty2.kl`; not yet checked on a running TV image |
-| Hardware keys | `qemu.hw.mainkeys` follows the AVD's `hw.mainKeys` (stock's default yes hides the navigation bar); phone, tablet, foldable and automotive AVDs created by emu-rs write `no` |
+| Hardware keys | `qemu.hw.mainkeys` follows the AVD's `hw.mainKeys` (stock's default yes hides the navigation bar); phone, tablet, foldable and automotive AVDs created by simee write `no` |
 | AutoMobile | API 37: 38 of 44 harness tools pass; open: network shaping, gRPC audio, VM snapshots |
-| Desktop app | sim-rs's window (`desktop/`), shared with iOS devices: AVD list, start/stop, live guest console, live screen with touch and form-factor controls (Back/Home/Recents/Power, rotate, hinge, rotary, D-pad) over `<avd>/emu-rs/display.sock` |
+| Desktop app | simee's window (`desktop/`), shared with iOS devices: AVD list, start/stop, live guest console, live screen with touch and form-factor controls (Back/Home/Recents/Power, rotate, hinge, rotary, D-pad) over `<avd>/simee/display.sock` |
 
 ## Quick start
 
@@ -41,9 +42,9 @@ cargo run -p emu -- -list-avds
 cargo run -p emu -- -avd <name> -show-kernel -verbose   # first boot formats and encrypts /data
 adb -s emulator-5554 shell                              # once adbd is up
 adb -s emulator-5554 emu kill
-make shim && export ANDROID_HOME=~/.emu-rs/sdk          # make tools launch emu-rs as "emulator"
+make shim && export ANDROID_HOME=~/.simee/sdk          # make tools launch simee as "emulator"
 cd desktop && cargo run                                 # the desktop window (iOS and Android)
-sim-rs list --platform android                          # the same AVDs through sim-rs
+simee list --platform android                          # the same AVDs through simee
 ```
 
 `cargo run` signs binaries with the `com.apple.security.hypervisor` entitlement
@@ -66,7 +67,7 @@ ignored for now.
 | `crates/emu-fdt` | Flattened device tree writer |
 | `apps/emu` | The `emu` CLI: SDK-emulator-compatible flags, per-AVD instance state, console server, display server |
 | `crates/sim-android` | The client front ends use: AVDs as devices, starting `emu`, the console and display-socket clients |
-| `desktop/` | sim-rs's Rune window (both platforms), its own workspace |
+| `desktop/` | simee's Rune window (both platforms), its own workspace |
 | `docs/` | [Stock board reference](docs/reference/stock-board.md), [desktop and display design](docs/design/desktop-and-display.md), [roadmap](docs/roadmap-android.md) |
 | `scripts/` | Cargo runner that signs with the hypervisor entitlement, SDK overlay (`make shim`), AutoMobile harness (`make harness-android DEVICE=emulator-5554`) |
 
@@ -76,7 +77,7 @@ ignored for now.
 below are from one API 36 `google_apis` AVD (4 vCPU, 2 GB) on an M-series Mac, 2026-11-22. Stock
 was cold-booted (`-no-snapshot-load`).
 
-| | emu-rs | stock |
+| | simee | stock |
 | --- | --- | --- |
 | launch → `adb device` | **14.5 s** | 25.8 s |
 | peak RSS (process tree) | **1.67 GB** | 5.09 GB |
@@ -89,7 +90,7 @@ the VMM: no userspace GIC, fewer device threads, and RAM that is only committed 
 
 ## Provisioning without Java
 
-emu-rs needs a system image, platform-tools (adb) and, for graphics, the gfxstream renderer.
+simee needs a system image, platform-tools (adb) and, for graphics, the gfxstream renderer.
 Java, sdkmanager, avdmanager, Python, e2fsprogs and the full emulator package aren't required
 (userdata is formatted natively by `crates/emu-ext4`). The `emu` binary provisions the rest
 itself:
@@ -128,19 +129,19 @@ only Apple silicon boots guests.
 498 MB on disk instead of the package's 1.32 GB. That keeps everything the renderer loads: the
 backend and its `@rpath` libraries, the shader translator it opens by name, `gles_angle`, and
 the Vulkan loader, ICDs (MoltenVK, lavapipe with its LLVM, SwiftShader) and validation layers.
-It goes to `$ANDROID_HOME/emu-rs/renderer/<revision>/` (with a `renderer.properties` marker
+It goes to `$ANDROID_HOME/simee/renderer/<revision>/` (with a `renderer.properties` marker
 recording revision and sha1, and a `current` symlink to the newest), never `emulator/`, so
 sdkmanager's own package tracking is never confused. `-provision` installs it unless the SDK
 already has a renderer; `-provision-renderer` updates to the newest stable revision and removes
 older ones.
 
 At boot emu uses the SDK's own `emulator/lib64` when present, else the newest
-`emu-rs/renderer/*/lib64`, and points gfxstream's launcher directory at its parent (where it
+`simee/renderer/*/lib64`, and points gfxstream's launcher directory at its parent (where it
 finds `lib64/vulkan` and `lib64/gles_*`). `emu-gfxstream` preloads the backend's `@rpath`
 dependencies leaves-first from that directory, so they resolve without any rpath; libraries
 gfxstream `dlopen`s by bare name resolve through the binary's rpaths (`@executable_path/lib64`,
 which emu links to the chosen `lib64`, then the build machine's `emulator/lib64` and
-`emu-rs/renderer/current/lib64`). To check an install without a VM:
+`simee/renderer/current/lib64`). To check an install without a VM:
 `cargo run -p emu-gfxstream --example renderer_caps -- <lib64> moltenvk` prints capsets 3, 8, 9.
 
 AVD defaults favour cheap, fast boots: 720×1280 screen, 2 GB RAM, 4 vCPU, 4 GB data.
@@ -150,13 +151,13 @@ above 2 GB slows cold boots down.
 ## Automotive
 
 What the AAOS sources show (`device/generic/car/emulator`, `hardware/interfaces/automotive/vehicle`,
-the emulator's `qemu-setup.cpp`), what emu-rs does with it, and what still needs a real boot.
+the emulator's `qemu-setup.cpp`), what simee does with it, and what still needs a real boot.
 
 **Vehicle HAL.** The emulator VHAL (`vhal_aidl/VehicleEmulator`, API 33–36) opens the qemud
 `car` pipe only when `ro.boot.qemu` is set; if the open fails it logs and carries on, and its
 property values come from the image's own JSON config. So the pipe doesn't gate boot: it is how
 the host drives the car. Stock registers the service only for car images (`build.prop`'s
-`ro.product.name`, `ro.product.system.name` or `ro.build.flavor` contains `car`); emu-rs does
+`ro.product.name`, `ro.product.system.name` or `ro.build.flavor` contains `car`); simee does
 the same (`Avd::is_car`, falling back to an `android-automotive*` tag when an image has no
 `build.prop`) and refuses the pipe on every other image, as before.
 
@@ -164,12 +165,12 @@ The channel is `libqemud` framing (4 hex digits of length; the guest sends 64 Ki
 payloads with a 4-byte big-endian `len | 0x8000_0000` header) around proto2
 `vhal_proto.EmulatorMessage`. The guest reads into a 2048-byte buffer and ends its read loop on
 a payload that fills it, so host frames carry at most 2047 bytes. It answers every command in
-order and sends `SET_PROPERTY_ASYNC` on its own from boot, so emu-rs drains the pipe whether or
+order and sends `SET_PROPERTY_ASYNC` on its own from boot, so simee drains the pipe whether or
 not anyone is waiting. `sim_core::vhal` is the protocol (a hand-written codec, no protobuf
 dependency, checked against hand-encoded stock commands), `emu_vmm::pipe::car` the pipe.
 
 Stock has no console command for the car (its controls live in the UI and in gRPC's
-`sendCarEvent`), so emu-rs adds one, as an extension:
+`sendCarEvent`), so simee adds one, as an extension:
 
 ```
 car set <property> [<area>] <value>    # SET_PROPERTY_CMD, as stock's car page sends
@@ -181,34 +182,34 @@ car names                              # the property names the console knows
 Properties are VHAL names (`GEAR_SELECTION`, `PERF_VEHICLE_SPEED`, `IGNITION_STATE`, ...; short
 `gear`, `speed`, `ignition`, `night`, `parking-brake`) or numeric ids; values are typed by the
 id's type bits (`drive`/`P`, `on`/`acc`, `12.5`, `true`, `2,0` for vectors, hex for bytes).
-Value lines read `property=<name> id=<hex> area=<n> status=<s> value=<text>`. sim-rs reaches it
-as the `vehicle` API method and CLI command (`sim-rs vehicle <avd> gear drive`), for devices
+Value lines read `property=<name> id=<hex> area=<n> status=<s> value=<text>`. simee reaches it
+as the `vehicle` API method and CLI command (`simee vehicle <avd> gear drive`), for devices
 whose form factor is auto.
 
 **Audio.** From API 35 the car audio HAL (`audio.primary.caremu`) calls `mixer_open(0)` and
 then `mixer_get_name()` without a NULL check, so without ALSA card 0 it most likely crash-loops.
-emu-rs adds a silent virtio-snd card (one output and one input stream, S16/S24/S32/float,
+simee adds a silent virtio-snd card (one output and one input stream, S16/S24/S32/float,
 8–48 kHz, mono or stereo, no jacks) on virtio-mmio slot 18 for car images and for XR images
 (whose image enables `VirtioSndCard`). Playback buffers are consumed and capture buffers come
 back as silence at the stream's real rate, so the HAL's blocking writes and reads keep their
 timing. `EMU_VIRTIO_SND=1` (or `0`) forces the card on (or off) for any image; `-no-audio`
 doesn't remove it, since it never plays on the host anyway. Stock puts virtio-snd on PCI, phone
-images included; emu-rs leaves phones without it until it has been tried on one.
+images included; simee leaves phones without it until it has been tried on one.
 
 **Needs a real boot.** Whether the car image reaches the launcher with these two pieces; that
 the VHAL connects and `car get gear` answers; that the kernel's `virtio_snd` driver binds on
 virtio-mmio and `caremu` opens card 0 (its mixer has no controls, which its init loop
 tolerates); and the rest of the car stack (EVS, cluster display, rotary controller), which
-emu-rs doesn't model.
+simee doesn't model.
 
 **Checked offline** against `system-images;android-34-ext9;android-automotive;arm64-v8a` r5
 (`scripts/inspect-image.py`, `emu -avd Car34 -dry-run`): the image ships `build.prop` beside it,
-so emu-rs recognizes it as a car and adds `qemud:car` and the sound card; its first-stage fstab
+so simee recognizes it as a car and adds `qemud:car` and the sound card; its first-stage fstab
 and modules match the board; its VHAL (`android.hardware.automotive.vehicle@V1-emulator-service`)
 opens `pipe:qemud:car`, over vsock first; and every property and gear/ignition value in
 `sim_core::vhal` exists in the image's own `vehicle-types-meta.json` (a trimmed copy is a test
 fixture). Its vendor also runs EVS, CAN, broadcast radio and remote-access HALs, none of which
-emu-rs serves.
+simee serves.
 
 ## Performance notes
 
@@ -269,7 +270,7 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   memory. A new ring is written out in full when it's made (so a full disk is an error rather than a
   `SIGBUS`), which costs its first frames 20–60 ms here, once per ring. Frames scale on one thread below 16 MiB of input and in up to 4
   bands above: two threads were slower than one on this VM (likely SMT siblings), four faster.
-  Rings live in `<avd>/emu-rs/`, a disk-backed file on macOS whose dirty pages the system writes
+  Rings live in `<avd>/simee/`, a disk-backed file on macOS whose dirty pages the system writes
   back periodically (benchmark rigs on Linux use `/dev/shm`). The direct Vulkan readback is checked
   against the GL one on its first 3 frames and turned off if they differ (`EMU_READBACK=gl` turns
   it off outright).

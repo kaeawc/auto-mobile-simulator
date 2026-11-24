@@ -1,7 +1,7 @@
 //! Runtime binding to gfxstream's `stream_renderer_*` C API (virtio-gpu 3D on the host).
 //!
 //! The Android SDK ships the renderer as `emulator/lib64/libgfxstream_backend.dylib`; it is
-//! `dlopen`ed here so emu-rs needs no build-time dependency on it. The renderer is process-wide
+//! `dlopen`ed here so simee needs no build-time dependency on it. The renderer is process-wide
 //! state, so there is at most one [`Renderer`] per process. Signatures follow
 //! `docs/reference/gfxstream/virtio-gpu-gfxstream-renderer.h`.
 #![cfg(target_os = "macos")]
@@ -580,7 +580,7 @@ static VULKAN_FAILED: AtomicBool = AtomicBool::new(false);
 /// Points the renderer at its Vulkan loader and ICDs (MoltenVK by default). gfxstream resolves
 /// `lib64/vulkan/*` and `lib64/gles_*` relative to its "launcher directory", which defaults to
 /// the executable's directory; set it to the parent of the renderer's `lib64` (the SDK's
-/// `emulator/`, or `<sdk>/emu-rs/renderer/<revision>/`).
+/// `emulator/`, or `<sdk>/simee/renderer/<revision>/`).
 ///
 /// Call before spawning threads that might read the environment.
 pub fn configure_environment(emulator_dir: &Path, icd: Icd) {
@@ -716,7 +716,7 @@ type ReadColorBuffer = unsafe extern "C" fn(*mut c_void, u32, i32, i32, i32, i32
 /// `GfxstreamFormat::R8G8B8A8_UNORM`.
 const GFXSTREAM_RGBA8: u32 = 1;
 
-/// The renderer's `FrameBuffer` members emu-rs calls directly.
+/// The renderer's `FrameBuffer` members simee calls directly.
 #[derive(Clone, Copy)]
 struct FbApi {
     get_fb: GetFb,

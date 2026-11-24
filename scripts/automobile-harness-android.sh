@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Drives an emu-rs device with AutoMobile through a private daemon (its own socket, PID file and
+# Drives a simee device with AutoMobile through a private daemon (its own socket, PID file and
 # state directories), so no other AutoMobile daemon on the machine is touched. Prints a
 # pass/fail line per tool and writes the matrix to <logs>/coverage.tsv.
 #
-#   scripts/automobile-harness-android.sh emulator-5554 [auto-mobile checkout]   # attach to a running emu-rs
+#   scripts/automobile-harness-android.sh emulator-5554 [auto-mobile checkout]   # attach to a running simee
 #   scripts/automobile-harness-android.sh @<avd> [auto-mobile checkout]          # AutoMobile boots it (via `make shim`)
 #
 # The checkout defaults to ../auto-mobile and runs from source (bun src/index.ts).
@@ -15,7 +15,7 @@ am_dir=$(cd "${2:-$repo/../auto-mobile}" && pwd)
 entry="$am_dir/src/index.ts"
 [ -f "$entry" ] || { echo "no $entry: not an auto-mobile checkout" >&2; exit 2; }
 
-root=$(mktemp -d "${TMPDIR:-/tmp}/emu-rs-am.XXXXXX")
+root=$(mktemp -d "${TMPDIR:-/tmp}/simee-am.XXXXXX")
 sock=$(mktemp -d /tmp/ers-am.XXXX)
 export AUTOMOBILE_DATA_DIR="$root/data" AUTOMOBILE_LOG_DIR="$root/logs" AUTOMOBILE_DB_DIR="$root/db" \
   AUTOMOBILE_COORDINATION_DIR="$root/coordination" AUTOMOBILE_ADB_SERVER_COORDINATION_DIR="$root/adb" \
@@ -26,8 +26,8 @@ export AUTOMOBILE_DATA_DIR="$root/data" AUTOMOBILE_LOG_DIR="$root/logs" AUTOMOBI
 mkdir -p "$AUTOMOBILE_DATA_DIR" "$AUTOMOBILE_LOG_DIR" "$AUTOMOBILE_DB_DIR" "$AUTOMOBILE_COORDINATION_DIR" "$AUTOMOBILE_ADB_SERVER_COORDINATION_DIR"
 
 if [[ "$target" == @* ]]; then
-  # Let AutoMobile launch the AVD itself; the SDK overlay makes its "emulator" emu-rs.
-  shim="${EMU_RS_SDK:-$HOME/.emu-rs/sdk}"
+  # Let AutoMobile launch the AVD itself; the SDK overlay makes its "emulator" simee.
+  shim="${SIMEE_SDK:-$HOME/.simee/sdk}"
   [ -x "$shim/emulator/emulator" ] || "$repo/scripts/sdk-shim.sh" "$shim"
   export ANDROID_HOME="$shim" ANDROID_SDK_ROOT="$shim"
   acquire=(getAndroid --avd-name "${target#@}")
@@ -52,7 +52,7 @@ echo "$out" | tail -15
 session=$(echo "$out" | grep -oE 'sessionUuid[^0-9a-f]*[0-9a-f-]{36}' | head -1 | grep -oE '[0-9a-f-]{36}' || true)
 [ -n "$session" ] || { echo "no session minted" >&2; exit 1; }
 
-# One line per tool: name, then arguments. Extend as emu-rs grows; the matrix shows what's left.
+# One line per tool: name, then arguments. Extend as simee grows; the matrix shows what's left.
 tools=(
   "observe"
   "listDevices"
@@ -73,7 +73,7 @@ tools=(
   "setSensor --sensor acceleration --value [0,9.8,0]"
   "setSensor --sensor light --reset true"
   "shake --duration 500"
-  "clipboard --action copy --text emu-rs"
+  "clipboard --action copy --text simee"
   "biometricAuth --action match --modality fingerprint"
   "sendSms --phoneNumber 5551234 --message hello"
   "phoneCall --action call --phoneNumber 5551234"
@@ -96,7 +96,7 @@ tools=(
   "videoRecording --action stop"
   "captureAudio --seconds 1"
   "injectAudioInput --tone {\"frequencyHz\":440,\"durationMs\":500}"
-  "deviceSnapshot --action capture --snapshotName emu-rs-harness"
+  "deviceSnapshot --action capture --snapshotName simee-harness"
 )
 pass=0; fail=0
 printf 'tool\tresult\n' > "$root/coverage.tsv"

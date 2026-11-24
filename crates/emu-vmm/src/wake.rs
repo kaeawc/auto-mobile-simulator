@@ -1,7 +1,7 @@
 //! Which vCPUs a raised interrupt must rouse, and how: the wake/park state machine.
 //!
 //! With the framework's in-kernel GIC an idle vCPU waits for interrupts inside `hv_vcpu_run`.
-//! emu-rs measured that wait not noticing an SPI raised by a device thread until the vCPU's own
+//! simee measured that wait not noticing an SPI raised by a device thread until the vCPU's own
 //! timer fired, so raising one kicks vCPUs out of the run (`hv_vcpus_exit`) to see it (first-boot
 //! `/data` encryption: 22 s without, 8 s with). Other VMMs on the same API (QEMU's and libkrun's
 //! in-kernel GIC, arcbox on macOS 26.4) only raise the SPI and measured kicks as pure cost, so

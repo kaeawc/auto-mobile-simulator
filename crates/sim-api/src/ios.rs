@@ -128,7 +128,7 @@ fn device_inject(device: &Device, on: bool) -> Result<(), String> {
     };
     device.exec("launchctl", &args, &[]).map_err(err)?;
     if !on {
-        device.exec("launchctl", &["unsetenv".to_owned(), "SIM_RS_NETSHAPE".to_owned()], &[]).map_err(err)?;
+        device.exec("launchctl", &["unsetenv".to_owned(), "SIMEE_NETSHAPE".to_owned()], &[]).map_err(err)?;
     }
     Ok(())
 }
@@ -177,7 +177,7 @@ const INPUT_METHODS: &[&str] = &["tap", "swipe", "touch", "rotary", "watch_gestu
 /// One input worker per device (by UDID), shared by every API connection. A worker keeps its
 /// device's HID client and display between calls (the service's objects stay on the thread that
 /// made them), runs that device's input in order, and lets go after five idle minutes.
-static INPUT: Workers<String, Input> = Workers::new("sim-rs-input", Duration::from_secs(300));
+static INPUT: Workers<String, Input> = Workers::new("simee-input", Duration::from_secs(300));
 
 /// A device's input connection, owned by its worker thread: the device, a watch on its state, and
 /// the HID client and main display, reused while the device stays in the same boot.
@@ -296,7 +296,7 @@ fn display_of(device: &Device, p: &Value) -> Result<sim_coresim::Display, String
     if on_carplay(p)? { device.external_display() } else { device.display() }.map_err(err)
 }
 
-/// The CarPlay screen's size: the car display sim-rs attaches.
+/// The CarPlay screen's size: the car display simee attaches.
 fn carplay_screen() -> Size {
     Size::new(f64::from(sim_core::carplay::WIDTH), f64::from(sim_core::carplay::HEIGHT))
 }
@@ -325,7 +325,7 @@ fn play_on(input: &mut Input, udid: &str, p: &Value, samples: &[Sample]) -> Resu
     played.map(|()| Value::Null)
 }
 
-/// The orientation sim-rs last set per device (UDID), so `rotate` without one turns 90° from there.
+/// The orientation simee last set per device (UDID), so `rotate` without one turns 90° from there.
 static ORIENTATIONS: std::sync::Mutex<Option<std::collections::HashMap<String, Orientation>>> = std::sync::Mutex::new(None);
 
 fn rotate(device: &Device, wanted: Option<Orientation>) -> Result<Value, String> {

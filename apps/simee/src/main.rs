@@ -1,4 +1,4 @@
-//! sim-rs: create, boot and drive iOS simulator devices and Android emulator devices.
+//! simee: create, boot and drive iOS simulator devices and Android emulator devices.
 //!
 //! Every device command is a call into the API's method table (`sim-api`), the same code the
 //! socket server and the desktop window run; this file only parses arguments and prints results.
@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use sim_core::device::DeviceInfo;
 
 #[derive(Parser)]
-#[command(name = "sim-rs", version, about = "Create, boot and drive iOS simulator and Android emulator devices")]
+#[command(name = "simee", version, about = "Create, boot and drive iOS simulator and Android emulator devices")]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -233,12 +233,12 @@ enum Cmd {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
-    /// Serve the JSON-lines API on a unix socket (default `$SIM_RS_SOCKET` or `$TMPDIR/sim-rs.sock`).
+    /// Serve the JSON-lines API on a unix socket (default `$SIMEE_SOCKET` or `$TMPDIR/simee.sock`).
     Serve {
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
     },
-    /// Call an API method on a running server, e.g. `sim-rs call processes '{"device":"booted"}'`.
+    /// Call an API method on a running server, e.g. `simee call processes '{"device":"booted"}'`.
     Call {
         method: String,
         /// JSON parameters.
@@ -265,7 +265,7 @@ fn main() -> Result<()> {
     match &cli.command {
         Cmd::Serve { socket } => {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
-            eprintln!("sim-rs API on {}", path.display());
+            eprintln!("simee API on {}", path.display());
             sim_api::serve(&path)?;
             return Ok(());
         }
@@ -495,7 +495,7 @@ fn form_factors_text(rows: &Value) -> String {
     out
 }
 
-/// The `xr` method's parameters for `sim-rs xr DEVICE WORDS...` (the console's `xr` syntax).
+/// The `xr` method's parameters for `simee xr DEVICE WORDS...` (the console's `xr` syntax).
 fn xr_params(device: &str, words: &[String]) -> Result<Value> {
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
     let command = sim_core::xr::XrCommand::parse(&words).map_err(anyhow::Error::msg)?;

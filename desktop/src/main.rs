@@ -1,4 +1,4 @@
-//! sim-rs desktop: one window onto iOS simulator and Android emulator devices, rendered with Rune.
+//! simee desktop: one window onto iOS simulator and Android emulator devices, rendered with Rune.
 //!
 //! Pick a device on the left (grouped by platform, each labelled with its sub-platform); boot it if
 //! needed. iOS screens stream from the device framebuffer without copying; Android screens stream
@@ -10,7 +10,7 @@
 //! Handlers only queue [`Action`]s and [`Input`]s; `poll` performs them. That keeps handlers pure,
 //! so the headless tests drive the real view without a device.
 //!
-//! `cargo run` opens the window (`SIM_RS_DEVICE=<udid|name|booted>` preselects a device);
+//! `cargo run` opens the window (`SIMEE_DEVICE=<udid|name|booted>` preselects a device);
 //! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
 //! watch, tv, apple-watch, apple-tv, empty).
 
@@ -226,7 +226,7 @@ impl State {
 fn init() -> State {
     State {
         devices: Vec::new(),
-        selected: std::env::var("SIM_RS_DEVICE").ok(),
+        selected: std::env::var("SIMEE_DEVICE").ok(),
         pixels: Pixels::new(),
         native: NativeSurface::new(),
         live: None,
@@ -430,8 +430,7 @@ fn setup(s: &mut State, waker: Waker) {
         s.debug.start(w);
     }
     // The window also serves the API, so scripts can drive the device it shows.
-    let socket =
-        std::env::var_os("SIM_RS_SOCKET").map_or_else(|| std::env::temp_dir().join("sim-rs-desktop.sock"), std::path::PathBuf::from);
+    let socket = std::env::var_os("SIMEE_SOCKET").map_or_else(|| std::env::temp_dir().join("simee-desktop.sock"), std::path::PathBuf::from);
     match sim_api::serve_in_background(socket.clone()) {
         Ok(()) => s.socket = Some(socket.display().to_string()),
         Err(e) => s.status = Some(format!("API socket {}: {e}", socket.display())),
@@ -656,7 +655,7 @@ fn screenshot(s: &mut State) -> String {
     }
     let dir = std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join("Desktop")).unwrap_or_else(|_| std::env::temp_dir());
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let path = dir.join(format!("sim-rs-{secs}.png"));
+    let path = dir.join(format!("simee-{secs}.png"));
     let result = sim_core::frame::encode_png(&sim_core::frame::Frame { width: w, height: h, rgba })
         .and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string()));
     match result {
@@ -680,7 +679,7 @@ fn main() {
         setup: Some(setup),
         poll: Some(poll),
         min_size: Some((1000.0, 560.0)),
-        ..AppSpec::new("sim-rs", (1240.0, 870.0), init, view::view)
+        ..AppSpec::new("simee", (1240.0, 870.0), init, view::view)
     });
 }
 

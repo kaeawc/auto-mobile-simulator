@@ -143,7 +143,7 @@ impl Kind {
     pub fn profile(&self) -> Profile {
         use FormFactor as F;
         let (width, height, density, shape) = match (self.platform, self.form_factor) {
-            // emu-rs's AVD defaults: small screens boot markedly faster.
+            // simee's AVD defaults: small screens boot markedly faster.
             (Platform::Android, F::Phone) => (720, 1280, Density::Dpi(320), Shape::Rounded),
             (Platform::Android, F::Tablet) => (2560, 1600, Density::Dpi(320), Shape::Rounded),
             (Platform::Android, F::Foldable) => (2208, 1840, Density::Dpi(420), Shape::Rectangle),
@@ -557,8 +557,8 @@ mod tests {
 
     #[test]
     fn android_xr_images_are_vision_devices() {
-        // What avdmanager writes for the SDK's XR headset, and the image directory tags emu-rs and
-        // sim-rs write (`google-xr`, `android-xr-v3-playstore`, `android-xr-preview-playstore`).
+        // What avdmanager writes for the SDK's XR headset, and the image directory tags simee and
+        // simee write (`google-xr`, `android-xr-v3-playstore`, `android-xr-preview-playstore`).
         let headset = avd(&[
             ("tag.id", "android-xr"),
             ("tag.ids", "android-xr,google_apis_playstore"),

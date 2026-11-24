@@ -1,4 +1,4 @@
-//! The sim-rs unix socket API.
+//! The simee unix socket API.
 //!
 //! One request per line, one response per line, JSON:
 //!
@@ -31,12 +31,12 @@ use serde_json::{Value, json};
 pub use methods::{METHODS, Session, call as call_method};
 pub use sim_core::frame::encode_png;
 
-/// The default socket path: `$SIM_RS_SOCKET`, else `$TMPDIR/sim-rs.sock`.
+/// The default socket path: `$SIMEE_SOCKET`, else `$TMPDIR/simee.sock`.
 pub fn default_socket() -> PathBuf {
-    if let Some(p) = std::env::var_os("SIM_RS_SOCKET") {
+    if let Some(p) = std::env::var_os("SIMEE_SOCKET") {
         return PathBuf::from(p);
     }
-    std::env::temp_dir().join("sim-rs.sock")
+    std::env::temp_dir().join("simee.sock")
 }
 
 #[derive(Deserialize)]
@@ -81,7 +81,7 @@ fn serve_connection(stream: UnixStream) {
 pub fn serve(path: &Path) -> std::io::Result<()> {
     let listener = bind(path)?;
     for stream in listener.incoming().flatten() {
-        std::thread::Builder::new().name("sim-rs-api".into()).spawn(move || serve_connection(stream))?;
+        std::thread::Builder::new().name("simee-api".into()).spawn(move || serve_connection(stream))?;
     }
     Ok(())
 }
@@ -89,7 +89,7 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
 /// Serves on a background thread; returns once the socket is bound.
 pub fn serve_in_background(path: PathBuf) -> std::io::Result<()> {
     let listener = bind(&path)?;
-    std::thread::Builder::new().name("sim-rs-api-accept".into()).spawn(move || {
+    std::thread::Builder::new().name("simee-api-accept".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
             std::thread::spawn(move || serve_connection(stream));
         }
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn serves_over_a_socket() {
-        let path = std::env::temp_dir().join(format!("sim-rs-api-test-{}.sock", std::process::id()));
+        let path = std::env::temp_dir().join(format!("simee-api-test-{}.sock", std::process::id()));
         serve_in_background(path.clone()).expect("bind");
         let result = call(&path, "help", Value::Null).expect("help");
         assert!(result.as_array().is_some_and(|m| m.iter().any(|x| x["method"] == "tap")));

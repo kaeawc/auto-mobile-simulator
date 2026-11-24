@@ -5,7 +5,7 @@
 //! against the manifest's size and sha1, unpacked with `/usr/bin/unzip` into a temporary
 //! directory under the SDK and renamed into the standard layout. Shelling out to the system's
 //! curl and unzip keeps a TLS stack and a zip implementation out of the binary. The host
-//! renderer is unpacked out of the `emulator` package the same way, into emu-rs's own directory
+//! renderer is unpacked out of the `emulator` package the same way, into simee's own directory
 //! (see [`renderer`]). Other hosts (Linux, for preparing images and AVDs) use the `curl` and
 //! `unzip` on their `PATH`.
 
@@ -316,7 +316,7 @@ impl Sdk {
 
     /// Downloads the `emulator` package `d` and unpacks only the renderer
     /// ([`renderer::INCLUDE`] minus [`renderer::EXCLUDE`]) into
-    /// `<sdk>/emu-rs/renderer/<revision>` with a [`renderer::MARKER`], points
+    /// `<sdk>/simee/renderer/<revision>` with a [`renderer::MARKER`], points
     /// [`renderer::CURRENT`] at it and removes older revisions. The archive is deleted.
     pub fn install_renderer(&self, d: &Download) -> Result<renderer::Installed> {
         let part = self.fetch_verified(d)?;

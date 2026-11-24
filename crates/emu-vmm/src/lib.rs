@@ -1,4 +1,4 @@
-//! The emu-rs virtual machine: an arm64 board that boots unmodified Android emulator system
+//! The simee virtual machine: an arm64 board that boots unmodified Android emulator system
 //! images on Hypervisor.framework.
 //!
 //! The device models build and test on any unix host; the machine that runs them (vCPUs, the GIC,

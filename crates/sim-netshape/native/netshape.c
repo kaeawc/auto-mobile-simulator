@@ -1,6 +1,6 @@
-// sim-rs network shaper: a dylib injected into iOS-simulator processes (DYLD_INSERT_LIBRARIES).
+// simee network shaper: a dylib injected into iOS-simulator processes (DYLD_INSERT_LIBRARIES).
 // It interposes BSD socket calls and applies a profile read from the file named by
-// SIM_RS_NETSHAPE: offline, added latency, up/down bandwidth and connection loss. Only sockets
+// SIMEE_NETSHAPE: offline, added latency, up/down bandwidth and connection loss. Only sockets
 // connected to non-loopback addresses are shaped, so local control channels are unaffected.
 // The profile is re-read when the file changes, so a controller can change it live.
 //
@@ -260,7 +260,7 @@ static void install(const parser_t *ps) {
 /// Re-reads the profile file if it changed (the caller holds g_reload_lock). Reads with open/read,
 /// so a reload doesn't allocate.
 static void check_profile(void) {
-    const char *path = getenv("SIM_RS_NETSHAPE");
+    const char *path = getenv("SIMEE_NETSHAPE");
     struct stat st;
     if (!path || stat(path, &st) != 0) {
         // No file: the base profile is cleared, the rules stay.
@@ -1153,7 +1153,7 @@ static const struct sockaddr *my_dnssd_get_address(dnssd_getaddrinfo_result_t re
 DYLD_INTERPOSE(my_dnssd_get_address, dnssd_getaddrinfo_result_get_address)
 
 __attribute__((constructor)) static void netshape_init(void) {
-    const char *marker = getenv("SIM_RS_NETSHAPE_MARK");
+    const char *marker = getenv("SIMEE_NETSHAPE_MARK");
     if (marker) {
         int fd = open(marker, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {

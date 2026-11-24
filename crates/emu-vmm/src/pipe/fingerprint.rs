@@ -5,7 +5,7 @@
 //! `finger remove` drive it through [`Fingerprint`].
 //!
 //! Camera: the provider sends NUL-terminated queries (`list`, ...) and reads an 8-hex-digit
-//! length plus a reply starting `ok` / `ko`. emu-rs has no host cameras yet, so `list` answers
+//! length plus a reply starting `ok` / `ko`. simee has no host cameras yet, so `list` answers
 //! with an empty list and other queries fail; without a service the provider retries the pipe
 //! in a tight loop.
 use std::sync::{Arc, Mutex};

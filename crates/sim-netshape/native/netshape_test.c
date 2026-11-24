@@ -573,7 +573,7 @@ static void bench(void) {
 
 /// Prints the effective profile for each host: `offline latency_ms down_bps up_bps loss_pct`.
 static int print_effective(const char *path, char **hosts, int n) {
-    setenv("SIM_RS_NETSHAPE", path, 1);
+    setenv("SIMEE_NETSHAPE", path, 1);
     for (int i = 0; i < n; i++) {
         struct sockaddr_storage ss = addr(hosts[i], 443);
         int rule = ss.ss_family ? match_rule((struct sockaddr *)&ss) : match_rule_name(hosts[i]);
@@ -587,7 +587,7 @@ int main(int argc, char **argv) {
     if (argc >= 3 && !strcmp(argv[1], "effective")) return print_effective(argv[2], argv + 3, argc - 3);
     const char *tmp = getenv("TMPDIR");
     snprintf(conf_path, sizeof conf_path, "%s/netshape-test-%d.conf", tmp && *tmp ? tmp : "/tmp", getpid());
-    setenv("SIM_RS_NETSHAPE", conf_path, 1);
+    setenv("SIMEE_NETSHAPE", conf_path, 1);
     if (argc >= 2 && !strcmp(argv[1], "bench")) {
         bench();
     } else {

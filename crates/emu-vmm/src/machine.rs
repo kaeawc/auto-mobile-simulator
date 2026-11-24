@@ -23,7 +23,7 @@ use crate::{board, boot, devices, disk, pipe, telephony, virtio};
 /// Host GPU rendering through gfxstream.
 pub struct GpuSpec {
     /// The renderer's `lib64` (holds `libgfxstream_backend.dylib`): the SDK's `emulator/lib64`
-    /// or `<sdk>/emu-rs/renderer/<revision>/lib64`.
+    /// or `<sdk>/simee/renderer/<revision>/lib64`.
     pub lib64: PathBuf,
     pub width: u32,
     pub height: u32,

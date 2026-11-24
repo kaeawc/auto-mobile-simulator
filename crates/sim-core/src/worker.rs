@@ -1,7 +1,7 @@
 //! Long-lived worker threads, one per key, each owning state that never leaves its thread. The iOS
 //! backend runs each device's input on its own worker: the simulator service's objects (the HID
 //! client, the display's port) belong to the thread that made them, and API connections come and
-//! go (one per `sim-rs call`), so the connection is kept by the worker instead. Jobs for one key
+//! go (one per `simee call`), so the connection is kept by the worker instead. Jobs for one key
 //! run one at a time, in order; different keys run in parallel. A worker idle for its timeout
 //! exits and drops its state; a job that panics fails its caller and resets its worker's state.
 
