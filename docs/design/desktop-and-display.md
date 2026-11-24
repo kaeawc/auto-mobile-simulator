@@ -31,8 +31,19 @@ pinned at `7a70745`, the same rev sim-rs uses.
    frames. A ring is announced with the first frame sent from it, written out in full when made,
    and removed with its stream or when the emulator exits. Other clients get `EMUF` frames on the
    socket as before.
-5. **Window.** The desktop reads each frame into the buffer it hands to `Pixels`.
-6. **Screenshots.** The console's `screenshot` encodes the shared capture directly.
+5. **Pacing.** At most one frame per interval in the long run, kept as a GCRA (a token bucket
+   held as one instant: the next frame's due time, advanced by an interval from when the last
+   was due or taken, whichever is later; a frame may go up to half an interval early). A frame
+   posted after a quiet spell goes out at once; an early one waits and the newest by then goes.
+   The interval is 16 ms: a steady 60 Hz stream goes out frame for frame (`frame_path_latency`,
+   2480x1740 into `hello 1080` by ring, posts every 16 ms: 120/120 delivered, post -> client
+   0.9 ms median, 3–4 ms max; with the old 33 ms gap measured from the end of each send: 49/120,
+   5.5–10.3 ms median, 20–42 ms max). A client may send an optional `fps <n>` line (1–240) for
+   its own cap; servers that don't know it ignore it, so it's compatible both ways. A socket
+   client that stops reading paces itself (the write blocks); a ring client reads a slot within
+   two intervals or sees it torn and skips it.
+6. **Window.** The desktop reads each frame into the buffer it hands to `Pixels`.
+7. **Screenshots.** The console's `screenshot` encodes the shared capture directly.
 
 Guest-composed scanouts (virtio-gpu `RESOURCE_FLUSH`) are read straight into the store
 (`DisplaySink::present_with`). Numbers and what's left: [android.md](../android.md#performance-notes).
@@ -72,8 +83,16 @@ Linux path.
 
 - **Touch.** `on_drag` delivers `Drag { phase, x, y, w, h }` in the element's own layout points.
   Guest pixel = `x / w * guest_w`, so no HiDPI code is needed.
-  - Events go to a virtio-input multi-touch device (`ABS_MT_*`) as they arrive. Unlike sim-rs's
-    HID path, moves aren't coalesced at 16 ms.
+  - Events go to a virtio-input multi-touch device (`ABS_MT_*`, protocol B) as they arrive.
+    Unlike sim-rs's HID path, moves aren't coalesced at 16 ms.
+  - A down sends the full set (slot, tracking id, position, pressure, `BTN_TOUCH`, `ABS_X/Y`); a
+    move sends only the axes that changed and `SYN` (3–5 events instead of 9), as stock's
+    `_mts_pointer_move` does; the kernel keeps each slot's values and drops repeats, so the
+    guest's readers see the same events. A raw `event send` on the touch device makes the next
+    touch send the full set again.
+  - Moves the guest hasn't started taking collapse into the newest (a stalled guest gets the
+    current position, not a backlog); downs, ups and keys are never dropped or reordered. Events
+    that arrive together go out with one interrupt.
   - `d.cancelled()` sends a real cancel.
 - **Pinch.** `on_magnify` drives two synthetic contacts.
 - **Scroll.** `on_wheel` (`WheelEvent { dx, dy, precise, momentum }`) goes to `REL_WHEEL`/`REL_HWHEEL`;

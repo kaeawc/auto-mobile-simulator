@@ -6,7 +6,7 @@
 //! `sensor set|get` changes (shake, rotation, hinge angle, proximity, ...).
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::qemud::{frame, take_frames};
@@ -99,15 +99,13 @@ impl PipeService for SensorService {
         if name != "qemud:sensors" {
             return None;
         }
-        let shared = Arc::new(Stream { enabled: Mutex::new(HashSet::new()), delay_ms: AtomicU64::new(200), stop: AtomicBool::new(false) });
+        let shared = Arc::new(Stream::default());
         let (s, sensors, start) = (shared.clone(), self.sensors.clone(), Instant::now());
         let _ = std::thread::Builder::new().name(format!("sensors-{}", ctx.conn)).spawn(move || {
-            while !s.stop.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(s.delay_ms.load(Ordering::Relaxed).clamp(10, 1000)));
-                let enabled: Vec<String> = s.enabled.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
-                if enabled.is_empty() {
-                    continue;
-                }
+            // Every enabled sensor goes out each tick, changed or not, as stock's
+            // `_hwSensorClient_tick` does (the HAL reports continuous sensors at their rate).
+            // With none enabled the thread sleeps until one is.
+            while let Some(enabled) = s.next_tick() {
                 let mut out = Vec::new();
                 for name in enabled {
                     if let Some(vals) = sensors.get(&name) {
@@ -127,8 +125,60 @@ impl PipeService for SensorService {
 
 struct Stream {
     enabled: Mutex<HashSet<String>>,
+    /// Signalled when a sensor is enabled or the pipe closes.
+    changed: Condvar,
     delay_ms: AtomicU64,
     stop: AtomicBool,
+    /// Times the stream thread woke for a tick.
+    #[cfg(test)]
+    ticks: AtomicU64,
+}
+
+impl Default for Stream {
+    fn default() -> Stream {
+        Stream {
+            enabled: Mutex::default(),
+            changed: Condvar::new(),
+            delay_ms: AtomicU64::new(200),
+            stop: AtomicBool::new(false),
+            #[cfg(test)]
+            ticks: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Stream {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.enabled.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Sleeps one delay (parked meanwhile, with nothing enabled, until something is), then the
+    /// sensors to send; `None` once the pipe has closed.
+    fn next_tick(&self) -> Option<Vec<String>> {
+        let mut en = self.lock();
+        loop {
+            while en.is_empty() && !self.stop.load(Ordering::SeqCst) {
+                en = self.changed.wait(en).unwrap_or_else(|e| e.into_inner());
+            }
+            let delay = Duration::from_millis(self.delay_ms.load(Ordering::Relaxed).clamp(10, 1000));
+            let stop = || self.stop.load(Ordering::SeqCst);
+            en = self.changed.wait_timeout_while(en, delay, |_| !stop()).unwrap_or_else(|e| e.into_inner()).0;
+            if stop() {
+                return None;
+            }
+            #[cfg(test)]
+            self.ticks.fetch_add(1, Ordering::Relaxed);
+            if !en.is_empty() {
+                return Some(en.iter().cloned().collect());
+            }
+        }
+    }
+
+    fn close(&self) {
+        let _en = self.lock();
+        self.stop.store(true, Ordering::SeqCst);
+        self.changed.notify_all();
+    }
 }
 
 struct SensorPipe {
@@ -151,9 +201,10 @@ impl PipeHandler for SensorPipe {
             } else if let Some(rest) = msg.strip_prefix("set:")
                 && let Some((name, on)) = rest.rsplit_once(':')
             {
-                let mut en = self.stream.enabled.lock().unwrap_or_else(|e| e.into_inner());
+                let mut en = self.stream.lock();
                 if on == "1" {
                     en.insert(name.to_string());
+                    self.stream.changed.notify_all();
                 } else {
                     en.remove(name);
                 }
@@ -174,7 +225,7 @@ impl PipeHandler for SensorPipe {
     }
 
     fn closed(&mut self) {
-        self.stream.stop.store(true, Ordering::Relaxed);
+        self.stream.close();
     }
 }
 
@@ -206,6 +257,43 @@ mod tests {
         assert_eq!(frames[0], b"acceleration:1:2:3");
         assert!(frames[1].starts_with(b"sync:"));
         pipe.closed();
+    }
+
+    #[test]
+    fn the_stream_sleeps_while_nothing_is_enabled_and_keeps_its_rate_when_something_is() {
+        let s = Arc::new(Stream::default());
+        s.delay_ms.store(10, Ordering::Relaxed);
+        let t = s.clone();
+        let sent = std::thread::spawn(move || {
+            let mut batches = 0;
+            while t.next_tick().is_some() {
+                batches += 1;
+            }
+            batches
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        // Before, a 10 ms delay woke the thread 100 times a second with nothing to send.
+        assert_eq!(s.ticks.load(Ordering::Relaxed), 0, "parked");
+        let mut pipe = SensorPipe { stream: s.clone(), mask: 1, buf: Vec::new() };
+        let mut req = Vec::new();
+        frame(&mut req, b"set:acceleration:1");
+        assert!(pipe.guest_data(&req, &mut Vec::new()));
+        std::thread::sleep(Duration::from_millis(300));
+        let ticks = s.ticks.load(Ordering::Relaxed);
+        // About 30 at 10 ms (a loaded host stretches sleeps), unchanged values included.
+        assert!((5..=31).contains(&ticks), "{ticks}");
+        // Disabled again: parked again (at most the tick in flight).
+        let mut req = Vec::new();
+        frame(&mut req, b"set:acceleration:0");
+        assert!(pipe.guest_data(&req, &mut Vec::new()));
+        std::thread::sleep(Duration::from_millis(30));
+        let parked = s.ticks.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(s.ticks.load(Ordering::Relaxed) <= parked + 1);
+        let closed = Instant::now();
+        pipe.closed();
+        assert!(sent.join().expect("stream") as u64 >= ticks);
+        assert!(closed.elapsed() < Duration::from_millis(100), "a close wakes it: {:?}", closed.elapsed());
     }
 
     #[test]
