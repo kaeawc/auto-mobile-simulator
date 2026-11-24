@@ -1,0 +1,35 @@
+# Desktop window
+
+One window for iOS and Android devices.
+
+![The desktop window with iOS and Android devices](desktop.png)
+
+```bash
+cd desktop
+cargo run --release                     # SIMEE_DEVICE=<udid|name|booted> preselects a device
+cargo run -- --snap shot.png --scene demo   # headless render; scenes: demo, android, foldable,
+                                            # watch, tv, apple-watch, apple-tv, empty
+```
+
+Devices are listed under iOS and Android, each with its sub-platform. Pick one (boot it if
+needed): click and drag on the screen for touches; type to use the device keyboard. ⌘⇧H is Home,
+⌘L Lock/Power, ⌘S saves a screenshot to the Desktop. The toolbar follows the form factor:
+
+| Device | Controls |
+| --- | --- |
+| iPhone / iPad | Home, Lock, Rotate, Appearance |
+| Apple Watch | Crown press, Side button, Crown up / down |
+| Apple TV | Menu, TV, arrows and Select (the Siri Remote), Appearance |
+| Apple Vision Pro | Home, Appearance |
+| Android phone / tablet | Back, Home, Recents, Power, Rotate |
+| Android foldable | the above, plus Fold closed / Half open / Open flat |
+| Wear OS watch (round screen) | Back, Home, Power, Rotary up / down |
+| Android TV | Back, Home, Power, D-pad and Select |
+| Android Automotive | Back, Home |
+| Android XR | Back, Home, Power, Look left / Recenter / Look right |
+
+iOS frames go to the GPU without copying (the framebuffer IOSurface is sampled directly) and the
+right-hand panel has five debug tabs (Device, Network, Storage, Processes, Logs). Android frames
+stream from the emulator's display socket, and the panel shows the device and its live guest
+console.
+
