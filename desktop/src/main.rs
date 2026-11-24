@@ -22,9 +22,11 @@ mod icons;
 #[cfg(target_os = "macos")]
 mod ios;
 mod keys;
+mod scan;
 #[cfg(target_os = "macos")]
 mod surface;
 mod view;
+mod work;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -100,9 +102,21 @@ pub struct State {
     /// Headless scenes show the screen without a live device.
     pub offline_screen: bool,
     offline_size: (u32, u32),
-    ctx: Option<Context>,
+    /// The UI thread's simulator service connection, made when an iOS device is first shown
+    /// (the scanner has its own).
+    ctx: Option<Result<Context, String>>,
     android_backend: Option<sim_android::Android>,
-    next_scan: f64,
+    /// Lists devices off the UI thread.
+    scanner: Option<scan::Scanner>,
+    /// The selected AVD as the last scan resolved it, and the UDID that scan was for.
+    android: Option<sim_android::Device>,
+    android_for: Option<String>,
+    /// A refresh asked to resolve `selected` (`booted`, a name) against the next scan.
+    resolve_pending: bool,
+    /// The next scan should (re)connect the selected device.
+    connect_pending: bool,
+    /// Status lines from background work.
+    outbox: work::Outbox,
     waker: Option<Waker>,
     work_done: Arc<AtomicBool>,
     work_error: Arc<Mutex<Option<String>>>,
@@ -125,28 +139,67 @@ impl State {
         self.live.is_some() || self.screen.is_some() || self.offline_screen
     }
 
-    fn refresh(&mut self) {
-        let mut list = Vec::new();
-        if let Some(ctx) = &self.ctx {
-            match device::list(ctx) {
-                Ok(l) => list.extend(l),
-                Err(e) => self.status = Some(e),
+    /// Asks the scanner for a scan now; `poll` applies it when it arrives.
+    fn rescan(&self) {
+        if let Some(sc) = &self.scanner {
+            sc.ask(self.selected.as_deref());
+        }
+    }
+
+    /// Applies a scan: the device list, the selected AVD and its console, and a (re)connect when
+    /// the list changed or one is pending. Returns whether anything shown changed.
+    fn apply_scan(&mut self, scan: scan::Scan) -> bool {
+        let before: Vec<(String, DeviceState)> = self.devices.iter().map(|d| (d.udid.clone(), d.state)).collect();
+        self.devices = scan.devices;
+        let mut changed = self.devices.iter().map(|d| (d.udid.clone(), d.state)).ne(before);
+        if let Some(e) = scan.error {
+            self.status = Some(e);
+        }
+        if std::mem::take(&mut self.resolve_pending) {
+            if self.selected.as_deref() == Some("booted") {
+                self.selected = self.devices.iter().find(|d| d.state == DeviceState::Booted).map(|d| d.udid.clone());
+            } else if let Some(q) = self.selected.clone()
+                && !self.devices.iter().any(|d| d.udid == q)
+            {
+                self.selected = self.devices.iter().find(|d| d.name == q).map(|d| d.udid.clone());
+            }
+            changed = true;
+        }
+        if scan.selected.is_some() && scan.selected == self.selected {
+            self.android_for = scan.selected;
+            self.android = match scan.android {
+                Some(Ok(d)) => Some(d),
+                Some(Err(e)) => {
+                    self.status = Some(e);
+                    None
+                }
+                None => None,
+            };
+            if self.android.is_some() && scan.console_log != self.console_log {
+                self.console_log = scan.console_log;
+                changed = true;
             }
         }
-        if let Some(a) = &self.android_backend {
-            list.extend(a.devices().into_iter().filter(|d| d.available));
+        if self.screen.as_ref().is_some_and(|sc| !sc.alive()) {
+            self.screen = None;
         }
-        list.sort_by_key(|d| (d.platform != Platform::Ios, d.state != DeviceState::Booted, d.runtime_id.clone(), d.name.clone()));
-        self.devices = list;
+        if changed || self.connect_pending {
+            self.connect();
+        }
+        changed
     }
 
     fn connect(&mut self) {
+        self.connect_pending = false;
         let Some(info) = self.selected_info().cloned() else { return };
         self.shape = info.kind().map_or(Shape::Rounded, |k| k.profile().shape);
         match info.platform {
             Platform::Ios => {
                 self.screen = None;
-                let (Some(ctx), Some(waker)) = (&self.ctx, self.waker.clone()) else { return };
+                if self.ctx.is_none() {
+                    self.ctx = Some(Context::new().map_err(|e| e.to_string()));
+                }
+                let (Some(Ok(ctx)), Some(waker)) = (&self.ctx, self.waker.clone()) else { return };
                 if self.live.as_ref().is_some_and(|l| l.udid == info.udid) {
                     return;
                 }
@@ -169,7 +222,15 @@ impl State {
                     return;
                 }
                 self.screen = None;
-                let Some(device) = self.android_device(&info.udid) else { return };
+                // The AVD is resolved on the scanner thread (it reads its config): wait for a
+                // scan of this one, unless the last one already failed to resolve it.
+                let Some(device) = self.android.clone().filter(|d| d.info.udid == info.udid) else {
+                    if self.android_for.as_deref() != Some(info.udid.as_str()) {
+                        self.connect_pending = true;
+                        self.rescan();
+                    }
+                    return;
+                };
                 if let Ok(p) = device.profile() {
                     self.shape = p.shape;
                 }
@@ -177,11 +238,15 @@ impl State {
                     self.offline_size = size;
                 }
                 let dir = device.avd.as_ref().map(|a| a.dir.clone());
-                self.console_log = dir.as_deref().map(|d| sim_android::console_log_tail(d, 200)).unwrap_or_default();
                 if info.state == DeviceState::Booted
                     && let Some(dir) = dir
                 {
-                    match android::Screen::connect(&info.udid, dir, 1080) {
+                    // The worker looks the AVD up for each job: this scan's copy goes stale
+                    // when the AVD starts, stops or restarts elsewhere.
+                    let backend = self.android_backend.clone().unwrap_or_default();
+                    let find = android::lookup(backend, info.udid.clone());
+                    let console = work::Worker::start("simee-android-console", find, self.outbox.clone());
+                    match android::Screen::connect(&info.udid, dir, 1080, console) {
                         Ok(sc) => {
                             self.screen = Some(sc);
                             self.status = None;
@@ -189,17 +254,6 @@ impl State {
                         Err(e) => self.status = Some(e),
                     }
                 }
-            }
-        }
-    }
-
-    fn android_device(&mut self, udid: &str) -> Option<sim_android::Device> {
-        let backend = self.android_backend.as_ref()?;
-        match backend.device(udid) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                self.status = Some(e);
-                None
             }
         }
     }
@@ -245,7 +299,12 @@ fn init() -> State {
         offline_size: (1206, 2622),
         ctx: None,
         android_backend: None,
-        next_scan: 0.0,
+        scanner: None,
+        android: None,
+        android_for: None,
+        resolve_pending: false,
+        connect_pending: false,
+        outbox: work::Outbox::default(),
         waker: None,
         work_done: Arc::new(AtomicBool::new(false)),
         work_error: Arc::new(Mutex::new(None)),
@@ -414,17 +473,22 @@ fn headless() -> bool {
 
 fn setup(s: &mut State, waker: Waker) {
     s.native.set_waker(waker.clone());
+    s.outbox = work::Outbox::new(Some(waker.clone()));
     s.waker = Some(waker);
     if s.offline || headless() {
         s.offline = true;
         return;
     }
     s.android_backend = Some(sim_android::Android::from_env());
-    match Context::new() {
-        Ok(ctx) => s.ctx = Some(ctx),
-        // Only worth a status line when there's nothing else to show.
-        Err(e) if s.android_backend.as_ref().is_none_or(|a| a.devices().is_empty()) => s.status = Some(e.to_string()),
-        Err(_) => {}
+    // Devices are listed on the scanner thread, so the window paints before the simulator
+    // service has answered. Android devices start and stop outside this window (the CLI,
+    // AutoMobile, a crash): it rescans every two seconds, following the selected device's
+    // guest console.
+    if let Some(w) = s.waker.clone() {
+        match scan::Scanner::start(Duration::from_secs(2), w) {
+            Ok(sc) => s.scanner = Some(sc),
+            Err(e) => s.status = Some(format!("device scanner: {e}")),
+        }
     }
     if let Some(w) = s.waker.clone() {
         s.debug.start(w);
@@ -455,14 +519,26 @@ fn press_button(s: &mut State, button: Button, t: f64, tx: &mut Tx) {
     tx.wake_after(Duration::from_millis(60));
 }
 
-/// Runs a console action on the selected Android device; failures go to the status line.
-fn android_action(s: &mut State, f: impl FnOnce(&sim_android::Device) -> Result<(), String>) {
-    let Some(udid) = s.screen.as_ref().map(|sc| sc.udid.clone()) else { return };
-    if let Some(d) = s.android_device(&udid)
-        && let Err(e) = f(&d)
-    {
-        s.status = Some(e);
+/// Queues a console action for the selected Android device on its console worker; failures go
+/// to the status line when it finishes.
+fn android_action(s: &State, f: impl FnOnce(&sim_android::Device) -> Result<(), String> + Send + 'static) {
+    if let Some(sc) = &s.screen {
+        sc.console(move |d| f(d).map(|()| None));
     }
+}
+
+/// Keeps only the newest of each run of pointer moves queued between two polls: a frame's worth
+/// of moves is one sample (iOS drops moves under ~16 ms apart anyway, so sending them all could
+/// lose the last one), and downs, ups and keys keep their order.
+fn coalesce_moves(inputs: Vec<Input>) -> Vec<Input> {
+    let mut out: Vec<Input> = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        if let (Input::Move(..), Some(Input::Move(..))) = (&input, out.last()) {
+            out.pop();
+        }
+        out.push(input);
+    }
+    out
 }
 
 fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
@@ -483,18 +559,15 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
         }
         match action {
             Action::Refresh => {
-                s.refresh();
-                if s.selected.as_deref() == Some("booted") {
-                    s.selected = s.devices.iter().find(|d| d.state == DeviceState::Booted).map(|d| d.udid.clone());
-                } else if let Some(q) = s.selected.clone()
-                    && !s.devices.iter().any(|d| d.udid == q)
-                {
-                    s.selected = s.devices.iter().find(|d| d.name == q).map(|d| d.udid.clone());
-                }
-                s.connect();
+                s.resolve_pending = true;
+                s.connect_pending = true;
+                s.rescan();
             }
             Action::Select(udid) => {
                 s.selected = Some(udid);
+                if let Some(sc) = &s.scanner {
+                    sc.follow(s.selected.as_deref());
+                }
                 s.connect();
             }
             Action::Boot => {
@@ -518,7 +591,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
                         s.status = Some(e);
                     }
                     drop(live);
-                    s.refresh();
+                    s.rescan();
                 }
                 if let Some(sc) = s.screen.take()
                     && let Some(backend) = s.android_backend.clone()
@@ -529,17 +602,21 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             }
             Action::Button(b) => press_button(s, b, t, tx),
             Action::ToggleAppearance => s.live.iter_mut().for_each(Live::toggle_appearance),
-            Action::Screenshot => s.status = Some(screenshot(s)),
+            Action::Screenshot => {
+                if let Some(msg) = screenshot(s) {
+                    s.status = Some(msg);
+                }
+            }
             Action::Rotate => match s.live.as_mut() {
                 Some(live) => live.rotate(),
                 None => android_action(s, sim_android::Device::rotate),
             },
-            Action::Fold(posture) => android_action(s, |d| d.fold(posture.angle())),
+            Action::Fold(posture) => android_action(s, move |d| d.fold(posture.angle())),
             Action::Rotary(ticks) => {
                 s.live.iter().for_each(|l| l.crown(ticks));
                 s.screen.iter().for_each(|sc| sc.wheel(ticks));
             }
-            Action::Xr(command) => android_action(s, |d| d.xr(&command).map(drop)),
+            Action::Xr(command) => android_action(s, move |d| d.xr(&command).map(drop)),
             Action::Debug(a) => {
                 if let Some(udid) = s.live.as_ref().map(|l| l.udid.clone())
                     && let Some(msg) = s.debug.perform(&udid, a)
@@ -549,7 +626,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             }
         }
     }
-    for input in std::mem::take(&mut s.inputs) {
+    for input in coalesce_moves(std::mem::take(&mut s.inputs)) {
         if s.offline || (s.live.is_none() && s.screen.is_none()) {
             continue;
         }
@@ -560,7 +637,11 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
                 s.actions.push(Action::Screenshot);
                 tx.wake_after(Duration::ZERO);
             }
-            Input::Key(KeyAction::Strokes(strokes)) if s.screen.is_some() => android_action(s, |d| d.strokes(&strokes)),
+            Input::Key(KeyAction::Strokes(strokes)) if s.screen.is_some() => {
+                if let Some(sc) = &s.screen {
+                    sc.strokes(strokes);
+                }
+            }
             input => apply(s, input),
         }
     }
@@ -569,36 +650,21 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
         s.status = Some(msg);
     }
     changed |= debug_changed;
+    for line in s.outbox.take() {
+        s.status = Some(line);
+        changed = true;
+    }
     if s.busy.is_some() && s.work_done.load(Ordering::Relaxed) {
         s.busy = None;
         if let Some(e) = s.work_error.lock().ok().and_then(|mut g| g.take()) {
             s.status = Some(e);
         }
-        s.refresh();
-        s.connect();
+        s.connect_pending = true;
+        s.rescan();
         changed = true;
     }
-    // Android devices start and stop outside this window (the CLI, AutoMobile, a crash): rescan
-    // every two seconds, and follow the selected device's guest console.
-    if !s.offline && s.android_backend.is_some() && t >= s.next_scan {
-        s.next_scan = t + 2.0;
-        tx.wake_after(Duration::from_secs(2));
-        let before: Vec<(String, DeviceState)> = s.devices.iter().map(|d| (d.udid.clone(), d.state)).collect();
-        s.refresh();
-        if s.screen.as_ref().is_some_and(|sc| !sc.alive()) {
-            s.screen = None;
-        }
-        if s.devices.iter().map(|d| (d.udid.clone(), d.state)).ne(before) {
-            s.connect();
-            changed = true;
-        }
-        if let Some(dir) = s.screen.as_ref().map(|sc| sc.avd_dir.clone()) {
-            let log = sim_android::console_log_tail(&dir, 200);
-            if log != s.console_log {
-                s.console_log = log;
-                changed = true;
-            }
-        }
+    if let Some(scan) = s.scanner.as_ref().and_then(scan::Scanner::take) {
+        changed |= s.apply_scan(scan);
     }
     // Fit the window to the device once its screen size is known.
     let live_size = s.live.as_ref().and_then(|l| l.shared.size()).or_else(|| s.screen.as_ref().and_then(android::Screen::device_size));
@@ -633,35 +699,32 @@ fn apply(s: &State, input: Input) {
     }
 }
 
-/// Saves the current frame to the Desktop; returns a status line.
-fn screenshot(s: &mut State) -> String {
-    let capture = if let Some(live) = &s.live {
-        Some(live.capture())
-    } else if let Some(udid) = s.screen.as_ref().map(|sc| sc.udid.clone()) {
-        s.android_device(&udid).map(|d| d.screenshot())
-    } else {
-        None
-    };
-    let (w, h, rgba) = match capture {
-        Some(Ok(f)) => (f.width, f.height, f.rgba),
-        Some(Err(e)) => return format!("screenshot failed: {e}"),
+/// Saves the current frame to the Desktop, off the UI thread: an Android device's emulator
+/// writes its PNG itself (on the console worker, no decode and re-encode), an iOS frame is
+/// copied here and encoded on a thread. The result reaches the status line through the outbox;
+/// returns a status line only for what fails at once.
+fn screenshot(s: &State) -> Option<String> {
+    let path = work::screenshot_path();
+    if let Some(sc) = &s.screen {
+        sc.console(move |d| match d.screenshot_png_to(&path) {
+            Ok(_) => Ok(Some(format!("saved {}", path.display()))),
+            Err(e) => Err(format!("screenshot failed: {e}")),
+        });
+        return None;
+    }
+    let frame = match s.live.as_ref().map(Live::capture) {
+        Some(Ok(f)) => f,
+        Some(Err(e)) => return Some(format!("screenshot failed: {e}")),
         None => {
-            let (w, h) = s.pixels.size();
-            (w, h, s.pixels.rgba())
+            let (width, height) = s.pixels.size();
+            sim_core::frame::Frame { width, height, rgba: s.pixels.rgba() }
         }
     };
-    if w == 0 || h == 0 {
-        return "no frame to save".into();
+    if frame.width == 0 || frame.height == 0 {
+        return Some("no frame to save".into());
     }
-    let dir = std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join("Desktop")).unwrap_or_else(|_| std::env::temp_dir());
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let path = dir.join(format!("simee-{secs}.png"));
-    let result = sim_core::frame::encode_png(&sim_core::frame::Frame { width: w, height: h, rgba })
-        .and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string()));
-    match result {
-        Ok(()) => format!("saved {}", path.display()),
-        Err(e) => format!("screenshot failed: {e}"),
-    }
+    work::save_png(frame, path, s.outbox.clone());
+    None
 }
 
 fn main() {
@@ -900,6 +963,62 @@ mod tests {
         for i in 0..icons::ALL.len() {
             assert!(rt.find(&format!("icon-{i}")).is_some(), "icon {i}");
         }
+    }
+
+    /// 1000 moves between two polls send one, the last, before the up; downs, ups and keys keep
+    /// their places.
+    #[test]
+    fn queued_moves_coalesce_to_the_newest_before_the_up() {
+        let mut inputs = vec![Input::Down(0.0, 0.0)];
+        inputs.extend((1..=1000).map(|i| Input::Move(i as f32, 0.0)));
+        inputs.push(Input::Up(1000.0, 0.0));
+        inputs.push(Input::Down(5.0, 5.0));
+        inputs.push(Input::Move(6.0, 6.0));
+        inputs.push(Input::Key(KeyAction::Home));
+        inputs.push(Input::Move(7.0, 7.0));
+        inputs.push(Input::Move(8.0, 8.0));
+        inputs.push(Input::Up(8.0, 8.0));
+        assert_eq!(
+            coalesce_moves(inputs),
+            [
+                Input::Down(0.0, 0.0),
+                Input::Move(1000.0, 0.0),
+                Input::Up(1000.0, 0.0),
+                Input::Down(5.0, 5.0),
+                Input::Move(6.0, 6.0),
+                Input::Key(KeyAction::Home),
+                Input::Move(8.0, 8.0),
+                Input::Up(8.0, 8.0),
+            ]
+        );
+    }
+
+    /// A scan replaces the list, resolves a `booted` selection when a refresh asked, and an
+    /// AVD that failed to resolve says why instead of asking again.
+    #[test]
+    fn scans_update_the_list_and_selection() {
+        let mut s = init();
+        demo(&mut s);
+        s.offline = false;
+        s.selected = Some("booted".into());
+        s.resolve_pending = true;
+        let mut devices = s.devices.clone();
+        for d in &mut devices {
+            d.state = if d.udid == "pixel_fold" { DeviceState::Booted } else { DeviceState::Shutdown };
+        }
+        assert!(s.apply_scan(scan::Scan { devices: devices.clone(), ..scan::Scan::default() }));
+        assert_eq!(s.selected.as_deref(), Some("pixel_fold"));
+        assert!(s.connect_pending, "waits for a scan that resolves the AVD");
+        let failed = scan::Scan {
+            devices: devices.clone(),
+            selected: Some("pixel_fold".into()),
+            android: Some(Err("pixel_fold: config unreadable".into())),
+            ..scan::Scan::default()
+        };
+        s.apply_scan(failed);
+        assert_eq!(s.status.as_deref(), Some("pixel_fold: config unreadable"));
+        assert!(!s.connect_pending && s.screen.is_none(), "no retry loop for an AVD that can't resolve");
+        assert!(!s.apply_scan(scan::Scan { devices, ..scan::Scan::default() }), "same list: nothing changed");
     }
 
     #[test]
