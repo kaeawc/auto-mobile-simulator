@@ -34,6 +34,22 @@ scripts/android-bench.sh <label> <avd> emu|stock [-no-snapshot-load]   # one boo
 These replace the 2026-11-22 run, whose 1.67 GB peak memory for emu (against 5.09 GB) did not
 hold up when remeasured.
 
+### Idle host CPU
+
+The same API 36 AVD, warm-booted under emu built without and with its network device (#29),
+alternating, 3 runs each, M3 Max, 2026-11-24. Each run waits 60 s after `sys.boot_completed`,
+then takes emu's CPU time over 240 s (`ps -o time`) and counts `SETUP_DATA_CALL` in the radio log
+over the same window. Other work on the host put the load average between 4 and 34 across the
+runs.
+
+| emu | Idle host CPU, median (runs) | Data calls in 240 s |
+| --- | --- | --- |
+| No network device | 65.9% of a core (61.6, 65.9, 66.3) | 276–294 |
+| Link-only virtio-net | 6.0% of a core (5.7, 6.0, 6.6) | 0 |
+
+Without an `eth0`, the guest's telephony retries the data call without a delay; with one, the
+call succeeds once and the guest goes idle.
+
 ## Android farm
 
 Clones of one settled golden AVD booted together, each until it is settled (boot complete and

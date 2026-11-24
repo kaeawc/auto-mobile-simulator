@@ -404,6 +404,9 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     if cfg.rng {
         slots[slots::RNG as usize] = Some(Box::new(virtio::rng::Rng::new()));
     }
+    // eth0, which the radio HAL configures from the modem's data-call reply. Link only for now:
+    // the frames the guest sends are dropped.
+    slots[slots::NET as usize] = Some(Box::new(virtio::net::Net::new(Box::new(virtio::net::LinkOnly))));
     if cfg.sound {
         slots[slots::SOUND as usize] = Some(Box::new(virtio::snd::Snd::new()));
     }

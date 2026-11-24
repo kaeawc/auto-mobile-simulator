@@ -5,6 +5,7 @@ pub mod console;
 pub mod gpu;
 pub mod input;
 pub mod mmio;
+pub mod net;
 pub mod queue;
 pub mod rng;
 pub mod snd;

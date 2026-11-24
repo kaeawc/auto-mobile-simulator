@@ -515,7 +515,13 @@ impl BootPlan {
 
     /// The virtio devices and host services the board gives the guest.
     pub fn devices(&self) -> Vec<&'static str> {
-        let mut out = vec!["virtio-blk x5", "virtio-console (logcat, modem)", "virtio-rng", "virtio-vsock (adb, qemud pipes)"];
+        let mut out = vec![
+            "virtio-blk x5",
+            "virtio-console (logcat, modem)",
+            "virtio-net (link only)",
+            "virtio-rng",
+            "virtio-vsock (adb, qemud pipes)",
+        ];
         out.push(if self.touch_screen {
             "virtio-input: multi-touch, keyboard (qwerty2), rotary"
         } else {
