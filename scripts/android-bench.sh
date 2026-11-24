@@ -20,22 +20,37 @@ case "$kind" in
   stock) bin="$sdk/emulator/emulator" ;;
   *) echo "kind must be emu or stock" >&2; exit 2 ;;
 esac
-now() { python3 -c 'import time;print(time.time())'; }
+# Wall-clock seconds with sub-second precision. One perl start (a few ms, no python) per reading,
+# and readings are taken only at events (start, adb up, boot), never once per poll.
+now() { perl -MTime::HiRes=time -e 'printf "%.3f\n", time'; }
+since() { awk -v a="$(now)" -v b="$1" -v d="${2:-1}" 'BEGIN { printf "%.*f\n", d, a - b }'; }
 t0=$(now)
 env -i HOME="$HOME" USER="$USER" TMPDIR="$TMPDIR" PATH="/usr/bin:/bin:/usr/sbin:/sbin" ANDROID_HOME="$sdk" ANDROID_SDK_ROOT="$sdk" \
   "$bin" -avd "$avd" -port "$port" -no-window -no-audio -no-boot-anim -no-snapshot-save "$@" > "$out/$label.log" 2>&1 &
 pid=$!
-deadline=$(( $(date +%s) + ${BOOT_TIMEOUT:-600} )); state=timeout; t_adb=""; rss=0
-while [ "$(date +%s)" -lt "$deadline" ]; do
+deadline=$(( SECONDS + ${BOOT_TIMEOUT:-600} )); state=timeout; t_adb=""; t_line=""; rss=0; tick=0
+# Poll every POLL seconds (default 0.15), so a sub-second win shows. Per poll: a builtin liveness
+# check and a grep of emu's log for its own `emu: boot completed in X s` line (emu only); adb is
+# asked about the device until it's up, and about sys.boot_completed on each poll for the stock
+# emulator (which prints nothing) or once the log line has appeared (to confirm it). Peak RSS is
+# sampled about once a second, not every poll.
+while [ "$SECONDS" -lt "$deadline" ]; do
   kill -0 $pid 2>/dev/null || { state=exited; break; }
-  # The stock launcher execs a qemu child; count the whole process tree.
-  r=$(ps -o rss= -p $pid $(pgrep -P $pid) 2>/dev/null | awk '{s+=$1} END{print s+0}'); [ "$r" -gt "$rss" ] && rss=$r
-  [ -z "$t_adb" ] && "$adb" -s "$serial" get-state 2>/dev/null | grep -q device && t_adb=$(python3 -c "print(round($(now)-$t0,1))")
-  [ "$("$adb" -s "$serial" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && { state=booted; break; }
-  sleep 1
+  tick=$((tick + 1))
+  if [ $((tick % 7)) -eq 1 ]; then
+    # The stock launcher execs a qemu child; count the whole process tree.
+    r=$(ps -o rss= -p $pid $(pgrep -P $pid) 2>/dev/null | awk '{s+=$1} END{print s+0}'); [ "$r" -gt "$rss" ] && rss=$r
+  fi
+  [ -z "$t_adb" ] && "$adb" -s "$serial" get-state 2>/dev/null | grep -q device && t_adb=$(since "$t0")
+  if [ "$kind" = stock ] || [ -n "$t_line" ] || [ $((tick % 14)) -eq 0 ] || { grep -q '^emu: boot completed' "$out/$label.log" 2>/dev/null && t_line=$(since "$t0" 2); }; then
+    [ "$("$adb" -s "$serial" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && { state=booted; break; }
+  fi
+  sleep "${POLL:-0.15}"
 done
-t_boot=$(python3 -c "print(round($(now)-$t0,1))")
-lat() { local s; s=$(now); "$adb" -s "$serial" shell "$@" >/dev/null 2>&1; python3 -c "print(round($(now)-$s,2))"; }
+t_boot=$(since "$t0")
+# emu's own figure (seconds from its start to the guest's boot event), when it printed one.
+emu_s=$(sed -n 's/^emu: boot completed in \([0-9.]*\)s.*/\1/p' "$out/$label.log" 2>/dev/null | head -1)
+lat() { local s; s=$(now); "$adb" -s "$serial" shell "$@" >/dev/null 2>&1; since "$s" 2; }
 med3() { printf '%s\n%s\n%s\n' "$(lat "$@")" "$(lat "$@")" "$(lat "$@")" | sort -n | sed -n 2p; }
 m=""
 if [ -n "$t_adb" ]; then
@@ -44,7 +59,7 @@ if [ -n "$t_adb" ]; then
   m+=" md5x4=$(lat 'for j in 1 2 3 4; do (dd if=/dev/zero bs=1048576 count=64 2>/dev/null | md5sum >/dev/null) & done; wait')"
   [ "$state" = booted ] && m+=" pm_list=$(med3 pm list packages) am_start_W=$(med3 am start -W -n com.android.settings/.Settings)"
 fi
-line="label=$label kind=$kind state=$state adb_s=${t_adb:-} boot_s=$t_boot peak_rss_mb=$((rss / 1024)) $m"
+line="label=$label kind=$kind state=$state adb_s=${t_adb:-} boot_s=$t_boot emu_boot_s=${emu_s:-} log_line_s=${t_line:-} peak_rss_mb=$((rss / 1024)) $m"
 echo "$line" | tee "$out/$label.result"
 "$adb" -s "$serial" emu kill >/dev/null 2>&1; sleep 3; kill $pid 2>/dev/null; wait $pid 2>/dev/null
 exit 0

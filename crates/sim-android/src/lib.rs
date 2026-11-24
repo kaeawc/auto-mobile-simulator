@@ -23,7 +23,7 @@ use emu_avd::{Avd, Env, NewAvd, Running};
 use sim_core::device::{DeviceInfo, DeviceState, RuntimeInfo, Selection, select};
 use sim_core::form_factor::{FormFactor, InputMethod, Kind, Profile, android_profile};
 use sim_core::frame::Frame;
-use sim_core::gesture::{Phase, Sample};
+use sim_core::gesture::{Phase, Sample, pace, pace_samples};
 use sim_core::hid::{Button, Direction, KEY_LEFT_SHIFT, KeyStroke, keystroke, linux_keycode};
 use sim_core::platform::{AndroidOs, Platform, SubPlatform};
 use sim_core::stream::Input;
@@ -46,6 +46,44 @@ impl Default for Android {
 
 /// A running emulator answers its console within this long of advertising itself.
 const CONSOLE_GRACE: Duration = Duration::from_secs(5);
+
+/// How often a boot wait looks at the child and the log.
+const BOOT_POLL: Duration = Duration::from_millis(50);
+/// How often adb is asked while the log hasn't said the guest booted (emulators that never say).
+const ADB_FALLBACK: Duration = Duration::from_secs(1);
+/// How often adb is asked when it's the only signal, or after the log said boot completed but
+/// adb didn't confirm yet.
+const ADB_RETRY: Duration = Duration::from_millis(250);
+
+/// Follows a log file from a start offset for emu's `emu: boot completed` line, reading only
+/// what was appended since the last look.
+struct LogTail {
+    path: PathBuf,
+    offset: u64,
+    /// The unfinished last line of what has been read.
+    partial: Vec<u8>,
+}
+
+impl LogTail {
+    fn new(path: &Path) -> Self {
+        LogTail { path: path.to_owned(), offset: 0, partial: Vec::new() }
+    }
+
+    /// Reads what's new; whether a complete line announced boot completion.
+    fn saw_boot(&mut self) -> bool {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut f) = std::fs::File::open(&self.path) else { return false };
+        let mut new = Vec::new();
+        if f.seek(SeekFrom::Start(self.offset)).and_then(|_| f.read_to_end(&mut new)).is_err() || new.is_empty() {
+            return false;
+        }
+        self.offset += new.len() as u64;
+        self.partial.extend_from_slice(&new);
+        let Some(end) = self.partial.iter().rposition(|&b| b == b'\n') else { return false };
+        let done: Vec<u8> = self.partial.drain(..=end).collect();
+        String::from_utf8_lossy(&done).lines().any(|l| l.starts_with("emu: boot completed"))
+    }
+}
 
 impl Android {
     /// The SDK and AVD home from the environment, resolved like the SDK tools do.
@@ -78,10 +116,18 @@ impl Android {
     /// AVD name loads just that AVD.
     pub fn device(&self, query: &str) -> Result<Device, String> {
         let running = self.running();
-        if self.has_avd(query) {
+        // One directory scan, not one for the exact-name check and another for the list.
+        let names = self.env.list_avds();
+        if !query.is_empty() && names.iter().any(|n| n == query) {
             return Ok(self.describe(query, &running));
         }
-        let devices: Vec<Device> = self.env.list_avds().into_iter().map(|name| self.describe(&name, &running)).collect();
+        // `booted` is decided by what is running alone: load only those AVDs, not every config.
+        let only_running = query.eq_ignore_ascii_case("booted");
+        let devices: Vec<Device> = names
+            .into_iter()
+            .filter(|name| !only_running || name.eq_ignore_ascii_case(query) || running.iter().any(|r| r.avd_name == *name))
+            .map(|name| self.describe(&name, &running))
+            .collect();
         let infos: Vec<DeviceInfo> = devices.iter().map(|d| d.info.clone()).collect();
         match select(&infos, query) {
             Selection::One(i) => devices.into_iter().nth(i).ok_or_else(|| format!("no device matches `{query}`")),
@@ -257,45 +303,72 @@ impl Device {
     /// `sys.boot_completed` is 1 when adb is available, else until the display has a frame.
     /// The emulator's own output goes to `<avd>/simee/emu.log`.
     pub fn boot(&self, android: &Android, timeout: Duration) -> Result<(), String> {
+        let bin = emu_binary();
+        let signer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/sign-run.sh");
+        let mut cmd = if cfg!(target_os = "macos") && signer.is_file() {
+            let mut c = Command::new(signer);
+            c.arg(&bin);
+            c
+        } else {
+            Command::new(&bin)
+        };
+        cmd.args(["-avd", &self.info.udid, "-no-boot-anim"]);
+        self.boot_with(android, timeout, cmd)
+    }
+
+    /// [`boot`](Self::boot) with the launch command given (its stdout and stderr are replaced by
+    /// the log). Boot is detected from emu's own `emu: boot completed in X s` line, tailed in the
+    /// log from where this launch began: no process per poll, and the lag is one poll (50 ms).
+    /// adb is the fallback for an emulator that never prints it (the stock one, an older emu),
+    /// consulted every [`ADB_FALLBACK`] and once more to confirm after the line appears. A child
+    /// that exits fails the wait at once instead of at the timeout.
+    fn boot_with(&self, android: &Android, timeout: Duration, mut cmd: Command) -> Result<(), String> {
         let avd = self.avd()?;
         let deadline = Instant::now() + timeout;
+        let log_dir = emu_avd::state_dir(&avd.dir);
+        let log_path = log_dir.join("emu.log");
         let mut child = None;
+        let mut tail = None;
         if self.running.is_none() {
-            let log_dir = emu_avd::state_dir(&avd.dir);
             std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
-            let log = std::fs::File::create(log_dir.join("emu.log")).map_err(|e| e.to_string())?;
-            let bin = emu_binary();
-            let signer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/sign-run.sh");
-            let mut cmd = if cfg!(target_os = "macos") && signer.is_file() {
-                let mut c = Command::new(signer);
-                c.arg(&bin);
-                c
-            } else {
-                Command::new(&bin)
-            };
+            let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
+            // Truncated just now: this launch's output starts at offset 0.
+            tail = Some(LogTail::new(&log_path));
             let err = log.try_clone().map_err(|e| e.to_string())?;
-            let spawned = cmd.args(["-avd", &self.info.udid, "-no-boot-anim"]).stdin(Stdio::null()).stdout(log).stderr(err).spawn();
-            child = Some(spawned.map_err(|e| format!("starting {}: {e}", bin.display()))?);
+            let spawned = cmd.stdin(Stdio::null()).stdout(log).stderr(err).spawn();
+            child = Some(spawned.map_err(|e| format!("starting {}: {e}", cmd.get_program().to_string_lossy()))?);
         }
         let adb = android.adb();
+        let find = || android.running().into_iter().find(|r| r.avd_name == self.info.udid);
+        let mut printed = false;
+        // Our own launch is watched through its log: adb is only the slow fallback. An emulator
+        // already running has no log to read from its start, so adb answers at once.
+        let slow = tail.is_some();
+        let mut next_check = if slow { Instant::now() + ADB_FALLBACK } else { Instant::now() };
         loop {
             if let Some(c) = child.as_mut()
                 && let Ok(Some(status)) = c.try_wait()
             {
-                let log = emu_avd::state_dir(&avd.dir).join("emu.log");
-                let tail = std::fs::read_to_string(&log).unwrap_or_default();
-                let last = tail.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_owned();
-                return Err(format!("emu exited ({status}) before booting: {last} (log: {})", log.display()));
+                let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+                let last = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_owned();
+                return Err(format!("emu exited ({status}) before booting: {last} (log: {})", log_path.display()));
             }
-            if let Some(r) = android.running().into_iter().find(|r| r.avd_name == self.info.udid)
-                && booted(&r, adb.as_deref())
-            {
-                return Ok(());
+            if !printed && tail.as_mut().is_some_and(LogTail::saw_boot) {
+                printed = true;
+                next_check = Instant::now(); // confirm now
+            }
+            if Instant::now() >= next_check {
+                next_check = Instant::now() + if printed || !slow { ADB_RETRY } else { ADB_FALLBACK };
+                if let Some(r) = find()
+                    && booted(&r, adb.as_deref())
+                {
+                    return Ok(());
+                }
             }
             if Instant::now() >= deadline {
                 return Err(format!("{} did not finish booting within {}s", self.info.name, timeout.as_secs()));
             }
-            sleep(Duration::from_millis(500));
+            sleep(BOOT_POLL);
         }
     }
 
@@ -343,11 +416,14 @@ impl Device {
     /// Plays touch samples (device pixels) over one display connection.
     pub fn play(&self, samples: &[Sample]) -> Result<(), String> {
         self.with_display(self.touch_screen()?, |display| {
-            for s in samples {
-                sleep(s.delay);
-                display.send(&Input::Touch { x: s.point.x as f32, y: s.point.y as f32, phase: s.phase })?;
-            }
-            Ok(())
+            // Against deadlines from the first sample, so send costs and oversleeps don't stretch it.
+            let start = Instant::now();
+            pace_samples(
+                samples,
+                || start.elapsed(),
+                sleep,
+                |s| display.send(&Input::Touch { x: s.point.x as f32, y: s.point.y as f32, phase: s.phase }),
+            )
         })
     }
 
@@ -374,12 +450,12 @@ impl Device {
         let mut lines = vec![format!("touchpad {} {} down", from.0, from.1)];
         lines.extend((1..=STEPS).map(|i| format!("touchpad {} {} move", lerp(from.0, to.0, i), lerp(from.1, to.1, i))));
         lines.push(format!("touchpad {} {} up", to.0, to.1));
-        let pause = duration / STEPS;
-        for line in lines {
-            self.console(&[line])?;
-            sleep(pause);
-        }
-        Ok(())
+        // One console session for the whole swipe, its steps on deadlines.
+        let mut session = console::Session::open(self.running()?.console_port)?;
+        let mut delays = vec![duration / STEPS; lines.len()];
+        delays[0] = Duration::ZERO;
+        let start = Instant::now();
+        pace(&delays, || start.elapsed(), sleep, |i| session.command(&lines[i]).map(drop))
     }
 
     /// The touchpad's size, if the AVD has one.
@@ -441,6 +517,30 @@ impl Device {
     pub fn button(&self, button: Button, direction: Direction) -> Result<(), String> {
         let key = button.android_key().ok_or_else(|| format!("the {} button doesn't exist on Android", button.as_str()))?;
         self.console(&[format!("event send EV_KEY:{key}:{}", u8::from(direction == Direction::Down))]).map(drop)
+    }
+
+    /// Presses a hardware button, holds it for `hold`, and releases it, in one console session
+    /// (down and up used to be two sessions).
+    pub fn press_button(&self, button: Button, hold: Duration) -> Result<(), String> {
+        let key = button.android_key().ok_or_else(|| format!("the {} button doesn't exist on Android", button.as_str()))?;
+        self.press_key_event(key, hold)
+    }
+
+    /// Presses a key by HID usage, holds it for `hold`, and releases it, in one console session.
+    pub fn press_key(&self, usage: u32, hold: Duration) -> Result<(), String> {
+        let code = linux_keycode(usage).ok_or_else(|| format!("HID usage {usage:#x} has no Android key"))?;
+        self.press_key_event(&code.to_string(), hold)
+    }
+
+    fn press_key_event(&self, key: &str, hold: Duration) -> Result<(), String> {
+        let (down, up) = (format!("event send EV_KEY:{key}:1"), format!("event send EV_KEY:{key}:0"));
+        if hold.is_zero() {
+            return self.console(&[down, up]).map(drop);
+        }
+        let mut session = console::Session::open(self.running()?.console_port)?;
+        session.command(&down)?;
+        sleep(hold);
+        session.command(&up).map(drop)
     }
 
     /// Presses or releases a key by HID usage.
@@ -772,6 +872,142 @@ mod tests {
         let glasses = f.android.device("glasses").expect("glasses");
         assert_eq!(glasses.touchpad_swipe((0, 0), (1542, 10), Duration::ZERO), Err("the touchpad is 1542x297".into()));
         assert_eq!(glasses.touchpad(1, 1, "tap"), Err("glasses isn't running; boot it first".into()));
+    }
+
+    /// A fake `adb` that counts its runs in `<root>/adb-runs` and answers `1`.
+    fn fake_adb(f: &Fixture) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = f.root.join("sdk/platform-tools");
+        std::fs::create_dir_all(&dir).expect("platform-tools");
+        let adb = dir.join("adb");
+        std::fs::write(&adb, format!("#!/bin/sh\necho run >> {}/adb-runs\necho 1\n", f.root.display())).expect("adb");
+        std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        f.root.join("adb-runs")
+    }
+
+    fn adb_runs(counter: &Path) -> usize {
+        std::fs::read_to_string(counter).map(|t| t.lines().count()).unwrap_or(0)
+    }
+
+    fn sh(script: &str) -> Command {
+        let mut c = Command::new("sh");
+        c.args(["-c", script]);
+        c
+    }
+
+    #[test]
+    fn boot_is_seen_in_the_log_with_one_adb_confirmation() {
+        let f = fixture("bootlog");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let runs = fake_adb(&f);
+        let d = f.android.device("phone").expect("stopped");
+        let _fake = fake_emulator(&f.android, "phone"); // the advertisement and console of the "launched" emu
+        let t = Instant::now();
+        d.boot_with(&f.android, Duration::from_secs(30), sh("sleep 0.5; echo 'emu: boot completed in 0.5s'; sleep 1")).expect("boots");
+        let took = t.elapsed();
+        println!("detected {:?} after the line", took.saturating_sub(Duration::from_millis(500)));
+        assert!(took >= Duration::from_millis(500), "not before the line: {took:?}");
+        assert!(took < Duration::from_millis(1500), "within a poll or two of the line: {took:?}");
+        assert_eq!(adb_runs(&runs), 1, "no adb until the line, then one confirmation");
+    }
+
+    #[test]
+    fn an_emu_that_dies_fails_the_boot_at_once() {
+        let f = fixture("bootdies");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let runs = fake_adb(&f);
+        let d = f.android.device("phone").expect("stopped");
+        let t = Instant::now();
+        let err = d.boot_with(&f.android, Duration::from_secs(60), sh("echo 'no hypervisor' >&2; exit 3")).expect_err("dies");
+        assert!(err.starts_with("emu exited") && err.contains("no hypervisor"), "{err}");
+        assert!(t.elapsed() < Duration::from_secs(5), "not the 60 s timeout");
+        assert_eq!(adb_runs(&runs), 0);
+    }
+
+    #[test]
+    fn an_emu_that_never_prints_boot_is_found_by_adb() {
+        let f = fixture("bootadb");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let runs = fake_adb(&f);
+        let d = f.android.device("phone").expect("stopped");
+        let _fake = fake_emulator(&f.android, "phone");
+        d.boot_with(&f.android, Duration::from_secs(30), sh("echo started; sleep 3")).expect("boots by adb");
+        assert!(adb_runs(&runs) >= 1);
+    }
+
+    #[test]
+    fn log_tail_reads_appended_lines_once_complete() {
+        use std::io::Write;
+        let dir = f_dir("tail-line");
+        let path = dir.join("emu.log");
+        std::fs::write(&path, "starting\n").expect("write");
+        let mut tail = LogTail::new(&path);
+        assert!(!tail.saw_boot());
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).expect("open");
+        file.write_all(b"emu: boot comp").expect("write");
+        assert!(!tail.saw_boot(), "a partial line isn't the line");
+        file.write_all(b"leted in 9.1s\nmore\n").expect("write");
+        assert!(tail.saw_boot());
+        assert!(!tail.saw_boot(), "seen lines aren't read again");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn f_dir(tag: &str) -> PathBuf {
+        let dir = PathBuf::from("/tmp").join(format!("sa-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    #[test]
+    fn booted_resolves_by_what_is_running() {
+        let f = fixture("booted");
+        for n in ["a", "b", "c"] {
+            f.android.create(n, "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        }
+        assert!(f.android.device("booted").is_err(), "nothing is running");
+        let _fake = fake_emulator(&f.android, "b");
+        let d = f.android.device("booted").expect("b is the booted one");
+        assert_eq!((d.info.udid.as_str(), d.info.state, d.avd.is_some()), ("b", DeviceState::Booted, true));
+        assert_eq!(f.android.device("c").map(|d| d.info.state), Ok(DeviceState::Shutdown));
+        assert!(f.android.device("nope").is_err());
+    }
+
+    #[test]
+    fn held_buttons_and_keys_go_down_then_up() {
+        let f = fixture("press");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let fake = fake_emulator(&f.android, "phone");
+        let d = f.android.device("phone").expect("running");
+        d.press_button(Button::Home, Duration::from_millis(40)).expect("home");
+        d.press_key(0x28, Duration::ZERO).expect("return");
+        d.press_key(0x28, Duration::from_millis(15)).expect("return held");
+        assert_eq!(
+            wait_for(&fake.console, 6),
+            [
+                "event send EV_KEY:KEY_HOME:1",
+                "event send EV_KEY:KEY_HOME:0",
+                "event send EV_KEY:28:1",
+                "event send EV_KEY:28:0",
+                "event send EV_KEY:28:1",
+                "event send EV_KEY:28:0",
+            ]
+        );
+        assert!(d.press_button(Button::Siri, Duration::ZERO).expect_err("no Siri").contains("doesn't exist on Android"));
+    }
+
+    #[test]
+    fn touchpad_swipes_run_in_order_over_one_session() {
+        let f = fixture("swipe");
+        add_image(&f, "android-36/ai-glasses/arm64-v8a", "ai-glasses");
+        f.android.create("glasses", "system-images;android-36;ai-glasses;arm64-v8a", None).expect("glasses");
+        let fake = fake_emulator(&f.android, "glasses");
+        let d = f.android.device("glasses").expect("running");
+        let t = Instant::now();
+        d.touchpad_swipe((0, 0), (100, 10), Duration::from_millis(100)).expect("swipe");
+        assert!(t.elapsed() >= Duration::from_millis(100), "the swipe takes its duration");
+        let got = wait_for(&fake.console, 12);
+        assert_eq!(got.len(), 12);
+        assert_eq!((got[0].as_str(), got[1].as_str(), got[11].as_str()), ("touchpad 0 0 down", "touchpad 10 1 move", "touchpad 100 10 up"));
     }
 
     #[test]
