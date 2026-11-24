@@ -551,7 +551,13 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
         }
         Cmd::Settle { device, timeout } => {
             let r = call("settle", json!({"device": device, "timeout_s": timeout}))?;
-            writeln!(out, "settle_s={} procs={} cpu_pct={}", r["settle_s"], r["procs"], r["cpu_pct"])?;
+            let mut line = format!("settle_s={} procs={} cpu_pct={}", r["settle_s"], r["procs"], r["cpu_pct"]);
+            for key in ["foreground_cpu_pct", "background_cpu_pct"] {
+                if let Some(v) = r.get(key) {
+                    line.push_str(&format!(" {key}={v}"));
+                }
+            }
+            writeln!(out, "{line}")?;
         }
         Cmd::Profile { device, name, undo } => {
             let r = call("profile", json!({"device": device, "name": name, "undo": undo}))?;
@@ -686,7 +692,19 @@ fn boot_line(d: &Value) -> String {
         return format!("device={} error={}", text(&d["device"]), text(e));
     }
     let mut line = format!("device={} boot_s={}", text(&d["device"]), d["boot_s"]);
-    for key in ["settled", "settle_s", "waited_s", "procs", "cpu_pct", "started_s", "done_s", "console_port", "serial"] {
+    for key in [
+        "settled",
+        "settle_s",
+        "waited_s",
+        "procs",
+        "cpu_pct",
+        "foreground_cpu_pct",
+        "background_cpu_pct",
+        "started_s",
+        "done_s",
+        "console_port",
+        "serial",
+    ] {
         if let Some(v) = d.get(key) {
             line.push_str(&format!(" {key}={}", text(v)));
         }
@@ -695,7 +713,12 @@ fn boot_line(d: &Value) -> String {
         line.push_str(&format!(" profile={}", text(&p["name"])));
         match p.get("error") {
             Some(e) => line.push_str(&format!(" profile_error={}", text(e))),
-            None => line.push_str(&format!(" disabled={} failed={}", p["disabled"], items(&p["failed"]).len())),
+            None => {
+                line.push_str(&format!(" disabled={} failed={}", p["disabled"], items(&p["failed"]).len()));
+                if let Some(a) = p.get("already") {
+                    line.push_str(&format!(" already={a}"));
+                }
+            }
         }
         line.push_str(&format!(" profile_s={}", p["took_s"]));
     }
@@ -983,6 +1006,15 @@ mod tests {
         assert_eq!(
             boot_line(&ok),
             "device=U boot_s=1.5 settled=true settle_s=9.0 procs=280 cpu_pct=3.2 profile=slim disabled=60 failed=0 profile_s=4.5"
+        );
+        // The CPU split and a re-applied profile's `already` show when the server reports them.
+        let split = json!({"device": "U", "boot_s": 1.5, "settled": true, "settle_s": 9.0, "procs": 117, "cpu_pct": 5.6,
+            "foreground_cpu_pct": 2.6, "background_cpu_pct": 3.0,
+            "profile": {"name": "slim", "disabled": 1, "already": 57, "failed": [], "took_s": 1.1}});
+        assert_eq!(
+            boot_line(&split),
+            "device=U boot_s=1.5 settled=true settle_s=9.0 procs=117 cpu_pct=5.6 foreground_cpu_pct=2.6 background_cpu_pct=3.0 \
+             profile=slim disabled=1 failed=0 already=57 profile_s=1.1"
         );
         assert_eq!(boot_line(&json!({"device": "V", "error": "no device matches `V`"})), "device=V error=no device matches `V`");
         let avd = json!({"device": "farm-1", "boot_s": 12.3, "console_port": 5556, "serial": "emulator-5556"});

@@ -102,6 +102,7 @@ impl PipeService for SensorService {
         let shared = Arc::new(Stream::default());
         let (s, sensors, start) = (shared.clone(), self.sensors.clone(), Instant::now());
         let _ = std::thread::Builder::new().name(format!("sensors-{}", ctx.conn)).spawn(move || {
+            crate::device_thread();
             // Every enabled sensor goes out each tick, changed or not, as stock's
             // `_hwSensorClient_tick` does (the HAL reports continuous sensors at their rate).
             // With none enabled the thread sleeps until one is.

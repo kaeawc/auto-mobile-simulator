@@ -229,6 +229,9 @@ impl Cpus {
     }
 
     fn thread_inner(&self, idx: usize, boot: Option<(u64, u64)>) -> Result<(), emu_hvf::Error> {
+        // The guest waits on this thread: keep it eligible for performance cores even when emu's
+        // parent runs at a low QoS. Not inherited by threads it spawns (see `set_qos`).
+        emu_hvf::host::set_qos(emu_hvf::host::Qos::UserInitiated);
         let vcpu = Vcpu::new()?;
         vcpu.set_sys_reg(SysReg::MPIDR_EL1, idx as u64)?;
         vcpu.set_vtimer_offset(self.vtimer_offset)?;

@@ -134,13 +134,27 @@ pub struct Queue {
     quiet: bool,
     /// The last indirect table read, kept for its allocation.
     indirect: Vec<u8>,
+    /// Runs when [`Queue::pop_draining`] finds the ring empty, before it re-enables
+    /// notifications: a test driver publishes there to hit the lost-wakeup window exactly.
+    #[cfg(test)]
+    pub(crate) on_empty: Option<Box<dyn FnMut() + Send>>,
 }
 
 const VIRTQ_USED_F_NO_NOTIFY: u16 = 1;
 
 impl Queue {
     pub fn new(cfg: QueueConfig, event_idx: bool) -> Queue {
-        Queue { cfg, next_avail: 0, next_used: 0, event_idx, signalled_used: None, quiet: false, indirect: Vec::new() }
+        Queue {
+            cfg,
+            next_avail: 0,
+            next_used: 0,
+            event_idx,
+            signalled_used: None,
+            quiet: false,
+            indirect: Vec::new(),
+            #[cfg(test)]
+            on_empty: None,
+        }
     }
 
     pub fn size(&self) -> u16 {
@@ -280,6 +294,34 @@ impl Queue {
         self.cfg.size != 0 && mem.read_u16(self.cfg.avail + 2).is_ok_and(|i| i != self.next_avail)
     }
 
+    /// [`Queue::pop_into`] for a device that serves a kick by draining the ring, as blk's worker
+    /// does: the first call of a drain turns kicks off ([`Queue::disable_notify`]), so the driver
+    /// publishing more meanwhile costs it no exit; on an empty ring it turns them back on and
+    /// rechecks ([`Queue::enable_notify`]), so an entry published in between is popped here
+    /// rather than left waiting for a kick that never comes. `Ok(false)` means the ring is empty
+    /// with kicks on: the device may sleep. A device that stops early (an error here, or its own
+    /// back-pressure) must call [`Queue::enable_notify`] itself; on `Err` this already has.
+    pub fn pop_draining(&mut self, mem: &GuestRam, chain: &mut Chain) -> Result<bool, QueueError> {
+        loop {
+            self.disable_notify(mem);
+            match self.pop_into(mem, chain) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(e) => {
+                    self.enable_notify(mem);
+                    return Err(e);
+                }
+            }
+            #[cfg(test)]
+            if let Some(f) = self.on_empty.as_mut() {
+                f();
+            }
+            if !self.enable_notify(mem) {
+                return Ok(false);
+            }
+        }
+    }
+
     /// Returns a chain to the driver with `len` bytes written into its buffers.
     pub fn add_used(&mut self, mem: &GuestRam, head: u16, len: u32) -> Result<(), QueueError> {
         let size = self.cfg.size;
@@ -362,6 +404,10 @@ pub(crate) mod tests {
             let slot = self.cfg.avail + 4 + u64::from(self.avail_idx % self.cfg.size) * 2;
             mem.write_u16(slot, head).expect("ring");
             self.avail_idx = self.avail_idx.wrapping_add(1);
+            // Buffers, descriptors and ring entry before the index that publishes them (the
+            // driver's virtio_wmb): a device that rechecks the ring without a kick reads them
+            // with no other synchronisation.
+            fence(Ordering::Release);
             mem.write_u16(self.cfg.avail + 2, self.avail_idx).expect("idx");
             head
         }
@@ -411,6 +457,18 @@ pub(crate) mod tests {
             new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(old)
         }
 
+        /// Linux's `virtqueue_enable_cb` once the driver has read the used ring up to `seen`:
+        /// under event-idx, interrupt at the next used entry (`used_event`); else clear
+        /// `VIRTQ_AVAIL_F_NO_INTERRUPT`.
+        pub fn enable_cb(&self, mem: &GuestRam, seen: u16, event_idx: bool) {
+            if event_idx {
+                mem.write_u16(self.cfg.avail + 4 + u64::from(self.cfg.size) * 2, seen).expect("used_event");
+            } else {
+                mem.write_u16(self.cfg.avail, 0).expect("avail flags");
+            }
+            fence(Ordering::SeqCst);
+        }
+
         pub fn avail_idx(&self) -> u16 {
             self.avail_idx
         }
@@ -421,7 +479,10 @@ pub(crate) mod tests {
         }
 
         pub fn used_idx(&self, mem: &GuestRam) -> u16 {
-            mem.read_u16(self.cfg.used + 2).expect("used idx")
+            let idx = mem.read_u16(self.cfg.used + 2).expect("used idx");
+            // Used entries and buffers are read after the index (pairs with add_used's release).
+            fence(Ordering::Acquire);
+            idx
         }
     }
 
@@ -615,6 +676,119 @@ pub(crate) mod tests {
             let old = drv.avail_idx();
             drv.push(&mem, &[buf]);
             assert!(drv.needs_kick(&mem, old, event_idx), "event_idx={event_idx}: kicks back on");
+        }
+    }
+
+    /// A burst the driver publishes while the device drains costs one kick, not one per entry,
+    /// in both suppression modes; and once the drain ends kicks are back on.
+    #[test]
+    fn a_burst_published_while_draining_costs_one_kick() {
+        const N: u16 = 32;
+        for event_idx in [true, false] {
+            let mem = GuestRam::new(RAM_BASE, 0x10_0000).expect("ram");
+            let mut drv = Driver::new(64);
+            let mut q = Queue::new(drv.cfg, event_idx);
+            let buf = (RAM_BASE + 0x9000, 1, true);
+            let publish = |drv: &mut Driver| {
+                let old = drv.avail_idx();
+                drv.push(&mem, &[buf]);
+                u32::from(drv.needs_kick(&mem, old, event_idx))
+            };
+            let mut kicks = publish(&mut drv);
+            let mut chain = Chain::default();
+            let mut served = 0;
+            // The device serves one entry per step; the driver publishes the rest meanwhile.
+            while q.pop_draining(&mem, &mut chain).expect("pop") {
+                served += 1;
+                if served < N {
+                    kicks += publish(&mut drv);
+                }
+            }
+            assert_eq!((served, kicks), (N, 1), "event_idx={event_idx}");
+            kicks += publish(&mut drv);
+            assert_eq!(kicks, 2, "event_idx={event_idx}: an idle device is kicked again");
+        }
+    }
+
+    /// The lost-wakeup window: the driver publishes after the device's last pop came back empty
+    /// but before it re-enabled kicks, so the driver sees kicks off and doesn't kick. The
+    /// recheck after re-enabling (ordered by its SeqCst fence) still serves the entry.
+    #[test]
+    fn an_entry_published_as_kicks_come_back_on_is_still_served() {
+        use std::sync::{Arc, Mutex};
+        for event_idx in [true, false] {
+            let mem = Arc::new(GuestRam::new(RAM_BASE, 0x10_0000).expect("ram"));
+            let drv = Arc::new(Mutex::new(Driver::new(8)));
+            let mut q = Queue::new(drv.lock().expect("drv").cfg, event_idx);
+            let buf = (RAM_BASE + 0x9000, 1, true);
+            drv.lock().expect("drv").push(&mem, &[buf]);
+            let missed = Arc::new(Mutex::new(Vec::new()));
+            let (m, d, missed2) = (mem.clone(), drv.clone(), missed.clone());
+            let mut fired = false;
+            q.on_empty = Some(Box::new(move || {
+                if !std::mem::replace(&mut fired, true) {
+                    let mut d = d.lock().expect("drv");
+                    let old = d.avail_idx();
+                    d.push(&m, &[buf]);
+                    missed2.lock().expect("missed").push(!d.needs_kick(&m, old, event_idx));
+                }
+            }));
+            let mut chain = Chain::default();
+            let mut served = 0;
+            while q.pop_draining(&mem, &mut chain).expect("pop") {
+                served += 1;
+            }
+            assert_eq!(*missed.lock().expect("missed"), [true], "event_idx={event_idx}: the driver skipped its kick");
+            assert_eq!(served, 2, "event_idx={event_idx}: the recheck found the entry");
+        }
+    }
+
+    /// A driver thread and a device thread race on avail.idx and the suppression state, the
+    /// driver kicking only when `virtqueue_kick_prepare` would: every entry is served.
+    #[test]
+    fn a_racing_driver_never_loses_a_wakeup() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU16;
+        use std::time::{Duration, Instant};
+        const N: u32 = 20_000;
+        for event_idx in [true, false] {
+            let mem = Arc::new(GuestRam::new(RAM_BASE, 0x10_0000).expect("ram"));
+            let mut drv = Driver::new(16);
+            let mut q = Queue::new(drv.cfg, event_idx);
+            let bell = Arc::new(super::super::Doorbell::default());
+            let served = Arc::new(AtomicU16::new(0));
+            let (m, b, s) = (mem.clone(), bell.clone(), served.clone());
+            let device = std::thread::spawn(move || {
+                let mut chain = Chain::default();
+                while b.wait() {
+                    while q.pop_draining(&m, &mut chain).expect("pop") {
+                        q.add_used(&m, chain.head, 0).expect("used");
+                        s.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+            let (mut sent, mut kicks, mut last) = (0u32, 0u32, (0u16, Instant::now()));
+            while sent < N || served.load(Ordering::SeqCst) != N as u16 {
+                let done = served.load(Ordering::SeqCst);
+                if done != last.0 {
+                    last = (done, Instant::now());
+                }
+                assert!(last.1.elapsed() < Duration::from_secs(10), "event_idx={event_idx}: lost wakeup after {sent} sent");
+                if sent < N && drv.avail_idx().wrapping_sub(done) < 4 {
+                    let old = drv.avail_idx();
+                    drv.push(&mem, &[(RAM_BASE + 0x9000, 1, true)]);
+                    sent += 1;
+                    if drv.needs_kick(&mem, old, event_idx) {
+                        kicks += 1;
+                        bell.ring();
+                    }
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            bell.stop();
+            device.join().expect("device");
+            assert!(kicks <= N);
         }
     }
 

@@ -356,6 +356,7 @@ impl VirtioDevice for Snd {
         let h = std::thread::Builder::new()
             .name("virtio-snd".into())
             .spawn(move || {
+                crate::device_thread();
                 let mut deadline: Option<Instant> = None;
                 loop {
                     let msg = match deadline {

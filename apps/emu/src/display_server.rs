@@ -169,6 +169,8 @@ fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<e
         }
     }
     wants.done.store(true, Ordering::Relaxed);
+    // Its frame thread may be waiting for a frame on a static screen: end that wait now.
+    display.wake();
 }
 
 /// One frame, ready to send once the capture is released.
@@ -192,10 +194,10 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
     let mut ring_failed = false;
     let mut stats = std::env::var_os("EMU_FRAME_STATS").is_some().then(Stats::default);
     while !wants.done.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
-        // Wait for a new frame (woken by the frame, or every 100 ms to notice the client or the
-        // emulator going away); then, if it's early, wait until it may go and send the newest by
-        // then. A client that was idle gets it at once.
-        let n = display.wait_newer(sent, Duration::from_millis(100));
+        // Wait for a new frame (woken by the frame, or by `wake` when the client goes away; the
+        // 1 s timeout only notices the emulator stopping); then, if it's early, wait until it may
+        // go and send the newest by then. A client that was idle gets it at once.
+        let n = display.wait_newer(sent, Duration::from_secs(1));
         let mw = wants.max_width.load(Ordering::Relaxed);
         if mw == 0 || n == sent {
             continue;
@@ -604,6 +606,23 @@ mod tests {
         wait_until("the ring's removal", || rig.rings().is_empty());
     }
 
+    /// On a static screen a stream's frame thread waits with a 1 s backstop; a client going away
+    /// wakes it, so its ring goes at once, not up to a second later.
+    #[test]
+    fn a_closed_client_ends_its_stream_at_once_on_a_static_screen() {
+        let rig = Rig::new("close");
+        let (d, reader) = rig.connect(true, 720);
+        let mut frames = Frames::new(reader);
+        rig.store.posted(1440, 200);
+        frames.next_frame().expect("frame");
+        // Let the frame thread go back to waiting for a frame that won't come.
+        std::thread::sleep(Duration::from_millis(50));
+        let closed = Instant::now();
+        drop((frames, d));
+        wait_until("the ring's removal", || rig.rings().is_empty());
+        assert!(closed.elapsed() < Duration::from_millis(500), "took {:?}", closed.elapsed());
+    }
+
     #[test]
     fn socket_clients_get_the_same_frames_and_share_one_readback() {
         let rig = Rig::new("sock");
@@ -768,7 +787,10 @@ mod tests {
         let mut left: Vec<String> =
             std::fs::read_dir(dir.join("simee")).expect("dir").flatten().filter_map(|e| e.file_name().into_string().ok()).collect();
         left.sort();
-        assert_eq!(left, ["frames-2147483646-0.png", mine.as_str(), "frames-x-1.ring"]);
+        // Sorted the same way: where our own ring falls depends on the digits of our pid.
+        let mut want = vec!["frames-2147483646-0.png".to_owned(), mine, "frames-x-1.ring".to_owned()];
+        want.sort();
+        assert_eq!(left, want);
         std::fs::remove_dir_all(&dir).ok();
     }
 

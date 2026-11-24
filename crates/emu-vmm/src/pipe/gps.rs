@@ -139,6 +139,7 @@ impl PipeService for GpsService {
         let stop = Arc::new(AtomicBool::new(false));
         let (gps, s) = (self.gps.clone(), stop.clone());
         let _ = std::thread::Builder::new().name(format!("gps-{}", ctx.conn)).spawn(move || {
+            crate::device_thread();
             // A new fix goes out right away; the current one is repeated every second. In
             // between the thread sleeps on the fix (no polling: one wakeup per sentence).
             let (mut seen, mut due) = (u64::MAX, Instant::now());

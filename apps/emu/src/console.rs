@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 use emu_vmm::Inputs;
@@ -426,7 +426,7 @@ pub fn serve(port: u16, info: ConsoleInfo) -> Result<()> {
     std::thread::Builder::new().name("console".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
             let info = info.clone();
-            std::thread::spawn(move || {
+            let _ = std::thread::Builder::new().name("console-session".into()).spawn(move || {
                 let _ = session(stream, &info);
             });
         }
@@ -471,7 +471,10 @@ fn session(stream: TcpStream, info: &ConsoleInfo) -> std::io::Result<()> {
             (_, false) => "KO: unknown command, try 'help'".to_string(),
             ("kill", true) => {
                 out.write_all(b"OK: killing emulator, bye bye\r\n")?;
-                info.stop.store(true, Ordering::SeqCst);
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                emu_vmm::request_stop(&info.stop);
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                info.stop.store(true, std::sync::atomic::Ordering::SeqCst);
                 return Ok(());
             }
             (_, true) => command(info, &words),

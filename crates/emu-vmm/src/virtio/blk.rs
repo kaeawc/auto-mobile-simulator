@@ -113,6 +113,7 @@ impl VirtioDevice for Blk {
         let handle = std::thread::Builder::new()
             .name(format!("blk-{}", self.serial))
             .spawn(move || {
+                crate::device_thread();
                 while b.wait() {
                     w.drain();
                 }

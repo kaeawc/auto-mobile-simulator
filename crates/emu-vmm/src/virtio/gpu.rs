@@ -11,8 +11,8 @@ use std::thread::JoinHandle;
 use emu_gfxstream::{Backing, Box3, Fence, Renderer, ResourceCreateArgs};
 use emu_hvf::{GuestRam, Vm};
 
-use super::mmio::F_RING_INDIRECT_DESC;
-use super::queue::Queue;
+use super::mmio::{F_RING_EVENT_IDX, F_RING_INDIRECT_DESC};
+use super::queue::{Chain, Queue};
 use super::{Activation, INT_USED_RING, Interrupt, VirtioDevice};
 use crate::display::DisplaySink;
 
@@ -129,7 +129,9 @@ impl VirtioDevice for Gpu {
         ID_GPU
     }
     fn features(&self) -> u64 {
-        F_VIRGL | F_RESOURCE_BLOB | F_CONTEXT_INIT | F_RING_INDIRECT_DESC
+        // Event-idx: the worker drains both queues with kicks off, so commands the guest
+        // queues while one runs (a long SUBMIT_3D, a flush) cost it no exit.
+        F_VIRGL | F_RESOURCE_BLOB | F_CONTEXT_INIT | F_RING_INDIRECT_DESC | F_RING_EVENT_IDX
     }
     fn num_queues(&self) -> usize {
         2
@@ -156,11 +158,12 @@ impl VirtioDevice for Gpu {
         *FENCE_SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(self.events.clone());
         let capsets: Vec<u32> =
             emu_gfxstream::capset::ALL.iter().copied().filter(|&c| self.cfg.renderer.capset_info(c).is_some()).collect();
+        let event_idx = act.features & F_RING_EVENT_IDX != 0;
         let mut w = Worker {
             mem: act.mem,
             irq: act.irq,
-            ctrl: Queue::new(ctrl, false),
-            cursor: cursor.map(|c| Queue::new(c, false)),
+            ctrl: Queue::new(ctrl, event_idx),
+            cursor: cursor.map(|c| Queue::new(c, event_idx)),
             cfg: self.cfg.clone(),
             capsets,
             resources: HashMap::new(),
@@ -172,6 +175,7 @@ impl VirtioDevice for Gpu {
         let handle = std::thread::Builder::new()
             .name("gpu".into())
             .spawn(move || {
+                crate::device_thread();
                 w.run(&rx);
                 w.teardown();
                 rx
@@ -336,23 +340,25 @@ impl Worker {
 
     /// Runs every available request; returns whether the control and cursor queues got used
     /// entries.
+    /// Both queues are drained with kicks off ([`Queue::pop_draining`]).
     fn process(&mut self) -> (bool, bool) {
         let (mut used, mut cursor_used) = (false, false);
+        let mut chain = Chain::default();
         if let Some(q) = self.cursor.as_mut() {
-            while let Ok(Some(c)) = q.pop(&self.mem) {
-                let _ = q.add_used(&self.mem, c.head, 0);
+            while let Ok(true) = q.pop_draining(&self.mem, &mut chain) {
+                let _ = q.add_used(&self.mem, chain.head, 0);
                 cursor_used = true;
             }
         }
         loop {
-            let chain = match self.ctrl.pop(&self.mem) {
-                Ok(Some(c)) => c,
-                Ok(None) => break,
+            match self.ctrl.pop_draining(&self.mem, &mut chain) {
+                Ok(true) => {}
+                Ok(false) => break,
                 Err(e) => {
                     eprintln!("emu: gpu ctrl: {e}");
                     break;
                 }
-            };
+            }
             let mut req = std::mem::take(&mut self.req);
             if chain.read_all_into(&self.mem, 32 << 20, &mut req).is_err() {
                 req.clear();

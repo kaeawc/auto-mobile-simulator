@@ -19,7 +19,7 @@ use sim_core::worker::Workers;
 use sim_coresim::{Appearance, Context, Device, Direction, Display, Hid, Orientation, StateWatch, StatusBar, WatchGesture};
 
 use crate::params::{
-    button, crown_delta, err, need_bool, need_f64, need_str, on_carplay, opt_form_factor, opt_orientation, opt_u64, pairs,
+    button, crown_delta, err, need_bool, need_f64, need_str, on_carplay, opt_bool, opt_form_factor, opt_orientation, opt_u64, pairs,
     remote_swipe_samples, screenshot_result, str_param, strings, swipe_samples, tap_samples, touch_sample,
 };
 
@@ -481,9 +481,10 @@ pub struct Profile {
 }
 
 /// Profiles `boot {profile}` applies. Each job is disabled in the device's own launchd database
-/// and booted out (stopped now). A plain reboot keeps the disables; a clone of the device doesn't
-/// (both measured): apply the profile on a clone's first boot; doing it again is harmless, and
-/// `profile {undo}` enables the jobs again.
+/// and booted out (stopped now). A plain reboot keeps most of the disables, but the paired-watch
+/// companions (companionappd, NPKCompanionAgent, brookcompaniond) come back enabled and running on
+/// every boot, and a clone of the device keeps none (all measured): apply the profile on every
+/// boot. Again it touches only the jobs that came back, and `profile {undo}` enables the jobs.
 pub const PROFILES: &[Profile] = &[Profile { name: "slim", disabled: SLIM }];
 
 /// The `slim` profile: daemons that burn CPU or memory on an idle booted device and that no
@@ -520,13 +521,14 @@ const SLIM: &[&str] = &[
     // Photo and media analysis.
     "com.apple.photoanalysisd",
     "com.apple.mediaanalysisd",
-    // Health, home, fitness, sleep.
+    // Health, home, fitness. Not sleepd: without it SpringBoard and mobiletimerd retry
+    // `com.apple.sleepd.sleepserver` in a tight loop on every later boot (~350 % of a core, and
+    // the device never settles; measured on iOS 27.2).
     "com.apple.healthd",
     "com.apple.homed",
     "com.apple.homeeventsd",
     "com.apple.fitnesscoachingd",
     "com.apple.fitnessintelligenced",
-    "com.apple.sleepd",
     // Store, iCloud sync, mail, news, weather, wallet, games, finance.
     "com.apple.appstored",
     "com.apple.itunesstored",
@@ -576,16 +578,28 @@ fn profile(name: &str) -> Result<&'static Profile, String> {
     })
 }
 
-/// The settle rule from `cpu_key` and `window_key` (the defaults where absent).
-fn settle_rule(p: &Value, cpu_key: &str, window_key: &str) -> crate::settle::Rule {
+/// The settle rule from `prefix` + `cpu_pct`, `window_s` and `foreground` (the defaults where
+/// absent): `settle_` for `boot` and `boot_many`, none for `settle`.
+fn settle_rule(p: &Value, prefix: &str) -> Result<crate::settle::Rule, String> {
     let mut rule = crate::settle::Rule::default();
-    if let Some(pct) = p.get(cpu_key).and_then(Value::as_f64) {
-        rule.cpu_pct = pct;
+    let key = |name: &str| format!("{prefix}{name}");
+    match p.get(key("cpu_pct")) {
+        None | Some(Value::Null) => {}
+        Some(v) => {
+            rule.cpu_pct =
+                v.as_f64().filter(|x| *x >= 0.0).ok_or_else(|| format!("{} must be a number of % of a core, not {v}", key("cpu_pct")))?
+        }
     }
-    if let Some(s) = opt_u64(p, window_key) {
-        rule.window = Duration::from_secs(s);
+    match p.get(key("window_s")) {
+        None | Some(Value::Null) => {}
+        Some(v) => {
+            rule.window = Duration::from_secs(v.as_u64().ok_or_else(|| format!("{} must be whole seconds, not {v}", key("window_s")))?)
+        }
     }
-    rule
+    if let Some(fg) = opt_bool(p, &key("foreground"))? {
+        rule.foreground = fg;
+    }
+    Ok(rule)
 }
 
 /// The plan for `p`, booting `concurrent` devices at once (1 for `boot`); `settle_default` when
@@ -607,7 +621,7 @@ fn boot_plan(
         timeout: Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)),
         env: pairs(p, "env"),
         shaper: if shaped { Some(shaper()?) } else { None },
-        settle: settle.then(|| settle_rule(p, "settle_cpu_pct", "settle_window_s")),
+        settle: if settle { Some(settle_rule(p, "settle_")?) } else { None },
         settle_timeout: opt_u64(p, "settle_timeout_s")
             .map_or_else(|| crate::settle::default_settle_timeout(concurrent), Duration::from_secs),
         profile: str_param(p, "profile").map(profile).transpose()?,
@@ -643,33 +657,35 @@ fn boot_device(device: &Device, plan: &BootPlan) -> Result<Value, String> {
     }
     if let Some(rule) = plan.settle {
         // From the start of the boot call, the profile included.
-        match wait_settled(&udid, rule, plan.settle_timeout) {
-            Ok(Settled { at: Some(_), settler }) => {
-                result["settled"] = json!(true);
-                result["settle_s"] = json!(round(start.elapsed().as_secs_f64()));
-                result["procs"] = json!(settler.procs());
-                result["cpu_pct"] = json!(settler.cpu_pct().map(round));
-            }
-            Ok(Settled { at: None, settler }) => {
-                result["settled"] = json!(false);
-                result["settle_error"] = json!(not_settled(&settler, rule, plan.settle_timeout));
-                result["waited_s"] = json!(round(start.elapsed().as_secs_f64()));
-                result["procs"] = json!(settler.procs());
-                result["cpu_pct"] = json!(settler.cpu_pct().map(round));
-            }
-            Err(e) => {
-                result["settled"] = json!(false);
-                result["settle_error"] = json!(e);
-            }
+        let Settled { at, settler } = wait_settled(&udid, rule, plan.settle_timeout);
+        if at.is_some() {
+            result["settled"] = json!(true);
+            result["settle_s"] = json!(round(start.elapsed().as_secs_f64()));
+        } else {
+            result["settled"] = json!(false);
+            result["settle_error"] = json!(not_settled(&settler, rule, plan.settle_timeout));
+            result["waited_s"] = json!(round(start.elapsed().as_secs_f64()));
         }
+        put_load(&mut result, &settler);
     }
     Ok(result)
 }
 
 /// Why a wait that ran out of time didn't settle.
 fn not_settled(settler: &crate::settle::Settler, rule: crate::settle::Rule, timeout: Duration) -> String {
-    let pct = settler.cpu_pct().map_or_else(|| "no process tree".to_owned(), |p| format!("{p:.0} % of a core"));
+    let what = if rule.foreground { " in the foreground" } else { "" };
+    let pct = settler.load().map_or_else(|| "no process tree".to_owned(), |l| format!("{:.0} % of a core{what}", l.judged_pct(&rule)));
     format!("device did not settle within {}s ({pct} over the last {}s)", timeout.as_secs(), rule.window.as_secs())
+}
+
+/// A settle wait's last figures: processes, and CPU over the window (all of it, and the
+/// background-QoS and foreground parts).
+fn put_load(result: &mut Value, settler: &crate::settle::Settler) {
+    let load = settler.load();
+    result["procs"] = json!(settler.procs());
+    result["cpu_pct"] = json!(load.map(|l| round(l.total_pct)));
+    result["background_cpu_pct"] = json!(load.map(|l| round(l.background_pct)));
+    result["foreground_cpu_pct"] = json!(load.map(|l| round(l.foreground_pct())));
 }
 
 fn round(x: f64) -> f64 {
@@ -684,6 +700,8 @@ struct Applied {
     changed: usize,
     failed: Vec<String>,
     not_loaded: Vec<String>,
+    /// Labels that were disabled and not loaded before, so left alone (counted in `changed`).
+    already: usize,
 }
 
 impl Applied {
@@ -692,6 +710,7 @@ impl Applied {
         let mut v = json!({(key): self.changed, "failed": self.failed});
         if !undo {
             v["not_loaded"] = json!(self.not_loaded);
+            v["already"] = json!(self.already);
         }
         v
     }
@@ -718,13 +737,14 @@ fn launchctl_refused(stderr: &str) -> bool {
 /// before (PID, status, label; empty when it couldn't run), `refused` the labels whose
 /// `disable`/`enable` failed or printed an error, `disabled` is `launchctl print-disabled system`
 /// after. With that listing each label is judged by it, else by `refused` alone.
-fn profile_outcome(labels: &[&str], loaded: &str, refused: &[&str], disabled: &str, undo: bool) -> Applied {
-    let loaded: std::collections::HashSet<&str> = loaded.lines().filter_map(|l| l.split_whitespace().nth(2)).collect();
+/// `already` are the labels that were off before and left alone (see [`still_on`]).
+fn profile_outcome(labels: &[&str], loaded: &str, already: &[&str], refused: &[&str], disabled: &str, undo: bool) -> Applied {
+    let loaded = loaded_labels(loaded);
     let listed = disabled.contains("=>");
     let disabled = disabled_labels(disabled);
-    let mut out = Applied::default();
+    let mut out = Applied { already: already.len(), ..Applied::default() };
     for l in labels {
-        if !loaded.is_empty() && !loaded.contains(l) {
+        if !loaded.is_empty() && !loaded.contains(l) && !already.contains(l) {
             out.not_loaded.push((*l).to_owned());
         }
         if !refused.contains(l) && (!listed || disabled.contains(l) != undo) {
@@ -736,9 +756,29 @@ fn profile_outcome(labels: &[&str], loaded: &str, refused: &[&str], disabled: &s
     out
 }
 
+/// The labels in a `launchctl list` (PID, status, label).
+fn loaded_labels(text: &str) -> std::collections::HashSet<&str> {
+    text.lines().filter_map(|l| l.split_whitespace().nth(2)).collect()
+}
+
+/// The labels of `labels` a profile still has to disable and stop: those `print-disabled`
+/// (`disabled`) doesn't list disabled, and those `launchctl list` (`loaded`) shows loaded. The
+/// rest are off already and are left alone, so applying a profile again on a later boot costs a
+/// spawn or two per job that came back, not two per job. Without either listing, all of them.
+fn still_on<'a>(labels: &[&'a str], loaded: &str, disabled: &str) -> Vec<&'a str> {
+    let loaded_set = loaded_labels(loaded);
+    if loaded_set.is_empty() || !disabled.contains("=>") {
+        return labels.to_vec();
+    }
+    let disabled = disabled_labels(disabled);
+    labels.iter().copied().filter(|l| !disabled.contains(l) || loaded_set.contains(l)).collect()
+}
+
 /// Disables and stops each of the profile's jobs, or with `undo` enables them again (they run
 /// from the next boot: an enabled job isn't loaded until launchd bootstraps it). The disables
-/// live in the device's launchd database, so a plain reboot keeps them (measured, docs/farm.md).
+/// live in the device's launchd database, so a plain reboot keeps most of them; a few jobs come
+/// back enabled on every boot (measured, docs/farm.md), so a farm applies the profile on every
+/// boot, and a job that is still off costs nothing here.
 fn apply_profile(device: &Device, profile: &Profile, undo: bool) -> Result<Applied, String> {
     // The runtime's launchctl (a bare `launchctl` would be the host's, see AGENTS.md). The runtime
     // has no shell, so each call is its own spawn (~0.1-0.4 s), and `exec` reports no exit
@@ -746,8 +786,15 @@ fn apply_profile(device: &Device, profile: &Profile, undo: bool) -> Result<Appli
     // launchd's own lists.
     let run = |args: &[&str]| device.exec("launchctl", &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(), &[]);
     let loaded = if undo { String::new() } else { run(&["list"]).map(|o| o.stdout).unwrap_or_default() };
+    let todo = if undo {
+        profile.disabled.to_vec()
+    } else {
+        let before = run(&["print-disabled", "system"]).map(|o| o.stdout).unwrap_or_default();
+        still_on(profile.disabled, &loaded, &before)
+    };
+    let already: Vec<&str> = profile.disabled.iter().copied().filter(|l| !todo.contains(l)).collect();
     let mut refused = Vec::new();
-    for label in profile.disabled {
+    for label in &todo {
         let target = format!("system/{label}");
         let changed = run(&[if undo { "enable" } else { "disable" }, &target]);
         if changed.as_ref().map_or(true, |o| launchctl_refused(&o.stderr)) {
@@ -759,16 +806,24 @@ fn apply_profile(device: &Device, profile: &Profile, undo: bool) -> Result<Appli
         }
     }
     let disabled = run(&["print-disabled", "system"]).map_err(err)?.stdout;
-    Ok(profile_outcome(profile.disabled, &loaded, &refused, &disabled, undo))
+    Ok(profile_outcome(profile.disabled, &loaded, &already, &refused, &disabled, undo))
 }
 
-/// The `ps` listing every settle wait in this process shares.
-static PS: crate::settle::Sampler = crate::settle::Sampler::new();
+/// A device's processes read through libproc (see [`crate::settle::Procs`]).
+struct LibProc;
 
-/// One `ps` listing of every process on the host.
-fn ps_rows() -> Result<Vec<crate::settle::Row>, String> {
-    let out = std::process::Command::new("/bin/ps").args(crate::settle::PS_ARGS).output().map_err(|e| format!("ps: {e}"))?;
-    Ok(crate::settle::parse_ps(&String::from_utf8_lossy(&out.stdout)))
+impl crate::settle::Procs for LibProc {
+    fn list(&mut self) -> Vec<crate::settle::Entry> {
+        sim_coresim::procs::list()
+            .iter()
+            .map(|p| crate::settle::Entry { pid: p.pid, ppid: p.ppid, springboard: p.name() == "SpringBoard" })
+            .collect()
+    }
+
+    fn cpu(&mut self, pid: i32) -> Option<crate::settle::Cpu> {
+        sim_coresim::procs::usage(pid)
+            .map(|u| crate::settle::Cpu { total_s: u.cpu_ns as f64 / 1e9, background_s: u.background_ns as f64 / 1e9 })
+    }
 }
 
 /// How a settle wait ended: `at` seconds after it started, or `None` when it ran out of time;
@@ -778,22 +833,25 @@ struct Settled {
     settler: crate::settle::Settler,
 }
 
-/// Waits until the booted device `udid` is settled by `rule`, sampling its process tree once a
-/// second from the process's shared listing ([`PS`]). An error only when `ps` can't run.
-fn wait_settled(udid: &str, rule: crate::settle::Rule, timeout: Duration) -> Result<Settled, String> {
+/// Waits until the booted device `udid` is settled by `rule`, reading its process tree (its
+/// `launchd_sim` and descendants, nothing else on the host) once a second.
+fn wait_settled(udid: &str, rule: crate::settle::Rule, timeout: Duration) -> Settled {
     let start = std::time::Instant::now();
     let mut settler = crate::settle::Settler::new(rule);
+    // Found by a scan of the host's processes, then reused while it is still a launchd_sim.
+    let mut root: Option<i32> = None;
     loop {
-        let (taken, rows) = PS.rows(Duration::from_millis(900), ps_rows)?;
-        // Timed by the listing: a shared one may be older than this call's own clock.
-        let t = taken.saturating_duration_since(start).as_secs_f64();
-        if let Some(Some(tree)) = crate::settle::trees(&rows, &[udid]).pop()
+        if root.is_none_or(|r| !sim_coresim::procs::is_launchd_sim(r)) {
+            root = sim_coresim::procs::launchd_sim(udid);
+        }
+        let t = start.elapsed().as_secs_f64();
+        if let Some(tree) = root.and_then(|r| crate::settle::tree(&mut LibProc, r))
             && settler.push(t, tree)
         {
-            return Ok(Settled { at: Some(start.elapsed().as_secs_f64()), settler });
+            return Settled { at: Some(t), settler };
         }
         if start.elapsed() >= timeout {
-            return Ok(Settled { at: None, settler });
+            return Settled { at: None, settler };
         }
         sleep(Duration::from_secs(1));
     }
@@ -907,11 +965,13 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             if d.state() != DeviceState::Booted {
                 return Err(format!("{} isn't booted", d.info().name));
             }
-            let rule = settle_rule(p, "cpu_pct", "window_s");
+            let rule = settle_rule(p, "")?;
             let timeout = opt_u64(p, "timeout_s").map_or_else(|| crate::settle::default_settle_timeout(1), Duration::from_secs);
-            let Settled { at, settler } = wait_settled(&d.info().udid, rule, timeout)?;
+            let Settled { at, settler } = wait_settled(&d.info().udid, rule, timeout);
             let settle_s = at.ok_or_else(|| not_settled(&settler, rule, timeout))?;
-            Ok(json!({"settle_s": round(settle_s), "procs": settler.procs(), "cpu_pct": settler.cpu_pct().map(round)}))
+            let mut result = json!({"settle_s": round(settle_s)});
+            put_load(&mut result, &settler);
+            Ok(result)
         }
         "profile" => {
             let d = s.device(p)?;
@@ -1392,24 +1452,115 @@ mod tests {
         // b: launchctl refused; c: it said nothing but launchd doesn't list it disabled; gone:
         // disabled (launchctl disables any label), but there was no such job loaded.
         assert_eq!(
-            profile_outcome(&labels, loaded, &["com.apple.b"], disabled, false),
-            Applied { changed: 2, failed: vec!["com.apple.b".into(), "com.apple.c".into()], not_loaded: vec!["com.apple.gone".into()] }
+            profile_outcome(&labels, loaded, &[], &["com.apple.b"], disabled, false),
+            Applied {
+                changed: 2,
+                failed: vec!["com.apple.b".into(), "com.apple.c".into()],
+                not_loaded: vec!["com.apple.gone".into()],
+                already: 0
+            }
         );
         // Undone: a label is enabled once launchd no longer lists it disabled.
         let undone = "\t\"com.apple.a\" => enabled\n\t\"com.apple.gone\" => disabled\n";
-        let r = profile_outcome(&labels, "", &[], undone, true);
+        let r = profile_outcome(&labels, "", &[], &[], undone, true);
         assert_eq!((r.changed, &r.failed), (3, &vec!["com.apple.gone".to_owned()]));
         assert_eq!(r.to_json(true), json!({"enabled": 3, "failed": ["com.apple.gone"]}));
         // No listings from launchctl: judged by what it refused alone.
-        let r = profile_outcome(&labels, "", &["com.apple.c"], "", false);
+        let r = profile_outcome(&labels, "", &[], &["com.apple.c"], "", false);
         assert_eq!((r.changed, &r.failed, r.not_loaded.len()), (3, &vec!["com.apple.c".to_owned()], 0));
-        assert_eq!(r.to_json(false), json!({"disabled": 3, "failed": ["com.apple.c"], "not_loaded": []}));
+        assert_eq!(r.to_json(false), json!({"disabled": 3, "failed": ["com.apple.c"], "not_loaded": [], "already": 0}));
         // What the runtime's launchctl prints when disabling a running job: a warning, not a failure.
         assert!(!launchctl_refused(
             "Warning: Please switch to user/foreground/com.apple.translationd service identifier (rdar://78126471)\n"
         ));
         assert!(!launchctl_refused(""));
         assert!(launchctl_refused("Could not find service \"x\" in domain for system\n"));
+    }
+
+    #[test]
+    fn a_reapplied_profile_touches_only_the_jobs_that_came_back() {
+        let labels = ["com.apple.a", "com.apple.companionappd", "com.apple.NPKCompanionAgent", "com.apple.new"];
+        // A slimmed device after a reboot (as slim-launchctl-list / print-disabled read on iOS
+        // 27.2): a is still off; the companions came back enabled and running; new was never
+        // disabled (added to the profile since) and isn't running.
+        let loaded = "PID\tStatus\tLabel\n66382\t0\tcom.apple.companionappd\n66387\t0\tcom.apple.NPKCompanionAgent\n\
+                      12\t0\tcom.apple.SpringBoard\n";
+        let disabled = "\tdisabled services = {\n\t\t\"com.apple.a\" => disabled\n\
+                        \t\t\"com.apple.companionappd\" => enabled\n\t\t\"com.apple.NPKCompanionAgent\" => disabled\n\t}\n";
+        assert_eq!(
+            still_on(&labels, loaded, disabled),
+            ["com.apple.companionappd", "com.apple.NPKCompanionAgent", "com.apple.new"],
+            "re-enabled, loaded though disabled, and never disabled"
+        );
+        // A fresh device (nothing disabled) or a listing that couldn't be read: every job.
+        assert_eq!(still_on(&labels, loaded, "\tdisabled services = {\n\t}\n"), labels);
+        assert_eq!(still_on(&labels, "", disabled), labels);
+        assert_eq!(still_on(&labels, loaded, ""), labels);
+        // What was left alone counts as disabled and isn't reported as not loaded.
+        let after = "\t\"com.apple.a\" => disabled\n\t\"com.apple.companionappd\" => disabled\n\
+                     \t\"com.apple.NPKCompanionAgent\" => disabled\n\t\"com.apple.new\" => disabled\n";
+        let r = profile_outcome(&labels, loaded, &["com.apple.a"], &[], after, false);
+        assert_eq!(r, Applied { changed: 4, failed: vec![], not_loaded: vec!["com.apple.new".into()], already: 1 });
+        assert_eq!(r.to_json(false)["already"], json!(1));
+        assert_eq!(r.to_json(true).get("already"), None, "undo touches every job");
+    }
+
+    #[test]
+    fn the_slim_profile_keeps_sleepd() {
+        // Without sleepd, SpringBoard and mobiletimerd spin retrying its mach service on every
+        // later boot and the device never settles (docs/farm.md).
+        let slim = profile("slim").expect("slim");
+        assert!(!slim.disabled.contains(&"com.apple.sleepd"));
+        assert_eq!(slim.disabled.len(), 58);
+        for companion in ["com.apple.companionappd", "com.apple.NPKCompanionAgent", "com.apple.brook.brookcompaniond"] {
+            assert!(slim.disabled.contains(&companion), "{companion} stays in: re-applied on every boot");
+        }
+    }
+
+    #[test]
+    fn settle_rules_read_their_keys() {
+        let none = || -> Result<std::path::PathBuf, String> { Err("unused".into()) };
+        let plan = boot_plan(&json!({"settle": true}), 1, false, none).expect("boot");
+        assert_eq!(plan.settle, Some(crate::settle::Rule::default()), "all CPU by default");
+        let p = json!({"settle": true, "settle_cpu_pct": 5.0, "settle_window_s": 20, "settle_foreground": true});
+        let rule = boot_plan(&p, 1, false, none).expect("boot").settle.expect("settle");
+        assert_eq!(rule, crate::settle::Rule { cpu_pct: 5.0, window: Duration::from_secs(20), foreground: true });
+        let rule = settle_rule(&json!({"cpu_pct": 7.0, "window_s": 3, "foreground": true}), "").expect("settle");
+        assert_eq!(rule, crate::settle::Rule { cpu_pct: 7.0, window: Duration::from_secs(3), foreground: true });
+        assert!(!settle_rule(&json!({"settle_foreground": true}), "").expect("settle").foreground, "settle's own keys have no prefix");
+        // A mistyped option is refused, not silently replaced by the default.
+        for bad in [
+            json!({"settle": true, "settle_foreground": "true"}),
+            json!({"settle": true, "settle_foreground": 1}),
+            json!({"settle": true, "settle_cpu_pct": "5"}),
+            json!({"settle": true, "settle_window_s": -1}),
+        ] {
+            assert!(boot_plan(&bad, 1, false, none).is_err(), "{bad}");
+        }
+        assert!(settle_rule(&json!({"foreground": "yes"}), "").is_err());
+    }
+
+    #[test]
+    fn a_settle_result_reports_background_and_foreground_cpu() {
+        let mut settler = crate::settle::Settler::new(crate::settle::Rule::default());
+        let tree = |total_s, background_s| crate::settle::Tree {
+            cpu: [(1, crate::settle::Cpu { total_s, background_s })].into(),
+            springboard: true,
+        };
+        settler.push(0.0, tree(0.0, 0.0));
+        settler.push(10.0, tree(3.0, 2.0));
+        let mut r = json!({});
+        put_load(&mut r, &settler);
+        assert_eq!(r, json!({"procs": 1, "cpu_pct": 30.0, "background_cpu_pct": 20.0, "foreground_cpu_pct": 10.0}));
+        let rule = crate::settle::Rule { foreground: true, ..Default::default() };
+        assert_eq!(
+            not_settled(&settler, rule, Duration::from_secs(60)),
+            "device did not settle within 60s (10 % of a core in the foreground over the last 10s)"
+        );
+        assert_eq!(
+            not_settled(&settler, crate::settle::Rule::default(), Duration::from_secs(60)),
+            "device did not settle within 60s (30 % of a core over the last 10s)"
+        );
     }
 
     #[test]

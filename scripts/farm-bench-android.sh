@@ -27,7 +27,10 @@
 # the host load the line records.
 #
 # Per device at idle (after AFTER_S): host CPU % (from the process's CPU time over IDLE_S) and vCPU
-# exits/s (from EMU_EXIT_PROFILE, which every device is started with), plus the PL011's share.
+# exits/s (from EMU_EXIT_PROFILE, which every device is started with), plus the PL011's share;
+# idle wakeups/s (`top -l 2 -s IDLE_S -stats pid,idlew`: the times the process woke a core out of
+# idle, over the same window; what keeps a farm host's cores from staying asleep), and footprint_mb
+# (`footprint`: the process's dirty memory, guest pages it has touched included, after the window).
 #
 # Stops only the PIDs it started (kill -INT, then waits), never touches other emulators.
 set -uo pipefail
@@ -73,6 +76,24 @@ sys_mb() {
 free_mb() { vm_stat | awk '/page size of/ {ps=$8} /^Pages free/ {f=$3} /^Pages speculative/ {s=$3} END {printf "%.0f\n", (f+s)*ps/1048576}'; }
 rss_mb() { ps -o rss= -p "$1" 2>/dev/null | awk '{s+=$1} END {printf "%.0f\n", s/1024}'; }
 load1() { sysctl -n vm.loadavg | awk '{print $2}'; }
+# A process's footprint (dirty memory), MB.
+footprint_mb() {
+  footprint --noCategories "$1" 2>/dev/null | awk '/ Footprint: / && !done {
+      for (i = 1; i < NF; i++) if ($i == "Footprint:") { v = $(i + 1); u = $(i + 2) }
+      done = 1 }
+    END { if (u == "GB") v *= 1024; if (u == "KB") v /= 1024; printf "%.0f\n", v }'
+}
+# Idle wakeups per second of each of the PIDs in $2.. over $1 seconds, "pid rate" per line: top
+# prints each process's cumulative IDLEW (a trailing + or - marks a change) once per sample.
+idle_wakeups() {
+  local s=$1 args=() p
+  shift
+  for p in "$@"; do args+=(-pid "$p"); done
+  top -l 2 -s "$s" -stats pid,idlew "${args[@]}" 2>/dev/null | awk -v s="$s" '
+    $1 == "PID" && $2 == "IDLEW" { blk++; next }
+    blk && $1 ~ /^[0-9]+$/ { v = $2; gsub(/[^0-9]/, "", v); w[blk, $1] = v; seen[$1] = 1 }
+    END { for (p in seen) if ((1, p) in w && (2, p) in w) printf "%s %.1f\n", p, (w[2, p] - w[1, p]) / s }'
+}
 # Sum of vCPU runs (= exits) and of PL011 accesses in an EMU_EXIT_PROFILE snapshot.
 exits() { awk '$1=="C" {c+=$3} $1=="R" && $2=="pl011" {p+=$4+$5} END {printf "%d %d\n", c, p}' "$1" 2>/dev/null; }
 
@@ -116,7 +137,7 @@ launch() {
   pids[i]=$!; ports[i]=$port; state[i]=booting; booted_at[i]=""; settled_at[i]=""
   # Each device gets BOOT_TIMEOUT from its own launch: with K < N, later ones start later.
   launched_at[i]=$(now)
-  deadline[i]=$(awk -v a="${launched_at[i]}" -v b="$boot_timeout" 'BEGIN {print a+b}')
+  deadline[i]=$(awk -v a="${launched_at[i]}" -v b="$boot_timeout" 'BEGIN {printf "%.3f", a+b}')
   echo "$name pid=${pids[i]} port=$port" >> "$run/pids"
   started=$((started + 1))
 }
@@ -171,7 +192,7 @@ for i in $(seq 0 $((n - 1))); do
   [ -n "${booted_at[i]:-}" ] && boots+=" $(awk -v a="${booted_at[i]}" -v b="${launched_at[i]}" 'BEGIN {printf "%.1f", a-b}')"
   [ -n "${settled_at[i]:-}" ] && settles+=" $(awk -v a="${settled_at[i]}" -v b="${launched_at[i]}" 'BEGIN {printf "%.1f", a-b}')"
 done
-med() { tr ' ' '\n' | grep . | sort -n | awk '{a[NR]=$1} END {if (NR) print a[int((NR+1)/2)]; else print "-"}'; }
+med() { tr " " "\n" | grep -E "^[0-9.]+\$" | sort -n | awk '{a[NR]=$1} END {if (NR) print a[int((NR+1)/2)]; else print "-"}'; }
 
 sleep "$after_s"
 sys2=$(sys_mb); rss2=0
@@ -182,15 +203,22 @@ ta=$(now)
 for i in "${!pids[@]}"; do
   c0[i]=$(cpu_s "${pids[i]}"); read -r "e0[i]" "p0[i]" <<< "$(exits "$run/exits-${names[i]}.txt")"
 done
-sleep "$idle_s"
+# The IDLE_S window itself: top's two samples, IDLE_S apart, of the settled devices (top drops
+# every -pid when one has exited).
+live=()
+for i in "${!pids[@]}"; do [ "${state[i]}" = settled ] && live+=("${pids[i]}"); done
+if [ "${#live[@]}" -gt 0 ]; then wakeups=$(idle_wakeups "$idle_s" "${live[@]}"); else wakeups=""; sleep "$idle_s"; fi
 tb=$(now)
-cpus=""; rates=""; shares=""
+cpus=""; rates=""; shares=""; wakes=""; fps=""
 for i in "${!pids[@]}"; do
   [ "${state[i]}" = settled ] || continue
   c1=$(cpu_s "${pids[i]}"); read -r e1 p1 <<< "$(exits "$run/exits-${names[i]}.txt")"
   cpus+=" $(awk -v c="$c1" -v p="${c0[i]}" -v a="$tb" -v b="$ta" 'BEGIN {printf "%.1f", 100*(c-p)/(a-b)}')"
   rates+=" $(awk -v x="$e1" -v y="${e0[i]:-0}" -v a="$tb" -v b="$ta" 'BEGIN {printf "%.0f", (x-y)/(a-b)}')"
   shares+=" $(awk -v x="$p1" -v y="${p0[i]:-0}" -v e="$e1" -v f="${e0[i]:-0}" 'BEGIN {d=e-f; s=0; if (d>0) s=100*(x-y)/d; printf "%.0f", s}')"
+  w=$(awk -v p="${pids[i]}" '$1 == p { print $2 }' <<< "$wakeups")
+  wakes+=" ${w:--}"
+  fps+=" $(footprint_mb "${pids[i]}")"
 done
 stop_all
 trap - EXIT INT TERM
@@ -199,6 +227,7 @@ line="label=$label mode=$mode n=$n k=$k make_s=$t_make all_settled_s=$t_all"
 line+=" boot_med_s=$(echo "$boots" | med) settle_med_s=$(echo "$settles" | med) failures=$failures"
 line+=" rss_mb=$rss1 sys_mb=$((sys1 - sys0)) rss_mb_after=$rss2 sys_mb_after=$((sys2 - sys0)) free_mb_start=$free0"
 line+=" idle_cpu_pct_med=$(echo "$cpus" | med) idle_cpu_pct=[${cpus# }] idle_exits_s_med=$(echo "$rates" | med) pl011_pct_med=$(echo "$shares" | med)"
+line+=" idle_wakeups_s_med=$(echo "$wakes" | med) idle_wakeups_s=[${wakes# }] footprint_mb_med=$(echo "$fps" | med) footprint_mb=[${fps# }]"
 [ -n "${disk_df_mb:-}" ] && line+=" disk_df_mb=$disk_df_mb disk_du_mb=$disk_du_mb"
 line+=" load_start=$load0 load_end=$(load1)"
 echo "$line" | tee -a "$out/farm.results"
