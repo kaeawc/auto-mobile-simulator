@@ -130,11 +130,17 @@ pub struct Queue {
     event_idx: bool,
     /// `used.idx` at the last interrupt, for event-idx suppression.
     signalled_used: Option<u16>,
+    /// Notifications off while the device drains (`disable_notify`).
+    quiet: bool,
+    /// The last indirect table read, kept for its allocation.
+    indirect: Vec<u8>,
 }
+
+const VIRTQ_USED_F_NO_NOTIFY: u16 = 1;
 
 impl Queue {
     pub fn new(cfg: QueueConfig, event_idx: bool) -> Queue {
-        Queue { cfg, next_avail: 0, next_used: 0, event_idx, signalled_used: None }
+        Queue { cfg, next_avail: 0, next_used: 0, event_idx, signalled_used: None, quiet: false, indirect: Vec::new() }
     }
 
     pub fn size(&self) -> u16 {
@@ -154,13 +160,22 @@ impl Queue {
 
     /// Pops the next available chain, if the driver has published one.
     pub fn pop(&mut self, mem: &GuestRam) -> Result<Option<Chain>, QueueError> {
+        let mut chain = Chain { head: 0, descs: Vec::with_capacity(4) };
+        Ok(self.pop_into(mem, &mut chain)?.then_some(chain))
+    }
+
+    /// [`Queue::pop`] into `chain` (its descriptors replaced), reusing its allocation: a device
+    /// that keeps one `Chain` pops without allocating. Returns whether a chain was popped; on
+    /// `false` or an error `chain` holds nothing useful.
+    pub fn pop_into(&mut self, mem: &GuestRam, chain: &mut Chain) -> Result<bool, QueueError> {
+        chain.descs.clear();
         let size = self.cfg.size;
         if size == 0 {
-            return Ok(None);
+            return Ok(false);
         }
         let avail_idx = mem.read_u16(self.cfg.avail + 2).map_err(|_| QueueError::BadAddress(self.cfg.avail))?;
         if avail_idx == self.next_avail {
-            return Ok(None);
+            return Ok(false);
         }
         // Read ring entries and descriptors only after observing the index (pairs with the
         // driver's write barrier before it bumps avail.idx).
@@ -171,32 +186,22 @@ impl Queue {
         if head >= size {
             return Err(QueueError::BadIndex(head));
         }
+        chain.head = head;
 
-        let mut chain = Chain { head, descs: Vec::with_capacity(4) };
-        let (mut table, mut table_len, mut idx) = (self.cfg.desc, size, head);
-        let mut in_indirect = false;
+        let mut idx = head;
         let mut budget = u32::from(size);
         loop {
             if budget == 0 {
                 return Err(QueueError::LoopOrTooLong);
             }
             budget -= 1;
-            if idx >= table_len {
+            if idx >= size {
                 return Err(QueueError::BadIndex(idx));
             }
-            let (addr, len, flags, next) = self.read_desc(mem, table, idx)?;
+            let (addr, len, flags, next) = self.read_desc(mem, self.cfg.desc, idx)?;
             if flags & DESC_F_INDIRECT != 0 {
-                if in_indirect {
-                    return Err(QueueError::NestedIndirect);
-                }
-                let n = len / 16;
-                if n == 0 || n > 0xffff {
-                    return Err(QueueError::LoopOrTooLong);
-                }
-                (table, table_len, idx) = (addr, n as u16, 0);
-                in_indirect = true;
-                budget = n;
-                continue;
+                self.read_indirect(mem, addr, len, chain)?;
+                break;
             }
             chain.descs.push(Desc { addr, len, write: flags & DESC_F_WRITE != 0 });
             if flags & DESC_F_NEXT == 0 {
@@ -204,12 +209,75 @@ impl Queue {
             }
             idx = next;
         }
-        if self.event_idx {
-            // Ask to be notified when the driver publishes the entry after this one.
+        if self.event_idx && !self.quiet {
+            // Ask to be notified when the driver publishes the entry after this one, and order
+            // that store before the next pop reads avail.idx (pairs with the driver's barrier
+            // between bumping avail.idx and reading avail_event): otherwise both sides can miss
+            // the other's store and the driver never kicks for work the device never sees.
             let avail_event = self.cfg.used + 4 + u64::from(size) * 8;
             let _ = mem.write_u16(avail_event, self.next_avail);
+            fence(Ordering::SeqCst);
         }
-        Ok(Some(chain))
+        Ok(true)
+    }
+
+    /// Follows an indirect table: copied out of the guest in one read, then walked from entry 0.
+    fn read_indirect(&mut self, mem: &GuestRam, table: u64, len: u32, chain: &mut Chain) -> Result<(), QueueError> {
+        let n = len / 16;
+        if n == 0 || n > 0xffff {
+            return Err(QueueError::LoopOrTooLong);
+        }
+        self.indirect.clear();
+        mem.read_append(table, n as usize * 16, &mut self.indirect).map_err(|_| QueueError::BadAddress(table))?;
+        let mut idx = 0u32;
+        for _ in 0..n {
+            if idx >= n {
+                return Err(QueueError::BadIndex(idx as u16));
+            }
+            let b = &self.indirect[idx as usize * 16..idx as usize * 16 + 16];
+            let addr = u64::from_le_bytes(b[0..8].try_into().unwrap_or_default());
+            let len = u32::from_le_bytes(b[8..12].try_into().unwrap_or_default());
+            let flags = u16::from_le_bytes([b[12], b[13]]);
+            if flags & DESC_F_INDIRECT != 0 {
+                return Err(QueueError::NestedIndirect);
+            }
+            chain.descs.push(Desc { addr, len, write: flags & DESC_F_WRITE != 0 });
+            if flags & DESC_F_NEXT == 0 {
+                return Ok(());
+            }
+            idx = u32::from(u16::from_le_bytes([b[14], b[15]]));
+        }
+        Err(QueueError::LoopOrTooLong)
+    }
+
+    /// Stops asking the driver for notifications while the device drains the queue (QEMU's
+    /// `virtio_queue_set_notification(vq, 0)`): `pop` leaves `avail_event` where it is (or sets
+    /// `VIRTQ_USED_F_NO_NOTIFY` without event-idx), so requests the driver publishes meanwhile
+    /// cost it no kick. Pair every call with [`Queue::enable_notify`] before the device sleeps.
+    pub fn disable_notify(&mut self, mem: &GuestRam) {
+        if self.quiet {
+            return;
+        }
+        self.quiet = true;
+        if !self.event_idx {
+            let _ = mem.write_u16(self.cfg.used, VIRTQ_USED_F_NO_NOTIFY);
+        }
+    }
+
+    /// Asks for a notification at the next published entry again, then rechecks: returns
+    /// whether chains are already waiting (the driver may have published them while
+    /// notifications were off, without kicking). A device sleeps only on `false`.
+    pub fn enable_notify(&mut self, mem: &GuestRam) -> bool {
+        self.quiet = false;
+        if self.event_idx {
+            let _ = mem.write_u16(self.cfg.used + 4 + u64::from(self.cfg.size) * 8, self.next_avail);
+        } else {
+            let _ = mem.write_u16(self.cfg.used, 0);
+        }
+        // Publish the request for a kick before looking for work (pairs with the driver's
+        // barrier between bumping avail.idx and reading avail_event / used.flags).
+        fence(Ordering::SeqCst);
+        self.cfg.size != 0 && mem.read_u16(self.cfg.avail + 2).is_ok_and(|i| i != self.next_avail)
     }
 
     /// Returns a chain to the driver with `len` bytes written into its buffers.
@@ -298,6 +366,55 @@ pub(crate) mod tests {
             head
         }
 
+        /// Publishes a chain as one indirect descriptor whose table is written at `table`, the way
+        /// Linux sends every multi-buffer request once `VIRTIO_RING_F_INDIRECT_DESC` is on.
+        pub fn push_indirect(&mut self, mem: &GuestRam, table: u64, bufs: &[(u64, u32, bool)]) -> u16 {
+            let mut t = vec![0u8; bufs.len() * 16];
+            for (i, ((addr, len, w), b)) in bufs.iter().zip(t.as_chunks_mut::<16>().0).enumerate() {
+                let mut flags = if *w { DESC_F_WRITE } else { 0 };
+                if i + 1 < bufs.len() {
+                    flags |= DESC_F_NEXT;
+                }
+                b[..8].copy_from_slice(&addr.to_le_bytes());
+                b[8..12].copy_from_slice(&len.to_le_bytes());
+                b[12..14].copy_from_slice(&flags.to_le_bytes());
+                b[14..16].copy_from_slice(&((i + 1) as u16).to_le_bytes());
+            }
+            mem.write(table, &t).expect("table");
+            let idx = self.next_desc % self.cfg.size;
+            self.next_desc = self.next_desc.wrapping_add(1);
+            let mut d = [0u8; 16];
+            d[..8].copy_from_slice(&table.to_le_bytes());
+            d[8..12].copy_from_slice(&(t.len() as u32).to_le_bytes());
+            d[12..14].copy_from_slice(&DESC_F_INDIRECT.to_le_bytes());
+            mem.write(self.cfg.desc + u64::from(idx) * 16, &d).expect("desc");
+            let slot = self.cfg.avail + 4 + u64::from(self.avail_idx % self.cfg.size) * 2;
+            mem.write_u16(slot, idx).expect("ring");
+            self.avail_idx = self.avail_idx.wrapping_add(1);
+            // Ring entry before the index that publishes it (the driver's virtio_wmb).
+            fence(Ordering::Release);
+            mem.write_u16(self.cfg.avail + 2, self.avail_idx).expect("idx");
+            idx
+        }
+
+        /// Whether the driver must kick after publishing entries `old..avail_idx` (Linux's
+        /// `virtqueue_kick_prepare`): the device's `avail_event` under event-idx, else the
+        /// `VIRTQ_USED_F_NO_NOTIFY` flag.
+        pub fn needs_kick(&self, mem: &GuestRam, old: u16, event_idx: bool) -> bool {
+            // The index store must be ordered before reading the device's suppression state.
+            fence(Ordering::SeqCst);
+            if !event_idx {
+                return mem.read_u16(self.cfg.used).expect("used flags") & 1 == 0;
+            }
+            let event = mem.read_u16(self.cfg.used + 4 + u64::from(self.cfg.size) * 8).expect("avail_event");
+            let new = self.avail_idx;
+            new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(old)
+        }
+
+        pub fn avail_idx(&self) -> u16 {
+            self.avail_idx
+        }
+
         pub fn used(&self, mem: &GuestRam, i: u16) -> (u32, u32) {
             let e = self.cfg.used + 4 + u64::from(i) * 8;
             (mem.read_u32(e).expect("id"), mem.read_u32(e + 4).expect("len"))
@@ -367,6 +484,138 @@ pub(crate) mod tests {
         let chain = q.pop(&mem).expect("pop").expect("chain");
         assert_eq!(chain.descs.len(), 2);
         assert!(chain.descs[1].write);
+    }
+
+    /// Device-side cost of popping a Linux-shaped block request: one indirect descriptor whose
+    /// table holds a header, 32 data pages and a status byte.
+    ///     cargo test --release -p emu-vmm queue_pop_indirect -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn queue_pop_indirect() {
+        use std::time::Instant;
+        let mem = GuestRam::new(RAM_BASE, 0x100_0000).expect("ram");
+        let mut drv = Driver::new(256);
+        let mut q = Queue::new(drv.cfg, true);
+        let bufs: Vec<(u64, u32, bool)> = std::iter::once((RAM_BASE + 0x10_0000, 16, false))
+            .chain((0..32).map(|i| (RAM_BASE + 0x20_0000 + i * 0x2000, 4096, true)))
+            .chain(std::iter::once((RAM_BASE + 0x10_0010, 1, true)))
+            .collect();
+        const N: u32 = 100_000;
+        // Tables are written once; the timed loop republishes them (the driver's cost is not ours).
+        for i in 0..64u64 {
+            drv.push_indirect(&mem, RAM_BASE + 0x8_0000 + i * 0x400, &bufs);
+        }
+        let (mut fresh, mut reused) = (Vec::new(), Vec::new());
+        let mut chain = Chain::default();
+        let mut popped = 0u32;
+        // Alternating rounds of `pop` (a new Vec per chain) and `pop_into` (one reused Chain).
+        for round in 0..14 {
+            let mut descs = 0usize;
+            let start = Instant::now();
+            for _ in 0..N {
+                if round % 2 == 0 {
+                    let c = q.pop(&mem).expect("pop").expect("chain");
+                    descs += c.descs.len();
+                    chain.head = c.head;
+                } else {
+                    assert!(q.pop_into(&mem, &mut chain).expect("pop"));
+                    descs += chain.descs.len();
+                }
+                q.add_used(&mem, chain.head, 0).expect("used");
+                // Republish the same head: bump avail.idx over a ring slot that already names it.
+                let slot = drv.cfg.avail + 4 + u64::from((popped as u16).wrapping_add(64) % 256) * 2;
+                mem.write_u16(slot, chain.head).expect("ring");
+                popped += 1;
+                mem.write_u16(drv.cfg.avail + 2, (popped as u16).wrapping_add(64)).expect("idx");
+            }
+            let ns = start.elapsed().as_secs_f64() * 1e9 / f64::from(N);
+            assert_eq!(descs, N as usize * 34);
+            if round >= 2 {
+                if round % 2 == 0 { fresh.push(ns) } else { reused.push(ns) }
+            }
+        }
+        fresh.sort_by(f64::total_cmp);
+        reused.sort_by(f64::total_cmp);
+        println!(
+            "queue pop: 34-desc indirect chain: pop {:>6.1} ns, pop_into {:>6.1} ns (median round)",
+            fresh[fresh.len() / 2],
+            reused[reused.len() / 2]
+        );
+    }
+
+    #[test]
+    fn pop_into_reuses_the_chain_and_matches_pop() {
+        let mem = GuestRam::new(RAM_BASE, 0x10_0000).expect("ram");
+        let mut drv = Driver::new(8);
+        let mut q = Queue::new(drv.cfg, true);
+        let mut chain = Chain::default();
+        assert_eq!(q.pop_into(&mem, &mut chain), Ok(false));
+        let bufs: Vec<(u64, u32, bool)> = (0..20).map(|i| (RAM_BASE + 0x8000 + i * 0x100, 16, i > 0)).collect();
+        let h1 = drv.push_indirect(&mem, RAM_BASE + 0x6000, &bufs);
+        let h2 = drv.push(&mem, &[(RAM_BASE + 0x9000, 4, false)]);
+        assert_eq!(q.pop_into(&mem, &mut chain), Ok(true));
+        assert_eq!(chain.head, h1);
+        let want: Vec<Desc> = bufs.iter().map(|&(addr, len, write)| Desc { addr, len, write }).collect();
+        assert_eq!(chain.descs, want);
+        let cap = chain.descs.capacity();
+        assert_eq!(q.pop_into(&mem, &mut chain), Ok(true));
+        assert_eq!((chain.head, chain.descs.as_slice()), (h2, &[Desc { addr: RAM_BASE + 0x9000, len: 4, write: false }][..]));
+        assert_eq!(chain.descs.capacity(), cap, "allocation kept");
+        assert_eq!(q.pop_into(&mem, &mut chain), Ok(false));
+    }
+
+    #[test]
+    fn indirect_tables_are_bounds_checked() {
+        let mem = GuestRam::new(RAM_BASE, 0x10_0000).expect("ram");
+        let mut drv = Driver::new(4);
+        let mut q = Queue::new(drv.cfg, false);
+        let table = RAM_BASE + 0x6000;
+        drv.push_indirect(&mem, table, &[(RAM_BASE + 0x8000, 4, false), (RAM_BASE + 0x8100, 4, true)]);
+        mem.write_u16(table + 14, 2).expect("next past the table");
+        assert_eq!(q.pop(&mem).err(), Some(QueueError::BadIndex(2)));
+        drv.push_indirect(&mem, table, &[(RAM_BASE + 0x8000, 4, false), (RAM_BASE + 0x8100, 4, true)]);
+        mem.write_u16(table + 16 + 14, 0).expect("loop back");
+        mem.write_u16(table + 16 + 12, DESC_F_NEXT).expect("flags");
+        assert_eq!(q.pop(&mem).err(), Some(QueueError::LoopOrTooLong));
+        drv.push_indirect(&mem, table, &[(RAM_BASE + 0x8000, 4, false)]);
+        mem.write_u16(table + 12, DESC_F_INDIRECT).expect("nested");
+        assert_eq!(q.pop(&mem).err(), Some(QueueError::NestedIndirect));
+        drv.push_indirect(&mem, RAM_BASE + 0x10_0000 - 8, &[]);
+        assert_eq!(q.pop(&mem).err(), Some(QueueError::LoopOrTooLong), "empty table");
+    }
+
+    /// Kicks are off while the device drains; turning them back on asks for the next entry and
+    /// reports entries published meanwhile, so the device serves them instead of sleeping.
+    #[test]
+    fn notifications_off_while_draining_then_recheck() {
+        for event_idx in [true, false] {
+            let mem = GuestRam::new(RAM_BASE, 0x10_0000).expect("ram");
+            let mut drv = Driver::new(8);
+            let mut q = Queue::new(drv.cfg, event_idx);
+            let buf = (RAM_BASE + 0x9000, 1, true);
+            assert!(!q.enable_notify(&mem), "nothing published");
+            let old = drv.avail_idx();
+            drv.push(&mem, &[buf]);
+            assert!(drv.needs_kick(&mem, old, event_idx), "an idle device wants a kick");
+            q.disable_notify(&mem);
+            assert!(q.pop(&mem).expect("pop").is_some());
+            let old = drv.avail_idx();
+            drv.push(&mem, &[buf]);
+            assert!(!drv.needs_kick(&mem, old, event_idx), "event_idx={event_idx}: no kick while draining");
+            assert!(q.pop(&mem).expect("pop").is_some());
+            assert!(q.pop(&mem).expect("pop").is_none());
+            // Published after the device's last pop, before it re-enables: no kick, so the
+            // recheck must find it.
+            let old = drv.avail_idx();
+            drv.push(&mem, &[buf]);
+            assert!(!drv.needs_kick(&mem, old, event_idx));
+            assert!(q.enable_notify(&mem), "event_idx={event_idx}: recheck sees the entry");
+            assert!(q.pop(&mem).expect("pop").is_some());
+            assert!(!q.enable_notify(&mem));
+            let old = drv.avail_idx();
+            drv.push(&mem, &[buf]);
+            assert!(drv.needs_kick(&mem, old, event_idx), "event_idx={event_idx}: kicks back on");
+        }
     }
 
     #[test]

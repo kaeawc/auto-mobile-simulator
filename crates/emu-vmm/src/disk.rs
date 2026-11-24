@@ -96,14 +96,19 @@ impl Overlay {
         self.zeroed.insert(s, e);
     }
 
-    /// The writable copy of the chunk at `chunk`, created from the base (or zeroes) on first use.
-    fn chunk_mut(&mut self, base: &File, chunk: u64) -> io::Result<&mut [u8]> {
-        let zeroed = self.zeroed_at(chunk).is_some();
+    fn is_empty(&self) -> bool {
+        self.chunks.is_empty() && self.zeroed.is_empty()
+    }
+
+    /// The writable copy of the chunk at `chunk`, created from the base (or zeroes) on first
+    /// use. `overwrite`: the caller replaces all of it, so a new chunk skips reading the base.
+    fn chunk_mut(&mut self, base: &File, chunk: u64, overwrite: bool) -> io::Result<&mut [u8]> {
+        let from_zeroes = overwrite || self.zeroed_at(chunk).is_some();
         Ok(match self.chunks.entry(chunk) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
                 let mut data = vec![0u8; CHUNK as usize].into_boxed_slice();
-                if !zeroed {
+                if !from_zeroes {
                     read_at(base, &mut data, chunk)?;
                 }
                 e.insert(data)
@@ -143,12 +148,31 @@ impl Disk {
 
     /// Reads `len` bytes at disk `offset` into guest memory at `gpa`.
     pub fn read_to_guest(&self, mem: &GuestRam, offset: u64, gpa: u64, len: u64) -> io::Result<()> {
-        self.check(offset, len)?;
-        let ov = match &self.overlay {
-            Some(o) if o.touches(offset, len) => o,
-            // Fast path: one pread straight into guest memory.
-            _ => return mem.read_from_file(gpa, len as usize, &self.file, offset),
-        };
+        self.read_vectored_to_guest(mem, offset, &[(gpa, len as usize)])
+    }
+
+    /// Reads the disk from `offset` into the guest ranges `segs` (`(gpa, len)`, back to back:
+    /// a virtio-blk request's data buffers). Where no ephemeral change covers the request that
+    /// is one `preadv` straight into guest memory, whatever the number of segments.
+    pub fn read_vectored_to_guest(&self, mem: &GuestRam, offset: u64, segs: &[(u64, usize)]) -> io::Result<()> {
+        let total: u64 = segs.iter().map(|&(_, len)| len as u64).sum();
+        self.check(offset, total)?;
+        match &self.overlay {
+            Some(ov) if !ov.is_empty() && ov.touches(offset, total) => {
+                let mut off = offset;
+                for &(gpa, len) in segs {
+                    self.read_overlaid(ov, mem, off, gpa, len as u64)?;
+                    off += len as u64;
+                }
+                Ok(())
+            }
+            _ => mem.read_vectored_from_file(segs, &self.file, offset),
+        }
+    }
+
+    /// One range of an ephemeral disk whose overlay covers part of it: written chunks from
+    /// memory, zeroed ranges as zeroes, the rest from the base.
+    fn read_overlaid(&self, ov: &Overlay, mem: &GuestRam, offset: u64, gpa: u64, len: u64) -> io::Result<()> {
         let end = offset + len;
         let mut off = offset;
         while off < end {
@@ -179,19 +203,36 @@ impl Disk {
 
     /// Writes `len` bytes from guest memory at `gpa` to disk `offset`.
     pub fn write_from_guest(&mut self, mem: &GuestRam, offset: u64, gpa: u64, len: u64) -> io::Result<()> {
-        self.check(offset, len)?;
+        self.write_vectored_from_guest(mem, offset, &[(gpa, len as usize)])
+    }
+
+    /// Writes the guest ranges `segs` (`(gpa, len)`, back to back) to the disk from `offset`:
+    /// one `pwritev` for a persistent image; an ephemeral disk copies them into its chunks,
+    /// reading a chunk's base only when the write leaves part of it as it was.
+    pub fn write_vectored_from_guest(&mut self, mem: &GuestRam, offset: u64, segs: &[(u64, usize)]) -> io::Result<()> {
+        let total: u64 = segs.iter().map(|&(_, len)| len as u64).sum();
+        self.check(offset, total)?;
         let Some(overlay) = self.overlay.as_mut() else {
-            return mem.write_to_file(gpa, len as usize, &self.file, offset);
+            return mem.write_vectored_to_file(segs, &self.file, offset);
         };
-        let mut pos = 0;
-        while pos < len {
-            let off = offset + pos;
-            let chunk = off / CHUNK * CHUNK;
-            let in_chunk = (off - chunk) as usize;
-            let n = (CHUNK - in_chunk as u64).min(len - pos) as usize;
-            let data = overlay.chunk_mut(&self.file, chunk)?;
-            mem.read(gpa + pos, &mut data[in_chunk..in_chunk + n]).map_err(mem_err)?;
-            pos += n as u64;
+        // Check every guest range first: a chunk created for a whole-chunk write starts as
+        // zeroes, so a copy that failed halfway would leave zeroes where the base was.
+        for &(gpa, len) in segs {
+            mem.host_range(gpa, len).ok_or_else(|| mem_err(emu_hvf::MemError { addr: gpa, len: len as u64 }))?;
+        }
+        let mut off = offset;
+        for &(gpa, len) in segs {
+            let mut pos = 0u64;
+            while pos < len as u64 {
+                let at = off + pos;
+                let chunk = at / CHUNK * CHUNK;
+                let in_chunk = (at - chunk) as usize;
+                let n = (CHUNK - in_chunk as u64).min(len as u64 - pos) as usize;
+                let data = overlay.chunk_mut(&self.file, chunk, n == CHUNK as usize)?;
+                mem.read(gpa + pos, &mut data[in_chunk..in_chunk + n]).map_err(mem_err)?;
+                pos += n as u64;
+            }
+            off += len as u64;
         }
         Ok(())
     }
@@ -260,7 +301,7 @@ fn zero_overlay_bytes(ov: &mut Overlay, base: &File, start: u64, end: u64) -> io
         let n = (chunk + CHUNK).min(end) - off;
         if ov.chunks.contains_key(&chunk) || ov.zeroed_at(chunk).is_none() {
             let i = (off - chunk) as usize;
-            ov.chunk_mut(base, chunk)?[i..i + n as usize].fill(0);
+            ov.chunk_mut(base, chunk, false)?[i..i + n as usize].fill(0);
         }
         off += n;
     }
@@ -345,6 +386,127 @@ mod tests {
         assert!(got[2 * CHUNK as usize..].iter().all(|&b| b == 0xaa));
         assert_eq!(std::fs::read(&path).expect("read")[CHUNK as usize - 2], 0xaa, "base untouched");
         assert!(d.read_to_guest(&mem, 3 * CHUNK - 1, RAM, 2).is_err(), "past the end");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Scattered guest pages, as a virtio-blk request carries them, read and written as one
+    /// request on both kinds of disk, with an ephemeral overlay covering part of the range.
+    #[test]
+    fn vectored_requests_match_per_segment_io() {
+        const LEN: u64 = 16 * CHUNK;
+        let base: Vec<u8> = (0..LEN).map(|i| (i * 13 % 251) as u8).collect();
+        let mem = GuestRam::new(RAM, 0x20_0000).expect("ram");
+        // Unaligned sizes so segments straddle chunks; every other page so none merge but two do.
+        let segs = [(RAM + 0x1_0000, 4096), (RAM + 0x1_2000, 100), (RAM + 0x1_2000 + 100, 3996), (RAM + 0x1_6000, 9000)];
+        let total: usize = segs.iter().map(|s| s.1).sum();
+        for kind in ["persistent", "ephemeral"] {
+            let path = tmp(&format!("vec-{kind}"));
+            std::fs::write(&path, &base).expect("write");
+            let mut d = if kind == "persistent" { Disk::persistent(&path) } else { Disk::ephemeral(&path) }.expect("open");
+            let mut model = base.clone();
+            // A small single write first, so the ephemeral overlay touches the vectored range.
+            mem.write(RAM, &[0xc3; 10]).expect("w");
+            d.write_from_guest(&mem, 3 * CHUNK + 5, RAM, 10).expect("small write");
+            model[3 * CHUNK as usize + 5..3 * CHUNK as usize + 15].fill(0xc3);
+            // Vectored write from offset CHUNK + 300: a full chunk and partial ones.
+            let src: Vec<u8> = (0..total).map(|i| (i % 7 + 1) as u8).collect();
+            let mut at = 0;
+            for &(gpa, len) in &segs {
+                mem.write(gpa, &src[at..at + len]).expect("w");
+                at += len;
+            }
+            d.write_vectored_from_guest(&mem, CHUNK + 300, &segs).expect("writev");
+            model[CHUNK as usize + 300..CHUNK as usize + 300 + total].copy_from_slice(&src);
+            // Read back vectored from a different offset into the same pages.
+            for off in [0, CHUNK + 300, 2 * CHUNK + 1] {
+                mem.zero(RAM + 0x1_0000, 0x1_0000).expect("zero");
+                d.read_vectored_to_guest(&mem, off, &segs).expect("readv");
+                let mut at = off as usize;
+                for &(gpa, len) in &segs {
+                    let mut got = vec![0u8; len];
+                    mem.read(gpa, &mut got).expect("r");
+                    assert_eq!(got, model[at..at + len], "{kind} read at {off}, segment {gpa:#x}");
+                    at += len;
+                }
+            }
+            assert!(d.read_vectored_to_guest(&mem, LEN - 4096, &segs).is_err(), "{kind}: past the end");
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// A 128 KiB request in 32 scattered 4 KiB pages: one call per page (what virtio-blk did
+    /// before vectored requests) against one vectored call, in alternating rounds in one process
+    /// so host noise hits both alike. Prints the median round of each.
+    ///     cargo test --release -p emu-vmm disk_vectored_vs_per_segment -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn disk_vectored_vs_per_segment() {
+        use std::time::Instant;
+        const FILE: u64 = 64 << 20;
+        const REQ: u64 = 32 * CHUNK;
+        const PER_ROUND: u64 = 2000;
+        let path = tmp("vec-bench");
+        std::fs::write(&path, (0..FILE).map(|i| (i >> 9) as u8).collect::<Vec<u8>>()).expect("image");
+        let mem = GuestRam::new(RAM, 32 << 20).expect("ram");
+        let segs: Vec<(u64, usize)> = (0..32).map(|i| (RAM + 0x10_0000 + i * 2 * CHUNK, CHUNK as usize)).collect();
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        for kind in ["persistent", "ephemeral"] {
+            for write in [false, true] {
+                let (mut per, mut vec) = (Vec::new(), Vec::new());
+                for round in 0..14 {
+                    // Ephemeral writes start from an empty overlay each round, so every chunk is new.
+                    let mut d = if kind == "persistent" { Disk::persistent(&path) } else { Disk::ephemeral(&path) }.expect("open");
+                    let vectored = round % 2 == 1;
+                    let start = Instant::now();
+                    for n in 0..PER_ROUND {
+                        let off = n * 7919 % (FILE / REQ) * REQ;
+                        match (write, vectored) {
+                            (false, false) => {
+                                for (i, &(gpa, len)) in segs.iter().enumerate() {
+                                    d.read_to_guest(&mem, off + i as u64 * CHUNK, gpa, len as u64).expect("read");
+                                }
+                            }
+                            (false, true) => d.read_vectored_to_guest(&mem, off, &segs).expect("readv"),
+                            (true, false) => {
+                                for (i, &(gpa, len)) in segs.iter().enumerate() {
+                                    d.write_from_guest(&mem, off + i as u64 * CHUNK, gpa, len as u64).expect("write");
+                                }
+                            }
+                            (true, true) => d.write_vectored_from_guest(&mem, off, &segs).expect("writev"),
+                        }
+                    }
+                    let us = start.elapsed().as_secs_f64() * 1e6 / PER_ROUND as f64;
+                    if round >= 2 {
+                        if vectored { vec.push(us) } else { per.push(us) }
+                    }
+                }
+                let (p, v) = (median(&mut per), median(&mut vec));
+                let op = if write { "write" } else { "read" };
+                println!("disk {kind:<10} {op:<5} 32x4KiB: per-segment {p:>6.1} us/req, vectored {v:>6.1} us/req ({:.2}x)", p / v);
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ephemeral_whole_chunk_writes_keep_the_base_where_a_copy_fails() {
+        let path = tmp("eph-full");
+        std::fs::write(&path, vec![0xaa; 4 * CHUNK as usize]).expect("write");
+        let mem = GuestRam::new(RAM, 0x10_0000).expect("ram");
+        let mut d = Disk::ephemeral(&path).expect("open");
+        mem.write(RAM, &[5; CHUNK as usize]).expect("w");
+        // The second range lies outside guest RAM: nothing is applied, not even the first chunk.
+        assert!(d.write_vectored_from_guest(&mem, 0, &[(RAM, CHUNK as usize), (RAM + 0x10_0000 - 8, 16)]).is_err());
+        assert!(d.overlay.as_ref().expect("overlay").is_empty());
+        // A whole-chunk write next to partial ones.
+        d.write_vectored_from_guest(&mem, CHUNK - 8, &[(RAM, 8), (RAM, CHUNK as usize), (RAM, 8)]).expect("write");
+        let got = read_all(&d, &mem, 4 * CHUNK);
+        assert!(got[..CHUNK as usize - 8].iter().all(|&b| b == 0xaa));
+        assert!(got[CHUNK as usize - 8..2 * CHUNK as usize + 8].iter().all(|&b| b == 5));
+        assert!(got[2 * CHUNK as usize + 8..].iter().all(|&b| b == 0xaa));
         let _ = std::fs::remove_file(path);
     }
 

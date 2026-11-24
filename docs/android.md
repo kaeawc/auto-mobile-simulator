@@ -230,6 +230,22 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   Writes already sit in the host page cache, so an emulator crash loses nothing either way.
 - **Zero-copy disk I/O.** `pread`/`pwrite` go straight between the image and guest RAM, one
   worker thread per disk, so the vCPU that kicked a queue goes back to the guest at once.
+- **One syscall per block request, no kicks while draining.** Linux sends a 128 KiB request as
+  one indirect table of up to 32 scattered pages; virtio-blk issued a `pread`/`pwrite` per page.
+  Now a request is one `preadv`/`pwritev` (guest-adjacent pages merged, at most 1024 iovecs a
+  call), an ephemeral disk checks its overlay once per request, and a whole-chunk write to an
+  ephemeral disk no longer reads the base chunk it replaces. In-process A/B medians on a loaded
+  Mac (`cargo test --release -p emu-vmm disk_vectored_vs_per_segment -- --ignored`), per
+  request: persistent read 20 → 7.2 µs, persistent write 62 → 9.9 µs, ephemeral read 20 → 7.5
+  µs; the skipped base read takes ephemeral writes to fresh chunks from 16 to 10.5 µs. The
+  worker turns notifications off while it drains and back on with a recheck (QEMU's
+  `virtio_queue_set_notification`; publish `avail_event`, full barrier, reread `avail.idx`), so
+  a guest that publishes while a request is being served doesn't kick. With a driver thread
+  racing the worker (`blk_kicks_while_draining`), kicks per request at queue depth 2 went from
+  1.0 to 0.001 with event-idx, and at every depth ≥ 2 from 1.0 to under 0.005 without it; at
+  depth ≥ 4 with event-idx the old code already rarely kicked. Each saved kick is an MMIO exit
+  on a real guest. Popping a 34-entry indirect chain into a reused `Chain`, with the table read
+  in one copy, takes 82 ns instead of about 400 (`queue_pop_indirect`).
 - **Sparse, lazily committed memory.** Guest RAM is an untouched anonymous mapping and the
   userdata image is a sparse file.
 - **Discard punches holes.** virtio-blk `DISCARD`/`WRITE_ZEROES` become `F_PUNCHHOLE` on
