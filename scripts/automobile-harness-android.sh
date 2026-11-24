@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Drives a simee device with AutoMobile through a private daemon (scripts/automobile-daemon.sh):
 # its own one, or the shared one AM_DAEMON_ENV names (scripts/automobile-farm.sh). Prints a
-# pass/fail line per tool and writes the matrix to <logs>/coverage.tsv.
+# pass/fail line and the wall time per tool and writes the matrix to <logs>/coverage.tsv.
 #
 #   scripts/automobile-harness-android.sh emulator-5554 [auto-mobile checkout]   # attach to a running simee
 #   scripts/automobile-harness-android.sh @<avd> [auto-mobile checkout]          # AutoMobile boots it (via `make shim`)
@@ -87,19 +87,26 @@ tools=(
   "deviceSnapshot --action capture --snapshotName simee-harness"
 )
 pass=0; fail=0
-printf 'tool\tresult\n' > "$log/coverage.tsv"
+# Wall time per tool call, in ms: bash 5's EPOCHREALTIME, else perl (a few ms of its own startup).
+now_ms() {
+  if [ -n "${EPOCHREALTIME:-}" ]; then local t=${EPOCHREALTIME/[.,]/}; echo $((t / 1000))
+  else perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; fi
+}
+printf 'tool\tresult\tms\n' > "$log/coverage.tsv"
 for line in "${tools[@]}"; do
   # HARNESS_ONLY=<regex> runs just the matching tools.
   if [ -n "${HARNESS_ONLY:-}" ] && ! [[ "$line" =~ $HARNESS_ONLY ]]; then continue; fi
   read -r -a argv <<< "$line"
+  t0=$(now_ms)
   if out=$(am --session-uuid "$session" "${argv[@]}" 2>&1); then
     result=pass; pass=$((pass + 1))
   else
     result=fail; fail=$((fail + 1))
     echo "$out" | tail -8 > "$log/fail-$(printf '%s' "$line" | tr -c 'A-Za-z0-9' _).log"
   fi
-  printf '%-40s %s\n' "$line" "$result"
-  printf '%s\t%s\n' "$line" "$result" >> "$log/coverage.tsv"
+  ms=$(($(now_ms) - t0))
+  printf '%-40s %s %6d ms\n' "$line" "$result" "$ms"
+  printf '%s\t%s\t%s\n' "$line" "$result" "$ms" >> "$log/coverage.tsv"
 done
 echo "== $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
