@@ -1,11 +1,12 @@
 //! vCPU threads: entering the guest and handling its exits (MMIO, PSCI, WFI, sysreg traps).
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use emu_hvf::{Exit, Reg, SysReg, Vcpu, VcpuHandle};
 
-use crate::bus::{Bus, le_value};
+use crate::bus::{Bus, ExitProfile, le_value};
 use crate::wake::{self, VcpuControl};
 
 const EC_WFX: u64 = 0x01;
@@ -127,12 +128,54 @@ pub struct Cpus {
     stop_cv: Condvar,
     unmapped_logged: AtomicU64,
     sysreg_logged: SeenOnce,
+    /// `EMU_EXIT_PROFILE`: per-device exit attribution and per-vCPU time (see [`ExitProfile`]).
+    profile: Option<Arc<ExitProfile>>,
+    profile_file: Option<PathBuf>,
+}
+
+impl Drop for Cpus {
+    fn drop(&mut self) {
+        if let Some(p) = &self.profile {
+            eprint!("{}", p.summary());
+            if let Some(path) = &self.profile_file {
+                write_profile(p, path);
+            }
+        }
+    }
+}
+
+/// Replaces `path` with the profile's dump, atomically, so a reader never sees half of one.
+fn write_profile(p: &ExitProfile, path: &std::path::Path) {
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, p.dump()).and_then(|()| std::fs::rename(&tmp, path)).is_err() {
+        eprintln!("emu: could not write the exit profile to {}", path.display());
+    }
+}
+
+/// Rewrites the profile file every second until the machine (the last strong reference) goes.
+fn spawn_profile_writer(p: &Arc<ExitProfile>, path: PathBuf) {
+    let weak = Arc::downgrade(p);
+    let _ = std::thread::Builder::new().name("exit-profile".into()).spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let Some(p) = weak.upgrade() else { return };
+            write_profile(&p, &path);
+        }
+    });
 }
 
 impl Cpus {
     pub fn new(bus: Bus, wakers: Arc<Wakers>, vtimer_offset: u64) -> Cpus {
         let n = wakers.len();
+        let target = crate::bus::profile_target(std::env::var("EMU_EXIT_PROFILE").ok().as_deref());
+        let profile = target.as_ref().map(|_| Arc::new(ExitProfile::new(&bus, n)));
+        let profile_file = target.flatten();
+        if let (Some(p), Some(path)) = (&profile, &profile_file) {
+            spawn_profile_writer(p, path.clone());
+        }
         Cpus {
+            profile,
+            profile_file,
             bus,
             slots: (0..n).map(|_| CpuSlot { power: Mutex::new(Power::Off), cv: Condvar::new() }).collect(),
             wakers,
@@ -243,9 +286,18 @@ impl Cpus {
                     vtimer_masked = false;
                 }
             }
+            let t = self.profile.as_ref().map(|p| {
+                p.entered();
+                Instant::now()
+            });
             self.wakers.enter(idx);
             let exit = vcpu.run();
             self.wakers.leave(idx);
+            if let (Some(p), Some(t)) = (&self.profile, t) {
+                let c = p.cpu(idx);
+                c.runs.fetch_add(1, Ordering::Relaxed);
+                c.guest_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
             match exit? {
                 Exit::Canceled => {
                     stats.canceled.fetch_add(1, Ordering::Relaxed);
@@ -292,16 +344,25 @@ impl Cpus {
                 let rt = ((iss >> 16) & 0x1f) as u32;
                 let sixty_four = (iss >> 15) & 1 == 1;
                 let write = (iss >> 6) & 1 == 1;
+                let t = self.profile.as_ref().map(|_| Instant::now());
                 if write {
                     stats.mmio_write.fetch_add(1, Ordering::Relaxed);
                     let v = if rt == 31 { 0 } else { vcpu.reg(Reg::x(rt))? };
-                    if !self.bus.write(ipa, &v.to_le_bytes()[..size]) {
+                    let hit = self.bus.write_at(ipa, &v.to_le_bytes()[..size]);
+                    if let (Some(p), Some(t)) = (&self.profile, t) {
+                        p.record(idx, hit, true, t.elapsed().as_nanos() as u64);
+                    }
+                    if hit.is_none() {
                         self.log_unmapped(ipa, true);
                     }
                 } else {
                     stats.mmio_read.fetch_add(1, Ordering::Relaxed);
                     let mut buf = [0u8; 8];
-                    if !self.bus.read(ipa, &mut buf[..size]) {
+                    let hit = self.bus.read_at(ipa, &mut buf[..size]);
+                    if let (Some(p), Some(t)) = (&self.profile, t) {
+                        p.record(idx, hit, false, t.elapsed().as_nanos() as u64);
+                    }
+                    if hit.is_none() {
                         self.log_unmapped(ipa, false);
                     }
                     let mut v = le_value(&buf[..size]);
@@ -377,7 +438,11 @@ impl Cpus {
             }
             timer = Some(Duration::from_nanos(emu_hvf::ticks_to_nanos(cval - now)));
         }
+        let t = self.profile.as_ref().map(|_| Instant::now());
         self.wakers.park(idx, timer);
+        if let (Some(p), Some(t)) = (&self.profile, t) {
+            p.cpu(idx).parked_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         Ok(())
     }
 
