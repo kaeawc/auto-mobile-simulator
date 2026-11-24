@@ -103,8 +103,9 @@ pub struct MachineConfig {
     /// fsync persistent disks when the guest flushes (`-disk-cache fsync`); default off.
     pub disk_fsync: bool,
     pub rng: bool,
-    /// Host TCP port bridged to the guest's adbd (stock: console port + 1).
-    pub adb_port: Option<u16>,
+    /// The host TCP port bridged to the guest's adbd (stock: console port + 1), bound by the
+    /// caller once and kept across guest resets.
+    pub adb: Option<Arc<pipe::adb::AdbListener>>,
     pub gpu: Option<GpuSpec>,
     /// Served to the guest's `qemu-props` over the `qemud:boot-properties` pipe.
     pub boot_props: Vec<(String, String)>,
@@ -328,9 +329,9 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
             cb(Inputs { screen: (w, h), touch: th, keyboard: kh, rotary: rh, mouse, touchpad });
         }
     }
-    if let Some(port) = cfg.adb_port {
+    if let Some(adb) = &cfg.adb {
         let (events, rx) = virtio::vsock::event_channel();
-        let svc = pipe::adb::AdbService::bind(port, events.clone()).with_context(|| format!("binding adb port {port}"))?;
+        let (svc, port) = (adb.attach(events.clone()), adb.port);
         let mut registry = pipe::PipeRegistry::default();
         registry.register("qemud:adb", Box::new(svc));
         registry.register("qemud:boot-properties", Box::new(pipe::qemud::BootProperties { props: cfg.boot_props.clone() }));
