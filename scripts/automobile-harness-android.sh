@@ -37,9 +37,16 @@ fi
 
 am() { (cd "$root" && bun "$entry" --cli "$@"); }
 cleanup() {
+  # Stop the private daemon through its own socket, PID and lock paths (still exported) before
+  # its socket directory goes: removing the directory doesn't stop it, and an orphan keeps one of
+  # AutoMobile's 3000-3010 ports. The PID file is JSON; its pid is the fallback if stop fails.
   if [ -f "$AUTOMOBILE_DAEMON_PID_FILE_PATH" ]; then
-    pid=$(tr -dc 0-9 < "$AUTOMOBILE_DAEMON_PID_FILE_PATH")
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    (cd "$root" && bun "$entry" --daemon stop) </dev/null >>"$root/daemon-stop.log" 2>&1 || true
+    pid=$(jq -r '.pid // empty' "$AUTOMOBILE_DAEMON_PID_FILE_PATH" 2>/dev/null || true)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      echo "daemon $pid didn't stop on request; sent SIGTERM" >&2
+    fi
   fi
   rm -rf "$sock"
   echo "logs: $root (coverage: $root/coverage.tsv)"
