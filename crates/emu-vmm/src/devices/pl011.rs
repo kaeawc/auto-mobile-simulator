@@ -35,6 +35,8 @@ struct State {
     imsc: u32,
     regs: [u32; 8], // ilpr, ibrd, fbrd, lcr_h, cr, ifls, dmacr, rsr
     line_buf: Vec<u8>,
+    /// The level last driven on the line (it starts low): the controller hears changes only.
+    level: bool,
 }
 
 pub struct Pl011 {
@@ -52,6 +54,7 @@ impl Pl011 {
                 imsc: 0,
                 regs: [0, 0, 0, 0, 0x300, 0x12, 0, 0],
                 line_buf: Vec::with_capacity(256),
+                level: false,
             }),
             irq,
             out: Mutex::new(out),
@@ -63,15 +66,22 @@ impl Pl011 {
         let mut s = self.lock();
         s.rx.extend(bytes);
         s.ris |= INT_RX | INT_RT;
-        self.update(&s);
+        self.update(&mut s);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn update(&self, s: &State) {
-        self.irq.set(s.ris & s.imsc != 0);
+    /// Drives the line to the masked status, only when that changes it: every console byte
+    /// is a register access, and each call into the controller is a hypervisor call (plus a
+    /// vCPU wake on a rise).
+    fn update(&self, s: &mut State) {
+        let level = s.ris & s.imsc != 0;
+        if level != s.level {
+            s.level = level;
+            self.irq.set(level);
+        }
     }
 
     fn emit(&self, s: &mut State, b: u8) {
@@ -95,7 +105,7 @@ impl MmioDevice for Pl011 {
                 if s.rx.is_empty() {
                     s.ris &= !(INT_RX | INT_RT);
                 }
-                self.update(&s);
+                self.update(&mut s);
                 u32::from(b)
             }
             RSR => s.regs[7],
@@ -143,14 +153,14 @@ impl MmioDevice for Pl011 {
             DMACR => s.regs[6] = v,
             _ => {}
         }
-        self.update(&s);
+        self.update(&mut s);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::irq::TestLine;
+    use crate::irq::{CountLine, TestLine};
 
     #[derive(Clone, Default)]
     struct Sink(Arc<Mutex<Vec<u8>>>);
@@ -198,5 +208,32 @@ mod tests {
         assert_eq!(rd(&u, FR) & FR_RXFE, 0);
         assert_eq!(rd(&u, DR), u32::from(b'a'));
         assert!(!line.level());
+    }
+
+    /// Every console byte is a DR write and every input byte a DR read: the controller is told
+    /// only when the line changes, not on every access.
+    #[test]
+    fn drives_the_line_only_on_changes() {
+        let line = Arc::new(CountLine::default());
+        let u = Pl011::new(line.clone(), Box::new(std::io::sink()));
+        u.write(IMSC, &(INT_RX | INT_TX).to_le_bytes());
+        assert!(line.level(), "TX fires on enable");
+        for b in b"a console line\n" {
+            u.write(DR, &[*b, 0, 0, 0]);
+        }
+        u.push_input(b"typed");
+        for _ in 0..5 {
+            rd(&u, DR);
+            rd(&u, FR);
+        }
+        assert!(line.level(), "TX still pending");
+        u.write(ICR, &INT_TX.to_le_bytes());
+        assert!(!line.level());
+        u.write(CR, &0x301u32.to_le_bytes());
+        u.push_input(b"x");
+        assert!(line.level());
+        rd(&u, DR);
+        assert!(!line.level());
+        assert_eq!((line.calls(), line.transitions()), (4, 4));
     }
 }

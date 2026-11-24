@@ -66,6 +66,10 @@ fn shutdown_signals() -> std::sync::mpsc::Receiver<i32> {
     rx
 }
 
+/// How often a running instance tells the adb server about itself again.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ADB_REANNOUNCE: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn main() -> ExitCode {
     match real_main() {
         Ok(code) => code,
@@ -99,6 +103,7 @@ fn create_avd(env: &emu_avd::Env, name: &str, sysdir: &str, opts: &args::Opts) -
 }
 
 fn real_main() -> Result<ExitCode> {
+    let launched = std::time::Instant::now();
     // First, before any thread exists.
     let signals = shutdown_signals();
     // Internal: `emu -probe-vulkan <lib64>` (see vkprobe.rs).
@@ -144,6 +149,17 @@ fn real_main() -> Result<ExitCode> {
         create_avd(&env, name, &sysdir, &opts)?;
         return Ok(ExitCode::SUCCESS);
     }
+    if let Some(name) = &opts.clone_avd {
+        let golden = opts.from.as_deref().context("-clone-avd needs -from GOLDEN")?;
+        let dir = env.clone_avd(golden, name)?;
+        println!("cloned {golden} as {name} at {}", dir.display());
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(name) = &opts.delete_avd {
+        env.delete_avd(name)?;
+        println!("deleted {name}");
+        return Ok(ExitCode::SUCCESS);
+    }
     if opts.accel_check {
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             println!("accel:\n0\nHypervisor.framework (arm64) is usable\naccel");
@@ -156,7 +172,7 @@ fn real_main() -> Result<ExitCode> {
     if opts.dry_run {
         return dry_run(&env, &name, &opts);
     }
-    boot(&env, &name, &opts, signals)
+    boot(&env, &name, &opts, signals, launched)
 }
 
 /// `-avd NAME -dry-run`: prints the boot plan without booting (on any host), and fails if the
@@ -174,13 +190,19 @@ fn dry_run(env: &emu_avd::Env, name: &str, opts: &args::Opts) -> Result<ExitCode
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn boot(_: &emu_avd::Env, name: &str, _: &args::Opts, _: std::sync::mpsc::Receiver<i32>) -> Result<ExitCode> {
+fn boot(_: &emu_avd::Env, name: &str, _: &args::Opts, _: std::sync::mpsc::Receiver<i32>, _: std::time::Instant) -> Result<ExitCode> {
     anyhow::bail!("cannot boot {name}: simee needs Hypervisor.framework on an Apple silicon Mac")
 }
 
 /// Boots the AVD and runs it until the guest powers off or a signal arrives.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn boot(env: &emu_avd::Env, name: &str, opts: &args::Opts, signals: std::sync::mpsc::Receiver<i32>) -> Result<ExitCode> {
+fn boot(
+    env: &emu_avd::Env,
+    name: &str,
+    opts: &args::Opts,
+    signals: std::sync::mpsc::Receiver<i32>,
+    launched: std::time::Instant,
+) -> Result<ExitCode> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -205,6 +227,20 @@ fn boot(env: &emu_avd::Env, name: &str, opts: &args::Opts, signals: std::sync::m
 
     let avd = env.load(name)?;
     let inst = instance::Instance::prepare(&avd, opts)?;
+    {
+        // An adb server finds emulators by scanning adb ports 5555..5585 (16 instances, unless
+        // started with ADB_LOCAL_TRANSPORT_MAX_PORT), or by being told (`host:emulator:<port>`,
+        // sent at boot). A server started later (adb kill-server, a reboot of adb) never hears
+        // of an instance above 5585, so it's told again every few seconds: for a device it
+        // already has, the server ignores it (one loopback connect and write).
+        let adb_port = inst.console_port + 1;
+        let _ = std::thread::Builder::new().name("adb-announce".into()).spawn(move || {
+            loop {
+                std::thread::sleep(ADB_REANNOUNCE);
+                emu_vmm::pipe::adb::AdbService::announce_port(adb_port);
+            }
+        });
+    }
     console::serve(
         inst.console_port,
         console::ConsoleInfo {
@@ -227,8 +263,15 @@ fn boot(env: &emu_avd::Env, name: &str, opts: &args::Opts, signals: std::sync::m
     let _display = inst.display.clone().and_then(|d| display_server::start(&avd.dir, d, inst.inputs.clone(), stop.clone()));
     // On stdout: launchers watch for the first line and the `emulator-<port>` serial.
     println!("emu: {} on emulator-{} (adb port {})", avd.name, inst.console_port, inst.console_port + 1);
+    let mut cfg = inst.machine_config(opts, launched)?;
+    // The cheap checks passed (console port bound, the boot files exist) and `prepare` has set
+    // the renderer's environment: bring the renderer up beside kernel load and VM setup. Nothing
+    // fallible runs between here and `run`, which claims it (or, failing before the GPU, waits
+    // for it to finish) before it returns.
+    if let Some(gpu) = inst.gpu_spec(opts) {
+        emu_vmm::start_renderer(gpu);
+    }
     loop {
-        let cfg = inst.machine_config(opts)?;
         let out = emu_vmm::run(cfg, stop.clone())?;
         if opts.verbose {
             eprintln!("emu: stopped after {:.1}s: {:?}", out.uptime.as_secs_f64(), out.reason);
@@ -236,9 +279,12 @@ fn boot(env: &emu_avd::Env, name: &str, opts: &args::Opts, signals: std::sync::m
                 let line: Vec<String> = exits.iter().filter(|(_, n)| *n > 0).map(|(k, n)| format!("{k}={n}")).collect();
                 eprintln!("emu:   vcpu{i}: {}", line.join(" "));
             }
+            if let Some(spool) = &inst.logcat {
+                eprintln!("emu:   logcat bytes dropped (its output fell behind): {}", spool.dropped());
+            }
         }
         match out.reason {
-            emu_vmm::StopReason::Reset if !stop.load(Ordering::SeqCst) => continue,
+            emu_vmm::StopReason::Reset if !stop.load(Ordering::SeqCst) => cfg = inst.machine_config(opts, launched)?,
             emu_vmm::StopReason::Fault(msg) => {
                 eprintln!("emu: guest fault: {msg}");
                 return Ok(ExitCode::FAILURE);

@@ -1,6 +1,6 @@
 //! The window: a device picker on the left (grouped by platform), the live screen and the controls
 //! its form factor has in the middle, and a platform panel on the right (iOS: the debug panel;
-//! Android: the guest console).
+//! Android: the guest log, logcat and the console's critical lines).
 
 use rune::tok::{self, Theme, radius, type_};
 use rune::{Color, Cx, Drag, El, Icon, KeyEvent, Phase, ScrollSpec, SurfaceFit, Tx, col, el, row, text};
@@ -206,7 +206,14 @@ pub fn screen_radius(shape: Shape, width: f32) -> f32 {
     }
 }
 
-/// An Android device's panel: what it is, and its guest console (kernel and init output).
+/// What an Android panel says when there's no log: emu keeps the kernel console quiet, and the
+/// logcat stream exists only for devices booted from here.
+const EMPTY_LOG: &str = "No log yet. Devices booted here stream logcat (info and up) to this panel. \
+                         The kernel console only has critical messages: for the full kernel log, \
+                         start emu with -show-kernel or EMU_CONSOLE=full.";
+
+/// An Android device's panel: what it is, and its guest log (the console's critical lines, then
+/// logcat).
 fn android_panel(s: &State, t: Theme) -> El {
     let mut facts = col().gap(4.0);
     if let Some(d) = s.selected_info() {
@@ -222,7 +229,7 @@ fn android_panel(s: &State, t: Theme) -> El {
         log = log.child(text(line.clone()).key(format!("log-{i}")).font(type_::MONO_CAPTION).color(t.text).truncate());
     }
     if s.console_log.is_empty() {
-        log = log.child(text("No console output yet").key("log-empty").font(type_::BODY).color(t.text_secondary));
+        log = log.child(text(EMPTY_LOG).key("log-empty").font(type_::BODY).color(t.text_secondary).wrap());
     }
     col()
         .key("android-panel")
@@ -235,6 +242,6 @@ fn android_panel(s: &State, t: Theme) -> El {
         .child(el().h(22.0))
         .child(text("DEVICE").font(type_::SECTION).color(t.text_secondary))
         .child(facts)
-        .child(text("CONSOLE").font(type_::SECTION).color(t.text_secondary))
+        .child(text("LOG").font(type_::SECTION).color(t.text_secondary))
         .child(log.scroll(ScrollSpec { stick_bottom: true }).shrink().min_h(0.0))
 }

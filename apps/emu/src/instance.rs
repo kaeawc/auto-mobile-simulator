@@ -26,10 +26,36 @@ const CACHE_BYTES: u64 = 66 << 20;
 const BASE_CMDLINE: &str = "8250.nr_uarts=1 no_timer_check console=ttyAMA0,38400 keep_bootcon earlyprintk=ttyAMA0 \
                             ndns=2 loop.max_part=7 printk.devkmsg=on bootconfig mac80211_hwsim.radios=0";
 
+/// Without `-show-kernel`, only messages below KERN_ERR reach the console (emergencies, alerts,
+/// criticals, so init's FATAL lines). The PL011 traps twice per byte, and booting printed 230 KB
+/// on it, 88% of all vCPU exits (~0.6 vCPU-s per boot, ~2.5 µs per byte in the writer, often
+/// init). Stock (`SetupParameters.cpp`) passes `console=0` then and prints nothing; with
+/// `-show-kernel` it passes `console=ttyAMA0,38400`, as simee always does. This keeps critical
+/// lines in `console.log`, panics included (`panic()` raises the console level). One sysrq-c test
+/// found console.log empty: each reset used to recreate the file, wiping the panic; it's opened
+/// once per process now. Use `-show-kernel` or `EMU_CONSOLE=full` to debug boots; dmesg still has
+/// everything.
+const QUIET_CONSOLE: &str = "loglevel=3";
+
+/// Every message on the console: `-show-kernel`, or `EMU_CONSOLE=full` (console.log only).
+fn full_console(opts: &Opts) -> bool {
+    opts.show_kernel || std::env::var("EMU_CONSOLE").is_ok_and(|v| v == "full")
+}
+
+/// The guest's logcat filter for `goldfish-logcat` (`logcat -f /dev/hvc1 ${ro.boot.logcat}`):
+/// `-logcat`'s, everything with `-logcat-output` alone, else silent (`*:S`): the stream is
+/// discarded then (stock's null chardev), so formatting and writing it is wasted guest work.
+fn logcat_filter(opts: &Opts) -> &str {
+    match (&opts.logcat, &opts.logcat_output) {
+        (Some(tags), _) => tags,
+        (None, Some(_)) => "*:V",
+        (None, None) => "*:S",
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub struct Instance {
     avd: Avd,
-    dir: PathBuf,
     /// Console port (the `emulator-<port>` serial); adb listens on port + 1.
     pub console_port: u16,
     /// Latest guest frame, when host rendering is on.
@@ -52,6 +78,12 @@ pub struct Instance {
     /// The adb port, bound for the life of the process so a guest reset reboots on it.
     adb: std::sync::Arc<emu_vmm::pipe::adb::AdbListener>,
     _lock: Option<File>,
+    /// This process's claim on its console port ([`claim_port`]).
+    _port_claim: File,
+    /// `<avd>/simee/console.log`, truncated when the process starts; every boot appends.
+    console_log: File,
+    /// Where logcat's stream goes (`-logcat`, `-logcat-output`), for the life of the process.
+    pub logcat: Option<emu_vmm::virtio::console::Spool>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -97,10 +129,24 @@ impl Instance {
         } else {
             emu_vmm::disk::ensure_sparse(&dir.join("encryptionkey.img"), 18 << 20)?;
         }
-        let console_port = match opts.port {
-            Some(p) => p,
-            None => free_port_pair().context("no free console/adb port pair in 5554..5682")?,
+        // `<HOME>/Library/Caches/simee/ports/<port>.lock`, which launchers (sim-android's
+        // allocator) also look at.
+        let lock_dir = emu_avd::port_lock_dir().unwrap_or_else(|| dir.join("ports"));
+        let (console_port, port_claim) = match opts.port {
+            // An explicit port is claimed too: a second simee given the same one fails here,
+            // clearly, instead of when it binds. Launchers match the message to try another pair.
+            Some(p) => {
+                let claim = claim_port(&lock_dir, p).with_context(|| format!("console port {p} {}", emu_avd::PORT_TAKEN))?;
+                (p, claim)
+            }
+            None => pick_port(&lock_dir, PORTS, port_free).context("no free console/adb port pair in 5554..5682")?,
         };
+        // Opened once per process, not per boot: a guest reset (a panic's reboot) keeps what
+        // the boot before it wrote, panic text included.
+        let console_log =
+            File::create(dir.join("console.log")).with_context(|| format!("creating {}", dir.join("console.log").display()))?;
+        let logcat =
+            logcat_sink(opts).with_context(|| format!("opening -logcat-output {}", opts.logcat_output.as_deref().unwrap_or("")))?;
         let adb_port = console_port + 1;
         let adb = emu_vmm::pipe::adb::AdbListener::bind(adb_port).with_context(|| format!("binding adb port {adb_port}"))?;
         let gpu_lib64 = renderer(avd, opts);
@@ -137,7 +183,6 @@ impl Instance {
         let display = gpu_lib64.as_ref().map(|_| std::sync::Arc::new(emu_vmm::display::FrameStore::default()));
         Ok(Instance {
             avd: avd.clone(),
-            dir,
             console_port,
             display,
             gpu_lib64,
@@ -152,6 +197,9 @@ impl Instance {
             car: avd.is_car().then(Default::default),
             adb: std::sync::Arc::new(adb),
             _lock: lock,
+            _port_claim: port_claim,
+            console_log,
+            logcat,
         })
     }
 
@@ -159,7 +207,19 @@ impl Instance {
         BootPlan::new(&self.avd, opts, self.gpu_lib64.clone())
     }
 
-    pub fn machine_config(&self, opts: &Opts) -> Result<emu_vmm::MachineConfig> {
+    /// The GPU this boot gets, if any (`emu_vmm::start_renderer` takes it early, `run` again).
+    pub fn gpu_spec(&self, opts: &Opts) -> Option<emu_vmm::GpuSpec> {
+        self.gpu_lib64.as_ref().zip(self.display.as_ref()).map(|(lib64, display)| emu_vmm::GpuSpec {
+            lib64: lib64.clone(),
+            width: self.avd.lcd().0,
+            height: self.avd.lcd().1,
+            verbose: opts.verbose,
+            display: display.clone(),
+        })
+    }
+
+    /// `launched`: when the process started, for `-verbose` launch timings.
+    pub fn machine_config(&self, opts: &Opts, launched: std::time::Instant) -> Result<emu_vmm::MachineConfig> {
         let plan = self.plan(opts);
         if let Some(missing) = plan.missing().first() {
             bail!("missing {}", missing.display());
@@ -171,26 +231,23 @@ impl Instance {
         }
         let mut initrd = std::fs::read(&plan.ramdisk).with_context(|| format!("reading {}", plan.ramdisk.display()))?;
         initrd.extend_from_slice(&plan.bootconfig.encode());
-        let log = File::create(self.dir.join("console.log"))?;
+        let log = self.console_log.try_clone().context("console.log")?;
         let console: Box<dyn Write + Send> = if opts.show_kernel { Box::new(Tee(std::io::stdout(), log)) } else { Box::new(log) };
+        let logcat = self.logcat.clone();
 
         Ok(emu_vmm::MachineConfig {
             cpus: plan.cpus,
             ram_bytes: plan.ram_bytes,
             kernel: plan.kernel,
+            // Inflated gzip kernels, beside vkprobe's verdicts.
+            kernel_cache: std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Caches/simee")),
             initrd: Some(initrd),
             cmdline: plan.cmdline,
             disks: plan.disks,
             disk_fsync: opts.disk_fsync,
             rng: true,
             adb: Some(self.adb.clone()),
-            gpu: self.gpu_lib64.as_ref().zip(self.display.as_ref()).map(|(lib64, display)| emu_vmm::GpuSpec {
-                lib64: lib64.clone(),
-                width: self.avd.lcd().0,
-                height: self.avd.lcd().1,
-                verbose: opts.verbose,
-                display: display.clone(),
-            }),
+            gpu: self.gpu_spec(opts),
             boot_props: plan.boot_props,
             input: Some((self.avd.lcd().0, self.avd.lcd().1)),
             touch_screen: plan.touch_screen,
@@ -219,15 +276,41 @@ impl Instance {
                 Some(std::sync::Arc::new(move |i| *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(i)))
             },
             console,
+            logcat,
+            launched: opts.verbose.then_some(launched),
         })
     }
 }
 
+/// Console ports stock and simee pick from (adb is each one + 1); stock's ceiling.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub const PORTS: std::ops::RangeInclusive<u16> = 5554..=5682;
+
+/// Claims console port `port` for this process: its lock file, held until the returned file is
+/// dropped or the process exits. None when another simee instance holds it.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub fn claim_port(dir: &Path, port: u16) -> Option<std::fs::File> {
+    std::fs::create_dir_all(dir).ok()?;
+    let f = std::fs::File::create(dir.join(format!("{port}.lock"))).ok()?;
+    f.try_lock().ok().map(|()| f)
+}
+
+/// The first even console port in `range` this process could claim whose console and adb
+/// ports are free (`free`), with its claim. Instances launched together used to race between
+/// probing a pair free and binding it (both picked the same pair, one then failed); the claim is
+/// taken before the probe and kept, so two simee instances never pick one pair. A stock
+/// emulator doesn't take claims, so the bind probe still keeps clear of the ones it holds.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub fn pick_port(dir: &Path, range: std::ops::RangeInclusive<u16>, free: impl Fn(u16) -> bool) -> Option<(u16, std::fs::File)> {
+    range.step_by(2).find_map(|p| {
+        let claim = claim_port(dir, p)?;
+        (free(p) && free(p + 1)).then_some((p, claim))
+    })
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-/// First even console port whose console and adb ports are both free, like the stock emulator.
-fn free_port_pair() -> Option<u16> {
-    let free = |p: u16| std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, p)).is_ok();
-    (5554..=5682).step_by(2).find(|&p| free(p) && free(p + 1))
+fn port_free(p: u16) -> bool {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, p)).is_ok()
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -255,6 +338,67 @@ impl<A: Write, B: Write> Write for Tee<A, B> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.0.flush()?;
         self.1.flush()
+    }
+}
+
+/// `-logcat-output FILE` rolls over to `FILE.1` past this size, so a long-lived device keeps at
+/// most twice this on disk.
+pub const LOGCAT_ROTATE_BYTES: u64 = 4 << 20;
+
+/// Guest buffers logcat's spool holds while its writer is behind (each one hvc1 buffer, up to a
+/// page); beyond that output is dropped and counted rather than stalling the console worker.
+const LOGCAT_SPOOL_DEPTH: usize = 1024;
+
+/// Where logcat's stream goes for this process: `-logcat-output`'s file (rotated), stdout with
+/// `-logcat` alone, else nowhere. Behind a spool either way.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub fn logcat_sink(opts: &Opts) -> std::io::Result<Option<emu_vmm::virtio::console::Spool>> {
+    let out: Box<dyn std::io::Write + Send> = match (&opts.logcat_output, &opts.logcat) {
+        (Some(path), _) => Box::new(RotatingFile::create(Path::new(path), LOGCAT_ROTATE_BYTES)?),
+        (None, Some(_)) => Box::new(std::io::stdout()),
+        (None, None) => return Ok(None),
+    };
+    emu_vmm::virtio::console::Spool::new("logcat-out", out, LOGCAT_SPOOL_DEPTH).map(Some)
+}
+
+/// A log file that, before a write would take it past `cap` bytes, is renamed to `<path>.1`
+/// (replacing the previous one) and started again.
+pub struct RotatingFile {
+    path: PathBuf,
+    file: std::fs::File,
+    len: u64,
+    cap: u64,
+}
+
+impl RotatingFile {
+    /// Creates (truncates) `path`.
+    pub fn create(path: &Path, cap: u64) -> std::io::Result<RotatingFile> {
+        let file = std::fs::File::create(path)?;
+        Ok(RotatingFile { path: path.to_owned(), file, len: 0, cap })
+    }
+
+    fn rotated(&self) -> PathBuf {
+        let mut p = self.path.clone().into_os_string();
+        p.push(".1");
+        PathBuf::from(p)
+    }
+}
+
+impl std::io::Write for RotatingFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.len > 0 && self.len + buf.len() as u64 > self.cap {
+            std::io::Write::flush(&mut self.file)?;
+            std::fs::rename(&self.path, self.rotated())?;
+            self.file = std::fs::File::create(&self.path)?;
+            self.len = 0;
+        }
+        std::io::Write::write_all(&mut self.file, buf)?;
+        self.len += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.file)
     }
 }
 
@@ -313,6 +457,10 @@ impl BootPlan {
         let user_mode = if opts.read_only { DiskMode::Ephemeral } else { DiskMode::Persistent };
         let disk = |slot, path: PathBuf, mode, serial: &str| DiskSpec { slot, path, mode, serial: serial.to_string() };
         let mut cmdline = String::from(BASE_CMDLINE);
+        if !full_console(opts) {
+            cmdline.push(' ');
+            cmdline.push_str(QUIET_CONSOLE);
+        }
         let extra = avd.image_cmdline();
         if !extra.is_empty() {
             cmdline.push(' ');
@@ -455,7 +603,7 @@ fn bootconfig(avd: &Avd, opts: &Opts, graphics: bool) -> BootConfig {
         .set("androidboot.serialno", "EMULATOR0EMURS0")
         .set("androidboot.veritymode", "enforcing")
         .set("androidboot.dalvik.vm.heapsize", "576m")
-        .set("androidboot.logcat", "*:V")
+        .set("androidboot.logcat", logcat_filter(opts))
         .set("androidboot.qemu.skin", format!("{w}x{h}"))
         .set("androidboot.qemu.vsync", "60")
         .set("androidboot.qemu.settings.system.screen_off_timeout", "2147483647")
@@ -563,6 +711,82 @@ mod tests {
     }
 
     #[test]
+    fn logcat_files_rotate_at_their_cap() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("emu-logcat-rotate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("logcat.txt");
+        std::fs::write(&path, "old run\n").expect("old");
+        let mut f = RotatingFile::create(&path, 10).expect("create");
+        assert_eq!(std::fs::read(&path).expect("read"), b"", "a new process starts the file again");
+        f.write_all(b"aaaa\n").and_then(|()| f.write_all(b"bbbb\n")).expect("write");
+        assert_eq!(std::fs::read(&path).expect("read"), b"aaaa\nbbbb\n");
+        f.write_all(b"cccc\n").expect("write");
+        assert_eq!(std::fs::read(dir.join("logcat.txt.1")).expect("rotated"), b"aaaa\nbbbb\n");
+        assert_eq!(std::fs::read(&path).expect("read"), b"cccc\n");
+        // A chunk bigger than the cap still goes in whole, into a fresh file.
+        f.write_all(&[b'x'; 25]).expect("write");
+        assert_eq!(std::fs::read(dir.join("logcat.txt.1")).expect("rotated"), b"cccc\n");
+        assert_eq!(std::fs::read(&path).expect("read").len(), 25);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A guest reset builds a new machine config; what the boot before it logged (a panic's
+    /// text) stays in console.log and the logcat file.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn a_reset_keeps_the_logs_of_the_boot_before() {
+        let s = sdk("reset-logs");
+        let avd = s.env.load("phone").expect("load");
+        let logcat = s.root.join("logcat.txt");
+        // A port outside 5554..5682, so no real emulator or farm is affected by its claim.
+        let opts = Opts { port: Some(6990), gpu: Some("off".into()), logcat_output: Some(logcat.display().to_string()), ..Opts::default() };
+        let inst = Instance::prepare(&avd, &opts).expect("prepare");
+        let launched = std::time::Instant::now();
+        let mut first = inst.machine_config(&opts, launched).expect("config");
+        first.console.write_all(b"Kernel panic - not syncing: sysrq triggered crash\n").expect("console");
+        first.logcat.as_ref().expect("logcat").send(b"F/libc: Fatal signal 6\n");
+        drop(first);
+        let mut second = inst.machine_config(&opts, launched).expect("config after reset");
+        second.console.write_all(b"Booting Linux\n").expect("console");
+        second.logcat.as_ref().expect("logcat").send(b"I/init: second boot\n");
+        let console = std::fs::read_to_string(emu_avd::state_dir(&avd.dir).join("console.log")).expect("console.log");
+        assert_eq!(console, "Kernel panic - not syncing: sysrq triggered crash\nBooting Linux\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::read_to_string(&logcat).unwrap_or_default() != "F/libc: Fatal signal 6\nI/init: second boot\n" {
+            assert!(std::time::Instant::now() < deadline, "{:?}", std::fs::read_to_string(&logcat));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop((second, inst));
+        if let Some(locks) = emu_avd::port_lock_dir() {
+            let _ = std::fs::remove_file(locks.join("6990.lock"));
+        }
+    }
+
+    #[test]
+    fn parallel_launches_claim_distinct_ports() {
+        let dir = std::env::temp_dir().join(format!("emu-ports-{}", std::process::id()));
+        // Sixteen launches at once, every pair probing free: each gets its own pair.
+        let picked: Vec<(u16, std::fs::File)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16).map(|_| s.spawn(|| pick_port(&dir, 5600..=5682, |_| true).expect("a port"))).collect();
+            handles.into_iter().map(|h| h.join().expect("thread")).collect()
+        });
+        let mut ports: Vec<u16> = picked.iter().map(|(p, _)| *p).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        assert_eq!(ports.len(), 16, "{ports:?}");
+        assert!(ports.iter().all(|p| p % 2 == 0 && (5600..=5630).contains(p)), "{ports:?}");
+        // A held claim is skipped and an explicit claim of it refused; a pair in use (a stock
+        // emulator's) is skipped too. Dropping a claim frees its port.
+        assert!(claim_port(&dir, 5600).is_none());
+        assert_eq!(pick_port(&dir, 5600..=5682, |p| p != 5633).map(|(p, _)| p), Some(5634));
+        drop(picked);
+        assert_eq!(pick_port(&dir, 5600..=5682, |_| true).map(|(p, _)| p), Some(5600));
+        assert!(pick_port(&dir, 5600..=5602, |_| false).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn each_form_factor_gets_its_devices() {
         let s = sdk("devices");
         let shape = |p: &BootPlan| (p.touch_screen, p.touchpad, p.dual_mode_mouse, p.xr, p.car, p.sound);
@@ -620,7 +844,16 @@ mod tests {
         assert_eq!(p.bootconfig.get("androidboot.debug.sf.nobootanimation"), Some("1"));
         assert!(p.missing().is_empty(), "the AVD's own disks are made at boot");
 
+        // The console is quiet unless -show-kernel; logcat's stream is silent unless asked for.
         let p = BootPlan::new(&avd, &Opts::default(), None);
+        assert!(p.cmdline.contains(" loglevel=3") && p.cmdline.contains("console=ttyAMA0"), "{}", p.cmdline);
+        assert_eq!(p.bootconfig.get("androidboot.logcat"), Some("*:S"));
+        let shown = BootPlan::new(&avd, &Opts { show_kernel: true, logcat: Some("*:I".into()), ..Opts::default() }, None);
+        assert!(!shown.cmdline.contains("loglevel="), "{}", shown.cmdline);
+        assert_eq!(shown.bootconfig.get("androidboot.logcat"), Some("*:I"));
+        let to_file = BootPlan::new(&avd, &Opts { logcat_output: Some("/tmp/l".into()), ..Opts::default() }, None);
+        assert_eq!(to_file.bootconfig.get("androidboot.logcat"), Some("*:V"));
+
         let userdata = p.disks.iter().find(|d| d.serial == "userdata").expect("userdata");
         assert_eq!((userdata.slot, userdata.mode), (slots::USERDATA, DiskMode::Persistent));
         std::fs::remove_file(avd.vendor_image()).expect("rm");

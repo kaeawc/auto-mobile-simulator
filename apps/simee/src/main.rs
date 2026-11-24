@@ -2,7 +2,12 @@
 //!
 //! Every device command is a call into the API's method table (`sim-api`), the same code the
 //! socket server and the desktop window run; this file only parses arguments and prints results.
+//! When a server (`simee serve`) of this build and environment answers on the default socket,
+//! commands go to it, so they reuse its service connection and per-device input connections;
+//! otherwise (and always for `boot`, see `sim_api::IN_CALLER`) they run in this process. The
+//! output is the same either way.
 
+use std::io::Write;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -14,6 +19,15 @@ use sim_core::device::DeviceInfo;
 #[derive(Parser)]
 #[command(name = "simee", version, about = "Create, boot and drive iOS simulator and Android emulator devices")]
 struct Cli {
+    /// Run the command in this process even when a server is listening on the default socket
+    /// (also `SIMEE_IN_PROCESS=1`).
+    #[arg(long)]
+    in_process: bool,
+    /// Say on stderr where each command runs and, when not on the server, why (also
+    /// `SIMEE_VERBOSE=1`). `SIMEE_REQUIRE_SERVER=1` makes a command that could have gone to a
+    /// server fail instead of running here.
+    #[arg(long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Cmd,
 }
@@ -87,7 +101,66 @@ enum Cmd {
         /// Seconds to wait for the first frame.
         #[arg(long, default_value_t = 120)]
         timeout: u64,
+        /// iOS: also wait until the device is quiet (its processes under 10 % of a core for 10 s)
+        /// and print the timings. A device booted but not settled in time prints "booted, not
+        /// settled" and still exits 0.
+        #[arg(long)]
+        settle: bool,
+        /// iOS: seconds the settle wait may take after the boot (default 600).
+        #[arg(long)]
+        settle_timeout: Option<u64>,
+        /// iOS: turn off a named set of daemons once booted (`slim`).
+        #[arg(long)]
+        profile: Option<String>,
     },
+    /// Boot several devices of one platform, a few at a time, and print each one's timings.
+    /// Exits non-zero only when a device failed to boot (one that booted but didn't settle in
+    /// time is counted in `unsettled`).
+    BootMany {
+        #[arg(required = true)]
+        devices: Vec<String>,
+        /// Boots in flight at once (default: a quarter of the host's CPUs, at least 2).
+        #[arg(short = 'j', long)]
+        concurrency: Option<u64>,
+        /// Seconds each device's boot may take.
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// iOS: wait until each device is quiet (the default; kept for older scripts).
+        #[arg(long, hide = true, conflicts_with = "no_settle")]
+        settle: bool,
+        /// iOS: don't wait until each device is quiet (a slot then bounds only the boot call).
+        #[arg(long)]
+        no_settle: bool,
+        /// iOS: seconds each settle wait may take after the boot (default 600, more above K=4).
+        #[arg(long)]
+        settle_timeout: Option<u64>,
+        /// iOS: turn off a named set of daemons on each device (`slim`).
+        #[arg(long)]
+        profile: Option<String>,
+        /// Android: the first console port to hand out (default 5554).
+        #[arg(long)]
+        first_port: Option<u16>,
+        /// Print the result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// iOS: wait until a booted simulator is quiet; prints how long that took.
+    Settle {
+        device: String,
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+    },
+    /// iOS: turn a named set of daemons off on a booted simulator (`slim`), or back on with --undo.
+    Profile {
+        device: String,
+        name: String,
+        /// Re-enable the profile's daemons (they run again from the next boot).
+        #[arg(long)]
+        undo: bool,
+    },
+    /// Create a device as a copy of a shut-down one (iOS: a simulator; Android: an AVD from a
+    /// golden booted once under simee); prints its UDID (an AVD's name).
+    Clone { template: String, name: String },
     /// Shut a device down.
     Shutdown { device: String },
     /// Erase all content and settings (device must be shut down).
@@ -278,50 +351,154 @@ fn main() -> Result<()> {
         }
         _ => {}
     }
-    let mut session = sim_api::Session::default();
-    let mut call = |method: &str, params: Value| sim_api::call_method(&mut session, method, &params).map_err(anyhow::Error::msg);
-    match cli.command {
+    let in_process = cli.in_process || flag("SIMEE_IN_PROCESS");
+    let mut transport = if in_process { Transport::local() } else { Transport::open(&sim_api::default_socket()) };
+    transport.verbose = cli.verbose || flag("SIMEE_VERBOSE");
+    transport.require = flag("SIMEE_REQUIRE_SERVER");
+    let (stdout, stderr) = (std::io::stdout(), std::io::stderr());
+    run(cli.command, &mut transport, &mut stdout.lock(), &mut stderr.lock())
+}
+
+/// Whether an on/off environment variable is on (set, not empty, not `0`).
+fn flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Where a command's method runs: a matching server already listening, or this process.
+///
+/// The server is tried on the first method that may be forwarded (`sim_api::forwards`; `boot`
+/// and the other methods whose child processes or state belong to the caller never are), with a
+/// handshake: it must answer `identity` within `sim_api::HANDSHAKE_TIMEOUT` with this build's,
+/// this executable's and this environment's identity. Otherwise (no server, a stale socket, an
+/// older or newer build, a suspended or wedged server) the method runs here: silently, or with the
+/// reason on stderr (`--verbose`), or not at all (`SIMEE_REQUIRE_SERVER=1`: a farm that counts on
+/// the server's warm connections would rather fail than run several times slower).
+struct Transport {
+    /// The socket still to try.
+    socket: Option<std::path::PathBuf>,
+    server: Option<sim_api::Client>,
+    /// Why the server isn't used, once the handshake has failed (or none was tried: in-process).
+    unused: Option<String>,
+    /// This process's session, made when a method first runs here.
+    local: Option<Box<sim_api::Session>>,
+    verbose: bool,
+    require: bool,
+}
+
+impl Transport {
+    fn local() -> Transport {
+        Transport {
+            socket: None,
+            server: None,
+            unused: Some("in-process was asked for".into()),
+            local: None,
+            verbose: false,
+            require: false,
+        }
+    }
+
+    /// The server on `socket` if it answers the handshake; else this process.
+    fn open(socket: &std::path::Path) -> Transport {
+        Transport { socket: Some(socket.to_owned()), unused: None, ..Transport::local() }
+    }
+
+    /// Whether methods that may be forwarded go to a server (handshaking first if not yet tried).
+    fn connected(&mut self) -> bool {
+        if let Some(socket) = self.socket.take() {
+            match sim_api::Client::handshake(&socket, sim_api::HANDSHAKE_TIMEOUT) {
+                Ok(client) => self.server = Some(client),
+                Err(e) => self.unused = Some(format!("the server on {} can't be used: {e}", socket.display())),
+            }
+        }
+        self.server.is_some()
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        let forwards = sim_api::forwards(method);
+        let forward = forwards && self.connected();
+        if forwards && !forward {
+            let why = self.unused.as_deref().unwrap_or("no server");
+            if self.require {
+                anyhow::bail!("SIMEE_REQUIRE_SERVER is set and `{method}` would run in this process: {why}");
+            }
+            if self.verbose {
+                eprintln!("simee: `{method}` runs in this process: {why}");
+            }
+        } else if self.verbose {
+            eprintln!("simee: `{method}` runs {}", if forward { "on the server" } else { "in this process (it always does)" });
+        }
+        let result = match (&mut self.server, forward) {
+            (Some(client), true) => client.call(method, &params),
+            _ => sim_api::call_method(self.local.get_or_insert_with(Box::default), method, &params),
+        };
+        result.map_err(anyhow::Error::msg)
+    }
+
+    /// HID messages are delivered asynchronously: a command that ran in this process gives the
+    /// last one time to leave before the process (and its HID client) exits. A server keeps its
+    /// client, so there is nothing to wait for.
+    fn flush(&self) {
+        if self.local.is_some() {
+            sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// A path parameter made absolute here, so a server with another working directory reads and
+/// writes the same file this process would.
+fn absolute(path: &str) -> String {
+    std::path::absolute(path).map_or_else(|_| path.to_owned(), |p| p.display().to_string())
+}
+
+/// Runs one device command and prints its result to `out` (and an in-device program's stderr to
+/// `err`).
+fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
+    let mut call = |method: &str, params: Value| transport.call(method, params);
+    let mut input = false;
+    match command {
         Cmd::List { json, booted, platform, form_factor } => {
             let devices = call("devices", json!({"booted": booted, "platform": platform, "form_factor": form_factor}))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&devices)?);
+                writeln!(out, "{}", serde_json::to_string_pretty(&devices)?)?;
             } else {
-                print!("{}", list_text(&serde_json::from_value::<Vec<DeviceInfo>>(devices)?));
+                write!(out, "{}", list_text(&serde_json::from_value::<Vec<DeviceInfo>>(devices)?))?;
             }
         }
         Cmd::FormFactors { json, platform } => {
             let rows = call("form_factors", json!({"platform": platform}))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&rows)?);
+                writeln!(out, "{}", serde_json::to_string_pretty(&rows)?)?;
             } else {
-                print!("{}", form_factors_text(&rows));
+                write!(out, "{}", form_factors_text(&rows))?;
             }
         }
         Cmd::Runtimes { json } => {
             let runtimes = call("runtimes", json!({}))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&runtimes)?);
+                writeln!(out, "{}", serde_json::to_string_pretty(&runtimes)?)?;
             } else {
                 for r in items(&runtimes) {
                     let note = if r["available"] == true { "" } else { " (unavailable)" };
-                    println!("{} ({} - {}) - {}{note}", text(&r["name"]), text(&r["version"]), text(&r["build"]), text(&r["identifier"]));
+                    let (name, version, build, id) = (text(&r["name"]), text(&r["version"]), text(&r["build"]), text(&r["identifier"]));
+                    writeln!(out, "{name} ({version} - {build}) - {id}{note}")?;
                 }
             }
         }
         Cmd::DeviceTypes { json } => {
             let types = call("device_types", json!({}))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&types)?);
+                writeln!(out, "{}", serde_json::to_string_pretty(&types)?)?;
             } else {
                 for t in items(&types) {
-                    println!(
+                    writeln!(
+                        out,
                         "{} ({}) {}x{} @{}x",
                         text(&t["name"]),
                         text(&t["identifier"]),
                         number(&t["screen_width"]),
                         number(&t["screen_height"]),
                         number(&t["screen_scale"])
-                    );
+                    )?;
                 }
             }
         }
@@ -329,45 +506,100 @@ fn main() -> Result<()> {
             let params = json!({"name": name, "device_type": device_type, "runtime": runtime, "platform": platform,
                 "system_image": system_image, "form_factor": form_factor});
             let d = call("create", params)?;
-            println!("{}", text(&d["udid"]));
+            writeln!(out, "{}", text(&d["udid"]))?;
         }
         Cmd::Delete { device } => drop(call("delete", json!({"device": device}))?),
-        Cmd::Boot { device, timeout, env, shaped } => {
+        Cmd::Boot { device, timeout, env, shaped, settle, settle_timeout, profile } => {
             let env: serde_json::Map<String, Value> =
                 env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), Value::from(v))).collect();
-            call("boot", json!({"device": device, "timeout_s": timeout, "env": env, "shaped": shaped}))?;
+            let mut params = json!({"device": device, "timeout_s": timeout, "env": env, "shaped": shaped});
+            // Only when asked, so `boot` sends what it always has to an Android device (which
+            // rejects these with the reason).
+            if settle {
+                params["settle"] = json!(true);
+            }
+            if let Some(s) = settle_timeout {
+                params["settle_timeout_s"] = json!(s);
+            }
+            if let Some(profile) = profile {
+                params["profile"] = json!(profile);
+            }
+            let timed = call("boot", params)?;
+            if !timed.is_null() {
+                writeln!(out, "{}", boot_line(&timed))?;
+                if timed["settled"] == json!(false) {
+                    writeln!(err, "{}", not_settled_line(&timed))?;
+                }
+            }
+        }
+        Cmd::BootMany { devices, concurrency, timeout, settle: _, no_settle, settle_timeout, profile, first_port, json } => {
+            let mut params = json!({"devices": devices, "concurrency": concurrency, "timeout_s": timeout});
+            // Each only when given: the backend has the defaults (iOS settles; Android has no
+            // settle and rejects iOS-only parameters).
+            for (key, v) in [
+                ("settle", no_settle.then_some(json!(false))),
+                ("settle_timeout_s", settle_timeout.map(Value::from)),
+                ("profile", profile.map(Value::from)),
+                ("first_port", first_port.map(Value::from)),
+            ] {
+                if let Some(v) = v {
+                    params[key] = v;
+                }
+            }
+            let r = call("boot_many", params)?;
+            print_boot_many(&r, devices.len(), json, out, err)?;
+        }
+        Cmd::Settle { device, timeout } => {
+            let r = call("settle", json!({"device": device, "timeout_s": timeout}))?;
+            writeln!(out, "settle_s={} procs={} cpu_pct={}", r["settle_s"], r["procs"], r["cpu_pct"])?;
+        }
+        Cmd::Profile { device, name, undo } => {
+            let r = call("profile", json!({"device": device, "name": name, "undo": undo}))?;
+            let changed = if undo { ("enabled", &r["enabled"]) } else { ("disabled", &r["disabled"]) };
+            writeln!(out, "profile={} {}={} failed={}", text(&r["name"]), changed.0, changed.1, items(&r["failed"]).len())?;
+            for l in items(&r["failed"]) {
+                writeln!(err, "simee: {} not {}", text(l), changed.0)?;
+            }
+        }
+        Cmd::Clone { template, name } => {
+            let d = call("clone", json!({"device": template, "name": name}))?;
+            writeln!(out, "{}", text(&d["udid"]))?;
         }
         Cmd::Shutdown { device } => drop(call("shutdown", json!({"device": device}))?),
         Cmd::Erase { device } => drop(call("erase", json!({"device": device}))?),
-        Cmd::Screenshot { device, path, display } => drop(call("screenshot", json!({"device": device, "path": path, "display": display}))?),
+        Cmd::Screenshot { device, path, display } => {
+            drop(call("screenshot", json!({"device": device, "path": absolute(&path), "display": display}))?)
+        }
         Cmd::Tap { device, x, y, hold, display } => {
             call("tap", json!({"device": device, "x": x, "y": y, "hold_ms": hold, "display": display}))?;
-            flush();
+            input = true;
         }
         Cmd::Swipe { device, x1, y1, x2, y2, duration, settle, display } => {
             let params = json!({"device": device, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": duration, "settle": settle,
                 "display": display});
             call("swipe", params)?;
-            flush();
+            input = true;
         }
         Cmd::Button { device, button, hold } => {
             call("button", json!({"device": device, "button": button, "hold_ms": hold}))?;
-            flush();
+            input = true;
         }
         Cmd::Type { device, text } => {
             call("type", json!({"device": device, "text": text}))?;
-            flush();
+            input = true;
         }
         Cmd::Key { device, usage } => {
             call("key", json!({"device": device, "usage": usage}))?;
-            flush();
+            input = true;
         }
         Cmd::OpenUrl { device, url } => drop(call("open_url", json!({"device": device, "url": url}))?),
-        Cmd::Install { device, path } => drop(call("install", json!({"device": device, "path": path}))?),
+        Cmd::Install { device, path } => drop(call("install", json!({"device": device, "path": absolute(&path)}))?),
         Cmd::Uninstall { device, bundle_id } => drop(call("uninstall", json!({"device": device, "bundle_id": bundle_id}))?),
-        Cmd::Launch { device, bundle_id } => println!("{}", call("launch", json!({"device": device, "bundle_id": bundle_id}))?["pid"]),
+        Cmd::Launch { device, bundle_id } => {
+            writeln!(out, "{}", call("launch", json!({"device": device, "bundle_id": bundle_id}))?["pid"])?
+        }
         Cmd::Terminate { device, bundle_id } => drop(call("terminate", json!({"device": device, "bundle_id": bundle_id}))?),
-        Cmd::Apps { device } => items(&call("apps", json!({"device": device}))?).iter().for_each(|id| println!("{}", text(id))),
+        Cmd::Apps { device } => lines(out, &call("apps", json!({"device": device}))?)?,
         Cmd::Appearance { device, mode } => drop(call("appearance", json!({"device": device, "mode": mode}))?),
         Cmd::Location { device, latitude, longitude } => {
             drop(call("location", json!({"device": device, "latitude": latitude, "longitude": longitude}))?)
@@ -379,7 +611,7 @@ fn main() -> Result<()> {
         Cmd::Rotate { device, orientation } => {
             let r = call("rotate", json!({"device": device, "orientation": orientation}))?;
             if let Some(o) = r["orientation"].as_str() {
-                println!("{o}");
+                writeln!(out, "{o}")?;
             }
         }
         Cmd::Fold { device, posture } => {
@@ -388,11 +620,9 @@ fn main() -> Result<()> {
                 Err(_) => json!({"device": device, "posture": posture}),
             };
             let r = call("fold", params)?;
-            println!("{} ({}°)", text(&r["posture"]), r["angle"]);
+            writeln!(out, "{} ({}°)", text(&r["posture"]), r["angle"])?;
         }
-        Cmd::Xr { device, command } => {
-            items(&call("xr", xr_params(&device, &command)?)?).iter().for_each(|l| println!("{}", text(l)));
-        }
+        Cmd::Xr { device, command } => lines(out, &call("xr", xr_params(&device, &command)?)?)?,
         Cmd::Touchpad { device, x, y, phase, to, duration_ms } => {
             let params = match to.as_deref() {
                 Some([tx, ty]) => json!({"device": device, "x": x, "y": y, "to_x": tx, "to_y": ty, "duration_ms": duration_ms}),
@@ -402,15 +632,15 @@ fn main() -> Result<()> {
         }
         Cmd::Rotary { device, ticks, delta } => {
             call("rotary", json!({"device": device, "ticks": ticks, "delta": delta}))?;
-            flush();
+            input = true;
         }
         Cmd::WatchGesture { device, gesture } => {
             call("watch_gesture", json!({"device": device, "gesture": gesture}))?;
-            flush();
+            input = true;
         }
         Cmd::RemoteSwipe { device, direction } => {
             call("remote_swipe", json!({"device": device, "direction": direction}))?;
-            flush();
+            input = true;
         }
         Cmd::Carplay { device, state } => {
             let on = match state.as_str() {
@@ -420,31 +650,89 @@ fn main() -> Result<()> {
             };
             let r = call("carplay", json!({"device": device, "on": on}))?;
             if on {
-                println!("CarPlay display {}x{}", number(&r["width"]), number(&r["height"]));
+                writeln!(out, "CarPlay display {}x{}", number(&r["width"]), number(&r["height"]))?;
             }
         }
         Cmd::Vehicle { device, property, value, area, json } => {
             let r = call("vehicle", json!({"device": device, "property": property, "value": value, "area_id": area}))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&r)?);
+                writeln!(out, "{}", serde_json::to_string_pretty(&r)?)?;
             } else if !r.is_null() {
                 let readings = if r.is_array() { items(&r).to_vec() } else { vec![r] };
                 for v in readings {
-                    println!("{} area {}: {}", text(&v["property"]), v["area_id"], text(&v["value"]));
+                    writeln!(out, "{} area {}: {}", text(&v["property"]), v["area_id"], text(&v["value"]))?;
                 }
             }
         }
-        Cmd::Console { device, command } => {
-            items(&call("console", json!({"device": device, "command": command.join(" ")}))?).iter().for_each(|l| println!("{}", text(l)));
-        }
-        Cmd::Serve { .. } | Cmd::Call { .. } => unreachable!("handled above"),
+        Cmd::Console { device, command } => lines(out, &call("console", json!({"device": device, "command": command.join(" ")}))?)?,
+        Cmd::Serve { .. } | Cmd::Call { .. } => anyhow::bail!("`serve` and `call` don't run through a transport"),
         Cmd::Exec { device, env, program, args } => {
             let env: serde_json::Map<String, Value> =
                 env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), Value::from(v))).collect();
-            let out = call("exec", json!({"device": device, "program": program, "args": args, "env": env}))?;
-            print!("{}", text(&out["stdout"]));
-            eprint!("{}", text(&out["stderr"]));
+            let result = call("exec", json!({"device": device, "program": program, "args": args, "env": env}))?;
+            write!(out, "{}", text(&result["stdout"]))?;
+            write!(err, "{}", text(&result["stderr"]))?;
         }
+    }
+    if input {
+        transport.flush();
+    }
+    Ok(())
+}
+
+/// One device's boot timings as `key=value` words (or its error).
+fn boot_line(d: &Value) -> String {
+    if let Some(e) = d.get("error") {
+        return format!("device={} error={}", text(&d["device"]), text(e));
+    }
+    let mut line = format!("device={} boot_s={}", text(&d["device"]), d["boot_s"]);
+    for key in ["settled", "settle_s", "waited_s", "procs", "cpu_pct", "started_s", "done_s", "console_port", "serial"] {
+        if let Some(v) = d.get(key) {
+            line.push_str(&format!(" {key}={}", text(v)));
+        }
+    }
+    if let Some(p) = d.get("profile") {
+        line.push_str(&format!(" profile={}", text(&p["name"])));
+        match p.get("error") {
+            Some(e) => line.push_str(&format!(" profile_error={}", text(e))),
+            None => line.push_str(&format!(" disabled={} failed={}", p["disabled"], items(&p["failed"]).len())),
+        }
+        line.push_str(&format!(" profile_s={}", p["took_s"]));
+    }
+    line
+}
+
+/// `boot-many`'s output for result `r` of `n` devices: a line per device and a summary (or the
+/// JSON), a note per device that booted but didn't settle; an error only when one failed to boot.
+fn print_boot_many(r: &Value, n: usize, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
+    if json {
+        writeln!(out, "{}", serde_json::to_string_pretty(r)?)?;
+    } else {
+        for d in items(&r["devices"]) {
+            writeln!(out, "{}", boot_line(d))?;
+        }
+        let unsettled = r["unsettled"].as_u64().unwrap_or(0);
+        writeln!(out, "all_s={} concurrency={} failed={} unsettled={unsettled}", r["all_s"], r["concurrency"], r["failed"])?;
+    }
+    for d in items(&r["devices"]).iter().filter(|d| d["settled"] == json!(false)) {
+        writeln!(err, "{}", not_settled_line(d))?;
+    }
+    if r["failed"].as_u64().unwrap_or(0) > 0 {
+        anyhow::bail!("{} of {n} devices failed to boot", r["failed"]);
+    }
+    Ok(())
+}
+
+/// What `boot --settle` and `boot-many` say about a device that booted but didn't settle in time.
+fn not_settled_line(d: &Value) -> String {
+    let after = d.get("waited_s").map_or_else(String::new, |s| format!(" after {s} s"));
+    format!("simee: {}: booted, not settled{after} ({})", text(&d["device"]), text(&d["settle_error"]))
+}
+
+/// Prints each element of a JSON array on its own line.
+fn lines(out: &mut dyn Write, v: &Value) -> Result<()> {
+    for line in items(v) {
+        writeln!(out, "{}", text(line))?;
     }
     Ok(())
 }
@@ -502,11 +790,6 @@ fn xr_params(device: &str, words: &[String]) -> Result<Value> {
     let mut params = serde_json::to_value(command)?;
     params["device"] = Value::from(device);
     Ok(params)
-}
-
-/// HID messages are delivered asynchronously; give the last one time to leave before exiting.
-fn flush() {
-    sleep(Duration::from_millis(100));
 }
 
 #[cfg(test)]
@@ -569,6 +852,10 @@ mod tests {
             "xr",
             "vehicle",
             "touchpad",
+            "boot_many",
+            "settle",
+            "profile",
+            "clone",
         ] {
             assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
         }
@@ -586,6 +873,263 @@ mod tests {
             json!({"device": "headset", "action": "options", "environment": "night", "passthrough": 0.25})
         );
         assert!(xr_params("headset", &words("fly")).expect_err("unknown").to_string().starts_with("usage: xr recenter"));
+    }
+
+    /// An SDK with a phone image and an AVD home under a fresh temp dir; a session for it.
+    fn android_root(tag: &str) -> std::path::PathBuf {
+        let root = std::path::PathBuf::from("/tmp").join(format!("simee-cli-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let image = root.join("sdk/system-images/android-36/google_apis/arm64-v8a");
+        std::fs::create_dir_all(&image).expect("image dir");
+        std::fs::write(image.join("system.img"), b"s").expect("system.img");
+        std::fs::write(image.join("source.properties"), "AndroidVersion.ApiLevel=36\nSystemImage.TagId=google_apis\n").expect("props");
+        root
+    }
+
+    fn android_session(root: &std::path::Path) -> sim_api::Session {
+        let env = emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") };
+        let mut android = sim_android::Android::new(env);
+        android.running_dir = Some(root.join("running"));
+        sim_api::Session::with_android(android)
+    }
+
+    /// A command's stdout, stderr and error, run through `transport`.
+    fn outputs(transport: &mut Transport, args: &[&str]) -> (String, String, Option<String>) {
+        let cli = Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).expect("arguments");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = run(cli.command, transport, &mut out, &mut err);
+        (String::from_utf8(out).expect("utf-8"), String::from_utf8(err).expect("utf-8"), result.err().map(|e| e.to_string()))
+    }
+
+    #[test]
+    fn a_server_and_this_process_print_the_same_bytes() {
+        let root = android_root("forward");
+        let socket = root.join("api.sock");
+        let server_root = root.clone();
+        sim_api::serve_in_background_with(socket.clone(), move || android_session(&server_root)).expect("serve");
+        let mut local = Transport { local: Some(Box::new(android_session(&root))), ..Transport::local() };
+        let mut server = Transport::open(&socket);
+        assert!(server.connected(), "a listening server of this build is used");
+        let image = "system-images;android-36;google_apis;arm64-v8a";
+        assert_eq!(outputs(&mut local, &["create", "pixel", "--platform", "android", "--system-image", image]).0, "pixel\n");
+        assert_eq!(
+            outputs(&mut server, &["create", "fold", "--platform", "android", "--system-image", image, "--form-factor", "foldable"]).0,
+            "fold\n"
+        );
+        for args in [
+            &["list", "--platform", "android"][..],
+            &["list", "--platform", "android", "--json"],
+            &["list", "--platform", "android", "--form-factor", "foldable", "--booted"],
+            &["form-factors"],
+            &["form-factors", "--json", "--platform", "android"],
+            &["tap", "fold", "10", "20"],
+            &["screenshot", "pixel", "shot.png"],
+            &["fold", "pixel", "closed"],
+            &["fold", "fold", "ajar"],
+            &["console", "fold", "ping"],
+            &["vehicle", "pixel"],
+        ] {
+            let (here, there) = (outputs(&mut local, args), outputs(&mut server, args));
+            assert_eq!(here, there, "simee {args:?}");
+        }
+        let listed = outputs(&mut server, &["list", "--platform", "android"]).0;
+        assert!(listed.contains("    fold (fold) (Shutdown) [Android · Foldable]\n"), "{listed}");
+        drop(server);
+        std::fs::remove_file(&socket).ok();
+        assert!(!Transport::open(&socket).connected(), "no server: this process");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_stale_socket_falls_back_to_this_process() {
+        let root = android_root("stale");
+        let socket = root.join("api.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind"));
+        assert!(socket.exists(), "the socket file outlives its listener");
+        let start = std::time::Instant::now();
+        assert!(!Transport::open(&socket).connected());
+        assert!(start.elapsed() < Duration::from_secs(1), "no wait on a stale socket");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_required_server_that_cant_be_used_fails_the_command_with_why() {
+        let root = android_root("require");
+        let socket = root.join("api.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind"));
+        let mut transport = Transport { require: true, ..Transport::open(&socket) };
+        let (out, _, err) = outputs(&mut transport, &["form-factors"]);
+        assert_eq!(out, "", "nothing ran here");
+        let err = err.expect("fails instead of running here");
+        assert!(err.starts_with("SIMEE_REQUIRE_SERVER is set and `form_factors` would run in this process: the server on "), "{err}");
+        assert!(err.contains("api.sock can't be used: "), "{err}");
+        // Without the requirement the same command runs here, and the reason stays known.
+        let mut transport = Transport::open(&socket);
+        assert!(outputs(&mut transport, &["form-factors"]).2.is_none());
+        assert!(transport.unused.as_deref().is_some_and(|u| u.contains("can't be used")), "{:?}", transport.unused);
+        // A matching server satisfies it.
+        let live = root.join("live.sock");
+        sim_api::serve_in_background(live.clone()).expect("serve");
+        let mut transport = Transport { require: true, ..Transport::open(&live) };
+        assert!(outputs(&mut transport, &["form-factors"]).2.is_none());
+        assert!(transport.server.is_some());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn boot_timings_print_as_words() {
+        let ok = json!({"device": "U", "boot_s": 1.5, "settled": true, "settle_s": 9.0, "procs": 280, "cpu_pct": 3.2,
+            "profile": {"name": "slim", "disabled": 60, "failed": [], "took_s": 4.5}});
+        assert_eq!(
+            boot_line(&ok),
+            "device=U boot_s=1.5 settled=true settle_s=9.0 procs=280 cpu_pct=3.2 profile=slim disabled=60 failed=0 profile_s=4.5"
+        );
+        assert_eq!(boot_line(&json!({"device": "V", "error": "no device matches `V`"})), "device=V error=no device matches `V`");
+        let avd = json!({"device": "farm-1", "boot_s": 12.3, "console_port": 5556, "serial": "emulator-5556"});
+        assert_eq!(boot_line(&avd), "device=farm-1 boot_s=12.3 console_port=5556 serial=emulator-5556");
+        let broken = json!({"device": "W", "boot_s": 2.0, "profile": {"name": "slim", "error": "no launchctl", "took_s": 0.0}});
+        assert_eq!(boot_line(&broken), "device=W boot_s=2.0 profile=slim profile_error=no launchctl profile_s=0.0");
+    }
+
+    #[test]
+    fn a_device_that_booted_but_didnt_settle_is_not_a_boot_failure() {
+        let late = json!({"device": "U", "boot_s": 3.0, "settled": false, "waited_s": 603.2, "procs": 250, "cpu_pct": 40.0,
+            "settle_error": "device did not settle within 600s (40 % of a core over the last 10s)"});
+        assert_eq!(
+            not_settled_line(&late),
+            "simee: U: booted, not settled after 603.2 s (device did not settle within 600s (40 % of a core over the last 10s))"
+        );
+        let r = json!({"concurrency": 2, "all_s": 610.0, "failed": 0, "unsettled": 1,
+            "devices": [late, {"device": "V", "boot_s": 2.0, "settled": true, "settle_s": 80.0}]});
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        print_boot_many(&r, 2, false, &mut out, &mut err).expect("unsettled exits 0");
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(out.ends_with("all_s=610.0 concurrency=2 failed=0 unsettled=1\n"), "{out}");
+        assert!(String::from_utf8(err).expect("utf-8").contains("U: booted, not settled after 603.2 s"));
+        let mut failed = r.clone();
+        failed["failed"] = json!(1);
+        let e = print_boot_many(&failed, 2, true, &mut Vec::new(), &mut Vec::new()).expect_err("a failed boot fails");
+        assert_eq!(e.to_string(), "1 of 2 devices failed to boot");
+    }
+
+    #[test]
+    fn boot_many_sends_only_what_was_asked() {
+        // `--settle` is the default now (kept for scripts); `--no-settle` turns it off.
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        assert!(matches!(parse(&["boot-many", "a", "--settle"]), Ok(Cmd::BootMany { no_settle: false, .. })));
+        assert!(matches!(parse(&["boot-many", "a", "--no-settle"]), Ok(Cmd::BootMany { no_settle: true, .. })));
+        assert!(parse(&["boot-many", "a", "--settle", "--no-settle"]).is_err());
+        assert!(matches!(parse(&["boot-many", "a", "--first-port", "5600"]), Ok(Cmd::BootMany { first_port: Some(5600), .. })));
+    }
+
+    /// A fake server's reply to a method: its result or its error.
+    type Answer = fn(&str) -> std::result::Result<Value, String>;
+
+    /// A server on `socket` that records each method it is sent and answers with `answer`; `None`
+    /// never answers (a wedged server).
+    fn fake_server(socket: &std::path::Path, answer: Option<Answer>) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        use std::io::BufRead;
+        let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let record = record.clone();
+                std::thread::spawn(move || {
+                    let mut writer = stream.try_clone().expect("clone");
+                    for line in std::io::BufReader::new(stream).lines().map_while(Result::ok) {
+                        let req: Value = serde_json::from_str(&line).expect("request");
+                        let method = req["method"].as_str().unwrap_or("").to_owned();
+                        record.lock().expect("lock").push(method.clone());
+                        match answer {
+                            Some(answer) => {
+                                let reply = match answer(&method) {
+                                    Ok(result) => json!({"id": req["id"], "ok": true, "result": result}),
+                                    Err(error) => json!({"id": req["id"], "ok": false, "error": error}),
+                                };
+                                writeln!(writer, "{reply}").expect("write");
+                            }
+                            None => std::thread::park(),
+                        }
+                    }
+                });
+            }
+        });
+        seen
+    }
+
+    #[test]
+    fn a_server_that_never_answers_runs_the_command_here() {
+        let root = android_root("wedged");
+        let socket = root.join("api.sock");
+        let seen = fake_server(&socket, None);
+        let mut local = Transport::local();
+        let expected = outputs(&mut local, &["form-factors"]);
+        let start = std::time::Instant::now();
+        let mut transport = Transport::open(&socket);
+        assert_eq!(outputs(&mut transport, &["form-factors"]), expected);
+        assert!(start.elapsed() < Duration::from_millis(1500), "{:?}", start.elapsed());
+        assert!(!transport.connected());
+        assert_eq!(*seen.lock().expect("lock"), ["identity"], "only the handshake reached it");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn another_build_or_an_old_server_runs_the_command_here() {
+        let root = android_root("skew");
+        let mut local = Transport::local();
+        let expected = outputs(&mut local, &["form-factors", "--json"]);
+        // An older build has no `identity` (it answers an error); another build answers another one.
+        let old: Answer = |m| Err(format!("unknown method `{m}`; call `help`"));
+        let other: Answer = |_| Ok(json!({"build": "0.0.0+0", "exe": "elsewhere", "env": "0"}));
+        for (tag, answer) in [("old", old), ("other", other)] {
+            let socket = root.join(format!("{tag}.sock"));
+            let seen = fake_server(&socket, Some(answer));
+            let mut transport = Transport::open(&socket);
+            assert_eq!(outputs(&mut transport, &["form-factors", "--json"]), expected, "{tag}");
+            assert_eq!(*seen.lock().expect("lock"), ["identity"], "{tag}: nothing forwarded");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn boot_runs_here_even_with_a_matching_server() {
+        let root = android_root("boot");
+        let socket = root.join("api.sock");
+        let seen = fake_server(&socket, Some(|m| Ok(if m == "identity" { sim_api::identity().clone() } else { json!([]) })));
+        let mut transport = Transport { local: Some(Box::new(android_session(&root))), ..Transport::open(&socket) };
+        // Resolved and rejected by this process's (empty) AVD home: nothing is started.
+        let err = transport.call("boot", json!({"device": "nope", "platform": "android"})).expect_err("no such AVD");
+        assert_eq!(err.to_string(), "no device matches `nope`");
+        assert!(seen.lock().expect("lock").is_empty(), "boot doesn't even handshake");
+        assert_eq!(transport.call("devices", json!({"platform": "android"})).expect("devices"), json!([]));
+        assert_eq!(*seen.lock().expect("lock"), ["identity", "devices"]);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn ios_only_boot_flags_are_refused_on_android_with_the_reason() {
+        let root = android_root("boot-flags");
+        let mut local = Transport { local: Some(Box::new(android_session(&root))), ..Transport::local() };
+        let image = "system-images;android-36;google_apis;arm64-v8a";
+        assert_eq!(outputs(&mut local, &["create", "pixel", "--platform", "android", "--system-image", image]).0, "pixel\n");
+        for (flags, key) in [(&["--settle"][..], "settle"), (&["--profile", "slim"], "profile"), (&["--shaped"], "shaped")] {
+            let args: Vec<&str> = ["boot", "pixel"].into_iter().chain(flags.iter().copied()).collect();
+            let (out, _, err) = outputs(&mut local, &args);
+            assert_eq!(out, "");
+            let err = err.expect("refused");
+            assert!(err.starts_with(&format!("`boot` takes `{key}` for iOS devices only (")), "{err}");
+        }
+        let (_, _, err) = outputs(&mut local, &["boot-many", "pixel", "--profile", "slim"]);
+        assert!(err.expect("refused").starts_with("`boot_many` takes `profile` for iOS devices only"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn path_parameters_are_made_absolute() {
+        let here = std::env::current_dir().expect("cwd");
+        assert_eq!(absolute("shot.png"), here.join("shot.png").display().to_string());
+        assert_eq!(absolute("/tmp/x.png"), "/tmp/x.png");
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! that adbd writes `accept`, we answer `ok` when a client arrives, it replies `start`, and the
 //! pipe then carries raw adb protocol.
 use std::collections::VecDeque;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
@@ -14,6 +14,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::Thread;
 use std::time::Duration;
 
+use rustix::buffer::spare_capacity;
 use rustix::event::{PollFd, PollFlags};
 use rustix::io::Errno;
 
@@ -185,6 +186,8 @@ struct TcpForward {
 /// Client bytes one connection may have read but the guest not yet taken.
 const TO_GUEST_WINDOW: usize = 1 << 20;
 const READ_CHUNK: usize = 64 * 1024;
+/// Reads at least this large hand their buffer over; smaller ones are copied out of it.
+const HAND_OVER: usize = READ_CHUNK / 4;
 /// Guest bytes held for a client that isn't reading. vsock's credit keeps a guest well under
 /// this; only the goldfish pipe, which has no credit, can reach it, and then `guest_data` waits
 /// for the client as the blocking write it replaces did.
@@ -289,26 +292,36 @@ impl TcpForward {
     }
 }
 
-fn spawn_reader(mut reader: TcpStream, ctx: PipeCtx, window: Arc<Window>) {
+fn spawn_reader(reader: TcpStream, ctx: PipeCtx, window: Arc<Window>) {
     let name = format!("adb-in-{}", ctx.conn);
     let _ = std::thread::Builder::new().name(name).spawn(move || {
         let _ = window.reader.set(std::thread::current());
-        let mut buf = vec![0u8; READ_CHUNK];
+        // Reads land in the spare capacity of a buffer that is never zeroed. A large read hands
+        // that buffer over as it is (and the next gets a fresh one): no copy. A small one is
+        // copied out, so queued data never pins a mostly empty 64 KiB buffer per read.
+        let mut buf = Vec::with_capacity(READ_CHUNK);
         while window.wait_for_room() {
-            match reader.read(&mut buf) {
+            match rustix::io::read(&reader, spare_capacity(&mut buf)) {
                 Ok(0) => break,
                 Ok(n) => {
                     window.queued.fetch_add(n, Ordering::SeqCst);
-                    if !ctx.send(HostMsg::Data(buf[..n].to_vec())) {
+                    let data = if n >= HAND_OVER {
+                        std::mem::replace(&mut buf, Vec::with_capacity(READ_CHUNK))
+                    } else {
+                        let small = buf.clone();
+                        buf.clear();
+                        small
+                    };
+                    if !ctx.send(HostMsg::Data(data)) {
                         return;
                     }
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                Err(Errno::AGAIN) => {
                     if !ready(&reader, PollFlags::IN) {
                         break;
                     }
                 }
-                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(Errno::INTR) => {}
                 Err(_) => break,
             }
         }
@@ -533,6 +546,7 @@ impl PipeHandler for AdbPipe {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
     use std::sync::mpsc::{Receiver, channel};
 
     use super::*;

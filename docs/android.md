@@ -230,6 +230,22 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   Writes already sit in the host page cache, so an emulator crash loses nothing either way.
 - **Zero-copy disk I/O.** `pread`/`pwrite` go straight between the image and guest RAM, one
   worker thread per disk, so the vCPU that kicked a queue goes back to the guest at once.
+- **One syscall per block request, no kicks while draining.** Linux sends a 128 KiB request as
+  one indirect table of up to 32 scattered pages; virtio-blk issued a `pread`/`pwrite` per page.
+  Now a request is one `preadv`/`pwritev` (guest-adjacent pages merged, at most 1024 iovecs a
+  call), an ephemeral disk checks its overlay once per request, and a whole-chunk write to an
+  ephemeral disk no longer reads the base chunk it replaces. In-process A/B medians on a loaded
+  Mac (`cargo test --release -p emu-vmm disk_vectored_vs_per_segment -- --ignored`), per
+  request: persistent read 20 → 7.2 µs, persistent write 62 → 9.9 µs, ephemeral read 20 → 7.5
+  µs; the skipped base read takes ephemeral writes to fresh chunks from 16 to 10.5 µs. The
+  worker turns notifications off while it drains and back on with a recheck (QEMU's
+  `virtio_queue_set_notification`; publish `avail_event`, full barrier, reread `avail.idx`), so
+  a guest that publishes while a request is being served doesn't kick. With a driver thread
+  racing the worker (`blk_kicks_while_draining`), kicks per request at queue depth 2 went from
+  1.0 to 0.001 with event-idx, and at every depth ≥ 2 from 1.0 to under 0.005 without it; at
+  depth ≥ 4 with event-idx the old code already rarely kicked. Each saved kick is an MMIO exit
+  on a real guest. Popping a 34-entry indirect chain into a reused `Chain`, with the table read
+  in one copy, takes 82 ns instead of about 400 (`queue_pop_indirect`).
 - **Sparse, lazily committed memory.** Guest RAM is an untouched anonymous mapping and the
   userdata image is a sparse file.
 - **Discard punches holes.** virtio-blk `DISCARD`/`WRITE_ZEROES` become `F_PUNCHHOLE` on
@@ -298,6 +314,38 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   `vsock_throughput_to_host` 5.9 → 6.4 GiB/s (its guest now honours credit),
   `adb_throughput_to_guest` (TCP client → guest, end to end) 498 → 870 MiB/s,
   `adb_throughput_to_host` 1382 → 1433 MiB/s.
+- **Launch to first guest instruction.** Most images ship a gzip `kernel-ranchu` (an API 37
+  kernel is 16 MiB that inflates to about 40 MiB). It used to be read whole, inflated into a
+  `Vec` with miniz_oxide and copied into guest RAM on every launch. QEMU, and so the stock
+  emulator, inflates on every launch too, while Firecracker and crosvm take only raw images. Now
+  the first launch inflates it in 1 MiB chunks straight into guest RAM with zlib-rs and writes
+  the image to `~/Library/Caches/simee/kernel-<path>-<stamp>`, keyed by path, size, mtime,
+  inode and the gzip trailer's CRC32 and ISIZE (one 8-byte `pread`, so a kernel rewritten in
+  place with its mtime kept is a miss), through a temp file that is synced before the rename. A
+  hit must be exactly ISIZE bytes long: a short entry would read as zeros past its end. Older
+  versions of the same path, and temp files over a minute old (a launch killed mid-write), are
+  removed. Later launches `pread` that file into guest RAM, as they do a raw `Image`. Medians of
+  7 interleaved runs on an M3 Max under CI load (`cargo test --release -p emu-vmm kernel_load --
+  --ignored --nocapture`): 115 ms before (miniz_oxide), 71–76 ms to inflate with zlib-rs, 86–95
+  ms on a miss (the synced cache write adds 15–20 ms), 3.5–3.9 ms on a hit. The gfxstream
+  renderer's load and init (about 400 ms, `renderer_init_off_thread`) now starts on its own
+  thread once the console port is bound and the boot files are found, and `run` waits for it
+  just before it creates the GPU device; a launch that fails before that point waits for the
+  init to finish before it exits, so the process never exits mid-dlopen. The thread stays
+  parked afterwards, as the main thread did. Reading the 1.8 MiB ramdisk straight into guest RAM instead of through a `Vec` saved
+  0.06 ms, so it was left as it was. `-verbose` prints the kernel source and time, how long the
+  boot waited for the renderer, and when the vCPUs started relative to launch.
+- **Quiet console.** The PL011 traps twice per byte, and a boot printed ~230 KB on it: 88% of
+  all vCPU exits. Without `-show-kernel` the cmdline now adds `loglevel=3`: only emergencies,
+  alerts and criticals print, and dmesg still has everything. Stock passes `console=0` then and
+  prints nothing. Measured with `EMU_EXIT_PROFILE` (`scripts/farm-bench-android.sh`, details in
+  docs/farm-android.md): exits to boot_completed 516k → 77–109k, idle 4.5k → 122–154 exits/s.
+- **goldfish-logcat.** `init.ranchu.rc` runs `logcat -f /dev/hvc1` all the time. hvc1 had no
+  backend, so logcat restarted every ~5 s. The virtio-console's third port (unnamed, so a console
+  port, which makes it hvc1) now backs it. Its output is discarded with filter `*:S` unless
+  `-logcat TAGS` or `-logcat-output FILE` is given (through a bounded queue that drops rather
+  than stall the console worker; FILE rolls over at 4 MiB). sim-android starts emu with
+  `-logcat '*:I' -logcat-output <avd>/simee/logcat.txt`, which the desktop's Android panel shows.
 
 ## Development
 

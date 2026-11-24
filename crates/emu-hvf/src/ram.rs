@@ -8,6 +8,9 @@ pub struct MemError {
     pub len: u64,
 }
 
+/// Most iovecs one `preadv`/`pwritev` takes (macOS and Linux both define `IOV_MAX` as 1024).
+const IOV_MAX: usize = 1024;
+
 /// A host address range backing guest-visible memory, handed to native libraries (the GPU
 /// renderer) that read and write guest buffers directly. Constructed only from live mappings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +210,88 @@ impl GuestRam {
         Ok(())
     }
 
+    /// Reads `file` from `offset` into the guest ranges `segs` (`(addr, len)`, in order) with
+    /// as few `preadv` calls as possible: guest-adjacent ranges merge into one iovec and at
+    /// most `IOV_MAX` (1024) go in one call. Short reads continue where they stopped; past end of
+    /// file the rest reads as zeroes, as in [`GuestRam::read_from_file`]. Every range is
+    /// checked before anything is read.
+    pub fn read_vectored_from_file(&self, segs: &[(u64, usize)], file: &std::fs::File, offset: u64) -> std::io::Result<()> {
+        self.vectored(segs, file, offset, false)
+    }
+
+    /// Writes the guest ranges `segs` (`(addr, len)`, in order) to `file` from `offset` with
+    /// as few `pwritev` calls as possible (see [`GuestRam::read_vectored_from_file`]).
+    pub fn write_vectored_to_file(&self, segs: &[(u64, usize)], file: &std::fs::File, offset: u64) -> std::io::Result<()> {
+        self.vectored(segs, file, offset, true)
+    }
+
+    fn vectored(&self, segs: &[(u64, usize)], file: &std::fs::File, offset: u64, write: bool) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let invalid = |e: MemError| std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
+        let mut iov: Vec<libc::iovec> = Vec::with_capacity(segs.len().min(IOV_MAX));
+        for &(addr, len) in segs {
+            let off = self.offset(addr, len).map_err(invalid)?;
+            if len == 0 {
+                continue;
+            }
+            // SAFETY: `off + len` is inside the mapping (checked above).
+            let base = unsafe { self.ptr.add(off) };
+            match iov.last_mut() {
+                // SAFETY: `last.iov_base + iov_len` is the end of a range checked to lie inside the mapping.
+                Some(last) if unsafe { last.iov_base.cast::<u8>().add(last.iov_len) } == base => last.iov_len += len,
+                _ => iov.push(libc::iovec { iov_base: base.cast(), iov_len: len }),
+            }
+        }
+        let fd = file.as_raw_fd();
+        let (mut first, mut pos) = (0usize, offset);
+        while first < iov.len() {
+            let batch = &iov[first..iov.len().min(first + IOV_MAX)];
+            // SAFETY: every iovec covers a range inside the mapping (checked above); preadv
+            // writes and pwritev reads only within them, and `batch.len() <= IOV_MAX` fits a c_int.
+            let n = unsafe {
+                if write {
+                    libc::pwritev(fd, batch.as_ptr(), batch.len() as libc::c_int, pos as libc::off_t)
+                } else {
+                    libc::preadv(fd, batch.as_ptr(), batch.len() as libc::c_int, pos as libc::off_t)
+                }
+            };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if n == 0 {
+                if write {
+                    return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "pwritev wrote nothing"));
+                }
+                // Past end of file: the rest reads as zeroes, like a sparse disk.
+                for v in &iov[first..] {
+                    // SAFETY: each iovec lies inside the mapping (checked above).
+                    unsafe { std::ptr::write_bytes(v.iov_base.cast::<u8>(), 0, v.iov_len) };
+                }
+                return Ok(());
+            }
+            // Skip what was transferred; a partly done iovec continues where it stopped.
+            let mut n = n as usize;
+            pos += n as u64;
+            while n > 0 && first < iov.len() {
+                let v = &mut iov[first];
+                if n >= v.iov_len {
+                    n -= v.iov_len;
+                    first += 1;
+                } else {
+                    // SAFETY: `n < iov_len`, so the advanced base stays inside the same range.
+                    v.iov_base = unsafe { v.iov_base.cast::<u8>().add(n) }.cast();
+                    v.iov_len -= n;
+                    n = 0;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Fills `len` bytes at `addr` with zeroes.
     pub fn zero(&self, addr: u64, len: usize) -> std::result::Result<(), MemError> {
         let off = self.offset(addr, len)?;
@@ -269,6 +354,73 @@ mod tests {
         assert!(ram.read_append(0x4000_7ffe, 4, &mut out).is_err(), "past the end");
         assert_eq!(out, b"host:guest", "unchanged on error");
         ram.read_append(0x4000_0000, 0, &mut out).expect("empty");
+    }
+
+    fn tmp_file(name: &str, data: &[u8]) -> (std::path::PathBuf, std::fs::File) {
+        let path = std::env::temp_dir().join(format!("emu-hvf-ram-{}-{name}", std::process::id()));
+        std::fs::write(&path, data).expect("write");
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
+        (path, file)
+    }
+
+    #[test]
+    fn vectored_reads_scatter_merge_and_zero_fill_past_eof() {
+        const B: u64 = 0x4000_0000;
+        let ram = GuestRam::new(B, 0x10_0000).expect("alloc");
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let (path, file) = tmp_file("readv", &data);
+        ram.write(B, &vec![0xee; 0x10_0000]).expect("fill");
+        // Adjacent pair (merged), a gap, an empty range, then a range running past EOF.
+        let segs = [(B + 0x100, 1000), (B + 0x100 + 1000, 24), (B + 0x8000, 0), (B + 0x9000, 3000), (B + 0x20000, 8000)];
+        ram.read_vectored_from_file(&segs, &file, 100).expect("readv");
+        let mut off = 100usize;
+        for &(addr, len) in &segs {
+            let mut got = vec![0u8; len];
+            ram.read(addr, &mut got).expect("r");
+            let want: Vec<u8> = (off..off + len).map(|i| data.get(i).copied().unwrap_or(0)).collect();
+            assert_eq!(got, want, "segment at {addr:#x}");
+            off += len;
+        }
+        let mut gap = [0u8; 4];
+        ram.read(B + 0x100 + 1024, &mut gap).expect("r");
+        assert_eq!(gap, [0xee; 4], "bytes between segments untouched");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn vectored_io_spans_more_than_iov_max_ranges() {
+        const B: u64 = 0x4000_0000;
+        let ram = GuestRam::new(B, 0x40_0000).expect("alloc");
+        // 2500 non-adjacent 16-byte ranges: three preadv/pwritev batches.
+        let segs: Vec<(u64, usize)> = (0..2500u64).map(|i| (B + i * 32, 16)).collect();
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i % 253) as u8).collect();
+        let (path, file) = tmp_file("iovmax", &data);
+        ram.read_vectored_from_file(&segs, &file, 0).expect("readv");
+        for (i, &(addr, _)) in segs.iter().enumerate() {
+            let mut got = [0u8; 16];
+            ram.read(addr, &mut got).expect("r");
+            assert_eq!(&got[..], &data[i * 16..i * 16 + 16], "segment {i}");
+        }
+        // Write them back shifted by one byte of file offset.
+        ram.write_vectored_to_file(&segs, &file, 1).expect("writev");
+        let back = std::fs::read(&path).expect("read");
+        assert_eq!(&back[1..40_001], &data[..]);
+        assert_eq!(back[0], data[0]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn vectored_io_checks_every_range_first() {
+        const B: u64 = 0x4000_0000;
+        let ram = GuestRam::new(B, 0x8000).expect("alloc");
+        let (path, file) = tmp_file("bounds", &[9u8; 64]);
+        let segs = [(B, 16), (B + 0x7ff8, 16)];
+        assert!(ram.read_vectored_from_file(&segs, &file, 0).is_err());
+        assert_eq!(ram.read_u32(B), Ok(0), "nothing read when a later range is bad");
+        ram.write(B, &[1u8; 16]).expect("w");
+        assert!(ram.write_vectored_to_file(&segs, &file, 0).is_err());
+        assert_eq!(std::fs::read(&path).expect("read"), [9u8; 64], "nothing written");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

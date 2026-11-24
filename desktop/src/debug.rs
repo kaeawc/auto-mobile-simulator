@@ -124,43 +124,107 @@ pub struct Debug {
     pub busy: usize,
     pub data_path: Option<String>,
     worker: Option<Worker>,
+    /// The number the next submitted job gets; results are applied in this order per tag.
+    seq: u64,
+    /// Per tag, the number of the newest result applied: an older one finishing later (a slow
+    /// listing that started before a command's quick reload) is dropped, never shown.
+    applied: Vec<(Tag, u64)>,
 }
 
-/// Finished jobs waiting for `poll`.
-type Results = Arc<Mutex<Vec<(Tag, Result<Value, String>)>>>;
+/// Finished jobs waiting for `poll`, with the number each was submitted under.
+type Results = Arc<Mutex<Vec<(Tag, u64, Result<Value, String>)>>>;
 
+type Jobs = mpsc::Sender<(Tag, u64, &'static str, Value)>;
+
+/// Two lanes, each a thread with its own API session, so a slow listing (container sizes,
+/// `nettop`, a log query) never holds up a toggle: commands and the reloads that must follow
+/// them go on `quick`, the tabs' listings on `slow`. Each lane keeps its own order.
 struct Worker {
-    jobs: mpsc::Sender<(Tag, &'static str, Value)>,
+    quick: Jobs,
+    slow: Jobs,
     results: Results,
 }
 
-impl Debug {
-    /// Starts the worker thread (not in headless scenes).
-    pub fn start(&mut self, waker: rune::Waker) {
-        let (tx, rx) = mpsc::channel::<(Tag, &'static str, Value)>();
-        let results: Results = Arc::default();
-        let out = results.clone();
-        let spawned = std::thread::Builder::new().name("simee-debug".into()).spawn(move || {
-            let mut session = Session::default();
-            for (tag, method, params) in rx {
-                let result = call_method(&mut session, method, &params);
-                if let Ok(mut r) = out.lock() {
-                    r.push((tag, result));
-                }
-                waker();
+/// Which lane a job goes on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lane {
+    Quick,
+    Slow,
+}
+
+impl Tag {
+    /// Commands (and the cheap overlay state) are quick; listings are slow.
+    fn lane(self) -> Lane {
+        match self {
+            Tag::CaState | Tag::RecordStarted | Tag::Done(_) => Lane::Quick,
+            Tag::Processes | Tag::Connections | Tag::Traffic | Tag::Containers | Tag::Logs | Tag::NetState | Tag::Flows => Lane::Slow,
+        }
+    }
+}
+
+type Call = fn(&mut Session, &str, &Value) -> Result<Value, String>;
+
+fn spawn_lane(name: &str, call: Call, results: Results, waker: rune::Waker) -> Option<Jobs> {
+    let (tx, rx) = mpsc::channel::<(Tag, u64, &'static str, Value)>();
+    let spawned = std::thread::Builder::new().name(name.into()).spawn(move || {
+        let mut session = Session::default();
+        for (tag, seq, method, params) in rx {
+            let result = call(&mut session, method, &params);
+            if let Ok(mut r) = results.lock() {
+                r.push((tag, seq, result));
             }
-        });
-        if spawned.is_ok() {
-            self.worker = Some(Worker { jobs: tx, results });
+            waker();
+        }
+    });
+    spawned.ok().map(|_| tx)
+}
+
+impl Debug {
+    /// Starts the worker threads (not in headless scenes).
+    pub fn start(&mut self, waker: rune::Waker) {
+        self.start_with(waker, call_method);
+    }
+
+    fn start_with(&mut self, waker: rune::Waker, call: Call) {
+        let results: Results = Arc::default();
+        let quick = spawn_lane("simee-debug", call, results.clone(), waker.clone());
+        let slow = spawn_lane("simee-debug-lists", call, results.clone(), waker);
+        if let (Some(quick), Some(slow)) = (quick, slow) {
+            self.worker = Some(Worker { quick, slow, results });
             self.text_size = 3;
         }
     }
 
-    fn submit(&mut self, udid: &str, tag: Tag, method: &'static str, mut params: Value) {
+    fn submit(&mut self, udid: &str, tag: Tag, method: &'static str, params: Value) {
+        self.submit_on(tag.lane(), udid, tag, method, params);
+    }
+
+    fn submit_on(&mut self, lane: Lane, udid: &str, tag: Tag, method: &'static str, mut params: Value) {
         let Some(w) = &self.worker else { return };
         params["device"] = json!(udid);
-        if w.jobs.send((tag, method, params)).is_ok() {
+        let jobs = if lane == Lane::Quick { &w.quick } else { &w.slow };
+        self.seq += 1;
+        if jobs.send((tag, self.seq, method, params)).is_ok() {
             self.busy += 1;
+        }
+    }
+
+    /// Whether a result of `tag` submitted as `seq` is newer than the last one applied (and, if
+    /// so, records it as applied). Commands' own results are always reported.
+    fn newest(&mut self, tag: Tag, seq: u64) -> bool {
+        if matches!(tag, Tag::Done(_)) {
+            return true;
+        }
+        match self.applied.iter_mut().find(|(t, _)| *t == tag) {
+            Some((_, last)) if *last > seq => false,
+            Some((_, last)) => {
+                *last = seq;
+                true
+            }
+            None => {
+                self.applied.push((tag, seq));
+                true
+            }
         }
     }
 
@@ -197,7 +261,8 @@ impl Debug {
                         Tag::NetState => ("network_state", json!({})),
                         _ => ("ca_debug_state", json!({})),
                     };
-                    self.submit(udid, tag, method, params);
+                    // Behind the command it reloads after, on the same lane.
+                    self.submit_on(Lane::Quick, udid, tag, method, params);
                 }
             }
             DebugAction::ToggleOverlay(id) => {
@@ -239,9 +304,13 @@ impl Debug {
             DebugAction::Reveal(rel) => {
                 let Some(root) = &self.data_path else { return Some("device path unknown".into()) };
                 let path = format!("{root}/{rel}");
-                return Some(match std::process::Command::new("/usr/bin/open").arg("-R").arg(&path).status() {
-                    Ok(s) if s.success() => format!("revealed {path}"),
-                    _ => format!("could not reveal {path}"),
+                // Finder can take a while to answer: don't wait for it (a thread reaps the child).
+                return Some(match std::process::Command::new("/usr/bin/open").arg("-R").arg(&path).spawn() {
+                    Ok(mut child) => {
+                        std::thread::spawn(move || child.wait());
+                        format!("revealing {path}")
+                    }
+                    Err(_) => format!("could not reveal {path}"),
                 });
             }
         }
@@ -251,11 +320,17 @@ impl Debug {
     /// Applies finished jobs; returns a status line for the last command, if any.
     pub fn drain(&mut self) -> (bool, Option<String>) {
         let Some(w) = &self.worker else { return (false, None) };
-        let done: Vec<_> = w.results.lock().map(|mut r| std::mem::take(&mut *r)).unwrap_or_default();
+        let mut done: Vec<_> = w.results.lock().map(|mut r| std::mem::take(&mut *r)).unwrap_or_default();
+        // Two lanes finish out of order: apply in submission order, and skip what a newer result
+        // of the same tag has already replaced.
+        done.sort_by_key(|&(_, seq, _)| seq);
         let mut status = None;
         let changed = !done.is_empty();
-        for (tag, result) in done {
+        for (tag, seq, result) in done {
             self.busy = self.busy.saturating_sub(1);
+            if !self.newest(tag, seq) {
+                continue;
+            }
             let value = match result {
                 Ok(v) => v,
                 // No proxy running just means no flows to show.
@@ -697,5 +772,92 @@ mod tests {
         assert_eq!(bytes(2048), "2 KB");
         assert_eq!(bytes(5 << 20), "5.0 MB");
         assert_eq!(bytes(3 << 30), "3.0 GB");
+    }
+
+    static GATE: Mutex<Option<mpsc::Receiver<()>>> = Mutex::new(None);
+
+    /// A stand-in for the API: listings wait on `GATE`, commands answer at once.
+    fn fake_call(_: &mut Session, method: &str, _: &Value) -> Result<Value, String> {
+        if method == "containers"
+            && let Some(gate) = GATE.lock().map_err(|e| e.to_string())?.take()
+        {
+            gate.recv().ok();
+        }
+        Ok(json!([]))
+    }
+
+    /// A slow listing doesn't hold up a toggle queued after it; a command's follow-up reload
+    /// stays behind the command.
+    #[test]
+    fn a_slow_listing_does_not_delay_a_toggle() {
+        let (release, gate) = mpsc::channel::<()>();
+        *GATE.lock().expect("gate") = Some(gate);
+        let mut d = Debug::default();
+        d.start_with(Arc::new(|| {}), fake_call);
+        d.submit("A1", Tag::Containers, "containers", json!({}));
+        d.perform("A1", DebugAction::ToggleContrast);
+        let start = std::time::Instant::now();
+        let mut status = None;
+        while status.is_none() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "the toggle finished while the listing waits");
+            status = d.drain().1;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(status.as_deref(), Some("contrast: done"));
+        assert_eq!(d.busy, 1, "the listing is still running");
+        release.send(()).expect("release");
+        while d.busy > 0 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "the listing finished");
+            d.drain();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(Tag::Containers.lane(), Lane::Slow);
+        assert_eq!(Tag::Done("x").lane(), Lane::Quick);
+    }
+
+    static STALE_GATE: Mutex<Option<mpsc::Receiver<()>>> = Mutex::new(None);
+
+    /// The listing asked for first (`{"before": true}`) waits on `STALE_GATE` and still shows
+    /// the app; every later one sees it cleared.
+    fn clearing_call(_: &mut Session, method: &str, params: &Value) -> Result<Value, String> {
+        if method != "containers" {
+            return Ok(json!({}));
+        }
+        if params["before"] == json!(true) {
+            if let Some(gate) = STALE_GATE.lock().map_err(|e| e.to_string())?.take() {
+                gate.recv().ok();
+            }
+            return Ok(json!([{"bundle_id": "com.example", "data": "Data/x", "bundle": null, "data_bytes": 9, "bundle_bytes": 0}]));
+        }
+        Ok(json!([]))
+    }
+
+    /// "Clear app data" while a slow Storage listing runs: the command's quick reload lands
+    /// first, and the older listing finishing after it is dropped, not shown over it.
+    #[test]
+    fn an_older_listing_never_overwrites_a_newer_reload() {
+        let (release, gate) = mpsc::channel::<()>();
+        *STALE_GATE.lock().expect("gate") = Some(gate);
+        let mut d = Debug::default();
+        d.start_with(Arc::new(|| {}), clearing_call);
+        d.submit("A1", Tag::Containers, "containers", json!({"before": true}));
+        d.perform("A1", DebugAction::Api { label: "cleared", method: "clear_container", params: json!({}), then: Some(Tag::Containers) });
+        let start = std::time::Instant::now();
+        while d.busy > 1 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "the command and its reload finished");
+            d.drain();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(d.containers.is_empty(), "the reload after the clear");
+        release.send(()).expect("release");
+        while d.busy > 0 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "the listing finished");
+            d.drain();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(d.containers.is_empty(), "the older listing was dropped: {:?}", d.containers);
+        // Per tag, a result older than the newest applied is dropped.
+        assert!(d.newest(Tag::Processes, 7) && !d.newest(Tag::Processes, 6) && d.newest(Tag::Processes, 8));
+        assert!(d.newest(Tag::Done("x"), 1), "command results always report");
     }
 }

@@ -11,11 +11,17 @@ pub const REASON: &str = "iOS simulator devices need a macOS host with Xcode";
 #[derive(Default)]
 pub struct Session;
 
+/// No simulators to select from.
+pub fn selection_infos(_: &mut Session) -> Result<Vec<sim_core::device::DeviceInfo>, String> {
+    Ok(Vec::new())
+}
+
 /// Listings are empty; every other method names a device that can't exist here.
 pub fn call(_: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     match method {
         "devices" | "runtimes" | "device_types" => Ok(Value::Array(Vec::new())),
         "create" => Err(format!("cannot create an iOS device: {REASON}")),
+        "boot_many" => Err(format!("cannot boot iOS devices: {REASON}")),
         _ => {
             let q = str_param(p, "device").unwrap_or("booted");
             Err(format!("no device matches `{q}` ({REASON})"))

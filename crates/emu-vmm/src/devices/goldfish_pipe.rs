@@ -72,6 +72,8 @@ struct State {
     pipes: HashMap<u32, Pipe>,
     /// (pipe id, wake flags) waiting for GET_SIGNALLED.
     signalled: VecDeque<(u32, u32)>,
+    /// The level last driven on the line (it starts low): the controller hears changes only.
+    level: bool,
 }
 
 pub struct GoldfishPipe {
@@ -101,7 +103,11 @@ impl GoldfishPipe {
         } else {
             s.signalled.push_back((id, flags));
         }
-        self.irq.set(true);
+        // Already up: the driver drains every signal before the line drops.
+        if !s.level {
+            s.level = true;
+            self.irq.set(true);
+        }
     }
 
     fn rd64(&self, addr: u64) -> u64 {
@@ -328,7 +334,8 @@ impl MmioDevice for GoldfishPipe {
                         let _ = self.mem.write(at, &b);
                     }
                 }
-                if s.signalled.is_empty() {
+                if s.signalled.is_empty() && s.level {
+                    s.level = false;
                     self.irq.set(false);
                 }
                 n as u32
@@ -439,7 +446,7 @@ impl PipeHandler for ProcessPipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::irq::TestLine;
+    use crate::irq::{CountLine, TestLine};
 
     const RAM: u64 = 0x4000_0000;
 
@@ -506,6 +513,38 @@ mod tests {
         assert_eq!(run(&d, &mem, 3, cb, CMD_POLL, None).0, POLL_OUT);
         assert_eq!(run(&d, &mem, 3, cb, CMD_CLOSE, None).0, 0);
         assert_eq!(run(&d, &mem, 3, cb, CMD_POLL, None).0, ERR_INVAL, "closed");
+    }
+
+    /// Two pipes woken before the driver drains them, then a drain with nothing left: the
+    /// controller hears one rise and one fall.
+    #[test]
+    fn drives_the_line_only_on_changes() {
+        let mem = Arc::new(GuestRam::new(RAM, 0x10_0000).expect("ram"));
+        let line = Arc::new(CountLine::default());
+        let mut reg = PipeRegistry::default();
+        reg.register("GLProcessPipe", Box::new(GlProcess::default()));
+        let d = GoldfishPipe::new(mem.clone(), Arc::new(reg), line.clone());
+        wr(&d, REG_VERSION, 4);
+        let (open_buf, sig_buf, data) = (RAM + 0x1000, RAM + 0x2000, RAM + 0x8000);
+        wr(&d, REG_OPEN_BUFFER_HIGH, 0);
+        wr(&d, REG_OPEN_BUFFER, open_buf as u32);
+        wr(&d, REG_SIGNAL_BUFFER_HIGH, 0);
+        wr(&d, REG_SIGNAL_BUFFER, sig_buf as u32);
+        wr(&d, REG_SIGNAL_BUFFER_COUNT, 64);
+        for (id, cb) in [(3, RAM + 0x3000), (4, RAM + 0x4000)] {
+            mem.write(open_buf, &cb.to_le_bytes()).expect("w");
+            assert_eq!(run(&d, &mem, id, cb, CMD_OPEN, None).0, 0);
+            mem.write(data, b"pipe:GLProcessPipe\0").expect("w");
+            assert_eq!(run(&d, &mem, id, cb, CMD_WRITE, Some((data, 19))).0, 19);
+            assert_eq!(run(&d, &mem, id, cb, CMD_WAKE_ON_READ, None).0, 0);
+            mem.write(data, &100u32.to_le_bytes()).expect("w");
+            assert_eq!(run(&d, &mem, id, cb, CMD_WRITE, Some((data, 4))).0, 4);
+            assert!(line.level(), "pipe {id} woken");
+        }
+        assert_eq!(rd(&d, REG_GET_SIGNALLED), 2);
+        assert!(!line.level(), "drained");
+        assert_eq!(rd(&d, REG_GET_SIGNALLED), 0);
+        assert_eq!((line.calls(), line.transitions()), (2, 2));
     }
 
     /// Issues `cmd` with several buffers.

@@ -52,3 +52,39 @@ impl TestLine {
         self.0.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
+
+/// Test double that counts how often the line is driven and how often that changed its level:
+/// a device that calls the controller only on changes has `calls() == transitions()`.
+#[cfg(test)]
+#[derive(Default)]
+pub struct CountLine {
+    level: std::sync::atomic::AtomicBool,
+    calls: std::sync::atomic::AtomicU32,
+    transitions: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(test)]
+impl IrqLine for CountLine {
+    fn set(&self, level: bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.calls.fetch_add(1, SeqCst);
+        if self.level.swap(level, SeqCst) != level {
+            self.transitions.fetch_add(1, SeqCst);
+        }
+    }
+}
+
+#[cfg(test)]
+impl CountLine {
+    pub fn level(&self) -> bool {
+        self.level.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn calls(&self) -> u32 {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn transitions(&self) -> u32 {
+        self.transitions.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}

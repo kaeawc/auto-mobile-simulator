@@ -1,11 +1,12 @@
 //! vCPU threads: entering the guest and handling its exits (MMIO, PSCI, WFI, sysreg traps).
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use emu_hvf::{Exit, Reg, SysReg, Vcpu, VcpuHandle};
 
-use crate::bus::{Bus, le_value};
+use crate::bus::{Bus, ExitProfile, le_value};
 use crate::wake::{self, VcpuControl};
 
 const EC_WFX: u64 = 0x01;
@@ -87,8 +88,10 @@ impl VcpuControl for HvVcpus {
     }
 }
 
-/// Per-vCPU exit counters.
+/// Per-vCPU exit counters, each vCPU's alone in its cache line (128 bytes on Apple silicon):
+/// one is bumped on every exit, and neighbours sharing the line would bounce it between cores.
 #[derive(Default)]
+#[repr(align(128))]
 pub struct ExitStats {
     pub mmio_read: AtomicU64,
     pub mmio_write: AtomicU64,
@@ -124,13 +127,55 @@ pub struct Cpus {
     stop: Mutex<Option<StopReason>>,
     stop_cv: Condvar,
     unmapped_logged: AtomicU64,
-    sysreg_logged: Mutex<Vec<u64>>,
+    sysreg_logged: SeenOnce,
+    /// `EMU_EXIT_PROFILE`: per-device exit attribution and per-vCPU time (see [`ExitProfile`]).
+    profile: Option<Arc<ExitProfile>>,
+    profile_file: Option<PathBuf>,
+}
+
+impl Drop for Cpus {
+    fn drop(&mut self) {
+        if let Some(p) = &self.profile {
+            eprint!("{}", p.summary());
+            if let Some(path) = &self.profile_file {
+                write_profile(p, path);
+            }
+        }
+    }
+}
+
+/// Replaces `path` with the profile's dump, atomically, so a reader never sees half of one.
+fn write_profile(p: &ExitProfile, path: &std::path::Path) {
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, p.dump()).and_then(|()| std::fs::rename(&tmp, path)).is_err() {
+        eprintln!("emu: could not write the exit profile to {}", path.display());
+    }
+}
+
+/// Rewrites the profile file every second until the machine (the last strong reference) goes.
+fn spawn_profile_writer(p: &Arc<ExitProfile>, path: PathBuf) {
+    let weak = Arc::downgrade(p);
+    let _ = std::thread::Builder::new().name("exit-profile".into()).spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let Some(p) = weak.upgrade() else { return };
+            write_profile(&p, &path);
+        }
+    });
 }
 
 impl Cpus {
     pub fn new(bus: Bus, wakers: Arc<Wakers>, vtimer_offset: u64) -> Cpus {
         let n = wakers.len();
+        let target = crate::bus::profile_target(std::env::var("EMU_EXIT_PROFILE").ok().as_deref());
+        let profile = target.as_ref().map(|_| Arc::new(ExitProfile::new(&bus, n)));
+        let profile_file = target.flatten();
+        if let (Some(p), Some(path)) = (&profile, &profile_file) {
+            spawn_profile_writer(p, path.clone());
+        }
         Cpus {
+            profile,
+            profile_file,
             bus,
             slots: (0..n).map(|_| CpuSlot { power: Mutex::new(Power::Off), cv: Condvar::new() }).collect(),
             wakers,
@@ -140,7 +185,7 @@ impl Cpus {
             stop: Mutex::new(None),
             stop_cv: Condvar::new(),
             unmapped_logged: AtomicU64::new(0),
-            sysreg_logged: Mutex::new(Vec::new()),
+            sysreg_logged: SeenOnce::new(),
         }
     }
 
@@ -241,9 +286,18 @@ impl Cpus {
                     vtimer_masked = false;
                 }
             }
+            let t = self.profile.as_ref().map(|p| {
+                p.entered();
+                Instant::now()
+            });
             self.wakers.enter(idx);
             let exit = vcpu.run();
             self.wakers.leave(idx);
+            if let (Some(p), Some(t)) = (&self.profile, t) {
+                let c = p.cpu(idx);
+                c.runs.fetch_add(1, Ordering::Relaxed);
+                c.guest_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
             match exit? {
                 Exit::Canceled => {
                     stats.canceled.fetch_add(1, Ordering::Relaxed);
@@ -290,16 +344,25 @@ impl Cpus {
                 let rt = ((iss >> 16) & 0x1f) as u32;
                 let sixty_four = (iss >> 15) & 1 == 1;
                 let write = (iss >> 6) & 1 == 1;
+                let t = self.profile.as_ref().map(|_| Instant::now());
                 if write {
                     stats.mmio_write.fetch_add(1, Ordering::Relaxed);
                     let v = if rt == 31 { 0 } else { vcpu.reg(Reg::x(rt))? };
-                    if !self.bus.write(ipa, &v.to_le_bytes()[..size]) {
+                    let hit = self.bus.write_at(ipa, &v.to_le_bytes()[..size]);
+                    if let (Some(p), Some(t)) = (&self.profile, t) {
+                        p.record(idx, hit, true, t.elapsed().as_nanos() as u64);
+                    }
+                    if hit.is_none() {
                         self.log_unmapped(ipa, true);
                     }
                 } else {
                     stats.mmio_read.fetch_add(1, Ordering::Relaxed);
                     let mut buf = [0u8; 8];
-                    if !self.bus.read(ipa, &mut buf[..size]) {
+                    let hit = self.bus.read_at(ipa, &mut buf[..size]);
+                    if let (Some(p), Some(t)) = (&self.profile, t) {
+                        p.record(idx, hit, false, t.elapsed().as_nanos() as u64);
+                    }
+                    if hit.is_none() {
                         self.log_unmapped(ipa, false);
                     }
                     let mut v = le_value(&buf[..size]);
@@ -375,7 +438,11 @@ impl Cpus {
             }
             timer = Some(Duration::from_nanos(emu_hvf::ticks_to_nanos(cval - now)));
         }
+        let t = self.profile.as_ref().map(|_| Instant::now());
         self.wakers.park(idx, timer);
+        if let (Some(p), Some(t)) = (&self.profile, t) {
+            p.cpu(idx).parked_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -443,9 +510,7 @@ impl Cpus {
     }
 
     fn log_sysreg(&self, enc: u64, is_read: bool) {
-        let mut seen = self.sysreg_logged.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.len() < 64 && !seen.contains(&enc) {
-            seen.push(enc);
+        if self.sysreg_logged.first_sighting(enc) {
             let (op0, op2, op1, crn, crm) = ((enc >> 20) & 3, (enc >> 17) & 7, (enc >> 14) & 7, (enc >> 10) & 0xf, (enc >> 1) & 0xf);
             eprintln!(
                 "emu: trapped sysreg S{op0}_{op1}_C{crn}_C{crm}_{op2} ({}), treating as RAZ/WI",
@@ -455,7 +520,120 @@ impl Cpus {
     }
 }
 
+/// The first [`SeenOnce::CAP`] distinct values, each reported once. A guest polling a trapped
+/// register (PMU, debug) asks on every exit for a value already seen: that answer is a lock-free
+/// scan; only a new value takes the lock.
+struct SeenOnce {
+    values: [AtomicU64; SeenOnce::CAP],
+    /// Entries below this are written (published with Release after the write).
+    len: AtomicUsize,
+    insert: Mutex<()>,
+}
+
+impl SeenOnce {
+    const CAP: usize = 64;
+
+    fn new() -> SeenOnce {
+        SeenOnce { values: std::array::from_fn(|_| AtomicU64::new(0)), len: AtomicUsize::new(0), insert: Mutex::new(()) }
+    }
+
+    fn contains(&self, value: u64, len: usize) -> bool {
+        self.values[..len].iter().any(|v| v.load(Ordering::Relaxed) == value)
+    }
+
+    /// True the first time `value` is offered, while fewer than `CAP` values have been.
+    fn first_sighting(&self, value: u64) -> bool {
+        let len = self.len.load(Ordering::Acquire);
+        if len >= Self::CAP || self.contains(value, len) {
+            return false;
+        }
+        let _g = self.insert.lock().unwrap_or_else(|e| e.into_inner());
+        let len = self.len.load(Ordering::Acquire);
+        if len >= Self::CAP || self.contains(value, len) {
+            return false;
+        }
+        self.values[len].store(value, Ordering::Relaxed);
+        self.len.store(len + 1, Ordering::Release);
+        true
+    }
+}
+
 enum Flow {
     CpuOff,
     Stop,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    #[test]
+    fn each_value_is_seen_once_up_to_the_cap() {
+        let s = SeenOnce::new();
+        assert!(s.first_sighting(0), "zero is a value like any other");
+        assert!(!s.first_sighting(0));
+        for v in 1..SeenOnce::CAP as u64 {
+            assert!(s.first_sighting(v), "{v}");
+        }
+        assert!(!s.first_sighting(5));
+        assert!(!s.first_sighting(1000), "full");
+    }
+
+    /// vCPU threads trapping on the same registers at once: each is still reported once.
+    #[test]
+    fn racing_sightings_report_each_value_once() {
+        let s = SeenOnce::new();
+        let firsts: Vec<u64> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..8)
+                .map(|_| sc.spawn(|| (0..40u64).flat_map(|_| 0..40u64).filter(|&v| s.first_sighting(v)).collect::<Vec<_>>()))
+                .collect();
+            hs.into_iter().flat_map(|h| h.join().expect("thread")).collect()
+        });
+        let mut sorted = firsts.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..40).collect::<Vec<_>>());
+    }
+
+    fn cpus(n: usize) -> Cpus {
+        Cpus::new(Bus::new(), Arc::new(Wakers::new(n, HvVcpus::new(n), wake::Mode::Targeted)), 0)
+    }
+
+    /// Per-exit bookkeeping with N vCPU threads: each one's exit counter, and the sysreg trap
+    /// log for an encoding already logged (the PMU and debug registers a guest polls).
+    /// `cargo test --release -p emu-vmm exit_bookkeeping_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn exit_bookkeeping_cost() {
+        const ITERS: u32 = 2_000_000;
+        fn worst(c: &Cpus, f: impl Fn(&Cpus, usize) + Sync) -> f64 {
+            let barrier = std::sync::Barrier::new(c.count());
+            std::thread::scope(|s| {
+                let hs: Vec<_> = (0..c.count())
+                    .map(|i| {
+                        let (barrier, f) = (&barrier, &f);
+                        s.spawn(move || {
+                            barrier.wait();
+                            let t = Instant::now();
+                            for _ in 0..ITERS {
+                                f(c, i);
+                            }
+                            t.elapsed().as_nanos() as f64 / f64::from(ITERS)
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().expect("thread")).fold(0.0, f64::max)
+            })
+        }
+        for n in [1usize, 2, 4, 8] {
+            let c = cpus(n);
+            c.log_sysreg(0x30_0000, true);
+            let stats = worst(&c, |c, i| {
+                c.stats[i].sysreg.fetch_add(1, Ordering::Relaxed);
+            });
+            let sysreg = worst(&c, |c, _| c.log_sysreg(0x30_0000, true));
+            println!("exit_bookkeeping {n} vCPUs: {stats:.1} ns per counter bump, {sysreg:.1} ns per logged sysreg trap");
+        }
+    }
 }

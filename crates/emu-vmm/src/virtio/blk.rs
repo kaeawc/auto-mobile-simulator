@@ -107,14 +107,8 @@ impl VirtioDevice for Blk {
         let cfg = act.queues.first().copied().flatten().ok_or("block request queue not enabled")?;
         self.stop_worker();
         let bell = Arc::new(Doorbell::default());
-        let mut w = Worker {
-            mem: act.mem,
-            irq: act.irq,
-            queue: Queue::new(cfg, act.features & F_RING_EVENT_IDX != 0),
-            disk: self.disk.clone(),
-            capacity_sectors: self.capacity_sectors,
-            serial: self.serial.clone(),
-        };
+        let queue = Queue::new(cfg, act.features & F_RING_EVENT_IDX != 0);
+        let mut w = Worker::new(act.mem, act.irq, queue, self.disk.clone(), self.capacity_sectors, self.serial.clone());
         let b = bell.clone();
         let handle = std::thread::Builder::new()
             .name(format!("blk-{}", self.serial))
@@ -146,27 +140,48 @@ struct Worker {
     disk: Arc<Mutex<Disk>>,
     capacity_sectors: u64,
     serial: String,
+    /// Reused for every request: the popped chain and its data buffers as `(gpa, len)`.
+    chain: Chain,
+    segs: Vec<(u64, usize)>,
 }
 
 impl Worker {
+    fn new(mem: Arc<GuestRam>, irq: Arc<Interrupt>, queue: Queue, disk: Arc<Mutex<Disk>>, capacity_sectors: u64, serial: String) -> Worker {
+        Worker { mem, irq, queue, disk, capacity_sectors, serial, chain: Chain::default(), segs: Vec::new() }
+    }
+
+    /// Serves every published request. Kicks are off while it runs (the guest publishing more
+    /// meanwhile costs it no MMIO exit); turning them back on rechecks the ring, so a request
+    /// published just before that is served here rather than waiting for a kick that never comes.
     fn drain(&mut self) {
         let mut completed = false;
-        loop {
-            let chain = match self.queue.pop(&self.mem) {
-                Ok(Some(c)) => c,
-                Ok(None) => break,
-                Err(e) => {
-                    eprintln!("emu: blk-{}: {e}", self.serial);
-                    break;
+        let mut chain = std::mem::take(&mut self.chain);
+        'session: loop {
+            self.queue.disable_notify(&self.mem);
+            loop {
+                match self.queue.pop_into(&self.mem, &mut chain) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(e) => {
+                        eprintln!("emu: blk-{}: {e}", self.serial);
+                        // Kicks back on, or the guest has no way left to wake the worker.
+                        self.queue.enable_notify(&self.mem);
+                        break 'session;
+                    }
                 }
-            };
-            let written = self.handle(&chain);
-            if let Err(e) = self.queue.add_used(&self.mem, chain.head, written) {
-                eprintln!("emu: blk-{}: {e}", self.serial);
+                let written = self.handle(&chain);
+                if let Err(e) = self.queue.add_used(&self.mem, chain.head, written) {
+                    eprintln!("emu: blk-{}: {e}", self.serial);
+                    self.queue.enable_notify(&self.mem);
+                    break 'session;
+                }
+                completed = true;
+            }
+            if !self.queue.enable_notify(&self.mem) {
                 break;
             }
-            completed = true;
         }
+        self.chain = chain;
         if completed && self.queue.should_notify(&self.mem) {
             self.irq.raise(INT_USED_RING);
         }
@@ -191,28 +206,24 @@ impl Worker {
         let data = &descs[1..descs.len() - 1];
         let mut written = 0u32;
         let result: Result<(), u8> = (|| match typ {
-            T_IN => {
-                let disk = self.disk.lock().map_err(|_| S_IOERR)?;
-                let mut off = sector.checked_mul(SECTOR).ok_or(S_IOERR)?;
+            // The data buffers go to the disk as one vectored request (one preadv/pwritev).
+            T_IN | T_OUT => {
+                let off = sector.checked_mul(SECTOR).ok_or(S_IOERR)?;
+                let want_write = typ == T_IN;
+                self.segs.clear();
                 for d in data {
-                    if !d.write {
+                    if d.write != want_write {
                         return Err(S_IOERR);
                     }
-                    disk.read_to_guest(&self.mem, off, d.addr, u64::from(d.len)).map_err(|_| S_IOERR)?;
-                    off += u64::from(d.len);
-                    written += d.len;
+                    self.segs.push((d.addr, d.len as usize));
                 }
-                Ok(())
-            }
-            T_OUT => {
-                let mut disk = self.disk.lock().map_err(|_| S_IOERR)?;
-                let mut off = sector.checked_mul(SECTOR).ok_or(S_IOERR)?;
-                for d in data {
-                    if d.write {
-                        return Err(S_IOERR);
-                    }
-                    disk.write_from_guest(&self.mem, off, d.addr, u64::from(d.len)).map_err(|_| S_IOERR)?;
-                    off += u64::from(d.len);
+                if typ == T_IN {
+                    let disk = self.disk.lock().map_err(|_| S_IOERR)?;
+                    disk.read_vectored_to_guest(&self.mem, off, &self.segs).map_err(|_| S_IOERR)?;
+                    written = data.iter().fold(0u32, |n, d| n.saturating_add(d.len));
+                } else {
+                    let mut disk = self.disk.lock().map_err(|_| S_IOERR)?;
+                    disk.write_vectored_from_guest(&self.mem, off, &self.segs).map_err(|_| S_IOERR)?;
                 }
                 Ok(())
             }
@@ -299,14 +310,7 @@ mod tests {
     }
 
     fn worker(blk: &Blk, mem: &Arc<GuestRam>, irq: &Arc<Interrupt>, drv: &Driver) -> Worker {
-        Worker {
-            mem: mem.clone(),
-            irq: irq.clone(),
-            queue: Queue::new(drv.cfg, false),
-            disk: blk.disk.clone(),
-            capacity_sectors: blk.capacity_sectors,
-            serial: blk.serial.clone(),
-        }
+        Worker::new(mem.clone(), irq.clone(), Queue::new(drv.cfg, false), blk.disk.clone(), blk.capacity_sectors, blk.serial.clone())
     }
 
     fn status(mem: &GuestRam) -> u8 {
@@ -378,6 +382,155 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Linux-shaped requests: one indirect table of a header, 32 scattered 4 KiB pages (every
+    /// other page, so no two are guest-adjacent) and a status byte, i.e. one 128 KiB request.
+    /// Reads and writes, persistent and ephemeral.
+    ///     cargo test --release -p emu-vmm blk_scattered_throughput -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn blk_scattered_throughput() {
+        use std::time::Instant;
+        const FILE: u64 = 64 << 20;
+        const SEGS: u64 = 32;
+        const REQ: u64 = SEGS * 4096;
+        let path = std::env::temp_dir().join(format!("emu-blk-sg-bench-{}.img", std::process::id()));
+        let data: Vec<u8> = (0..FILE).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+        std::fs::write(&path, &data).expect("image");
+        for (kind, disk) in [("persistent", Disk::persistent(&path)), ("ephemeral", Disk::ephemeral(&path))] {
+            let blk = Blk::new(disk.expect("disk"), "bench");
+            let mem = Arc::new(GuestRam::new(RAM_BASE, 64 << 20).expect("ram"));
+            let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+            // Reads of a clean disk, writes, then reads again (an ephemeral overlay now covers it).
+            for (op, typ) in [("read", T_IN), ("write", T_OUT), ("reread", T_IN)] {
+                let mut drv = Driver::new(256);
+                let mut w = worker(&blk, &mem, &irq, &drv);
+                let (batch, total) = (32u64, 512u64 << 20);
+                let start = Instant::now();
+                let (mut done, mut n) = (0u64, 0u64);
+                while done < total {
+                    for i in 0..batch {
+                        let hdr = RAM_BASE + 0x10_0000 + i * 32;
+                        let sector = (n * 7919 % (FILE / REQ)) * REQ / 512;
+                        let mut h = [0u8; 16];
+                        h[..4].copy_from_slice(&typ.to_le_bytes());
+                        h[8..].copy_from_slice(&sector.to_le_bytes());
+                        mem.write(hdr, &h).expect("hdr");
+                        let bufs: Vec<(u64, u32, bool)> = std::iter::once((hdr, 16, false))
+                            .chain((0..SEGS).map(|s| (RAM_BASE + 0x40_0000 + (i * SEGS + s) * 0x2000, 4096, typ == T_IN)))
+                            .chain(std::iter::once((hdr + 16, 1, true)))
+                            .collect();
+                        drv.push_indirect(&mem, RAM_BASE + 0x20_0000 + i * 0x400, &bufs);
+                        n += 1;
+                    }
+                    w.drain();
+                    done += batch * REQ;
+                }
+                let secs = start.elapsed().as_secs_f64();
+                let mut st = [0u8; 1];
+                mem.read(RAM_BASE + 0x10_0010, &mut st).expect("status");
+                assert_eq!(st[0], S_OK, "{kind} {op}");
+                println!(
+                    "blk {kind:<10} {op:<6} 32x4KiB: {:>6.0} req/s, {:>6.0} MiB/s, {:>6.1} us/req",
+                    n as f64 / secs,
+                    (done >> 20) as f64 / secs,
+                    secs * 1e6 / n as f64
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Runs `reqs` reads of `segs` scattered 4 KiB pages each, with a driver thread publishing
+    /// (up to `depth` in flight) while the worker thread drains, the way a guest and the blk
+    /// worker race. The driver kicks whenever Linux's `virtqueue_kick_prepare` would. Returns
+    /// (seconds, kicks). Panics if the driver waits 10 s without a completion: a lost wakeup.
+    fn race(event_idx: bool, reqs: u32, depth: u16, segs: u64) -> (f64, u32) {
+        use std::time::{Duration, Instant};
+        let path = std::env::temp_dir().join(format!("emu-blk-race-{}-{event_idx}-{reqs}-{depth}-{segs}.img", std::process::id()));
+        std::fs::write(&path, vec![5u8; 1 << 20]).expect("image");
+        let blk = Blk::new(Disk::persistent(&path).expect("disk"), "race");
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 64 << 20).expect("ram"));
+        let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+        let mut drv = Driver::new(256);
+        let mut w = worker(&blk, &mem, &irq, &drv);
+        w.queue = Queue::new(drv.cfg, event_idx);
+        let bell = Arc::new(Doorbell::default());
+        let b = bell.clone();
+        let handle = std::thread::spawn(move || {
+            while b.wait() {
+                w.drain();
+            }
+        });
+        let (mut kicks, mut sent) = (0u32, 0u32);
+        let (mut last_used, mut last_progress) = (0u16, Instant::now());
+        let start = Instant::now();
+        loop {
+            let used = drv.used_idx(&mem);
+            if used != last_used {
+                (last_used, last_progress) = (used, Instant::now());
+            }
+            if u32::from(used) == reqs & 0xffff && sent == reqs {
+                break;
+            }
+            assert!(last_progress.elapsed() < Duration::from_secs(10), "lost wakeup: {sent} sent, used.idx {used}, {kicks} kicks");
+            if sent < reqs && drv.avail_idx().wrapping_sub(used) < depth {
+                let slot = u64::from(sent % u32::from(depth));
+                let hdr = RAM_BASE + 0x10_0000 + slot * 32;
+                let mut h = [0u8; 16];
+                h[8..].copy_from_slice(&(u64::from(sent) * segs * 8 % (2048 - segs * 8)).to_le_bytes());
+                mem.write(hdr, &h).expect("hdr");
+                let bufs: Vec<(u64, u32, bool)> = std::iter::once((hdr, 16, false))
+                    .chain((0..segs).map(|s| (RAM_BASE + 0x40_0000 + (slot * segs + s) * 0x2000, 4096, true)))
+                    .chain(std::iter::once((hdr + 16, 1, true)))
+                    .collect();
+                let old = drv.avail_idx();
+                drv.push_indirect(&mem, RAM_BASE + 0x20_0000 + slot * 0x400, &bufs);
+                sent += 1;
+                if drv.needs_kick(&mem, old, event_idx) {
+                    kicks += 1;
+                    bell.ring();
+                }
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+        let secs = start.elapsed().as_secs_f64();
+        bell.stop();
+        handle.join().expect("worker");
+        let _ = std::fs::remove_file(&path);
+        (secs, kicks)
+    }
+
+    /// The driver and the worker race on avail.idx and the notification state: every request
+    /// completes (no lost wakeup), with and without event-idx.
+    #[test]
+    fn racing_driver_never_loses_a_wakeup() {
+        for event_idx in [true, false] {
+            for depth in [1, 4, 64] {
+                race(event_idx, 3000, depth, 1);
+                race(event_idx, 300, depth, 8);
+            }
+        }
+    }
+
+    /// Kicks (MMIO exits on a real guest) per request while the worker drains.
+    ///     cargo test --release -p emu-vmm blk_kicks_while_draining -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn blk_kicks_while_draining() {
+        const N: u32 = 50_000;
+        for (event_idx, segs) in [(true, 1u64), (true, 32), (false, 32)] {
+            for depth in [1u16, 2, 4, 16, 64] {
+                let (secs, kicks) = race(event_idx, N, depth, segs);
+                println!(
+                    "blk race event_idx={event_idx:<5} {segs:>2}x4KiB depth {depth:>2}: {:>7.0} req/s, {:.3} kicks/req",
+                    f64::from(N) / secs,
+                    f64::from(kicks) / f64::from(N)
+                );
+            }
+        }
+    }
+
     #[test]
     fn discard_and_write_zeroes() {
         const SECTORS: u64 = 128;
@@ -427,6 +580,53 @@ mod tests {
         w.drain();
         assert_eq!(status(&mem), S_IOERR);
         assert_eq!(std::fs::read(&path).expect("read")[0], 7, "first sector untouched");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A Linux-shaped request (indirect table, scattered pages) is served as one vectored
+    /// request: data lands in each page in order, and a buffer of the wrong direction fails it.
+    #[test]
+    fn scattered_requests_read_and_write_every_segment() {
+        let path = std::env::temp_dir().join(format!("emu-blk-sg-{}", std::process::id()));
+        let image: Vec<u8> = (0..64 * 1024u32).map(|i| (i * 31 % 251) as u8).collect();
+        std::fs::write(&path, &image).expect("write");
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x10_0000).expect("ram"));
+        let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+        let mut drv = Driver::new(16);
+        let blk = Blk::new(Disk::persistent(&path).expect("open"), "vdd");
+        let mut w = worker(&blk, &mem, &irq, &drv);
+        let (hdr, st) = (RAM_BASE + 0x20000, RAM_BASE + 0x21000);
+        let pages = [(RAM_BASE + 0x40000, 4096u32), (RAM_BASE + 0x42000, 512), (RAM_BASE + 0x42200, 1024), (RAM_BASE + 0x48000, 2560)];
+        let send = |w: &mut Worker, drv: &mut Driver, typ: u32, sector: u64, write: bool| {
+            let mut h = [0u8; 16];
+            h[..4].copy_from_slice(&typ.to_le_bytes());
+            h[8..].copy_from_slice(&sector.to_le_bytes());
+            mem.write(hdr, &h).expect("hdr");
+            let bufs: Vec<(u64, u32, bool)> = std::iter::once((hdr, 16, false))
+                .chain(pages.iter().map(|&(a, l)| (a, l, write)))
+                .chain(std::iter::once((st, 1, true)))
+                .collect();
+            let i = drv.avail_idx();
+            drv.push_indirect(&mem, RAM_BASE + 0x6000 + u64::from(i) * 0x100, &bufs);
+            w.drain();
+            (status(&mem), drv.used(&mem, i).1)
+        };
+        // Read 8 KiB from sector 3.
+        assert_eq!(send(&mut w, &mut drv, T_IN, 3, true), (S_OK, 8192 + 1));
+        let mut at = 3 * 512;
+        for &(a, l) in &pages {
+            let mut got = vec![0u8; l as usize];
+            mem.read(a, &mut got).expect("r");
+            assert_eq!(got, image[at..at + l as usize], "page {a:#x}");
+            at += l as usize;
+        }
+        // Write them back at sector 40, then check the file.
+        assert_eq!(send(&mut w, &mut drv, T_OUT, 40, false), (S_OK, 1));
+        let file = std::fs::read(&path).expect("read");
+        assert_eq!(file[40 * 512..40 * 512 + 8192], image[3 * 512..3 * 512 + 8192]);
+        // A device-writable buffer in a write request fails it before anything is written.
+        assert_eq!(send(&mut w, &mut drv, T_OUT, 0, true).0, S_IOERR);
+        assert_eq!(std::fs::read(&path).expect("read")[..512], image[..512]);
         let _ = std::fs::remove_file(path);
     }
 

@@ -8,11 +8,11 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use emu_gfxstream::{Box3, Fence, Renderer, ResourceCreateArgs};
-use emu_hvf::{GuestRam, HostRange, Vm};
+use emu_gfxstream::{Backing, Box3, Fence, Renderer, ResourceCreateArgs};
+use emu_hvf::{GuestRam, Vm};
 
 use super::mmio::F_RING_INDIRECT_DESC;
-use super::queue::{Chain, Queue};
+use super::queue::Queue;
 use super::{Activation, INT_USED_RING, Interrupt, VirtioDevice};
 use crate::display::DisplaySink;
 
@@ -167,6 +167,7 @@ impl VirtioDevice for Gpu {
             scanout: None,
             pending: Vec::new(),
             req: Vec::new(),
+            body: Vec::new(),
         };
         let handle = std::thread::Builder::new()
             .name("gpu".into())
@@ -227,15 +228,15 @@ impl Hdr {
         (b.len() >= 24).then(|| Hdr { typ: le32(b, 0), flags: le32(b, 4), fence_id: le64(b, 8), ctx_id: le32(b, 16), ring_idx: b[20] })
     }
 
-    /// The response header: echoes fence fields.
-    fn reply(&self, typ: u32) -> Vec<u8> {
-        let mut out = Vec::with_capacity(24);
-        out.extend_from_slice(&typ.to_le_bytes());
-        out.extend_from_slice(&(self.flags & (FLAG_FENCE | FLAG_RING_IDX)).to_le_bytes());
-        out.extend_from_slice(&self.fence_id.to_le_bytes());
-        out.extend_from_slice(&self.ctx_id.to_le_bytes());
-        out.push(self.ring_idx);
-        out.extend_from_slice(&[0, 0, 0]);
+    /// The response header: echoes fence fields (the guest driver signals its fence from the
+    /// fence id in the response). On the stack: most replies are only this.
+    fn reply(&self, typ: u32) -> [u8; 24] {
+        let mut out = [0u8; 24];
+        out[0..4].copy_from_slice(&typ.to_le_bytes());
+        out[4..8].copy_from_slice(&(self.flags & (FLAG_FENCE | FLAG_RING_IDX)).to_le_bytes());
+        out[8..16].copy_from_slice(&self.fence_id.to_le_bytes());
+        out[16..20].copy_from_slice(&self.ctx_id.to_le_bytes());
+        out[20] = self.ring_idx;
         out
     }
 }
@@ -254,6 +255,34 @@ fn le64(b: &[u8], o: usize) -> u64 {
     b.get(o..o + 8).map_or(0, |s| u64::from_le_bytes(s.try_into().unwrap_or_default()))
 }
 
+/// Whether the driver wants an interrupt for the queues that got used entries (`(used,
+/// queue)`), as blk and vsock ask: a queue whose driver suppressed interrupts
+/// (`VIRTQ_AVAIL_F_NO_INTERRUPT`, Linux's `virtqueue_disable_cb` while its dequeue worker
+/// drains the ring) raises none. Every used queue is asked, so each records the notification.
+fn wants_interrupt(mem: &GuestRam, queues: &mut [(bool, Option<&mut Queue>)]) -> bool {
+    let mut raise = false;
+    for (used, q) in queues.iter_mut() {
+        if let (true, Some(q)) = (*used, q.as_mut()) {
+            raise |= q.should_notify(mem);
+        }
+    }
+    raise
+}
+
+/// [`Worker::backing`]. The entry count is checked against the request before anything is
+/// reserved for it (it comes from the guest).
+fn backing(mem: &GuestRam, req: &[u8], at: usize, n: u32) -> Option<Backing> {
+    let n = n as usize;
+    if n.checked_mul(16).and_then(|b| b.checked_add(at)).is_none_or(|end| end > req.len()) {
+        return None;
+    }
+    let mut b = Backing::with_capacity(n);
+    for e in req[at..at + n * 16].as_chunks::<16>().0 {
+        b.push(mem.host_range(le64(e, 0), le32(e, 8) as usize)?);
+    }
+    Some(b)
+}
+
 fn rect(b: &[u8], o: usize) -> (u32, u32, u32, u32) {
     (le32(b, o), le32(b, o + 4), le32(b, o + 8), le32(b, o + 12))
 }
@@ -270,22 +299,27 @@ struct Worker {
     pending: Vec<Pending>,
     /// The current control request, reused across requests (command streams are KBs to MBs).
     req: Vec<u8>,
+    /// The current reply's payload after its header, reused likewise (most replies have none).
+    body: Vec<u8>,
 }
 
 impl Worker {
     fn run(&mut self, rx: &Receiver<Event>) {
         while let Ok(ev) = rx.recv() {
             let mut ev = Some(ev);
-            let mut used = false;
+            let (mut ctrl, mut cursor) = (false, false);
             while let Some(e) = ev.take() {
                 match e {
                     Event::Stop => return,
-                    Event::Kick => used |= self.process(),
-                    Event::Fence(f) => used |= self.complete_fences(f),
+                    Event::Kick => {
+                        let (c, k) = self.process();
+                        (ctrl, cursor) = (ctrl | c, cursor | k);
+                    }
+                    Event::Fence(f) => ctrl |= self.complete_fences(f),
                 }
                 ev = rx.try_recv().ok();
             }
-            if used {
+            if wants_interrupt(&self.mem, &mut [(ctrl, Some(&mut self.ctrl)), (cursor, self.cursor.as_mut())]) {
                 self.irq.raise(INT_USED_RING);
             }
         }
@@ -300,12 +334,14 @@ impl Worker {
         }
     }
 
-    fn process(&mut self) -> bool {
-        let mut used = false;
+    /// Runs every available request; returns whether the control and cursor queues got used
+    /// entries.
+    fn process(&mut self) -> (bool, bool) {
+        let (mut used, mut cursor_used) = (false, false);
         if let Some(q) = self.cursor.as_mut() {
             while let Ok(Some(c)) = q.pop(&self.mem) {
                 let _ = q.add_used(&self.mem, c.head, 0);
-                used = true;
+                cursor_used = true;
             }
         }
         loop {
@@ -321,11 +357,18 @@ impl Worker {
             if chain.read_all_into(&self.mem, 32 << 20, &mut req).is_err() {
                 req.clear();
             }
-            let (hdr, resp) = match Hdr::parse(&req) {
-                Some(h) => (h, self.handle(&h, &mut req, &chain)),
-                None => (Hdr::default(), Hdr::default().reply(cmd::ERR_UNSPEC)),
+            let mut body = std::mem::take(&mut self.body);
+            body.clear();
+            let (hdr, typ) = match Hdr::parse(&req) {
+                Some(h) => (h, self.handle(&h, &mut req, &mut body)),
+                None => (Hdr::default(), cmd::ERR_UNSPEC),
             };
-            let len = chain.write_all(&self.mem, &resp).unwrap_or(0);
+            if typ >= cmd::ERR_UNSPEC {
+                body.clear(); // an error is the header alone
+            }
+            let resp = hdr.reply(typ);
+            let len = chain.write_parts(&self.mem, &[&resp, &body]).unwrap_or(0);
+            self.body = body;
             if trace() {
                 // For resource commands, the resource id (and for creates, target/format/bind).
                 let detail = match hdr.typ {
@@ -381,7 +424,7 @@ impl Worker {
             let _ = self.ctrl.add_used(&self.mem, chain.head, len);
             used = true;
         }
-        used
+        (used, cursor_used)
     }
 
     fn complete_fences(&mut self, f: Fence) -> bool {
@@ -412,69 +455,61 @@ impl Worker {
         used
     }
 
-    /// Guest memory entries (`addr: u64, len: u32, pad: u32`) → host ranges.
-    fn backing(&self, req: &[u8], at: usize, n: u32) -> Option<Vec<HostRange>> {
-        (0..n as usize)
-            .map(|i| {
-                let o = at + i * 16;
-                self.mem.host_range(le64(req, o), le32(req, o + 8) as usize)
-            })
-            .collect()
+    /// Guest memory entries (`addr: u64, len: u32, pad: u32`) → the renderer's iovecs, built in
+    /// place. None if an entry is outside guest RAM or the request is shorter than `n` entries.
+    fn backing(&self, req: &[u8], at: usize, n: u32) -> Option<Backing> {
+        backing(&self.mem, req, at, n)
     }
 
-    fn handle(&mut self, h: &Hdr, req: &mut [u8], _chain: &Chain) -> Vec<u8> {
+    /// Runs one control request; returns the response type. A response payload (after the
+    /// header the caller writes) goes into `body`, which arrives empty.
+    fn handle(&mut self, h: &Hdr, req: &mut [u8], body: &mut Vec<u8>) -> u32 {
         let r = &self.cfg.renderer;
-        let ok = || h.reply(cmd::OK_NODATA);
+        let ok = cmd::OK_NODATA;
+        let or = |res: Result<(), emu_gfxstream::Error>, err: u32| if res.is_ok() { ok } else { err };
         match h.typ {
             cmd::GET_DISPLAY_INFO => {
-                let mut out = h.reply(cmd::OK_DISPLAY_INFO);
                 for i in 0..16u32 {
                     let (w, hgt, en): (u32, u32, u32) = if i == 0 { (self.cfg.width, self.cfg.height, 1) } else { (0, 0, 0) };
                     for v in [0u32, 0, w, hgt, en, 0] {
-                        out.extend_from_slice(&v.to_le_bytes());
+                        body.extend_from_slice(&v.to_le_bytes());
                     }
                 }
-                out
+                cmd::OK_DISPLAY_INFO
             }
             cmd::GET_CAPSET_INFO => {
                 let idx = le32(req, 24) as usize;
                 match self.capsets.get(idx).and_then(|&id| r.capset_info(id).map(|(v, s)| (id, v, s))) {
                     Some((id, ver, size)) => {
-                        let mut out = h.reply(cmd::OK_CAPSET_INFO);
                         for v in [id, ver, size, 0] {
-                            out.extend_from_slice(&v.to_le_bytes());
+                            body.extend_from_slice(&v.to_le_bytes());
                         }
-                        out
+                        cmd::OK_CAPSET_INFO
                     }
-                    None => h.reply(cmd::ERR_INVALID_PARAMETER),
+                    None => cmd::ERR_INVALID_PARAMETER,
                 }
             }
             cmd::GET_CAPSET => {
-                let data = r.capset(le32(req, 24), le32(req, 28));
-                let mut out = h.reply(cmd::OK_CAPSET);
-                out.extend_from_slice(&data);
-                out
+                body.extend_from_slice(&r.capset(le32(req, 24), le32(req, 28)));
+                cmd::OK_CAPSET
             }
             cmd::CTX_CREATE => {
                 let nlen = (le32(req, 24) as usize).min(64);
                 let init = le32(req, 28);
                 let name = req.get(32..32 + nlen).unwrap_or(&[]);
-                match r.context_create(h.ctx_id, name, init) {
-                    Ok(()) => ok(),
-                    Err(_) => h.reply(cmd::ERR_UNSPEC),
-                }
+                or(r.context_create(h.ctx_id, name, init), cmd::ERR_UNSPEC)
             }
             cmd::CTX_DESTROY => {
                 r.context_destroy(h.ctx_id);
-                ok()
+                ok
             }
             cmd::CTX_ATTACH_RESOURCE => {
                 r.ctx_attach_resource(h.ctx_id, le32(req, 24));
-                ok()
+                ok
             }
             cmd::CTX_DETACH_RESOURCE => {
                 r.ctx_detach_resource(h.ctx_id, le32(req, 24));
-                ok()
+                ok
             }
             cmd::RESOURCE_CREATE_2D => {
                 let (id, format, width, height) = (le32(req, 24), le32(req, 28), le32(req, 32), le32(req, 36));
@@ -489,7 +524,7 @@ impl Worker {
                     array_size: 1,
                     ..Default::default()
                 };
-                self.create(h, id, args, width, height, format)
+                self.create(id, args, width, height, format)
             }
             cmd::RESOURCE_CREATE_3D => {
                 let v: Vec<u32> = (0..11).map(|i| le32(req, 24 + i * 4)).collect();
@@ -506,7 +541,7 @@ impl Worker {
                     nr_samples: v[9],
                     flags: v[10],
                 };
-                self.create(h, v[0], args, v[4], v[5], v[2])
+                self.create(v[0], args, v[4], v[5], v[2])
             }
             cmd::RESOURCE_UNREF => {
                 let id = le32(req, 24);
@@ -520,31 +555,25 @@ impl Worker {
                     }
                 }
                 r.resource_unref(id);
-                ok()
+                ok
             }
             cmd::RESOURCE_ATTACH_BACKING => {
                 let (id, n) = (le32(req, 24), le32(req, 28));
                 match self.backing(req, 32, n) {
-                    Some(b) => match r.attach_backing(id, &b) {
-                        Ok(()) => ok(),
-                        Err(_) => h.reply(cmd::ERR_UNSPEC),
-                    },
-                    None => h.reply(cmd::ERR_INVALID_PARAMETER),
+                    Some(b) => or(r.attach_backing(id, b), cmd::ERR_UNSPEC),
+                    None => cmd::ERR_INVALID_PARAMETER,
                 }
             }
             cmd::RESOURCE_DETACH_BACKING => {
                 r.detach_backing(le32(req, 24));
-                ok()
+                ok
             }
             cmd::TRANSFER_TO_HOST_2D => {
                 let (x, y, w, hgt) = rect(req, 24);
                 let offset = le64(req, 40);
                 let id = le32(req, 48);
                 let b = Box3 { x, y, z: 0, w, h: hgt, d: 1 };
-                match r.transfer_write(id, 0, 0, 0, 0, b, offset) {
-                    Ok(()) => ok(),
-                    Err(_) => h.reply(cmd::ERR_INVALID_RESOURCE_ID),
-                }
+                or(r.transfer_write(id, 0, 0, 0, 0, b, offset), cmd::ERR_INVALID_RESOURCE_ID)
             }
             cmd::TRANSFER_TO_HOST_3D | cmd::TRANSFER_FROM_HOST_3D => {
                 let b = Box3 { x: le32(req, 24), y: le32(req, 28), z: le32(req, 32), w: le32(req, 36), h: le32(req, 40), d: le32(req, 44) };
@@ -555,48 +584,44 @@ impl Worker {
                 } else {
                     r.transfer_read(id, h.ctx_id, level, stride, layer_stride, b, offset, &[])
                 };
-                match res {
-                    Ok(()) => ok(),
-                    Err(_) => h.reply(cmd::ERR_INVALID_RESOURCE_ID),
-                }
+                or(res, cmd::ERR_INVALID_RESOURCE_ID)
             }
             cmd::SUBMIT_3D => {
                 let size = le32(req, 24) as usize;
-                // The command stream in place, not a copy of it.
-                let Some(buf) = req.get_mut(32..32 + size) else { return h.reply(cmd::ERR_INVALID_PARAMETER) };
-                match r.submit(h.ctx_id, buf) {
-                    Ok(()) => ok(),
-                    Err(_) => h.reply(cmd::ERR_UNSPEC),
-                }
+                // The command stream in place in the request buffer: one copy out of guest
+                // memory, as crosvm and QEMU make, so the renderer never decodes memory the guest
+                // can still change.
+                let Some(buf) = req.get_mut(32..32 + size) else { return cmd::ERR_INVALID_PARAMETER };
+                or(r.submit(h.ctx_id, buf), cmd::ERR_UNSPEC)
             }
             cmd::RESOURCE_CREATE_BLOB => {
                 let (id, blob_mem, blob_flags, n) = (le32(req, 24), le32(req, 28), le32(req, 32), le32(req, 36));
                 let (blob_id, size) = (le64(req, 40), le64(req, 48));
-                let Some(backing) = self.backing(req, 56, n) else { return h.reply(cmd::ERR_INVALID_PARAMETER) };
-                match r.create_blob(h.ctx_id, id, blob_mem, blob_flags, blob_id, size, &backing) {
+                let Some(backing) = self.backing(req, 56, n) else { return cmd::ERR_INVALID_PARAMETER };
+                match r.create_blob(h.ctx_id, id, blob_mem, blob_flags, blob_id, size, backing) {
                     Ok(()) => {
                         self.resources.insert(id, Resource::default());
-                        ok()
+                        ok
                     }
                     Err(e) => {
                         eprintln!("emu: gpu: create_blob {id}: {e}");
-                        h.reply(cmd::ERR_UNSPEC)
+                        cmd::ERR_UNSPEC
                     }
                 }
             }
-            cmd::RESOURCE_MAP_BLOB => self.map_blob(h, le32(req, 24), le64(req, 32)),
+            cmd::RESOURCE_MAP_BLOB => self.map_blob(le32(req, 24), le64(req, 32), body),
             cmd::RESOURCE_UNMAP_BLOB => {
                 let id = le32(req, 24);
                 if let Some((ipa, len)) = self.resources.get_mut(&id).and_then(|res| res.mapped.take()) {
                     let _ = Vm::unmap_raw(ipa, len);
                     let _ = r.unmap(id);
                 }
-                ok()
+                ok
             }
             cmd::SET_SCANOUT | cmd::SET_SCANOUT_BLOB => {
                 let scanout_id = le32(req, 40);
                 if scanout_id != 0 {
-                    return h.reply(cmd::ERR_INVALID_SCANOUT_ID);
+                    return cmd::ERR_INVALID_SCANOUT_ID;
                 }
                 let id = le32(req, 44);
                 self.scanout = if id == 0 {
@@ -614,63 +639,60 @@ impl Worker {
                     let (w, hgt, fmt) = res.map_or((self.cfg.width, self.cfg.height, 1), |r| (r.width, r.height, r.format));
                     Some(Scanout { resource: id, width: w, height: hgt, format: fmt, stride: w * 4 })
                 };
-                ok()
+                ok
             }
             cmd::RESOURCE_FLUSH => {
                 let id = le32(req, 40);
                 if let Some(s) = self.scanout.filter(|s| s.resource == id) {
                     self.present(s);
                 }
-                ok()
+                ok
             }
-            cmd::UPDATE_CURSOR | cmd::MOVE_CURSOR => ok(),
-            _ => h.reply(cmd::ERR_UNSPEC),
+            cmd::UPDATE_CURSOR | cmd::MOVE_CURSOR => ok,
+            _ => cmd::ERR_UNSPEC,
         }
     }
 
-    /// Every reply must echo the request's fence fields: the guest driver signals its fence
-    /// from the fence id in the response header.
-    fn create(&mut self, h: &Hdr, id: u32, args: ResourceCreateArgs, width: u32, height: u32, format: u32) -> Vec<u8> {
+    fn create(&mut self, id: u32, args: ResourceCreateArgs, width: u32, height: u32, format: u32) -> u32 {
         match self.cfg.renderer.resource_create(args, &[]) {
             Ok(()) => {
                 self.resources.insert(id, Resource { width, height, format, mapped: None });
-                h.reply(cmd::OK_NODATA)
+                cmd::OK_NODATA
             }
             Err(e) => {
                 eprintln!("emu: gpu: resource_create {id}: {e}");
-                h.reply(cmd::ERR_UNSPEC)
+                cmd::ERR_UNSPEC
             }
         }
     }
 
-    fn map_blob(&mut self, h: &Hdr, id: u32, offset: u64) -> Vec<u8> {
+    fn map_blob(&mut self, id: u32, offset: u64, body: &mut Vec<u8>) -> u32 {
         let r = &self.cfg.renderer;
-        let Some(res) = self.resources.get_mut(&id) else { return h.reply(cmd::ERR_INVALID_RESOURCE_ID) };
+        let Some(res) = self.resources.get_mut(&id) else { return cmd::ERR_INVALID_RESOURCE_ID };
         let host = match r.map(id) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("emu: gpu: map blob {id}: {e}");
-                return h.reply(cmd::ERR_UNSPEC);
+                return cmd::ERR_UNSPEC;
             }
         };
         let (base, size) = self.cfg.shm;
         let len = host.len().div_ceil(4096) * 4096;
         if offset.checked_add(len as u64).is_none_or(|end| end > size) {
             let _ = r.unmap(id);
-            return h.reply(cmd::ERR_INVALID_PARAMETER);
+            return cmd::ERR_INVALID_PARAMETER;
         }
         // `host` stays mapped until we unmap it (RESOURCE_UNMAP_BLOB / UNREF / teardown).
         let range = emu_gfxstream::page_range(host, len);
         if let Err(e) = Vm::map_raw(range, base + offset) {
             eprintln!("emu: gpu: hv_vm_map blob {id} at +{offset:#x} ({len:#x} bytes): {e}");
             let _ = r.unmap(id);
-            return h.reply(cmd::ERR_UNSPEC);
+            return cmd::ERR_UNSPEC;
         }
         res.mapped = Some((base + offset, len));
-        let mut out = h.reply(cmd::OK_MAP_INFO);
-        out.extend_from_slice(&(r.map_info(id) & 0x0f).to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out
+        body.extend_from_slice(&(r.map_info(id) & 0x0f).to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        cmd::OK_MAP_INFO
     }
 
     /// Reads the flushed scanout straight into the display's buffer: one copy, not a readback
@@ -682,5 +704,120 @@ impl Worker {
         self.cfg
             .display
             .present_with(s.width, s.height, stride, s.format, &mut |buf| renderer.read_into(s.resource, stride, b, buf).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtio::queue::tests::{Driver, RAM_BASE};
+
+    const NO_INTERRUPT: u16 = 1;
+
+    fn ram() -> GuestRam {
+        GuestRam::new(RAM_BASE, 0x40_0000).expect("ram")
+    }
+
+    #[test]
+    fn interrupts_follow_the_drivers_suppression() {
+        let mem = ram();
+        let (mut cd, mut kd) = (Driver::new(8), Driver::at(RAM_BASE + 0x8000, 8));
+        let (mut ctrl, mut cursor) = (Queue::new(cd.cfg, false), Queue::new(kd.cfg, false));
+        let complete = |drv: &mut Driver, q: &mut Queue| {
+            drv.push(&mem, &[(RAM_BASE + 0x2_0000, 24, true)]);
+            let c = q.pop(&mem).expect("pop").expect("chain");
+            q.add_used(&mem, c.head, 24).expect("used");
+        };
+        complete(&mut cd, &mut ctrl);
+        assert!(wants_interrupt(&mem, &mut [(true, Some(&mut ctrl)), (false, Some(&mut cursor))]), "interrupts on");
+        assert!(!wants_interrupt(&mem, &mut [(false, Some(&mut ctrl)), (false, None)]), "nothing used: no interrupt");
+        // The driver drains the control queue with callbacks disabled.
+        mem.write_u16(cd.cfg.avail, NO_INTERRUPT).expect("flags");
+        complete(&mut cd, &mut ctrl);
+        assert!(!wants_interrupt(&mem, &mut [(true, Some(&mut ctrl)), (false, Some(&mut cursor))]), "suppressed");
+        // A cursor completion still interrupts when its queue wants it.
+        complete(&mut kd, &mut cursor);
+        assert!(wants_interrupt(&mem, &mut [(true, Some(&mut ctrl)), (true, Some(&mut cursor))]));
+        mem.write_u16(kd.cfg.avail, NO_INTERRUPT).expect("flags");
+        assert!(!wants_interrupt(&mem, &mut [(true, Some(&mut ctrl)), (true, Some(&mut cursor))]), "both suppressed");
+        mem.write_u16(cd.cfg.avail, 0).expect("flags");
+        assert!(wants_interrupt(&mem, &mut [(true, Some(&mut ctrl)), (true, None)]), "re-enabled");
+    }
+
+    fn entries(list: &[(u64, u32)]) -> Vec<u8> {
+        let mut req = vec![0xAA; 8]; // whatever precedes the entries
+        for &(addr, len) in list {
+            req.extend_from_slice(&addr.to_le_bytes());
+            req.extend_from_slice(&len.to_le_bytes());
+            req.extend_from_slice(&[0; 4]);
+        }
+        req
+    }
+
+    #[test]
+    fn backing_entries_become_host_ranges_or_nothing() {
+        let mem = ram();
+        let req = entries(&[(RAM_BASE, 4096), (RAM_BASE + 0x3000, 100)]);
+        assert_eq!(backing(&mem, &req, 8, 2).map(|b| b.len()), Some(2));
+        assert_eq!(backing(&mem, &req, 8, 0).map(|b| b.len()), Some(0));
+        assert!(backing(&mem, &req, 8, 3).is_none(), "more entries than the request holds");
+        assert!(backing(&mem, &req, 8, u32::MAX).is_none(), "a huge count reserves nothing");
+        let outside = entries(&[(RAM_BASE, 4096), (RAM_BASE + 0x40_0000, 1)]);
+        assert!(backing(&mem, &outside, 8, 2).is_none(), "an entry outside guest RAM");
+        let wraps = entries(&[(u64::MAX - 10, 4096)]);
+        assert!(backing(&mem, &wraps, 8, 1).is_none());
+    }
+
+    /// One control command through the queue as the worker runs it (pop, read, parse, reply,
+    /// write, used), its reply built in a fresh Vec per command (before) vs a header on the
+    /// stack and a reused body buffer (now). Interleaved, median of 7.
+    ///     cargo test --release -p emu-vmm gpu_command_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn gpu_command_cost() {
+        const N: u32 = 200_000;
+        let mem = ram();
+        let (req_at, resp_at) = (RAM_BASE + 0x2_0000, RAM_BASE + 0x2_1000);
+        let mut hdr = [0u8; 24];
+        hdr[..4].copy_from_slice(&cmd::CTX_ATTACH_RESOURCE.to_le_bytes());
+        hdr[4..8].copy_from_slice(&FLAG_FENCE.to_le_bytes());
+        mem.write(req_at, &hdr).expect("req");
+        let run = |reuse: bool| {
+            let mut drv = Driver::new(256);
+            let mut q = Queue::new(drv.cfg, false);
+            let (mut req, mut body) = (Vec::new(), Vec::<u8>::with_capacity(64));
+            let t = std::time::Instant::now();
+            for _ in 0..N {
+                drv.push(&mem, &[(req_at, 32, false), (resp_at, 24, true)]);
+                let c = q.pop(&mem).expect("pop").expect("chain");
+                c.read_all_into(&mem, 32 << 20, &mut req).expect("read");
+                let h = Hdr::parse(&req).expect("hdr");
+                let len = if reuse {
+                    // Now: the header on the stack, the (empty) body in a reused buffer.
+                    body.clear();
+                    let typ = std::hint::black_box(cmd::OK_NODATA);
+                    c.write_parts(&mem, &[&h.reply(typ), &body]).expect("write")
+                } else {
+                    // Before: every reply a fresh Vec.
+                    let mut out = Vec::with_capacity(24);
+                    out.extend_from_slice(&cmd::OK_NODATA.to_le_bytes());
+                    out.extend_from_slice(&(h.flags & (FLAG_FENCE | FLAG_RING_IDX)).to_le_bytes());
+                    out.extend_from_slice(&h.fence_id.to_le_bytes());
+                    out.extend_from_slice(&h.ctx_id.to_le_bytes());
+                    out.extend_from_slice(&[h.ring_idx, 0, 0, 0]);
+                    c.write_all(&mem, &std::hint::black_box(out)).expect("write")
+                };
+                q.add_used(&mem, c.head, len).expect("used");
+            }
+            t.elapsed().as_secs_f64() * 1e9 / f64::from(N)
+        };
+        let (mut fresh, mut reused) = (Vec::new(), Vec::new());
+        for _ in 0..7 {
+            fresh.push(run(false));
+            reused.push(run(true));
+        }
+        fresh.sort_by(f64::total_cmp);
+        reused.sort_by(f64::total_cmp);
+        println!("gpu command through the queue: {:.0} ns (reply in a fresh Vec) -> {:.0} ns (header on the stack)", fresh[3], reused[3]);
     }
 }

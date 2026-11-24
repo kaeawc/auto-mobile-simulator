@@ -30,6 +30,15 @@ pub fn opt_u64(p: &Value, key: &str) -> Option<u64> {
     p.get(key).and_then(Value::as_u64)
 }
 
+/// `boot_many`'s `concurrency`: at least 1; by default a quarter of the host's CPUs, at least 2.
+pub fn concurrency(p: &Value) -> Result<usize, String> {
+    match opt_u64(p, "concurrency") {
+        Some(0) => Err("concurrency must be at least 1".into()),
+        Some(k) => Ok(k as usize),
+        None => Ok(crate::settle::default_concurrency(std::thread::available_parallelism().map_or(4, usize::from))),
+    }
+}
+
 // Only iOS methods read this so far.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn need_bool(p: &Value, key: &str) -> Result<bool, String> {
@@ -205,7 +214,12 @@ pub fn screenshot_result(frame: &Frame, p: &Value) -> Result<Value, String> {
 pub fn png_result(width: u32, height: u32, png: &[u8], p: &Value) -> Result<Value, String> {
     match str_param(p, "path") {
         Some(path) => std::fs::write(path, png).map(|()| json!({"path": path, "width": width, "height": height})).map_err(err),
-        None => Ok(json!({"width": width, "height": height, "png": base64::engine::general_purpose::STANDARD.encode(png)})),
+        None => {
+            // The base64 text moves into the result; `json!` would copy it.
+            let mut result = json!({"width": width, "height": height});
+            result["png"] = Value::String(base64::engine::general_purpose::STANDARD.encode(png));
+            Ok(result)
+        }
     }
 }
 

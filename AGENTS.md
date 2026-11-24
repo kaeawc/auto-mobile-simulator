@@ -82,6 +82,8 @@ cargo run -p emu -- -avd <name> -show-kernel -verbose
 adb -s emulator-5554 shell getprop sys.boot_completed      # after VMM changes, boot an AVD and check
 SIMEE_E2E_AVD=<avd> cargo nextest run -p simee --test e2e_android
 scripts/automobile-harness-android.sh emulator-5554
+# Many devices, both platforms: one private AutoMobile daemon, one session per device
+scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
 ```
 
 ## Map
@@ -153,7 +155,9 @@ scripts/automobile-harness-android.sh emulator-5554
   icons), `keys.rs` (host keys → HID), `view.rs`, `main.rs` (state, actions, poll, tests).
   Headless `--snap` needs a debug build (release builds lack Rune's tooling feature); scenes:
   demo, android, foldable, watch, tv, empty. On Linux it renders with Mesa's lavapipe.
-- `scripts/` — `parity.sh`, `automobile-harness.sh`, `pf-shape.sh` (pf/dummynet, needs sudo);
+- `scripts/` — `parity.sh`, `automobile-harness.sh`, `automobile-farm.sh` (every device through
+  one private AutoMobile daemon; `automobile-daemon.sh` starts, joins and stops it, and the
+  harnesses join it through `AM_DAEMON_ENV`), `pf-shape.sh` (pf/dummynet, needs sudo);
   Android: `sign-run.sh` (the cargo runner: hypervisor entitlement), `sdk-shim.sh` (SDK overlay
   whose `emulator` is simee), `automobile-harness-android.sh`, `android-bench.sh`,
   `inspect-image.py` (what a system image expects of the board, unpacked without booting: fstab,

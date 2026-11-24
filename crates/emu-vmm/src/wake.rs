@@ -132,7 +132,11 @@ fn action(old: u32) -> Action {
     }
 }
 
+/// One vCPU's word and wait, alone in its cache line (128 bytes on Apple silicon): its thread
+/// writes the word twice per exit, and neighbours sharing the line would bounce it between
+/// cores on every exit of every vCPU.
 #[derive(Default)]
+#[repr(align(128))]
 struct Slot {
     word: AtomicU32,
     wait: Mutex<()>,
@@ -776,5 +780,41 @@ mod tests {
     #[test]
     fn stress_targeted_kicks_between_vcpus() {
         stress(4, 2, 1500);
+    }
+
+    /// The per-exit cost of publishing where a vCPU is: N vCPU threads each looping
+    /// `enter`/`leave` on their own slot, no interrupt sources. Neighbouring slots sharing a
+    /// cache line show up as a per-exit cost that grows with N.
+    /// `cargo test --release -p emu-vmm exit_publish_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn exit_publish_cost() {
+        const ITERS: u32 = 2_000_000;
+        for cpus in [1usize, 2, 4, 8] {
+            let w = wakers(cpus);
+            for i in 0..cpus {
+                w.online(i);
+            }
+            let barrier = std::sync::Barrier::new(cpus);
+            let per: Vec<f64> = std::thread::scope(|s| {
+                let hs: Vec<_> = (0..cpus)
+                    .map(|i| {
+                        let (w, barrier) = (&w, &barrier);
+                        s.spawn(move || {
+                            barrier.wait();
+                            let t = Instant::now();
+                            for _ in 0..ITERS {
+                                w.enter(i);
+                                w.leave(i);
+                            }
+                            t.elapsed().as_nanos() as f64 / f64::from(ITERS)
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().expect("thread")).collect()
+            });
+            let worst = per.iter().copied().fold(0.0, f64::max);
+            println!("exit_publish {cpus} vCPUs: {worst:.1} ns per enter+leave (slowest thread)");
+        }
     }
 }

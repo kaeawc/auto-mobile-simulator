@@ -2,7 +2,9 @@
 //!
 //! The guest's `qemu-props` walks `/sys/class/virtio-ports`, reads each port's name and sets
 //! `vendor.qemu.vport.<name>=/dev/vportNpM`; HALs open their port by that property (the radio
-//! HAL's `modem`, the GNSS HAL's `gnss`, ...). Port 0 is a plain console port.
+//! HAL's `modem`, the GNSS HAL's `gnss`, ...). Unnamed ports are console ports: the guest makes
+//! each one the next `/dev/hvcN` in port order (port 0 is `hvc0`; the next unnamed one `hvc1`,
+//! where the ranchu images' `goldfish-logcat` writes `logcat -f /dev/hvc1`, as on stock's board).
 //!
 //! Queues: port 0 rx/tx are 0/1, control rx/tx are 2/3, port n ≥ 1 uses 2n+2 / 2n+3. Control
 //! messages are `{ id: u32, event: u16, value: u16 }` plus a payload for PORT_NAME. Handshake:
@@ -11,6 +13,7 @@
 //! The guest reports its own opens with PORT_OPEN; data for a port the guest hasn't opened is
 //! held until it does (the driver would discard it).
 use std::collections::VecDeque;
+use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
@@ -50,8 +53,70 @@ impl PortBackend for Sink {
     }
 }
 
+/// Writes guest output to a [`Spool`] (a log file, stdout), sending nothing back. The worker
+/// only queues it: a slow or stuck destination (a full pipe nobody reads) drops output instead of
+/// stalling the worker, which also serves the other ports (the radio HAL's `modem`).
+pub struct Writer(pub Spool);
+
+impl PortBackend for Writer {
+    fn guest_data(&mut self, data: &[u8]) -> Vec<u8> {
+        self.0.send(data);
+        Vec::new()
+    }
+}
+
+/// A bounded queue in front of a writer, drained by its own thread. [`Spool::send`] never
+/// blocks: when `depth` chunks are already waiting it drops the chunk and counts its bytes; the
+/// writer thread notes the loss in the stream (`[emu: N bytes dropped ...]`) before the next
+/// chunk it writes. Clones share the queue; the thread ends when every clone is gone.
+#[derive(Clone)]
+pub struct Spool {
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    /// Bytes dropped so far.
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// Dropped but not yet noted in the stream.
+    unreported: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Spool {
+    pub fn new(name: &str, mut out: Box<dyn std::io::Write + Send>, depth: usize) -> std::io::Result<Spool> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(depth);
+        let spool = Spool { tx, dropped: Default::default(), unreported: Default::default() };
+        let unreported = spool.unreported.clone();
+        std::thread::Builder::new().name(name.into()).spawn(move || {
+            for chunk in rx {
+                let lost = unreported.swap(0, Relaxed);
+                if lost > 0 {
+                    let _ = write!(out, "\n[emu: {lost} bytes dropped: this output fell behind]\n");
+                }
+                // A failed write (a full disk, a closed pipe) loses that chunk, nothing more.
+                let _ = out.write_all(&chunk).and_then(|()| out.flush());
+            }
+        })?;
+        Ok(spool)
+    }
+
+    /// Queues `data`, or drops it when the queue is full or the writer has gone.
+    pub fn send(&self, data: &[u8]) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if data.is_empty() {
+            return;
+        }
+        if self.tx.try_send(data.to_vec()).is_err() {
+            self.dropped.fetch_add(data.len() as u64, Relaxed);
+            self.unreported.fetch_add(data.len() as u64, Relaxed);
+        }
+    }
+
+    /// Bytes dropped so far because the writer fell behind.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 pub struct PortSpec {
-    /// Empty for port 0 (the console port).
+    /// Empty for a console port (`hvcN`); else the name the guest finds it by.
     pub name: String,
     pub backend: Box<dyn PortBackend>,
 }
@@ -267,8 +332,8 @@ impl Worker {
             }
             ctl::PORT_READY if value == 1 => {
                 let Some(p) = self.ports.get(id as usize) else { return };
-                if id == 0 {
-                    self.ctl_out.push_back(ctl_msg(0, ctl::CONSOLE_PORT, 1, &[]));
+                if p.name.is_empty() {
+                    self.ctl_out.push_back(ctl_msg(id, ctl::CONSOLE_PORT, 1, &[]));
                 } else {
                     let name = p.name.clone();
                     self.ctl_out.push_back(ctl_msg(id, ctl::PORT_NAME, 1, name.as_bytes()));
@@ -465,6 +530,124 @@ mod tests {
             got.extend(g.recv(rx_queue(1)));
         }
         assert_eq!(got, big);
+    }
+
+    /// A `Write` the test can read back.
+    #[derive(Clone, Default)]
+    struct Shared(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Shared {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("buf").extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn unnamed_ports_after_the_first_are_console_ports_too() {
+        // The board's layout: console (hvc0), modem, then logcat's console (hvc1).
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x40_0000).expect("ram"));
+        let logcat = Shared::default();
+        let (mut dev, _host) = Console::new(vec![
+            PortSpec { name: String::new(), backend: Box::new(Sink) },
+            PortSpec { name: "modem".into(), backend: Box::new(Sink) },
+            PortSpec {
+                name: String::new(),
+                backend: Box::new(Writer(Spool::new("test-logcat", Box::new(logcat.clone()), 64).expect("spool"))),
+            },
+        ]);
+        assert_eq!(dev.num_queues(), 8);
+        let mut q: Vec<Driver> = (0..8).map(|i| Driver::at(RAM_BASE + 0x1000 + i * 0x2000, 16)).collect();
+        for b in 0..8u64 {
+            q[CTL_RX].push(&mem, &[(BUFS + b * 64, 64, true)]);
+        }
+        let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+        dev.activate(Activation { mem: mem.clone(), irq, queues: q.iter().map(|d| Some(d.cfg)).collect(), features: F_MULTIPORT })
+            .expect("activate");
+        let mut tx = RAM_BASE + 0x20_0000;
+        let mut send = |q: &mut Driver, dev: &mut Console, queue: usize, bytes: &[u8]| {
+            mem.write(tx, bytes).expect("tx");
+            q.push(&mem, &[(tx, bytes.len() as u32, false)]);
+            tx += 0x100;
+            dev.notify(queue as u16);
+        };
+        send(&mut q[CTL_TX], &mut dev, CTL_TX, &ctl_msg(2, ctl::PORT_READY, 1, &[]));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while q[CTL_RX].used_idx(&mem) < 2 {
+            assert!(Instant::now() < deadline, "no reply to PORT_READY");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let read = |i: u16| {
+            let (id, len) = q[CTL_RX].used(&mem, i);
+            let mut b = vec![0u8; len as usize];
+            mem.read(BUFS + u64::from(id) % 8 * 64, &mut b).expect("rx");
+            b
+        };
+        assert_eq!(read(0), ctl_msg(2, ctl::CONSOLE_PORT, 1, &[]), "a console port, not a named one");
+        assert_eq!(read(1), ctl_msg(2, ctl::PORT_OPEN, 1, &[]));
+        send(&mut q[tx_queue(2)], &mut dev, tx_queue(2), b"11-23 19:35:00.000 I/ActivityManager: Start proc\n");
+        while logcat.0.lock().expect("buf").is_empty() {
+            assert!(Instant::now() < deadline, "logcat output never arrived");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(*logcat.0.lock().expect("buf"), b"11-23 19:35:00.000 I/ActivityManager: Start proc\n");
+    }
+
+    /// A `Write` that blocks until the test opens its gate (a pipe nobody reads).
+    struct Gated(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>, Shared);
+
+    impl std::io::Write for Gated {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let (open, cv) = &*self.0;
+            let mut g = open.lock().expect("gate");
+            while !*g {
+                g = cv.wait(g).expect("gate");
+            }
+            self.1.write(b)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_stuck_writer_drops_output_instead_of_blocking_the_port() {
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let out = Shared::default();
+        let mut port = Writer(Spool::new("test-stuck", Box::new(Gated(gate.clone(), out.clone())), 4).expect("spool"));
+        // The writer thread takes one chunk and blocks on it; four more fill the queue; the
+        // rest are dropped and counted. None of it waits.
+        let t = Instant::now();
+        for _ in 0..100 {
+            assert!(port.guest_data(&[b'#'; 10]).is_empty());
+        }
+        assert!(t.elapsed() < Duration::from_secs(1), "guest_data blocked: {:?}", t.elapsed());
+        let dropped = port.0.dropped();
+        assert!([950, 960].contains(&dropped), "four queued, maybe one more taken: {dropped}");
+        *gate.0.lock().expect("gate") = true;
+        gate.1.notify_all();
+        let kept = |b: &[u8]| b.iter().filter(|&&c| c == b'#').count() as u64;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while kept(&out.0.lock().expect("buf")) < 1000 - dropped {
+            assert!(Instant::now() < deadline, "the queued chunks never drained");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Drained: the next chunk goes through.
+        port.guest_data(b"after\n");
+        while !out.0.lock().expect("buf").ends_with(b"after\n") {
+            assert!(Instant::now() < deadline, "the spool never drained");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let text = String::from_utf8(out.0.lock().expect("buf").clone()).expect("utf8");
+        // Every dropped byte is noted (in one marker, or two when the drops straddled a chunk the
+        // writer had already taken).
+        let noted: u64 =
+            text.split("[emu: ").skip(1).map(|s| s.split(' ').next().and_then(|n| n.parse::<u64>().ok()).expect("count")).sum();
+        assert_eq!(noted, dropped, "{text}");
+        assert_eq!(kept(text.as_bytes()), 1000 - dropped);
     }
 
     #[test]

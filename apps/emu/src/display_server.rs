@@ -1,8 +1,8 @@
 //! Live display and input for local front ends (the desktop app) over a unix socket at
 //! `<avd>/simee/display.sock`. The protocol (frame records one way, input lines the other) is
 //! `sim_core::stream`, shared with the clients that read it. A frame goes out when the guest posted
-//! a new one, at most every `MIN_INTERVAL`, read back once however many clients and screenshots
-//! want it ([`FrameStore::latest`]).
+//! a new one, at most every [`DEFAULT_INTERVAL`] (or what the client asked for with `fps <n>`),
+//! read back once however many clients and screenshots want it ([`FrameStore::latest`]).
 //!
 //! A client that sends `shm` gets its frames through a shared ring: a file in `<avd>/simee/`
 //! this process maps, writes each frame into (downscaled straight into its slot), and announces
@@ -22,7 +22,12 @@ use sim_core::gesture::Phase;
 use sim_core::pixels::{downscale_factor, downscale_into, downscaled_size};
 use sim_core::stream::{FrameHeader, Input, Record, ring};
 
-const MIN_INTERVAL: Duration = Duration::from_millis(33);
+/// The shortest time between two frames to one client unless it asks otherwise (`fps <n>`):
+/// 16 ms, so 60 Hz content goes out frame for frame. A frame posted after a quiet spell goes out
+/// at once; under a steady stream each goes out at most one interval after the last.
+const DEFAULT_INTERVAL: Duration = Duration::from_millis(16);
+/// The rates a client may ask for with `fps <n>`.
+const FPS: std::ops::RangeInclusive<u32> = 1..=240;
 /// Slots per ring: a client reading a frame within two frame intervals never races the writer.
 const RING_SLOTS: u32 = 3;
 
@@ -82,6 +87,26 @@ struct Wants {
     max_width: AtomicU32,
     shared: AtomicBool,
     done: AtomicBool,
+    /// Frames per second asked for with `fps <n>`; 0 for [`DEFAULT_INTERVAL`].
+    fps: AtomicU32,
+}
+
+impl Wants {
+    fn interval(&self) -> Duration {
+        match self.fps.load(Ordering::Relaxed) {
+            0 => DEFAULT_INTERVAL,
+            fps => Duration::from_secs(1) / fps,
+        }
+    }
+}
+
+/// `fps <n>`: the client's frame rate cap, an optional line ahead of or after `hello` (servers
+/// that don't know it ignore it, as they do any line they can't parse). `n` outside [`FPS`] is
+/// ignored. Not in `sim_core::stream` yet, so only this server knows it.
+fn parse_fps(line: &str) -> Option<u32> {
+    let mut w = line.split_whitespace();
+    let (Some("fps"), Some(n), None) = (w.next(), w.next(), w.next()) else { return None };
+    n.parse().ok().filter(|n| FPS.contains(n))
 }
 
 fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<emu_vmm::Inputs>>>, stop: Arc<AtomicBool>, dir: PathBuf) {
@@ -92,6 +117,10 @@ fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<e
     let mut finger_down = false;
     for line in BufReader::new(conn).lines() {
         let Ok(line) = line else { break };
+        if let Some(fps) = parse_fps(&line) {
+            wants.fps.store(fps, Ordering::Relaxed);
+            continue;
+        }
         let Some(input) = Input::parse(&line) else { continue };
         let g = inputs.lock().unwrap_or_else(|e| e.into_inner());
         match (input, g.as_ref()) {
@@ -152,24 +181,30 @@ enum Out {
 
 fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &AtomicBool, dir: &Path) {
     let mut sent = 0u64;
-    let mut last = Instant::now() - MIN_INTERVAL;
+    // Pacing is a GCRA (a token bucket kept as one instant): `tat` is when the next frame would
+    // be due at exactly one per interval; a frame may go up to half an interval before that.
+    // The long-run rate stays at most one per interval, while a frame that comes in a little
+    // early after a late one (vsync jitter) isn't held back. None: the next goes out at once.
+    let mut tat: Option<Instant> = None;
     // For socket frames: one buffer for the stream's life.
     let mut rows = Vec::new();
     let mut ring: Option<Ring> = None;
     let mut ring_failed = false;
     let mut stats = std::env::var_os("EMU_FRAME_STATS").is_some().then(Stats::default);
     while !wants.done.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
-        // At most one frame per MIN_INTERVAL; then wait for a new one (woken by the frame, or
-        // every 100 ms to notice the client or the emulator going away).
-        let since = last.elapsed();
-        if since < MIN_INTERVAL {
-            std::thread::sleep(MIN_INTERVAL - since);
-        }
+        // Wait for a new frame (woken by the frame, or every 100 ms to notice the client or the
+        // emulator going away); then, if it's early, wait until it may go and send the newest by
+        // then. A client that was idle gets it at once.
         let n = display.wait_newer(sent, Duration::from_millis(100));
         let mw = wants.max_width.load(Ordering::Relaxed);
         if mw == 0 || n == sent {
             continue;
         }
+        let interval = wants.interval();
+        if let Some(left) = tat.and_then(|t| t.checked_sub(interval / 2)).and_then(|t| t.checked_duration_since(Instant::now())) {
+            std::thread::sleep(left);
+        }
+        let n = display.frames().max(n);
         let started = Instant::now();
         let frame = if wants.shared.load(Ordering::Relaxed) && !ring_failed {
             shared_frame(display, mw, n, &mut ring, dir).unwrap_or_else(|e| {
@@ -183,7 +218,7 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
         };
         let Some(frame) = frame else {
             // Nothing readable: try again after the interval, not in a spin.
-            last = Instant::now();
+            tat = Some(Instant::now() + interval);
             continue;
         };
         let captured = started.elapsed();
@@ -207,8 +242,12 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
         if result.is_err() {
             break;
         }
-        last = Instant::now();
-        if let Some(line) = stats.as_mut().and_then(|s| s.add(&frame, captured, last - started - captured)) {
+        let done = Instant::now();
+        // From when this frame was due (or taken, if later), not when it finished going out: a
+        // capture's time and sleep overshoot then don't add up frame after frame (which made a
+        // steady 60 Hz stream lag further each frame until one was dropped).
+        tat = Some(tat.map_or(started, |t| t.max(started)) + interval);
+        if let Some(line) = stats.as_mut().and_then(|s| s.add(&frame, captured, done - started - captured)) {
             eprintln!("emu: display: {line}");
         }
     }
@@ -838,12 +877,99 @@ mod tests {
         lines
     }
 
+    /// The guest posting steadily every `cadence` (an animation, a scroll), `runs` frames, a client
+    /// reading as fast as it can: post -> client has the pixels for each frame it got, and how
+    /// many of the posted frames reached it. `before` lines go to the server ahead of `hello`.
+    fn cadence_bench(cases: &[(u32, u32, u32, bool)], runs: usize, cadence: Duration, before: &[&str]) -> Vec<String> {
+        let mut lines = Vec::new();
+        for &(w, h, max_width, shared) in cases {
+            let src = pixels(w, h, 0);
+            let rig = Rig::with(
+                &format!("cad{w}{max_width}{shared}"),
+                None,
+                Some(Box::new(move |_, _, buf| {
+                    buf.copy_from_slice(&src);
+                    true
+                })),
+            );
+            let mut d = Display::connect(&rig.dir).expect("connect");
+            let mut raw = d.try_clone().expect("clone");
+            for line in before {
+                raw.write_all(format!("{line}\n").as_bytes()).expect("line");
+            }
+            if shared {
+                d.request_shared().expect("shm");
+            }
+            d.send(&Input::Hello { max_width }).expect("hello");
+            let r = d.try_clone().expect("clone");
+            r.set_read_timeout(Some(Duration::from_secs(1))).expect("timeout");
+            std::thread::sleep(Duration::from_millis(50));
+            let posts: Arc<Mutex<Vec<Instant>>> = Arc::default();
+            let (p, store) = (posts.clone(), rig.store.clone());
+            let poster = std::thread::spawn(move || {
+                let start = Instant::now();
+                for n in 1..=runs as u32 {
+                    // Steady posts, as a guest's vsync would: on the grid, not drifting.
+                    if let Some(wait) = (start + cadence * n).checked_duration_since(Instant::now()) {
+                        std::thread::sleep(wait);
+                    }
+                    p.lock().expect("posts").push(Instant::now());
+                    store.posted(w, h);
+                }
+            });
+            let mut frames = Frames::new(r);
+            let mut lat = Vec::new();
+            while let Ok((header, px)) = frames.next_frame() {
+                let at = Instant::now();
+                std::hint::black_box(px);
+                if let Some(t) = posts.lock().expect("posts").get(header.frame as usize - 1) {
+                    lat.push(ms(at.duration_since(*t)));
+                }
+                if header.frame as usize >= runs {
+                    break;
+                }
+            }
+            poster.join().expect("poster");
+            let way = if shared { "ring  " } else { "socket" };
+            let got = lat.len();
+            let all = if std::env::var_os("SAMPLES").is_some() { format!(" {lat:.1?}") } else { String::new() };
+            lines.push(format!(
+                "{w}x{h} hello {max_width} {way} posts every {} ms: {got}/{runs} frames delivered, post -> client has pixels median {:.2} ms, max {:.2} ms{all}",
+                cadence.as_millis(),
+                median(lat.clone()),
+                lat.iter().copied().fold(0.0, f64::max),
+            ));
+        }
+        lines
+    }
+
+    #[test]
+    fn clients_can_set_their_frame_rate() {
+        assert_eq!(parse_fps("fps 120"), Some(120));
+        assert_eq!(parse_fps(" fps  30 "), Some(30));
+        for bad in ["fps 0", "fps 241", "fps", "fps 60 1", "fps x", "hello 60"] {
+            assert_eq!(parse_fps(bad), None, "{bad}");
+        }
+        let w = Wants::default();
+        assert_eq!(w.interval(), DEFAULT_INTERVAL);
+        w.fps.store(120, Ordering::Relaxed);
+        assert_eq!(w.interval(), Duration::from_secs(1) / 120);
+        // A client asking for 10 fps of 60 Hz content gets about every sixth frame, the newest
+        // each time; the first goes out at once. The line isn't `sim_core::stream`'s, so a
+        // stream that doesn't send it is unchanged.
+        let lines = cadence_bench(&[(16, 8, 8, true)], 30, Duration::from_millis(16), &["fps 10"]);
+        let got: usize = lines[0].split('/').next().and_then(|s| s.rsplit(' ').next()).and_then(|n| n.parse().ok()).expect("count");
+        assert!((2..=8).contains(&got), "{lines:?}");
+    }
+
     #[test]
     fn the_benchmarks_run() {
         let lines = transport_bench(&[scratch("bench")], &[(8, 4)], 3, Duration::ZERO);
         assert!(lines.len() == 1 && lines[0].contains("8x4"), "{lines:?}");
-        let lines = latency_bench(&[(16, 8, 8, true), (16, 8, 8, false)], 3, MIN_INTERVAL, true);
+        let lines = latency_bench(&[(16, 8, 8, true), (16, 8, 8, false)], 3, DEFAULT_INTERVAL, true);
         assert!(lines.len() == 2 && lines.iter().all(|l| l.contains("median of 3")), "{lines:?}");
+        let lines = cadence_bench(&[(16, 8, 8, true)], 3, Duration::from_millis(16), &[]);
+        assert!(lines.len() == 1 && lines[0].contains("/3 frames delivered"), "{lines:?}");
     }
 
     /// Moving one frame's RGBA rows from the emulator to a client, on the socket and through the
@@ -878,6 +1004,10 @@ mod tests {
             }
         }
         for l in latency_bench(&cases, 11, Duration::from_millis(40), std::env::var_os("SAMPLES").is_some()) {
+            println!("{l}");
+        }
+        // A steady 16 ms post cadence (60 Hz content): latency and frames delivered.
+        for l in cadence_bench(&cases, 120, Duration::from_millis(16), &[]) {
             println!("{l}");
         }
     }

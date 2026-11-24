@@ -117,8 +117,108 @@ pub enum Kind {
 
 enum Msg {
     Events(Vec<InputEvent>),
+    /// One finger on slot 0 at device pixels, down or lifted; the worker turns it into events
+    /// (see [`TouchState`]).
+    Touch {
+        x: i32,
+        y: i32,
+        down: bool,
+    },
     Kick,
     Stop,
+}
+
+/// A batch of events and how far into it the guest has taken.
+struct Batch {
+    events: Vec<InputEvent>,
+    sent: usize,
+    /// A move of the finger from this position (the one before it), which a newer move may
+    /// replace while none of it has gone out.
+    move_from: Option<(i32, i32)>,
+}
+
+/// The finger as the queued events leave it, so a move carries only what changed. Multi-touch
+/// protocol B is stateful (the kernel keeps each slot's values and drops repeats, and the stock
+/// emulator's `_mts_pointer_move` sends only the changed coordinates), so a move needs only the
+/// axes that moved: the guest's evdev readers see exactly what the full set produced.
+#[derive(Default)]
+struct TouchState {
+    /// The kernel's slot 0 holds what this state says: false until a down sets it all, and
+    /// again after raw events (`event send`) may have changed it.
+    known: bool,
+    down: bool,
+    x: i32,
+    y: i32,
+}
+
+impl TouchState {
+    /// The batch for a touch: the full set on a down (or when the state isn't known), the axes
+    /// that changed on a move (none when nothing did), the lift on an up.
+    fn batch(&mut self, x: i32, y: i32, down: bool) -> Option<Batch> {
+        let batch = |events: Vec<InputEvent>, move_from| Some(Batch { events, sent: 0, move_from });
+        if !down {
+            let mut ev = Vec::with_capacity(4);
+            if !self.known {
+                ev.push(InputEvent::new(EV_ABS, ABS_MT_SLOT, 0));
+            }
+            ev.extend([InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, -1), InputEvent::new(EV_KEY, BTN_TOUCH, 0), InputEvent::syn()]);
+            self.down = false;
+            return batch(ev, None);
+        }
+        if self.known && self.down {
+            let from = (self.x, self.y);
+            (self.x, self.y) = (x, y);
+            let ev = move_events(from, (x, y));
+            return if ev.is_empty() { None } else { batch(ev, Some(from)) };
+        }
+        (self.known, self.down, self.x, self.y) = (true, true, x, y);
+        batch(
+            vec![
+                InputEvent::new(EV_ABS, ABS_MT_SLOT, 0),
+                InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, 1),
+                InputEvent::new(EV_ABS, ABS_MT_POSITION_X, x),
+                InputEvent::new(EV_ABS, ABS_MT_POSITION_Y, y),
+                InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 0x81),
+                InputEvent::new(EV_KEY, BTN_TOUCH, 1),
+                InputEvent::new(EV_ABS, ABS_X, x),
+                InputEvent::new(EV_ABS, ABS_Y, y),
+                InputEvent::syn(),
+            ],
+            None,
+        )
+    }
+
+    /// Raw events for this device: if they set any axis or `BTN_TOUCH`, the kernel's slot state
+    /// may differ from this one, so the next touch sends the full set.
+    fn raw(&mut self, events: &[InputEvent]) {
+        if events.iter().any(|e| e.typ == EV_ABS || (e.typ == EV_KEY && e.code == BTN_TOUCH)) {
+            self.known = false;
+        }
+    }
+}
+
+/// What a move from `from` to `to` sends: the multi-touch position and the single-touch axes
+/// that changed, then `SYN_REPORT`; nothing when neither did.
+fn move_events(from: (i32, i32), to: (i32, i32)) -> Vec<InputEvent> {
+    let (dx, dy) = (from.0 != to.0, from.1 != to.1);
+    if !dx && !dy {
+        return Vec::new();
+    }
+    let mut ev = Vec::with_capacity(5);
+    if dx {
+        ev.push(InputEvent::new(EV_ABS, ABS_MT_POSITION_X, to.0));
+    }
+    if dy {
+        ev.push(InputEvent::new(EV_ABS, ABS_MT_POSITION_Y, to.1));
+    }
+    if dx {
+        ev.push(InputEvent::new(EV_ABS, ABS_X, to.0));
+    }
+    if dy {
+        ev.push(InputEvent::new(EV_ABS, ABS_Y, to.1));
+    }
+    ev.push(InputEvent::syn());
+    ev
 }
 
 /// Sends events to one virtio-input device; cheap to clone, usable from any thread.
@@ -134,24 +234,11 @@ impl InputHandle {
         let _ = self.tx.send(Msg::Events(events));
     }
 
-    /// Single-finger touch at device pixels; `down=false` lifts the finger.
+    /// Single-finger touch at device pixels; `down=false` lifts the finger. With the finger
+    /// already down this is a move: it sends only the axes that changed, and replaces an older
+    /// move the guest hasn't started taking yet (downs, ups and keys are never dropped).
     pub fn touch(&self, x: i32, y: i32, down: bool) {
-        let mut ev = vec![InputEvent::new(EV_ABS, ABS_MT_SLOT, 0)];
-        if down {
-            ev.extend([
-                InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, 1),
-                InputEvent::new(EV_ABS, ABS_MT_POSITION_X, x),
-                InputEvent::new(EV_ABS, ABS_MT_POSITION_Y, y),
-                InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 0x81),
-                InputEvent::new(EV_KEY, BTN_TOUCH, 1),
-                InputEvent::new(EV_ABS, ABS_X, x),
-                InputEvent::new(EV_ABS, ABS_Y, y),
-            ]);
-        } else {
-            ev.extend([InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, -1), InputEvent::new(EV_KEY, BTN_TOUCH, 0)]);
-        }
-        ev.push(InputEvent::syn());
-        self.send(ev);
+        let _ = self.tx.send(Msg::Touch { x, y, down });
     }
 
     /// Press and release a key (Linux keycode).
@@ -191,9 +278,14 @@ impl Input {
     /// as the host sent them: what an input would deliver, for tests and diagnostics.
     pub fn take_queued(&self) -> Vec<Vec<InputEvent>> {
         let Some(rx) = &self.rx else { return Vec::new() };
+        let mut touch = TouchState::default();
         rx.try_iter()
             .filter_map(|m| match m {
-                Msg::Events(e) => Some(e),
+                Msg::Events(e) => {
+                    touch.raw(&e);
+                    Some(e)
+                }
+                Msg::Touch { x, y, down } => touch.batch(x, y, down).map(|b| b.events),
                 Msg::Kick | Msg::Stop => None,
             })
             .collect()
@@ -329,27 +421,8 @@ impl VirtioDevice for Input {
         let statusq = act.queues.get(1).copied().flatten();
         self.stop_worker();
         let rx = self.rx.take().ok_or("input worker receiver missing")?;
-        let mut w = Worker {
-            mem: act.mem,
-            irq: act.irq,
-            eventq: Queue::new(eventq, false),
-            statusq: statusq.map(|q| Queue::new(q, false)),
-            pending: VecDeque::new(),
-        };
-        let h = std::thread::Builder::new()
-            .name(format!("input-{}", self.name))
-            .spawn(move || {
-                while let Ok(msg) = rx.recv() {
-                    match msg {
-                        Msg::Stop => break,
-                        Msg::Events(ev) => w.pending.extend(ev),
-                        Msg::Kick => w.drain_status(),
-                    }
-                    w.flush();
-                }
-                rx
-            })
-            .map_err(|e| e.to_string())?;
+        let w = Worker::new(act.mem, act.irq, Queue::new(eventq, false), statusq.map(|q| Queue::new(q, false)));
+        let h = std::thread::Builder::new().name(format!("input-{}", self.name)).spawn(move || w.run(rx)).map_err(|e| e.to_string())?;
         self.worker = Some(h);
         Ok(())
     }
@@ -366,11 +439,87 @@ struct Worker {
     irq: Arc<Interrupt>,
     eventq: Queue,
     statusq: Option<Queue>,
-    /// Events waiting for guest buffers (bounded: oldest dropped beyond 4096).
-    pending: VecDeque<InputEvent>,
+    /// Batches waiting for guest buffers, in order (bounded: the oldest dropped beyond
+    /// [`Worker::MAX_PENDING`] events).
+    pending: VecDeque<Batch>,
+    /// Events in `pending` not yet sent.
+    queued: usize,
+    touch: TouchState,
 }
 
 impl Worker {
+    const MAX_PENDING: usize = 4096;
+
+    fn new(mem: Arc<GuestRam>, irq: Arc<Interrupt>, eventq: Queue, statusq: Option<Queue>) -> Worker {
+        Worker { mem, irq, eventq, statusq, pending: VecDeque::new(), queued: 0, touch: TouchState::default() }
+    }
+
+    /// Handles messages until `Stop` (or every sender is gone), taking everything already
+    /// waiting before each flush: moves that arrived together go out as one, with one interrupt.
+    fn run(mut self, rx: Receiver<Msg>) -> Receiver<Msg> {
+        while let Ok(msg) = rx.recv() {
+            if !self.handle(msg) {
+                return rx;
+            }
+            while let Ok(msg) = rx.try_recv() {
+                if !self.handle(msg) {
+                    return rx;
+                }
+            }
+            self.flush();
+        }
+        rx
+    }
+
+    /// False on `Stop`.
+    fn handle(&mut self, msg: Msg) -> bool {
+        match msg {
+            Msg::Stop => return false,
+            Msg::Events(events) => {
+                self.touch.raw(&events);
+                self.push(Batch { events, sent: 0, move_from: None });
+            }
+            Msg::Touch { x, y, down } => {
+                if let Some(b) = self.touch.batch(x, y, down) {
+                    self.push(b);
+                }
+            }
+            Msg::Kick => self.drain_status(),
+        }
+        true
+    }
+
+    /// Queues a batch. A move replaces the move queued just before it when none of that has
+    /// gone to the guest: one batch from where the older one started to where this one ends.
+    fn push(&mut self, mut b: Batch) {
+        if b.move_from.is_some()
+            && let Some(last) = self.pending.back()
+            && last.sent == 0
+            && let Some(from) = last.move_from
+        {
+            self.queued -= last.events.len();
+            self.pending.pop_back();
+            // The touch state is where this move ends.
+            b.events = move_events(from, (self.touch.x, self.touch.y));
+            if b.events.is_empty() {
+                return; // back where the older move started: nothing to send
+            }
+            b.move_from = Some(from);
+        }
+        self.queued += b.events.len();
+        self.pending.push_back(b);
+        // Bounded: whole batches go, oldest first, never the one the guest is part way into.
+        while self.queued > Self::MAX_PENDING && self.pending.len() > 1 {
+            let at = usize::from(self.pending.front().is_some_and(|f| f.sent > 0));
+            if let Some(gone) = self.pending.remove(at) {
+                self.queued -= gone.events.len() - gone.sent;
+                // The guest never sees this batch, so what it knows of the contact no longer
+                // matches ours: the next touch sends the full set again.
+                self.touch.known = false;
+            }
+        }
+    }
+
     fn drain_status(&mut self) {
         let Some(q) = self.statusq.as_mut() else { return };
         let mut used = false;
@@ -383,19 +532,22 @@ impl Worker {
         }
     }
 
+    /// Moves queued events into guest buffers, one event each, then raises one interrupt.
     fn flush(&mut self) {
-        while self.pending.len() > 4096 {
-            self.pending.pop_front();
-        }
         let mut used = false;
-        while let Some(ev) = self.pending.front().copied() {
+        while let Some(b) = self.pending.front_mut() {
+            let Some(ev) = b.events.get(b.sent).copied() else {
+                self.pending.pop_front();
+                continue;
+            };
             let chain = match self.eventq.pop(&self.mem) {
                 Ok(Some(c)) => c,
                 _ => break,
             };
             let n = chain.write_all(&self.mem, &ev.bytes()).unwrap_or(0);
             let _ = self.eventq.add_used(&self.mem, chain.head, n);
-            self.pending.pop_front();
+            b.sent += 1;
+            self.queued -= 1;
             used = true;
         }
         if used {
@@ -502,18 +654,335 @@ mod tests {
         for i in 0..4 {
             drv.push(&mem, &[(RAM_BASE + 0x20000 + i * 8, 8, true)]);
         }
-        let mut w = Worker {
-            mem: mem.clone(),
-            irq: Arc::new(Interrupt::new(line.clone())),
-            eventq: Queue::new(drv.cfg, false),
-            statusq: None,
-            pending: VecDeque::new(),
-        };
-        w.pending.extend([InputEvent::new(EV_KEY, 116, 1), InputEvent::syn()]);
+        let mut w = Worker::new(mem.clone(), Arc::new(Interrupt::new(line.clone())), Queue::new(drv.cfg, false), None);
+        w.handle(Msg::Events(vec![InputEvent::new(EV_KEY, 116, 1), InputEvent::syn()]));
         w.flush();
         assert!(line.level());
         assert_eq!(drv.used_idx(&mem), 2);
         assert_eq!(mem.read_u16(RAM_BASE + 0x20000 + 2).expect("code"), 116);
+    }
+
+    /// Counts the times the interrupt line goes up.
+    #[derive(Default)]
+    struct Raises(std::sync::atomic::AtomicUsize);
+
+    impl crate::irq::IrqLine for Raises {
+        fn set(&self, level: bool) {
+            if level {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    const BUFS: u64 = RAM_BASE + 0x20000;
+
+    /// A touch worker over a 64-entry event queue (the device's size) with `bufs` buffers posted.
+    struct Rig {
+        mem: Arc<GuestRam>,
+        drv: Driver,
+        irq: Arc<Interrupt>,
+        raises: Arc<Raises>,
+        w: Worker,
+        posted: u64,
+        read: u16,
+    }
+
+    impl Rig {
+        fn new(bufs: u64) -> Rig {
+            let mem = Arc::new(GuestRam::new(RAM_BASE, 0x10_0000).expect("ram"));
+            let raises = Arc::new(Raises::default());
+            let irq = Arc::new(Interrupt::new(raises.clone()));
+            let drv = Driver::new(64);
+            let w = Worker::new(mem.clone(), irq.clone(), Queue::new(drv.cfg, false), None);
+            let mut rig = Rig { mem, drv, irq, raises, w, posted: 0, read: 0 };
+            rig.post(bufs);
+            rig
+        }
+
+        /// The guest posts `n` more one-event buffers (descriptors recycled in order).
+        fn post(&mut self, n: u64) {
+            for _ in 0..n {
+                self.drv.push(&self.mem, &[(BUFS + (self.posted % 64) * 8, 8, true)]);
+                self.posted += 1;
+            }
+        }
+
+        /// The events the guest got since the last call; acks the interrupt like the driver.
+        fn take(&mut self) -> Vec<InputEvent> {
+            let mut out = Vec::new();
+            while self.read != self.drv.used_idx(&self.mem) {
+                let (id, len) = self.drv.used(&self.mem, self.read % 64);
+                assert_eq!(len, 8);
+                let at = BUFS + u64::from(id) * 8;
+                let (typ, code) = (self.mem.read_u16(at).expect("type"), self.mem.read_u16(at + 2).expect("code"));
+                out.push(InputEvent::new(typ, code, self.mem.read_u32(at + 4).expect("value") as i32));
+                self.read = self.read.wrapping_add(1);
+            }
+            self.irq.ack(INT_USED_RING);
+            out
+        }
+
+        fn send(&mut self, msgs: impl IntoIterator<Item = Msg>) {
+            for m in msgs {
+                self.w.handle(m);
+            }
+            self.w.flush();
+        }
+
+        fn raised(&self) -> usize {
+            self.raises.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn touch(x: i32, y: i32, down: bool) -> Msg {
+        Msg::Touch { x, y, down }
+    }
+
+    #[test]
+    fn a_down_sends_the_full_set_and_a_move_only_what_changed() {
+        let mut rig = Rig::new(64);
+        rig.send([touch(10, 20, true)]);
+        assert_eq!(
+            rig.take(),
+            [
+                InputEvent::new(EV_ABS, ABS_MT_SLOT, 0),
+                InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, 1),
+                InputEvent::new(EV_ABS, ABS_MT_POSITION_X, 10),
+                InputEvent::new(EV_ABS, ABS_MT_POSITION_Y, 20),
+                InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 0x81),
+                InputEvent::new(EV_KEY, BTN_TOUCH, 1),
+                InputEvent::new(EV_ABS, ABS_X, 10),
+                InputEvent::new(EV_ABS, ABS_Y, 20),
+                InputEvent::syn(),
+            ]
+        );
+        rig.send([touch(11, 21, true)]);
+        assert_eq!(
+            rig.take(),
+            [
+                InputEvent::new(EV_ABS, ABS_MT_POSITION_X, 11),
+                InputEvent::new(EV_ABS, ABS_MT_POSITION_Y, 21),
+                InputEvent::new(EV_ABS, ABS_X, 11),
+                InputEvent::new(EV_ABS, ABS_Y, 21),
+                InputEvent::syn(),
+            ]
+        );
+        // One axis moved: one axis goes. Nothing moved: nothing goes (as stock's move bails).
+        rig.send([touch(11, 25, true)]);
+        assert_eq!(rig.take(), [InputEvent::new(EV_ABS, ABS_MT_POSITION_Y, 25), InputEvent::new(EV_ABS, ABS_Y, 25), InputEvent::syn()]);
+        let raised = rig.raised();
+        rig.send([touch(11, 25, true)]);
+        assert!(rig.take().is_empty());
+        assert_eq!(rig.raised(), raised, "no interrupt for nothing");
+        rig.send([touch(11, 25, false)]);
+        assert_eq!(rig.take(), [InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, -1), InputEvent::new(EV_KEY, BTN_TOUCH, 0), InputEvent::syn()]);
+        // The next touch is a down again: the full set.
+        rig.send([touch(5, 5, true)]);
+        assert_eq!(rig.take().len(), 9);
+    }
+
+    #[test]
+    fn raw_events_make_the_next_touch_send_everything() {
+        let mut rig = Rig::new(64);
+        rig.send([touch(10, 20, true)]);
+        rig.take();
+        // `event send EV_ABS:ABS_MT_SLOT:3`: the kernel's slot is no longer ours.
+        rig.send([Msg::Events(vec![InputEvent::new(EV_ABS, ABS_MT_SLOT, 3), InputEvent::syn()])]);
+        rig.take();
+        rig.send([touch(11, 20, true)]);
+        let ev = rig.take();
+        assert_eq!(ev[0], InputEvent::new(EV_ABS, ABS_MT_SLOT, 0));
+        assert_eq!(ev.len(), 9);
+        // Keys on another device are none of this: the rotary's REL events don't count either.
+        rig.send([Msg::Events(vec![InputEvent::new(EV_REL, REL_WHEEL, 1), InputEvent::syn()])]);
+        rig.take();
+        rig.send([touch(12, 20, true)]);
+        assert_eq!(rig.take().len(), 3, "x and its single-touch axis, then SYN");
+    }
+
+    /// N moves while the guest has no buffers: before, 9 events each (the 64-entry queue took
+    /// the oldest seven and stale positions kept coming); now one move to the newest position.
+    #[test]
+    fn moves_the_guest_has_not_taken_collapse_into_the_newest() {
+        const N: i32 = 100;
+        let mut rig = Rig::new(0);
+        rig.send([touch(0, 0, true)]);
+        for i in 1..=N {
+            rig.send([touch(i, 2 * i, true)]);
+        }
+        assert_eq!(rig.w.pending.len(), 2, "the down and one move");
+        assert_eq!(rig.w.queued, 9 + 5);
+        rig.post(64);
+        rig.send([Msg::Kick]);
+        let ev = rig.take();
+        assert_eq!(ev.len(), 14);
+        assert_eq!(rig.raised(), 1, "one interrupt");
+        assert_eq!(
+            ev[9..],
+            [
+                InputEvent::new(EV_ABS, ABS_MT_POSITION_X, N),
+                InputEvent::new(EV_ABS, ABS_MT_POSITION_Y, 2 * N),
+                InputEvent::new(EV_ABS, ABS_X, N),
+                InputEvent::new(EV_ABS, ABS_Y, 2 * N),
+                InputEvent::syn()
+            ]
+        );
+        // A move back to where the queued one started cancels it.
+        let mut stalled = Rig::new(0);
+        stalled.send([touch(0, 0, true), touch(5, 5, true), touch(0, 0, true)]);
+        assert_eq!(stalled.w.pending.len(), 1, "just the down");
+    }
+
+    #[test]
+    fn downs_ups_and_keys_are_never_dropped_or_reordered() {
+        let mut rig = Rig::new(0);
+        let key = |v| Msg::Events(vec![InputEvent::new(EV_KEY, 116, v), InputEvent::syn()]);
+        rig.send([touch(1, 1, true), touch(2, 2, true), touch(3, 3, true), key(1), touch(4, 4, true), touch(5, 5, true)]);
+        rig.send([touch(5, 5, false), key(0), touch(9, 9, true), touch(8, 8, true), touch(7, 7, false)]);
+        rig.post(64);
+        rig.send([Msg::Kick]);
+        let ev = rig.take();
+        // Each batch's first event, in order: down, move (to 3), key, move (to 5), up, key,
+        // down, move (to 8), up.
+        let mut firsts = Vec::new();
+        let mut start = true;
+        for e in &ev {
+            if start {
+                firsts.push(*e);
+            }
+            start = *e == InputEvent::syn();
+        }
+        assert_eq!(
+            firsts,
+            [
+                InputEvent::new(EV_ABS, ABS_MT_SLOT, 0),
+                InputEvent::new(EV_ABS, ABS_MT_POSITION_X, 3),
+                InputEvent::new(EV_KEY, 116, 1),
+                InputEvent::new(EV_ABS, ABS_MT_POSITION_X, 5),
+                InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, -1),
+                InputEvent::new(EV_KEY, 116, 0),
+                InputEvent::new(EV_ABS, ABS_MT_SLOT, 0),
+                InputEvent::new(EV_ABS, ABS_MT_POSITION_X, 8),
+                InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, -1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_move_the_guest_is_part_way_into_is_left_alone() {
+        let mut rig = Rig::new(2);
+        rig.send([touch(0, 0, true)]);
+        assert_eq!(rig.take().len(), 2);
+        rig.post(7);
+        rig.send([Msg::Kick]);
+        assert_eq!(rig.take().len(), 7, "the down is in");
+        rig.send([touch(1, 1, true)]);
+        rig.take();
+        rig.post(2);
+        rig.send([touch(2, 2, true)]);
+        assert_eq!(rig.take().len(), 2, "half of the move to 2,2");
+        rig.send([touch(3, 3, true), touch(4, 4, true)]);
+        assert_eq!(rig.w.pending.len(), 2, "the started move stays; the new ones collapse behind it");
+        rig.post(64);
+        rig.send([Msg::Kick]);
+        let ev = rig.take();
+        assert_eq!(ev.len(), 3 + 5);
+        assert_eq!(ev[3], InputEvent::new(EV_ABS, ABS_MT_POSITION_X, 4));
+    }
+
+    #[test]
+    fn the_backlog_is_bounded_by_whole_batches() {
+        let mut rig = Rig::new(0);
+        let key = |v| Msg::Events(vec![InputEvent::new(EV_KEY, 30, v), InputEvent::syn()]);
+        for i in 0..3000 {
+            rig.send([key(i % 2)]);
+        }
+        assert!(rig.w.queued <= Worker::MAX_PENDING);
+        assert!(rig.w.pending.iter().all(|b| b.events.len() == 2));
+        assert_eq!(rig.w.queued, rig.w.pending.len() * 2);
+    }
+
+    /// Threads touching and pressing keys through handles while a guest thread takes events and
+    /// kicks: every key arrives once, in each thread's order, and the finger ends where it was
+    /// last put.
+    #[test]
+    fn handles_and_the_guest_hammering_together() {
+        const THREADS: u16 = 4;
+        // Under the backlog bound even if the guest took nothing until the end (1200 key
+        // batches of 2, 150 moves of at most 5), so nothing may be dropped.
+        const KEYS: i32 = 150;
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x10_0000).expect("ram"));
+        let raises = Arc::new(Raises::default());
+        let irq = Arc::new(Interrupt::new(raises.clone()));
+        let (mut dev, h) = Input::new(Kind::Touch { width: 100, height: 100 }, "touch");
+        let mut drv = Driver::new(64);
+        let cfg = drv.cfg;
+        let mut posted = 0u64;
+        for _ in 0..64 {
+            drv.push(&mem, &[(BUFS + (posted % 64) * 8, 8, true)]);
+            posted += 1;
+        }
+        dev.activate(Activation { mem: mem.clone(), irq: irq.clone(), queues: vec![Some(cfg), None], features: 0 }).expect("activate");
+        let dev = Arc::new(std::sync::Mutex::new(dev));
+        let senders: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let h = h.clone();
+                std::thread::spawn(move || {
+                    for i in 0..KEYS {
+                        h.send(vec![InputEvent::new(EV_KEY, 100 + t, i), InputEvent::syn()]);
+                        if t == 0 {
+                            h.touch(i % 50, i % 70, true);
+                        }
+                    }
+                    if t == 0 {
+                        h.touch(7, 9, true);
+                    }
+                })
+            })
+            .collect();
+        let (mut read, mut got) = (0u16, Vec::new());
+        let start = std::time::Instant::now();
+        let mut finished = false;
+        loop {
+            let used = drv.used_idx(&mem);
+            while read != used {
+                let (id, _) = drv.used(&mem, read % 64);
+                let at = BUFS + u64::from(id) * 8;
+                got.push(InputEvent::new(
+                    mem.read_u16(at).expect("type"),
+                    mem.read_u16(at + 2).expect("code"),
+                    mem.read_u32(at + 4).expect("value") as i32,
+                ));
+                read = read.wrapping_add(1);
+                drv.push(&mem, &[(BUFS + (posted % 64) * 8, 8, true)]);
+                posted += 1;
+            }
+            irq.ack(INT_USED_RING);
+            dev.lock().expect("dev").notify(0);
+            let keys = got.iter().filter(|e| e.typ == EV_KEY && (100..100 + THREADS).contains(&e.code)).count();
+            // The last touch is in once its x is.
+            if finished
+                && keys == (THREADS as usize) * KEYS as usize
+                && got.iter().rev().find(|e| e.code == ABS_MT_POSITION_X).is_some_and(|e| e.value == 7)
+            {
+                break;
+            }
+            finished = finished || senders.iter().all(|s| s.is_finished());
+            assert!(start.elapsed() < std::time::Duration::from_secs(20), "stalled with {} events", got.len());
+            std::thread::yield_now();
+        }
+        for s in senders {
+            s.join().expect("sender");
+        }
+        for t in 0..THREADS {
+            let mine: Vec<i32> = got.iter().filter(|e| e.typ == EV_KEY && e.code == 100 + t).map(|e| e.value).collect();
+            assert_eq!(mine, (0..KEYS).collect::<Vec<_>>(), "thread {t}'s keys, once each, in order");
+        }
+        let y = got.iter().rev().find(|e| e.code == ABS_MT_POSITION_Y).map(|e| e.value);
+        assert_eq!(y, Some(9));
+        // Every batch ends with SYN: nothing was cut.
+        assert_eq!(got.last(), Some(&InputEvent::syn()));
+        drop(dev);
     }
 
     fn has(bits: &[u8], code: u16) -> bool {

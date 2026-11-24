@@ -4,7 +4,7 @@
 //! side reads with `pread` ([`Frames`] takes either).
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -67,22 +67,43 @@ fn read_exactly(r: &mut impl Read, len: usize) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Bytes of socket input read ahead: room for 256 queued ring notices, so one `read` sees every
+/// notice that piled up while the previous frame was being read and shown.
+const READ_AHEAD: usize = 8 * 1024;
+
 /// The frames of one display connection, wherever the server puts their pixels.
 pub struct Frames<R> {
-    reader: R,
+    /// Buffered, so the notices already waiting on the socket are visible without another
+    /// syscall (a read returns what has arrived; it doesn't wait to fill the buffer).
+    reader: BufReader<R>,
     ring: Option<Ring>,
     /// Where to ask for socket frames when an announced ring can't be opened.
     fallback: Option<UnixStream>,
     /// Frames announced in the ring but overwritten before they could be read (or in a ring
     /// that couldn't be opened).
     pub torn: u64,
+    /// Ring frames skipped unread because a newer one was already announced behind them.
+    pub superseded: u64,
     /// Frames passed over unread because nobody wanted them ([`Frames::next_frame_when`]).
     pub skipped: u64,
 }
 
 impl<R: Read> Frames<R> {
     pub fn new(reader: R) -> Frames<R> {
-        Frames { reader, ring: None, fallback: None, torn: 0, skipped: 0 }
+        Frames { reader: BufReader::with_capacity(READ_AHEAD, reader), ring: None, fallback: None, torn: 0, superseded: 0, skipped: 0 }
+    }
+
+    /// The ring notice already read ahead behind the current record, if the next record is one.
+    /// Only whole buffered records count: this never blocks or reads.
+    fn queued_notice(&mut self) -> Option<(FrameHeader, u32)> {
+        let raw: &[u8; HEADER_LEN] = self.reader.buffer().get(..HEADER_LEN)?.try_into().ok()?;
+        match Record::decode(raw) {
+            Ok(Record::Shared { header, slot }) => {
+                self.reader.consume(HEADER_LEN);
+                Some((header, slot))
+            }
+            _ => None,
+        }
     }
 
     /// When an announced ring can't be opened (another user's file, a sandbox), ask for frames on
@@ -92,17 +113,34 @@ impl<R: Read> Frames<R> {
         self
     }
 
-    /// The next whole frame: its header and RGBA rows. Ring announcements are followed, and a
-    /// frame the server overwrote before it was read (or that names a ring this side couldn't
-    /// open) is skipped for the next one.
+    /// The next whole frame, one per announcement, in order: its header and RGBA rows. Ring
+    /// announcements are followed, and a frame the server overwrote before it was read (or that
+    /// names a ring this side couldn't open) is skipped for the next one.
     pub fn next_frame(&mut self) -> std::io::Result<(FrameHeader, Vec<u8>)> {
-        self.next_frame_when(|| true)
+        self.read_next(false, || true)
+    }
+
+    /// Like [`Frames::next_frame`], but a client that fell behind (a window showing frames) gets
+    /// only the newest of the ring frames already announced: the ones before it are skipped
+    /// unread (counted in `superseded`). Socket frames and ring announcements are never skipped.
+    pub fn newest_frame(&mut self) -> std::io::Result<(FrameHeader, Vec<u8>)> {
+        self.read_next(true, || true)
     }
 
     /// [`Frames::next_frame`], reading a frame's pixels only if `wanted()` says so when it
     /// arrives: one nobody wants (its window is hidden) is passed over without reading it from
     /// the ring (a socket frame's bytes are drained without keeping them).
     pub fn next_frame_when(&mut self, wanted: impl Fn() -> bool) -> std::io::Result<(FrameHeader, Vec<u8>)> {
+        self.read_next(false, wanted)
+    }
+
+    /// [`Frames::newest_frame`] with [`Frames::next_frame_when`]'s `wanted()`: a shown window gets
+    /// the newest announced frame, a hidden one reads none.
+    pub fn newest_frame_when(&mut self, wanted: impl Fn() -> bool) -> std::io::Result<(FrameHeader, Vec<u8>)> {
+        self.read_next(true, wanted)
+    }
+
+    fn read_next(&mut self, skip_to_newest: bool, wanted: impl Fn() -> bool) -> std::io::Result<(FrameHeader, Vec<u8>)> {
         loop {
             let mut hdr = [0u8; HEADER_LEN];
             self.reader.read_exact(&mut hdr)?;
@@ -127,11 +165,19 @@ impl<R: Read> Frames<R> {
                     }
                 }
                 Record::Shared { .. } if !wanted() => self.skipped += 1,
-                Record::Shared { header, slot } => match self.ring.as_ref().map(|r| r.read(slot, &header)) {
-                    Some(Ok(Some(rgba))) => return Ok((header, rgba)),
-                    Some(Err(e)) => return Err(e),
-                    Some(Ok(None)) | None => self.torn += 1,
-                },
+                Record::Shared { mut header, mut slot } => {
+                    // A client that fell behind reads only the newest of the frames announced
+                    // so far: the older ones would be replaced before anything showed them.
+                    while skip_to_newest && let Some(newer) = self.queued_notice() {
+                        self.superseded += 1;
+                        (header, slot) = newer;
+                    }
+                    match self.ring.as_ref().map(|r| r.read(slot, &header)) {
+                        Some(Ok(Some(rgba))) => return Ok((header, rgba)),
+                        Some(Err(e)) => return Err(e),
+                        Some(Ok(None)) | None => self.torn += 1,
+                    }
+                }
             }
         }
     }
@@ -230,6 +276,140 @@ mod tests {
         }
     }
 
+    /// A client that fell behind: the server announces 8 phone-sized frames in one burst before
+    /// the client reads any. Prints the time to catch up per burst and the frames read.
+    /// `cargo test --release -p sim-android display_burst_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "bench"]
+    fn display_burst_bench() {
+        const SLOTS: u32 = 8;
+        const BURSTS: usize = 40;
+        let (w, h) = (1080u32, 2400u32);
+        let len = w * h * 4;
+        let dir = std::env::temp_dir().join(format!("sa-burst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("frames.ring");
+        let layout = ring::Layout::new(SLOTS, u64::from(len));
+        let px = vec![7u8; len as usize];
+        let slots: Vec<(u32, ring::Slot, &[u8])> = (0..SLOTS)
+            .map(|i| {
+                let slot = ring::Slot { seq: 2, frame: u64::from(i), width: w, height: h, device_width: w, device_height: h, len };
+                (i, slot, px.as_slice())
+            })
+            .collect();
+        write_ring(&path, layout, &slots);
+        // Every frame in order (`next_frame`), then the window's path (`newest_frame`).
+        for newest in [false, true] {
+            burst_run(&path, newest, SLOTS, BURSTS, (w, h));
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn burst_run(path: &Path, newest: bool, slots: u32, bursts: usize, (w, h): (u32, u32)) {
+        let len = w * h * 4;
+        let (client, mut server) = UnixStream::pair().expect("pair");
+        let (caught_up, wait) = std::sync::mpsc::channel::<()>();
+        let p = path.to_str().expect("utf8").as_bytes().to_vec();
+        let writer = std::thread::spawn(move || {
+            let mut ring = Record::Ring { path_len: p.len() as u32 }.encode().to_vec();
+            ring.extend(&p);
+            server.write_all(&ring).expect("ring");
+            let mut burst = Vec::new();
+            for i in 0..slots {
+                let header = FrameHeader::new(w, h, w, h, u64::from(i)).expect("size");
+                burst.extend(Record::Shared { header, slot: i }.encode());
+            }
+            for _ in 0..bursts {
+                server.write_all(&burst).expect("burst");
+                wait.recv().expect("caught up");
+            }
+        });
+        let mut frames = Frames::new(client);
+        let (mut read, mut times) = (0usize, Vec::new());
+        for _ in 0..bursts {
+            let start = std::time::Instant::now();
+            loop {
+                let (header, rgba) = if newest { frames.newest_frame() } else { frames.next_frame() }.expect("frame");
+                assert_eq!(rgba.len(), len as usize);
+                read += 1;
+                if header.frame == u64::from(slots - 1) {
+                    break;
+                }
+            }
+            times.push(start.elapsed());
+            caught_up.send(()).expect("send");
+        }
+        writer.join().expect("writer");
+        times.sort();
+        println!(
+            "{}: burst of {slots} {w}x{h} notices: median {:?} to catch up, {} frames read ({:.1} per burst, {:.0} MB per burst)",
+            if newest { "newest_frame" } else { "next_frame" },
+            times[bursts / 2],
+            read,
+            read as f64 / bursts as f64,
+            read as f64 / bursts as f64 * f64::from(len) / 1e6
+        );
+    }
+
+    /// A reader that hands out at most one record header's worth of bytes per read.
+    struct Trickle<R>(R);
+
+    impl<R: Read> Read for Trickle<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(HEADER_LEN);
+            self.0.read(&mut buf[..n])
+        }
+    }
+
+    /// A fake emulator announces 120 frames at once (the window was busy): the client reads
+    /// only the newest from the ring, once.
+    #[test]
+    fn a_backlog_of_notices_reads_only_the_newest_frame() {
+        let dir = std::env::temp_dir().join(format!("sa-backlog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("frames.ring");
+        let layout = ring::Layout::new(3, 8);
+        let slot = |frame| ring::Slot { seq: 2, frame, width: 2, height: 1, device_width: 4, device_height: 2, len: 8 };
+        // The ring holds the last three frames announced, frame n in slot n % 3.
+        let (old, newest) = ([1u8; 8], [2u8; 8]);
+        write_ring(&path, layout, &[(1, slot(118), &old), (2, slot(119), &old), (0, slot(120), &newest)]);
+        let header = |frame| FrameHeader::new(2, 1, 4, 2, frame).expect("size");
+        let p = path.to_str().expect("utf8").as_bytes();
+        let mut msg = Record::Ring { path_len: p.len() as u32 }.encode().to_vec();
+        msg.extend(p);
+        for n in 1..=120u64 {
+            msg.extend(Record::Shared { header: header(n), slot: (n % 3) as u32 }.encode());
+        }
+        let (client, mut server) = UnixStream::pair().expect("pair");
+        server.write_all(&msg).expect("send");
+        drop(server);
+        let mut frames = Frames::new(client);
+        assert_eq!(frames.newest_frame().expect("frame"), (header(120), newest.to_vec()));
+        assert_eq!((frames.superseded, frames.torn), (119, 0), "one ring read for 120 notices");
+        assert!(frames.newest_frame().is_err(), "nothing else announced");
+        // `next_frame` keeps its meaning: one frame per notice, in order (frames 1-117 were
+        // overwritten in the 3-slot ring, so they're torn, not skipped).
+        let mut frames = Frames::new(std::io::Cursor::new(msg.clone()));
+        let got: Vec<u64> = std::iter::from_fn(|| frames.next_frame().ok()).map(|(h, _)| h.frame).collect();
+        assert_eq!(got, vec![118, 119, 120]);
+        assert_eq!((frames.superseded, frames.torn), (0, 117));
+        // Neighbours: a socket frame or a new ring behind the notices stops the skipping, and
+        // the newest notice still wins over the ones before it.
+        let mut msg = Record::Ring { path_len: p.len() as u32 }.encode().to_vec();
+        msg.extend(p);
+        msg.extend(Record::Shared { header: header(119), slot: 2 }.encode());
+        msg.extend(Record::Frame(header(121)).encode());
+        msg.extend([9; 8]);
+        msg.extend(Record::Shared { header: header(118), slot: 1 }.encode());
+        msg.extend(Record::Shared { header: header(120), slot: 0 }.encode());
+        let mut frames = Frames::new(std::io::Cursor::new(msg));
+        assert_eq!(frames.newest_frame().expect("ring frame").0, header(119));
+        assert_eq!(frames.newest_frame().expect("socket frame"), (header(121), vec![9; 8]));
+        assert_eq!(frames.newest_frame().expect("newest"), (header(120), newest.to_vec()));
+        assert_eq!((frames.superseded, frames.torn), (1, 0));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn frames_come_from_the_socket_or_the_ring() {
         let dir = std::env::temp_dir().join(format!("sa-frames-{}", std::process::id()));
@@ -253,7 +433,8 @@ mod tests {
         stream.extend(Record::Frame(header(10)).encode());
         stream.extend([9; 8]);
         stream.extend(Record::Shared { header: header(11), slot: 7 }.encode());
-        let mut frames = Frames::new(std::io::Cursor::new(stream));
+        // One record per read: a client keeping up, so no notice is ever queued behind another.
+        let mut frames = Frames::new(Trickle(std::io::Cursor::new(stream)));
         assert_eq!(frames.next_frame().expect("ring frame"), (header(5), px.to_vec()));
         assert_eq!(frames.next_frame().expect("socket frame"), (header(10), vec![9; 8]));
         assert_eq!(frames.torn, 3);
