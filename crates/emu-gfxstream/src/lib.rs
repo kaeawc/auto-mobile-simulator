@@ -10,11 +10,11 @@
 
 mod macho;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 pub use emu_hvf::HostRange;
 
@@ -248,11 +248,80 @@ fn iovs(ranges: &[HostRange]) -> Vec<Iov> {
     ranges.iter().map(|r| Iov { base: r.as_ptr().cast(), len: r.len() }).collect()
 }
 
+/// A resource's guest memory as the renderer's iovec array, built in place from host ranges
+/// (one allocation, no intermediate list). [`Renderer::attach_backing`] and
+/// [`Renderer::create_blob`] take it and keep it for as long as the renderer may hold it.
+#[derive(Default)]
+pub struct Backing(Vec<Iov>);
+
+impl Backing {
+    pub fn with_capacity(n: usize) -> Backing {
+        Backing(Vec::with_capacity(n))
+    }
+
+    pub fn push(&mut self, r: HostRange) {
+        self.0.push(Iov { base: r.as_ptr().cast(), len: r.len() });
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// The iovec arrays handed to the renderer, owned until it can no longer use them. The header
+/// doesn't say whether the renderer copies them; the SDK's (37.x) `VirtioGpuResource::AttachIov`
+/// copies the array and its `createBlob` ignores it, but older gfxstream and other renderers may
+/// keep the pointer, so (like crosvm's rutabaga, which keeps `backing_iovecs` in the resource)
+/// an array is freed only after the call that ends its use returns: a detach or a re-attach for
+/// attached backing, the resource's unref for both.
+#[derive(Default)]
+struct IovStore {
+    attached: HashMap<u32, Box<[Iov]>>,
+    blobs: HashMap<u32, Box<[Iov]>>,
+}
+
+impl IovStore {
+    /// Keeps `v` as `res`'s attached backing. The array it replaces is no longer the renderer's
+    /// (the attach that replaced it has returned) and is returned to be dropped.
+    fn attach(&mut self, res: u32, v: Box<[Iov]>) -> Option<Box<[Iov]>> {
+        if v.is_empty() { self.attached.remove(&res) } else { self.attached.insert(res, v) }
+    }
+
+    fn detach(&mut self, res: u32) -> Option<Box<[Iov]>> {
+        self.attached.remove(&res)
+    }
+
+    fn blob(&mut self, res: u32, v: Box<[Iov]>) {
+        if !v.is_empty() {
+            self.blobs.insert(res, v);
+        }
+    }
+
+    /// Drops everything kept for `res` (after its unref); returns how many arrays that was.
+    fn release(&mut self, res: u32) -> usize {
+        usize::from(self.attached.remove(&res).is_some()) + usize::from(self.blobs.remove(&res).is_some())
+    }
+
+    /// Iovec entries kept, over every array.
+    fn entries(&self) -> usize {
+        self.attached.values().chain(self.blobs.values()).map(|v| v.len()).sum()
+    }
+}
+
 fn ok(name: &'static str, rc: c_int) -> Result<()> {
     if rc == 0 { Ok(()) } else { Err(Error::Call(name, rc)) }
 }
 
-/// The initialized renderer. Calls may come from any thread.
+/// The initialized renderer, shared between threads. The header promises no more than that its
+/// calls may come from other threads than `init`'s; it doesn't say the resource table may be used
+/// by two at once, so callers make every resource call (create, unref, backing, transfers,
+/// submits, maps) from one thread, as virtio-gpu's worker does. The FrameBuffer readbacks
+/// ([`Renderer::read_last_posted_to`] and friends) take the FrameBuffer's own lock and may come
+/// from any thread.
 pub struct Renderer {
     api: Api,
     handle: *mut c_void,
@@ -266,11 +335,23 @@ pub struct Renderer {
     vk: std::sync::OnceLock<Option<VkRead>>,
     /// [`VkTrust`] of the direct readback, as a u8.
     vk_trust: AtomicU8,
+    /// Iovec arrays the renderer may still point at.
+    iovs: Mutex<IovStore>,
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        // The renderer is process-wide state that outlives this handle (there is no teardown
+        // call), so arrays it may still point at stay allocated.
+        std::mem::forget(std::mem::take(&mut *self.iov_store()));
+    }
 }
 
 // SAFETY: the dlopen handle is only used for dlsym, which is thread-safe.
 unsafe impl Send for Renderer {}
-// SAFETY: as above; renderer calls are thread-safe by the stream_renderer contract.
+// SAFETY: as above; the renderer's own state is process-wide and its calls may come from any
+// thread; resource calls are kept on one thread by the caller (see `Renderer`), and the iovec
+// store is behind its own mutex.
 unsafe impl Sync for Renderer {}
 
 /// The renderer library inside `lib64`.
@@ -317,6 +398,7 @@ impl Renderer {
             fb: std::sync::OnceLock::new(),
             vk: std::sync::OnceLock::new(),
             vk_trust: AtomicU8::new(VkTrust::Unchecked as u8),
+            iovs: Mutex::new(IovStore::default()),
         })
     }
 
@@ -383,30 +465,56 @@ impl Renderer {
         unsafe { (self.api.context_destroy)(ctx_id) }
     }
 
-    /// Creates a resource, optionally backed by guest memory ranges.
-    pub fn resource_create(&self, mut args: ResourceCreateArgs, backing: &[HostRange]) -> Result<()> {
-        let mut v = iovs(backing);
-        let p = if v.is_empty() { std::ptr::null_mut() } else { v.as_mut_ptr() };
-        // SAFETY: the iovecs point into guest RAM, which outlives the renderer.
-        ok("resource_create", unsafe { (self.api.resource_create)(&mut args, p, v.len() as u32) })
+    fn iov_store(&self) -> MutexGuard<'_, IovStore> {
+        self.iovs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Iovec entries kept for the renderer (attached backing and guest-memory blobs).
+    pub fn backing_entries(&self) -> usize {
+        self.iov_store().entries()
+    }
+
+    /// Creates a resource, optionally backed by guest memory ranges (kept as its attached
+    /// backing, like [`Renderer::attach_backing`]).
+    pub fn resource_create(&self, mut args: ResourceCreateArgs, backing: &[HostRange]) -> Result<()> {
+        let mut v = iovs(backing).into_boxed_slice();
+        let p = if v.is_empty() { std::ptr::null_mut() } else { v.as_mut_ptr() };
+        // SAFETY: the iovecs point into guest RAM, which outlives the renderer; the array is kept
+        // until the resource's detach or unref.
+        let rc = unsafe { (self.api.resource_create)(&mut args, p, v.len() as u32) };
+        if rc == 0 {
+            drop(self.iov_store().attach(args.handle, v));
+        }
+        ok("resource_create", rc)
+    }
+
+    /// Unrefs a resource and then frees the iovec arrays kept for it.
     pub fn resource_unref(&self, id: u32) {
         // SAFETY: plain call.
         unsafe { (self.api.resource_unref)(id) }
+        self.iov_store().release(id);
     }
 
-    pub fn attach_backing(&self, id: u32, backing: &[HostRange]) -> Result<()> {
-        // The renderer keeps the iovec array, so it must outlive the resource: leak it.
-        let v = Box::leak(iovs(backing).into_boxed_slice());
-        // SAFETY: the array is leaked (lives forever) and points into guest RAM.
-        ok("attach_iov", unsafe { (self.api.attach_iov)(id as c_int, v.as_mut_ptr(), v.len() as c_int) })
+    /// Attaches guest memory to a resource. The array is kept until the resource's next
+    /// attach, its detach or its unref returns.
+    pub fn attach_backing(&self, id: u32, backing: Backing) -> Result<()> {
+        let mut v = backing.0.into_boxed_slice();
+        // SAFETY: the array points into guest RAM and stays allocated (in `iovs`) for as long as
+        // the renderer may use it.
+        let rc = unsafe { (self.api.attach_iov)(id as c_int, v.as_mut_ptr(), v.len() as c_int) };
+        if rc == 0 {
+            // The previous array (if any) is dropped only now, after the renderer replaced it.
+            drop(self.iov_store().attach(id, v));
+        }
+        ok("attach_iov", rc)
     }
 
+    /// Detaches a resource's guest memory and then frees its iovec array.
     pub fn detach_backing(&self, id: u32) {
         let (mut p, mut n) = (std::ptr::null_mut(), 0);
         // SAFETY: out-pointers reference live locals.
         unsafe { (self.api.detach_iov)(id as c_int, &mut p, &mut n) }
+        drop(self.iov_store().detach(id));
     }
 
     pub fn ctx_attach_resource(&self, ctx: u32, res: u32) {
@@ -464,22 +572,18 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn create_blob(
-        &self,
-        ctx: u32,
-        res: u32,
-        blob_mem: u32,
-        blob_flags: u32,
-        blob_id: u64,
-        size: u64,
-        backing: &[HostRange],
-    ) -> Result<()> {
+    pub fn create_blob(&self, ctx: u32, res: u32, blob_mem: u32, blob_flags: u32, blob_id: u64, size: u64, backing: Backing) -> Result<()> {
         let b = CreateBlob { blob_mem, blob_flags, blob_id, size };
-        let v = Box::leak(iovs(backing).into_boxed_slice());
+        let v = backing.0.into_boxed_slice();
         let p = if v.is_empty() { std::ptr::null() } else { v.as_ptr() };
-        // SAFETY: the blob descriptor lives for the call; the iovec array is leaked because the
-        // renderer may keep it for guest-memory blobs.
-        ok("create_blob", unsafe { (self.api.create_blob)(ctx, res, &b, p, v.len() as u32, std::ptr::null()) })
+        // SAFETY: the blob descriptor lives for the call; the iovec array points into guest RAM
+        // and is kept until the resource's unref, since the renderer may keep it for
+        // guest-memory blobs.
+        let rc = unsafe { (self.api.create_blob)(ctx, res, &b, p, v.len() as u32, std::ptr::null()) };
+        if rc == 0 {
+            self.iov_store().blob(res, v);
+        }
+        ok("create_blob", rc)
     }
 
     /// Host mapping of a mappable blob.
@@ -1045,6 +1149,103 @@ pub fn page_range(host: HostRange, len: usize) -> HostRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ranges(mem: &emu_hvf::GuestRam, n: usize) -> impl Iterator<Item = HostRange> + '_ {
+        (0..n).map(move |i| mem.host_range(mem.base() + (i as u64 % 64) * 4096, 4096).expect("range"))
+    }
+
+    fn backing(mem: &emu_hvf::GuestRam, n: usize) -> Backing {
+        let mut b = Backing::with_capacity(n);
+        for r in ranges(mem, n) {
+            b.push(r);
+        }
+        b
+    }
+
+    #[test]
+    fn backing_is_the_ranges_as_iovecs() {
+        let mem = emu_hvf::GuestRam::new(0x4000_0000, 64 * 4096).expect("ram");
+        let b = backing(&mem, 3);
+        let want = iovs(&ranges(&mem, 3).collect::<Vec<_>>());
+        assert_eq!((b.len(), b.is_empty()), (3, false));
+        for (a, w) in b.0.iter().zip(&want) {
+            assert_eq!((a.base, a.len), (w.base, w.len));
+        }
+        assert!(Backing::default().is_empty());
+    }
+
+    #[test]
+    fn iovec_arrays_live_until_their_use_ends() {
+        let mem = emu_hvf::GuestRam::new(0x4000_0000, 64 * 4096).expect("ram");
+        let arr = |n| backing(&mem, n).0.into_boxed_slice();
+        let mut s = IovStore::default();
+        assert!(s.attach(1, arr(4)).is_none(), "first attach replaces nothing");
+        let first = s.attached[&1].as_ptr();
+        let old = s.attach(1, arr(2)).expect("a re-attach hands back the replaced array");
+        assert_eq!((old.as_ptr(), old.len(), s.entries()), (first, 4, 2), "the new one is kept");
+        drop(old);
+        s.blob(2, arr(5));
+        s.blob(3, arr(0));
+        assert_eq!(s.entries(), 7, "an empty blob array isn't kept");
+        assert_eq!(s.detach(2).map(|v| v.len()), None, "a blob's array survives a detach");
+        assert_eq!(s.entries(), 7);
+        assert_eq!(s.detach(1).map(|v| v.len()), Some(2));
+        assert!(s.attach(4, arr(3)).is_none());
+        assert_eq!(s.attach(4, arr(0)).map(|v| v.len()), Some(3), "attaching nothing frees the last array");
+        assert_eq!((s.release(2), s.release(2), s.entries()), (1, 0, 0), "unref frees the blob's array once");
+        assert!(s.attach(5, arr(1)).is_none());
+        s.blob(5, arr(1));
+        assert_eq!(s.release(5), 2, "unref frees attached and blob arrays");
+    }
+
+    /// Building a 16K-entry backing list (a 64 MiB resource in 4 KiB pages): host ranges, then
+    /// an iovec copy of them, leaked per call (before) vs the iovec array built in place and
+    /// kept by the renderer until unref (now). Median of 9 runs.
+    ///     cargo test --release -p emu-gfxstream backing_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn backing_cost() {
+        const N: usize = 16 * 1024;
+        const REPS: u32 = 200;
+        let mem = emu_hvf::GuestRam::new(0x4000_0000, 64 * 4096).expect("ram");
+        let median = |f: &mut dyn FnMut()| {
+            let mut runs: Vec<f64> = (0..9)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    for _ in 0..REPS {
+                        f();
+                    }
+                    t.elapsed().as_secs_f64() * 1e6 / f64::from(REPS)
+                })
+                .collect();
+            runs.sort_by(f64::total_cmp);
+            runs[4]
+        };
+        let (mut old_us, mut new_us) = (Vec::new(), Vec::new());
+        // Interleaved: the host is shared.
+        for _ in 0..3 {
+            old_us.push(median(&mut || {
+                let hr: Vec<HostRange> = ranges(&mem, N).collect();
+                let v = iovs(&hr).into_boxed_slice(); // was Box::leak'ed: 256 KiB per create
+                std::hint::black_box(&v);
+            }));
+            new_us.push(median(&mut || {
+                let v = backing(&mem, N).0.into_boxed_slice();
+                std::hint::black_box(&v);
+            }));
+        }
+        let mid = |v: &[f64]| {
+            let mut v = v.to_vec();
+            v.sort_by(f64::total_cmp);
+            v[1]
+        };
+        println!(
+            "16K-entry backing: {:.1} us (ranges, then iovecs; leaked) -> {:.1} us (iovecs in place; freed on unref)",
+            mid(&old_us),
+            mid(&new_us)
+        );
+        println!("  runs before {old_us:.1?} after {new_us:.1?}; leaked before: {} KiB per create", N * std::mem::size_of::<Iov>() / 1024);
+    }
 
     #[test]
     fn bundled_deps_are_ordered_leaves_first() {
