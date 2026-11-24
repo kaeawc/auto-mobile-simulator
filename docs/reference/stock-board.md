@@ -45,9 +45,16 @@ goldfish address space (`607d:f153`, host-visible memory for graphics), virtio-w
 
 ## Kernel command line and bootconfig
 
-Kernel: `8250.nr_uarts=1 no_timer_check console=ttyAMA0,38400 keep_bootcon earlyprintk=ttyAMA0
-ndns=2 loop.max_part=7 printk.devkmsg=on bootconfig mac80211_hwsim.radios=0` plus the image's
-`kernel_cmdline.txt`.
+Kernel, stock's `-show-kernel` command line (its `console=ttyAMA0,38400` and `printk.devkmsg=on`
+appear only in that mode, so that's the mode this capture was taken in): `8250.nr_uarts=1
+no_timer_check console=ttyAMA0,38400 keep_bootcon earlyprintk=ttyAMA0 ndns=2 loop.max_part=7
+printk.devkmsg=on bootconfig mac80211_hwsim.radios=0` plus the image's `kernel_cmdline.txt`. The
+console parameters depend on the mode (`SetupParameters.cpp` `setupVirtualSerialPorts`, QEMU2
+on ARM): `keep_bootcon earlyprintk=ttyAMA0` always; `console=ttyAMA0,38400` only with
+`-show-kernel`, else `console=0` and the serial port backed by `null`; `printk.devkmsg=on`
+(`main-kernel-parameters.cpp`) only with `-show-kernel`, `-shell` or `-shell-serial`. simee
+always passes the `-show-kernel` set and, without `-show-kernel`, adds `loglevel=3` (critical
+messages and panics only; docs/farm-android.md).
 
 Bootconfig is appended to the ramdisk. Keys: `androidboot.hardware=ranchu`,
 `boot_devices=a003600.virtio_mmio`, `qemu=1`, `qemu.avd_name`, `serialno`, `veritymode`,

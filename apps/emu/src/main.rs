@@ -66,6 +66,10 @@ fn shutdown_signals() -> std::sync::mpsc::Receiver<i32> {
     rx
 }
 
+/// How often a running instance tells the adb server about itself again.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ADB_REANNOUNCE: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn main() -> ExitCode {
     match real_main() {
         Ok(code) => code,
@@ -145,6 +149,17 @@ fn real_main() -> Result<ExitCode> {
         create_avd(&env, name, &sysdir, &opts)?;
         return Ok(ExitCode::SUCCESS);
     }
+    if let Some(name) = &opts.clone_avd {
+        let golden = opts.from.as_deref().context("-clone-avd needs -from GOLDEN")?;
+        let dir = env.clone_avd(golden, name)?;
+        println!("cloned {golden} as {name} at {}", dir.display());
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(name) = &opts.delete_avd {
+        env.delete_avd(name)?;
+        println!("deleted {name}");
+        return Ok(ExitCode::SUCCESS);
+    }
     if opts.accel_check {
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             println!("accel:\n0\nHypervisor.framework (arm64) is usable\naccel");
@@ -212,6 +227,20 @@ fn boot(
 
     let avd = env.load(name)?;
     let inst = instance::Instance::prepare(&avd, opts)?;
+    {
+        // An adb server finds emulators by scanning adb ports 5555..5585 (16 instances, unless
+        // started with ADB_LOCAL_TRANSPORT_MAX_PORT), or by being told (`host:emulator:<port>`,
+        // sent at boot). A server started later (adb kill-server, a reboot of adb) never hears
+        // of an instance above 5585, so it's told again every few seconds: for a device it
+        // already has, the server ignores it (one loopback connect and write).
+        let adb_port = inst.console_port + 1;
+        let _ = std::thread::Builder::new().name("adb-announce".into()).spawn(move || {
+            loop {
+                std::thread::sleep(ADB_REANNOUNCE);
+                emu_vmm::pipe::adb::AdbService::announce_port(adb_port);
+            }
+        });
+    }
     console::serve(
         inst.console_port,
         console::ConsoleInfo {
@@ -249,6 +278,9 @@ fn boot(
             for (i, exits) in out.exits.iter().enumerate() {
                 let line: Vec<String> = exits.iter().filter(|(_, n)| *n > 0).map(|(k, n)| format!("{k}={n}")).collect();
                 eprintln!("emu:   vcpu{i}: {}", line.join(" "));
+            }
+            if let Some(spool) = &inst.logcat {
+                eprintln!("emu:   logcat bytes dropped (its output fell behind): {}", spool.dropped());
             }
         }
         match out.reason {

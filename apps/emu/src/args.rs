@@ -7,6 +7,8 @@ usage: emu -avd NAME [options]
        emu -avd NAME -dry-run   (print the boot plan without booting; any host)
        emu -list-avds | -version | -accel-check
        emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a [-lcd 720x1280@320] [-cores N] [-memory MB]
+       emu -clone-avd NAME -from GOLDEN   (copy-on-write clone of a stopped AVD's settled simee disks)
+       emu -delete-avd NAME               (refused while any emulator, simee or stock, runs it)
        emu -provision API [-tag google_apis] [-abi arm64-v8a] [-no-renderer] [-dry-run] [-create-avd NAME [-lcd WxH@DPI] [-cores N] [-memory MB]]
        emu -provision-renderer [-dry-run]
        emu -list-images [-tag TAG] [-abi arm64-v8a]
@@ -30,7 +32,12 @@ options:
   -port N           console port; adb uses N+1
   -read-only        keep every disk write in memory (several instances per AVD)
   -wipe-data        reset user data before booting
-  -show-kernel      print the guest console
+  -show-kernel      print the guest console, every kernel and init message (without it the
+                    console, <avd>/simee/console.log, gets only critical ones and panics, like
+                    stock; EMU_CONSOLE=full logs everything there without printing it)
+  -logcat TAGS      stream the guest's logcat (filter TAGS, e.g. '*:I') to stdout
+  -logcat-output F  stream it to file F instead (all of it unless -logcat; F rolls over to F.1
+                    at 4 MiB)
   -verbose          diagnostics, including vCPU exit counts at shutdown
   -no-boot-anim     skip the boot animation
   -disk-cache MODE  unsafe (default: guest flushes stay in the host page cache) or fsync
@@ -54,7 +61,6 @@ const IGNORED_WITH_VALUE: &[&str] = &[
     "dns-server",
     "http-proxy",
     "timezone",
-    "logcat",
     "shell-serial",
     "prop",
     "datadir",
@@ -76,7 +82,6 @@ const IGNORED_WITH_VALUE: &[&str] = &[
     "encryption-key",
     "cache",
     "cache-size",
-    "logcat-output",
     "kernel",
     "ramdisk",
     "system",
@@ -98,6 +103,10 @@ pub struct Opts {
     pub read_only: bool,
     pub wipe_data: bool,
     pub show_kernel: bool,
+    /// `-logcat TAGS`: the guest's logcat filter, streamed to stdout.
+    pub logcat: Option<String>,
+    /// `-logcat-output FILE`: the stream goes to FILE.
+    pub logcat_output: Option<String>,
     pub verbose: bool,
     pub no_boot_anim: bool,
     pub no_window: bool,
@@ -106,6 +115,10 @@ pub struct Opts {
     /// `-disk-cache unsafe|fsync`: whether guest disk flushes fsync on the host.
     pub disk_fsync: bool,
     pub create_avd: Option<String>,
+    /// `-clone-avd NAME -from GOLDEN`.
+    pub clone_avd: Option<String>,
+    pub from: Option<String>,
+    pub delete_avd: Option<String>,
     pub sysdir: Option<String>,
     /// WxH@DPI
     pub lcd: Option<(u32, u32, u32)>,
@@ -147,6 +160,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
             "read-only" => o.read_only = true,
             "wipe-data" => o.wipe_data = true,
             "show-kernel" => o.show_kernel = true,
+            "logcat" => o.logcat = Some(value(flag)?),
+            "logcat-output" => o.logcat_output = Some(value(flag)?),
             "verbose" | "debug-init" => o.verbose = true,
             "no-boot-anim" => o.no_boot_anim = true,
             "no-window" => o.no_window = true,
@@ -159,6 +174,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
                 }
             }
             "create-avd" => o.create_avd = Some(value(flag)?),
+            "clone-avd" => o.clone_avd = Some(value(flag)?),
+            "from" => o.from = Some(value(flag)?),
+            "delete-avd" => o.delete_avd = Some(value(flag)?),
             "sysdir" => o.sysdir = Some(value(flag)?),
             "lcd" => o.lcd = Some(parse_lcd(&value(flag)?)?),
             "provision" => o.provision = Some(value(flag)?),
@@ -221,6 +239,9 @@ mod tests {
         assert_eq!(o.create_avd.as_deref(), Some("small"));
         assert_eq!(o.lcd, Some((480, 800, 240)));
         assert!(parse_lcd("480").is_err());
+        let o = p("-clone-avd farm-1 -from golden");
+        assert_eq!((o.clone_avd.as_deref(), o.from.as_deref()), (Some("farm-1"), Some("golden")));
+        assert_eq!(p("-delete-avd farm-1").delete_avd.as_deref(), Some("farm-1"));
     }
 
     #[test]

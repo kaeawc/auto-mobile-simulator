@@ -335,6 +335,17 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   parked afterwards, as the main thread did. Reading the 1.8 MiB ramdisk straight into guest RAM instead of through a `Vec` saved
   0.06 ms, so it was left as it was. `-verbose` prints the kernel source and time, how long the
   boot waited for the renderer, and when the vCPUs started relative to launch.
+- **Quiet console.** The PL011 traps twice per byte, and a boot printed ~230 KB on it: 88% of
+  all vCPU exits. Without `-show-kernel` the cmdline now adds `loglevel=3`: only emergencies,
+  alerts and criticals print, and dmesg still has everything. Stock passes `console=0` then and
+  prints nothing. Measured with `EMU_EXIT_PROFILE` (`scripts/farm-bench-android.sh`, details in
+  docs/farm-android.md): exits to boot_completed 516k → 77–109k, idle 4.5k → 122–154 exits/s.
+- **goldfish-logcat.** `init.ranchu.rc` runs `logcat -f /dev/hvc1` all the time. hvc1 had no
+  backend, so logcat restarted every ~5 s. The virtio-console's third port (unnamed, so a console
+  port, which makes it hvc1) now backs it. Its output is discarded with filter `*:S` unless
+  `-logcat TAGS` or `-logcat-output FILE` is given (through a bounded queue that drops rather
+  than stall the console worker; FILE rolls over at 4 MiB). sim-android starts emu with
+  `-logcat '*:I' -logcat-output <avd>/simee/logcat.txt`, which the desktop's Android panel shows.
 
 ## Development
 

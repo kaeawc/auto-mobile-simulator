@@ -19,7 +19,9 @@ use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use emu_avd::{Avd, Env, NewAvd, Running};
+/// The SDK and AVD home an [`Android`] works over (`Android::env`).
+pub use emu_avd::Env;
+use emu_avd::{Avd, NewAvd, Running};
 use sim_core::device::{DeviceInfo, DeviceState, RuntimeInfo, Selection, select};
 use sim_core::form_factor::{FormFactor, InputMethod, Kind, Profile, android_profile};
 use sim_core::frame::Frame;
@@ -42,6 +44,27 @@ impl Default for Android {
     fn default() -> Self {
         Self::from_env()
     }
+}
+
+/// How long a launched emulator that didn't boot gets to quit after SIGINT before SIGKILL.
+const STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// Stops a child this crate started: SIGINT (emu shuts down in order, like `kill -INT <pid>`),
+/// up to `grace` for it to exit, then SIGKILL; reaped either way.
+fn stop_child(child: &mut std::process::Child, grace: Duration) -> Result<(), String> {
+    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+        return Ok(());
+    }
+    let _ = Command::new("kill").args(["-INT", &child.id().to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(50));
+    }
+    child.kill().map_err(|e| e.to_string())?;
+    child.wait().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// A running emulator answers its console within this long of advertising itself.
@@ -210,18 +233,100 @@ impl Android {
         Ok(self.describe(name, &[]).info)
     }
 
+    /// Creates AVD `name` from `golden`, a stopped AVD that has booted under simee, with
+    /// copy-on-write clones of its settled disks (`emu_avd::Env::clone_avd`): it boots warm,
+    /// without first boot, and takes no disk space until it writes.
+    pub fn clone_avd(&self, golden: &str, name: &str) -> Result<DeviceInfo, String> {
+        self.env.clone_avd(golden, name).map_err(|e| e.to_string())?;
+        Ok(self.describe(name, &[]).info)
+    }
+
+    /// Boots every AVD in `avds` (those not running yet), at most `concurrency` at a time, each
+    /// on its own console port handed out here from `first_port` up ([`allocate_ports`]), and
+    /// waits for each like [`Device::boot`]. One result per AVD, in order: how long it took from
+    /// launch to booted, or why it didn't. A device that fails doesn't stop the others; the next
+    /// one starts as soon as any finishes.
+    pub fn boot_many(&self, avds: &[String], concurrency: usize, timeout: Duration, first_port: u16) -> Result<Vec<BootOutcome>, String> {
+        let locks = emu_avd::port_lock_dir();
+        let free = |p: u16| port_usable(locks.as_deref(), p, port_free);
+        self.boot_many_with(avds, concurrency, timeout, first_port, free, |d, port| d.launch_command(Some(port)))
+    }
+
+    fn boot_many_with(
+        &self,
+        avds: &[String],
+        concurrency: usize,
+        timeout: Duration,
+        first_port: u16,
+        free: impl Fn(u16) -> bool + Sync,
+        launch: impl Fn(&Device, u16) -> Command + Sync,
+    ) -> Result<Vec<BootOutcome>, String> {
+        let running = self.running();
+        let devices: Vec<Device> = avds.iter().map(|a| self.device(a)).collect::<Result<_, _>>()?;
+        let taken: Vec<u16> = running.iter().flat_map(|r| [r.console_port, r.adb_port]).collect();
+        let to_start = devices.iter().filter(|d| d.running.is_none()).count();
+        let last = *emu_ports().end();
+        let handed = allocate_ports(to_start, first_port, last, &taken, &free)?;
+        // Where a device whose pair was taken after all (another farm, or a bare emu started by
+        // another tool, claimed it between our probe and emu's claim) looks for its next one.
+        let spare = std::sync::Mutex::new(handed.iter().max().map_or(first_port, |p| p + 2));
+        let retry_port = |taken_now: &[u16]| -> Option<u16> {
+            let mut from = spare.lock().unwrap_or_else(|e| e.into_inner());
+            let p = allocate_ports(1, *from, last, taken_now, &free).ok()?.first().copied()?;
+            *from = p + 2;
+            Some(p)
+        };
+        let mut ports = handed.into_iter();
+        let jobs: Vec<(Device, u16)> = devices
+            .into_iter()
+            .map(|d| {
+                let port = match &d.running {
+                    Some(r) => r.console_port,
+                    None => ports.next().unwrap_or_default(),
+                };
+                (d, port)
+            })
+            .collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let results: std::sync::Mutex<Vec<Option<BootOutcome>>> = std::sync::Mutex::new(vec![None; jobs.len()]);
+        std::thread::scope(|s| {
+            for _ in 0..concurrency.clamp(1, jobs.len().max(1)) {
+                s.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((d, port)) = jobs.get(i) else { break };
+                        let (mut port, mut tries) = (*port, 0);
+                        let started = Instant::now();
+                        let result = loop {
+                            let r = d.boot_with(self, timeout, launch(d, port)).map(|()| started.elapsed());
+                            match r {
+                                Err(e) if e.contains(emu_avd::PORT_TAKEN) && tries < PORT_RETRIES => {
+                                    tries += 1;
+                                    let taken_now: Vec<u16> = self.running().iter().flat_map(|r| [r.console_port, r.adb_port]).collect();
+                                    match retry_port(&taken_now) {
+                                        Some(p) => port = p,
+                                        None => break Err(e),
+                                    }
+                                }
+                                r => break r,
+                            }
+                        };
+                        let outcome = BootOutcome { avd: d.info.udid.clone(), console_port: port, result };
+                        results.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(outcome);
+                    }
+                });
+            }
+        });
+        Ok(results.into_inner().unwrap_or_else(|e| e.into_inner()).into_iter().flatten().collect())
+    }
+
     /// Deletes a stopped AVD (its directory and pointer file).
     pub fn delete(&self, device: &Device) -> Result<(), String> {
         if device.running.is_some() {
             return Err(format!("{} is running; shut it down first", device.info.name));
         }
-        let avd = device.avd.as_ref().ok_or_else(|| format!("{} has no AVD directory", device.info.name))?;
-        std::fs::remove_dir_all(&avd.dir).map_err(|e| format!("{}: {e}", avd.dir.display()))?;
-        let pointer = self.env.avd_home.join(format!("{}.ini", device.info.udid));
-        if pointer.is_file() {
-            std::fs::remove_file(&pointer).map_err(|e| format!("{}: {e}", pointer.display()))?;
-        }
-        Ok(())
+        // Also refuses one a stock emulator holds that hasn't advertised itself (its lock files).
+        self.env.delete_avd_in(&device.info.udid, self.running_dir.as_deref()).map_err(|e| e.to_string())
     }
 
     /// `adb`, from the SDK's platform-tools or the PATH.
@@ -229,6 +334,53 @@ impl Android {
         let sdk = self.env.sdk_root.as_ref().map(|r| r.join("platform-tools/adb")).filter(|p| p.is_file());
         sdk.or_else(|| Command::new("adb").arg("version").output().ok().filter(|o| o.status.success()).map(|_| PathBuf::from("adb")))
     }
+}
+
+/// One device's result in [`Android::boot_many`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootOutcome {
+    pub avd: String,
+    /// Its console port (`emulator-<port>`); adb is the next one.
+    pub console_port: u16,
+    /// Launch to booted, or why it didn't boot.
+    pub result: Result<Duration, String>,
+}
+
+/// The console ports emulators use (stock's range: 5554 to 5682, adb on each + 1).
+pub fn emu_ports() -> std::ops::RangeInclusive<u16> {
+    5554..=5682
+}
+
+/// How many other pairs [`Android::boot_many`] tries for a device whose emu reports its pair
+/// taken ([`emu_avd::PORT_TAKEN`]).
+const PORT_RETRIES: usize = 3;
+
+/// Whether console or adb port `p` is usable: no simee instance holds its claim in `locks`
+/// (`<locks>/<p>.lock`, taken by emu before it probes or binds, so one that's starting counts)
+/// and `bind` says it's free now.
+pub fn port_usable(locks: Option<&Path>, p: u16, bind: impl Fn(u16) -> bool) -> bool {
+    !locks.is_some_and(|d| emu_avd::port_claimed(d, p)) && bind(p)
+}
+
+/// Console ports for `n` devices launched together: even ports from `first` to `last` whose
+/// console and adb ports aren't `taken` (advertised by a running emulator, stock or simee) and
+/// are `free` (in [`Android::boot_many`]: not claimed by a starting simee, [`port_usable`],
+/// and free to bind now). One allocator hands out every pair, so devices launched at once never
+/// probe their way to the same one. Another allocator (a second farm, a bare `emu`) can still
+/// claim a pair between this probe and emu's own claim; emu then exits with
+/// [`emu_avd::PORT_TAKEN`] and `boot_many` moves that device to another pair.
+pub fn allocate_ports(n: usize, first: u16, last: u16, taken: &[u16], free: &dyn Fn(u16) -> bool) -> Result<Vec<u16>, String> {
+    let start = first + first % 2;
+    let ports: Vec<u16> =
+        (start..=last).step_by(2).filter(|&p| !taken.contains(&p) && !taken.contains(&(p + 1)) && free(p) && free(p + 1)).take(n).collect();
+    if ports.len() < n {
+        return Err(format!("only {} free console/adb port pairs in {first}..{last} for {n} devices", ports.len()));
+    }
+    Ok(ports)
+}
+
+fn port_free(p: u16) -> bool {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, p)).is_ok()
 }
 
 /// `system-images;android-36;google_apis;arm64-v8a` for an image directory.
@@ -303,6 +455,12 @@ impl Device {
     /// `sys.boot_completed` is 1 when adb is available, else until the display has a frame.
     /// The emulator's own output goes to `<avd>/simee/emu.log`.
     pub fn boot(&self, android: &Android, timeout: Duration) -> Result<(), String> {
+        self.boot_with(android, timeout, self.launch_command(None))
+    }
+
+    /// The command that starts `emu` for this AVD, on console port `port` if given (else emu
+    /// picks the first free pair).
+    fn launch_command(&self, port: Option<u16>) -> Command {
         let bin = emu_binary();
         let signer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/sign-run.sh");
         let mut cmd = if cfg!(target_os = "macos") && signer.is_file() {
@@ -313,7 +471,15 @@ impl Device {
             Command::new(&bin)
         };
         cmd.args(["-avd", &self.info.udid, "-no-boot-anim"]);
-        self.boot_with(android, timeout, cmd)
+        // The guest's logcat, for the desktop's panel and anyone debugging a boot: the console
+        // is quiet now, and logcat over hvc1 is the cheap stream.
+        if let Some(avd) = &self.avd {
+            cmd.args(["-logcat", LOGCAT_FILTER, "-logcat-output"]).arg(emu_avd::state_dir(&avd.dir).join(LOGCAT_FILE));
+        }
+        if let Some(port) = port {
+            cmd.args(["-port", &port.to_string()]);
+        }
+        cmd
     }
 
     /// [`boot`](Self::boot) with the launch command given (its stdout and stderr are replaced by
@@ -366,7 +532,15 @@ impl Device {
                 }
             }
             if Instant::now() >= deadline {
-                return Err(format!("{} did not finish booting within {}s", self.info.name, timeout.as_secs()));
+                // A device that failed leaves nothing behind: the emulator this call started is
+                // stopped and reaped (no zombie in a long-lived caller), its ports released.
+                let stopped = child.as_mut().map(|c| stop_child(c, STOP_GRACE));
+                let note = match stopped {
+                    Some(Ok(())) => "; stopped it",
+                    Some(Err(_)) => "; it could not be stopped",
+                    None => "",
+                };
+                return Err(format!("{} did not finish booting within {}s{note}", self.info.name, timeout.as_secs()));
             }
             sleep(BOOT_POLL);
         }
@@ -671,13 +845,54 @@ fn booted(r: &Running, adb: Option<&Path>) -> bool {
     }
 }
 
-/// The last `n` lines of a device's guest console (`<avd>/simee/console.log`). Reads from the
-/// end, 64 KiB at a time, until it has them: the log grows to megabytes of kernel output, and
-/// the desktop asks every two seconds. Bytes that aren't UTF-8 show as U+FFFD.
+/// The last `n` lines of a device's guest console (`<avd>/simee/console.log`). Without
+/// `-show-kernel` (or `EMU_CONSOLE=full`) emu keeps the console quiet: only critical kernel
+/// messages and panics, so for a normal boot it's empty.
 pub fn console_log_tail(avd_dir: &Path, n: usize) -> Vec<String> {
+    file_tail(&emu_avd::state_dir(avd_dir).join("console.log"), n)
+}
+
+/// Where [`Device::boot`] has emu write the guest's logcat, in the AVD's state directory
+/// ([`emu_avd::state_dir`]; `-logcat-output`; it rolls over to `logcat.txt.1` at 4 MiB). Filter
+/// [`LOGCAT_FILTER`].
+pub const LOGCAT_FILE: &str = "logcat.txt";
+
+/// The logcat filter devices booted here stream to [`LOGCAT_FILE`]: info and up. hvc1 takes
+/// whole buffers per kick, so it costs the guest logcat's formatting, not vCPU exits per byte.
+pub const LOGCAT_FILTER: &str = "*:I";
+
+/// The last `n` lines of a device's logcat stream ([`LOGCAT_FILE`], the rolled-over file
+/// before it when the current one is short).
+pub fn logcat_tail(avd_dir: &Path, n: usize) -> Vec<String> {
+    let dir = emu_avd::state_dir(avd_dir);
+    let current = file_tail(&dir.join(LOGCAT_FILE), n);
+    if current.len() >= n {
+        return current;
+    }
+    let mut older = file_tail(&dir.join(format!("{LOGCAT_FILE}.1")), n - current.len());
+    older.extend(current);
+    older
+}
+
+/// What a device panel shows, newest last, at most `n` lines: the console's critical lines (a
+/// panic, init's FATAL; at most a quarter of `n`) then logcat's.
+pub fn device_log_tail(avd_dir: &Path, n: usize) -> Vec<String> {
+    let mut lines = console_log_tail(avd_dir, n / 4);
+    let rest = n - lines.len();
+    lines.extend(logcat_tail(avd_dir, rest));
+    lines
+}
+
+/// The last `n` lines of `path`. Reads from the end, 64 KiB at a time, until it has them: logs
+/// grow to megabytes, and the desktop asks every two seconds. Bytes that aren't UTF-8 show as
+/// U+FFFD.
+fn file_tail(path: &Path, n: usize) -> Vec<String> {
     use std::io::{Read, Seek, SeekFrom};
     const STEP: u64 = 64 * 1024;
-    let Ok(mut f) = std::fs::File::open(emu_avd::state_dir(avd_dir).join("console.log")) else { return Vec::new() };
+    if n == 0 {
+        return Vec::new();
+    }
+    let Ok(mut f) = std::fs::File::open(path) else { return Vec::new() };
     let Ok(len) = f.metadata().map(|m| m.len()) else { return Vec::new() };
     let mut window = STEP.min(len);
     let tail = loop {
@@ -909,6 +1124,193 @@ mod tests {
         assert!(took >= Duration::from_millis(500), "not before the line: {took:?}");
         assert!(took < Duration::from_millis(1500), "within a poll or two of the line: {took:?}");
         assert_eq!(adb_runs(&runs), 1, "no adb until the line, then one confirmation");
+    }
+
+    #[test]
+    fn ports_are_handed_out_once_around_running_emulators() {
+        assert_eq!(allocate_ports(3, 5600, 5682, &[5602, 5603], &|_| true), Ok(vec![5600, 5604, 5606]));
+        assert_eq!(allocate_ports(2, 5601, 5682, &[5605], &|p| p != 5603), Ok(vec![5606, 5608]), "odd start rounds up; adb ports count");
+        assert_eq!(allocate_ports(2, 5678, 5682, &[], &|_| true), Ok(vec![5678, 5680]));
+        assert!(allocate_ports(4, 5678, 5682, &[], &|_| true).expect_err("too few").starts_with("only 3 free"), "5682 is the last");
+        assert_eq!(allocate_ports(0, 5600, 5682, &[], &|_| false), Ok(vec![]));
+    }
+
+    #[test]
+    fn ports_claimed_by_a_starting_emu_are_skipped() {
+        // Another simee (a second farm, a bare `emu` from another tool) holds 5600's claim but
+        // hasn't bound or advertised yet: only the lock file shows it.
+        let locks = f_dir("port-locks");
+        std::fs::create_dir_all(&locks).expect("mkdir");
+        let held = std::fs::File::create(locks.join("5600.lock")).expect("lock file");
+        held.lock().expect("lock");
+        std::fs::File::create(locks.join("5602.lock")).expect("an unheld leftover");
+        let free = |p: u16| port_usable(Some(&locks), p, |_| true);
+        assert!(!free(5600) && free(5602) && free(5601));
+        assert_eq!(allocate_ports(2, 5600, 5682, &[], &free), Ok(vec![5602, 5604]));
+        drop(held);
+        // Released (a child another test forks at this moment holds a copy of the descriptor
+        // until it execs, so give it a moment).
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while emu_avd::port_claimed(&locks, 5600) && Instant::now() < deadline {
+            sleep(Duration::from_millis(10));
+        }
+        assert_eq!(allocate_ports(2, 5600, 5682, &[], &free), Ok(vec![5600, 5602]), "released");
+        assert!(!port_usable(None, 5600, |p| p != 5600), "the bind probe still counts");
+        let _ = std::fs::remove_dir_all(locks);
+    }
+
+    #[test]
+    fn a_device_whose_pair_was_taken_moves_to_the_next() {
+        let f = fixture("taken");
+        let names: Vec<String> = ["t1", "t2"].iter().map(|s| s.to_string()).collect();
+        for n in &names {
+            f.android.create(n, "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        }
+        fake_adb(&f);
+        let _console = fake_emulator(&f.android, "console-only");
+        let me = f.android.running_dir.clone().expect("running").join(format!("pid_{}.ini", std::process::id()));
+        let console = Running::parse(&format!("pid_{}.ini", std::process::id()), &std::fs::read_to_string(&me).expect("ad"))
+            .expect("parse")
+            .console_port;
+        let run = f.android.running_dir.clone().expect("running");
+        let launches = std::sync::Mutex::new(Vec::new());
+        let out = f
+            .android
+            .boot_many_with(
+                &names,
+                2,
+                Duration::from_secs(20),
+                5600,
+                |_| true,
+                |d, port| {
+                    launches.lock().expect("launches").push((d.info.udid.clone(), port));
+                    // t1's first pair was claimed by someone else between allocation and launch.
+                    if port == 5600 {
+                        return sh(&format!("echo 'emu: error: console port {port} {}' >&2; exit 1", emu_avd::PORT_TAKEN));
+                    }
+                    sh(&format!(
+                        "printf 'port.serial={console}\\navd.name={}\\nemulator=simee\\n' > {}/pid_$$.ini; \
+                     echo 'emu: boot completed in 0.1s'; sleep 2",
+                        d.info.udid,
+                        run.display()
+                    ))
+                },
+            )
+            .expect("boot_many");
+        assert_eq!(out.iter().map(|o| (o.avd.as_str(), o.console_port)).collect::<Vec<_>>(), [("t1", 5604), ("t2", 5602)]);
+        assert!(out.iter().all(|o| o.result.is_ok()), "{out:?}");
+        let tries: Vec<u16> = launches.into_inner().expect("launches").into_iter().filter(|(a, _)| a == "t1").map(|(_, p)| p).collect();
+        assert_eq!(tries, [5600, 5604]);
+    }
+
+    #[test]
+    fn a_boot_that_times_out_stops_and_reaps_its_emulator() {
+        let f = fixture("timeout");
+        f.android.create("slow", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let d = f.android.device("slow").expect("stopped");
+        let pid_file = f.root.join("slow.pid");
+        // An emu that never boots; it quits on SIGINT as emu does.
+        let t = Instant::now();
+        let err = d
+            .boot_with(&f.android, Duration::from_millis(500), sh(&format!("echo $$ > {}; exec sleep 60", pid_file.display())))
+            .expect_err("never boots");
+        assert!(err.contains("did not finish booting") && err.contains("stopped it"), "{err}");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        let pid: i32 = std::fs::read_to_string(&pid_file).expect("pid").trim().parse().expect("pid");
+        // Gone and reaped: a zombie would still answer signal 0.
+        let alive = Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().expect("kill -0");
+        assert!(!alive.success(), "pid {pid} is still there");
+    }
+
+    #[test]
+    fn an_emulator_that_ignores_sigint_is_killed() {
+        let mut child = sh("trap '' INT; while :; do sleep 0.05; done").spawn().expect("spawn");
+        sleep(Duration::from_millis(200)); // the trap is set
+        let t = Instant::now();
+        stop_child(&mut child, Duration::from_millis(300)).expect("stopped");
+        assert!(t.elapsed() >= Duration::from_millis(300), "waited the grace first");
+        assert!(child.try_wait().expect("wait").is_some(), "reaped");
+    }
+
+    #[test]
+    fn launches_stream_logcat_to_the_avd() {
+        let f = fixture("logcat-arg");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let d = f.android.device("phone").expect("device");
+        let args: Vec<String> = d.launch_command(Some(5600)).get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let at = args.iter().position(|a| a == "-logcat-output").expect("-logcat-output");
+        assert_eq!(Path::new(&args[at + 1]), emu_avd::state_dir(&d.avd.as_ref().expect("avd").dir).join(LOGCAT_FILE));
+        let at = args.iter().position(|a| a == "-logcat").expect("-logcat");
+        assert_eq!(args[at + 1], LOGCAT_FILTER);
+    }
+
+    #[test]
+    fn the_device_log_is_the_consoles_critical_lines_then_logcat() {
+        let dir = f_dir("devlog");
+        std::fs::create_dir_all(emu_avd::state_dir(&dir)).expect("mkdir");
+        assert!(device_log_tail(&dir, 200).is_empty());
+        std::fs::write(emu_avd::state_dir(&dir).join("console.log"), "").expect("quiet console");
+        std::fs::write(emu_avd::state_dir(&dir).join("logcat.txt.1"), "o1\no2\no3\n").expect("rolled over");
+        std::fs::write(emu_avd::state_dir(&dir).join("logcat.txt"), "l1\nl2\n").expect("logcat");
+        assert_eq!(device_log_tail(&dir, 4), ["o2", "o3", "l1", "l2"], "the rolled-over file fills a short current one");
+        assert_eq!(logcat_tail(&dir, 2), ["l1", "l2"]);
+        std::fs::write(emu_avd::state_dir(&dir).join("console.log"), "Kernel panic - not syncing\n").expect("panic");
+        assert_eq!(device_log_tail(&dir, 4), ["Kernel panic - not syncing", "o3", "l1", "l2"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn boot_many_runs_k_at_a_time_on_their_own_ports() {
+        let f = fixture("many");
+        let names: Vec<String> = ["d1", "d2", "d3", "bad"].iter().map(|s| s.to_string()).collect();
+        for n in &names {
+            f.android.create(n, "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        }
+        fake_adb(&f);
+        // One fake console answers for every device; each launched "emu" advertises itself
+        // (its shell's PID) with it, then prints the boot line.
+        let _console = fake_emulator(&f.android, "console-only");
+        let me = f.android.running_dir.clone().expect("running").join(format!("pid_{}.ini", std::process::id()));
+        let ad = std::fs::read_to_string(&me).expect("fake ad");
+        let console = Running::parse(&format!("pid_{}.ini", std::process::id()), &ad).expect("parse").console_port;
+        let run = f.android.running_dir.clone().expect("running");
+        let launches = std::sync::Mutex::new(Vec::new());
+        let t = Instant::now();
+        let out = f
+            .android
+            .boot_many_with(
+                &names,
+                2,
+                Duration::from_secs(20),
+                5600,
+                |_| true,
+                |d, port| {
+                    launches.lock().expect("launches").push((d.info.udid.clone(), port));
+                    if d.info.udid == "bad" {
+                        return sh("echo 'emu: error: no hypervisor' >&2; exit 1");
+                    }
+                    sh(&format!(
+                        "printf 'port.serial={console}\\navd.name={}\\nemulator=simee\\n' > {}/pid_$$.ini; sleep 0.4; \
+                     echo 'emu: boot completed in 0.4s'; sleep 3",
+                        d.info.udid,
+                        run.display()
+                    ))
+                },
+            )
+            .expect("boot_many");
+        let took = t.elapsed();
+        assert_eq!(
+            out.iter().map(|o| (o.avd.as_str(), o.console_port)).collect::<Vec<_>>(),
+            [("d1", 5600), ("d2", 5602), ("d3", 5604), ("bad", 5606)]
+        );
+        assert!(out[..3].iter().all(|o| o.result.as_ref().is_ok_and(|d| *d >= Duration::from_millis(400))), "{out:?}");
+        assert!(out[3].result.as_ref().expect_err("bad fails").contains("no hypervisor"), "{out:?}");
+        assert!(took >= Duration::from_millis(800), "three 0.4 s boots two at a time take two rounds: {took:?}");
+        let mut ports: Vec<u16> = launches.into_inner().expect("launches").into_iter().map(|(_, p)| p).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        assert_eq!(ports.len(), 4, "one port each");
+        assert!(f.android.boot_many(&["nope".to_string()], 1, Duration::from_secs(1), 5600).is_err(), "unknown AVDs fail up front");
     }
 
     #[test]

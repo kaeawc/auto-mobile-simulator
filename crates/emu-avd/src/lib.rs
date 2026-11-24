@@ -75,8 +75,15 @@ impl Env {
     }
 
     pub fn load(&self, name: &str) -> Result<Avd> {
+        let content_dir = self.content_dir(name)?;
+        let config = parse_ini(&read(&content_dir.join("config.ini"))?);
+        Avd::new(name, content_dir, config, self.sdk_root.as_deref())
+    }
+
+    /// AVD `name`'s directory: its pointer's `path=` (or `path.rel=`), else `<name>.avd`.
+    fn content_dir(&self, name: &str) -> Result<PathBuf> {
         let pointer = self.avd_home.join(format!("{name}.ini"));
-        let content_dir = if pointer.is_file() {
+        Ok(if pointer.is_file() {
             let p = parse_ini(&read(&pointer)?);
             p.get("path")
                 .map(PathBuf::from)
@@ -89,10 +96,58 @@ impl Env {
                 return Err(Error::UnknownAvd(name.to_string(), self.avd_home.clone()));
             }
             d
-        };
-        let config = parse_ini(&read(&content_dir.join("config.ini"))?);
-        Avd::new(name, content_dir, config, self.sdk_root.as_deref())
+        })
     }
+}
+
+/// Whether `name` is an AVD name `create_avd` accepts: letters, digits, `.`, `_`, `-`, and not
+/// `.` or `..` (so `<avd home>/<name>.avd` and `<name>.ini` stay inside the AVD home).
+fn valid_avd_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+/// Console port claims: simee holds `<dir>/<port>.lock` locked for its process's life, taken
+/// before it probes or binds the port (`$HOME/Library/Caches/simee/ports`).
+pub fn port_lock_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Caches/simee/ports"))
+}
+
+/// Whether some process holds console port `port`'s claim in `dir`. The probe takes the lock
+/// for an instant when it's free, so an emu claiming that port at the same moment may see it
+/// taken: launchers that pass `-port` retry on another pair when emu exits with [`PORT_TAKEN`].
+pub fn port_claimed(dir: &Path, port: u16) -> bool {
+    std::fs::File::open(dir.join(format!("{port}.lock"))).is_ok_and(|f| matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
+}
+
+/// What emu says (in its exit error) when `-port N`'s claim is held by another instance.
+pub const PORT_TAKEN: &str = "is taken by another simee instance";
+
+/// Lock files the stock emulator keeps in an AVD directory while it runs it: `multiinstance.lock`
+/// (a file lock) and `hardware-qemu.ini.lock` (holds its PID). Also simee's own.
+fn held_lock(dir: &Path) -> Option<PathBuf> {
+    let candidates = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "lock"))
+        .chain(std::iter::once(state_dir(dir).join("instance.lock")));
+    for path in candidates {
+        let Ok(f) = std::fs::File::open(&path) else { continue };
+        if matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)) {
+            return Some(path);
+        }
+        // A PID lock (stock's filelock: the PID, then NUL) whose process is alive. A stale one
+        // from a crash names a dead PID (or, rarely, a reused one: refusing then is safe).
+        let pid = std::fs::read(&path).ok().and_then(|b| {
+            let digits: String = b.iter().take_while(|c| c.is_ascii_digit()).map(|&c| c as char).collect();
+            digits.parse::<i32>().ok()
+        });
+        if pid.and_then(rustix::process::Pid::from_raw).is_some_and(|p| rustix::process::test_kill_process(p).is_ok()) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// A resolved AVD: its directory, config and system image.
@@ -406,8 +461,7 @@ impl Env {
     /// Creates an AVD the way the SDK's avdmanager lays it out (`<name>.ini` pointer and
     /// `<name>.avd/config.ini`), with no Java involved. Refuses to overwrite an existing AVD.
     pub fn create_avd(&self, spec: &NewAvd) -> Result<PathBuf> {
-        let valid = !spec.name.is_empty() && spec.name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
-        if !valid {
+        if !valid_avd_name(&spec.name) {
             return Err(Error::Config(format!("invalid AVD name '{}' (letters, digits, . _ -)", spec.name)));
         }
         let dir = self.avd_home.join(format!("{}.avd", spec.name));
@@ -452,6 +506,108 @@ impl Env {
         }
         Ok(dir)
     }
+
+    /// Creates AVD `name` as a copy of `golden` whose simee disks (`<golden>/simee/`: userdata,
+    /// cache, metadata) are copy-on-write clones: on APFS `std::fs::copy` clones the file
+    /// (`fclonefileat`), so a clone takes no space until either side writes, and it boots warm
+    /// (no first-boot formatting, encryption or dexopt) from the state the golden was settled in.
+    /// The clone runs persistent, with its own state from then on.
+    ///
+    /// Only the golden's `config.ini`, `boot.prop` and `simee/` files are read; its stock
+    /// emulator files (qcow2 overlays, snapshots) are never touched or copied. The golden must be
+    /// stopped (its instance lock is held for the copy) and must have booted under simee once.
+    ///
+    /// What tells clones apart: the AVD name (`androidboot.qemu.avd_name`, the console's
+    /// `avd name`) and the adb serial `emulator-<console port>`, which is per launch. Like the
+    /// stock emulator's `-read-only` instances, clones keep the golden's guest identity
+    /// (`ro.serialno`, Settings' android_id and per-app SSAIDs live in the cloned userdata).
+    pub fn clone_avd(&self, golden: &str, name: &str) -> Result<PathBuf> {
+        let src = self.load(golden)?;
+        let src_disks = state_dir(&src.dir);
+        let userdata = src_disks.join("userdata.img");
+        if !userdata.is_file() {
+            return Err(Error::Config(format!("{golden} has no simee user data yet (boot it once with emu, then stop it)")));
+        }
+        let io = |p: &Path, e| Error::Io(p.to_path_buf(), e);
+        // Held while copying, so the golden can't start (or is refused if it's running).
+        let lock_path = src_disks.join("instance.lock");
+        let lock = std::fs::File::create(&lock_path).map_err(|e| io(&lock_path, e))?;
+        if lock.try_lock().is_err() {
+            return Err(Error::Config(format!("{golden} is running; stop it before cloning it")));
+        }
+        let sysdir = src.get("image.sysdir.1").unwrap_or_default().to_owned();
+        self.create_avd(&NewAvd::new(name, &sysdir))?;
+        let dir = self.avd_home.join(format!("{name}.avd"));
+        let made = (|| {
+            // The golden's config, renamed: same hardware and image.
+            let config: String = read(&src.dir.join("config.ini"))?
+                .lines()
+                .map(|l| match l.split_once('=').map(|(k, _)| k.trim()) {
+                    Some("AvdId") => format!("AvdId={name}\n"),
+                    Some("avd.ini.displayname") => format!("avd.ini.displayname={name}\n"),
+                    _ => format!("{l}\n"),
+                })
+                .collect();
+            let cfg = dir.join("config.ini");
+            std::fs::write(&cfg, config).map_err(|e| io(&cfg, e))?;
+            let boot = src.dir.join("boot.prop");
+            if boot.is_file() {
+                std::fs::copy(&boot, dir.join("boot.prop")).map_err(|e| io(&boot, e))?;
+            }
+            let disks = state_dir(&dir);
+            std::fs::create_dir_all(&disks).map_err(|e| io(&disks, e))?;
+            for f in CLONED_DISKS {
+                let from = src_disks.join(f);
+                if from.is_file() {
+                    std::fs::copy(&from, disks.join(f)).map_err(|e| io(&from, e))?;
+                }
+            }
+            Ok(())
+        })();
+        drop(lock);
+        if let Err(e) = made {
+            let _ = self.delete_avd(name);
+            return Err(e);
+        }
+        Ok(dir)
+    }
+
+    /// Deletes AVD `name`: its directory (where its `<name>.ini` points, as [`Env::load`] finds
+    /// it) and that pointer, nothing else. Refused while any emulator runs it, simee or stock:
+    /// one advertised in [`running_dir`] for it, or a lock file in its directory that is held
+    /// (simee's `simee/instance.lock`, stock's `multiinstance.lock`, `hardware-qemu.ini.lock`).
+    pub fn delete_avd(&self, name: &str) -> Result<()> {
+        self.delete_avd_in(name, running_dir().as_deref())
+    }
+
+    /// [`Env::delete_avd`] with running emulators advertised in `running`.
+    pub fn delete_avd_in(&self, name: &str, running: Option<&Path>) -> Result<()> {
+        if !valid_avd_name(name) {
+            return Err(Error::Config(format!("invalid AVD name '{name}' (letters, digits, . _ -)")));
+        }
+        let pointer = self.avd_home.join(format!("{name}.ini"));
+        let dir = self.content_dir(name)?;
+        if dir.exists() && !dir.join("config.ini").is_file() {
+            return Err(Error::Config(format!("{} has no config.ini; not deleting a directory that isn't an AVD", dir.display())));
+        }
+        let real = dir.canonicalize().ok();
+        let advertised = running.map(running_instances_in).unwrap_or_default().into_iter().find(|r| {
+            r.avd_name == name || r.avd_dir.as_deref().is_some_and(|d| d == dir || (real.is_some() && d.canonicalize().ok() == real))
+        });
+        if let Some(r) = advertised {
+            return Err(Error::Config(format!("{name} is running ({}, PID {}); stop it before deleting it", r.serial(), r.pid)));
+        }
+        if let Some(lock) = held_lock(&dir) {
+            return Err(Error::Config(format!("{name} is running ({} is held); stop it before deleting it", lock.display())));
+        }
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|e| Error::Io(dir.clone(), e))?;
+        }
+        if pointer.exists() {
+            std::fs::remove_file(&pointer).map_err(|e| Error::Io(pointer.clone(), e))?;
+        }
+        Ok(())
+    }
 }
 
 /// emu's own state under an AVD or SDK directory: `<avd>/simee/` (disks, logs, display socket,
@@ -462,6 +618,11 @@ pub const STATE_DIR: &str = "simee";
 pub fn state_dir(avd_dir: &Path) -> PathBuf {
     avd_dir.join(STATE_DIR)
 }
+
+/// The simee disks a clone gets from its golden AVD (`<avd>/simee/`): user data, the cache
+/// partition and the metadata partition that holds user data's encryption key, so the three stay
+/// consistent.
+pub const CLONED_DISKS: [&str; 3] = ["userdata.img", "cache.img", "encryptionkey.img"];
 
 /// Where running emulators advertise themselves (`pid_<pid>.ini`), as the SDK tools look for them.
 pub fn running_dir() -> Option<PathBuf> {
@@ -692,6 +853,128 @@ mod tests {
             [Some(true), Some(false), Some(false)]
         );
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn clones_copy_the_goldens_simee_disks_and_nothing_else() {
+        let tmp = std::env::temp_dir().join(format!("emu-avd-clone-{}", std::process::id()));
+        let sdk = tmp.join("sdk");
+        let sys = sdk.join("system-images/android-36/google_apis/arm64-v8a");
+        std::fs::create_dir_all(&sys).expect("mkdir");
+        std::fs::write(sys.join("kernel-ranchu"), b"k").expect("write");
+        let env = Env { sdk_root: Some(sdk), avd_home: tmp.join("avd") };
+        let mut spec = NewAvd::new("golden", "system-images/android-36/google_apis/arm64-v8a");
+        spec.lcd = (480, 800, 240);
+        spec.boot_props = vec![("qemu.hw.mainkeys".into(), "1".into())];
+        let gdir = env.create_avd(&spec).expect("create golden");
+        assert!(env.clone_avd("golden", "c1").is_err(), "a golden that never booted under simee has no user data");
+        assert!(!env.avd_home.join("c1.avd").exists() && !env.avd_home.join("c1.ini").exists(), "nothing left behind");
+
+        std::fs::create_dir_all(state_dir(&gdir)).expect("mkdir");
+        for (f, body) in [("userdata.img", "data"), ("cache.img", "cache"), ("encryptionkey.img", "key"), ("console.log", "log")] {
+            std::fs::write(state_dir(&gdir).join(f), body).expect("write");
+        }
+        std::fs::write(gdir.join("userdata-qemu.img.qcow2"), b"stock").expect("stock overlay");
+        let cdir = env.clone_avd("golden", "c1").expect("clone");
+        let c = env.load("c1").expect("load clone");
+        assert_eq!((c.lcd(), c.get("AvdId"), c.get("avd.ini.displayname")), ((480, 800, 240), Some("c1"), Some("c1")));
+        assert_eq!(c.boot_properties(), vec![("qemu.hw.mainkeys".to_string(), "1".to_string())]);
+        for (f, body) in [("userdata.img", "data"), ("cache.img", "cache"), ("encryptionkey.img", "key")] {
+            assert_eq!(std::fs::read_to_string(state_dir(&cdir).join(f)).expect("cloned"), body);
+        }
+        assert!(!state_dir(&cdir).join("console.log").exists() && !cdir.join("userdata-qemu.img.qcow2").exists(), "only the disks");
+        // Copy-on-write: the clone's writes don't reach the golden.
+        std::fs::write(state_dir(&cdir).join("userdata.img"), "changed").expect("write");
+        assert_eq!(std::fs::read_to_string(state_dir(&gdir).join("userdata.img")).expect("golden"), "data");
+        assert!(env.clone_avd("golden", "c1").is_err(), "names are unique");
+
+        // A running golden (its instance lock held) is refused, and so is deleting a running clone.
+        let held = std::fs::File::create(state_dir(&gdir).join("instance.lock")).expect("lock");
+        held.lock().expect("lock");
+        assert!(env.clone_avd("golden", "c2").expect_err("running").to_string().contains("running"));
+        assert!(!env.avd_home.join("c2.avd").exists());
+        drop(held);
+        let held = std::fs::File::create(state_dir(&cdir).join("instance.lock")).expect("lock");
+        held.lock().expect("lock");
+        assert!(env.delete_avd("c1").is_err());
+        drop(held);
+        env.delete_avd("c1").expect("delete");
+        assert!(!cdir.exists() && !env.avd_home.join("c1.ini").exists());
+        assert!(env.delete_avd("c1").is_err(), "already gone");
+        assert!(state_dir(&gdir).join("userdata.img").is_file(), "the golden is untouched");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn delete_avd_follows_the_pointer_and_refuses_running_ones() {
+        let tmp = std::env::temp_dir().join(format!("emu-avd-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let sdk = tmp.join("sdk");
+        let sys = sdk.join("system-images/android-36/google_apis/arm64-v8a");
+        std::fs::create_dir_all(&sys).expect("mkdir");
+        std::fs::write(sys.join("kernel-ranchu"), b"k").expect("write");
+        let env = Env { sdk_root: Some(sdk), avd_home: tmp.join("avd") };
+        let running = tmp.join("running");
+        std::fs::create_dir_all(&running).expect("mkdir");
+        let make = |name: &str| env.create_avd(&NewAvd::new(name, "system-images/android-36/google_apis/arm64-v8a")).expect("create");
+
+        // Names are validated as create_avd does: nothing outside the AVD home is reached.
+        std::fs::create_dir_all(tmp.join("outside.avd")).expect("mkdir");
+        std::fs::write(tmp.join("outside.avd/config.ini"), "").expect("write");
+        std::fs::write(tmp.join("outside.ini"), "path=x\n").expect("write");
+        for bad in ["../outside", "a/b", "..", ""] {
+            assert!(env.delete_avd_in(bad, Some(&running)).expect_err(bad).to_string().contains("invalid AVD name"), "{bad}");
+        }
+        assert!(tmp.join("outside.avd/config.ini").is_file() && tmp.join("outside.ini").is_file());
+
+        // The pointer's path= is where the AVD lives: that directory goes, and the pointer.
+        let moved = make("moved");
+        let elsewhere = tmp.join("store/moved.avd");
+        std::fs::create_dir_all(tmp.join("store")).expect("mkdir");
+        std::fs::rename(&moved, &elsewhere).expect("move");
+        std::fs::write(env.avd_home.join("moved.ini"), format!("path={}\n", elsewhere.display())).expect("pointer");
+        std::fs::create_dir_all(env.avd_home.join("moved.avd")).expect("decoy");
+        env.delete_avd_in("moved", Some(&running)).expect("delete");
+        assert!(!elsewhere.exists() && !env.avd_home.join("moved.ini").exists());
+        assert!(env.avd_home.join("moved.avd").is_dir(), "only the directory the pointer names");
+
+        // A held stock lock refuses (multiinstance.lock is a file lock), and so does a live PID
+        // in hardware-qemu.ini.lock; a stale PID doesn't.
+        let dir = make("stock");
+        let held = std::fs::File::create(dir.join("multiinstance.lock")).expect("lock");
+        held.lock().expect("lock");
+        assert!(env.delete_avd_in("stock", Some(&running)).expect_err("held").to_string().contains("multiinstance.lock"));
+        drop(held);
+        std::fs::write(dir.join("hardware-qemu.ini.lock"), format!("{}\0", std::process::id())).expect("pid lock");
+        assert!(env.delete_avd_in("stock", Some(&running)).expect_err("live pid").to_string().contains("hardware-qemu.ini.lock"));
+        std::fs::write(dir.join("hardware-qemu.ini.lock"), b"999999999\0").expect("stale pid lock");
+        // An advertised instance of it (stock writes the same running file) refuses too.
+        std::fs::write(running.join(format!("pid_{}.ini", std::process::id())), "port.serial=5600\navd.name=stock\n").expect("ad");
+        assert!(env.delete_avd_in("stock", Some(&running)).expect_err("advertised").to_string().contains("emulator-5600"));
+        std::fs::remove_file(running.join(format!("pid_{}.ini", std::process::id()))).expect("rm ad");
+        env.delete_avd_in("stock", Some(&running)).expect("stopped: deleted");
+        assert!(!dir.exists() && !env.avd_home.join("stock.ini").exists());
+
+        // A pointer naming a directory that isn't an AVD is not deleted.
+        std::fs::create_dir_all(tmp.join("notavd")).expect("mkdir");
+        std::fs::write(env.avd_home.join("odd.ini"), format!("path={}\n", tmp.join("notavd").display())).expect("pointer");
+        assert!(env.delete_avd_in("odd", Some(&running)).is_err());
+        assert!(tmp.join("notavd").is_dir());
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn port_claims_are_seen_while_held() {
+        let dir = std::env::temp_dir().join(format!("emu-avd-ports-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        assert!(!port_claimed(&dir, 5600), "no lock file");
+        let f = std::fs::File::create(dir.join("5600.lock")).expect("lock");
+        assert!(!port_claimed(&dir, 5600), "a file nobody holds");
+        f.lock().expect("lock");
+        assert!(port_claimed(&dir, 5600));
+        drop(f);
+        assert!(!port_claimed(&dir, 5600), "released");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

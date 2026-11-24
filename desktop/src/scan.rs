@@ -24,7 +24,9 @@ pub struct Scan {
     /// That device, resolved, when it's an AVD (its config, profile and running instance), or
     /// why it couldn't be.
     pub android: Option<Result<sim_android::Device, String>>,
-    /// That AVD's guest console, newest last.
+    /// That AVD's guest log, newest last: the console's critical lines (quiet unless
+    /// `-show-kernel`), then the logcat stream emu writes for devices booted from here
+    /// (`sim_android::device_log_tail`).
     pub console_log: Vec<String>,
     /// Why there's nothing to list.
     pub error: Option<String>,
@@ -64,7 +66,7 @@ fn scan(ctx: Result<&Context, &str>, android: &sim_android::Android, selected: O
     {
         let resolved = android.device(udid);
         if let Some(dir) = resolved.as_ref().ok().and_then(|d| d.avd.as_ref()).map(|a| a.dir.clone()) {
-            out.console_log = sim_android::console_log_tail(&dir, 200);
+            out.console_log = sim_android::device_log_tail(&dir, 200);
         }
         out.android = Some(resolved);
     }
@@ -190,6 +192,27 @@ mod tests {
         times.sort();
         let n = scan(ctx.as_ref().map_err(String::as_str), &android, None).devices.len();
         println!("scan of {n} devices: median {:?} (min {:?}, max {:?})", times[4], times[0], times[8]);
+    }
+
+    /// A selected AVD's panel gets its logcat stream: the console is empty on a normal boot.
+    #[test]
+    fn a_selected_avds_log_includes_its_logcat() {
+        let root = std::env::temp_dir().join(format!("desktop-scan-log-{}", std::process::id()));
+        let image = root.join("sdk/system-images/android-36/google_apis/arm64-v8a");
+        std::fs::create_dir_all(&image).expect("image dir");
+        std::fs::write(image.join("system.img"), b"s").expect("system.img");
+        std::fs::write(image.join("source.properties"), "AndroidVersion.ApiLevel=36\nPkg.Revision=7\nSystemImage.TagId=google_apis\n")
+            .expect("props");
+        let mut android = sim_android::Android::new(sim_android::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") });
+        android.running_dir = Some(root.join("running"));
+        android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let dir = root.join("avd/phone.avd/simee");
+        std::fs::create_dir_all(&dir).expect("simee");
+        std::fs::write(dir.join("console.log"), "").expect("quiet console");
+        std::fs::write(dir.join("logcat.txt"), "11-23 20:00:00.000  512  512 I ActivityManager: Start proc\n").expect("logcat");
+        let found = scan(Err("no simulator service"), &android, Some("phone"));
+        assert_eq!(found.console_log, ["11-23 20:00:00.000  512  512 I ActivityManager: Start proc"]);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Scans run on the scanner's thread; one that finds nothing new isn't posted and doesn't

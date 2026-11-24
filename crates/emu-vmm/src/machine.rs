@@ -195,6 +195,10 @@ pub struct MachineConfig {
     pub on_input: Option<Arc<dyn Fn(Inputs) + Send + Sync>>,
     /// Where guest console (PL011) output goes.
     pub console: Box<dyn Write + Send>,
+    /// Where the guest's `goldfish-logcat` stream (`/dev/hvc1`) goes; None discards it, as
+    /// stock's null chardev does without `-logcat`. A spool, so a slow destination drops output
+    /// rather than stalling the console worker (which also serves `modem`).
+    pub logcat: Option<virtio::console::Spool>,
     /// When the process started; set, `run` prints launch timings (kernel load, renderer wait,
     /// first vCPU start) on stderr (`-verbose`).
     pub launched: Option<Instant>,
@@ -331,12 +335,18 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         *slot = Some(Box::new(virtio::blk::Blk::new(disk, d.serial.clone())));
     }
     {
-        // Port 0 is the console port; named ports follow (qemu-props publishes them as
-        // vendor.qemu.vport.<name>).
-        use virtio::console::{Console, PortSpec, Sink};
+        // Port 0 is the console port (hvc0); named ports follow (qemu-props publishes them as
+        // vendor.qemu.vport.<name>); the unnamed port 2 becomes hvc1, logcat's (init.ranchu.rc's
+        // goldfish-logcat runs `logcat -f /dev/hvc1` and restarted every ~5 s without it).
+        use virtio::console::{Console, PortBackend, PortSpec, Sink, Writer};
+        let logcat: Box<dyn PortBackend> = match cfg.logcat {
+            Some(w) => Box::new(Writer(w)),
+            None => Box::new(Sink),
+        };
         let (vcon, handles) = Console::new(vec![
             PortSpec { name: String::new(), backend: Box::new(Sink) },
             PortSpec { name: "modem".into(), backend: cfg.telephony.backend() },
+            PortSpec { name: String::new(), backend: logcat },
         ]);
         if let Some(h) = handles.get(1) {
             cfg.telephony.attach(h.clone());
