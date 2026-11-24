@@ -39,6 +39,17 @@ pub fn concurrency(p: &Value) -> Result<usize, String> {
     }
 }
 
+/// An optional boolean: absent or null is `None`, any other type is refused.
+// Only iOS methods read this so far.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn opt_bool(p: &Value, key: &str) -> Result<Option<bool>, String> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(other) => Err(format!("`{key}` must be true or false, not {other}")),
+    }
+}
+
 // Only iOS methods read this so far.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn need_bool(p: &Value, key: &str) -> Result<bool, String> {

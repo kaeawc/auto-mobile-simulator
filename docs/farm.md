@@ -39,21 +39,39 @@ and poster, widget and Siri extensions keep starting for minutes after.
 `boot --settle` (and `boot_many {settle}`, and `settle` for a device already booted) also waits
 until the device's whole process tree (its `launchd_sim` and every descendant) uses under 10 % of
 one core over 10 s with SpringBoard running (`settle_cpu_pct`, `settle_window_s` change the rule).
-CPU is each process's accumulated CPU time from `ps`, so it is exact over the window and a process
+CPU is each process's accumulated CPU time, so it is exact over the window and a process
 that exits doesn't make the tree look quieter. The threshold comes from the measurements: an idle
 device runs at 1-6 % (no client attached), so 10 % separates "storm over" from "idle" with room
 for one busy daemon; 5 % (the research brief's guess) never fired on some idle devices.
+
+The wait reads the tree through libproc (`sim_coresim::procs`) once a second: the host's process
+table (pid, parent, name), then the CPU time of the device's own processes. It used to spawn a
+host-wide `ps -Ao pid=,ppid=,time=,args=` instead, 6.5-8.4 % of a core during a `boot_many` on a
+host with ~2000 processes. Measured on this host with ~1200 processes and no device booted
+(`cargo test -p sim-coresim --release poll_cost -- --ignored --nocapture --test-threads=1`, median
+of 3): the `ps` listing cost 38.2 ms of CPU per poll; the table costs 0.24 ms, and reading CPU
+costs 1.1 µs per process, so a poll of a 100-300 process device costs about 0.35-0.6 ms. Each wait
+reads the table itself, so 8 waits at once cost about 4 ms a second, where one shared `ps` listing
+cost 38 ms.
+
+Each process's CPU is split by QoS: the `background_cpu_pct` of a result is what ran at the
+maintenance or background QoS (launchd jobs of `ProcessType` Background, darwinbg tasks:
+priority 4, on the efficiency cores), `foreground_cpu_pct` the rest, `cpu_pct` all of it. Once a
+device is past its first-boot storm most of what it still runs is background work on the 4 E-cores
+while the P-cores idle. `settle_foreground: true` (`foreground: true` for `settle`) judges the
+tree on its foreground CPU only, so a device with only background work left counts as settled.
+The default is unchanged (all CPU). Not yet measured on a device: how much sooner it fires. The
+QoS split itself was checked on the host (`taskpolicy -b yes` lands 99.9 % in background CPU, plain
+`yes` 0 %: `procs::tests::background_cpu_is_attributed_to_background_qos`).
 
 The settle wait has its own budget, `settle_timeout_s` (`--settle-timeout`), counted from the end
 of the boot, separate from `timeout_s` (the boot call). Its default is 600 s, and in `boot_many`
 150 s per device in flight above K = 4 (K = 8: 1200 s): settle times measured 250-537 s per device
 under load, and K storms at once make each one longer. A wait that runs out is not a failed boot:
 the result says `settled: false` with `settle_error` (the CPU over the last window), `waited_s`,
-`procs` and `cpu_pct`, and the device stays booted. The standalone `settle` method still fails
-when it runs out of time (waiting is all it does), with the same 600 s default.
-
-Every settle wait in one process shares one `ps` listing per second (`settle::Sampler`): N
-concurrent waits cost one host-wide listing a second, not N.
+`procs`, `cpu_pct`, `background_cpu_pct` and `foreground_cpu_pct`, and the device stays booted.
+The standalone `settle` method still fails when it runs out of time (waiting is all it does), with
+the same 600 s default.
 
 Settled is not forever. Deferred work starts two to four minutes after boot (process count
 190 → 240 on a clone, with 100-700 % bursts), so a device that settled at 60 s can be busy again
@@ -115,7 +133,7 @@ that has done its first boot skips the data migration and indexing storm.
 ### The `slim` profile
 
 `boot --profile slim` (or `simee profile <device> slim` on a booted one) disables (in the
-device's own launchd database) and stops 59 daemons no AutoMobile tool and no simee method needs: PosterBoard and the
+device's own launchd database) and stops 58 daemons no AutoMobile tool and no simee method needs: PosterBoard and the
 ~15 poster extensions it keeps alive (~30-45 MB footprint each), widgets (chronod), Siri and
 suggestions, photo and media analysis, Health, Home, fitness, the Store, iCloud sync, Mail, News,
 Weather, Wallet, Game Center, Screen Time, watch and Find My companions, experiments and ML hosts.
@@ -136,13 +154,30 @@ print-disabled system` lists as disabled afterwards, `failed` names the others (
 stopped, or not a job in this runtime: `launchctl disable` accepts any label, so a mistyped one
 shows up here).
 
-The disables survive a plain reboot (measured, iOS 27.2: a slimmed device shut down and booted
+Most disables survive a plain reboot (measured, iOS 27.2: a slimmed device shut down and booted
 without `--profile` came up with 133 processes, its sampled jobs still listed disabled and none
-loaded). A clone doesn't inherit them (`clone` resets them: a clone of a slimmed template came up
-with 221 processes), so apply the profile on each clone's first boot; applying it again is
-harmless. `simee profile <device> slim --undo` (`profile {name, undo: true}`) enables the same
-jobs again; they run from the next boot (measured: 59 enabled in 13 s; after a reboot the sampled
-jobs were loaded again and none listed disabled, 209 processes at settle against 133 slim).
+loaded). Three don't: companionappd, NPKCompanionAgent and brookcompaniond come back listed
+`enabled` and running after every reboot (measured on iOS 27.2: `launchctl print-disabled system`
+and `launchctl list` after a reboot of a slimmed device). A clone doesn't inherit any of them
+(`clone` resets them: a clone of a slimmed template came up with 221 processes). So pass
+`--profile slim` on every boot, not only a clone's first. Applying it again is cheap: it reads
+`launchctl list` and `print-disabled` first and leaves alone each job that is still disabled and
+not loaded (the result's `already` counts them, and they aren't listed in `not_loaded`), so a
+reboot costs those two reads, a disable and a bootout per job that came back, and the final
+`print-disabled`. `simee profile <device> slim --undo` (`profile {name, undo: true}`) enables the
+same jobs again; they run from the next boot (measured: 59 enabled in 13 s; after a reboot the
+sampled jobs were loaded again and none listed disabled, 209 processes at settle against 133 slim).
+
+`com.apple.sleepd` is kept. With it disabled, every later boot of a slimmed device spins:
+SpringBoard and mobiletimerd retry the `com.apple.sleepd.sleepserver` mach service in a tight loop
+(138k log lines in 3 s, about 350 % of a core), and the device never settles. Measured on iOS 27.2,
+3 warm reboots each, judged from outside by a 2 s sampler (same 10 % / 10 s rule), load 4-60:
+
+| warm reboot | settled | CPU-s to settle | processes | footprint |
+| --- | --- | --- | --- | --- |
+| stock | 48-110 s | 347-383 | 198-208 | 1.79-1.92 GB |
+| slim without sleepd | 29-83 s | 69-142 | 94-113 | 733-922 MB |
+| slim with sleepd disabled | never | ~350 % of a core, spinning | | |
 
 `com.apple.carkitd` is not in the profile: `carplay` needs it. The kept jobs are pinned by a test
 per simee method that reaches into the device (`carplay`, `location`, `privacy`, `push`,
@@ -151,7 +186,7 @@ per simee method that reaches into the device (`carplay`, `location`, `privacy`,
 
 Kept: SpringBoard, backboardd, InputUI (keyboard), the accessibility server and daemons
 (AutoMobile reads the screen through accessibility), installd, lsd, runningboardd, tccd,
-usernotificationsd, locationd, sharingd, webbookmarksd (Safari), assetsd, logging, configd_sim,
+usernotificationsd, locationd, sharingd, webbookmarksd (Safari), assetsd, sleepd, logging, configd_sim,
 nsurlsessiond. AutoMobile's tools pass on a slim device (getApple, observe, pressButton, listApps,
 launchApp, tapOn, swipeOn, terminateApp, openLink, homeScreen, getLogs).
 
@@ -204,3 +239,8 @@ There is no Android `settle`: sim-android has no settle rule in Rust (the Androi
 process under 60 % of a core for 5 s). `boot` and `boot_many` refuse
 the iOS-only `settle`, `settle_*`, `profile`, `shaped` and `env` on an AVD with the reason,
 instead of ignoring them.
+
+Per settled device at idle the bench also records `footprint_mb` (`footprint` of the emu process:
+its dirty memory, the guest pages it has touched included) and `idle_wakeups_s` (`top -l 2 -s
+IDLE_S -stats pid,idlew`: how often the process woke a core out of idle), with their medians, beside
+the host CPU and vCPU exits. On a loaded host few cores are idle, so the wakeup count reads low.
