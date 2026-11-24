@@ -154,7 +154,19 @@ impl Instance {
         BootPlan::new(&self.avd, opts, self.gpu_lib64.clone())
     }
 
-    pub fn machine_config(&self, opts: &Opts) -> Result<emu_vmm::MachineConfig> {
+    /// The GPU this boot gets, if any (`emu_vmm::start_renderer` takes it early, `run` again).
+    pub fn gpu_spec(&self, opts: &Opts) -> Option<emu_vmm::GpuSpec> {
+        self.gpu_lib64.as_ref().zip(self.display.as_ref()).map(|(lib64, display)| emu_vmm::GpuSpec {
+            lib64: lib64.clone(),
+            width: self.avd.lcd().0,
+            height: self.avd.lcd().1,
+            verbose: opts.verbose,
+            display: display.clone(),
+        })
+    }
+
+    /// `launched`: when the process started, for `-verbose` launch timings.
+    pub fn machine_config(&self, opts: &Opts, launched: std::time::Instant) -> Result<emu_vmm::MachineConfig> {
         let plan = self.plan(opts);
         if let Some(missing) = plan.missing().first() {
             bail!("missing {}", missing.display());
@@ -173,19 +185,15 @@ impl Instance {
             cpus: plan.cpus,
             ram_bytes: plan.ram_bytes,
             kernel: plan.kernel,
+            // Inflated gzip kernels, beside vkprobe's verdicts.
+            kernel_cache: std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Caches/simee")),
             initrd: Some(initrd),
             cmdline: plan.cmdline,
             disks: plan.disks,
             disk_fsync: opts.disk_fsync,
             rng: true,
             adb_port: Some(self.console_port + 1),
-            gpu: self.gpu_lib64.as_ref().zip(self.display.as_ref()).map(|(lib64, display)| emu_vmm::GpuSpec {
-                lib64: lib64.clone(),
-                width: self.avd.lcd().0,
-                height: self.avd.lcd().1,
-                verbose: opts.verbose,
-                display: display.clone(),
-            }),
+            gpu: self.gpu_spec(opts),
             boot_props: plan.boot_props,
             input: Some((self.avd.lcd().0, self.avd.lcd().1)),
             touch_screen: plan.touch_screen,
@@ -214,6 +222,7 @@ impl Instance {
                 Some(std::sync::Arc::new(move |i| *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(i)))
             },
             console,
+            launched: opts.verbose.then_some(launched),
         })
     }
 }

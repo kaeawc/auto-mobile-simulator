@@ -33,11 +33,63 @@ pub struct GpuSpec {
 
 static RENDERER: std::sync::OnceLock<Arc<emu_gfxstream::Renderer>> = std::sync::OnceLock::new();
 
+type RendererInit = std::sync::mpsc::Receiver<Result<Arc<emu_gfxstream::Renderer>>>;
+
+/// An initialization [`start_renderer`] began, not yet claimed by [`run`].
+static PENDING: std::sync::Mutex<Option<RendererInit>> = std::sync::Mutex::new(None);
+
+/// Loads and initializes the renderer on its own thread, so the dlopen chain and EGL/GLES/Vulkan
+/// setup (hundreds of ms) overlap the rest of the launch; [`run`] waits for it before it creates
+/// the GPU device, and an init failure surfaces there as before. Call after the renderer's
+/// environment is configured (`emu_gfxstream::configure_environment`). The thread stays parked
+/// after init, like the main thread that initialized it before: thread-local EGL state made
+/// during init never sees its thread exit.
+pub fn start_renderer(spec: GpuSpec) {
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if RENDERER.get().is_some() || pending.is_some() {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new().name("renderer-init".into()).spawn(move || {
+        let t = Instant::now();
+        let r = init_renderer(&spec);
+        if spec.verbose {
+            eprintln!("emu: renderer initialized in {} ms (off the boot path)", t.elapsed().as_millis());
+        }
+        let _ = tx.send(r);
+        loop {
+            std::thread::park();
+        }
+    });
+    if spawned.is_ok() {
+        *pending = Some(rx);
+    }
+}
+
 /// The renderer is process-wide: loaded and initialized once, reused across guest reboots.
+/// Claims an init [`start_renderer`] began, or initializes it here.
 fn renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     if let Some(r) = RENDERER.get() {
         return Ok(r.clone());
     }
+    let pending = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match pending {
+        Some(rx) => rx.recv().unwrap_or_else(|_| Err(anyhow::anyhow!("the renderer init thread died"))),
+        None => init_renderer(spec),
+    }
+}
+
+/// Waits out an init [`start_renderer`] began that no boot claimed (a launch that fails before
+/// it reaches the GPU), so the process never exits while the renderer is inside dlopen or EGL
+/// init. The result is dropped: the launch is failing anyway.
+fn settle_renderer() {
+    let pending = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(rx) = pending {
+        let _ = rx.recv();
+    }
+}
+
+fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     let r = emu_gfxstream::Renderer::load(&spec.lib64).context("loading the gfxstream renderer")?;
     let mut flags = emu_gfxstream::flags::USE_EGL | emu_gfxstream::flags::USE_GLES | emu_gfxstream::flags::USE_VK;
     if std::env::var_os("EMU_GL_COMPOSITION").is_none() {
@@ -96,6 +148,8 @@ pub struct MachineConfig {
     pub cpus: u32,
     pub ram_bytes: u64,
     pub kernel: PathBuf,
+    /// Where an inflated gzip kernel is cached between launches (none: inflate every launch).
+    pub kernel_cache: Option<PathBuf>,
     /// Initrd bytes, bootconfig already appended.
     pub initrd: Option<Vec<u8>>,
     pub cmdline: String,
@@ -141,6 +195,9 @@ pub struct MachineConfig {
     pub on_input: Option<Arc<dyn Fn(Inputs) + Send + Sync>>,
     /// Where guest console (PL011) output goes.
     pub console: Box<dyn Write + Send>,
+    /// When the process started; set, `run` prints launch timings (kernel load, renderer wait,
+    /// first vCPU start) on stderr (`-verbose`).
+    pub launched: Option<Instant>,
 }
 
 pub struct Outcome {
@@ -159,7 +216,20 @@ fn random_bytes<const N: usize>() -> [u8; N] {
 }
 
 /// Boots the machine and blocks until it powers off, resets, faults, or `stop` becomes true.
+/// On an error, an early renderer init ([`start_renderer`]) has finished before this returns.
 pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
+    settled(boot_and_run(cfg, stop))
+}
+
+/// `result`, once no renderer init is left mid-flight when it is an error.
+fn settled<T>(result: Result<T>) -> Result<T> {
+    if result.is_err() {
+        settle_renderer();
+    }
+    result
+}
+
+fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     let started = Instant::now();
     if cfg.cpus == 0 || cfg.cpus > 16 {
         bail!("cpus must be in 1..=16 (got {})", cfg.cpus);
@@ -178,12 +248,12 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     }
 
     // Kernel, initrd, device tree.
-    let kernel = boot::parse_kernel(std::fs::read(&cfg.kernel).with_context(|| format!("reading {}", cfg.kernel.display()))?)?;
-    let entry = KERNEL_ADDR + kernel.text_offset;
-    if entry + kernel.image_size > INITRD_ADDR {
-        bail!("kernel image ({} bytes) overlaps the initrd area", kernel.image_size);
+    let t = Instant::now();
+    let kernel = boot::load_kernel(&cfg.kernel, &mem, KERNEL_ADDR, INITRD_ADDR, cfg.kernel_cache.as_deref())?;
+    let entry = kernel.entry;
+    if cfg.launched.is_some() {
+        eprintln!("emu: kernel {:?}, {} MiB in {} ms", kernel.source, kernel.len >> 20, t.elapsed().as_millis());
     }
-    mem.write(entry, &kernel.image)?;
     let initrd = match &cfg.initrd {
         Some(bytes) => {
             if INITRD_ADDR + bytes.len() as u64 > mem.end() {
@@ -282,7 +352,11 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     let mut dma_renderer = None;
     let mut gpu_renderer = None;
     if let Some(spec) = &cfg.gpu {
+        let t = Instant::now();
         let r = renderer(spec)?;
+        if cfg.launched.is_some() {
+            eprintln!("emu: renderer ready (boot waited {} ms)", t.elapsed().as_millis());
+        }
         gpu_renderer = Some(r.clone());
         // Guest-physical → host for the renderer's DMA paths (gralloc CPU reads land in the
         // goldfish address-space area; direct-mapped buffers may be anywhere in RAM).
@@ -378,6 +452,13 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         let boot = (idx == 0).then_some((entry, DTB_ADDR));
         threads.push(std::thread::Builder::new().name(format!("vcpu{idx}")).spawn(move || c.thread_main(idx, boot))?);
     }
+    if let Some(launched) = cfg.launched {
+        eprintln!(
+            "emu: vCPUs started {} ms after launch ({} ms in machine setup)",
+            launched.elapsed().as_millis(),
+            started.elapsed().as_millis()
+        );
+    }
 
     let reason = loop {
         if let Some(r) = cpus.wait_stop(Duration::from_millis(100)) {
@@ -401,4 +482,98 @@ pub fn run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     drop(as_area);
     drop(mem);
     Ok(Outcome { reason, uptime: started.elapsed(), exits })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(lib64: PathBuf) -> GpuSpec {
+        GpuSpec { lib64, width: 720, height: 1280, verbose: true, display: Arc::new(crate::display::FrameStore::default()) }
+    }
+
+    /// Serializes the tests that use the process-wide `PENDING` slot.
+    static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A launch that fails before it claims the renderer returns only after the init thread is
+    /// done: exiting mid-dlopen or mid-EGL-init could crash or hang the process.
+    #[test]
+    fn a_failed_launch_waits_out_the_pending_renderer_init() {
+        let _slot = SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        let done = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        *PENDING.lock().expect("lock") = Some(rx);
+        let init = std::thread::spawn({
+            let done = done.clone();
+            move || {
+                // A slow init, still running when the launch fails.
+                std::thread::sleep(Duration::from_millis(200));
+                done.store(true, Ordering::SeqCst);
+                let _ = tx.send(Err(anyhow::anyhow!("never claimed")));
+            }
+        });
+        let err = settled::<()>(Err(anyhow::anyhow!("missing kernel-ranchu"))).expect_err("still the launch's error");
+        assert_eq!(err.to_string(), "missing kernel-ranchu");
+        assert!(done.load(Ordering::SeqCst), "returned while the renderer init was still running");
+        assert!(PENDING.lock().expect("lock").is_none());
+        init.join().expect("init thread");
+        // A successful run leaves nothing to wait for and returns at once.
+        assert_eq!(settled(Ok(7)).expect("ok"), 7);
+    }
+
+    /// An init started early that fails reports its error where the boot claims it.
+    #[test]
+    fn early_renderer_failure_surfaces_at_claim() {
+        let _slot = SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        let bad = spec(std::env::temp_dir().join(format!("emu-no-renderer-{}", std::process::id())));
+        start_renderer(spec(bad.lib64.clone()));
+        let err = renderer(&bad).err().expect("no renderer there");
+        assert!(format!("{err:#}").contains("loading the gfxstream renderer"), "{err:#}");
+        // Nothing left pending or cached: a later claim tries again.
+        assert!(PENDING.lock().expect("lock").is_none() && RENDERER.get().is_none());
+        assert!(renderer(&bad).is_err());
+    }
+
+    /// The renderer initialized on `start_renderer`'s thread serves the boot's threads, as one
+    /// initialized on the main thread did. Needs a renderer (`EMU_RENDERER_LIB64`, else the
+    /// SDK's `emulator/lib64`); no guest. The test binary lacks `emu`'s rpaths, so gfxstream's
+    /// bare-name dlopen of ANGLE needs a fallback path (without it, init crashes in the renderer):
+    ///     L=~/Library/Android/sdk/emulator/lib64; DYLD_FALLBACK_LIBRARY_PATH=$L:$L/gles_angle:/usr/lib \
+    ///       cargo test --release -p emu-vmm renderer_init_off_thread -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs a gfxstream renderer and a host GPU"]
+    fn renderer_init_off_thread() {
+        let _slot = SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        let lib64 = std::env::var_os("EMU_RENDERER_LIB64")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").expect("HOME")).join("Library/Android/sdk/emulator/lib64"));
+        emu_gfxstream::link_beside_exe(&lib64);
+        emu_gfxstream::configure_environment(lib64.parent().expect("launcher dir"), emu_gfxstream::Icd::MoltenVk);
+        let t = Instant::now();
+        start_renderer(spec(lib64.clone()));
+        let started = t.elapsed();
+        // What `run` does meanwhile (VM, kernel, devices) happens here; then it claims.
+        let r = renderer(&spec(lib64.clone())).expect("renderer");
+        println!(
+            "start_renderer returned in {:.2} ms; renderer ready after {:.0} ms",
+            started.as_secs_f64() * 1e3,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        // Used from threads other than the one that initialized it.
+        let caps = std::thread::spawn({
+            let r = r.clone();
+            move || emu_gfxstream::capset::ALL.iter().filter(|&&id| r.capset_info(id).is_some()).count()
+        })
+        .join()
+        .expect("caps thread");
+        assert!(caps > 0, "no capability sets");
+        let ram = Arc::new(GuestRam::new(RAM_BASE, 16 << 20).expect("ram"));
+        let translate: emu_gfxstream::DmaTranslator =
+            Box::new(move |gpa| ram.host_range(gpa, 1).map_or(std::ptr::null_mut(), |h| h.as_ptr()));
+        assert!(r.set_dma_translator(Some(translate)).is_ok());
+        let _ = r.set_dma_translator(None);
+        println!("vulkan ok: {}, capsets: {caps}", emu_gfxstream::vulkan_ok());
+        // Claimed once; later boots (guest reboots) reuse it.
+        assert!(Arc::ptr_eq(&r, &renderer(&spec(lib64)).expect("again")));
+    }
 }

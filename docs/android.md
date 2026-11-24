@@ -314,6 +314,27 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   `vsock_throughput_to_host` 5.9 → 6.4 GiB/s (its guest now honours credit),
   `adb_throughput_to_guest` (TCP client → guest, end to end) 498 → 870 MiB/s,
   `adb_throughput_to_host` 1382 → 1433 MiB/s.
+- **Launch to first guest instruction.** Most images ship a gzip `kernel-ranchu` (an API 37
+  kernel is 16 MiB that inflates to about 40 MiB). It used to be read whole, inflated into a
+  `Vec` with miniz_oxide and copied into guest RAM on every launch. QEMU, and so the stock
+  emulator, inflates on every launch too, while Firecracker and crosvm take only raw images. Now
+  the first launch inflates it in 1 MiB chunks straight into guest RAM with zlib-rs and writes
+  the image to `~/Library/Caches/simee/kernel-<path>-<stamp>`, keyed by path, size, mtime,
+  inode and the gzip trailer's CRC32 and ISIZE (one 8-byte `pread`, so a kernel rewritten in
+  place with its mtime kept is a miss), through a temp file that is synced before the rename. A
+  hit must be exactly ISIZE bytes long: a short entry would read as zeros past its end. Older
+  versions of the same path, and temp files over a minute old (a launch killed mid-write), are
+  removed. Later launches `pread` that file into guest RAM, as they do a raw `Image`. Medians of
+  7 interleaved runs on an M3 Max under CI load (`cargo test --release -p emu-vmm kernel_load --
+  --ignored --nocapture`): 115 ms before (miniz_oxide), 71–76 ms to inflate with zlib-rs, 86–95
+  ms on a miss (the synced cache write adds 15–20 ms), 3.5–3.9 ms on a hit. The gfxstream
+  renderer's load and init (about 400 ms, `renderer_init_off_thread`) now starts on its own
+  thread once the console port is bound and the boot files are found, and `run` waits for it
+  just before it creates the GPU device; a launch that fails before that point waits for the
+  init to finish before it exits, so the process never exits mid-dlopen. The thread stays
+  parked afterwards, as the main thread did. Reading the 1.8 MiB ramdisk straight into guest RAM instead of through a `Vec` saved
+  0.06 ms, so it was left as it was. `-verbose` prints the kernel source and time, how long the
+  boot waited for the renderer, and when the vCPUs started relative to launch.
 
 ## Development
 

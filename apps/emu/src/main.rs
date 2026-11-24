@@ -99,6 +99,7 @@ fn create_avd(env: &emu_avd::Env, name: &str, sysdir: &str, opts: &args::Opts) -
 }
 
 fn real_main() -> Result<ExitCode> {
+    let launched = std::time::Instant::now();
     // First, before any thread exists.
     let signals = shutdown_signals();
     // Internal: `emu -probe-vulkan <lib64>` (see vkprobe.rs).
@@ -156,7 +157,7 @@ fn real_main() -> Result<ExitCode> {
     if opts.dry_run {
         return dry_run(&env, &name, &opts);
     }
-    boot(&env, &name, &opts, signals)
+    boot(&env, &name, &opts, signals, launched)
 }
 
 /// `-avd NAME -dry-run`: prints the boot plan without booting (on any host), and fails if the
@@ -174,13 +175,19 @@ fn dry_run(env: &emu_avd::Env, name: &str, opts: &args::Opts) -> Result<ExitCode
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn boot(_: &emu_avd::Env, name: &str, _: &args::Opts, _: std::sync::mpsc::Receiver<i32>) -> Result<ExitCode> {
+fn boot(_: &emu_avd::Env, name: &str, _: &args::Opts, _: std::sync::mpsc::Receiver<i32>, _: std::time::Instant) -> Result<ExitCode> {
     anyhow::bail!("cannot boot {name}: simee needs Hypervisor.framework on an Apple silicon Mac")
 }
 
 /// Boots the AVD and runs it until the guest powers off or a signal arrives.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn boot(env: &emu_avd::Env, name: &str, opts: &args::Opts, signals: std::sync::mpsc::Receiver<i32>) -> Result<ExitCode> {
+fn boot(
+    env: &emu_avd::Env,
+    name: &str,
+    opts: &args::Opts,
+    signals: std::sync::mpsc::Receiver<i32>,
+    launched: std::time::Instant,
+) -> Result<ExitCode> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -227,8 +234,15 @@ fn boot(env: &emu_avd::Env, name: &str, opts: &args::Opts, signals: std::sync::m
     let _display = inst.display.clone().and_then(|d| display_server::start(&avd.dir, d, inst.inputs.clone(), stop.clone()));
     // On stdout: launchers watch for the first line and the `emulator-<port>` serial.
     println!("emu: {} on emulator-{} (adb port {})", avd.name, inst.console_port, inst.console_port + 1);
+    let mut cfg = inst.machine_config(opts, launched)?;
+    // The cheap checks passed (console port bound, the boot files exist) and `prepare` has set
+    // the renderer's environment: bring the renderer up beside kernel load and VM setup. Nothing
+    // fallible runs between here and `run`, which claims it (or, failing before the GPU, waits
+    // for it to finish) before it returns.
+    if let Some(gpu) = inst.gpu_spec(opts) {
+        emu_vmm::start_renderer(gpu);
+    }
     loop {
-        let cfg = inst.machine_config(opts)?;
         let out = emu_vmm::run(cfg, stop.clone())?;
         if opts.verbose {
             eprintln!("emu: stopped after {:.1}s: {:?}", out.uptime.as_secs_f64(), out.reason);
@@ -238,7 +252,7 @@ fn boot(env: &emu_avd::Env, name: &str, opts: &args::Opts, signals: std::sync::m
             }
         }
         match out.reason {
-            emu_vmm::StopReason::Reset if !stop.load(Ordering::SeqCst) => continue,
+            emu_vmm::StopReason::Reset if !stop.load(Ordering::SeqCst) => cfg = inst.machine_config(opts, launched)?,
             emu_vmm::StopReason::Fault(msg) => {
                 eprintln!("emu: guest fault: {msg}");
                 return Ok(ExitCode::FAILURE);
