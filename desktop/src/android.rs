@@ -258,7 +258,9 @@ mod tests {
     /// the screen connected (while the window held a "not running" copy) gets the next action.
     #[test]
     fn console_jobs_look_the_device_up_when_they_run() {
-        let root = std::env::temp_dir().join(format!("rs-lookup-{}", std::process::id()));
+        // Not `rs-lookup-<pid>`: that is `quiet_display("lookup")`'s directory where the temp dir is
+        // /tmp (Linux), and it removes it.
+        let root = std::env::temp_dir().join(format!("rs-lookup-avds-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (avds, running) = (root.join("avd"), root.join("running"));
         std::fs::create_dir_all(&avds).expect("avd home");
