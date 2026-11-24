@@ -427,7 +427,13 @@ impl VirtioDevice for Input {
         let rx = self.rx.take().ok_or("input worker receiver missing")?;
         let event_idx = act.features & F_RING_EVENT_IDX != 0;
         let w = Worker::new(act.mem, act.irq, Queue::new(eventq, event_idx), statusq.map(|q| Queue::new(q, event_idx)));
-        let h = std::thread::Builder::new().name(format!("input-{}", self.name)).spawn(move || w.run(rx)).map_err(|e| e.to_string())?;
+        let h = std::thread::Builder::new()
+            .name(format!("input-{}", self.name))
+            .spawn(move || {
+                crate::device_thread();
+                w.run(rx)
+            })
+            .map_err(|e| e.to_string())?;
         self.worker = Some(h);
         Ok(())
     }
@@ -1037,10 +1043,12 @@ mod tests {
             irq.ack(INT_USED_RING);
             dev.lock().expect("dev").notify(0);
             let keys = got.iter().filter(|e| e.typ == EV_KEY && (100..100 + THREADS).contains(&e.code)).count();
-            // The last touch is in once its x is.
+            // The last touch is in once its x is and its batch has ended (events land one buffer
+            // at a time, so stopping at the x alone could miss its y and SYN still on the way).
             if finished
                 && keys == (THREADS as usize) * KEYS as usize
                 && got.iter().rev().find(|e| e.code == ABS_MT_POSITION_X).is_some_and(|e| e.value == 7)
+                && got.last() == Some(&InputEvent::syn())
             {
                 break;
             }

@@ -315,6 +315,7 @@ impl TcpForward {
 fn spawn_reader(reader: TcpStream, ctx: PipeCtx, window: Arc<Window>) {
     let name = format!("adb-in-{}", ctx.conn);
     let _ = std::thread::Builder::new().name(name).spawn(move || {
+        crate::device_thread();
         let _ = window.reader.set(std::thread::current());
         // Reads land in the spare capacity of a buffer that is never zeroed. A large read hands
         // that buffer over as it is (and the next gets a fresh one): no copy. A small one is
@@ -353,6 +354,7 @@ fn spawn_reader(reader: TcpStream, ctx: PipeCtx, window: Arc<Window>) {
 fn spawn_writer(stream: Arc<TcpStream>, ctx: PipeCtx, q: Arc<ToHost>) {
     let name = format!("adb-out-{}", ctx.conn);
     let _ = std::thread::Builder::new().name(name).spawn(move || {
+        crate::device_thread();
         // Two buffers trade places: the writer drains one while the worker fills the other.
         let mut chunk = Vec::new();
         'run: loop {

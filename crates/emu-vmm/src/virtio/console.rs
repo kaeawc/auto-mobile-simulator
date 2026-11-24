@@ -86,6 +86,8 @@ impl Spool {
         let spool = Spool { tx, dropped: Default::default(), unreported: Default::default() };
         let unreported = spool.unreported.clone();
         std::thread::Builder::new().name(name.into()).spawn(move || {
+            // Writes logcat to a file: nothing in the guest waits on it.
+            emu_hvf::host::set_qos(emu_hvf::host::Qos::Utility);
             for chunk in rx {
                 let lost = unreported.swap(0, Relaxed);
                 if lost > 0 {
@@ -225,6 +227,7 @@ impl VirtioDevice for Console {
         let h = std::thread::Builder::new()
             .name("virtio-console".into())
             .spawn(move || {
+                crate::device_thread();
                 while let Ok(msg) = rx.recv() {
                     match msg {
                         Msg::Stop => break,

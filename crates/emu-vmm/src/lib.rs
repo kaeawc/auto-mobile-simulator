@@ -27,3 +27,10 @@ pub use disk::{DiskMode, DiskSpec};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use machine::*;
 pub use virtio::input::Inputs;
+
+/// Called first on every device worker thread: user-initiated QoS, as the vCPUs run. A thread
+/// doesn't inherit its spawner's QoS on Darwin (`emu_hvf::host` pins this), so a worker started
+/// from a vCPU thread would otherwise run at the default class.
+pub(crate) fn device_thread() {
+    emu_hvf::host::set_qos(emu_hvf::host::Qos::UserInitiated);
+}

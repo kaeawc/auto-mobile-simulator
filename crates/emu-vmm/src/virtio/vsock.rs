@@ -151,6 +151,7 @@ impl VirtioDevice for Vsock {
         let handle = std::thread::Builder::new()
             .name("vsock".into())
             .spawn(move || {
+                crate::device_thread();
                 w.run(&rx);
                 w.close_all();
                 rx
@@ -1761,7 +1762,7 @@ mod tests {
     /// Packets the guest sends while the worker drains the tx ring cost it no kicks (event-idx:
     /// the worker stopped asking for them while it drains). Before, every packet kicked.
     #[test]
-    fn a_burst_sent_while_the_worker_drains_costs_one_kick() {
+    fn a_burst_sent_while_the_worker_drains_costs_no_kicks() {
         const N: u32 = 32;
         let (entered_tx, entered) = std::sync::mpsc::channel();
         let (release, release_rx) = std::sync::mpsc::channel();

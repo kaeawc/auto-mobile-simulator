@@ -175,6 +175,7 @@ impl VirtioDevice for Gpu {
         let handle = std::thread::Builder::new()
             .name("gpu".into())
             .spawn(move || {
+                crate::device_thread();
                 w.run(&rx);
                 w.teardown();
                 rx

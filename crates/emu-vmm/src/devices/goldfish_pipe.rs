@@ -89,7 +89,10 @@ impl GoldfishPipe {
         let (events, rx) = channel();
         let dev = Arc::new(GoldfishPipe { state: Arc::new(Mutex::new(State::default())), mem, registry, irq, events });
         let weak = Arc::downgrade(&dev);
-        let _ = std::thread::Builder::new().name("goldfish-pipe".into()).spawn(move || host_loop(&weak, &rx));
+        let _ = std::thread::Builder::new().name("goldfish-pipe".into()).spawn(move || {
+            crate::device_thread();
+            host_loop(&weak, &rx)
+        });
         dev
     }
 
