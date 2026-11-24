@@ -304,12 +304,11 @@ mod tests {
         screen.set_visible(false);
         screen.set_visible(false); // no change: nothing sent
         wait_until("the emulator to hear the window hid", || seen.lines.lock().expect("lines").len() == 3);
-        // Room for the frame that was on its way to arrive (and be passed over).
-        std::thread::sleep(Duration::from_millis(40));
+        // The frame that was on its way goes out (and is passed over).
+        wait_until("the frame on its way", || seen.sent_paused.load(Ordering::Relaxed) == 1);
         let (read, newest) = (screen.frames_read(), seen.newest.load(Ordering::Relaxed));
-        std::thread::sleep(Duration::from_millis(300));
-        let made = seen.newest.load(Ordering::Relaxed) - newest;
-        assert!(made >= 30, "the guest kept making frames ({made})");
+        // Counted in the guest's frames, not wall time: a busy CI runner oversleeps.
+        wait_until("the guest to make frames while hidden", || seen.newest.load(Ordering::Relaxed) - newest >= 20);
         assert_eq!(screen.frames_read(), read, "no frame read while hidden");
         assert_eq!(seen.sent_paused.load(Ordering::Relaxed), 1, "only the frame already on its way was announced");
         let last_shown = shown(&screen);
