@@ -121,10 +121,24 @@ impl Android {
     /// Every running emulator: simee's (their advertisements), then the stock emulator's
     /// ([`Env::stock_instances`]) for AVDs simee doesn't run.
     fn running(&self) -> Vec<Running> {
-        let mut all = self.running_dir.as_deref().map(emu_avd::running_instances_in).unwrap_or_default();
+        let mut all = self.simee_running();
         let stock = self.env.stock_instances(&all);
         all.extend(stock);
         all
+    }
+
+    fn simee_running(&self) -> Vec<Running> {
+        self.running_dir.as_deref().map(emu_avd::running_instances_in).unwrap_or_default()
+    }
+
+    /// The emulator running AVD `name` alone (simee's, else the stock one's): reads that AVD's
+    /// lock only, not every AVD's, which is what a call on one device needs.
+    fn running_of(&self, name: &str) -> Option<Running> {
+        let simee = self.simee_running();
+        match simee.iter().find(|r| r.avd_name == name) {
+            Some(r) => Some(r.clone()),
+            None => self.env.stock_instance(name, &simee),
+        }
     }
 
     /// Every AVD, labelled with its form factor; running ones (simee or stock) are `Booted`.
@@ -143,12 +157,13 @@ impl Android {
     /// Resolves a UDID-or-name query (`booted` is the only running device) to a device. An exact
     /// AVD name loads just that AVD.
     pub fn device(&self, query: &str) -> Result<Device, String> {
-        let running = self.running();
         // One directory scan, not one for the exact-name check and another for the list.
         let names = self.env.list_avds();
+        // An exact AVD name (what every API call passes) probes that AVD alone.
         if !query.is_empty() && names.iter().any(|n| n == query) {
-            return Ok(self.describe(query, &running));
+            return Ok(self.describe(query, &self.running_of(query).into_iter().collect::<Vec<_>>()));
         }
+        let running = self.running();
         // `booted` is decided by what is running alone: load only those AVDs, not every config.
         let only_running = query.eq_ignore_ascii_case("booted");
         let devices: Vec<Device> = names
@@ -420,7 +435,7 @@ pub fn emu_binary() -> PathBuf {
     let exe = std::env::current_exe().ok();
     let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
     let chosen = choose_emu(var("SIMEE_EMU").or_else(|| var("EMU_BIN")), exe.as_deref(), &target, Path::is_file);
-    if chosen.starts_with(&target) && chosen.parent().is_some_and(|d| d.ends_with("release")) {
+    if is_checkout_release(&chosen, &target) {
         static NOTED: std::sync::Once = std::sync::Once::new();
         NOTED.call_once(|| {
             if let Some(note) = stale_note(&chosen, &Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")) {
@@ -429,6 +444,14 @@ pub fn emu_binary() -> PathBuf {
         });
     }
     chosen
+}
+
+/// Whether `emu` is a release binary under `target`, compared canonically: the running
+/// executable's path is resolved, `target` (built from `CARGO_MANIFEST_DIR/../../target`) isn't.
+fn is_checkout_release(emu: &Path, target: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (emu, target) = (canon(emu), canon(target));
+    emu.starts_with(&target) && emu.parent().is_some_and(|d| d.ends_with("release"))
 }
 
 /// Which `emu` to start (see [`emu_binary`]): `explicit` wins as given; else, in order, an `emu`
@@ -635,8 +658,15 @@ impl Device {
             // `kill` closes the session after its reply, so the reply may be cut short.
             let _ = console::send(r.console_port, &["kill".into()]);
         } else {
-            // The stock console wants its auth token first: interrupt the process, which the
-            // stock emulator turns into a clean exit.
+            // `kill -INT` makes the stock emulator exit cleanly without a console session
+            // (which would need its auth token first). The PID came from a lock file, so first
+            // confirm it is still a qemu running this AVD: never signal a reused PID.
+            if !emu_avd::process_runs_avd(r.pid, &r.avd_name) {
+                return Err(format!(
+                    "{}: PID {} no longer looks like the stock emulator running it (its command line changed); not signalling it",
+                    self.info.name, r.pid
+                ));
+            }
             Command::new("kill").args(["-INT", &r.pid.to_string()]).status().map_err(|e| format!("kill: {e}"))?;
         }
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -910,7 +940,8 @@ impl Device {
 /// Whether a running instance has finished booting.
 fn booted(r: &Running, adb: Option<&Path>) -> bool {
     let started = Instant::now();
-    // The stock emulator's console wants an auth token simee doesn't hold: adb alone says.
+    // Only simee's console is pinged here; for the stock emulator (whose console also wants its
+    // auth token first) adb alone says whether it has booted.
     let console_up = !r.simee
         || loop {
             if console::send(r.console_port, &["ping".into()]).is_ok() {
@@ -1111,6 +1142,44 @@ mod tests {
         assert!(err.contains("stock emulator") && err.contains("emulator-5750") && err.contains("needs simee's emu"), "{err}");
         assert!(err.contains("simee boot phone"), "{err}");
         assert_eq!(d.running.as_ref().map(Running::emulator), Some("stock"));
+    }
+
+    #[test]
+    fn stock_shutdown_refuses_a_pid_that_is_no_longer_its_qemu() {
+        let f = fixture("stockkill");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let mut d = f.android.device("phone").expect("phone");
+        // A PID that is some other program now (as after a reuse): a `sleep` this test started.
+        let mut other = Command::new("sleep").arg("30").spawn().expect("sleep");
+        d.running = Some(Running {
+            pid: other.id() as i32,
+            avd_name: "phone".into(),
+            console_port: 5750,
+            adb_port: 5751,
+            avd_dir: None,
+            simee: false,
+        });
+        let err = d.shutdown().expect_err("not its qemu");
+        let alive = other.try_wait().expect("wait").is_none();
+        let _ = other.kill();
+        let _ = other.wait();
+        assert!(alive, "the unrelated process was not signalled");
+        assert!(err.contains("no longer looks like the stock emulator") && err.contains("not signalling"), "{err}");
+    }
+
+    #[test]
+    fn the_stale_check_sees_a_release_emu_through_a_dotdot_target() {
+        let root = PathBuf::from("/tmp").join(format!("sa-canon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("target/release")).expect("dirs");
+        std::fs::create_dir_all(root.join("crates/x")).expect("dirs");
+        std::fs::write(root.join("target/release/emu"), b"").expect("emu");
+        let canonical = std::fs::canonicalize(root.join("target/release/emu")).expect("canonical");
+        // `CARGO_MANIFEST_DIR/../../target` is not normalized; the executable's path is.
+        let target = root.join("crates/x/../../target");
+        assert!(is_checkout_release(&canonical, &target));
+        assert!(!is_checkout_release(&canonical.with_file_name("elsewhere").join("emu"), &target));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
