@@ -390,6 +390,26 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   default there. Whether vCPUs reach a higher tier when emu is started from Terminal or a
   launchd job, and whether that changes boot or settle time, is not yet measured.
 
+- **GPU state across guest resets.** The renderer is process-wide and outlives each boot, but a
+  reset left the guest's virtio-gpu contexts and resources in it. An orderly `adb reboot` hid
+  that, since the guest's processes close their contexts on the way down. A hard reset (a kernel
+  panic, a watchdog, `echo b > /proc/sysrq-trigger`) didn't: the next boot's contexts of the same
+  ids failed (`Failed to create process resource for puid 1`), SurfaceFlinger never started and
+  the boot never completed. Now a reset removes the guest's blob mappings at once and releases
+  its resources and contexts when the device next activates, on the GPU worker before the
+  guest's first command. Released at the reset instead, a shutdown destroyed contexts just
+  before exit: the renderer's cleanup thread was then still destroying their Vulkan instances
+  while `exit` ran its static destructors, and one stop in four ended in SIGSEGV. A reset first
+  gives the fences the guest still waits on up to 100 ms to signal (a late one could complete a
+  request of the next boot, whose fence ids start again at 1), and fences signalled after the
+  device stopped reach no one. Between a reset and the next boot's first post, host screenshots
+  and streams show black instead of the last boot's final frame; a Vulkan-only renderer's post
+  notices are held until the renderer posts a buffer of the new boot (a color buffer's handle
+  can be the guest's resource id, which every boot allocates alike, so creation of that id
+  counts too). Before, once the new boot signalled fences, screenshots failed (`Failed to read
+  from ColorBuffer:3, not found`) until its first post. Numbers in
+  [benchmarks](benchmarks.md#emulator-internals).
+
 ## Development
 
 ```bash

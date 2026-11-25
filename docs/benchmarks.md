@@ -128,6 +128,16 @@ in [android.md](android.md#performance-notes).
 | Whole-disk FITRIM | | 90 ms | M-series Mac |
 | Vulkan-only renderer: warm boot of a 1080×2400 phone, median (runs) | 3.7 s (3.7, 3.5, 3.7) | 3.3 s (3.3, 3.3, 3.3) | M3 Max, 2026-11-25, `EMU_RENDERER_GL=1 scripts/android-bench.sh` against without |
 | Vulkan-only renderer: peak RSS of that boot | 3262 MB (3279, 1939, 3262) | 2014 MB (2044, 2014, 1945) | same runs |
+| GPU state released on reset: hard guest reset of a 720×1280 API 36 phone, reset to the next boot's first host frame, median (runs) | never (boot doesn't complete) | 1.37 s (1.45, 1.31, 1.42, 1.32) | M3 Max, 2026-11-25, see below |
+| Same, reset to `sys.boot_completed` | never | 7.0 s (7.09, 7.01, 6.97, 6.99) | same runs |
+| Same change, `adb reboot`: reset to first host frame / to `sys.boot_completed` | 1.15 / 6.87 s (1.29, 1.15, 1.15 / 6.87, 6.87, 6.81) | 1.08 / 6.75 s (1.20, 1.08, 1.08 / 6.77, 6.75, 6.71) | same AVD and hour |
+| Same change, `kill -INT` to process exit (exit status) | 0.16 s (0.141, 0.157, 0.275; all 0) | 0.12 s (0.115, 0.116, 0.135; all 0) | same AVD and hour |
+
+The reset rows: a hard reset is `echo b > /proc/sysrq-trigger` under `adb root`; the reset is
+the moment emu's `-verbose` log prints `stopped after …: Reset`, and the first host frame is the
+first `adb emu screenshot` (polled every 0.1 s) that differs from the one taken at the reset. With
+the change that one is black; before it, it was the last boot's final frame. The `adb reboot` and
+exit rows show no cost from the change; their differences are within run-to-run noise.
 
 The `--ignored` benches run on any host:
 
