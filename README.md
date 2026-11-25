@@ -20,6 +20,7 @@ of 3 boots each. A cold boot is a new AVD's first; a warm boot is any later one,
 | Warm boot, until `sys.boot_completed` | **3.5 s** | 17.1 s |
 | Warm boot, until `adb` sees the device | **1.6 s** | 8.5 s |
 | Peak memory, whole process tree, warm | **2.09 GB** | 3.78 GB |
+| Janky frames swiping the launcher, Pixel Tablet / phone | **0% / 0.25%** | 5.6% / 6.2% |
 | Java needed to provision an image | no | yes (`sdkmanager`) |
 
 The SDK emulator restores a snapshot in 2.8 s; emu has no snapshots yet, and its warm boot is

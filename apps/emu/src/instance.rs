@@ -215,6 +215,7 @@ impl Instance {
             height: self.avd.lcd().1,
             verbose: opts.verbose,
             display: display.clone(),
+            vulkan_only: guest_egl() == "angle",
         })
     }
 
@@ -635,8 +636,7 @@ fn bootconfig(avd: &Avd, opts: &Opts, graphics: bool) -> BootConfig {
         // address-space graphics: with `emulation` GLES rides the virtio-gpu pipe stream,
         // whose blocking reads serialize all processes on one queue (boots took 14–28 s with
         // ANRs, against 5–8 s on ANGLE). EMU_GUEST_EGL=emulation restores it.
-        let egl = std::env::var("EMU_GUEST_EGL").unwrap_or_else(|_| "angle".into());
-        bc.set("androidboot.hardwareegl", egl);
+        bc.set("androidboot.hardwareegl", guest_egl());
     }
     if opts.no_boot_anim {
         bc.set("androidboot.debug.sf.nobootanimation", "1");
@@ -717,6 +717,13 @@ fn legacy_cmdline(bc: &BootConfig, graphics: bool) -> String {
         out.push(format!("{key}={v}"));
     }
     out.join(" ")
+}
+
+/// The guest's GLES driver: ANGLE on the guest's Vulkan, or `EMU_GUEST_EGL` (`emulation`, the
+/// GLES encoder). Under ANGLE no guest process uses the host's GL, so the renderer runs without
+/// it ([`emu_vmm::GpuSpec::vulkan_only`]).
+fn guest_egl() -> String {
+    std::env::var("EMU_GUEST_EGL").unwrap_or_else(|_| "angle".into())
 }
 
 /// What the stock host hands `qemu-props` at boot.
