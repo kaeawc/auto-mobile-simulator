@@ -154,6 +154,20 @@ impl PortHandle {
     }
 }
 
+/// The most a backend's replies may leave queued for a guest that isn't reading them. A reply is
+/// kept or dropped whole, so a framed protocol (H4, UCI) never loses half a message.
+const REPLY_CAP: usize = 64 << 10;
+
+/// Queues a backend's `reply` for the guest unless the port already holds [`REPLY_CAP`] bytes
+/// (a guest that writes commands and never posts receive buffers); returns whether it was kept.
+fn queue_reply(pending: &mut VecDeque<u8>, reply: Vec<u8>) -> bool {
+    if pending.len() >= REPLY_CAP {
+        return false;
+    }
+    pending.extend(reply);
+    true
+}
+
 struct Port {
     name: String,
     backend: Box<dyn PortBackend>,
@@ -330,7 +344,7 @@ impl Worker {
             if !data.is_empty() {
                 let p = &mut self.ports[port as usize];
                 let reply = p.backend.guest_data(&data);
-                p.pending.extend(reply);
+                queue_reply(&mut p.pending, reply);
             }
         }
         // The flush raises one interrupt for both directions.
@@ -547,6 +561,22 @@ mod tests {
         g.control(9, ctl::PORT_READY, 1); // no such port: ignored
         g.send(CTL_TX, &[1, 2, 3]); // runt message: ignored
         assert!(g.idle(CTL_RX));
+    }
+
+    #[test]
+    fn replies_to_a_guest_that_never_reads_are_bounded() {
+        let mut pending = VecDeque::new();
+        let mut kept = 0;
+        for _ in 0..10_000 {
+            if queue_reply(&mut pending, vec![0; 256]) {
+                kept += 1;
+            }
+        }
+        assert!(pending.len() < REPLY_CAP + 256, "{} bytes queued", pending.len());
+        assert_eq!(pending.len(), kept * 256);
+        // Once the guest drains it, replies queue again.
+        pending.clear();
+        assert!(queue_reply(&mut pending, b"OK\r\n".to_vec()));
     }
 
     #[test]

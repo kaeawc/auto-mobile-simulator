@@ -33,6 +33,11 @@ mod status {
     pub const UNKNOWN_OID: u8 = 0x08;
 }
 
+/// The most the HAL's bytes may be buffered (an unfinished frame) or a segmented command's
+/// payload may grow to. UCI's control payloads are at most 255 bytes a segment; real commands
+/// are a few hundred bytes in all.
+const MAX_BUFFERED: usize = 4096;
+
 /// `DEVICE_STATE_READY`.
 const DEVICE_READY: u8 = 0x01;
 
@@ -53,6 +58,8 @@ pub struct Uwbs {
     buf: Vec<u8>,
     /// A segmented command's payload so far.
     partial: Vec<u8>,
+    /// The GID and OID of the message in `partial`.
+    partial_id: (u8, u8),
 }
 
 impl Uwbs {
@@ -64,7 +71,17 @@ impl Uwbs {
         while self.buf.len() - at >= 4 {
             let h = &self.buf[at..at + 4];
             let mt = h[0] >> 5;
+            // Not a UCI message type: the stream is out of step (the HAL restarted mid-frame, or
+            // the guest is sending junk). Drop what's buffered and wait for a fresh header.
+            if mt > MT_NOTIFICATION {
+                self.clear();
+                return out;
+            }
             let len = if mt == MT_DATA { usize::from(u16::from_le_bytes([h[2], h[3]])) } else { usize::from(h[3]) };
+            if 4 + len > MAX_BUFFERED {
+                self.clear();
+                return out;
+            }
             if self.buf.len() - at < 4 + len {
                 break;
             }
@@ -76,6 +93,16 @@ impl Uwbs {
             if mt != MT_COMMAND {
                 continue;
             }
+            // A segment of another message restarts reassembly; a message that outgrows the bound
+            // is dropped.
+            if !self.partial.is_empty() && self.partial_id != (gid, oid) {
+                self.partial.clear();
+            }
+            self.partial_id = (gid, oid);
+            if self.partial.len() + payload.len() > MAX_BUFFERED {
+                self.partial.clear();
+                continue;
+            }
             self.partial.extend_from_slice(&payload);
             if last {
                 let payload = std::mem::take(&mut self.partial);
@@ -83,6 +110,9 @@ impl Uwbs {
             }
         }
         self.buf.drain(..at);
+        if self.buf.len() > MAX_BUFFERED {
+            self.clear();
+        }
         out
     }
 
@@ -108,8 +138,8 @@ fn answer(gid: u8, oid: u8, _payload: &[u8]) -> Vec<u8> {
         (GID_CORE, oid::CORE_GET_CAPS_INFO | oid::CORE_SET_CONFIG | oid::CORE_GET_CONFIG) => rsp(&[status::OK, 0]),
         (GID_CORE, _) => rsp(&[status::UNKNOWN_OID]),
         (GID_ANDROID, oid::ANDROID_SET_COUNTRY_CODE) => rsp(&[status::OK]),
-        // Sessions (GID 1), ranging (GID 2), data control, test and vendor groups: refused, as
-        // there's no peer.
+        // Sessions (GID 1), ranging (GID 2) and data control (GID 3), and the rest of the Android
+        // group: rejected, as there's no peer. Test and vendor groups answer UNKNOWN_GID.
         (0x1..=0x3, _) | (GID_ANDROID, _) => rsp(&[status::REJECTED]),
         _ => rsp(&[status::UNKNOWN_GID]),
     }
@@ -147,6 +177,34 @@ mod tests {
         assert!(u.push(&[0x20, 0x02, 0x00]).is_empty());
         u.clear();
         assert!(u.push(&[0x01]).is_empty());
+    }
+
+    #[test]
+    fn segments_are_bounded_and_per_message() {
+        let mut u = Uwbs::default();
+        // PBF-set segments forever: memory stays bounded and nothing is answered.
+        for _ in 0..1000 {
+            assert!(u.push(&[0x30, 0x04, 0x00, 0xff].iter().copied().chain([7; 255]).collect::<Vec<u8>>()).is_empty());
+            assert!(u.partial.len() <= MAX_BUFFERED);
+        }
+        // A segment of a different message restarts reassembly rather than joining it.
+        let mut u = Uwbs::default();
+        assert!(u.push(&[0x30, 0x04, 0x00, 0x02, 1, 2]).is_empty());
+        assert_eq!(u.push(&[0x20, 0x02, 0x00, 0x00])[..4], [0x40, 0x02, 0x00, 0x0a]);
+        assert!(u.partial.is_empty());
+        // An oversized declared data packet doesn't make the buffer wait for 64 KiB.
+        assert!(u.push(&[0x00, 0x00, 0xff, 0xff, 1]).is_empty());
+        assert!(u.buf.is_empty());
+    }
+
+    #[test]
+    fn resyncs_on_an_invalid_header() {
+        let mut u = Uwbs::default();
+        // A restarted HAL leaves the stream mid-frame: what's read as a header has no message
+        // type (0xe0 is 7). The buffered bytes are dropped and the next command answers.
+        assert!(u.push(&[0xe0, 0, 0, 0, 0, 0, 0, 0, 0]).is_empty());
+        assert!(u.buf.is_empty());
+        assert_eq!(u.push(&[0x20, 0x03, 0x00, 0x00]), [0x40, 0x03, 0x00, 0x02, 0x00, 0x00]);
     }
 
     #[test]
