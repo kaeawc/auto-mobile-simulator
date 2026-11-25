@@ -24,8 +24,6 @@ const TCP_TX: usize = 256 * 1024;
 const UDP_IDLE: Duration = Duration::from_secs(60);
 const DNS_IDLE: Duration = Duration::from_secs(10);
 const PING_IDLE: Duration = Duration::from_secs(10);
-const MAX_UDP: usize = 512;
-const MAX_PING: usize = 64;
 /// Datagrams read from one socket per pass, so one busy flow can't starve the rest.
 const DATAGRAMS_PER_PASS: usize = 64;
 
@@ -46,15 +44,25 @@ impl Wire {
         Wire { rx: VecDeque::new(), tx: Vec::new(), limit, blocked: false, verify }
     }
 
-    fn full(&self) -> bool {
-        self.limit.is_some_and(|l| self.tx.len() >= l)
+    /// How many more frames the guest's queue takes this pass.
+    fn room(&self) -> usize {
+        self.limit.map_or(usize::MAX, |l| l.saturating_sub(self.tx.len()))
     }
 
-    /// Queues a frame built outside smoltcp; dropped when the guest's queue is full.
-    fn push(&mut self, f: Vec<u8>) {
-        if !self.full() {
-            self.tx.push(f);
+    fn full(&self) -> bool {
+        self.room() == 0
+    }
+
+    /// Queues the frames of one datagram built outside smoltcp: all of them, or none when the
+    /// guest's queue lacks room for all (a datagram missing a fragment is lost anyway).
+    fn push_all(&mut self, frames: &mut Vec<Vec<u8>>) -> bool {
+        if frames.len() > self.room() {
+            frames.clear();
+            self.blocked = true;
+            return false;
         }
+        self.tx.append(frames);
+        true
     }
 }
 
@@ -113,6 +121,9 @@ enum TcpState {
     /// The host connect is in progress; the guest's latest SYN waits for its outcome.
     Connecting(Vec<u8>),
     Open(SocketHandle),
+    /// smoltcp is done with the connection (the guest sent FIN), but what the guest sent
+    /// before it hasn't all reached the host yet: the rest, and how much of it went.
+    Draining(Vec<u8>, usize),
 }
 
 struct TcpFlow {
@@ -125,11 +136,24 @@ struct TcpFlow {
     write_blocked: bool,
     /// The guest's FIN was passed on.
     host_shut: bool,
+    /// The guest sent FIN (smoltcp's socket reached a state past it).
+    guest_fin: bool,
+    /// Writing to the host failed while draining.
+    dead: bool,
 }
 
 impl TcpFlow {
     fn new(stream: TcpStream, state: TcpState) -> TcpFlow {
-        TcpFlow { stream, state, ready: PollFlags::empty(), host_eof: false, write_blocked: false, host_shut: false }
+        TcpFlow {
+            stream,
+            state,
+            ready: PollFlags::empty(),
+            host_eof: false,
+            write_blocked: false,
+            host_shut: false,
+            guest_fin: false,
+            dead: false,
+        }
     }
 
     /// What to wait for on the host socket. Nothing when there is no room for what it would
@@ -148,6 +172,8 @@ impl TcpFlow {
                 }
                 ev
             }
+            TcpState::Draining(..) if self.write_blocked => PollFlags::OUT,
+            TcpState::Draining(..) => PollFlags::empty(),
         }
     }
 }
@@ -157,6 +183,10 @@ struct UdpFlow {
     ready: PollFlags,
     idle: Duration,
     deadline: Instant,
+    /// DNS (port 53): queries sent and not answered yet; the flow is dropped at the last
+    /// answer, so a resolver's one-query sockets don't each hold a host socket for
+    /// [`DNS_IDLE`].
+    queries: Option<u32>,
 }
 
 struct PingFlow {
@@ -182,14 +212,13 @@ struct Emitter {
 }
 
 impl Emitter {
+    /// Queues one datagram's frames, all or none (see [`Wire::push_all`]).
     fn emit(&mut self, wire: &mut Wire, src: Ipv4Addr, dst: Ipv4Addr, proto: u8, l4: &[u8]) {
         let Some(guest_mac) = self.guest_mac else { return };
         self.ip_id = self.ip_id.wrapping_add(1);
         let link = Link { gateway_mac: self.gateway_mac, guest_mac };
         packet::ipv4_frames(&mut self.frames, link, src, dst, proto, self.ip_id, l4);
-        for f in self.frames.drain(..) {
-            wire.push(f);
-        }
+        wire.push_all(&mut self.frames);
     }
 }
 
@@ -263,13 +292,17 @@ impl Engine {
                         slots.push(Slot::Tcp(*k));
                     }
                 }
-                for (k, f) in &self.udp {
-                    fds.push(PollFd::new(&f.sock, PollFlags::IN));
-                    slots.push(Slot::Udp(*k));
-                }
-                for (k, f) in &self.ping {
-                    fds.push(PollFd::new(&f.sock, PollFlags::IN));
-                    slots.push(Slot::Ping(*k));
+                // A datagram read while the guest's queue is full would be dropped: they wait
+                // in their host sockets until the guest takes frames (the device wakes this).
+                if !self.wire.blocked {
+                    for (k, f) in &self.udp {
+                        fds.push(PollFd::new(&f.sock, PollFlags::IN));
+                        slots.push(Slot::Udp(*k));
+                    }
+                    for (k, f) in &self.ping {
+                        fds.push(PollFd::new(&f.sock, PollFlags::IN));
+                        slots.push(Slot::Ping(*k));
+                    }
                 }
                 match rustix::event::poll(&mut fds, timeout.as_ref()) {
                     Ok(_) | Err(rustix::io::Errno::INTR) => {}
@@ -380,7 +413,8 @@ impl Engine {
     /// Drops every flow: the guest's stack was reset, so none of its connections exist.
     fn clear(&mut self) {
         for f in self.tcp.values() {
-            if let TcpState::Open(h) = f.state {
+            if let TcpState::Open(h) = &f.state {
+                let h = *h;
                 self.sockets.remove(h);
             }
         }
@@ -438,6 +472,13 @@ impl Engine {
     }
 
     fn open_tcp(&mut self, key: Key, syn: Vec<u8>) {
+        // Past the caps the SYN finds no socket and smoltcp resets it, as for a refused connect.
+        let limits = self.cfg.limits;
+        let connecting = self.tcp.values().filter(|f| matches!(f.state, TcpState::Connecting(_))).count();
+        if self.tcp.len() >= limits.tcp || connecting >= limits.tcp_connecting {
+            self.wire.rx.push_back(syn);
+            return;
+        }
         let Some(to) = self.host_addr(key.1) else {
             self.wire.rx.push_back(syn);
             return;
@@ -490,10 +531,22 @@ impl Engine {
     /// Moves data between each connection's smoltcp buffers and its host socket.
     fn service_tcp(&mut self) {
         for f in self.tcp.values_mut() {
-            let TcpState::Open(h) = f.state else { continue };
-            let s = self.sockets.get_mut::<tcp::Socket>(h);
             let ready = std::mem::replace(&mut f.ready, PollFlags::empty());
+            let h = match &mut f.state {
+                TcpState::Open(h) => *h,
+                TcpState::Draining(rest, at) => {
+                    if !f.write_blocked || ready.intersects(PollFlags::OUT | PollFlags::ERR | PollFlags::HUP) {
+                        (f.write_blocked, f.dead) = drain(&f.stream, rest, at);
+                    }
+                    continue;
+                }
+                TcpState::Connecting(_) => continue,
+            };
+            let s = self.sockets.get_mut::<tcp::Socket>(h);
             let stream = &f.stream;
+            if matches!(s.state(), tcp::State::CloseWait | tcp::State::LastAck | tcp::State::Closing | tcp::State::TimeWait) {
+                f.guest_fin = true;
+            }
 
             // Guest to host, straight from smoltcp's buffer.
             if !f.write_blocked || ready.intersects(PollFlags::OUT | PollFlags::ERR | PollFlags::HUP) {
@@ -548,21 +601,56 @@ impl Engine {
     }
 
     /// Drops connections smoltcp is done with: closed (after any RST went out) or in
-    /// TIME-WAIT (the last ACK went out).
+    /// TIME-WAIT (the last ACK went out). After the guest's FIN, what it sent before that and
+    /// the host hasn't taken yet still goes (smoltcp keeps it, but clears it when TIME-WAIT
+    /// ends): the connection drains from a copy, then the host gets its FIN.
     fn reap(&mut self) {
         let sockets = &mut self.sockets;
         self.tcp.retain(|_, f| {
-            let TcpState::Open(h) = f.state else { return true };
-            let s = sockets.get::<tcp::Socket>(h);
-            let done = match s.state() {
-                tcp::State::TimeWait => true,
-                tcp::State::Closed => s.remote_endpoint().is_none(),
-                _ => false,
+            let h = match &f.state {
+                TcpState::Connecting(_) => return true,
+                TcpState::Draining(rest, at) => {
+                    let done = f.dead || *at >= rest.len();
+                    if done && !f.dead && !f.host_shut {
+                        let _ = f.stream.shutdown(Shutdown::Write);
+                    }
+                    return !done;
+                }
+                TcpState::Open(h) => *h,
             };
-            if done {
-                sockets.remove(h);
+            let s = sockets.get_mut::<tcp::Socket>(h);
+            let fin = match s.state() {
+                tcp::State::TimeWait => true,
+                // Without the guest's FIN (it reset the connection, or writing to the host
+                // failed) nothing more goes.
+                tcp::State::Closed if s.remote_endpoint().is_none() => f.guest_fin,
+                _ => return true,
+            };
+            let mut rest = Vec::new();
+            if fin {
+                while s.can_recv() {
+                    let took = s.recv(|b| {
+                        rest.extend_from_slice(b);
+                        (b.len(), b.len())
+                    });
+                    if !matches!(took, Ok(n) if n > 0) {
+                        break;
+                    }
+                }
             }
-            !done
+            sockets.remove(h);
+            // Write what the host takes now; the rest waits for it to poll writable.
+            let mut at = 0;
+            let (blocked, dead) = drain(&f.stream, &rest, &mut at);
+            if blocked {
+                f.state = TcpState::Draining(rest, at);
+                f.write_blocked = true;
+                return true;
+            }
+            if fin && !dead && !f.host_shut {
+                let _ = f.stream.shutdown(Shutdown::Write);
+            }
+            false
         });
     }
 
@@ -571,15 +659,19 @@ impl Engine {
         let now = Instant::now();
         if !self.udp.contains_key(&key) {
             let Some(to) = self.host_addr(dst) else { return };
-            if self.udp.len() >= MAX_UDP {
+            if self.udp.len() >= self.cfg.limits.udp {
                 evict(&mut self.udp, |f| f.deadline);
             }
             let Ok(sock) = host::udp(to) else { return };
-            let idle = if dst.port() == 53 { DNS_IDLE } else { UDP_IDLE };
-            self.udp.insert(key, UdpFlow { sock, ready: PollFlags::empty(), idle, deadline: now });
+            let dns = dst.port() == 53;
+            let idle = if dns { DNS_IDLE } else { UDP_IDLE };
+            self.udp.insert(key, UdpFlow { sock, ready: PollFlags::empty(), idle, deadline: now, queries: dns.then_some(0) });
         }
         if let Some(f) = self.udp.get_mut(&key) {
             f.deadline = now + f.idle;
+            if let Some(q) = &mut f.queries {
+                *q += 1;
+            }
             let _ = f.sock.send(payload);
         }
     }
@@ -595,7 +687,7 @@ impl Engine {
         let key = (dst, ident);
         let now = Instant::now();
         if !self.ping.contains_key(&key) {
-            if self.ping.len() >= MAX_PING {
+            if self.ping.len() >= self.cfg.limits.ping {
                 evict(&mut self.ping, |f| f.deadline);
             }
             let Ok(sock) = host::ping() else { return };
@@ -608,7 +700,8 @@ impl Engine {
     }
 
     /// Replies on the datagram sockets that polled readable, as frames from the address the
-    /// guest sent to.
+    /// guest sent to. A datagram is read only when the guest's queue has room for all its
+    /// fragments; the rest wait in their sockets.
     fn service_datagrams(&mut self) {
         let now = Instant::now();
         for (&(src, dst), f) in self.udp.iter_mut() {
@@ -616,6 +709,13 @@ impl Engine {
                 continue;
             }
             for _ in 0..DATAGRAMS_PER_PASS {
+                let room = self.wire.room();
+                if room < packet::MAX_FRAGMENTS
+                    && f.sock.peek(&mut self.scratch[packet::UDP_HDR..]).is_ok_and(|n| packet::fragments(packet::UDP_HDR + n) > room)
+                {
+                    self.wire.blocked = true;
+                    break;
+                }
                 // ECONNREFUSED (an ICMP port unreachable) or no more data: either ends it.
                 let Ok(n) = f.sock.recv(&mut self.scratch[packet::UDP_HDR..]) else { break };
                 if n > usize::from(u16::MAX) - packet::UDP_HDR {
@@ -625,6 +725,14 @@ impl Engine {
                 packet::udp_header(d, dst, src);
                 self.out.emit(&mut self.wire, *dst.ip(), *src.ip(), packet::PROTO_UDP, d);
                 f.deadline = now + f.idle;
+                if let Some(q) = &mut f.queries {
+                    *q = q.saturating_sub(1);
+                    if *q == 0 {
+                        // Answered: `expire` drops it this pass.
+                        f.deadline = now;
+                        break;
+                    }
+                }
             }
         }
         for (&(dst, ident), f) in self.ping.iter_mut() {
@@ -632,6 +740,11 @@ impl Engine {
                 continue;
             }
             for _ in 0..DATAGRAMS_PER_PASS {
+                let room = self.wire.room();
+                if room < packet::MAX_FRAGMENTS && f.sock.peek_from(&mut self.scratch).is_ok_and(|(n, _)| packet::fragments(n) > room) {
+                    self.wire.blocked = true;
+                    break;
+                }
                 let Ok((n, from)) = f.sock.recv_from(&mut self.scratch) else { break };
                 let b = &self.scratch[..n];
                 let Some(m) = packet::strip_ip_header(b) else { continue };
@@ -659,6 +772,21 @@ impl Engine {
         self.udp.retain(|_, f| f.deadline > now);
         self.ping.retain(|_, f| f.deadline > now);
     }
+}
+
+/// Writes what's left of a drained connection to the host, from `at`, until it's all gone or
+/// the host's buffer is full: whether it is full, and whether the host failed.
+fn drain(stream: &TcpStream, rest: &[u8], at: &mut usize) -> (bool, bool) {
+    while *at < rest.len() {
+        match (&mut &*stream).write(&rest[*at..]) {
+            Ok(0) => return (false, true),
+            Ok(n) => *at += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return (true, false),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return (false, true),
+        }
+    }
+    (false, false)
 }
 
 fn io_result(r: io::Result<usize>) -> (usize, io::Result<usize>) {

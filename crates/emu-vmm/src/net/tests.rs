@@ -390,3 +390,206 @@ fn a_frame_for_an_unknown_flow_is_reset_not_forwarded() {
     assert_eq!(rst[packet::ETH_HDR + packet::IP_HDR + 13] & 0x04, 0x04, "RST flag");
     assert_eq!(n.flows(), 0);
 }
+
+#[test]
+fn flow_caps_leave_the_rest_of_emu_its_descriptors() {
+    // macOS's default soft limit: the caps and emu's own descriptors fit under it.
+    let l = Limits::for_fds(256);
+    assert!((l.tcp + l.udp + l.ping) as u64 + RESERVED_FDS <= 256, "{l:?}");
+    assert!(l.tcp_connecting <= l.tcp);
+    // What emu raises the limit to on macOS, and anything above it.
+    let full = Limits { tcp: 1024, tcp_connecting: 256, udp: 512, ping: 64 };
+    assert_eq!(Limits::for_fds(10240), full);
+    assert_eq!(Limits::for_fds(u64::MAX), full);
+    // Even a starved process lets one flow of each kind through.
+    let tiny = Limits::for_fds(0);
+    assert!(tiny.tcp >= 1 && tiny.tcp_connecting >= 1 && tiny.udp >= 1 && tiny.ping >= 1);
+}
+
+#[test]
+fn a_syn_past_the_tcp_cap_is_reset() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let limits = Limits { tcp: 2, tcp_connecting: 2, udp: 4, ping: 4 };
+    let mut g = Guest::new(Config { limits, ..Config::default() });
+    let a = g.connect(port, 49160);
+    let b = g.connect(port, 49161);
+    g.until("two established", |g| g.sock(a).state() == tcp::State::Established && g.sock(b).state() == tcp::State::Established);
+    let c = g.connect(port, 49162);
+    let start = Instant::now();
+    g.until("the third is reset", |g| g.sock(c).state() == tcp::State::Closed);
+    assert!(start.elapsed() < Duration::from_millis(900), "a RST, not the guest's SYN retransmit timer");
+    assert_eq!(g.nat.flows(), 2);
+    assert_eq!(g.sock(a).state(), tcp::State::Established, "the open ones are untouched");
+    drop(listener);
+}
+
+#[test]
+fn a_dns_flow_is_dropped_once_every_query_is_answered() {
+    let resolver = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let at = resolver.local_addr().expect("addr");
+    let fake = std::thread::spawn(move || {
+        // Two queries from one socket (A and AAAA, as some resolvers send them), then answers.
+        let mut b = [0u8; 512];
+        let (n1, from) = resolver.recv_from(&mut b).expect("query 1");
+        let q1 = b[..n1].to_vec();
+        let (n2, _) = resolver.recv_from(&mut b).expect("query 2");
+        let q2 = b[..n2].to_vec();
+        resolver.send_to(&q1, from).expect("answer 1");
+        resolver.send_to(&q2, from).expect("answer 2");
+    });
+    let mut n = nat(Config { dns: Dns::Fixed(at), ..Config::default() });
+    let src = SocketAddrV4::new(GUEST, 51001);
+    n.transmit(&udp_frame(src, SocketAddrV4::new(DNS, 53), b"query-a"));
+    n.transmit(&udp_frame(src, SocketAddrV4::new(DNS, 53), b"query-aaaa"));
+    let is_answer = |f: &[u8]| matches!(packet::parse(f), Frame::Udp { .. });
+    let a1 = next_frame(&mut n, Duration::from_secs(5), is_answer).expect("answer 1");
+    let a2 = next_frame(&mut n, Duration::from_secs(5), is_answer).expect("answer 2, after the first didn't drop the flow");
+    let payload = |f: &[u8]| match packet::parse(f) {
+        Frame::Udp { payload, .. } => payload.to_vec(),
+        _ => unreachable!(),
+    };
+    assert_eq!(payload(&a1), b"query-a");
+    assert_eq!(payload(&a2), b"query-aaaa");
+    fake.join().expect("resolver");
+    let start = Instant::now();
+    while n.flows() != 0 {
+        assert!(start.elapsed() < Duration::from_secs(2), "the answered DNS flow still holds a host socket");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_datagram_reaches_the_guest_whole_or_not_at_all_and_none_wait_forever() {
+    const COUNT: u32 = 60;
+    // 8008 bytes of UDP: 6 fragments each, so the guest's queue (256 frames) fills mid-datagram.
+    const SIZE: usize = 8000;
+    assert_eq!(packet::fragments(packet::UDP_HDR + SIZE), 6);
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let port = server.local_addr().expect("addr").port();
+    let blast = std::thread::spawn(move || {
+        let mut b = [0u8; 16];
+        let (_, from) = server.recv_from(&mut b).expect("go");
+        for i in 0..COUNT {
+            let mut d = vec![i as u8; SIZE];
+            d[..4].copy_from_slice(&i.to_be_bytes());
+            server.send_to(&d, from).expect("send");
+        }
+    });
+    let mut n = nat(Config::default());
+    n.transmit(&udp_frame(SocketAddrV4::new(GUEST, 40010), SocketAddrV4::new(GW, port), b"go"));
+    blast.join().expect("server");
+    // The guest takes nothing for a while: its queue fills.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Reassemble by IP id: (bytes seen, total once the last fragment is seen).
+    let mut seen: std::collections::HashMap<u16, (usize, Option<usize>)> = std::collections::HashMap::new();
+    let mut last = Instant::now();
+    while last.elapsed() < Duration::from_millis(500) {
+        let Some(f) = n.receive() else {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        };
+        last = Instant::now();
+        if f.len() <= 34 || f[23] != packet::PROTO_UDP {
+            continue;
+        }
+        let (ip, body) = ip_of(&f);
+        let id = u16::from_be_bytes([ip[4], ip[5]]);
+        let ff = u16::from_be_bytes([ip[6], ip[7]]);
+        let e = seen.entry(id).or_default();
+        e.0 += body.len();
+        if ff & 0x2000 == 0 {
+            e.1 = Some(usize::from(ff & 0x1fff) * 8 + body.len());
+        }
+    }
+    let whole = seen.values().filter(|(got, total)| *total == Some(*got)).count();
+    let partial: Vec<_> = seen.values().filter(|(got, total)| *total != Some(*got)).collect();
+    assert!(partial.is_empty(), "datagrams cut mid-way: {partial:?}");
+    assert!(whole > 256 / 6, "reading resumed once the guest took frames: {whole} of {COUNT}");
+    // Darwin's UDP receive buffer (786 KB) holds every datagram that waited.
+    #[cfg(target_vendor = "apple")]
+    assert_eq!(whole, COUNT as usize, "none dropped");
+}
+
+/// The upload's byte at `at`.
+fn upload_byte(at: usize) -> u8 {
+    (at.wrapping_mul(11) >> 3) as u8
+}
+
+#[test]
+fn what_the_guest_sent_before_its_fin_reaches_a_slow_host() {
+    enum Cmd {
+        Read(usize),
+        ReadToEnd,
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (cmd, cmds) = std::sync::mpsc::channel::<Cmd>();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().expect("accept");
+        // The host closes its half first and reads only when told.
+        s.shutdown(std::net::Shutdown::Write).expect("half-close");
+        let mut got = Vec::new();
+        for c in cmds {
+            match c {
+                Cmd::Read(n) => {
+                    let at = got.len();
+                    got.resize(at + n, 0);
+                    s.read_exact(&mut got[at..]).expect("read");
+                }
+                Cmd::ReadToEnd => {
+                    s.read_to_end(&mut got).expect("read to the guest's FIN");
+                    break;
+                }
+            }
+        }
+        got
+    });
+    let mut g = Guest::new(Config::default());
+    let h = g.connect(port, 49163);
+    g.until("the host's FIN", |g| g.sock(h).state() == tcp::State::CloseWait);
+
+    // Upload until nothing more is acknowledged: the host's socket buffers and the NAT's
+    // receive buffer are full, and the rest waits in the guest's.
+    let mut sent = 0;
+    let (mut acked, mut moved) = (0, Instant::now());
+    g.until("every buffer on the way is full", |g| {
+        let s = g.sock(h);
+        while s.can_send() {
+            sent += s
+                .send(|b| {
+                    for (k, v) in b.iter_mut().enumerate() {
+                        *v = upload_byte(sent + k);
+                    }
+                    (b.len(), b.len())
+                })
+                .expect("send");
+        }
+        let now_acked = sent - s.send_queue();
+        if now_acked != acked {
+            (acked, moved) = (now_acked, Instant::now());
+        }
+        moved.elapsed() > Duration::from_millis(300)
+    });
+    // The host takes a little: enough for the guest's queue and its FIN to reach the NAT, which
+    // acknowledges the FIN while still holding most of a buffer's worth for the host.
+    cmd.send(Cmd::Read(g.sock(h).send_queue() + 64 * 1024)).expect("server");
+    g.until("the guest's queue is sent", |g| g.sock(h).send_queue() == 0);
+    g.sock(h).close();
+    g.until("closed", |g| g.sock(h).state() == tcp::State::Closed);
+    cmd.send(Cmd::ReadToEnd).expect("server");
+    let start = Instant::now();
+    while !server.is_finished() {
+        g.pump();
+        deadline("the host reads to the end", start);
+    }
+    let got = server.join().expect("server");
+    assert_eq!(got.len(), sent, "every byte before the FIN reached the host");
+    assert!(got.iter().enumerate().all(|(i, &v)| v == upload_byte(i)), "in order and intact");
+    let start = Instant::now();
+    while g.nat.flows() != 0 {
+        g.pump();
+        deadline("the drained flow is reaped", start);
+    }
+}

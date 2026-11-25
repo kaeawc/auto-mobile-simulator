@@ -90,7 +90,8 @@ Unsupported combinations are refused with the reason. The matrix and its gaps:
 - Automotive and Android XR images have their devices implemented but have not been booted.
 - iOS microphone injection still needs a loopback audio device.
 - Android guests reach the internet over IPv4 only (TCP, UDP, ping); no IPv6 or inbound port
-  forwarding yet.
+  forwarding yet. IP fragments the guest sends are dropped, and DNS goes to the host's first
+  resolver, not to a VPN's scoped one.
 
 ## Documentation
 

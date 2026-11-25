@@ -188,12 +188,22 @@ pub struct Link {
     pub guest_mac: [u8; 6],
 }
 
+/// Payload bytes per fragment: what the MTU leaves after the IP header, a multiple of 8.
+const FRAGMENT: usize = (MTU - IP_HDR) & !7;
+
+/// How many frames [`ipv4_frames`] makes of an `len`-byte IP payload.
+pub fn fragments(len: usize) -> usize {
+    len.div_ceil(FRAGMENT).max(1)
+}
+
+/// The most frames one datagram (at most 64 KiB) takes.
+pub const MAX_FRAGMENTS: usize = (u16::MAX as usize).div_ceil(FRAGMENT);
+
 /// Wraps an IPv4 payload (`l4`, header included) in frames for the guest, fragmented to its MTU.
 pub fn ipv4_frames(out: &mut Vec<Vec<u8>>, link: Link, src: Ipv4Addr, dst: Ipv4Addr, proto: u8, id: u16, l4: &[u8]) {
-    const MAX: usize = (MTU - IP_HDR) & !7;
     let mut offset = 0;
     loop {
-        let chunk = &l4[offset..l4.len().min(offset + MAX)];
+        let chunk = &l4[offset..l4.len().min(offset + FRAGMENT)];
         let more = offset + chunk.len() < l4.len();
         let mut f = Vec::with_capacity(ETH_HDR + IP_HDR + chunk.len());
         f.extend_from_slice(&link.guest_mac);
@@ -242,6 +252,17 @@ mod tests {
         let link = Link { gateway_mac: [2; 6], guest_mac: [4; 6] };
         ipv4_frames(&mut out, link, Ipv4Addr::new(10, 0, 2, 2), Ipv4Addr::new(10, 0, 2, 15), PROTO_UDP, 7, &[0; 8]);
         assert_eq!(fold(sum(&out[0][ETH_HDR..ETH_HDR + IP_HDR], 0)), 0);
+    }
+
+    #[test]
+    fn fragments_counts_the_frames_ipv4_frames_makes() {
+        let link = Link { gateway_mac: [2; 6], guest_mac: [4; 6] };
+        for len in [0, 1, FRAGMENT - 1, FRAGMENT, FRAGMENT + 1, 8008, usize::from(u16::MAX)] {
+            let mut out = Vec::new();
+            ipv4_frames(&mut out, link, Ipv4Addr::new(10, 0, 2, 2), Ipv4Addr::new(10, 0, 2, 15), PROTO_UDP, 7, &vec![0; len]);
+            assert_eq!(fragments(len), out.len(), "{len} bytes");
+        }
+        assert_eq!(fragments(usize::from(u16::MAX)), MAX_FRAGMENTS);
     }
 
     #[test]

@@ -53,6 +53,46 @@ pub struct Config {
     /// What the gateway's address reaches on the host.
     pub loopback: IpAddr,
     pub dns: Dns,
+    /// How many flows (each a host socket) the guest may hold open.
+    pub limits: Limits,
+}
+
+/// Caps on the guest's flows. The guest is untrusted and every flow is a host file descriptor
+/// of the emu process: past the process's limit (`RLIMIT_NOFILE`, 256 by default on macOS) new
+/// flows fail and so does every `accept` emu makes (the console, the adb bridge).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// TCP connections, connecting or open; a SYN past this is reset.
+    pub tcp: usize,
+    /// Of those, host connects still in progress.
+    pub tcp_connecting: usize,
+    /// UDP flows; past this the one closest to expiring is dropped.
+    pub udp: usize,
+    /// ICMP echo flows, likewise.
+    pub ping: usize,
+}
+
+/// File descriptors left for the rest of emu: disks, the console and its clients, the adb
+/// bridge, the display socket and frame rings, the renderer, the NAT's own wakeup.
+const RESERVED_FDS: u64 = 128;
+
+impl Limits {
+    /// The caps for a process allowed `fds` descriptors: at most 1024 TCP (256 connecting),
+    /// 512 UDP and 64 ICMP flows, fewer when the limit leaves less than that after
+    /// [`RESERVED_FDS`].
+    pub fn for_fds(fds: u64) -> Limits {
+        let budget = usize::try_from(fds.saturating_sub(RESERVED_FDS)).unwrap_or(usize::MAX);
+        let udp = (budget / 4).min(512);
+        let ping = (budget / 16).min(64);
+        let tcp = (budget - udp - ping).clamp(1, 1024);
+        Limits { tcp, tcp_connecting: tcp.min(256), udp: udp.max(1), ping: ping.max(1) }
+    }
+
+    /// The caps for this process's current `RLIMIT_NOFILE` (emu raises it at start).
+    pub fn from_rlimit() -> Limits {
+        let fds = rustix::process::getrlimit(rustix::process::Resource::Nofile).current.unwrap_or(u64::MAX);
+        Limits::for_fds(fds)
+    }
 }
 
 impl Default for Config {
@@ -64,6 +104,7 @@ impl Default for Config {
             gateway_mac: GATEWAY_MAC,
             loopback: IpAddr::V4(Ipv4Addr::LOCALHOST),
             dns: Dns::System,
+            limits: Limits::from_rlimit(),
         }
     }
 }

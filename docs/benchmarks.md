@@ -50,23 +50,32 @@ runs.
 Without an `eth0`, the guest's telephony retries the data call without a delay; with one, the
 call succeeds once and the guest goes idle.
 
-With the user-mode NAT behind it (#36): a fresh API 36 google_apis AVD, warm-booted under the same
-emu build with the NAT and with it swapped for link only, one boot each, M3 Max, 2026-11-25.
-Each waits 60 s after `sys.boot_completed`, then takes emu's CPU time over three 20 s windows
-(`ps -o time`); the 1-minute load was 8.6–11.1.
+With the user-mode NAT behind it (#36): one fresh API 36 google_apis AVD and one emu build, the
+NAT on and off (`EMU_NET=link`), 3 warm boots each, alternating after one uncounted first boot,
+M3 Max (16 CPUs), 2026-11-25. Each waits 60 s after `sys.boot_completed`, then takes emu's CPU
+time over 60 s (`ps -o time`). `scripts/net-bench.sh idle <avd>`. Other lanes' work on the host
+put the 1-minute load between 4.5 and 77 across the runs (each run's load at its start and end
+below); the first link-only run had 65–77, the rest 4.5–15.6.
 
-| emu | Idle host CPU, median (runs) | Guest internet |
+| emu | Idle host CPU, median (runs, 1-minute load) | Guest internet |
 | --- | --- | --- |
-| Link-only virtio-net | 5.9% of a core (6.8, 5.9, 5.8) | none |
-| virtio-net with the NAT | 6.6% of a core (6.6, 5.0, 7.5) | validated |
+| Link-only virtio-net | 5.6% of a core (7.5 at 77–65, 5.6 at 9.3–8.9, 4.9 at 5.4–4.5) | none |
+| virtio-net with the NAT | 5.9% of a core (5.9 at 11.9–8.9, 5.0 at 9.6–7.4, 7.3 at 10.8–15.6) | validated |
 
 The difference is inside the run-to-run spread. `sample <pid> 5` on the idle NAT device found its
 net thread blocked in `poll` in all 3939 samples.
 
-Throughput through the NAT on the same device and day, 200 MiB to and from a server on the
-host's loopback (10.0.2.2), 3 runs each, timed on the host side: guest to host 0.307 s median
-(0.312, 0.307, 0.302; about 680 MB/s), host to guest 0.338 s median (1.313 cold, 0.338, 0.315;
-about 620 MB/s, timed in the guest). Guest `nc` against a Python socket sink and `http.server`.
+Throughput through the NAT on the same AVD, build and day, after the boot above: 200 MiB between
+the guest's toybox `nc` and a Python socket server on the host's loopback (the guest's
+10.0.2.2), one uncounted warm-up transfer then 3 runs each way, all timed on the host by the
+server (from accept to the guest's last byte, or to the guest's close after the host's last
+byte); the 1-minute load was 6.5–7.5. `scripts/net-bench.sh throughput <avd>`.
+
+| Direction | Time for 200 MiB, median (runs) | Rate |
+| --- | --- | --- |
+| Guest to host | 0.342 s (0.321, 0.349, 0.342) | about 610 MB/s |
+| Host to guest | 0.102 s (0.109, 0.102, 0.098) | about 2.1 GB/s |
+
 The SDK emulator's slirp was not measured on this host.
 
 ## Android farm
