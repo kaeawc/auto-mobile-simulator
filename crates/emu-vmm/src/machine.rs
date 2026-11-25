@@ -97,6 +97,17 @@ fn settle_renderer() {
     }
 }
 
+/// The renderer features emu turns on (see [`init_renderer`]), then `extra` overrides.
+fn renderer_features(extra: Option<&str>) -> String {
+    let mut features =
+        String::from("RefCountPipe:enabled,GlDirectMem:enabled,HasSharedSlotsHostMemoryAllocator:enabled,VulkanVirtualQueue:enabled");
+    if let Some(extra) = extra {
+        features.push(',');
+        features.push_str(extra);
+    }
+    features
+}
+
 fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     let r = emu_gfxstream::Renderer::load(&spec.lib64).context("loading the gfxstream renderer")?;
     let gl_composition = std::env::var_os("EMU_GL_COMPOSITION").is_some();
@@ -122,12 +133,10 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     // - CPU reads of color buffers (screencap, software readers) by DMA into shared-slot host
     //   memory (`ANDROID_EMU_read_color_buffer_dma` = GlDirectMem + shared slots), resolved
     //   through the DMA translator `run` installs.
+    // - a graphics queue family with more than one queue (VulkanVirtualQueue, on in stock): HWUI
+    //   on Vulkan (`skiavk`, what the guest draws its UI with) asserts it and aborts without.
     // EMU_RENDERER_FEATURES adds overrides, e.g. "HostComposition:disabled".
-    let mut features = String::from("RefCountPipe:enabled,GlDirectMem:enabled,HasSharedSlotsHostMemoryAllocator:enabled");
-    if let Ok(extra) = std::env::var("EMU_RENDERER_FEATURES") {
-        features.push(',');
-        features.push_str(&extra);
-    }
+    let features = renderer_features(std::env::var("EMU_RENDERER_FEATURES").ok().as_deref());
     // Without GL there's no post callback: fences drive the post notices instead.
     let ticker = vulkan_only
         .then(|| crate::display::PostTicker::start(spec.display.clone(), spec.width, spec.height, POST_NOTICE_INTERVAL, POST_NOTICE_TAIL));
@@ -591,6 +600,18 @@ mod tests {
     fn idle_cpus() -> Arc<Cpus> {
         let wakers = Arc::new(Wakers::new(1, HvVcpus::new(1), WakeMode::from_env()));
         Arc::new(Cpus::new(Bus::new(), wakers, 0))
+    }
+
+    #[test]
+    fn the_renderer_offers_the_queues_hwui_on_vulkan_needs() {
+        let f = renderer_features(None);
+        for want in
+            ["RefCountPipe:enabled", "GlDirectMem:enabled", "HasSharedSlotsHostMemoryAllocator:enabled", "VulkanVirtualQueue:enabled"]
+        {
+            assert!(f.split(',').any(|x| x == want), "{want} missing from {f}");
+        }
+        // Overrides come last, so they win.
+        assert!(renderer_features(Some("VulkanVirtualQueue:disabled")).ends_with(",VulkanVirtualQueue:disabled"));
     }
 
     /// Serializes the tests that use the process-wide `RUNNING` slot.

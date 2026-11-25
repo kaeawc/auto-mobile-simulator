@@ -25,7 +25,7 @@ to use fewer resources.
 | adb | virtio-vsock with a host bridge on `console port + 1`, announced to the adb server. `adb shell`/`root`/`push` work, and the device shows up about 8 s after launch on a warm boot |
 | Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot`, plus simee's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
 | Discovery | `-list-avds`, `pid_<pid>.ini` running-instance file, `emulator-<port>` serial on stdout |
-| Graphics | Home screen and apps render. virtio-gpu with gfxstream contexts on the host GPU: the guest's GLES through ANGLE on its Vulkan, so the renderer runs without a GL backend (see "Vulkan-only renderer" below); Vulkan on MoltenVK (lavapipe fallback), Vulkan composition. Host-visible memory via blob mapping; goldfish address space (PCIe, shared-slot allocator) and goldfish pipe (refcounted color buffers) for the ranchu gralloc; guest `screencap` and host screenshots both work |
+| Graphics | Home screen and apps render. virtio-gpu with gfxstream contexts on the host GPU: the guest's UI drawn with Skia on its Vulkan and its GLES through ANGLE on that Vulkan, as stock's `GuestAngle` mode does, so the renderer runs without a GL backend (see "Vulkan-only renderer" below); Vulkan on MoltenVK (lavapipe fallback), Vulkan composition. Host-visible memory via blob mapping; goldfish address space (PCIe, shared-slot allocator) and goldfish pipe (refcounted color buffers) for the ranchu gralloc; guest `screencap` and host screenshots both work |
 | Input & sensors | virtio-input touchscreen, keyboard and rotary, plus stock's dual-mode mouse on XR images. The keyboard is stock's `qwerty2` (0627:0001, stock's key set), so goldfish's `qwerty2.kl` applies: HOME, D-pad centre (`KEY_CENTER`), Recents (580), media and stem keys arrive. The console takes every stock `KEY_*` name and numeric codes. `qemud:sensors` lists the AVD's sensors by stock's rules (`hw.sensor*` flags; heart rate and wrist tilt on Wear OS API 28+; the hinge on foldables) with live values; GNSS over `qemud:gps`; goldfish battery; fingerprint; clipboard |
 | Telephony | AT modem on a virtio-console `modem` port: the radio HAL registers on LTE with a loaded SIM; incoming SMS and calls from the console |
 | Network | virtio-net at stock's net slot (26, MAC `52:54:00:12:34:56`), so the guest has the `eth0` the radio HAL configures from the modem's `+CGCONTRDP` reply (10.0.2.15/24, gateway 10.0.2.2, DNS 10.0.2.3). Link only so far: frames the guest sends are dropped and none arrive; a user-mode NAT behind it is next ([#36](https://github.com/kaeawc/simee/issues/36)) |
@@ -300,6 +300,22 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   keep GL. Host screenshots matched the guest's `screencap` on every form factor, the stream ran
   40 fps at full tablet size during swipes (GL: 24–33), and the AutoMobile harness gave the same
   results under both on phone, tablet, foldable, watch, TV, car, XR headset and glasses.
+- **Gboard's blank keyboard: the UI draws with Skia on Vulkan, as stock's does.** On MoltenVK
+  Gboard's keyboard was one flat panel: its buffer came out fully transparent (guest `screencap`
+  and host frame alike), on 3 of 3 boots; on KosmicKrisp it drew. emu ran every app's HWUI as
+  Skia GL on ANGLE on the guest's Vulkan, and that stack on MoltenVK loses Gboard's drawing.
+  Stock 37.2.13 with `-gpu host` drew it, but there the guest's GLES is the `emulation` encoder,
+  not ANGLE, so it was not the same stack. Stock with `-feature GuestAngle` (emu's stack) draws it
+  too, and its `/proc/bootconfig` showed why: a `GuestAngle` guest gets
+  `androidboot.debug.hwui.renderer=skiavk`, `androidboot.debug.renderengine.backend=skiavkthreaded`
+  and `androidboot.hardware.angle_feature_overrides_disabled=exposeN*`, and the renderer runs with
+  `VulkanVirtualQueue`, without which HWUI on Vulkan aborts every app (`VulkanManager::initialize`
+  asserts its queue family has two queues). emu now passes the same, so apps draw with Skia on
+  Vulkan and only apps' own GLES goes through ANGLE. Gboard then drew on 3 of 3 boots (about 100
+  frames, `Pipeline=Skia (Vulkan)`; the build before stayed blank on 4 of 4), guest `screencap`
+  and host screenshot alike. Launcher frame pacing didn't move: `scripts/android-jank.sh` on a
+  1080×2400 phone, consecutive boots at host load 5, 3 runs each, janky frames median 0% before
+  and after, p90 5 ms, emu 21% → 22% of a core.
 - **vsock without intermediate copies.** adb (and every qemud pipe) rides vsock. Host bytes were
   copied into the connection's queue, out of it into a packet `Vec`, and then into the guest's
   buffer; now the adb forwarder hands its buffer over, the worker takes it over when nothing is

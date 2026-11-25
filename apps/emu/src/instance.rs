@@ -636,7 +636,9 @@ fn bootconfig(avd: &Avd, opts: &Opts, graphics: bool) -> BootConfig {
         // address-space graphics: with `emulation` GLES rides the virtio-gpu pipe stream,
         // whose blocking reads serialize all processes on one queue (boots took 14–28 s with
         // ANRs, against 5–8 s on ANGLE). EMU_GUEST_EGL=emulation restores it.
-        bc.set("androidboot.hardwareegl", guest_egl());
+        for (k, v) in guest_graphics(&guest_egl()) {
+            bc.set(k, v);
+        }
     }
     if opts.no_boot_anim {
         bc.set("androidboot.debug.sf.nobootanimation", "1");
@@ -724,6 +726,25 @@ fn legacy_cmdline(bc: &BootConfig, graphics: bool) -> String {
 /// it ([`emu_vmm::GpuSpec::vulkan_only`]).
 fn guest_egl() -> String {
     std::env::var("EMU_GUEST_EGL").unwrap_or_else(|_| "angle".into())
+}
+
+/// The bootconfig entries for a guest GLES driver `egl`. Under ANGLE they are what stock 37.2
+/// gives a `GuestAngle` guest: the UI toolkit (HWUI) and SurfaceFlinger draw with Skia on the
+/// guest's Vulkan (`skiavk`, which needs the renderer's `VulkanVirtualQueue`), not Skia GL on
+/// ANGLE on that Vulkan, and ANGLE hides its non-conformant `exposeN*` extensions. Skia GL on
+/// ANGLE on MoltenVK leaves some apps' buffers fully transparent: Gboard's keyboard was a blank
+/// panel (docs/android.md, "Gboard's blank keyboard").
+fn guest_graphics(egl: &str) -> Vec<(&'static str, String)> {
+    let mut out = vec![("androidboot.hardwareegl", egl.to_string())];
+    if egl == "angle" {
+        out.extend([
+            ("androidboot.debug.hwui.renderer", "skiavk".to_string()),
+            ("androidboot.debug.renderengine.backend", "skiavkthreaded".to_string()),
+            ("androidboot.hardware.angle_feature_overrides_disabled", "exposeN*".to_string()),
+            ("androidboot.hardware.angle_feature_overrides_enabled", String::new()),
+        ]);
+    }
+    out
 }
 
 /// What the stock host hands `qemu-props` at boot.
@@ -852,6 +873,29 @@ mod tests {
         let line = legacy_cmdline(&bc, true);
         assert_eq!(line, "android.qemud=1 qemu.encrypt=1 qemu.gles=1 qemu.gltransport=virtio-gpu-asg androidboot.vbmeta.size=4352");
         assert!(!legacy_cmdline(&bc, false).contains("qemu.gles"));
+    }
+
+    #[test]
+    fn guest_angle_draws_the_ui_with_vulkan_as_stock_does() {
+        let get = |egl: &str, k: &str| guest_graphics(egl).into_iter().find(|(key, _)| *key == k).map(|(_, v)| v);
+        assert_eq!(get("angle", "androidboot.hardwareegl").as_deref(), Some("angle"));
+        assert_eq!(get("angle", "androidboot.debug.hwui.renderer").as_deref(), Some("skiavk"));
+        assert_eq!(get("angle", "androidboot.debug.renderengine.backend").as_deref(), Some("skiavkthreaded"));
+        assert_eq!(get("angle", "androidboot.hardware.angle_feature_overrides_disabled").as_deref(), Some("exposeN*"));
+        // The GLES encoder (EMU_GUEST_EGL=emulation) keeps the image's own choice, as stock
+        // without GuestAngle does.
+        assert_eq!(guest_graphics("emulation"), vec![("androidboot.hardwareegl", "emulation".to_string())]);
+    }
+
+    #[test]
+    fn a_plan_with_a_renderer_tells_the_guest_its_graphics() {
+        let s = sdk("graphics");
+        let avd = s.env.load("phone").expect("load");
+        let with = BootPlan::new(&avd, &Opts::default(), Some(PathBuf::from("/nonexistent/lib64")));
+        assert_eq!(with.bootconfig.get("androidboot.hardware.gltransport"), Some("virtio-gpu-asg"));
+        assert!(with.bootconfig.get("androidboot.hardwareegl").is_some());
+        let without = plan(&s, "phone");
+        assert_eq!(without.bootconfig.get("androidboot.debug.hwui.renderer"), None, "no renderer: the image's default");
     }
 
     #[test]
