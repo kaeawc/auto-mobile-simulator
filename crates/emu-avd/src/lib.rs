@@ -198,8 +198,10 @@ impl Avd {
         mb * 1024 * 1024
     }
 
+    /// `disk.dataPartition.size`, a disk size: `6G`, `2048M`, or plain bytes (`6442450944`, as
+    /// Android Studio and the stock emulator write it).
     pub fn data_partition_bytes(&self) -> u64 {
-        self.get("disk.dataPartition.size").and_then(parse_size_mb).unwrap_or(6 * 1024) * 1024 * 1024
+        self.get("disk.dataPartition.size").and_then(parse_disk_size).unwrap_or(6 << 30)
     }
 
     pub fn lcd(&self) -> (u32, u32, u32) {
@@ -712,6 +714,21 @@ pub fn parse_size_mb(v: &str) -> Option<u64> {
     num.trim().parse::<u64>().ok().map(|n| n * mult)
 }
 
+/// Parses a disk size the way stock's `diskSize` properties take it into bytes: a `K`, `M` or
+/// `G` suffix (with or without `B`, any case), or plain bytes. Unlike `hw.ramSize`, whose plain
+/// number is megabytes.
+pub fn parse_disk_size(v: &str) -> Option<u64> {
+    let upper = v.trim().to_ascii_uppercase();
+    let upper = upper.strip_suffix('B').unwrap_or(&upper);
+    let (num, shift) = match upper.as_bytes().last()? {
+        b'G' => (&upper[..upper.len() - 1], 30),
+        b'M' => (&upper[..upper.len() - 1], 20),
+        b'K' => (&upper[..upper.len() - 1], 10),
+        _ => (upper, 0),
+    };
+    num.trim().parse::<u64>().ok()?.checked_mul(1 << shift)
+}
+
 /// Stock's car-image test (`qemu-setup.cpp`, `avd/util.c`): the product name, the system
 /// product name or the build flavor contains `car` (`sdk_car_arm64`, `gcar_emu_arm64-userdebug`).
 /// Stock registers the `qemud:car` service only for these images.
@@ -741,6 +758,15 @@ mod tests {
         assert_eq!(parse_size_mb("66MB"), Some(66));
         assert_eq!(parse_size_mb("512M"), Some(512));
         assert_eq!(parse_size_mb("bogus"), None);
+        // Disk sizes: a plain number is bytes there (a 6 GB partition was read as 6 PB).
+        assert_eq!(parse_disk_size("6442450944"), Some(6 << 30));
+        assert_eq!(parse_disk_size("6g"), Some(6 << 30));
+        assert_eq!(parse_disk_size("10G"), Some(10 << 30));
+        assert_eq!(parse_disk_size("800MB"), Some(800 << 20));
+        assert_eq!(parse_disk_size("66m"), Some(66 << 20));
+        assert_eq!(parse_disk_size("512k"), Some(512 << 10));
+        assert_eq!(parse_disk_size(""), None);
+        assert_eq!(parse_disk_size("bogus"), None);
     }
 
     #[test]
