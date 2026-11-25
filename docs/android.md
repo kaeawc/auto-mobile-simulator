@@ -28,7 +28,7 @@ to use fewer resources.
 | Graphics | Home screen and apps render. virtio-gpu with gfxstream contexts on the host GPU: GLES through ANGLE on Metal, Vulkan on MoltenVK (lavapipe fallback), Vulkan composition. Host-visible memory via blob mapping; goldfish address space (PCIe, shared-slot allocator) and goldfish pipe (refcounted color buffers) for the ranchu gralloc; guest `screencap` and host screenshots both work |
 | Input & sensors | virtio-input touchscreen, keyboard and rotary, plus stock's dual-mode mouse on XR images. The keyboard is stock's `qwerty2` (0627:0001, stock's key set), so goldfish's `qwerty2.kl` applies: HOME, D-pad centre (`KEY_CENTER`), Recents (580), media and stem keys arrive. The console takes every stock `KEY_*` name and numeric codes. `qemud:sensors` lists the AVD's sensors by stock's rules (`hw.sensor*` flags; heart rate and wrist tilt on Wear OS API 28+; the hinge on foldables) with live values; GNSS over `qemud:gps`; goldfish battery; fingerprint; clipboard |
 | Telephony | AT modem on a virtio-console `modem` port: the radio HAL registers on LTE with a loaded SIM; incoming SMS and calls from the console |
-| Audio | virtio-snd as ALSA card 0 (one playback and one capture stream; S16/S24/S32/float, 8–48 kHz, mono or stereo), on images that enable `VirtioSndCard` (phone, Wear, TV, XR) and on Automotive, like stock. The ranchu audio HAL plays through it: guest output reaches the host's default output device through CoreAudio, resampled to the device's own rate. A host stream is open only while the guest's PCM stream runs, so a device that plays nothing opens no host audio (idle CPU unchanged: 3.2% of a core vs 3.9% without the card, API 36, median of 3 × 30 s). Capture is silence unless `-allow-host-audio`, which records the host's default microphone, as stock; `-no-audio` keeps the card but opens no host device. Booted on API 36 phone only |
+| Audio | virtio-snd as ALSA card 0 (one playback and one capture stream; S16/S24/S32/float, 8–48 kHz, mono or stereo), on images that enable `VirtioSndCard` (phone, Wear, TV, XR) and on Automotive, like stock. The ranchu audio HAL plays through it: guest output reaches the host's default output device through CoreAudio, resampled to the device's own rate. A host stream is open only while the guest's PCM stream runs, so a device that plays nothing opens no host audio. Capture is silence unless `-allow-host-audio`, which records the host's default microphone, as stock; `-no-audio` keeps the card but opens no host device. Devices simee starts (`simee boot`, `boot_many`, the API) are silent (`-no-audio`) unless booted with `audio` (`simee boot --audio`); the desktop app boots with audio, since a person is watching. Booted with the card on phone API 35, 36, 37, Wear (API 37) and TV (API 36) |
 | Network | virtio-net at stock's net slot (26, MAC `52:54:00:12:34:56`), so the guest has the `eth0` the radio HAL configures from the modem's `+CGCONTRDP` reply (10.0.2.15/24, gateway 10.0.2.2, DNS 10.0.2.3). Link only so far: frames the guest sends are dropped and none arrive; a user-mode NAT behind it is next ([#36](https://github.com/kaeawc/simee/issues/36)) |
 | Images | Phone API 35, 36, 37 and Wear boot (5–8 s warm; Wear gets stock's +512 MB below 1 GB). Automotive: the vehicle HAL channel (`qemud:car`) and the virtio-snd card are implemented but not yet booted ([Automotive](#automotive)); Bluetooth needs a controller (in progress). Android XR (`google-xr`, `android-xr-*`, `ai-glasses`; provisioned from the `google_xr` site) gets the dual-mode mouse and `qemud:xr_service` (console `xr`), not yet booted: it gets the virtio-snd card too |
 | Wear OS | New AVDs: 512 MB (booted with stock's +512 MB), `hw.mainKeys=yes`, no D-pad, and for round screens `boot.prop`'s `ro.emulator.circular=true`, which reaches the guest as a `qemu-props` property and bootconfig `androidboot.emulator.circular=1`. The rotary turns 15 units (degrees) per click, like stock; the console's `EV_REL:REL_WHEEL:<n>` stays raw |
@@ -204,8 +204,18 @@ is `/proc/asound` card 0 (`pcmC0D0p`, `pcmC0D0c`); AudioFlinger's primary output
 stereo S16, 1088-frame HAL buffer) plays through it, the HAL setting 544-frame periods in a
 2176-frame buffer; a ringtone preview (`am start -a android.intent.action.VIEW -t audio/ogg
 -d file:///product/media/audio/ringtones/Andromeda.ogg`) played on the Mac's speakers, about
-11 s of it with no underrun on either side and no HAL write errors. Not yet booted with the
-card: Wear, TV, Automotive, XR; capture from a real microphone.
+11 s of it with no underrun on either side and no HAL write errors. Phone API 35 and 37
+(`google_apis`), Wear (`android-wear-signed` 37) and TV (`android-tv` 36) boot with the card
+(2026-11-25, release emu, `-no-audio -verbose`): each has `/dev/snd/pcmC0D0p`, its audio HAL
+opens the playback stream (48 kHz stereo S16, 2176-byte periods in an 8704-byte buffer) for a
+UI sound or a ringtone preview, and a minute of logcat after that has no audio HAL errors. The
+looping ringtone preview on the phones logs `AudioTrack: pauseAndWait: timeout expired` (a
+warning in the player's client, about every 3 s while it loops). Not yet booted with the card:
+Automotive, XR; capture from a real microphone.
+
+An I/O buffer may carry at most the stream's buffer and no more than its ring holds (1 s):
+longer chains complete as a bad message without being read, so a guest can't make the card
+copy, decode or allocate gigabytes.
 
 **Needs a real boot.** Whether the car image reaches the launcher with these two pieces; that
 the VHAL connects and `car get gear` answers; that the kernel's `virtio_snd` driver binds on

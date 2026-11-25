@@ -68,6 +68,9 @@ const PCM_INFO_SIZE: usize = 32;
 const CHMAP_INFO_SIZE: usize = 24;
 /// `virtio_snd_pcm_status`: status and latency, at the end of every I/O buffer.
 pub const IO_STATUS_SIZE: u32 = 8;
+/// Seconds of audio a ring holds: more than any guest buffer, so only a stalled host drops. One
+/// I/O buffer carries at most this much ([`Params::max_io_bytes`]).
+const RING_SECONDS: u32 = 1;
 
 fn le32(b: &[u8], at: usize) -> Option<u32> {
     b.get(at..at + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
@@ -102,6 +105,18 @@ impl Params {
     /// How long `bytes` of audio last.
     fn duration(&self, bytes: u32) -> Duration {
         Duration::from_nanos(u64::from(bytes) * 1_000_000_000 / self.byte_rate().max(1))
+    }
+
+    /// The most audio bytes one I/O buffer may carry: the stream's buffer, and no more than its
+    /// ring holds. The guest sizes its chains (64 descriptors of up to 4 GiB each), so anything
+    /// longer completes as a bad message and is never read, decoded or allocated for.
+    pub fn max_io_bytes(&self) -> u32 {
+        self.buffer_bytes.min(self.hz() * RING_SECONDS * self.frame_bytes())
+    }
+
+    /// The stream's buffer in frames.
+    fn buffer_frames(&self) -> usize {
+        (self.buffer_bytes / self.frame_bytes().max(1)) as usize
     }
 }
 
@@ -278,11 +293,21 @@ impl<T> Pcm<T> {
         }
     }
 
+    /// Whether stream `stream_id` takes an I/O buffer of `direction` carrying `bytes` of audio:
+    /// its direction, with parameters set, and no longer than [`Params::max_io_bytes`].
+    pub fn accepts(&self, stream_id: u32, direction: u8, bytes: u64) -> bool {
+        self.streams
+            .get(stream_id as usize)
+            .and_then(|s| s.params.filter(|_| s.direction == direction))
+            .is_some_and(|p| bytes <= u64::from(p.max_io_bytes()))
+    }
+
     /// Queues an I/O buffer for `stream_id`, which must be a stream of `direction` (tx buffers
     /// go to the output stream, rx buffers to the input one). Bad buffers complete at once.
     pub fn queue(&mut self, stream_id: u32, direction: u8, io: Io<T>, now: Instant, done: &mut Vec<Done<T>>) {
+        let accepted = self.accepts(stream_id, direction, u64::from(io.bytes));
         match self.streams.get_mut(stream_id as usize) {
-            Some(s) if s.direction == direction && s.params.is_some() => {
+            Some(s) if accepted => {
                 if s.pending.is_empty() && s.running && s.cursor < now {
                     // Restarting after an underrun: time runs from now, not from the gap.
                     s.cursor = now;
@@ -419,6 +444,35 @@ impl VirtioDevice for Snd {
     }
 }
 
+fn readable_len(chain: &Chain) -> u64 {
+    chain.readable().map(|d| u64::from(d.len)).sum()
+}
+
+fn writable_len(chain: &Chain) -> u64 {
+    chain.writable().map(|d| u64::from(d.len)).sum()
+}
+
+/// Writes `data` into the last `data.len()` writable bytes of `chain` (the status that ends an
+/// I/O buffer) and nothing before them; returns the bytes written.
+fn write_tail(chain: &Chain, mem: &GuestRam, mut data: &[u8]) -> u32 {
+    let Some(mut skip) = writable_len(chain).checked_sub(data.len() as u64) else { return 0 };
+    let mut written = 0;
+    for d in chain.writable() {
+        let len = u64::from(d.len);
+        if skip >= len {
+            skip -= len;
+            continue;
+        }
+        let take = ((len - skip) as usize).min(data.len());
+        let Some(addr) = d.addr.checked_add(skip) else { break };
+        if take == 0 || mem.write(addr, &data[..take]).is_err() {
+            break;
+        }
+        (data, written, skip) = (&data[take..], written + take as u32, 0);
+    }
+    written
+}
+
 /// How the worker reaches the host: the real one, or (in tests) a log of commands.
 trait Sink: Send {
     fn send(&mut self, cmd: Command);
@@ -438,9 +492,6 @@ struct Link {
     /// Input: reads the ring at the guest's rate.
     reader: Option<Reader>,
 }
-
-/// Seconds of audio a ring holds: more than any guest buffer, so only a stalled host drops.
-const RING_SECONDS: u32 = 1;
 
 struct Worker {
     mem: Arc<GuestRam>,
@@ -522,34 +573,40 @@ impl Worker {
         }
         let dir = if direction == D_OUTPUT { Direction::Output } else { Direction::Input };
         match code {
-            R_PCM_SET_PARAMS | R_PCM_PREPARE | R_PCM_RELEASE => {
+            // STOP too: frames left in a stopped stream's ring would play (or be read) late
+            // after the next START.
+            R_PCM_SET_PARAMS | R_PCM_PREPARE | R_PCM_RELEASE | R_PCM_STOP => {
                 self.send(Command::Close(dir));
                 self.links[id] = Link::default();
             }
             R_PCM_START => {
                 let hz = params.hz();
+                let buffer_frames = params.buffer_frames();
                 let ring = if direction == D_OUTPUT {
                     // Frames queued before START (ALSA prefills) are already in it.
                     self.links[id].ring.get_or_insert_with(|| Arc::new(Ring::new((hz * RING_SECONDS) as usize, hz))).clone()
                 } else {
                     // The host sets the rate when its stream opens; until then capture is silence.
                     let ring = Arc::new(Ring::new((hz * RING_SECONDS) as usize, 0));
-                    // Start once 20 ms is in; keep at most 200 ms of latency.
-                    self.links[id] = Link { ring: Some(ring.clone()), reader: Some(Reader::new(hz, hz as usize / 50, hz as usize / 5)) };
+                    // Start once 20 ms is in; keep at most 200 ms (or the guest's buffer) of latency.
+                    let prime = hz as usize / 50;
+                    let reader = Reader::new(hz, prime, audio::max_latency(hz, buffer_frames, prime));
+                    self.links[id] = Link { ring: Some(ring.clone()), reader: Some(reader) };
                     ring
                 };
-                self.send(Command::Open(dir, ring));
+                self.send(Command::Open { direction: dir, ring, buffer_frames });
             }
-            R_PCM_STOP => self.send(Command::Close(dir)),
             _ => {}
         }
     }
 
     /// Playback: the guest's audio in `chain` (after its 4-byte header) into the stream's ring.
+    /// Reads at most the header and [`Params::max_io_bytes`].
     fn play(&mut self, id: usize, chain: &Chain) {
         let Some(p) = self.pcm.params(id).filter(|_| self.enabled(D_OUTPUT) && self.pcm.direction(id) == Some(D_OUTPUT)) else { return };
         let Some(format) = Format::from_virtio(p.format) else { return };
-        if chain.read_all_into(&self.mem, usize::MAX, &mut self.bytes).is_err() || self.bytes.len() <= 4 {
+        let max = 4 + p.max_io_bytes() as usize;
+        if chain.read_all_into(&self.mem, max, &mut self.bytes).is_err() || self.bytes.len() <= 4 {
             return;
         }
         let ring = self.links[id].ring.get_or_insert_with(|| Arc::new(Ring::new((p.hz() * RING_SECONDS) as usize, p.hz())));
@@ -558,10 +615,12 @@ impl Worker {
         ring.push_all(&self.frames);
     }
 
-    /// Capture: `len` bytes of the stream's audio from the host into `self.bytes`, or silence.
+    /// Capture: `len` bytes (at most [`Params::max_io_bytes`]) of the stream's audio from the
+    /// host into `self.bytes`, or silence.
     fn record(&mut self, id: usize, len: usize) {
         self.bytes.clear();
         let p = self.pcm.params(id);
+        let len = len.min(p.map_or(0, |p| p.max_io_bytes() as usize));
         let link = &mut self.links[id];
         if let (Some(p), Some(ring), Some(reader)) = (p, link.ring.as_ref(), link.reader.as_mut())
             && let Some(format) = Format::from_virtio(p.format)
@@ -595,14 +654,17 @@ impl Worker {
                 // The header (`virtio_snd_pcm_xfer`: the stream id) leads the readable part; the
                 // status ends the writable part. Playback data is readable, capture writable.
                 let header = chain.read_all(&self.mem, 4).unwrap_or_default();
-                let readable: u32 = chain.readable().map(|d| d.len).sum();
-                let writable: u32 = chain.writable().map(|d| d.len).sum();
-                let bytes = if direction == D_OUTPUT { readable.saturating_sub(4) } else { writable.saturating_sub(IO_STATUS_SIZE) };
+                // In u64: 64 guest-sized lengths overflow a u32.
+                let (readable, writable) = (readable_len(&chain), writable_len(&chain));
+                let status = u64::from(IO_STATUS_SIZE);
+                let bytes = if direction == D_OUTPUT { readable.saturating_sub(4) } else { writable.saturating_sub(status) };
                 match le32(&header, 0) {
-                    Some(id) if writable >= IO_STATUS_SIZE => {
+                    // Oversized buffers are refused before anything is read from them.
+                    Some(id) if writable >= status && self.pcm.accepts(id, direction, bytes) => {
                         if direction == D_OUTPUT {
                             self.play(id as usize, &chain);
                         }
+                        let bytes = u32::try_from(bytes).unwrap_or(u32::MAX);
                         self.pcm.queue(id, direction, Io { handle: (queue, chain), bytes }, now, &mut done);
                     }
                     _ => done.push(Done { handle: (queue, chain), status: S_BAD_MSG, latency: 0 }),
@@ -614,17 +676,19 @@ impl Worker {
         for d in done {
             let (queue, chain) = d.handle;
             // The status goes in the last 8 writable bytes; capture data before it.
-            let writable: u32 = chain.writable().map(|d| d.len).sum();
-            let len = writable.saturating_sub(IO_STATUS_SIZE) as usize;
-            if queue == QUEUE_RX && d.status == S_OK {
-                self.record(1, len);
+            let len = writable_len(&chain).saturating_sub(u64::from(IO_STATUS_SIZE));
+            let mut status = [0u8; IO_STATUS_SIZE as usize];
+            status[..4].copy_from_slice(&d.status.to_le_bytes());
+            status[4..].copy_from_slice(&d.latency.to_le_bytes());
+            let cap = self.pcm.params(1).map_or(0, |p| u64::from(p.max_io_bytes()));
+            let n = if queue == QUEUE_RX && d.status == S_OK && len <= cap {
+                self.record(1, len as usize);
+                self.bytes.extend_from_slice(&status);
+                chain.write_all(&self.mem, &self.bytes).unwrap_or(0)
             } else {
-                self.bytes.clear();
-                self.bytes.resize(len, 0);
-            }
-            self.bytes.extend_from_slice(&d.status.to_le_bytes());
-            self.bytes.extend_from_slice(&d.latency.to_le_bytes());
-            let n = chain.write_all(&self.mem, &self.bytes).unwrap_or(0);
+                // Playback, or a buffer refused: only the status, whatever the guest's lengths.
+                write_tail(&chain, &self.mem, &status)
+            };
             let q = if queue == QUEUE_TX { self.txq.as_mut() } else { self.rxq.as_mut() };
             if let Some(q) = q {
                 let _ = q.add_used(&self.mem, chain.head, n);
@@ -830,14 +894,84 @@ mod tests {
         w.run();
         assert_eq!((txd.used(&mem, 0).1, mem.read_u32(buf(4) + 0x800).expect("status")), (8, S_OK));
 
-        // Capture on a stream with no parameters: rejected, the status still at the end.
+        // Capture on a stream with no parameters: rejected, only the status written, at the end.
         mem.write(buf(6), &1u32.to_le_bytes()).expect("xfer header");
         mem.write(buf(6) + 0x800, &[0xaa; 24]).expect("data");
         rxd.push(&mem, &[(buf(6), 4, false), (buf(6) + 0x800, 16, true), (buf(6) + 0x810, 8, true)]);
         w.run();
         let mut back = [0u8; 24];
         mem.read(buf(6) + 0x800, &mut back).expect("read");
-        assert_eq!((rxd.used(&mem, 0).1, &back[..16], le32(&back, 16)), (24, &[0u8; 16][..], Some(S_BAD_MSG)));
+        assert_eq!((rxd.used(&mem, 0).1, &back[..16], le32(&back, 16)), (8, &[0xaa; 16][..], Some(S_BAD_MSG)));
+    }
+
+    #[test]
+    fn caps_io_buffers_at_the_stream_buffer_and_its_ring() {
+        let t0 = Instant::now();
+        let mut pcm = Pcm::<u32>::new(t0);
+        let mut done = Vec::new();
+        // 48 kHz stereo S16, a 3840-byte buffer: no I/O buffer may carry more.
+        pcm.control(&set_params(0, 3840, 1920, 2, 5, 7), t0, &mut done);
+        assert_eq!(pcm.params(0).expect("params").max_io_bytes(), 3840);
+        assert!(pcm.accepts(0, D_OUTPUT, 3840) && !pcm.accepts(0, D_OUTPUT, 3841));
+        assert!(!pcm.accepts(0, D_INPUT, 4) && !pcm.accepts(1, D_INPUT, 4) && !pcm.accepts(9, D_OUTPUT, 4));
+        // A guest buffer longer than the ring (1 s): the ring's size bounds it.
+        pcm.control(&set_params(1, u32::MAX, 960, 2, 5, 7), t0, &mut done);
+        assert_eq!(pcm.params(1).expect("params").max_io_bytes(), 192_000);
+        assert!(!pcm.accepts(1, D_INPUT, u64::from(u32::MAX) * 64));
+        pcm.queue(0, D_OUTPUT, Io { handle: 1, bytes: 3841 }, t0, &mut done);
+        pcm.queue(1, D_INPUT, Io { handle: 2, bytes: 192_004 }, t0, &mut done);
+        assert_eq!(done.iter().map(|d| (d.handle, d.status)).collect::<Vec<_>>(), [(1, S_BAD_MSG), (2, S_BAD_MSG)]);
+    }
+
+    #[test]
+    fn refuses_oversized_chains_without_reading_them() {
+        use crate::irq::TestLine;
+        use crate::virtio::queue::tests::{Driver, RAM_BASE};
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x10_0000).expect("ram"));
+        let driver = |n: u64| {
+            let mut d = Driver::new(8);
+            for a in [&mut d.cfg.desc, &mut d.cfg.avail, &mut d.cfg.used] {
+                *a += n * 0x4000;
+            }
+            d
+        };
+        let (mut ctl, mut txd, mut rxd) = (driver(0), driver(1), driver(2));
+        let mut w = Worker::new(
+            mem.clone(),
+            Arc::new(Interrupt::new(Arc::new(TestLine::default()))),
+            Queue::new(ctl.cfg, false),
+            [Some(Queue::new(txd.cfg, false)), Some(Queue::new(rxd.cfg, false))],
+            Options { output: true, input: true, verbose: false },
+            Some(Box::new(FakeHost::default())),
+        );
+        fn buf(i: u64) -> u64 {
+            RAM_BASE + 0x8_0000 + i * 0x1000
+        }
+        for (i, r) in
+            [set_params(0, 3840, 1920, 2, 5, 7), req(&[R_PCM_PREPARE, 0]), set_params(1, 3840, 960, 2, 5, 7), req(&[R_PCM_PREPARE, 1])]
+                .into_iter()
+                .enumerate()
+        {
+            let i = i as u64;
+            mem.write(buf(i), &r).expect("request");
+            ctl.push(&mem, &[(buf(i), r.len() as u32, false), (buf(i) + 0x800, 4, true)]);
+            w.run();
+            assert_eq!(mem.read_u32(buf(i) + 0x800).expect("status"), S_OK);
+        }
+        let status = |at: u64| mem.read_u32(at).expect("status");
+        mem.write(buf(4), &0u32.to_le_bytes()).expect("xfer header");
+        mem.write(buf(6), &1u32.to_le_bytes()).expect("xfer header");
+        // Playback: one byte over the buffer, then two descriptors of nearly 4 GiB (their sum
+        // overflows a u32) far outside guest RAM. Capture: nearly 4 GiB to fill.
+        txd.push(&mem, &[(buf(4), 4, false), (buf(5), 3841, false), (buf(4) + 0x800, 8, true)]);
+        txd.push(&mem, &[(buf(4), 4, false), (1 << 40, u32::MAX, false), (1 << 41, u32::MAX, false), (buf(4) + 0x900, 8, true)]);
+        rxd.push(&mem, &[(buf(6), 4, false), (1 << 40, u32::MAX - 8, true), (buf(6) + 0x800, 8, true)]);
+        w.run();
+        assert_eq!((txd.used_idx(&mem), rxd.used_idx(&mem)), (2, 1), "completed at once");
+        assert_eq!([txd.used(&mem, 0).1, txd.used(&mem, 1).1, rxd.used(&mem, 0).1], [8, 8, 8], "only the status written");
+        assert_eq!([status(buf(4) + 0x800), status(buf(4) + 0x900), status(buf(6) + 0x800)], [S_BAD_MSG; 3]);
+        assert!(w.bytes.capacity() <= 4 + 3840 && w.frames.capacity() <= 960, "nothing read or allocated for them");
+        assert!(w.links[0].ring.is_none(), "nothing reached the ring");
     }
 
     type Sent = (String, Option<Arc<Ring>>);
@@ -849,7 +983,7 @@ mod tests {
     impl Sink for FakeHost {
         fn send(&mut self, cmd: Command) {
             let entry = match cmd {
-                Command::Open(d, ring) => (format!("open {d:?}"), Some(ring)),
+                Command::Open { direction: d, ring, .. } => (format!("open {d:?}"), Some(ring)),
                 Command::Close(d) => (format!("close {d:?}"), None),
             };
             self.0.lock().expect("log").push(entry);
@@ -917,8 +1051,10 @@ mod tests {
         let ring = opened[0].1.clone().expect("ring");
         assert_eq!((opened[0].0.as_str(), ring.len(), ring.rate()), ("open Output", 480, 48_000));
         assert_eq!(ring.pop(), Some([0.5, -0.5]));
+        ring.push_all(&[[0.25; 2]; 4]);
         assert_eq!(control(&mut w, req(&[R_PCM_STOP, 0])), S_OK);
         assert_eq!(host.names(), ["close Output"], "no host stream while the guest's is stopped");
+        assert!(w.links[0].ring.is_none(), "STOP drops what was left, so the next START doesn't play it late");
 
         // Capture, 48 kHz stereo S16: what the host pushes comes back in the guest's format.
         assert_eq!(control(&mut w, set_params(1, 3840, 960, 2, 5, 7)), S_OK);

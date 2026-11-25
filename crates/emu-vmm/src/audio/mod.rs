@@ -291,6 +291,13 @@ impl Resampler {
     }
 }
 
+/// The most frames a [`Reader`] lets wait before it skips back: 200 ms at `hz`, or the guest's
+/// whole buffer (`buffer_frames`) and the prime when that is more, so a guest that keeps a large
+/// buffer queued isn't cut.
+pub fn max_latency(hz: u32, buffer_frames: usize, prime: usize) -> usize {
+    (hz as usize / 5).max(buffer_frames.saturating_add(prime))
+}
+
 /// The consumer side of a [`Ring`]: converts its frames to the reader's rate, waits for `prime`
 /// frames before starting (and again after running dry), and skips back to `prime` frames of
 /// latency when more than `max` are waiting.
@@ -483,6 +490,18 @@ mod tests {
         let idle = Ring::new(16, 0);
         idle.push_all(&[[0.5; 2]; 8]);
         assert_eq!(Reader::new(48_000, 1, 8).read(&idle, &mut out), 0);
+    }
+
+    #[test]
+    fn latency_bound_covers_the_guests_buffer() {
+        assert_eq!(max_latency(48_000, 2176, 480), 9600, "a small buffer: 200 ms");
+        assert_eq!(max_latency(48_000, 19_200, 480), 19_680, "a 400 ms buffer: all of it and the prime");
+        assert_eq!(max_latency(48_000, usize::MAX, 480), usize::MAX);
+        // A reader with that bound keeps a full 400 ms buffer instead of skipping it back.
+        let ring = Ring::new(32_768, 48_000);
+        ring.push_all(&vec![[0.5; 2]; 19_200]);
+        Reader::new(48_000, 480, max_latency(48_000, 19_200, 480)).read(&ring, &mut [[0.0; 2]; 4]);
+        assert_eq!(ring.stats().skipped, 0);
     }
 
     #[test]

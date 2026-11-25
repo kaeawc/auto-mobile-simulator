@@ -22,8 +22,9 @@ pub enum Direction {
 #[derive(Debug)]
 pub enum Command {
     /// Start the host stream of `direction` with `ring`: an output stream reads the guest's
-    /// frames from it; an input stream fills it (and sets its rate).
-    Open(Direction, Arc<Ring>),
+    /// frames from it, letting up to the guest's buffer (`buffer_frames`) wait; an input stream
+    /// fills it (and sets its rate).
+    Open { direction: Direction, ring: Arc<Ring>, buffer_frames: usize },
     /// Stop that host stream, if open.
     Close(Direction),
 }
@@ -76,24 +77,30 @@ impl Drop for Host {
 fn serve(rx: Receiver<Command>, verbose: bool) {
     crate::device_thread();
     let mut streams: [Option<imp::Stream>; 2] = [None, None];
+    // A host with no output (or input) device would say so on every guest START.
+    let mut warned = [false; 2];
     let slot = |d: Direction| match d {
         Direction::Output => 0,
         Direction::Input => 1,
     };
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            Command::Open(d, ring) => {
+            Command::Open { direction: d, ring, buffer_frames } => {
                 if let Some(s) = streams[slot(d)].take() {
                     s.close(verbose);
                 }
-                match imp::Stream::open(d, ring, verbose) {
+                match imp::Stream::open(d, ring, buffer_frames, verbose) {
                     Ok(s) => {
                         if verbose {
                             eprintln!("emu: audio: {}", s.describe());
                         }
                         streams[slot(d)] = Some(s);
                     }
-                    Err(e) => eprintln!("emu: audio: no host {}: {e}", name(d)),
+                    Err(e) => {
+                        if report(verbose, &mut warned[slot(d)]) {
+                            eprintln!("emu: audio: no host {}: {e}", name(d));
+                        }
+                    }
                 }
             }
             Command::Close(d) => {
@@ -106,6 +113,13 @@ fn serve(rx: Receiver<Command>, verbose: bool) {
     for s in streams.into_iter().flatten() {
         s.close(verbose);
     }
+}
+
+/// Whether to log a failure to open a host stream: the first time, and every time with -verbose.
+fn report(verbose: bool, warned: &mut bool) -> bool {
+    let first = !*warned;
+    *warned = true;
+    verbose || first
 }
 
 fn name(d: Direction) -> &'static str {
@@ -122,7 +136,7 @@ mod imp {
 
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-    use super::super::{Frame, Reader, Ring, gather, spread};
+    use super::super::{Frame, Reader, Ring, gather, max_latency, spread};
     use super::{Direction, name};
 
     pub struct Stream {
@@ -135,7 +149,7 @@ mod imp {
     }
 
     impl Stream {
-        pub fn open(direction: Direction, ring: Arc<Ring>, verbose: bool) -> Result<Stream, String> {
+        pub fn open(direction: Direction, ring: Arc<Ring>, buffer_frames: usize, verbose: bool) -> Result<Stream, String> {
             let host = cpal::default_host();
             let device = match direction {
                 Direction::Output => host.default_output_device(),
@@ -160,9 +174,11 @@ mod imp {
             };
             let stream = match direction {
                 Direction::Output => {
-                    // Start once 10 ms of guest audio is queued; keep at most 200 ms.
-                    let guest_hz = ring.rate().max(1) as usize;
-                    let mut reader = Reader::new(hz, guest_hz / 100, guest_hz / 5);
+                    // Start once 10 ms of guest audio is queued; keep at most 200 ms, or the
+                    // guest's whole buffer when that is more.
+                    let guest_hz = ring.rate().max(1);
+                    let prime = guest_hz as usize / 100;
+                    let mut reader = Reader::new(hz, prime, max_latency(guest_hz, buffer_frames, prime));
                     let (ring, counted) = (ring.clone(), frames.clone());
                     let mut scratch: Vec<Frame> = vec![[0.0; 2]; 4096];
                     device.build_output_stream::<f32, _, _>(
@@ -239,7 +255,7 @@ mod imp {
     pub enum Stream {}
 
     impl Stream {
-        pub fn open(_: Direction, _: Arc<Ring>, _: bool) -> Result<Stream, String> {
+        pub fn open(_: Direction, _: Arc<Ring>, _: usize, _: bool) -> Result<Stream, String> {
             Err("host audio is macOS-only so far".into())
         }
 
@@ -262,5 +278,13 @@ mod tests {
         let mut h = Host::new(false);
         h.send(Command::Close(Direction::Output));
         assert!(h.thread.is_none() && h.tx.is_none());
+    }
+
+    #[test]
+    fn a_missing_host_device_is_reported_once_unless_verbose() {
+        let mut warned = false;
+        assert_eq!([report(false, &mut warned), report(false, &mut warned), report(false, &mut warned)], [true, false, false]);
+        let mut warned = false;
+        assert_eq!([report(true, &mut warned), report(true, &mut warned)], [true, true]);
     }
 }
