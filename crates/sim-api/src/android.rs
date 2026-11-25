@@ -165,7 +165,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             let running = d
                 .running
                 .as_ref()
-                .map(|r| json!({"serial": r.serial(), "console_port": r.console_port, "adb_port": r.adb_port, "pid": r.pid}));
+                .map(|r| json!({"serial": r.serial(), "console_port": r.console_port, "adb_port": r.adb_port, "pid": r.pid, "emulator": r.emulator()}));
             Ok(json!({
                 "device": d.info,
                 "avd_dir": avd.map(|a| a.dir.display().to_string()),
