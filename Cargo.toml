@@ -51,6 +51,8 @@ rustix = { version = "1", default-features = false, features = ["event", "fs", "
 roxmltree = { version = "0.21", default-features = false, features = ["std"] }
 # The SDK repository publishes sha1 checksums; dependency-free pure Rust.
 sha1_smol = { version = "1", default-features = false }
+# Host audio for emu's virtio-snd card (CoreAudio on macOS; emu-vmm only, macOS only).
+cpal = { version = "0.18", default-features = false }
 # Objective-C runtime bindings. Only sim-coresim may depend on these.
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError"] }

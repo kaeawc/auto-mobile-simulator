@@ -42,6 +42,8 @@ options:
   -no-boot-anim     skip the boot animation
   -disk-cache MODE  unsafe (default: guest flushes stay in the host page cache) or fsync
   -gpu MODE         off disables host rendering; swiftshader/lavapipe pick software Vulkan
+  -no-audio         the sound card stays silent and no host audio device is opened (-audio none)
+  -allow-host-audio the guest records from the host's default microphone (otherwise silence)
 Other SDK emulator flags are accepted.
 ";
 
@@ -70,14 +72,12 @@ const IGNORED_WITH_VALUE: &[&str] = &[
     "id",
     "accel",
     "selinux",
-    "audio",
     "screen",
     "grpc-use-token",
     "grpc-use-jwt",
     "metrics-collection",
     "metrics-to-file",
     "idle-grpc-timeout",
-    "allow-host-audio",
     "radio",
     "encryption-key",
     "cache",
@@ -110,6 +110,10 @@ pub struct Opts {
     pub verbose: bool,
     pub no_boot_anim: bool,
     pub no_window: bool,
+    /// `-no-audio` (or `-audio none`): the sound card neither plays nor records on the host.
+    pub no_audio: bool,
+    /// `-allow-host-audio`: the sound card records from the host's microphone.
+    pub allow_host_audio: bool,
     /// `-gpu MODE`: `off`/`none` disables host rendering; anything else uses gfxstream.
     pub gpu: Option<String>,
     /// `-disk-cache unsafe|fsync`: whether guest disk flushes fsync on the host.
@@ -165,6 +169,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
             "verbose" | "debug-init" => o.verbose = true,
             "no-boot-anim" => o.no_boot_anim = true,
             "no-window" => o.no_window = true,
+            "no-audio" => o.no_audio = true,
+            "allow-host-audio" => o.allow_host_audio = true,
+            // `-audio BACKEND`: QEMU's audio driver; only `none` means anything here.
+            "audio" => o.no_audio |= value(flag)? == "none",
             "gpu" => o.gpu = Some(value(flag)?),
             "disk-cache" => {
                 o.disk_fsync = match value(flag)?.as_str() {
@@ -220,9 +228,19 @@ mod tests {
         let o = p("-avd pixel -no-window -no-audio -no-snapshot-save -gpu swiftshader_indirect -grpc 8554 -port 5570 -no-boot-anim");
         assert_eq!(o.avd.as_deref(), Some("pixel"));
         assert_eq!(o.port, Some(5570));
-        assert!(o.no_window && o.no_boot_anim);
+        assert!(o.no_window && o.no_boot_anim && o.no_audio);
         assert_eq!(o.gpu.as_deref(), Some("swiftshader_indirect"));
         assert!(o.ignored.iter().any(|i| i == "-grpc 8554"));
+    }
+
+    #[test]
+    fn audio_flags() {
+        let o = p("-avd pixel -allow-host-audio -port 5570");
+        assert!(o.allow_host_audio && !o.no_audio);
+        assert_eq!(o.port, Some(5570), "-allow-host-audio takes no value");
+        assert!(p("-avd pixel -audio none").no_audio);
+        assert!(!p("-avd pixel -audio coreaudio").no_audio);
+        assert!(!p("-avd pixel").no_audio && !p("-avd pixel").allow_host_audio);
     }
 
     #[test]

@@ -180,8 +180,8 @@ pub struct MachineConfig {
     /// The vehicle HAL channel (`qemud:car`, console `car`). Like stock, only for car images;
     /// other guests asking for the pipe are refused.
     pub car: Option<Arc<pipe::car::Car>>,
-    /// A silent virtio-snd card (ALSA card 0).
-    pub sound: bool,
+    /// The virtio-snd card (ALSA card 0) and what it may do on the host.
+    pub sound: Option<crate::audio::Options>,
     /// Touchscreen size; enables the virtio-input touchscreen, keyboard and rotary devices.
     pub input: Option<(u32, u32)>,
     /// With `input`: a multi-touch screen (false for `hw.screen=no-touch`, TV's).
@@ -407,8 +407,8 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     // eth0, which the radio HAL configures from the modem's data-call reply. Link only for now:
     // the frames the guest sends are dropped.
     slots[slots::NET as usize] = Some(Box::new(virtio::net::Net::new(Box::new(virtio::net::LinkOnly))));
-    if cfg.sound {
-        slots[slots::SOUND as usize] = Some(Box::new(virtio::snd::Snd::new()));
+    if let Some(opts) = cfg.sound {
+        slots[slots::SOUND as usize] = Some(Box::new(virtio::snd::Snd::new(opts)));
     }
     let mut dma_renderer = None;
     let mut gpu_renderer = None;
