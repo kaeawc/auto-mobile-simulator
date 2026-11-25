@@ -95,6 +95,22 @@ impl Shown {
     }
 }
 
+/// The device screen's height in the window, in points: the window is fitted to it.
+pub const SCREEN_POINTS: f32 = 760.0;
+
+/// Pixels the device screen's height covers on a Retina display (2 per point).
+const SCREEN_PIXELS: u32 = 1520;
+
+/// The widest frame to ask emu for, for a device of `size` pixels. emu shrinks frames by a whole
+/// factor (`ceil(width / max_width)`), so this asks for the largest factor that still leaves at
+/// least the pixels the view shows on the device's shorter side, whichever way it's turned, and
+/// never shrinks a device that's smaller than that. A fixed 1080 shrank a 2560-wide tablet
+/// threefold to 853 px, and the window stretched it back to about 2400.
+pub fn stream_max_width((w, h): (u32, u32)) -> u32 {
+    let factor = (w.min(h) / SCREEN_PIXELS).max(1);
+    w.max(h).max(1).div_ceil(factor)
+}
+
 impl Screen {
     /// Connects and asks for frames at most `max_width` pixels wide. Console work for the
     /// device goes to `console`.
@@ -243,6 +259,21 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use sim_core::stream::{FrameHeader, Record, ring};
+
+    #[test]
+    fn streams_are_asked_for_at_least_the_pixels_the_view_shows() {
+        // emu's factor for a frame `fw` wide under `max`, as `downscale_factor` computes it.
+        let factor = |fw: u32, max: u32| sim_core::pixels::downscale_factor(fw, max);
+        // Pixel Tablet, Pixel 4 XL, a medium phone, a 4K TV, a round watch: full size.
+        for size in [(2560, 1600), (1440, 3040), (1080, 2400), (3840, 2160), (454, 454)] {
+            let max = super::stream_max_width(size);
+            assert_eq!((factor(size.0, max), factor(size.1, max)), (1, 1), "{size:?} asks for {max}");
+        }
+        // Only a screen at least twice the view on its shorter side is shrunk, and never below it.
+        let max = super::stream_max_width((6400, 3600));
+        assert_eq!(factor(6400, max), 2);
+        assert!(3600 / factor(3600, max) >= super::SCREEN_PIXELS);
+    }
 
     use super::*;
     use crate::work::Outbox;
