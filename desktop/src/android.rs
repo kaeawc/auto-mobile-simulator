@@ -157,10 +157,13 @@ impl Screen {
     }
 
     /// Shown again: console work goes to `console`, and while the window is `visible` the
-    /// emulator sends its newest frame at once (the last one shows until it lands).
+    /// emulator sends its newest frame at once (the last one shows until it lands). Something is
+    /// sent either way (`hello 0` while hidden keeps the stream paused): the write is what finds
+    /// an emulator that went away while this screen was paused.
     pub fn resume(&mut self, console: Worker<Lookup>, visible: bool) {
         self.console = Some(console);
-        self.set_visible(visible);
+        self.shown.set(visible);
+        self.send(&Input::Hello { max_width: if visible { self.max_width } else { 0 } });
     }
 
     /// Pauses the frame stream while the window is hidden (minimised, or covered where the

@@ -13,7 +13,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use emu_hvf::SharedMap;
@@ -84,14 +84,45 @@ pub fn start(
 /// What a client asked for.
 #[derive(Default)]
 struct Wants {
+    /// From `hello`; 0 pauses the stream (the client keeps its last frame).
     max_width: AtomicU32,
     shared: AtomicBool,
     done: AtomicBool,
     /// Frames per second asked for with `fps <n>`; 0 for [`DEFAULT_INTERVAL`].
     fps: AtomicU32,
+    /// Held while `max_width` or `done` changes and while a paused stream checks them, so a
+    /// change can't land between that check and its wait on `changed`.
+    lock: Mutex<()>,
+    /// Notified when `max_width` or `done` changes.
+    changed: Condvar,
+    /// Passes of the frame loop, for telling a parked stream from a spinning one in tests.
+    passes: AtomicU64,
 }
 
 impl Wants {
+    fn set_max_width(&self, max_width: u32) {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.max_width.store(max_width, Ordering::Relaxed);
+        self.changed.notify_all();
+    }
+
+    fn finish(&self) {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.done.store(true, Ordering::Relaxed);
+        self.changed.notify_all();
+    }
+
+    /// While paused (`hello 0`), waits until the client resumes or goes away, up to `timeout`
+    /// (the caller's backstop for the emulator stopping). A paused stream waits here, not on
+    /// [`FrameStore::wait_newer`]: the frame it already sent is older than the guest's newest,
+    /// so that wait would return at once, round and round, and its reader mark would keep the
+    /// store from freeing its buffers.
+    fn wait_unpaused(&self, timeout: Duration) {
+        let g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self
+            .changed
+            .wait_timeout_while(g, timeout, |_| self.max_width.load(Ordering::Relaxed) == 0 && !self.done.load(Ordering::Relaxed));
+    }
     fn interval(&self) -> Duration {
         match self.fps.load(Ordering::Relaxed) {
             0 => DEFAULT_INTERVAL,
@@ -125,7 +156,7 @@ fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<e
         let g = inputs.lock().unwrap_or_else(|e| e.into_inner());
         match (input, g.as_ref()) {
             (Input::Hello { max_width: mw }, _) => {
-                wants.max_width.store(mw, Ordering::Relaxed);
+                wants.set_max_width(mw);
                 if let Some(writer) = writer.take() {
                     let (display, wants, stop, dir) = (display.clone(), wants.clone(), stop.clone(), dir.clone());
                     let _ = std::thread::Builder::new()
@@ -168,7 +199,7 @@ fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<e
             _ => {}
         }
     }
-    wants.done.store(true, Ordering::Relaxed);
+    wants.finish();
     // Its frame thread may be waiting for a frame on a static screen: end that wait now.
     display.wake();
 }
@@ -194,6 +225,13 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
     let mut ring_failed = false;
     let mut stats = std::env::var_os("EMU_FRAME_STATS").is_some().then(Stats::default);
     while !wants.done.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+        wants.passes.fetch_add(1, Ordering::Relaxed);
+        if wants.max_width.load(Ordering::Relaxed) == 0 {
+            // Paused: wait for `hello <w>`, then send the newest frame (if it's newer than the
+            // last sent) at once.
+            wants.wait_unpaused(Duration::from_secs(1));
+            continue;
+        }
         // Wait for a new frame (woken by the frame, or by `wake` when the client goes away; the
         // 1 s timeout only notices the emulator stopping); then, if it's early, wait until it may
         // go and send the newest by then. A client that was idle gets it at once.
@@ -758,6 +796,57 @@ mod tests {
         rig.store.posted(4, 4);
         assert!(std::io::Read::read(&mut r, &mut [0u8; 1]).is_err());
         assert_eq!(rig.reads.load(Ordering::Relaxed), 0);
+    }
+
+    /// `hello 0` pauses a stream (the desktop's switched-away screen). While the guest keeps
+    /// drawing, the paused stream waits for the client, not for frames: it neither spins nor
+    /// counts as a reader, so the store frees its buffers; `hello <w>` sends the newest at once.
+    #[test]
+    fn a_paused_stream_waits_for_the_client_and_resumes_with_the_newest_frame() {
+        let store = Arc::new(FrameStore::with_idle(Duration::from_millis(50)));
+        let (w, h) = (8u32, 4u32);
+        let present = |n: u64| store.present(w, h, w * 4, sim_core::pixels::PixelFormat::RGBA_VIRTIO, &pixels(w, h, n));
+        let wants = Arc::new(Wants::default());
+        wants.set_max_width(720);
+        let stop = Arc::new(AtomicBool::new(false));
+        let dir = scratch("pause");
+        let (out, mut client) = UnixStream::pair().expect("pair");
+        client.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+        let stream = {
+            let (store, wants, stop, dir) = (store.clone(), wants.clone(), stop.clone(), dir.join("simee"));
+            std::thread::spawn(move || frames(out, &store, &wants, &stop, &dir))
+        };
+        present(1);
+        let (hd, rgba) = read_frame(&mut client).expect("frame");
+        assert_eq!((hd.frame, rgba), (1, pixels(w, h, 1)));
+        let with_capture = store.buffered_bytes();
+        // Pause, then the guest draws on.
+        wants.set_max_width(0);
+        std::thread::sleep(Duration::from_millis(30));
+        present(2);
+        let passes = wants.passes.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(300));
+        let spun = wants.passes.load(Ordering::Relaxed) - passes;
+        assert!(spun <= 1, "a paused stream made {spun} passes in 300 ms");
+        // Unread for longer than the store's idle time: the next present frees the capture.
+        present(3);
+        assert!(store.buffered_bytes() < with_capture, "a paused stream kept the store from idling");
+        // Resume: the newest frame, without waiting for another.
+        let resumed = Instant::now();
+        wants.set_max_width(720);
+        let (hd, rgba) = read_frame(&mut client).expect("frame after resume");
+        assert_eq!((hd.frame, rgba), (3, pixels(w, h, 3)));
+        assert!(resumed.elapsed() < Duration::from_millis(200), "took {:?}", resumed.elapsed());
+        // Closing while paused ends the stream at once, too.
+        wants.set_max_width(0);
+        std::thread::sleep(Duration::from_millis(30));
+        let closed = Instant::now();
+        // As `client` does when the connection ends.
+        wants.finish();
+        store.wake();
+        stream.join().expect("stream");
+        assert!(closed.elapsed() < Duration::from_millis(500), "took {:?}", closed.elapsed());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

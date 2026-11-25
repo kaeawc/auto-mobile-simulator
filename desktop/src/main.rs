@@ -242,6 +242,8 @@ impl State {
     fn resume_screen(&mut self, udid: &str) -> bool {
         let Some(i) = self.paused.iter().position(|p| p.screen.udid == udid) else { return false };
         let mut p = self.paused.remove(i);
+        // The previous device's log, until the rescan that follows brings this one's.
+        self.console_log.clear();
         let backend = self.android_backend.clone().unwrap_or_default();
         let console = work::Worker::start("simee-android-console", android::lookup(backend, udid.to_owned()), self.outbox.clone());
         p.screen.resume(console, self.visible);
@@ -648,6 +650,10 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
                 s.rescan();
             }
             Action::Select(udid) => {
+                if s.selected.as_ref() != Some(&udid) {
+                    // The scan of the new selection brings its log.
+                    s.console_log.clear();
+                }
                 s.selected = Some(udid);
                 if let Some(sc) = &s.scanner {
                     sc.follow(s.selected.as_deref());
@@ -845,6 +851,14 @@ mod tests {
         scene(&mut s);
         let mut rt = Runtime::new(s, view::view, (1240.0, 870.0), Env::new(true, 2.0));
         rt.frame(0.0);
+        rt
+    }
+
+    /// As the app runs: every frame polls first, so queued actions are performed (the plain
+    /// runtime leaves them queued for tests that check what a handler queued).
+    fn polled_runtime(scene: fn(&mut State)) -> Runtime<State> {
+        let mut rt = runtime(scene);
+        rt.poll = Some(poll);
         rt
     }
 
@@ -1118,7 +1132,7 @@ mod tests {
     /// assistive technology); the others don't, and the highlight follows a new selection.
     #[test]
     fn the_selected_device_is_highlighted() {
-        let mut rt = runtime(demo);
+        let mut rt = polled_runtime(demo);
         let sel = view::selection(rune::tok::theme(true), true);
         let (row0, row1) = (element(&rt, "device-0"), element(&rt, "device-1"));
         assert!(row0.item_selected && !row1.item_selected, "only iPhone 17 is selected");
@@ -1126,10 +1140,8 @@ mod tests {
         assert_ne!(row1.fill, sel.fill);
         assert_eq!(element(&rt, "device-0-bar").fill, sel.bar, "and marked with the accent bar");
         assert_eq!(element(&rt, "device-1-bar").fill.a, 0.0, "the bar's slot is empty on the others");
+        // The press's frame asks for the next, whose poll selects.
         press(&mut rt, "device-1");
-        rt.update(|s, tx| {
-            poll(s, 1.0, tx);
-        });
         rt.frame(1.0 / 60.0);
         assert!(element(&rt, "device-1").item_selected && !element(&rt, "device-0").item_selected);
     }
@@ -1221,44 +1233,52 @@ mod tests {
 
     /// Switching away from an Android device pauses its stream and keeps its last frame; switching
     /// back shows that frame at once (the same buffer, no placeholder, no reconnect) and asks the
-    /// emulator for live frames again.
+    /// emulator for live frames again. With the window hidden it still says something (`hello 0`,
+    /// staying paused): that write is what finds an emulator that went away meanwhile. The log
+    /// panel never shows the device switched away from.
     #[test]
     fn a_paused_device_shows_its_last_frame_when_switched_back() {
-        let (dir, lines) = recording_display("paused");
-        let mut rt = runtime(android_scene);
-        rt.update(|s, _| {
-            s.offline = false;
-            s.offline_screen = false;
-            let console =
-                work::Worker::start("test-console", android::lookup(sim_android::Android::default(), "pixel_9".into()), s.outbox.clone());
-            let sc = android::Screen::connect("pixel_9", dir.clone(), 1080, console).expect("connect");
-            sc.pixels.set(2, 1, vec![9; 8]);
-            s.screen = Some(sc);
-        });
-        rt.frame(1.0 / 60.0);
-        let shown = rt.state.screen.as_ref().map(|sc| sc.pixels.signature()).expect("a screen");
-        // Away to a device that isn't running, and back.
-        for udid in ["pixel_fold", "pixel_9"] {
-            rt.update(|s, tx| {
-                s.actions.push(Action::Select(udid.into()));
-                poll(s, 1.0, tx);
+        for visible in [true, false] {
+            let (dir, lines) = recording_display(&format!("paused{visible}"));
+            let mut rt = polled_runtime(android_scene);
+            rt.update(|s, _| {
+                s.offline = false;
+                s.offline_screen = false;
+                s.visible = visible;
+                let console = work::Worker::start(
+                    "test-console",
+                    android::lookup(sim_android::Android::default(), "pixel_9".into()),
+                    s.outbox.clone(),
+                );
+                let sc = android::Screen::connect("pixel_9", dir.clone(), 1080, console).expect("connect");
+                sc.pixels.set(2, 1, vec![9; 8]);
+                s.screen = Some(sc);
             });
             rt.frame(1.0 / 60.0);
-            if udid == "pixel_fold" {
-                assert!(rt.find("placeholder").is_some() && rt.state.screen.is_none(), "the fold isn't running");
+            let shown = rt.state.screen.as_ref().map(|sc| sc.pixels.signature()).expect("a screen");
+            // Away to a device that isn't running, and back.
+            for udid in ["pixel_fold", "pixel_9"] {
+                rt.state.console_log = vec![format!("{udid}'s predecessor's log")];
+                rt.update(|s, tx| queue(s, tx, Action::Select(udid.into())));
+                rt.frame(1.0 / 60.0);
+                assert!(rt.state.console_log.is_empty(), "{udid}: {:?}", rt.state.console_log);
+                if udid == "pixel_fold" {
+                    assert!(rt.find("placeholder").is_some() && rt.state.screen.is_none(), "the fold isn't running");
+                }
             }
+            assert!(rt.find("placeholder").is_none() && rt.find("device-screen").is_some(), "the screen shows at once");
+            let sc = rt.state.screen.as_ref().expect("the paused screen came back");
+            assert_eq!(sc.pixels.signature(), shown, "the same buffer and frame, not a new one");
+            assert_eq!(sc.pixels.rgba(), [9; 8]);
+            let start = std::time::Instant::now();
+            while lines.lock().expect("lines").len() < 4 {
+                assert!(start.elapsed() < Duration::from_secs(5), "{:?}", lines.lock().expect("lines"));
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let back = if visible { "hello 1080" } else { "hello 0" };
+            assert_eq!(*lines.lock().expect("lines"), ["shm", "hello 1080", "hello 0", back], "paused, then resumed (visible: {visible})");
+            let _ = std::fs::remove_dir_all(dir);
         }
-        assert!(rt.find("placeholder").is_none() && rt.find("device-screen").is_some(), "the screen shows at once");
-        let sc = rt.state.screen.as_ref().expect("the paused screen came back");
-        assert_eq!(sc.pixels.signature(), shown, "the same buffer and frame, not a new one");
-        assert_eq!(sc.pixels.rgba(), [9; 8]);
-        let start = std::time::Instant::now();
-        while lines.lock().expect("lines").len() < 4 {
-            assert!(start.elapsed() < Duration::from_secs(5), "{:?}", lines.lock().expect("lines"));
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert_eq!(*lines.lock().expect("lines"), ["shm", "hello 1080", "hello 0", "hello 1080"], "paused, then resumed");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
