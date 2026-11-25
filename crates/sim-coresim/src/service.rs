@@ -55,6 +55,29 @@ fn linked_dir(target: Option<std::path::PathBuf>, is_dir: impl Fn(&std::path::Pa
     (target.is_absolute() && !dir.is_empty() && is_dir(&target)).then(|| dir.to_owned())
 }
 
+/// SimulatorKit inside a frameworks directory.
+const SIMULATOR_KIT: &str = "SimulatorKit.framework/SimulatorKit";
+
+/// Where SimulatorKit may be for a developer directory, in the order to try: Xcode 27 ships it in
+/// the app's `Contents/SharedFrameworks`, earlier Xcodes in `Contents/Developer/Library/
+/// PrivateFrameworks`. A developer directory that isn't an app's `Contents/Developer` (the
+/// Command Line Tools, which have none) gets only the second.
+fn simulator_kit_candidates(developer_dir: &str) -> Vec<String> {
+    let dir = developer_dir.trim_end_matches('/');
+    let shared = dir.strip_suffix("/Contents/Developer").map(|app| format!("{app}/Contents/SharedFrameworks/{SIMULATOR_KIT}"));
+    shared.into_iter().chain([format!("{dir}/Library/PrivateFrameworks/{SIMULATOR_KIT}")]).collect()
+}
+
+/// Loads the first SimulatorKit of [`simulator_kit_candidates`] that opens, else
+/// [`Error::Unavailable`] naming every path tried.
+fn open_simulator_kit(developer_dir: &str) -> Result<Library> {
+    let candidates = simulator_kit_candidates(developer_dir);
+    candidates
+        .iter()
+        .find_map(|path| Library::open(path).ok())
+        .ok_or_else(|| Error::Unavailable(format!("cannot load SimulatorKit (tried {})", candidates.join(", "))))
+}
+
 #[cfg(test)]
 mod developer_dir_tests {
     use std::path::PathBuf;
@@ -73,6 +96,41 @@ mod developer_dir_tests {
         assert_eq!(linked_dir(Some(PathBuf::from("Xcode.app/Contents/Developer")), |_| true), None, "relative");
         assert_eq!(linked_dir(Some(PathBuf::from("/")), |_| true), None);
         assert_eq!(linked_dir(None, |_| true), None, "no link");
+    }
+
+    #[test]
+    fn simulator_kit_is_looked_for_where_xcode_27_moved_it_then_where_it_was() {
+        let kit = "SimulatorKit.framework/SimulatorKit";
+        assert_eq!(
+            simulator_kit_candidates("/Applications/Xcode-27.2.0.app/Contents/Developer"),
+            [
+                format!("/Applications/Xcode-27.2.0.app/Contents/SharedFrameworks/{kit}"),
+                format!("/Applications/Xcode-27.2.0.app/Contents/Developer/Library/PrivateFrameworks/{kit}"),
+            ]
+        );
+        assert_eq!(
+            simulator_kit_candidates("/Applications/Xcode.app/Contents/Developer/"),
+            [
+                format!("/Applications/Xcode.app/Contents/SharedFrameworks/{kit}"),
+                format!("/Applications/Xcode.app/Contents/Developer/Library/PrivateFrameworks/{kit}"),
+            ],
+            "a trailing slash"
+        );
+        assert_eq!(
+            simulator_kit_candidates("/Library/Developer/CommandLineTools"),
+            [format!("/Library/Developer/CommandLineTools/Library/PrivateFrameworks/{kit}")],
+            "not inside an app's Contents: only the developer directory's own"
+        );
+        assert_eq!(simulator_kit_candidates("/"), [format!("/Library/PrivateFrameworks/{kit}")]);
+    }
+
+    #[test]
+    fn a_missing_simulator_kit_is_unavailable_and_names_every_path_tried() {
+        let Err(Error::Unavailable(msg)) = open_simulator_kit("/nonexistent/Xcode.app/Contents/Developer") else {
+            panic!("expected Error::Unavailable");
+        };
+        assert!(msg.contains("/nonexistent/Xcode.app/Contents/SharedFrameworks/"), "{msg}");
+        assert!(msg.contains("/nonexistent/Xcode.app/Contents/Developer/Library/PrivateFrameworks/"), "{msg}");
     }
 
     /// The link against the spawn this replaces (no simulator service is touched).
@@ -142,7 +200,7 @@ impl Context {
     pub fn new() -> Result<Self> {
         let dir = developer_dir()?;
         Library::open(CORE_SIMULATOR)?;
-        let kit = Library::open(&format!("{dir}/Library/PrivateFrameworks/SimulatorKit.framework/SimulatorKit"))?;
+        let kit = open_simulator_kit(&dir)?;
         let cls = rt::class(c"SimServiceContext")?;
         if cls.class_method(sel!(sharedServiceContextForDeveloperDir:error:)).is_none() {
             return Err(Error::Unavailable("sharedServiceContextForDeveloperDir:error:".into()));
