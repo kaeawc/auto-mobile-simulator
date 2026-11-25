@@ -50,6 +50,25 @@ runs.
 Without an `eth0`, the guest's telephony retries the data call without a delay; with one, the
 call succeeds once and the guest goes idle.
 
+With the user-mode NAT behind it (#36): a fresh API 36 google_apis AVD, warm-booted under the same
+emu build with the NAT and with it swapped for link only, one boot each, M3 Max, 2026-11-25.
+Each waits 60 s after `sys.boot_completed`, then takes emu's CPU time over three 20 s windows
+(`ps -o time`); the 1-minute load was 8.6–11.1.
+
+| emu | Idle host CPU, median (runs) | Guest internet |
+| --- | --- | --- |
+| Link-only virtio-net | 5.9% of a core (6.8, 5.9, 5.8) | none |
+| virtio-net with the NAT | 6.6% of a core (6.6, 5.0, 7.5) | validated |
+
+The difference is inside the run-to-run spread. `sample <pid> 5` on the idle NAT device found its
+net thread blocked in `poll` in all 3939 samples.
+
+Throughput through the NAT on the same device and day, 200 MiB to and from a server on the
+host's loopback (10.0.2.2), 3 runs each, timed on the host side: guest to host 0.307 s median
+(0.312, 0.307, 0.302; about 680 MB/s), host to guest 0.338 s median (1.313 cold, 0.338, 0.315;
+about 620 MB/s, timed in the guest). Guest `nc` against a Python socket sink and `http.server`.
+The SDK emulator's slirp was not measured on this host.
+
 ## Android farm
 
 Clones of one settled golden AVD booted together, each until it is settled (boot complete and
@@ -119,4 +138,5 @@ Claims that would belong in the README once someone runs them:
 - Time per automation step (tap, then screenshot) through the socket API against `simctl` and
   against `adb` on the SDK emulator.
 - Host CPU of an idle booted device, emu against the SDK emulator.
+- Network throughput and latency through emu's NAT against the SDK emulator's slirp.
 - A farm of SDK emulators on the same host, to compare with the emu farm above.

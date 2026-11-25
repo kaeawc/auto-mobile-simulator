@@ -404,9 +404,16 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     if cfg.rng {
         slots[slots::RNG as usize] = Some(Box::new(virtio::rng::Rng::new()));
     }
-    // eth0, which the radio HAL configures from the modem's data-call reply. Link only for now:
-    // the frames the guest sends are dropped.
-    slots[slots::NET as usize] = Some(Box::new(virtio::net::Net::new(Box::new(virtio::net::LinkOnly))));
+    // eth0, which the radio HAL configures from the modem's data-call reply, behind the
+    // user-mode NAT (10.0.2.2 the host's loopback, 10.0.2.3 its resolver).
+    let net: Box<dyn virtio::net::Backend> = match crate::net::Nat::new(crate::net::Config::default()) {
+        Ok(n) => Box::new(n),
+        Err(e) => {
+            eprintln!("emu: net: no NAT ({e}); the network is link only");
+            Box::new(virtio::net::LinkOnly)
+        }
+    };
+    slots[slots::NET as usize] = Some(Box::new(virtio::net::Net::new(net)));
     if cfg.sound {
         slots[slots::SOUND as usize] = Some(Box::new(virtio::snd::Snd::new()));
     }

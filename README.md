@@ -89,7 +89,8 @@ Unsupported combinations are refused with the reason. The matrix and its gaps:
   snapshots.
 - Automotive and Android XR images have their devices implemented but have not been booted.
 - iOS microphone injection still needs a loopback audio device.
-- Android guests have a network link but no internet yet ([#36](https://github.com/kaeawc/simee/issues/36)).
+- Android guests reach the internet over IPv4 only (TCP, UDP, ping); no IPv6 or inbound port
+  forwarding yet.
 
 ## Documentation
 
