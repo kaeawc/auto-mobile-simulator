@@ -8,7 +8,12 @@
 //! screenshot to the Desktop.
 //!
 //! Handlers only queue [`Action`]s and [`Input`]s; `poll` performs them. That keeps handlers pure,
-//! so the headless tests drive the real view without a device.
+//! so the headless tests drive the real view without a device. Rune runs `poll` at the start of a
+//! frame, before that frame's handlers, so a handler that queues work also asks for the next frame
+//! ([`queue`], [`request_poll`]); otherwise the work would wait for the next input or timer.
+//!
+//! Switching away from an Android device pauses its stream and keeps its screen (and last frame)
+//! for a while; switching back shows that frame at once and resumes the stream.
 //!
 //! `cargo run` opens the window (`SIMEE_DEVICE=<udid|name|booted>` preselects a device);
 //! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
@@ -83,6 +88,8 @@ pub struct State {
     pub live: Option<Live>,
     /// The selected Android device, when it's running.
     pub screen: Option<android::Screen>,
+    /// Android screens switched away from, oldest first: streams paused, last frames kept.
+    paused: Vec<Paused>,
     /// The selected Android device's guest console, newest last.
     pub console_log: Vec<String>,
     /// The selected device's screen outline (round Wear OS watches).
@@ -123,6 +130,28 @@ pub struct State {
     sized_for: Option<(u32, u32)>,
     /// Whether the window shows (not minimised, hidden, or covered where the system says so).
     visible: bool,
+}
+
+/// An Android screen switched away from, with what the window showed it with.
+struct Paused {
+    screen: android::Screen,
+    shape: Shape,
+    size: (u32, u32),
+}
+
+/// Paused Android screens kept at most. Each holds its display connection, a parked frame thread
+/// and its last frame (about 10 MB for a 1080x2400 phone); the oldest goes first.
+const PAUSED_LIMIT: usize = 4;
+
+/// Asks for a frame now, so `poll` performs what a handler just queued.
+pub fn request_poll(tx: &mut Tx) {
+    tx.wake_after(Duration::ZERO);
+}
+
+/// Queues `action` for `poll` and asks for the frame that performs it.
+pub fn queue(s: &mut State, tx: &mut Tx, action: Action) {
+    s.actions.push(action);
+    request_poll(tx);
 }
 
 impl State {
@@ -185,15 +214,54 @@ impl State {
         if self.screen.as_ref().is_some_and(|sc| !sc.alive()) {
             self.screen = None;
         }
+        // A paused device that stopped (here or elsewhere) has nothing to come back to.
+        let devices = &self.devices;
+        self.paused.retain(|p| p.screen.alive() && devices.iter().any(|d| d.udid == p.screen.udid && d.state == DeviceState::Booted));
         if changed || self.connect_pending {
             self.connect();
         }
         changed
     }
 
+    /// Pauses the Android screen shown, keeping it (and its last frame) for a switch back.
+    fn pause_screen(&mut self) {
+        let Some(mut screen) = self.screen.take() else { return };
+        if !screen.alive() {
+            return;
+        }
+        screen.pause();
+        self.paused.retain(|p| p.screen.udid != screen.udid);
+        self.paused.push(Paused { screen, shape: self.shape, size: self.offline_size });
+        if self.paused.len() > PAUSED_LIMIT {
+            self.paused.remove(0);
+        }
+    }
+
+    /// Shows `udid`'s paused screen again: its last frame at once, live frames as the emulator
+    /// sends them. False when there's none, or its emulator went away meanwhile.
+    fn resume_screen(&mut self, udid: &str) -> bool {
+        let Some(i) = self.paused.iter().position(|p| p.screen.udid == udid) else { return false };
+        let mut p = self.paused.remove(i);
+        // The previous device's log, until the rescan that follows brings this one's.
+        self.console_log.clear();
+        let backend = self.android_backend.clone().unwrap_or_default();
+        let console = work::Worker::start("simee-android-console", android::lookup(backend, udid.to_owned()), self.outbox.clone());
+        p.screen.resume(console, self.visible);
+        if !p.screen.alive() {
+            return false;
+        }
+        (self.shape, self.offline_size) = (p.shape, p.size);
+        self.screen = Some(p.screen);
+        self.status = None;
+        true
+    }
+
     fn connect(&mut self) {
         self.connect_pending = false;
         let Some(info) = self.selected_info().cloned() else { return };
+        if self.screen.as_ref().is_some_and(|sc| sc.udid != info.udid) {
+            self.pause_screen();
+        }
         self.shape = info.kind().map_or(Shape::Rounded, |k| k.profile().shape);
         match info.platform {
             Platform::Ios => {
@@ -224,6 +292,11 @@ impl State {
                     return;
                 }
                 self.screen = None;
+                if info.state == DeviceState::Booted && self.resume_screen(&info.udid) {
+                    // Its log and running instance, without waiting for the periodic scan.
+                    self.rescan();
+                    return;
+                }
                 // The AVD is resolved on the scanner thread (it reads its config): wait for a
                 // scan of this one, unless the last one already failed to resolve it.
                 let Some(device) = self.android.clone().filter(|d| d.info.udid == info.udid) else {
@@ -288,6 +361,7 @@ fn init() -> State {
         native: NativeSurface::new(),
         live: None,
         screen: None,
+        paused: Vec::new(),
         console_log: Vec::new(),
         shape: Shape::Rounded,
         held: None,
@@ -576,6 +650,10 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
                 s.rescan();
             }
             Action::Select(udid) => {
+                if s.selected.as_ref() != Some(&udid) {
+                    // The scan of the new selection brings its log.
+                    s.console_log.clear();
+                }
                 s.selected = Some(udid);
                 if let Some(sc) = &s.scanner {
                     sc.follow(s.selected.as_deref());
@@ -774,6 +852,14 @@ mod tests {
         scene(&mut s);
         let mut rt = Runtime::new(s, view::view, (1240.0, 870.0), Env::new(true, 2.0));
         rt.frame(0.0);
+        rt
+    }
+
+    /// As the app runs: every frame polls first, so queued actions are performed (the plain
+    /// runtime leaves them queued for tests that check what a handler queued).
+    fn polled_runtime(scene: fn(&mut State)) -> Runtime<State> {
+        let mut rt = runtime(scene);
+        rt.poll = Some(poll);
         rt
     }
 
@@ -1037,6 +1123,163 @@ mod tests {
         assert_eq!(s.status.as_deref(), Some("pixel_fold: config unreadable"));
         assert!(!s.connect_pending && s.screen.is_none(), "no retry loop for an AVD that can't resolve");
         assert!(!s.apply_scan(scan::Scan { devices, ..scan::Scan::default() }), "same list: nothing changed");
+    }
+
+    fn element(rt: &Runtime<State>, key: &str) -> rune::ElementInfo {
+        rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key)).unwrap_or_else(|| panic!("{key} rendered"))
+    }
+
+    /// The selected device's row stands out from the sidebar (and says it's selected to
+    /// assistive technology); the others don't, and the highlight follows a new selection.
+    #[test]
+    fn the_selected_device_is_highlighted() {
+        let mut rt = polled_runtime(demo);
+        let sel = view::selection(rune::tok::theme(true), true);
+        let (row0, row1) = (element(&rt, "device-0"), element(&rt, "device-1"));
+        assert!(row0.item_selected && !row1.item_selected, "only iPhone 17 is selected");
+        assert_eq!(row0.fill, sel.fill, "the selected row is tinted");
+        assert_ne!(row1.fill, sel.fill);
+        assert_eq!(element(&rt, "device-0-bar").fill, sel.bar, "and marked with the accent bar");
+        assert_eq!(element(&rt, "device-1-bar").fill.a, 0.0, "the bar's slot is empty on the others");
+        // The press's frame asks for the next, whose poll selects.
+        press(&mut rt, "device-1");
+        rt.frame(1.0 / 60.0);
+        assert!(element(&rt, "device-1").item_selected && !element(&rt, "device-0").item_selected);
+    }
+
+    /// WCAG contrast of two opaque colours (linear light in, as Rune's colours are).
+    fn contrast(a: rune::Color, b: rune::Color) -> f32 {
+        let (la, lb) = (a.luminance() + 0.05, b.luminance() + 0.05);
+        la.max(lb) / la.min(lb)
+    }
+
+    /// In both themes: the row's text (and its badge, drawn in the primary text colour when
+    /// selected) reads at 4.5:1 on the tint, and the accent bar stands at 3:1 against the sidebar.
+    #[test]
+    fn the_selection_highlight_has_accessible_contrast_in_light_and_dark() {
+        for dark in [true, false] {
+            let t = rune::tok::theme(dark);
+            let sel = view::selection(t, dark);
+            assert!(contrast(t.text, sel.fill) >= 4.5, "text on the tint (dark: {dark}): {}", contrast(t.text, sel.fill));
+            assert!(contrast(sel.bar, t.card) >= 3.0, "bar on the sidebar (dark: {dark}): {}", contrast(sel.bar, t.card));
+            assert_ne!(sel.fill, t.card, "the tint differs from the sidebar (dark: {dark})");
+        }
+    }
+
+    /// `poll` runs at the start of a frame, before that frame's handlers: a handler that queues
+    /// work asks for the next frame, so the work starts at once instead of on the next input.
+    #[test]
+    fn handlers_that_queue_work_ask_for_a_poll() {
+        let mut rt = runtime(demo);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.wake_deadline(), None, "a still window sleeps");
+        for key in ["device-1", "home-button", "overlay-blended-layers", "tab-network", "debug-reload"] {
+            press(&mut rt, key);
+            assert!(rt.wake_deadline().is_some(), "{key} asks for a poll");
+            rt.frame(1.0 / 60.0);
+            assert_eq!(rt.wake_deadline(), None, "{key}: one poll, then the window sleeps again");
+        }
+        let mut rt = runtime(demo);
+        let ([x, y, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+        rt.pointer_down(x + w * 0.5, y + h * 0.5);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.wake_deadline().is_some(), "a touch asks for a poll");
+        rt.pointer_up(x + w * 0.5, y + h * 0.5);
+        rt.frame(1.0 / 60.0);
+        rt.frame(1.0 / 60.0);
+        rt.key(KeyEvent::from(Key::Text("a".into())));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.wake_deadline().is_some(), "a keystroke asks for a poll");
+    }
+
+    /// A fake worker finishing queued work wakes the window, and the poll that wakes it shows
+    /// the result.
+    #[test]
+    fn finished_work_wakes_the_window_and_the_next_poll_shows_it() {
+        let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w = woken.clone();
+        let mut rt = runtime(demo);
+        rt.state.outbox = work::Outbox::new(Some(Arc::new(move || {
+            w.fetch_add(1, Ordering::Relaxed);
+        })));
+        let worker = work::Worker::start("fake-worker", (), rt.state.outbox.clone());
+        assert!(worker.run(|()| Ok(Some("rotated".into()))));
+        let start = std::time::Instant::now();
+        while woken.load(Ordering::Relaxed) == 0 {
+            assert!(start.elapsed() < Duration::from_secs(5), "the worker woke the window");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut changed = false;
+        rt.update(|s, tx| changed = poll(s, 1.0, tx));
+        assert!(changed && rt.state.status.as_deref() == Some("rotated"));
+    }
+
+    /// A display socket that takes one client and records its lines.
+    fn recording_display(name: &str) -> (std::path::PathBuf, Arc<Mutex<Vec<String>>>) {
+        use std::io::BufRead;
+        let dir = std::path::PathBuf::from("/tmp").join(format!("rs-main-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("simee")).expect("dir");
+        let listener = std::os::unix::net::UnixListener::bind(sim_android::display::socket(&dir)).expect("bind");
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let l = lines.clone();
+        std::thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("accept");
+            for line in std::io::BufReader::new(conn).lines().map_while(Result::ok) {
+                l.lock().expect("lines").push(line);
+            }
+        });
+        (dir, lines)
+    }
+
+    /// Switching away from an Android device pauses its stream and keeps its last frame; switching
+    /// back shows that frame at once (the same buffer, no placeholder, no reconnect) and asks the
+    /// emulator for live frames again. With the window hidden it still says something (`hello 0`,
+    /// staying paused): that write is what finds an emulator that went away meanwhile. The log
+    /// panel never shows the device switched away from.
+    #[test]
+    fn a_paused_device_shows_its_last_frame_when_switched_back() {
+        for visible in [true, false] {
+            let (dir, lines) = recording_display(&format!("paused{visible}"));
+            let mut rt = polled_runtime(android_scene);
+            rt.update(|s, _| {
+                s.offline = false;
+                s.offline_screen = false;
+                s.visible = visible;
+                let console = work::Worker::start(
+                    "test-console",
+                    android::lookup(sim_android::Android::default(), "pixel_9".into()),
+                    s.outbox.clone(),
+                );
+                let sc = android::Screen::connect("pixel_9", dir.clone(), 1080, console).expect("connect");
+                sc.pixels.set(2, 1, vec![9; 8]);
+                s.screen = Some(sc);
+            });
+            rt.frame(1.0 / 60.0);
+            let shown = rt.state.screen.as_ref().map(|sc| sc.pixels.signature()).expect("a screen");
+            // Away to a device that isn't running, and back.
+            for udid in ["pixel_fold", "pixel_9"] {
+                rt.state.console_log = vec![format!("{udid}'s predecessor's log")];
+                rt.update(|s, tx| queue(s, tx, Action::Select(udid.into())));
+                rt.frame(1.0 / 60.0);
+                assert!(rt.state.console_log.is_empty(), "{udid}: {:?}", rt.state.console_log);
+                if udid == "pixel_fold" {
+                    assert!(rt.find("placeholder").is_some() && rt.state.screen.is_none(), "the fold isn't running");
+                }
+            }
+            assert!(rt.find("placeholder").is_none() && rt.find("device-screen").is_some(), "the screen shows at once");
+            let sc = rt.state.screen.as_ref().expect("the paused screen came back");
+            assert_eq!(sc.pixels.signature(), shown, "the same buffer and frame, not a new one");
+            assert_eq!(sc.pixels.rgba(), [9; 8]);
+            let start = std::time::Instant::now();
+            while lines.lock().expect("lines").len() < 4 {
+                assert!(start.elapsed() < Duration::from_secs(5), "{:?}", lines.lock().expect("lines"));
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let back = if visible { "hello 1080" } else { "hello 0" };
+            assert_eq!(*lines.lock().expect("lines"), ["shm", "hello 1080", "hello 0", back], "paused, then resumed (visible: {visible})");
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
