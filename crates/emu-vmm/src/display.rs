@@ -14,8 +14,11 @@
 //! static screen keeps its buffers. The check runs on the next post, so it needs no thread or
 //! timer of its own. Unread guest-composed frames are then read in place into the kept buffer,
 //! one buffer instead of three.
+//!
+//! A renderer without GL can't report its posts (gfxstream's post callback reads every post back
+//! through GL); [`PostTicker`] stands in, driven by the renderer's fences.
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use sim_core::pixels::{PixelFormat, to_rgba_into};
@@ -392,12 +395,133 @@ impl DisplaySink for FrameStore {
     }
 }
 
+/// Post notices for a renderer that can't make them: a Vulkan-only renderer, whose post callback
+/// would read every post back through the GL backend it doesn't have. Each renderer fence
+/// [`PostTicker::poke`]s it; while pokes keep coming it records a posted frame
+/// ([`DisplaySink::posted`]) at most once per `interval`, and goes on for `tail` after the last
+/// one. Host composition and its post run on the renderer's post worker after the fence that
+/// ends the composer's commands, so the tail is what catches the last frame of an animation.
+/// A quiet guest costs nothing: the thread sleeps until the next fence. A notice with no new
+/// frame behind it costs a reader one readback of an unchanged frame, and only while one reads.
+pub struct PostTicker {
+    state: Mutex<TickState>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct TickState {
+    /// The last poke not yet followed by a full tail of notices.
+    last: Option<Instant>,
+    /// The thread is waiting for a poke (a poke then has to wake it).
+    idle: bool,
+    stop: bool,
+}
+
+impl PostTicker {
+    /// Starts the notice thread for a `width` x `height` display.
+    pub fn start(sink: Arc<dyn DisplaySink>, width: u32, height: u32, interval: Duration, tail: Duration) -> Arc<PostTicker> {
+        let ticker = Arc::new(PostTicker { state: Mutex::new(TickState::default()), wake: Condvar::new() });
+        let t = ticker.clone();
+        let spawned = std::thread::Builder::new().name("post-ticker".into()).spawn(move || t.run(&*sink, width, height, interval, tail));
+        if let Err(e) = spawned {
+            eprintln!("emu: post-ticker: {e}; host frames won't update");
+        }
+        ticker
+    }
+
+    fn lock(&self) -> MutexGuard<'_, TickState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The renderer finished some work (a fence signalled). Cheap: one uncontended lock, and a
+    /// wakeup only when the thread was idle.
+    pub fn poke(&self) {
+        let mut s = self.lock();
+        s.last = Some(Instant::now());
+        if s.idle {
+            s.idle = false;
+            self.wake.notify_one();
+        }
+    }
+
+    /// Ends the thread (after its current notice).
+    pub fn stop(&self) {
+        self.lock().stop = true;
+        self.wake.notify_one();
+    }
+
+    fn run(&self, sink: &dyn DisplaySink, width: u32, height: u32, interval: Duration, tail: Duration) {
+        loop {
+            {
+                let mut s = self.lock();
+                loop {
+                    if s.stop {
+                        return;
+                    }
+                    match s.last {
+                        Some(t) if t.elapsed() <= tail => break,
+                        _ => {
+                            s.last = None;
+                            s.idle = true;
+                            s = self.wake.wait(s).unwrap_or_else(std::sync::PoisonError::into_inner);
+                        }
+                    }
+                }
+            }
+            sink.posted(width, height);
+            std::thread::sleep(interval);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    /// Counts posted notices.
+    #[derive(Default)]
+    struct Posts(AtomicUsize);
+
+    impl DisplaySink for Posts {
+        fn present(&self, _: u32, _: u32, _: u32, _: u32, _: &[u8]) {}
+        fn posted(&self, w: u32, h: u32) {
+            assert_eq!((w, h), (2560, 1600));
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn post_ticker_notices_while_fences_come_and_for_a_tail_after() {
+        let posts = Arc::new(Posts::default());
+        let (interval, tail) = (Duration::from_millis(5), Duration::from_millis(40));
+        let ticker = PostTicker::start(posts.clone(), 2560, 1600, interval, tail);
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(posts.0.load(Ordering::Relaxed), 0, "no fence, no notice");
+
+        // A steady stream of fences for 100 ms: notices keep coming, at most one per interval.
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(100) {
+            ticker.poke();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let during = posts.0.load(Ordering::Relaxed);
+        assert!((5..=21).contains(&during), "{during} notices in 100 ms");
+
+        // The tail: notices go on for about 40 ms after the last fence, then stop.
+        std::thread::sleep(Duration::from_millis(120));
+        let after = posts.0.load(Ordering::Relaxed);
+        assert!(after > during, "the frame posted after the last fence is noticed");
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(posts.0.load(Ordering::Relaxed), after, "a quiet guest gets no notices");
+
+        // One fence after a quiet spell wakes it again.
+        ticker.poke();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(posts.0.load(Ordering::Relaxed) > after);
+        ticker.stop();
+    }
 
     #[test]
     fn wake_ends_a_wait_without_a_frame() {
