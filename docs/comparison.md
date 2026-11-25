@@ -20,6 +20,7 @@ You can mix the two: boot with simee, install with Xcode.
 | Cold boot, until `sys.boot_completed` | 9.5 s | 22.9 s |
 | Warm boot, until `sys.boot_completed` | 3.5 s | 17.1 s |
 | Peak memory, process tree, cold / warm | 3.76 / 2.09 GB | 4.99 / 3.78 GB |
+| Janky frames swiping the launcher, Pixel Tablet / phone | 0% / 0.25% | 5.6% / 6.2% |
 
 Medians of 3 boots of one API 36 AVD; the setup is in [benchmarks.md](benchmarks.md).
 

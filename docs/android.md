@@ -21,11 +21,11 @@ to use fewer resources.
 | VM core | vCPUs, the framework's in-kernel GICv3, PSCI (SMP, power off and reset), arch timer, PL011 console, PL031 RTC |
 | Board | Stock memory map and virtio-mmio slots, so the unmodified fstab and first-stage init find `vda`–`vde` and their by-name paths |
 | Storage | virtio-blk with indirect descriptors, event-idx, and discard/write-zeroes (hole punching). System and vendor are copy-on-write in memory; userdata, cache and metadata persist per AVD. Userdata is created by a native ext4 formatter (no `mkfs.ext4`) |
-| Boot | Full Android boot to `sys.boot_completed`: 9.5 s cold, 3.5 s warm (stock: 22.9 s and 17.1 s; [benchmarks](benchmarks.md)); first boot formats and encrypts `/data` |
+| Boot | Full Android boot to `sys.boot_completed`: 9.5 s cold, 3.5 s warm (stock: 22.9 s and 17.1 s; [benchmarks](benchmarks.md)); first boot formats and encrypts `/data`. System images from API 34 on; emu refuses older ones up front with the reason, since they boot their kernel but get no graphics: API 29 and 30 use goldfish pipes emu doesn't serve ([#38](https://github.com/kaeawc/simee/issues/38)), API 31 to 33 a guest-backed graphics ring the renderer can't map ([#39](https://github.com/kaeawc/simee/issues/39)). `EMU_ALLOW_OLD_IMAGES=1` boots them anyway, for that work. Images without `AndroidbootProps2` (API 30 and older, kernels without bootconfig) get stock's legacy kernel command line (`qemu.*` names) instead of bootconfig |
 | adb | virtio-vsock with a host bridge on `console port + 1`, announced to the adb server. `adb shell`/`root`/`push` work, and the device shows up about 8 s after launch on a warm boot |
 | Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot`, plus simee's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
 | Discovery | `-list-avds`, `pid_<pid>.ini` running-instance file, `emulator-<port>` serial on stdout |
-| Graphics | Home screen and apps render. virtio-gpu with gfxstream contexts on the host GPU: GLES through ANGLE on Metal, Vulkan on MoltenVK (lavapipe fallback), Vulkan composition. Host-visible memory via blob mapping; goldfish address space (PCIe, shared-slot allocator) and goldfish pipe (refcounted color buffers) for the ranchu gralloc; guest `screencap` and host screenshots both work |
+| Graphics | Home screen and apps render. virtio-gpu with gfxstream contexts on the host GPU: the guest's GLES through ANGLE on its Vulkan, so the renderer runs without a GL backend (see "Vulkan-only renderer" below); Vulkan on MoltenVK (lavapipe fallback), Vulkan composition. Host-visible memory via blob mapping; goldfish address space (PCIe, shared-slot allocator) and goldfish pipe (refcounted color buffers) for the ranchu gralloc; guest `screencap` and host screenshots both work |
 | Input & sensors | virtio-input touchscreen, keyboard and rotary, plus stock's dual-mode mouse on XR images. The keyboard is stock's `qwerty2` (0627:0001, stock's key set), so goldfish's `qwerty2.kl` applies: HOME, D-pad centre (`KEY_CENTER`), Recents (580), media and stem keys arrive. The console takes every stock `KEY_*` name and numeric codes. `qemud:sensors` lists the AVD's sensors by stock's rules (`hw.sensor*` flags; heart rate and wrist tilt on Wear OS API 28+; the hinge on foldables) with live values; GNSS over `qemud:gps`; goldfish battery; fingerprint; clipboard |
 | Telephony | AT modem on a virtio-console `modem` port: the radio HAL registers on LTE with a loaded SIM; incoming SMS and calls from the console |
 | Network | virtio-net at stock's net slot (26, MAC `52:54:00:12:34:56`), so the guest has the `eth0` the radio HAL configures from the modem's `+CGCONTRDP` reply (10.0.2.15/24, gateway 10.0.2.2, DNS 10.0.2.3). Link only so far: frames the guest sends are dropped and none arrive; a user-mode NAT behind it is next ([#36](https://github.com/kaeawc/simee/issues/36)) |
@@ -279,9 +279,27 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   `SIGBUS`), which costs its first frames 20–60 ms here, once per ring. Frames scale on one thread below 16 MiB of input and in up to 4
   bands above: two threads were slower than one on this VM (likely SMT siblings), four faster.
   Rings live in `<avd>/simee/`, a disk-backed file on macOS whose dirty pages the system writes
-  back periodically (benchmark rigs on Linux use `/dev/shm`). The direct Vulkan readback is checked
-  against the GL one on its first 3 frames and turned off if they differ (`EMU_READBACK=gl` turns
-  it off outright).
+  back periodically (benchmark rigs on Linux use `/dev/shm`). With a GL backend the direct Vulkan
+  readback is checked against the GL one on its first 3 frames and turned off if they differ
+  (`EMU_READBACK=gl` turns it off outright); a Vulkan-only renderer has only the direct one.
+- **Vulkan-only renderer.** With a GL backend, gfxstream gives every color buffer a GL texture
+  beside its Vulkan image, and after each guest queue submit copies the image into it on the CPU:
+  a Vulkan readback, then `glTexSubImage2D`, which Apple's driver retiles on the CPU
+  (`agxsTwiddleAddressCommon` was a fifth of a core in `sample` while a tablet animated). Two
+  full-frame copies per frame, so the cost grows with the screen: 16 MB each on a 2560×1600
+  tablet, whose launcher missed 37% of its frames. The guest's GLES runs on ANGLE over its own
+  Vulkan, so nothing reads the GL side, and emu starts the renderer without GL (gfxstream's
+  `GuestVulkanOnly`): no GL texture, no copy. Frame pacing then beats stock on the phone and the
+  tablet ([benchmarks](benchmarks.md#frame-pacing)). Two things change with it. gfxstream's post
+  callback needs GL (registering it and every post read back through GL), so a `PostTicker`
+  stands in: each renderer fence pokes it, and while they come it marks a new frame for the
+  display store at most every 16 ms, and for 50 ms after the last, which covers the post the
+  renderer's post worker makes after the composer's fence; a quiet guest costs nothing. And host
+  frames are read only by the direct Vulkan readback, so emu chooses Vulkan-only only when the
+  renderer build has it. `EMU_GUEST_EGL=emulation`, `EMU_GL_COMPOSITION` and `EMU_RENDERER_GL=1`
+  keep GL. Host screenshots matched the guest's `screencap` on every form factor, the stream ran
+  40 fps at full tablet size during swipes (GL: 24–33), and the AutoMobile harness gave the same
+  results under both on phone, tablet, foldable, watch, TV, car, XR headset and glasses.
 - **vsock without intermediate copies.** adb (and every qemud pipe) rides vsock. Host bytes were
   copied into the connection's queue, out of it into a packet `Vec`, and then into the guest's
   buffer; now the adb forwarder hands its buffer over, the worker takes it over when nothing is
