@@ -184,8 +184,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   one private AutoMobile daemon; `automobile-daemon.sh` starts, joins and stops it, and the
   harnesses join it through `AM_DAEMON_ENV`), `pf-shape.sh` (pf/dummynet, needs sudo);
   Android: `sign-run.sh` (the cargo runner: hypervisor entitlement), `sdk-shim.sh` (SDK overlay
-  whose `emulator` is simee), `automobile-harness-android.sh`, `android-bench.sh`,
-  `net-bench.sh` (idle CPU with the NAT and link only, throughput through the NAT),
+  whose `emulator` is simee), `automobile-harness-android.sh`, `android-bench.sh`, `android-jank.sh` (frame pacing under
+  launcher swipes), `net-bench.sh` (idle CPU with the NAT and link only, throughput through the NAT),
   `inspect-image.py` (what a system image expects of the board, unpacked without booting: fstab,
   modules, input names, vendor HALs).
 - `docs/research/` — `network-shaping.md`, `audio-camera.md`; `docs/automobile-tool-matrix.md`.

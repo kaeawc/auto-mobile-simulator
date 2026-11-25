@@ -29,9 +29,17 @@ pub struct GpuSpec {
     pub height: u32,
     pub verbose: bool,
     pub display: Arc<dyn crate::display::DisplaySink>,
+    /// The guest's GLES is ANGLE on its Vulkan, so the renderer can run without a GL backend
+    /// (see `init_renderer`).
+    pub vulkan_only: bool,
 }
 
 static RENDERER: std::sync::OnceLock<Arc<emu_gfxstream::Renderer>> = std::sync::OnceLock::new();
+
+/// Post notices of a Vulkan-only renderer ([`crate::display::PostTicker`]): at most one per
+/// display frame (60 Hz) while the renderer signals fences, and for 50 ms (three frames) after.
+const POST_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+const POST_NOTICE_TAIL: std::time::Duration = std::time::Duration::from_millis(50);
 
 type RendererInit = std::sync::mpsc::Receiver<Result<Arc<emu_gfxstream::Renderer>>>;
 
@@ -91,8 +99,21 @@ fn settle_renderer() {
 
 fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     let r = emu_gfxstream::Renderer::load(&spec.lib64).context("loading the gfxstream renderer")?;
-    let mut flags = emu_gfxstream::flags::USE_EGL | emu_gfxstream::flags::USE_GLES | emu_gfxstream::flags::USE_VK;
-    if std::env::var_os("EMU_GL_COMPOSITION").is_none() {
+    let gl_composition = std::env::var_os("EMU_GL_COMPOSITION").is_some();
+    // With a GL backend, every color buffer has a GL texture beside its Vulkan image, and each
+    // guest queue submit copies the image into it on the CPU (a Vulkan readback, then
+    // glTexSubImage2D, which Apple's driver retiles on the CPU): two full-frame copies per frame,
+    // 16 MB each on a 2560x1600 tablet. Guests on ANGLE never read the GL side, so the renderer
+    // runs without GL (gfxstream's GuestVulkanOnly). A Pixel Tablet swiping through the app
+    // drawer went from 37% janky frames (p90 53 ms) to none (p90 5 ms), and emu from 163% to 62%
+    // of a core; see docs/benchmarks.md. Host frames are then read only through the direct
+    // Vulkan readback, so a renderer build without it keeps GL. EMU_RENDERER_GL=1 keeps GL anyway.
+    let vulkan_only = spec.vulkan_only && !gl_composition && std::env::var_os("EMU_RENDERER_GL").is_none() && r.can_read_vulkan_directly();
+    let mut flags = emu_gfxstream::flags::USE_EGL | emu_gfxstream::flags::USE_VK;
+    if !vulkan_only {
+        flags |= emu_gfxstream::flags::USE_GLES;
+    }
+    if !gl_composition {
         flags |= emu_gfxstream::flags::VULKAN_NATIVE_SWAPCHAIN;
     }
     // What the ranchu gralloc expects of the host:
@@ -107,7 +128,18 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
         features.push(',');
         features.push_str(&extra);
     }
-    r.init_with_features(spec.width, spec.height, flags, Some(&features), spec.verbose, virtio::gpu::fence_handler())
+    // Without GL there's no post callback: fences drive the post notices instead.
+    let ticker = vulkan_only
+        .then(|| crate::display::PostTicker::start(spec.display.clone(), spec.width, spec.height, POST_NOTICE_INTERVAL, POST_NOTICE_TAIL));
+    let fences = virtio::gpu::fence_handler();
+    let fences: Arc<dyn Fn(emu_gfxstream::Fence) + Send + Sync> = match ticker {
+        Some(t) => Arc::new(move |f| {
+            fences(f);
+            t.poke();
+        }),
+        None => fences,
+    };
+    r.init_with_features(spec.width, spec.height, flags, Some(&features), spec.verbose, fences)
         .context("initializing the gfxstream renderer")?;
     // Host composition posts frames to the renderer's display. A post is only a notice: the
     // callback's pixels come from the renderer's GL readback, which is stale under Vulkan
@@ -118,6 +150,9 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     let direct = r.can_read_last_posted();
     if direct {
         display.set_readback(Box::new(|w, h, buf| RENDERER.get().is_some_and(|r| r.read_last_posted_to(w, h, buf).is_ok())));
+    }
+    if vulkan_only {
+        return Ok(RENDERER.get_or_init(|| Arc::new(r)).clone());
     }
     let primary = std::sync::atomic::AtomicU32::new(u32::MAX);
     let posted = r.set_post_callback(Box::new(move |f| {
@@ -555,7 +590,14 @@ mod tests {
     use super::*;
 
     fn spec(lib64: PathBuf) -> GpuSpec {
-        GpuSpec { lib64, width: 720, height: 1280, verbose: true, display: Arc::new(crate::display::FrameStore::default()) }
+        GpuSpec {
+            lib64,
+            width: 720,
+            height: 1280,
+            verbose: true,
+            display: Arc::new(crate::display::FrameStore::default()),
+            vulkan_only: false,
+        }
     }
 
     fn idle_cpus() -> Arc<Cpus> {

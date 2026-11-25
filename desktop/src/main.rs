@@ -248,7 +248,7 @@ impl State {
                     let backend = self.android_backend.clone().unwrap_or_default();
                     let find = android::lookup(backend, info.udid.clone());
                     let console = work::Worker::start("simee-android-console", find, self.outbox.clone());
-                    match android::Screen::connect(&info.udid, dir, 1080, console) {
+                    match android::Screen::connect(&info.udid, dir, android::stream_max_width(self.offline_size), console) {
                         Ok(sc) => {
                             sc.set_visible(self.visible);
                             self.screen = Some(sc);
@@ -684,7 +684,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
         && s.sized_for != Some(size)
     {
         s.sized_for = Some(size);
-        let screen_h = 760.0_f32;
+        let screen_h = android::SCREEN_POINTS;
         let screen_w = screen_h * size.0 as f32 / size.1 as f32;
         tx.resize_window((240.0 + 32.0 + screen_w.max(420.0) + 340.0, screen_h + 110.0));
         changed = true;

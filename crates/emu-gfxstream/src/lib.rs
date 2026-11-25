@@ -335,6 +335,10 @@ pub struct Renderer {
     vk: std::sync::OnceLock<Option<VkRead>>,
     /// [`VkTrust`] of the direct readback, as a u8.
     vk_trust: AtomicU8,
+    /// The renderer has a GL backend (initialized with [`flags::USE_GLES`]). Without one, color
+    /// buffers are Vulkan images only and every GL path (the exported readback, the post
+    /// callback's readback) aborts in the renderer, so they're never taken.
+    gl: AtomicBool,
     /// Iovec arrays the renderer may still point at.
     iovs: Mutex<IovStore>,
 }
@@ -398,6 +402,7 @@ impl Renderer {
             fb: std::sync::OnceLock::new(),
             vk: std::sync::OnceLock::new(),
             vk_trust: AtomicU8::new(VkTrust::Unchecked as u8),
+            gl: AtomicBool::new(true),
             iovs: Mutex::new(IovStore::default()),
         })
     }
@@ -423,6 +428,12 @@ impl Renderer {
         }
         VERBOSE.store(verbose, Ordering::Relaxed);
         let _ = FENCE_HANDLER.set(on_fence);
+        let gl = renderer_flags & flags::USE_GLES != 0;
+        self.gl.store(gl, Ordering::Relaxed);
+        if !gl {
+            // Nothing to check the direct readback against, and nothing else to read with.
+            self.vk_trust.store(VkTrust::Trusted as u8, Ordering::Relaxed);
+        }
         let features = features.map(|f| CString::new(f).unwrap_or_default());
         let mut params = vec![
             Param { key: 1, value: 0 },
@@ -791,6 +802,10 @@ impl Renderer {
     /// asynchronously as BGRA. This is how the stock emulator streams its screen. Uses the
     /// renderer's exported C++ `FrameBuffer::getFB()` / `setPostCallback`.
     pub fn set_post_callback(&self, handler: PostHandler) -> Result<()> {
+        // Registering starts the GL readback worker, and every post reads back through GL.
+        if !self.has_gl() {
+            return Err(Error::Call("FrameBuffer::setPostCallback (no GL backend)", 0));
+        }
         let _ = POST_HANDLER.set(handler);
         let h = self.handle;
         let get_fb: GetFb = sym!(h, "_ZN9gfxstream4host11FrameBuffer5getFBEv");
@@ -859,6 +874,17 @@ impl Renderer {
         self.fb_api().is_ok()
     }
 
+    /// Whether this renderer build has the direct Vulkan readback ([`VkRead`]) emu knows how to
+    /// call. Checked before init: a renderer without GL reads frames only that way.
+    pub fn can_read_vulkan_directly(&self) -> bool {
+        self.can_read_last_posted() && VkRead::symbols(self.handle, &self.backend).is_some()
+    }
+
+    /// The renderer has a GL backend: [`Renderer::set_post_callback`] works only then.
+    pub fn has_gl(&self) -> bool {
+        self.gl.load(Ordering::Relaxed)
+    }
+
     /// The last color buffer the renderer posted (host composition's output), read back as
     /// RGBA, `width` x `height`, top row first.
     pub fn read_last_posted(&self, width: u32, height: u32) -> Result<Vec<u8>> {
@@ -916,6 +942,9 @@ impl Renderer {
                 return Ok(());
             }
             _ => {}
+        }
+        if !self.has_gl() {
+            return Err(Error::Call("read_last_posted_to: Vulkan readback (no GL backend)", 0));
         }
         Self::read_through_gl(&f, fb, cb, width, height, px)
     }
@@ -1014,8 +1043,17 @@ const GET_FB: &str = "_ZN9gfxstream4host11FrameBuffer5getFBEv";
 const HAS_EMULATION_VK: &str = "_ZNK9gfxstream4host11FrameBuffer14hasEmulationVkEv";
 const READ_COLOR_BUFFER_VK: &str = "_ZN9gfxstream4host2vk11VkEmulation22readColorBufferToBytesEjjjjjPvy";
 
+/// What [`VkRead::resolve`] finds in the loaded image before it needs a live FrameBuffer: the
+/// image's slide, `hasEmulationVk`'s live address, and `readColorBufferToBytes`'s file address.
+struct VkSymbols {
+    slide: u64,
+    has_vk_live: u64,
+    read: u64,
+}
+
 impl VkRead {
-    fn resolve(handle: *mut c_void, backend: &Path, fb: *mut c_void) -> Option<VkRead> {
+    /// The direct readback's symbols, from the renderer file that's loaded.
+    fn symbols(handle: *mut c_void, backend: &Path) -> Option<VkSymbols> {
         if std::env::var("EMU_READBACK").is_ok_and(|v| v == "gl") {
             return None;
         }
@@ -1039,6 +1077,11 @@ impl VkRead {
         if has_vk_live.wrapping_sub(has_vk) != slide {
             return None;
         }
+        Some(VkSymbols { slide, has_vk_live, read })
+    }
+
+    fn resolve(handle: *mut c_void, backend: &Path, fb: *mut c_void) -> Option<VkRead> {
+        let VkSymbols { slide, has_vk_live, read } = Self::symbols(handle, backend)?;
         // SAFETY: the address is the entry of an exported function in the loaded image, whose
         // code pages are mapped readable; 20 bytes stay inside its text segment.
         let code: [u32; 5] = unsafe { std::ptr::read_unaligned(has_vk_live as usize as *const [u32; 5]) };

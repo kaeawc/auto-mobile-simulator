@@ -20,6 +20,7 @@ of 3 boots each. A cold boot is a new AVD's first; a warm boot is any later one,
 | Warm boot, until `sys.boot_completed` | **3.5 s** | 17.1 s |
 | Warm boot, until `adb` sees the device | **1.6 s** | 8.5 s |
 | Peak memory, whole process tree, warm | **2.09 GB** | 3.78 GB |
+| Janky frames swiping the launcher, Pixel Tablet / phone | **0% / 0.25%** | 5.6% / 6.2% |
 | Java needed to provision an image | no | yes (`sdkmanager`) |
 
 The SDK emulator restores a snapshot in 2.8 s; emu has no snapshots yet, and its warm boot is
@@ -89,6 +90,9 @@ Unsupported combinations are refused with the reason. The matrix and its gaps:
   snapshots.
 - Automotive and Android XR images have their devices implemented but have not been booted.
 - iOS microphone injection still needs a loopback audio device.
+- Android system images below API 34 are refused with the reason: API 29 and 30 need goldfish
+  pipes emu doesn't serve ([#38](https://github.com/kaeawc/simee/issues/38)), API 31 to 33 a
+  graphics fix ([#39](https://github.com/kaeawc/simee/issues/39)).
 - Android guests reach the internet over IPv4 only (TCP, UDP, ping); no IPv6 or inbound port
   forwarding yet. IP fragments the guest sends are dropped, and DNS goes to the host's first
   resolver, not to a VPN's scoped one.
