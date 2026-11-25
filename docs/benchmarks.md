@@ -8,6 +8,9 @@ says what was run, on what, and when. The rules for keeping it current are in
 
 One API 36 `google_apis` arm64 AVD (4 vCPU, 2 GB) on an M3 Max (macOS 26.6.2), 2026-11-24, SDK
 emulator 37.2.13.0. Medians of 3 boots of each kind; host load average 3–5 during the boots.
+These runs predate emu's Vulkan-only renderer (2026-11-25), which shortened a phone's warm boot
+and lowered its peak memory on another AVD ([internals](#emulator-internals)); this table is due
+a rerun with it.
 
 - **Cold:** a new AVD's first boot (no userdata yet: emu formats and encrypts `/data`).
 - **Warm:** a later boot of the same AVD. The SDK emulator runs with `-no-snapshot-load`; emu
@@ -49,6 +52,33 @@ runs.
 
 Without an `eth0`, the guest's telephony retries the data call without a delay; with one, the
 call succeeds once and the guest goes idle.
+
+### Frame pacing
+
+How smoothly the guest draws under steady motion: 10 app-drawer swipes up and down on the
+launcher, then the launcher's own frame stats (`dumpsys gfxinfo`). Janky frames missed their
+deadline. One API 36 `google_apis` AVD of each size (4 vCPU, 2 GB) on the M3 Max, 2026-11-25,
+SDK emulator 37.2.13.0, each warm-booted and given 60 s to settle, 3 runs of each alternating;
+host load average 4–7. emu with GL is the same build with `EMU_RENDERER_GL=1`, as emu ran before
+the Vulkan-only renderer. Host CPU is emu's process over the run; the stock emulator's runs in a
+child process the script doesn't track.
+
+```bash
+scripts/android-jank.sh emulator-<port> [emulator pid]   # one key=value line
+```
+
+| Device | Emulator | Janky frames, median (runs) | Frame time p90 / p99 | Host CPU |
+| --- | --- | --- | --- | --- |
+| Pixel Tablet, 2560×1600 | emu | 0% (0, 0.56, 0) | 5 / 6 ms | 49% of a core |
+| | emu with GL | 9.5% (9.5, 9.9, 8.7) | 22 / 48 ms | 96% |
+| | SDK emulator | 5.6% (5.9, 5.5, 5.6) | 18 / 23 ms | |
+| Phone, 1080×2400 | emu | 0.25% (0.25, 0.13, 0.25) | 5 / 5 ms | 33% |
+| | emu with GL | 5.0% (6.1, 5.0, 5.0) | 14 / 31 ms | 63% |
+| | SDK emulator | 6.2% (8.4, 5.7, 6.2) | 18 / 30 ms | |
+
+Both display at 60 Hz. The stock emulator's tablet rendered about 1350 frames over the swipes and
+emu's about 530; emu with the guest on stock's GLES driver (`EMU_GUEST_EGL=emulation`) rendered
+1254, so the count follows the guest's driver. On the phone both render about 790.
 
 ## Android farm
 
@@ -96,6 +126,8 @@ in [android.md](android.md#performance-notes).
 | vsock host to guest | 474 MiB/s | 597 MiB/s | 4-core Linux VM, `vsock_throughput` |
 | adb client to guest, end to end | 498 MiB/s | 870 MiB/s | 4-core Linux VM, `adb_throughput_to_guest` |
 | Whole-disk FITRIM | | 90 ms | M-series Mac |
+| Vulkan-only renderer: warm boot of a 1080×2400 phone, median (runs) | 3.7 s (3.7, 3.5, 3.7) | 3.3 s (3.3, 3.3, 3.3) | M3 Max, 2026-11-25, `EMU_RENDERER_GL=1 scripts/android-bench.sh` against without |
+| Vulkan-only renderer: peak RSS of that boot | 3262 MB (3279, 1939, 3262) | 2014 MB (2044, 2014, 1945) | same runs |
 
 The `--ignored` benches run on any host:
 

@@ -25,7 +25,10 @@ esac
 now() { perl -MTime::HiRes=time -e 'printf "%.3f\n", time'; }
 since() { awk -v a="$(now)" -v b="$1" -v d="${2:-1}" 'BEGIN { printf "%.*f\n", d, a - b }'; }
 t0=$(now)
-env -i HOME="$HOME" USER="$USER" TMPDIR="$TMPDIR" PATH="/usr/bin:/bin:/usr/sbin:/sbin" ANDROID_HOME="$sdk" ANDROID_SDK_ROOT="$sdk" \
+# emu's own switches (EMU_RENDERER_GL=1, EMU_GUEST_EGL=...) pass through, for A/B runs.
+emu_env=()
+while IFS= read -r kv; do emu_env+=("$kv"); done < <(env | grep '^EMU_' || true)
+env -i HOME="$HOME" USER="$USER" TMPDIR="$TMPDIR" PATH="/usr/bin:/bin:/usr/sbin:/sbin" ANDROID_HOME="$sdk" ANDROID_SDK_ROOT="$sdk" ${emu_env[@]+"${emu_env[@]}"} \
   "$bin" -avd "$avd" -port "$port" -no-window -no-audio -no-boot-anim -no-snapshot-save "$@" > "$out/$label.log" 2>&1 &
 pid=$!
 deadline=$(( SECONDS + ${BOOT_TIMEOUT:-600} )); state=timeout; t_adb=""; t_line=""; rss=0; tick=0
