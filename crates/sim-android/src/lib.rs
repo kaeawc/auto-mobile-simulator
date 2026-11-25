@@ -249,7 +249,8 @@ impl Android {
     pub fn boot_many(&self, avds: &[String], concurrency: usize, timeout: Duration, first_port: u16) -> Result<Vec<BootOutcome>, String> {
         let locks = emu_avd::port_lock_dir();
         let free = |p: u16| port_usable(locks.as_deref(), p, port_free);
-        self.boot_many_with(avds, concurrency, timeout, first_port, free, |d, port| d.launch_command(Some(port)))
+        // A farm stays silent: N devices would open N host audio streams.
+        self.boot_many_with(avds, concurrency, timeout, first_port, free, |d, port| d.launch_command(Some(port), false))
     }
 
     fn boot_many_with(
@@ -453,14 +454,16 @@ impl Device {
 
     /// Starts `emu` for this AVD (unless it's running) and waits until it has booted: until
     /// `sys.boot_completed` is 1 when adb is available, else until the display has a frame.
-    /// The emulator's own output goes to `<avd>/simee/emu.log`.
-    pub fn boot(&self, android: &Android, timeout: Duration) -> Result<(), String> {
-        self.boot_with(android, timeout, self.launch_command(None))
+    /// The emulator's own output goes to `<avd>/simee/emu.log`. With `audio` the device plays
+    /// on the host's default output; without it (what tools and farms want) it is silent
+    /// (`-no-audio`) and opens no host audio device.
+    pub fn boot(&self, android: &Android, timeout: Duration, audio: bool) -> Result<(), String> {
+        self.boot_with(android, timeout, self.launch_command(None, audio))
     }
 
     /// The command that starts `emu` for this AVD, on console port `port` if given (else emu
-    /// picks the first free pair).
-    fn launch_command(&self, port: Option<u16>) -> Command {
+    /// picks the first free pair), silent unless `audio`.
+    fn launch_command(&self, port: Option<u16>, audio: bool) -> Command {
         let bin = emu_binary();
         let signer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/sign-run.sh");
         let mut cmd = if cfg!(target_os = "macos") && signer.is_file() {
@@ -471,6 +474,9 @@ impl Device {
             Command::new(&bin)
         };
         cmd.args(["-avd", &self.info.udid, "-no-boot-anim"]);
+        if !audio {
+            cmd.arg("-no-audio");
+        }
         // The guest's logcat, for the desktop's panel and anyone debugging a boot: the console
         // is quiet now, and logcat over hvc1 is the cheap stream.
         if let Some(avd) = &self.avd {
@@ -1237,11 +1243,21 @@ mod tests {
         let f = fixture("logcat-arg");
         f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
         let d = f.android.device("phone").expect("device");
-        let args: Vec<String> = d.launch_command(Some(5600)).get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = d.launch_command(Some(5600), false).get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         let at = args.iter().position(|a| a == "-logcat-output").expect("-logcat-output");
         assert_eq!(Path::new(&args[at + 1]), emu_avd::state_dir(&d.avd.as_ref().expect("avd").dir).join(LOGCAT_FILE));
         let at = args.iter().position(|a| a == "-logcat").expect("-logcat");
         assert_eq!(args[at + 1], LOGCAT_FILTER);
+    }
+
+    #[test]
+    fn launches_are_silent_unless_audio_is_asked_for() {
+        let f = fixture("audio-arg");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let d = f.android.device("phone").expect("device");
+        let silent = |audio| d.launch_command(None, audio).get_args().any(|a| a == "-no-audio");
+        assert!(silent(false), "tools and farms: no host audio stream per device");
+        assert!(!silent(true), "a person watching hears it");
     }
 
     #[test]

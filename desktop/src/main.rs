@@ -593,7 +593,8 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
                     }
                     Platform::Android => {
                         let Some(backend) = s.android_backend.clone() else { continue };
-                        s.run_async("Booting…", move || backend.device(&info.udid)?.boot(&backend, Duration::from_secs(300)));
+                        // With audio: a person is watching this one (tools and farms boot silent).
+                        s.run_async("Booting…", move || backend.device(&info.udid)?.boot(&backend, Duration::from_secs(300), true));
                     }
                 }
             }
