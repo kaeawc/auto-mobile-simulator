@@ -72,6 +72,27 @@ ignored for now.
 | `docs/` | [Stock board reference](reference/stock-board.md), [desktop and display design](design/desktop-and-display.md), [roadmap](roadmap-android.md) |
 | `scripts/` | Cargo runner that signs with the hypervisor entitlement, SDK overlay (`make shim`), AutoMobile harness (`make harness-android DEVICE=emulator-5554`) |
 
+## Which `emu` simee starts, and AVDs the stock emulator runs
+
+`simee boot`, `simee boot-many` and the desktop start the release `emu`, because a debug guest
+boots several times slower. In order: `$SIMEE_EMU` (or `$EMU_BIN`) as given; an `emu` beside the
+running executable unless that is a debug build's; this checkout's `target/release/emu`; an `emu`
+beside the executable or `target/debug/emu` only when no release build exists; `emu` on the PATH.
+A release `emu` older than the sources (`apps/emu`, `crates/emu-*`, `crates/sim-core`) is still
+used, with a note on stderr; simee never builds it for you (`cargo build --release -p emu`, then
+`codesign -s - -f --entitlements scripts/hypervisor.entitlements target/release/emu`).
+
+AVDs the stock emulator runs list as `Booted`. The stock emulator (36.x, macOS) does not write the
+`pid_<pid>.ini` that simee's `emu` writes to `~/Library/Caches/TemporaryItems/avd/running`; it
+holds `<avd>/multiinstance.lock` and writes the qemu PID to `<avd>/hardware-qemu.ini.lock`. simee
+reads that PID, checks it is alive and a qemu started for that AVD (`ps`), and takes the console
+port from its `-port` argument, else from the emulator-range port it listens on (`lsof`).
+`simee info` shows `running.emulator` (`stock` or `simee`), the serial, ports and PID. What needs
+simee's `emu` (touch, keys, wheel and frames over `display.sock`, the touchpad) says so and names
+the fix instead of failing on a missing socket. `shutdown` interrupts the qemu process (the stock
+console wants an auth token). `simee list` does not mark the emulator yet: `DeviceInfo` has no
+field for it.
+
 ## Benchmarks
 
 `scripts/android-bench.sh` boots an AVD the same way under either emulator and measures it. The
