@@ -3,6 +3,7 @@
 //!
 //! Requests run on one worker thread. A request carrying a fence is answered only after the
 //! renderer signals that fence (its callback posts to the worker), per (context, ring) timeline.
+//! The renderer gets the device's own fence ids, not the guest's ([`FenceIds`]).
 //!
 //! The renderer is process-wide and outlives the device: a reset (the driver's, or the machine's
 //! when the guest reboots) gives back everything the guest made in it ([`Worker::teardown`],
@@ -121,11 +122,54 @@ pub fn fence_handler() -> Arc<dyn Fn(Fence) + Send + Sync> {
     })
 }
 
-/// Longest a reset waits for the renderer to signal the fences the guest still waits on before
-/// it destroys their contexts. A fence signalled after the reset could complete a request of the
-/// next boot, whose fence ids start again from 1. They normally signal within a frame; a renderer
-/// stuck on one costs a reset (or a shutdown) this long, no more.
+/// Longest a reset waits for the renderer to signal the fences the guest still waits on, so the
+/// work they stand for is done before the guest's mappings go and its contexts are released. They
+/// normally signal within a frame; a renderer stuck on one costs a reset (or a shutdown) this
+/// long, no more. One signalled later completes nothing ([`FenceIds`]).
 const FENCE_SETTLE: Duration = Duration::from_millis(100);
+
+/// The last fence id any GPU device gave the renderer (see [`FenceIds`]).
+static LAST_FENCE_ID: AtomicU64 = AtomicU64::new(0);
+
+/// The fence ids one activation of the device gives the renderer: one more than the last, from a
+/// process-wide counter, instead of the guest's own ids. A fence the renderer still holds from
+/// before a reset (stopping waits [`FENCE_SETTLE`] for them, no longer) can signal at any time
+/// after, and a `Fence` says nothing of which boot made it; the guest's ids start again at 1 each
+/// boot, so with them a late fence (ctx 1, ring 0, id 4000) would complete the next boot's
+/// requests up to 4000 on that timeline before their work was done. Every id of this activation
+/// is above `base`, the last id given out before it, so an earlier boot's fence is known
+/// ([`FenceIds::stale`]) and retires nothing. On a timeline the ids keep the order the requests
+/// arrived in, which is the order the renderer signals them; the guest's id goes back in the
+/// reply, which is written before the fence is made.
+#[derive(Clone, Copy)]
+struct FenceIds {
+    counter: &'static AtomicU64,
+    base: u64,
+}
+
+impl FenceIds {
+    /// Ids for an activation starting now: every one above those `counter` gave out before.
+    fn after(counter: &'static AtomicU64) -> FenceIds {
+        FenceIds { counter, base: counter.load(Ordering::Acquire) }
+    }
+
+    fn next(&self) -> u64 {
+        self.counter.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Whether `f` is an earlier activation's fence (one the renderer signalled after its reset).
+    fn stale(&self, f: &Fence) -> bool {
+        f.fence_id <= self.base
+    }
+}
+
+/// The renderer fence for request `h`, with id `id`, and the timeline it signals on.
+fn fence_for(h: &Hdr, id: u64) -> ((u32, u8), Fence) {
+    let ringed = h.flags & FLAG_RING_IDX != 0;
+    let timeline = if ringed { (h.ctx_id, h.ring_idx) } else { (0, 0) };
+    let flags = emu_gfxstream::FENCE_FLAG | if ringed { emu_gfxstream::FENCE_FLAG_RING_IDX } else { 0 };
+    (timeline, Fence { flags, fence_id: id, ctx_id: timeline.0, ring_idx: timeline.1 })
+}
 
 pub struct Gpu {
     cfg: Arc<GpuConfig>,
@@ -210,6 +254,7 @@ impl VirtioDevice for Gpu {
             contexts: HashSet::new(),
             scanout: None,
             pending: Vec::new(),
+            fence_ids: FenceIds::after(&LAST_FENCE_ID),
             req: Vec::new(),
             body: Vec::new(),
         };
@@ -255,6 +300,7 @@ struct Scanout {
 struct Pending {
     /// (ctx, ring) for ring-indexed fences; (0, 0) for the global timeline.
     timeline: (u32, u8),
+    /// The renderer's id for the fence ([`FenceIds`]), not the guest's.
     fence_id: u64,
     head: u16,
     len: u32,
@@ -268,6 +314,12 @@ fn retire(pending: &mut Vec<Pending>, f: &Fence) -> Vec<Pending> {
     let (done, rest) = std::mem::take(pending).into_iter().partition(|p| p.timeline == timeline && p.fence_id <= f.fence_id);
     *pending = rest;
     done
+}
+
+/// [`retire`] for a fence of this activation; an earlier one's ([`FenceIds::stale`]) retires
+/// nothing.
+fn complete(pending: &mut Vec<Pending>, ids: &FenceIds, f: &Fence) -> Vec<Pending> {
+    if ids.stale(f) { Vec::new() } else { retire(pending, f) }
 }
 
 /// What a reset gives back to the renderer, in the order it does. The guest's mappings of blobs
@@ -436,6 +488,7 @@ struct Worker {
     contexts: HashSet<u32>,
     scanout: Option<Scanout>,
     pending: Vec<Pending>,
+    fence_ids: FenceIds,
     /// The current control request, reused across requests (command streams are KBs to MBs).
     req: Vec<u8>,
     /// The current reply's payload after its header, reused likewise (most replies have none).
@@ -474,7 +527,7 @@ impl Worker {
         let deadline = t + FENCE_SETTLE;
         while !self.pending.is_empty() {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(Event::Fence(f)) => drop(retire(&mut self.pending, &f)),
+                Ok(Event::Fence(f)) => drop(complete(&mut self.pending, &self.fence_ids, &f)),
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
@@ -592,16 +645,12 @@ impl Worker {
             }
             self.req = req;
             if hdr.flags & FLAG_FENCE != 0 {
-                let ringed = hdr.flags & FLAG_RING_IDX != 0;
-                let timeline = if ringed { (hdr.ctx_id, hdr.ring_idx) } else { (0, 0) };
-                let f = Fence {
-                    flags: emu_gfxstream::FENCE_FLAG | if ringed { emu_gfxstream::FENCE_FLAG_RING_IDX } else { 0 },
-                    fence_id: hdr.fence_id,
-                    ctx_id: if ringed { hdr.ctx_id } else { 0 },
-                    ring_idx: if ringed { hdr.ring_idx } else { 0 },
-                };
+                let (timeline, f) = fence_for(&hdr, self.fence_ids.next());
+                if trace() {
+                    eprintln!("gpu: fence {} for the guest's {}", f.fence_id, hdr.fence_id);
+                }
                 if self.cfg.renderer.create_fence(f).is_ok() {
-                    self.pending.push(Pending { timeline, fence_id: hdr.fence_id, head: chain.head, len });
+                    self.pending.push(Pending { timeline, fence_id: f.fence_id, head: chain.head, len });
                     continue;
                 }
             }
@@ -614,15 +663,16 @@ impl Worker {
     fn complete_fences(&mut self, f: Fence) -> bool {
         if trace() {
             eprintln!(
-                "gpu: fence signaled id {} ctx {} ring {} flags {:#x} (pending {})",
+                "gpu: fence signaled id {} ctx {} ring {} flags {:#x} (pending {}){}",
                 f.fence_id,
                 f.ctx_id,
                 f.ring_idx,
                 f.flags,
-                self.pending.len()
+                self.pending.len(),
+                if self.fence_ids.stale(&f) { ", from before the reset" } else { "" }
             );
         }
-        let done = retire(&mut self.pending, &f);
+        let done = complete(&mut self.pending, &self.fence_ids, &f);
         for p in &done {
             let _ = self.ctrl.add_used(&self.mem, p.head, p.len);
         }
@@ -943,6 +993,73 @@ mod tests {
         assert_eq!(ids(&retire(&mut p, &fence(Some((5, 1)), 9))), [((5, 1), 2)], "another ring of the context stays");
         assert!(retire(&mut p, &fence(Some((6, 0)), 9)).is_empty(), "no requests on that timeline");
         assert_eq!(ids(&p), [((5, 0), 2), ((0, 0), 4)]);
+    }
+
+    /// The renderer as far as fences go: it holds the fences it was given until told to signal.
+    #[derive(Default)]
+    struct FakeRenderer {
+        held: Vec<Fence>,
+    }
+
+    impl FakeRenderer {
+        /// What the worker does with a fenced request: a fence made with the activation's next id.
+        fn fenced(&mut self, ids: &FenceIds, pending: &mut Vec<Pending>, ctx: u32, ring: u8, guest_id: u64) {
+            let h = Hdr { typ: cmd::SUBMIT_3D, flags: FLAG_FENCE | FLAG_RING_IDX, fence_id: guest_id, ctx_id: ctx, ring_idx: ring };
+            let (timeline, f) = fence_for(&h, ids.next());
+            self.held.push(f);
+            pending.push(Pending { timeline, fence_id: f.fence_id, head: guest_id as u16, len: 24 });
+        }
+
+        /// Signals the fence it was given `nth` (0 first).
+        fn signal(&self, nth: usize) -> Fence {
+            self.held[nth]
+        }
+    }
+
+    #[test]
+    fn a_fence_from_before_a_reset_completes_nothing_of_the_next_boot() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let mut renderer = FakeRenderer::default();
+        let guest_ids = |v: &[Pending]| v.iter().map(|p| p.head).collect::<Vec<_>>();
+        // The last boot: fences up to the guest's 4000 on (ctx 1, ring 0); the last hasn't
+        // signalled when the reset drops what was pending.
+        let old = FenceIds::after(&COUNTER);
+        let mut pending = Vec::new();
+        for id in [3998, 3999, 4000] {
+            renderer.fenced(&old, &mut pending, 1, 0, id);
+        }
+        assert_eq!(guest_ids(&complete(&mut pending, &old, &renderer.signal(1))), [3998, 3999]);
+        pending.clear();
+        // The next boot, its fence ids from 1 again on the same timeline.
+        let new = FenceIds::after(&COUNTER);
+        for id in 1..=5 {
+            renderer.fenced(&new, &mut pending, 1, 0, id);
+        }
+        // The renderer signals the last boot's fence 4000 late: nothing of the new boot is done.
+        let late = renderer.signal(2);
+        assert!(new.stale(&late));
+        assert!(complete(&mut pending, &new, &late).is_empty(), "a late fence retired the next boot's requests");
+        assert_eq!(pending.len(), 5);
+        // The new boot's own fences retire its requests up to theirs, on their timeline.
+        assert_eq!(guest_ids(&complete(&mut pending, &new, &renderer.signal(5))), [1, 2, 3]);
+        assert!(!new.stale(&renderer.signal(3)));
+        renderer.fenced(&new, &mut pending, 2, 0, 6);
+        assert_eq!(guest_ids(&complete(&mut pending, &new, &renderer.signal(8))), [6], "another context's timeline");
+        assert_eq!(guest_ids(&complete(&mut pending, &new, &renderer.signal(7))), [4, 5]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_fence_keeps_its_timeline_and_the_guest_id_stays_in_the_reply() {
+        let ring = Hdr { typ: cmd::SUBMIT_3D, flags: FLAG_FENCE | FLAG_RING_IDX, fence_id: 77, ctx_id: 3, ring_idx: 1 };
+        let (timeline, f) = fence_for(&ring, 9001);
+        assert_eq!(timeline, (3, 1));
+        assert_eq!(f, fence(Some((3, 1)), 9001));
+        assert_eq!(le64(&ring.reply(cmd::OK_NODATA), 8), 77, "the guest signals its own id");
+        let global = Hdr { flags: FLAG_FENCE, ..ring };
+        let (timeline, f) = fence_for(&global, 9002);
+        assert_eq!(timeline, (0, 0));
+        assert_eq!(f, fence(None, 9002), "the global timeline names no context");
     }
 
     #[test]

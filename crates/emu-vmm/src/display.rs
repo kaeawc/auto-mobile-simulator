@@ -460,6 +460,12 @@ impl PostTicker {
         self.lock().hold = Some(until);
     }
 
+    /// Whether notices are held ([`PostTicker::hold_until`]), for the machine's tests.
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn holding(&self) -> bool {
+        self.lock().hold.is_some()
+    }
+
     fn lock(&self) -> MutexGuard<'_, TickState> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }

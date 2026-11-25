@@ -128,16 +128,23 @@ in [android.md](android.md#performance-notes).
 | Whole-disk FITRIM | | 90 ms | M-series Mac |
 | Vulkan-only renderer: warm boot of a 1080×2400 phone, median (runs) | 3.7 s (3.7, 3.5, 3.7) | 3.3 s (3.3, 3.3, 3.3) | M3 Max, 2026-11-25, `EMU_RENDERER_GL=1 scripts/android-bench.sh` against without |
 | Vulkan-only renderer: peak RSS of that boot | 3262 MB (3279, 1939, 3262) | 2014 MB (2044, 2014, 1945) | same runs |
-| GPU state released on reset: hard guest reset of a 720×1280 API 36 phone, reset to the next boot's first host frame, median (runs) | never (boot doesn't complete) | 1.37 s (1.45, 1.31, 1.42, 1.32) | M3 Max, 2026-11-25, see below |
-| Same, reset to `sys.boot_completed` | never | 7.0 s (7.09, 7.01, 6.97, 6.99) | same runs |
-| Same change, `adb reboot`: reset to first host frame / to `sys.boot_completed` | 1.15 / 6.87 s (1.29, 1.15, 1.15 / 6.87, 6.87, 6.81) | 1.08 / 6.75 s (1.20, 1.08, 1.08 / 6.77, 6.75, 6.71) | same AVD and hour |
-| Same change, `kill -INT` to process exit (exit status) | 0.16 s (0.141, 0.157, 0.275; all 0) | 0.12 s (0.115, 0.116, 0.135; all 0) | same AVD and hour |
+| GPU state released on reset: hard guest reset of a 720×1280 API 36 phone, reset to the next boot's first host frame, median (runs) | never (boot not complete in 60 s) | 3.30 s (3.20, 3.39, 3.30) | M3 Max, 2026-11-25, `scripts/android-reset-bench.sh <avd> hard 3` |
+| Same, reset to `sys.boot_completed` | never | 3.44 s (3.34, 3.54, 3.44) | same runs |
+| Same change, `adb reboot`: reset to first host frame / to `sys.boot_completed`, median of 6 (two boots, 3 resets each) | 3.05 / 3.19 s (3.00, 3.09, 3.10, 2.94, 2.93, 3.20 / 3.14, 3.24, 3.23, 3.08, 3.07, 3.34) | 3.30 / 3.44 s (2.90, 3.30, 3.35, 2.94, 3.32, 3.30 / 3.05, 3.44, 3.49, 3.08, 3.46, 3.44) | same AVD and hour, builds interleaved, `scripts/android-reset-bench.sh <avd> reboot 3` |
+| Same change, `kill -INT` to process exit (exit status) | 0.12 s (0.12, 0.12, 0.12; all 0) | 0.12 s (0.12, 0.12, 0.12; all 0) | same AVD and hour, `scripts/android-reset-bench.sh <avd> exit 3` |
 
-The reset rows: a hard reset is `echo b > /proc/sysrq-trigger` under `adb root`; the reset is
-the moment emu's `-verbose` log prints `stopped after …: Reset`, and the first host frame is the
-first `adb emu screenshot` (polled every 0.1 s) that differs from the one taken at the reset. With
-the change that one is black; before it, it was the last boot's final frame. The `adb reboot` and
-exit rows show no cost from the change; their differences are within run-to-run noise.
+The reset rows come from `scripts/android-reset-bench.sh` with `EMU` set to each build (host
+load 6 to 10 on 16 cores). A hard reset is `echo b > /proc/sysrq-trigger` under `adb root`; the
+reset is the moment emu's `-verbose` log prints `stopped after …: Reset`; the first host frame is
+the first `adb emu screenshot` after it (polled every 0.1 s) that is neither the frame taken just
+before the reset nor all black. That is the next boot's first content, by the same test on both
+builds (before the change the screen kept the last boot's final frame until then, after it
+black). The `adb reboot` rows show a cost: a process's first reset is no slower (2.90 and 2.94 s
+to the first frame, against 2.93 to 3.00 s), but each later one is about 0.3 s later both to the
+first frame and to `sys.boot_completed`, so the delay is in the guest, not only in host frames.
+Its cause is not yet measured. These rows replace a first run whose first host frame was the
+first screenshot that differed from the one taken at the reset, a test that counted different
+frames on the two builds.
 
 The `--ignored` benches run on any host:
 

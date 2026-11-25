@@ -400,9 +400,12 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   guest's first command. Released at the reset instead, a shutdown destroyed contexts just
   before exit: the renderer's cleanup thread was then still destroying their Vulkan instances
   while `exit` ran its static destructors, and one stop in four ended in SIGSEGV. A reset first
-  gives the fences the guest still waits on up to 100 ms to signal (a late one could complete a
-  request of the next boot, whose fence ids start again at 1), and fences signalled after the
-  device stopped reach no one. Between a reset and the next boot's first post, host screenshots
+  gives the fences the guest still waits on up to 100 ms to signal, and fences signalled after the
+  device stopped reach no one. The renderer gets the device's fence ids, from a counter that
+  never restarts, not the guest's, which start again at 1 each boot: a fence of the last boot
+  that the renderer signals after the next one started (fence 4000 on context 1, ring 0) is
+  known by its id and completes nothing, where with the guest's ids it would have completed the
+  new boot's requests up to 4000 before their work was done. Between a reset and the next boot's first post, host screenshots
   and streams show black instead of the last boot's final frame; a Vulkan-only renderer's post
   notices are held until the renderer posts a buffer of the new boot (a color buffer's handle
   can be the guest's resource id, which every boot allocates alike, so creation of that id
