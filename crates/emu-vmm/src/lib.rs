@@ -7,6 +7,7 @@
 
 pub mod board;
 pub mod boot;
+pub mod bt;
 pub mod bus;
 pub mod devices;
 pub mod disk;

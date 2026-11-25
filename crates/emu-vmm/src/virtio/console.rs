@@ -5,11 +5,15 @@
 //! HAL's `modem`, the GNSS HAL's `gnss`, ...). Unnamed ports are console ports: the guest makes
 //! each one the next `/dev/hvcN` in port order (port 0 is `hvc0`; the next unnamed one `hvc1`,
 //! where the ranchu images' `goldfish-logcat` writes `logcat -f /dev/hvc1`, as on stock's board).
+//! A named port whose backend asks for it ([`PortBackend::console`]) is both: the guest publishes
+//! its name and makes it the next `hvcN` (stock's `uwb` port, which the UWB HAL opens as
+//! `/dev/hvc2`). The guest refuses to open a console port's `/dev/vportNpM`.
 //!
 //! Queues: port 0 rx/tx are 0/1, control rx/tx are 2/3, port n ≥ 1 uses 2n+2 / 2n+3. Control
 //! messages are `{ id: u32, event: u16, value: u16 }` plus a payload for PORT_NAME. Handshake:
-//! guest DEVICE_READY → host DEVICE_ADD per port → guest PORT_READY → host PORT_NAME (named
-//! ports) or CONSOLE_PORT (port 0), then PORT_OPEN(1) since the host end is always connected.
+//! guest DEVICE_READY → host DEVICE_ADD per port → guest PORT_READY → host CONSOLE_PORT (console
+//! ports) and PORT_NAME (named ports), in QEMU's order, then PORT_OPEN(1) since the host end is
+//! always connected.
 //! The guest reports its own opens with PORT_OPEN; data for a port the guest hasn't opened is
 //! held until it does (the driver would discard it).
 use std::collections::VecDeque;
@@ -42,6 +46,11 @@ pub trait PortBackend: Send {
     /// The guest opened (`true`) or closed the port; returns bytes to send once open.
     fn guest_open(&mut self, _open: bool) -> Vec<u8> {
         Vec::new()
+    }
+    /// For a named port: the guest should also make it a console port (`/dev/hvcN`), for a guest
+    /// program that opens the tty rather than `/dev/vportNpM`. Unnamed ports always are.
+    fn console(&self) -> bool {
+        false
     }
 }
 
@@ -343,9 +352,10 @@ impl Worker {
             }
             ctl::PORT_READY if value == 1 => {
                 let Some(p) = self.ports.get(id as usize) else { return };
-                if p.name.is_empty() {
+                if p.name.is_empty() || p.backend.console() {
                     self.ctl_out.push_back(ctl_msg(id, ctl::CONSOLE_PORT, 1, &[]));
-                } else {
+                }
+                if !p.name.is_empty() {
                     let name = p.name.clone();
                     self.ctl_out.push_back(ctl_msg(id, ctl::PORT_NAME, 1, name.as_bytes()));
                 }
@@ -721,6 +731,68 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(*logcat.0.lock().expect("buf"), b"11-23 19:35:00.000 I/ActivityManager: Start proc\n");
+    }
+
+    /// A backend that wants a tty in the guest (the UWB HAL's `/dev/hvc2`).
+    struct Tty;
+
+    impl PortBackend for Tty {
+        fn guest_data(&mut self, data: &[u8]) -> Vec<u8> {
+            data.to_vec()
+        }
+        fn console(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_named_port_can_be_a_console_port_too() {
+        // Stock's order: console (hvc0), logcat (hvc1), uwb (named, hvc2), bluetooth (named).
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x40_0000).expect("ram"));
+        let (mut dev, _host) = Console::new(vec![
+            PortSpec { name: String::new(), backend: Box::new(Sink) },
+            PortSpec { name: String::new(), backend: Box::new(Sink) },
+            PortSpec { name: "uwb".into(), backend: Box::new(Tty) },
+            PortSpec { name: "bluetooth".into(), backend: Box::new(Sink) },
+        ]);
+        let mut q: Vec<Driver> = (0..10).map(|i| Driver::at(RAM_BASE + 0x1000 + i * 0x2000, 16)).collect();
+        for b in 0..8u64 {
+            q[CTL_RX].push(&mem, &[(BUFS + b * 64, 64, true)]);
+        }
+        let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+        dev.activate(Activation { mem: mem.clone(), irq, queues: q.iter().map(|d| Some(d.cfg)).collect(), features: F_MULTIPORT })
+            .expect("activate");
+        let mut tx = RAM_BASE + 0x20_0000;
+        for port in [2, 3] {
+            mem.write(tx, &ctl_msg(port, ctl::PORT_READY, 1, &[])).expect("tx");
+            q[CTL_TX].push(&mem, &[(tx, 8, false)]);
+            tx += 0x100;
+            dev.notify(CTL_TX as u16);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while q[CTL_RX].used_idx(&mem) < 5 {
+            assert!(Instant::now() < deadline, "no reply to PORT_READY");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let got: Vec<Vec<u8>> = (0..5)
+            .map(|i| {
+                let (id, len) = q[CTL_RX].used(&mem, i);
+                let mut b = vec![0u8; len as usize];
+                mem.read(BUFS + u64::from(id) % 8 * 64, &mut b).expect("rx");
+                b
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ctl_msg(2, ctl::CONSOLE_PORT, 1, &[]),
+                ctl_msg(2, ctl::PORT_NAME, 1, b"uwb"),
+                ctl_msg(2, ctl::PORT_OPEN, 1, &[]),
+                ctl_msg(3, ctl::PORT_NAME, 1, b"bluetooth"),
+                ctl_msg(3, ctl::PORT_OPEN, 1, &[]),
+            ],
+            "uwb: console then name, as QEMU's virtconsole with a name; bluetooth: a plain named port"
+        );
     }
 
     /// A `Write` that blocks until the test opens its gate (a pipe nobody reads).

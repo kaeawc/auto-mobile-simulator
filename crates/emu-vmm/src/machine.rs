@@ -395,6 +395,15 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
             PortSpec { name: String::new(), backend: Box::new(Sink) },
             PortSpec { name: "modem".into(), backend: cfg.telephony.backend() },
             PortSpec { name: String::new(), backend: logcat },
+            // A named console port, so the guest's third console (hvc2), where the UWB HAL looks.
+            PortSpec { name: "uwb".into(), backend: Box::new(crate::bt::UwbPort::default()) },
+            // Stable per AVD: its disks' paths.
+            PortSpec {
+                name: "bluetooth".into(),
+                backend: Box::new(crate::bt::BluetoothPort::new(crate::bt::address_for(
+                    cfg.disks.iter().map(|d| d.path.as_os_str().as_encoded_bytes()).collect::<Vec<_>>().concat().as_slice(),
+                ))),
+            },
         ]);
         if let Some(h) = handles.get(1) {
             cfg.telephony.attach(h.clone());
