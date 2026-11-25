@@ -572,10 +572,24 @@ fn what_the_guest_sent_before_its_fin_reaches_a_slow_host() {
         }
         moved.elapsed() > Duration::from_millis(300)
     });
-    // The host takes a little: enough for the guest's queue and its FIN to reach the NAT, which
-    // acknowledges the FIN while still holding most of a buffer's worth for the host.
-    cmd.send(Cmd::Read(g.sock(h).send_queue() + 64 * 1024)).expect("server");
-    g.until("the guest's queue is sent", |g| g.sock(h).send_queue() == 0);
+    // The host takes a little at a time, never more than the NAT has acknowledged, until the
+    // guest's queue has reached the NAT. How much each read frees on the way depends on the host's
+    // socket buffers (Linux autotunes them), so read in steps rather than one guessed amount. The
+    // NAT then acknowledges the FIN while still holding data for the host.
+    let mut requested = 0;
+    g.until("the guest's queue is sent", |g| {
+        let s = g.sock(h);
+        if s.send_queue() == 0 {
+            return true;
+        }
+        let acked = sent - s.send_queue();
+        let step = (acked - requested.min(acked)).min(16 * 1024);
+        if step > 0 && requested + step <= acked {
+            requested += step;
+            cmd.send(Cmd::Read(step)).expect("server");
+        }
+        false
+    });
     g.sock(h).close();
     g.until("closed", |g| g.sock(h).state() == tcp::State::Closed);
     cmd.send(Cmd::ReadToEnd).expect("server");
