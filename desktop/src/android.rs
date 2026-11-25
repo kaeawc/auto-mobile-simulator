@@ -7,6 +7,8 @@
 //! While the window is hidden the frame stream pauses: the emulator is told to stop sending
 //! (`hello 0`, so it stops scaling frames for us too) and the frame thread reads nothing; shown
 //! again, it asks for frames and the emulator sends its newest at once.
+//! Switched away from, a screen pauses the same way and keeps its last frame in its `Pixels`;
+//! resumed, the window shows that frame at once and the emulator's newest replaces it.
 //! What the socket doesn't carry (typing with shift, rotation, the hinge, screenshots) goes over
 //! the console through `sim-android`, on the screen's console worker: a console session can take
 //! seconds on a busy emulator, and the window never waits for one.
@@ -46,7 +48,9 @@ pub struct Screen {
     link: Arc<Mutex<sim_android::display::Display>>,
     device: Arc<(AtomicU32, AtomicU32)>,
     alive: Arc<AtomicBool>,
-    console: Worker<Lookup>,
+    /// None while paused: dropping the worker drops its queued jobs, and the one running posts
+    /// nothing, so a device that isn't shown never reports.
+    console: Option<Worker<Lookup>>,
     /// The last job queued on `console`, when it is a stroke job: strokes typed behind it join
     /// it (one console session) instead of queueing a session each.
     tail: Mutex<Option<QueuedStrokes>>,
@@ -141,7 +145,22 @@ impl Screen {
             .map_err(|e| e.to_string())?;
         let tail = Mutex::new(None);
         let link = Arc::new(Mutex::new(display));
-        Ok(Screen { udid: udid.to_owned(), avd_dir, pixels, link, device, alive, console, tail, max_width, shown, read })
+        Ok(Screen { udid: udid.to_owned(), avd_dir, pixels, link, device, alive, console: Some(console), tail, max_width, shown, read })
+    }
+
+    /// Switched away from: stops the stream as a hidden window does and drops the console work
+    /// still queued. The last frame stays in `pixels`, the connection and frame thread stay up.
+    pub fn pause(&mut self) {
+        self.set_visible(false);
+        self.console = None;
+        *lock(&self.tail) = None;
+    }
+
+    /// Shown again: console work goes to `console`, and while the window is `visible` the
+    /// emulator sends its newest frame at once (the last one shows until it lands).
+    pub fn resume(&mut self, console: Worker<Lookup>, visible: bool) {
+        self.console = Some(console);
+        self.set_visible(visible);
     }
 
     /// Pauses the frame stream while the window is hidden (minimised, or covered where the
@@ -164,7 +183,7 @@ impl Screen {
         let mut tail = lock(&self.tail);
         // Strokes typed after this job go behind it, not into a stroke job ahead of it.
         *tail = None;
-        self.console.run(move |find: &Lookup| job(&find()?))
+        self.console.as_ref().is_some_and(|c| c.run(move |find: &Lookup| job(&find()?)))
     }
 
     /// Types key strokes: as display socket taps when it can carry them and no console work is
@@ -173,8 +192,9 @@ impl Screen {
     /// one queued session, not one per key).
     pub fn strokes(&self, strokes: Vec<KeyStroke>) {
         let mut tail = lock(&self.tail);
+        let Some(console) = &self.console else { return };
         if let Some(keys) = display_keys(&strokes)
-            && self.console.idle()
+            && console.idle()
         {
             drop(tail);
             keys.into_iter().for_each(|k| self.send(&Input::Key(k)));
@@ -191,7 +211,7 @@ impl Screen {
         strokes.truncate(STROKE_LIMIT);
         let queued: QueuedStrokes = Arc::new(Mutex::new(Some(strokes)));
         let job = queued.clone();
-        if self.console.run(move |find: &Lookup| {
+        if console.run(move |find: &Lookup| {
             // Taken (and the lock let go) before the session: typing joins a later job meanwhile.
             let strokes = lock(&job).take();
             match strokes {
@@ -322,7 +342,7 @@ mod tests {
 
     fn wait_idle(screen: &Screen) {
         let start = Instant::now();
-        while !screen.console.idle() {
+        while !screen.console.as_ref().is_none_or(Worker::idle) {
             assert!(start.elapsed() < Duration::from_secs(5), "console idle");
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -425,7 +445,7 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(5), "console jobs ran");
             std::thread::sleep(Duration::from_millis(2));
         }
-        while !screen.console.idle() {
+        while !screen.console.as_ref().is_none_or(Worker::idle) {
             assert!(start.elapsed() < Duration::from_secs(5), "console idle");
             std::thread::sleep(Duration::from_millis(2));
         }

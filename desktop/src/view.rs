@@ -14,8 +14,11 @@ const GREEN: Color = Color { r: 0.20, g: 0.78, b: 0.45, a: 1.0 };
 const GREY: Color = Color { r: 0.55, g: 0.55, b: 0.58, a: 1.0 };
 const AMBER: Color = Color { r: 0.95, g: 0.70, b: 0.25, a: 1.0 };
 
+/// The window is always drawn in the dark theme.
+const DARK: bool = true;
+
 pub fn view(s: &State, _: &mut Cx<State>) -> El {
-    let t = tok::theme(true);
+    let t = tok::theme(DARK);
     let mut root = row().w_full().h_full().fill(t.bg).child(sidebar(s, t)).child(stage(s, t));
     if s.showing_screen() {
         root = root.child(match s.selected_info().map(|d| d.platform) {
@@ -29,8 +32,8 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
 /// A toolbar button: an icon (labelled for accessibility), with visible text only for the primary
 /// action, which also gets the accent fill.
 fn button(key: &str, glyph: &'static Icon, label: &str, action: Action, primary: bool, t: Theme) -> El {
-    let b = crate::debug::icon_button(key, glyph, label, primary || key == "refresh-button", t, move |s: &mut State| {
-        s.actions.push(action.clone())
+    let b = crate::debug::icon_button(key, glyph, label, primary || key == "refresh-button", t, move |s: &mut State, tx: &mut Tx| {
+        crate::queue(s, tx, action.clone())
     });
     if primary { b.fill(tok::accent(0, true)) } else { b }
 }
@@ -61,28 +64,47 @@ fn sidebar(s: &State, t: Theme) -> El {
             list = list.child(text(short).font(type_::SECTION).color(t.text_secondary).px(8.0).padding(4.0));
         }
         let selected = s.selected.as_deref() == Some(d.udid.as_str());
+        let highlight = selection(t, DARK);
         let color = match d.state {
             DeviceState::Booted => GREEN,
             DeviceState::Booting | DeviceState::ShuttingDown | DeviceState::Creating => AMBER,
             _ => GREY,
         };
         let udid = d.udid.clone();
+        let mut badge = platform_badge(d, t).key(format!("device-{i}-platform"));
+        if selected {
+            // The secondary colour is too faint on the tint.
+            badge = badge.color(t.text);
+        }
+        // The bar's slot is there on every row, so names line up whichever is selected.
+        let bar =
+            el().key(format!("device-{i}-bar")).w(3.0).h(16.0).radius(1.5).fill(if selected { highlight.bar } else { Color::TRANSPARENT });
         let mut item = row()
             .key(format!("device-{i}"))
             .role("button")
             .label(format!("{}, {}", d.name, d.label()))
+            .focus_selected(selected)
             .w_full()
             .h(30.0)
-            .px(8.0)
-            .gap(8.0)
             .center_y()
             .radius(radius::SM)
-            .on_press(move |s: &mut State| s.actions.push(Action::Select(udid.clone())))
-            .child(el().size(8.0, 8.0).radius(4.0).fill(color))
-            .child(text(d.name.clone()).font(type_::BODY).color(t.text).grow(1.0).truncate())
-            .child(platform_badge(d, t).key(format!("device-{i}-platform")));
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| crate::queue(s, tx, Action::Select(udid.clone())))
+            .child(bar)
+            .child(
+                row()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .h_full()
+                    .pl(5.0)
+                    .pr(8.0)
+                    .gap(8.0)
+                    .center_y()
+                    .child(el().size(8.0, 8.0).radius(4.0).fill(color))
+                    .child(text(d.name.clone()).font(type_::BODY).color(t.text).grow(1.0).truncate())
+                    .child(badge),
+            );
         if selected {
-            item = item.fill(t.card);
+            item = item.fill(highlight.fill);
         }
         list = list.child(item);
     }
@@ -104,6 +126,22 @@ fn sidebar(s: &State, t: Theme) -> El {
             t,
         )))
         .child(list.scroll(ScrollSpec { stick_bottom: false }).shrink().min_h(0.0))
+}
+
+/// How the selected device's row is drawn.
+pub struct Selection {
+    /// The row: the sidebar tinted toward the accent, under the primary text colour.
+    pub fill: Color,
+    /// A bar at the row's leading edge in the accent, which stands out from the sidebar on its
+    /// own (the tint alone would be too faint at 3:1 without washing out the text).
+    pub bar: Color,
+}
+
+/// The selected row's colours for theme `t` (`dark` or light). The text on the tint and the bar
+/// against the sidebar meet WCAG's 4.5:1 and 3:1 in both (a test checks).
+pub fn selection(t: Theme, dark: bool) -> Selection {
+    let accent = tok::accent(0, dark);
+    Selection { fill: t.card.mix(accent, if dark { 0.24 } else { 0.14 }), bar: accent }
 }
 
 /// The device's sub-platform (`iPadOS`, `watchOS`, `Wear OS`), else its platform.
@@ -174,7 +212,7 @@ fn screen(s: &State) -> El {
     };
     let device = device
         .focusable(true)
-        .on_drag(|s: &mut State, d: &mut Drag, _: &mut Tx| {
+        .on_drag(|s: &mut State, d: &mut Drag, tx: &mut Tx| {
             let (w, h) = s.screen_size();
             let to_device = |x: f32, y: f32| (x / d.w.max(1.0) * w as f32, y / d.h.max(1.0) * h as f32);
             let (x, y) = to_device(d.x, d.y);
@@ -184,12 +222,14 @@ fn screen(s: &State) -> El {
                 Phase::Up if d.cancelled() => Input::Up(x, y),
                 Phase::Up => Input::Up(x, y),
             });
+            crate::request_poll(tx);
         })
-        .on_key(|s: &mut State, k: &KeyEvent, _: &mut Tx| {
+        .on_key(|s: &mut State, k: &KeyEvent, tx: &mut Tx| {
             let action = crate::keys::map(k);
             let handled = action != crate::keys::KeyAction::Ignore;
             if handled {
                 s.inputs.push(Input::Key(action));
+                crate::request_poll(tx);
             }
             handled
         });
