@@ -201,7 +201,11 @@ fn dry_run(env: &emu_avd::Env, name: &str, opts: &args::Opts) -> Result<ExitCode
     for path in &missing {
         eprintln!("emu: missing {}", path.display());
     }
-    Ok(if missing.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+    let unsupported = instance::unsupported(&avd).filter(|_| !instance::allow_old_images());
+    if let Some(why) = &unsupported {
+        eprintln!("emu: {why}");
+    }
+    Ok(if missing.is_empty() && unsupported.is_none() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -221,6 +225,13 @@ fn boot(
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    // Before anything is created or started: refusing takes milliseconds, and the error is the
+    // last line front ends show (`emu exited … before booting: <line>`).
+    if !instance::allow_old_images()
+        && let Some(why) = instance::unsupported(&env.load(name)?)
+    {
+        anyhow::bail!(why);
+    }
     if opts.verbose && !opts.ignored.is_empty() {
         eprintln!("emu: accepted but not implemented yet: {}", opts.ignored.join(" "));
     }

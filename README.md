@@ -89,6 +89,9 @@ Unsupported combinations are refused with the reason. The matrix and its gaps:
   snapshots.
 - Automotive and Android XR images have their devices implemented but have not been booted.
 - iOS microphone injection still needs a loopback audio device.
+- Android system images below API 34 are refused with the reason: API 29 and 30 need goldfish
+  pipes emu doesn't serve ([#38](https://github.com/kaeawc/simee/issues/38)), API 31 to 33 a
+  graphics fix ([#39](https://github.com/kaeawc/simee/issues/39)).
 - Android guests have a network link but no internet yet ([#36](https://github.com/kaeawc/simee/issues/36)).
 
 ## Documentation

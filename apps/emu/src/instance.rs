@@ -230,7 +230,9 @@ impl Instance {
             }
         }
         let mut initrd = std::fs::read(&plan.ramdisk).with_context(|| format!("reading {}", plan.ramdisk.display()))?;
-        initrd.extend_from_slice(&plan.bootconfig.encode());
+        if !plan.bootconfig.entries().is_empty() {
+            initrd.extend_from_slice(&plan.bootconfig.encode());
+        }
         let log = self.console_log.try_clone().context("console.log")?;
         let console: Box<dyn Write + Send> = if opts.show_kernel { Box::new(Tee(std::io::stdout(), log)) } else { Box::new(log) };
         let logcat = self.logcat.clone();
@@ -494,7 +496,18 @@ impl BootPlan {
             touchpad: avd.touchpad(),
             dual_mode_mouse: xr && avd.image_feature("VirtioDualModeMouse").unwrap_or(true),
         };
-        plan.bootconfig = bootconfig(avd, opts, plan.renderer.is_some());
+        let bc = bootconfig(avd, opts, plan.renderer.is_some());
+        if takes_bootconfig(avd) {
+            plan.bootconfig = bc;
+        } else {
+            // API 30 and older: kernels without bootconfig (4.14, android11-5.4) take a bootconfig
+            // block after the ramdisk as junk, fall back to an initrd and panic ("Unable to mount
+            // root fs on unknown-block(0,0)"). Stock passes these images everything on the
+            // command line instead, under the older names.
+            plan.cmdline = plan.cmdline.replace(" bootconfig", "");
+            plan.cmdline.push(' ');
+            plan.cmdline.push_str(&legacy_cmdline(&bc, plan.renderer.is_some()));
+        }
         plan
     }
 
@@ -644,6 +657,68 @@ fn bootconfig(avd: &Avd, opts: &Opts, graphics: bool) -> BootConfig {
     bc
 }
 
+/// Whether the image's kernel reads bootconfig: images say so with `AndroidbootProps2` (every
+/// image from API 31 on), and stock passes bootconfig only then. An image that says nothing and
+/// isn't known to be older (no `advancedFeatures.ini`, or no API level) is taken as new.
+fn takes_bootconfig(avd: &Avd) -> bool {
+    avd.image_feature("AndroidbootProps2") == Some(true) || avd.api_level().is_none_or(|api| api >= 31)
+}
+
+/// Why emu can't run this AVD's image yet, if it can't: system images below API 34 boot their
+/// kernel and init but never get graphics, so a boot would only loop. emu refuses them up front
+/// with the reason; `EMU_ALLOW_OLD_IMAGES=1` boots them anyway, for work on the issues named.
+pub fn unsupported(avd: &Avd) -> Option<String> {
+    let api = avd.api_level()?;
+    let why = match api {
+        ..=30 => {
+            "its graphics, modem and logcat use goldfish pipes emu doesn't serve yet (`opengles`, `qemud:gsm`; https://github.com/kaeawc/simee/issues/38)"
+        }
+        31..=33 => {
+            "its address-space graphics ring is a guest-backed 3D resource the renderer can't map yet (https://github.com/kaeawc/simee/issues/39)"
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "{}: API {api} images don't run on emu yet: {why}. emu runs API 34 and newer; create the AVD from a newer image (`emu -provision 36`), or boot this one with the SDK's emulator",
+        avd.name
+    ))
+}
+
+/// Whether `EMU_ALLOW_OLD_IMAGES` lets an unsupported image boot anyway.
+pub fn allow_old_images() -> bool {
+    std::env::var("EMU_ALLOW_OLD_IMAGES").is_ok_and(|v| v == "1")
+}
+
+/// The kernel command line stock gives images without `AndroidbootProps2` (API 30 and older,
+/// whose kernels lack bootconfig), from the same entries: `androidboot.qemu.*` as `qemu.*`, the
+/// few properties bootconfig renamed back to their `qemu.*` names, the rest as they are. Init
+/// splits the command line on spaces without quoting, so a value with a space (the adb key) is
+/// left out; those images' adbd doesn't read it. ANGLE isn't on these images: GLES is the
+/// image's own `emulation` driver (`qemu.gles=1`).
+fn legacy_cmdline(bc: &BootConfig, graphics: bool) -> String {
+    let mut out = vec!["android.qemud=1".to_string(), "qemu.encrypt=1".to_string()];
+    if graphics {
+        out.push("qemu.gles=1".to_string());
+    }
+    for (k, v) in bc.entries() {
+        if v.contains(char::is_whitespace) || k == "androidboot.hardwareegl" {
+            continue;
+        }
+        let key = match k.as_str() {
+            "androidboot.qemu" => "qemu".to_string(),
+            "androidboot.dalvik.vm.heapsize" => "qemu.dalvik.vm.heapsize".to_string(),
+            "androidboot.opengles.version" => "qemu.opengles.version".to_string(),
+            "androidboot.hardware.gltransport" => "qemu.gltransport".to_string(),
+            _ => match k.strip_prefix("androidboot.qemu.") {
+                Some(rest) => format!("qemu.{rest}"),
+                None => k.clone(),
+            },
+        };
+        out.push(format!("{key}={v}"));
+    }
+    out.join(" ")
+}
+
 /// What the stock host hands `qemu-props` at boot.
 fn boot_props(avd: &Avd) -> Vec<(String, String)> {
     let mut props = avd.qemu_props();
@@ -710,6 +785,83 @@ mod tests {
             env.create_avd(&NewAvd::for_image(name, &format!("system-images/{dir}"))).expect("create");
         }
         Sdk { root, env }
+    }
+
+    /// Adds an image of `api` (with `features` as its `advancedFeatures.ini`) and an AVD on it.
+    fn add_image(s: &Sdk, name: &str, api: u32, features: &str) {
+        let rel = format!("system-images/android-{api}/default/arm64-v8a");
+        let d = s.root.join("sdk").join(&rel);
+        std::fs::create_dir_all(&d).expect("image dir");
+        for f in ["kernel-ranchu", "ramdisk.img", "system.img", "vendor.img"] {
+            std::fs::write(d.join(f), b"x").expect("image file");
+        }
+        std::fs::write(d.join("source.properties"), format!("AndroidVersion.ApiLevel={api}\n")).expect("source.properties");
+        std::fs::write(d.join("advancedFeatures.ini"), features).expect("features");
+        s.env.create_avd(&NewAvd::for_image(name, &rel)).expect("create");
+    }
+
+    #[test]
+    fn images_without_bootconfig_get_stocks_legacy_command_line() {
+        let s = sdk("legacy");
+        add_image(&s, "q", 29, "GLAsyncSwap = on\n");
+        add_image(&s, "s", 33, "AndroidbootProps2 = on\n");
+
+        // The 4.14 kernel would take a bootconfig block after the ramdisk as junk and panic.
+        let q = plan(&s, "q");
+        assert!(q.bootconfig.entries().is_empty(), "{:?}", q.bootconfig.entries());
+        let words: Vec<&str> = q.cmdline.split(' ').collect();
+        assert!(!words.contains(&"bootconfig"), "{}", q.cmdline);
+        // As the stock emulator passes them to the same API 29 image.
+        for w in [
+            "android.qemud=1",
+            "qemu.encrypt=1",
+            "androidboot.hardware=ranchu",
+            "androidboot.boot_devices=a003600.virtio_mmio",
+            "qemu=1",
+            "qemu.avd_name=q",
+            "qemu.dalvik.vm.heapsize=576m",
+            "qemu.opengles.version=196609",
+            "qemu.vsync=60",
+            "qemu.settings.system.screen_off_timeout=2147483647",
+        ] {
+            assert!(words.contains(&w), "{w} missing from {}", q.cmdline);
+        }
+        assert!(!q.cmdline.contains("androidboot.qemu"), "{}", q.cmdline);
+
+        let new = plan(&s, "s");
+        assert_eq!(new.bootconfig.get("androidboot.qemu.avd_name"), Some("s"));
+        assert!(new.cmdline.split(' ').any(|w| w == "bootconfig") && !new.cmdline.contains("qemu.avd_name"), "{}", new.cmdline);
+        let phone = plan(&s, "phone");
+        assert_eq!(phone.bootconfig.get("androidboot.hardware"), Some("ranchu"), "no API level or flag: taken as new");
+    }
+
+    #[test]
+    fn legacy_command_line_renames_graphics_and_drops_what_init_cannot_split() {
+        let mut bc = BootConfig::new();
+        bc.set("androidboot.hardware.gltransport", "virtio-gpu-asg")
+            .set("androidboot.hardwareegl", "angle")
+            .set("androidboot.qemu.adb.pubkey", "QAAAAB== user@host")
+            .set("androidboot.vbmeta.size", "4352");
+        let line = legacy_cmdline(&bc, true);
+        assert_eq!(line, "android.qemud=1 qemu.encrypt=1 qemu.gles=1 qemu.gltransport=virtio-gpu-asg androidboot.vbmeta.size=4352");
+        assert!(!legacy_cmdline(&bc, false).contains("qemu.gles"));
+    }
+
+    #[test]
+    fn images_below_api_34_are_refused_with_the_reason() {
+        let s = sdk("old");
+        add_image(&s, "q", 29, "");
+        add_image(&s, "r", 30, "");
+        add_image(&s, "s", 31, "AndroidbootProps2 = on\n");
+        add_image(&s, "t", 33, "AndroidbootProps2 = on\n");
+        add_image(&s, "u", 34, "AndroidbootProps2 = on\n");
+        let why = |n: &str| unsupported(&s.env.load(n).expect("load"));
+        for (n, api, issue) in [("q", 29, "issues/38"), ("r", 30, "issues/38"), ("s", 31, "issues/39"), ("t", 33, "issues/39")] {
+            let w = why(n).unwrap_or_default();
+            assert!(w.starts_with(&format!("{n}: API {api} images")) && w.contains(issue) && w.contains("API 34 and newer"), "{w}");
+        }
+        assert_eq!(why("u"), None);
+        assert_eq!(why("phone"), None, "no API level: not refused");
     }
 
     fn plan(s: &Sdk, name: &str) -> BootPlan {
