@@ -17,6 +17,7 @@ pub mod pixels;
 pub mod platform;
 pub mod reuse;
 pub mod stream;
+pub mod stylus;
 pub mod vhal;
 pub mod worker;
 pub mod xr;

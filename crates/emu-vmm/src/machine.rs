@@ -523,7 +523,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     if let Some((w, h)) = cfg.input {
         use virtio::input::{Input, Kind};
         let th = cfg.touch_screen.then(|| {
-            let (touch, th) = Input::new(Kind::Touch { width: w, height: h }, "virtio_input_multi_touch_1");
+            let (touch, th) = Input::new(Kind::Touch { width: w, height: h, pen: true }, "virtio_input_multi_touch_1");
             slots[slots::TOUCH as usize] = Some(Box::new(touch));
             th
         });
@@ -537,7 +537,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
             mh
         });
         let touchpad = cfg.touchpad.map(|(tw, th)| {
-            let (pad, ph) = Input::new(Kind::Touch { width: tw, height: th }, virtio::input::TOUCHPAD_NAME);
+            let (pad, ph) = Input::new(Kind::Touch { width: tw, height: th, pen: false }, virtio::input::TOUCHPAD_NAME);
             slots[slots::TOUCHPAD as usize] = Some(Box::new(pad));
             ph
         });
