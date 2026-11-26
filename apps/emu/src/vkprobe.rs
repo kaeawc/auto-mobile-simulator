@@ -50,14 +50,13 @@ fn probe_and_record(lib64: &Path, cache: Option<PathBuf>) -> bool {
 /// it) are in emu's shader cache before the first boot: the probe's init (a GL backend, as API 31
 /// to 35 guests get), then, when MoltenVK works, an API 36 guest's (no GL, Vulkan composition),
 /// which compiles about another 0.9 s the probe's doesn't. Records the MoltenVK verdict too.
-/// Returns whether Vulkan came up and how long the children took.
-pub fn warm(lib64: &Path) -> (bool, std::time::Duration) {
+/// Returns whether Vulkan came up, whether the API 36 init ran to the end (false when Vulkan
+/// didn't come up or that child failed), and how long the children took.
+pub fn warm(lib64: &Path) -> (bool, bool, std::time::Duration) {
     let t = std::time::Instant::now();
     let ok = probe_and_record(lib64, cache_file(lib64));
-    if ok {
-        child("-warm-renderer", lib64);
-    }
-    (ok, t.elapsed())
+    let warmed = ok && child("-warm-renderer", lib64);
+    (ok, warmed, t.elapsed())
 }
 
 /// Child side of [`warm`]: the renderer's init exactly as an API 36 boot on MoltenVK makes it.

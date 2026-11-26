@@ -273,6 +273,7 @@ are what a fresh checkout, a CI cache miss or a Rune bump pays.
 
 Claims that would belong in the README once someone runs them:
 
+- Whether a farm's guest shaders, which share emu's per-bundle Metal cache (`dev.simee.emu`), push ANGLE's shader library out of it, so renderer init goes cold again on a busy farm.
 - First boot of a fresh install with and without `emu -provision-renderer`'s renderer warm-up,
   launch to `sys.boot_completed` on a quiet host (only the renderer init itself is measured,
   at load 180 to 210), and a third round of the repeat-boot A/B's after arm.

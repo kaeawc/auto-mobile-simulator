@@ -501,9 +501,11 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   one path shares it, and other processes can't rotate it out. And `emu -provision-renderer`
   (and `-provision`) end by initializing the renderer in two children, the probe's GL-backed
   init and an API 36 boot's own (`emu_vmm::warm_renderer`), so the first boot of a fresh install
-  finds the cache warm (0.9 s for both when warm): a fresh copy's boot-shaped init took 0.78,
-  1.00 and 0.78 s after `-provision-renderer` from its path, against 5.42 s for the first fresh
-  copy without (`-warm-renderer` timed, host load 180 to 210, so slow throughout). Still cold
+  finds the cache warm (0.9 s for both when warm). Whether that pays on a fresh install isn't
+  established yet: a fresh copy's boot-shaped init took 0.78, 1.00 and 0.78 s after
+  `-provision-renderer` from its path, against 5.42, 0.83 and 0.73 s without (`-warm-renderer`
+  timed, host load 180 to 210), a win in only one of three rounds; the quiet-host rerun is under
+  "Not yet measured" in [benchmarks](benchmarks.md). Still cold
   once, sometimes: the first launch from a new path without provisioning there, and, not yet seen, likely the first after a macOS update
   (the cache's subdirectories look keyed by compiler and GPU: `32024`, `16777235_419`).
   KosmicKrisp wasn't measured.

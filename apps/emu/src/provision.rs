@@ -143,9 +143,14 @@ fn renderer(sdk: &Sdk, opts: &Opts, update: bool) -> Result<()> {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn warm_renderer(root: &std::path::Path) {
     let Some(lib64) = renderer::find_lib64(root) else { return };
-    let (ok, took) = crate::vkprobe::warm(&lib64);
-    let vulkan = if ok { "" } else { "; MoltenVK didn't come up, so boots use lavapipe (software Vulkan)" };
-    println!("renderer initialized in {:.1} s, its Metal shaders now cached{vulkan}", took.as_secs_f64());
+    let (ok, warmed, took) = crate::vkprobe::warm(&lib64);
+    if !ok {
+        println!("renderer probed in {:.1} s; MoltenVK didn't come up, so boots use lavapipe (software Vulkan)", took.as_secs_f64());
+    } else if warmed {
+        println!("renderer initialized in {:.1} s, its Metal shaders now cached", took.as_secs_f64());
+    } else {
+        eprintln!("emu: warming the renderer failed after {:.1} s; the first boot compiles its shaders instead", took.as_secs_f64());
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
