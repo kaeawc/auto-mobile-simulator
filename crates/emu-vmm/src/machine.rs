@@ -32,6 +32,10 @@ pub struct GpuSpec {
     /// The guest's GLES is ANGLE on its Vulkan, so the renderer can run without a GL backend
     /// (see `init_renderer`).
     pub vulkan_only: bool,
+    /// Offer a graphics queue family with more than one queue (gfxstream's VulkanVirtualQueue),
+    /// which HWUI on Vulkan asserts: for ANGLE guests on images that advertise the feature (the
+    /// ones emu gives `skiavk`).
+    pub virtual_queue: bool,
 }
 
 static RENDERER: std::sync::OnceLock<Arc<emu_gfxstream::Renderer>> = std::sync::OnceLock::new();
@@ -100,6 +104,20 @@ fn settle_renderer() {
     }
 }
 
+/// The renderer features emu turns on (see [`init_renderer`]), with VulkanVirtualQueue when
+/// `virtual_queue` ([`GpuSpec::virtual_queue`]), then `extra` overrides.
+fn renderer_features(virtual_queue: bool, extra: Option<&str>) -> String {
+    let mut features = String::from("RefCountPipe:enabled,GlDirectMem:enabled,HasSharedSlotsHostMemoryAllocator:enabled");
+    if virtual_queue {
+        features.push_str(",VulkanVirtualQueue:enabled");
+    }
+    if let Some(extra) = extra {
+        features.push(',');
+        features.push_str(extra);
+    }
+    features
+}
+
 fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     let r = emu_gfxstream::Renderer::load(&spec.lib64).context("loading the gfxstream renderer")?;
     let gl_composition = std::env::var_os("EMU_GL_COMPOSITION").is_some();
@@ -125,12 +143,11 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     // - CPU reads of color buffers (screencap, software readers) by DMA into shared-slot host
     //   memory (`ANDROID_EMU_read_color_buffer_dma` = GlDirectMem + shared slots), resolved
     //   through the DMA translator `run` installs.
+    // - for images that advertise it, a graphics queue family with more than one queue
+    //   (VulkanVirtualQueue): HWUI on Vulkan (`skiavk`, what those guests draw their UI with on
+    //   ANGLE) asserts it and aborts without.
     // EMU_RENDERER_FEATURES adds overrides, e.g. "HostComposition:disabled".
-    let mut features = String::from("RefCountPipe:enabled,GlDirectMem:enabled,HasSharedSlotsHostMemoryAllocator:enabled");
-    if let Ok(extra) = std::env::var("EMU_RENDERER_FEATURES") {
-        features.push(',');
-        features.push_str(&extra);
-    }
+    let features = renderer_features(spec.virtual_queue, std::env::var("EMU_RENDERER_FEATURES").ok().as_deref());
     // Without GL there's no post callback: fences drive the post notices instead.
     let ticker = vulkan_only
         .then(|| crate::display::PostTicker::start(spec.display.clone(), spec.width, spec.height, POST_NOTICE_INTERVAL, POST_NOTICE_TAIL));
@@ -655,6 +672,7 @@ mod tests {
             verbose: true,
             display: Arc::new(crate::display::FrameStore::default()),
             vulkan_only: false,
+            virtual_queue: false,
         }
     }
 
@@ -690,6 +708,22 @@ mod tests {
         let other = Blanks::default();
         hold_then_blank(&other, None);
         assert_eq!(*other.held_at_blank.lock().unwrap_or_else(PoisonError::into_inner), [false]);
+    }
+
+    #[test]
+    fn the_renderer_offers_the_queues_hwui_on_vulkan_needs_only_to_images_that_take_them() {
+        let has = |f: &str, want: &str| f.split(',').any(|x| x == want);
+        let f = renderer_features(true, None);
+        for want in
+            ["RefCountPipe:enabled", "GlDirectMem:enabled", "HasSharedSlotsHostMemoryAllocator:enabled", "VulkanVirtualQueue:enabled"]
+        {
+            assert!(has(&f, want), "{want} missing from {f}");
+        }
+        // An image that doesn't advertise it, or a guest on the GLES encoder: one queue.
+        let one = renderer_features(false, None);
+        assert!(has(&one, "RefCountPipe:enabled") && !one.contains("VulkanVirtualQueue"), "{one}");
+        // Overrides come last, so they win.
+        assert!(renderer_features(true, Some("VulkanVirtualQueue:disabled")).ends_with(",VulkanVirtualQueue:disabled"));
     }
 
     /// Serializes the tests that use the process-wide `RUNNING` slot.

@@ -9,8 +9,8 @@
 //!
 //! Handlers only queue [`Action`]s and [`Input`]s; `poll` performs them. That keeps handlers pure,
 //! so the headless tests drive the real view without a device. Rune runs `poll` at the start of a
-//! frame, before that frame's handlers, so a handler that queues work also asks for the next frame
-//! ([`queue`], [`request_poll`]); otherwise the work would wait for the next input or timer.
+//! frame and again after that frame's handlers, so what a handler queues is performed in the same
+//! frame without asking for a wake.
 //!
 //! Switching away from an Android device pauses its stream and keeps its screen (and last frame)
 //! for a while; switching back shows that frame at once and resumes the stream.
@@ -142,17 +142,6 @@ struct Paused {
 /// Paused Android screens kept at most. Each holds its display connection, a parked frame thread
 /// and its last frame (about 10 MB for a 1080x2400 phone); the oldest goes first.
 const PAUSED_LIMIT: usize = 4;
-
-/// Asks for a frame now, so `poll` performs what a handler just queued.
-pub fn request_poll(tx: &mut Tx) {
-    tx.wake_after(Duration::ZERO);
-}
-
-/// Queues `action` for `poll` and asks for the frame that performs it.
-pub fn queue(s: &mut State, tx: &mut Tx, action: Action) {
-    s.actions.push(action);
-    request_poll(tx);
-}
 
 impl State {
     pub fn selected_info(&self) -> Option<&DeviceInfo> {
@@ -726,7 +715,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             Input::Key(KeyAction::Lock) => press_button(s, Button::Lock, t, tx),
             Input::Key(KeyAction::Screenshot) => {
                 s.actions.push(Action::Screenshot);
-                tx.wake_after(Duration::ZERO);
+                tx.request_poll();
             }
             Input::Key(KeyAction::Strokes(strokes)) if s.screen.is_some() => {
                 if let Some(sc) = &s.screen {
@@ -1166,30 +1155,34 @@ mod tests {
         }
     }
 
-    /// `poll` runs at the start of a frame, before that frame's handlers: a handler that queues
-    /// work asks for the next frame, so the work starts at once instead of on the next input.
+    /// Rune polls again after a frame's handlers (rune#2391): what a press, a touch or a keystroke
+    /// queues is performed in the frame that handled it, with no wake asked for, so the window
+    /// sleeps again at once.
     #[test]
-    fn handlers_that_queue_work_ask_for_a_poll() {
-        let mut rt = runtime(demo);
+    fn work_a_handler_queues_is_performed_in_its_frame() {
+        let mut rt = polled_runtime(demo);
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.wake_deadline(), None, "a still window sleeps");
+        let before = rt.state.selected.clone();
         for key in ["device-1", "home-button", "overlay-blended-layers", "tab-network", "debug-reload"] {
             press(&mut rt, key);
-            assert!(rt.wake_deadline().is_some(), "{key} asks for a poll");
-            rt.frame(1.0 / 60.0);
-            assert_eq!(rt.wake_deadline(), None, "{key}: one poll, then the window sleeps again");
+            assert!(rt.state.actions.is_empty(), "{key}: performed in its frame");
+            assert_eq!(rt.wake_deadline(), None, "{key}: no wake, the window sleeps");
         }
-        let mut rt = runtime(demo);
+        assert!(rt.state.selected.is_some() && rt.state.selected != before, "device-1 was selected in its frame");
         let ([x, y, w, h], _) = rt.presented("device-screen").expect("screen drawn");
         rt.pointer_down(x + w * 0.5, y + h * 0.5);
         rt.frame(1.0 / 60.0);
-        assert!(rt.wake_deadline().is_some(), "a touch asks for a poll");
+        assert!(rt.state.inputs.is_empty(), "a touch is performed in its frame: {:?}", rt.state.inputs);
+        assert_eq!(rt.wake_deadline(), None, "a touch asks for no wake");
         rt.pointer_up(x + w * 0.5, y + h * 0.5);
-        rt.frame(1.0 / 60.0);
         rt.frame(1.0 / 60.0);
         rt.key(KeyEvent::from(Key::Text("a".into())));
         rt.frame(1.0 / 60.0);
-        assert!(rt.wake_deadline().is_some(), "a keystroke asks for a poll");
+        assert!(rt.state.inputs.is_empty(), "a keystroke is performed in its frame: {:?}", rt.state.inputs);
+        assert_eq!(rt.wake_deadline(), None, "a keystroke asks for no wake");
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.wake_deadline(), None, "a still window still sleeps");
     }
 
     /// A fake worker finishing queued work wakes the window, and the poll that wakes it shows
@@ -1260,7 +1253,7 @@ mod tests {
             // Away to a device that isn't running, and back.
             for udid in ["pixel_fold", "pixel_9"] {
                 rt.state.console_log = vec![format!("{udid}'s predecessor's log")];
-                rt.update(|s, tx| queue(s, tx, Action::Select(udid.into())));
+                rt.update(|s, _| s.actions.push(Action::Select(udid.into())));
                 rt.frame(1.0 / 60.0);
                 assert!(rt.state.console_log.is_empty(), "{udid}: {:?}", rt.state.console_log);
                 if udid == "pixel_fold" {

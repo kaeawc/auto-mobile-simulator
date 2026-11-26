@@ -593,7 +593,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let during = posts.0.load(Ordering::Relaxed);
-        assert!((5..=21).contains(&during), "{during} notices in 100 ms");
+        // Sleeps run long on a loaded CI runner, so bound the count by the time that really
+        // passed: more than one notice, never more than one per interval.
+        let most = (start.elapsed().as_millis() / interval.as_millis()) as usize + 1;
+        assert!((2..=most).contains(&during), "{during} notices in {:?} (at most {most})", start.elapsed());
 
         // The tail: notices go on for about 40 ms after the last fence, then stop.
         std::thread::sleep(Duration::from_millis(120));

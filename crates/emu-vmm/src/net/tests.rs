@@ -470,10 +470,14 @@ fn a_datagram_reaches_the_guest_whole_or_not_at_all_and_none_wait_forever() {
     let blast = std::thread::spawn(move || {
         let mut b = [0u8; 16];
         let (_, from) = server.recv_from(&mut b).expect("go");
+        // Paced, so the NAT's thread moves datagrams from the host socket into the guest's queue
+        // as they come: Linux's default UDP receive buffer holds only about 15 of these, and an
+        // unpaced burst would be dropped by the kernel before the NAT saw it.
         for i in 0..COUNT {
             let mut d = vec![i as u8; SIZE];
             d[..4].copy_from_slice(&i.to_be_bytes());
             server.send_to(&d, from).expect("send");
+            std::thread::sleep(Duration::from_millis(2));
         }
     });
     let mut n = nat(Config::default());
