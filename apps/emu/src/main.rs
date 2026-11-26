@@ -244,18 +244,26 @@ fn real_main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if opts.accel_check {
-        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            println!("accel:\n0\nHypervisor.framework (arm64) is usable\naccel");
-            return Ok(ExitCode::SUCCESS);
-        }
-        println!("accel:\n1\nsimee needs Hypervisor.framework on an Apple silicon Mac\naccel");
-        return Ok(ExitCode::FAILURE);
+        let (ok, what) = accel_check();
+        println!("accel:\n{}\n{what}\naccel", if ok { 0 } else { 1 });
+        return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
     }
     let name = opts.avd.clone().context("no AVD given (use -avd NAME, or -list-avds)")?;
     if opts.dry_run {
         return dry_run(&env, &name, &opts);
     }
     boot(&env, &name, &opts, signals, launched)
+}
+
+/// `-accel-check`: whether this host can boot a guest, and what runs it or what's missing (stock
+/// prints the same `accel:` block).
+fn accel_check() -> (bool, String) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    return (true, "Hypervisor.framework (arm64) is usable".into());
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    return software::accel_check();
+    #[cfg(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))))]
+    (false, "simee needs Hypervisor.framework on an Apple silicon Mac, or software mode on x86_64 Linux".into())
 }
 
 /// `-avd NAME -dry-run`: prints the boot plan without booting (on any host), and fails if the
