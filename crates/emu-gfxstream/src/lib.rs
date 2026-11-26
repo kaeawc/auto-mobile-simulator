@@ -56,9 +56,21 @@ pub mod flags {
     pub const USE_EGL: u64 = 1 << 0;
     pub const USE_GLES: u64 = 1 << 4;
     pub const USE_VK: u64 = 1 << 5;
+    /// Host-visible blobs allocated so they can be exported as fds ([`Renderer::export_blob`]):
+    /// what a frontend in another process needs to map them into its guest.
+    pub const USE_EXTERNAL_BLOB: u64 = 1 << 6;
+    /// Host-visible blobs from system memory (shm) rather than the Vulkan driver.
+    pub const USE_SYSTEM_BLOB: u64 = 1 << 7;
     /// Vulkan composition and posting. On macOS the GL post worker hands work to an
     /// emulator-UI-thread hook that standalone hosts don't service (compose never completes).
     pub const VULKAN_NATIVE_SWAPCHAIN: u64 = 1 << 8;
+}
+
+/// `stream_renderer_handle.handle_type` of an exported blob.
+pub mod handle {
+    pub const MEM_OPAQUE_FD: u32 = 0x1;
+    pub const MEM_DMABUF: u32 = 0x2;
+    pub const MEM_SHM: u32 = 0x4;
 }
 
 pub const FENCE_FLAG: u32 = 1 << 0;
@@ -130,6 +142,13 @@ struct CreateBlob {
 }
 
 #[repr(C)]
+#[derive(Default)]
+struct Handle {
+    os_handle: i64,
+    handle_type: u32,
+}
+
+#[repr(C)]
 struct Debug {
     debug_type: u32,
     message: *const c_char,
@@ -157,6 +176,7 @@ struct Api {
     resource_map: unsafe extern "C" fn(u32, *mut *mut c_void, *mut u64) -> c_int,
     resource_unmap: unsafe extern "C" fn(u32) -> c_int,
     resource_map_info: unsafe extern "C" fn(u32, *mut u32) -> c_int,
+    export_blob: unsafe extern "C" fn(u32, *mut Handle) -> c_int,
     create_fence: unsafe extern "C" fn(*const Fence) -> c_int,
     suspend: unsafe extern "C" fn() -> c_int,
     snapshot: unsafe extern "C" fn(*const c_char) -> c_int,
@@ -229,6 +249,7 @@ impl Api {
             resource_map: sym!(h, "stream_renderer_resource_map"),
             resource_unmap: sym!(h, "stream_renderer_resource_unmap"),
             resource_map_info: sym!(h, "stream_renderer_resource_map_info"),
+            export_blob: sym!(h, "stream_renderer_export_blob"),
             create_fence: sym!(h, "stream_renderer_create_fence"),
             suspend: sym!(h, "stream_renderer_suspend"),
             snapshot: sym!(h, "stream_renderer_snapshot"),
@@ -677,6 +698,26 @@ impl Renderer {
     pub fn unmap(&self, res: u32) -> Result<()> {
         // SAFETY: plain call.
         ok("resource_unmap", unsafe { (self.api.resource_unmap)(res) })
+    }
+
+    /// A host-visible blob's memory as a file descriptor of the given [`handle`] type, for
+    /// another process to map (a vhost-user frontend's `SHMEM_MAP`). Needs the renderer
+    /// initialized with [`flags::USE_EXTERNAL_BLOB`] or [`flags::USE_SYSTEM_BLOB`]. The renderer
+    /// hands over the blob's own descriptor and keeps none (gfxstream's
+    /// `VirtioGpuResource::ExportBlob` releases it), so a blob exports once: keep the fd for as
+    /// long as the blob may be mapped again.
+    pub fn export_blob(&self, res: u32) -> Result<(std::os::fd::OwnedFd, u32)> {
+        use std::os::fd::FromRawFd;
+        let mut h = Handle::default();
+        // SAFETY: out-pointer references a live local.
+        ok("export_blob", unsafe { (self.api.export_blob)(res, &mut h) })?;
+        let fd = std::os::fd::RawFd::try_from(h.os_handle).map_err(|_| Error::Call("export_blob: handle", -22))?;
+        if fd < 0 {
+            return Err(Error::Call("export_blob: no fd", -9));
+        }
+        // SAFETY: the renderer releases the blob's descriptor to us (it keeps no copy), so this
+        // is its only owner from here on.
+        Ok((unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }, h.handle_type))
     }
 
     pub fn map_info(&self, res: u32) -> u32 {

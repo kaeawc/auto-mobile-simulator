@@ -226,16 +226,38 @@ The numbers are in [benchmarks.md](benchmarks.md#android-software-mode-linux-wit
   zygote restarts every 5 s, and the sensors HAL has no `qemud:sensors`. emu keeps the devices,
   console, adb bridge, display socket and frame ring, and serves them to QEMU over vhost-user
   (the virtio devices; QEMU 11's `SHMEM_MAP` lets a backend map GPU blobs into the guest) and
-  vfio-user (goldfish address space, a plain PCI device). Goldfish pipe is an ACPI/DT platform
-  device that neither protocol carries; whether gralloc runs without its `refcount` pipe (the
-  renderer's `RefCountPipe` off) is the open question. The vhost-user backend is
+  vfio-user (goldfish address space, a plain PCI device). The vhost-user backend is
   `crates/emu-vmm/src/vhost_user.rs`: QEMU's guest RAM is a shared memfd
   (`-object memory-backend-memfd,share=on`) that emu maps once (`GuestRam::map_shared`), rings are
   translated through the memory table, kicks and calls are eventfds, and a raise calls only the
   queues whose used ring moved. vsock runs on it: the guest's adbd and qemud pipes reach emu's
   adb bridge and pipe services (`examples/vhost_user_vsock.rs`), with bulk transfers faster than
   QEMU's own user network and round trips level with it
-  ([benchmarks](benchmarks.md#android-software-mode-linux-without-kvm)).
+  ([benchmarks](benchmarks.md#android-software-mode-linux-without-kvm)). The console, net and GPU
+  go through QEMU's generic `vhost-user-test-device-pci` (virtio id, queue count, config size),
+  so QEMU needs no code per device (`examples/soft_devices.rs` serves the set and prints the QEMU
+  arguments).
+- **GPU: emu's virtio-gpu over vhost-user.** The renderer runs Vulkan-only with exportable blobs
+  (`USE_EXTERNAL_BLOB`); a host-visible blob the guest maps is exported once as an fd (gfxstream
+  hands its own descriptor over, so emu keeps it for later maps) and QEMU maps it into the GPU's
+  shared-memory BAR on `SHMEM_MAP` (the device's `ShmWindow`; on Apple silicon the same device
+  maps host pages into the VM). With external blobs the renderer refuses
+  `stream_renderer_resource_map`, so a mapping's size is the blob's from `RESOURCE_CREATE_BLOB`.
+  Mapped blobs then show up in every vhost-user device's memory table as further fds: guest RAM is
+  the fd that maps guest-physical 0. SurfaceFlinger's RenderEngine initializes Vulkan on it (132 ms
+  in the guest) and frames reach emu.
+- **Goldfish address space over vfio-user** (`crates/emu-vmm/src/vfio_user.rs`): the ranchu
+  mapper aborts without it ("GoldfishAddressSpaceHostMemoryAllocator failed to open"). emu serves
+  its config space and registers by message, and its 16 GiB area as a sparse memfd QEMU maps into
+  the guest; the device model is emu's own, built once the guest has placed BAR1.
+- **Open: the goldfish pipe.** `libqemupipe.ranchu.so` opens `opengles`, `GLProcessPipe` and
+  `refcount` on `/dev/goldfish_pipe_dprctd` and falls back to vsock only when that open fails
+  with `EAGAIN` (its other pipes go to vsock port 5000 first). Without the device the allocator
+  can't open `refcount`, the composer gets no swapchain and SurfaceFlinger aborts ("Can't create
+  AidlComposerClient"); SELinux isn't the cause (the vendor policy allows the allocator vsock, and
+  permissive changes nothing). On x86 the pipe driver binds only by ACPI (`GFSH0003`) or DT, so
+  it needs an ACPI device whose registers QEMU forwards to emu; the plan is a vfio-user PCI
+  function carrying them and an SSDT whose `_CRS` reads that function's BAR and interrupt line.
 - **Rendering: gfxstream on lavapipe**, from the SDK's Linux `emulator` package, whose `lib64`
   carries `libgfxstream_backend.so` and its own lavapipe (238 MB without the Qt UI).
 
