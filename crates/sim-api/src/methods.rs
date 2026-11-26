@@ -598,7 +598,7 @@ mod tests {
         assert_eq!(err, missing);
         let err = call(&mut s, "boot_many", &json!({"devices": [udid, "phone"]})).expect_err("mixed");
         assert_eq!(err, missing);
-        assert_eq!(call(&mut s, "fold", &json!({"device": udid, "posture": "closed"})).expect_err("no such device"), missing);
+        assert_eq!(call(&mut s, "xr", &json!({"device": udid})).expect_err("no such device"), missing);
         assert_eq!(call(&mut s, "console", &json!({"device": udid})).expect_err("no such device"), missing);
         std::fs::remove_dir_all(root).ok();
     }
