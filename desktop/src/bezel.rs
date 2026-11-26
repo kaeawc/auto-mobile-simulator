@@ -105,21 +105,24 @@ impl Bezel {
             let (call, outbox, pending) = (self.call, self.outbox.clone(), self.pending.clone());
             let spawned = std::thread::Builder::new().name("simee-bezel".into()).spawn(move || {
                 let mut session = Session::default();
-                // How far behind the window the gesture in progress runs.
-                let mut lag = std::time::Duration::ZERO;
+                // The previous sample of the gesture in progress: when it was made and when it
+                // went out. Each sample goes out no sooner than its gap after the previous one,
+                // so a slow first call (the connect) or a late wake-up of this thread shifts the
+                // rest of the gesture later instead of squeezing it into a burst (a fling).
+                let mut prev: Option<(Instant, Instant)> = None;
                 for sample in rx {
-                    let now = Instant::now();
-                    let due = sample.at + lag;
-                    if sample.phase != Phase::Down && due > now {
-                        std::thread::sleep(due - now);
+                    if let (Some((made, sent)), false) = (prev, sample.phase == Phase::Down) {
+                        let due = sent + sample.at.saturating_duration_since(made);
+                        let now = Instant::now();
+                        if due > now {
+                            std::thread::sleep(due - now);
+                        }
                     }
+                    let sent = Instant::now();
                     if let Err(e) = call(&mut session, "touch", &sample.params) {
                         outbox.post(format!("edge swipe: {e}"));
                     }
-                    if sample.phase == Phase::Down {
-                        // A slow first call (the connect) delays the whole gesture by as much.
-                        lag = Instant::now().saturating_duration_since(sample.at);
-                    }
+                    prev = (sample.phase != Phase::Up).then_some((sample.at, sent));
                     pending.fetch_sub(1, Ordering::Release);
                 }
             });

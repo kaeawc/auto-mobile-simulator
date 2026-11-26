@@ -36,6 +36,11 @@ pub struct GpuSpec {
     /// which HWUI on Vulkan asserts: for ANGLE guests on images that advertise the feature (the
     /// ones emu gives `skiavk`).
     pub virtual_queue: bool,
+    /// The guest's GLES encoder talks over the goldfish `opengles` pipe (API 29 and 30 images,
+    /// `qemu.gltransport=pipe`): the board has no virtio-gpu (those kernels' driver oopses on
+    /// it, and stock gives them none), each pipe gets a render channel of its own, and the
+    /// renderer offers none of the virtio-gpu-only extensions.
+    pub pipe_gles: bool,
 }
 
 static RENDERER: std::sync::OnceLock<Arc<emu_gfxstream::Renderer>> = std::sync::OnceLock::new();
@@ -126,11 +131,24 @@ fn settle_renderer() {
 }
 
 /// The renderer features emu turns on (see [`init_renderer`]), with VulkanVirtualQueue when
-/// `virtual_queue` ([`GpuSpec::virtual_queue`]), then `extra` overrides.
-fn renderer_features(virtual_queue: bool, extra: Option<&str>) -> String {
-    let mut features = String::from("RefCountPipe:enabled,GlDirectMem:enabled,HasSharedSlotsHostMemoryAllocator:enabled");
+/// `virtual_queue` ([`GpuSpec::virtual_queue`]), without the virtio-gpu extensions for a
+/// [`GpuSpec::pipe_gles`] guest, then `extra` overrides.
+fn renderer_features(virtual_queue: bool, pipe_gles: bool, extra: Option<&str>) -> String {
+    let mut features = String::from("RefCountPipe:enabled,GlDirectMem:enabled");
     if virtual_queue {
         features.push_str(",VulkanVirtualQueue:enabled");
+    }
+    if pipe_gles {
+        // Advertised, these send the guest's gralloc to virtio-gpu blobs
+        // (`ANDROID_EMU_virtio_gpu_next`) and its EGL to virtio-gpu fences
+        // (`ANDROID_EMU_virtio_gpu_native_sync`), and a pipe guest has no virtio-gpu.
+        features.push_str(",VirtioGpuNext:disabled,VirtioGpuNativeSync:disabled");
+    } else {
+        // API 29's gralloc takes shared slots for its DMA color buffer updates and fails on
+        // large ones ("lockAndWriteDma: ERROR: No DMA context bound!"), leaving system_server
+        // drawing into buffers that never post until the watchdog kills it. Stock doesn't
+        // offer shared slots to these images either; their CPU reads go through the pipe.
+        features.push_str(",HasSharedSlotsHostMemoryAllocator:enabled");
     }
     if let Some(extra) = extra {
         features.push(',');
@@ -168,7 +186,7 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     //   (VulkanVirtualQueue): HWUI on Vulkan (`skiavk`, what those guests draw their UI with on
     //   ANGLE) asserts it and aborts without.
     // EMU_RENDERER_FEATURES adds overrides, e.g. "HostComposition:disabled".
-    let features = renderer_features(spec.virtual_queue, std::env::var("EMU_RENDERER_FEATURES").ok().as_deref());
+    let features = renderer_features(spec.virtual_queue, spec.pipe_gles, std::env::var("EMU_RENDERER_FEATURES").ok().as_deref());
     // Without GL there's no post callback: fences drive the post notices instead.
     let ticker = vulkan_only
         .then(|| crate::display::PostTicker::start(spec.display.clone(), spec.width, spec.height, POST_NOTICE_INTERVAL, POST_NOTICE_TAIL));
@@ -571,15 +589,17 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
             Ok(()) => dma_renderer = Some(r.clone()),
             Err(e) => eprintln!("emu: renderer DMA hooks unavailable ({e}); guest CPU reads of color buffers will fail"),
         }
-        let gpu = virtio::gpu::Gpu::new(virtio::gpu::GpuConfig {
-            width: spec.width,
-            height: spec.height,
-            renderer: r,
-            shm: (GPU_SHM_BASE, GPU_SHM_SIZE),
-            display: spec.display.clone(),
-            verbose: spec.verbose,
-        });
-        slots[slots::GPU as usize] = Some(Box::new(gpu));
+        if !spec.pipe_gles {
+            let gpu = virtio::gpu::Gpu::new(virtio::gpu::GpuConfig {
+                width: spec.width,
+                height: spec.height,
+                renderer: r,
+                shm: (GPU_SHM_BASE, GPU_SHM_SIZE),
+                display: spec.display.clone(),
+                verbose: spec.verbose,
+            });
+            slots[slots::GPU as usize] = Some(Box::new(gpu));
+        }
     }
     if let Some((w, h)) = cfg.input {
         use virtio::input::{Input, Kind};
@@ -632,7 +652,17 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         }
         registry.register("multidisplay", Box::new(pipe::misc::Silent("multidisplay")));
         registry.register("qemud:camera", Box::new(pipe::fingerprint::CameraService));
-        registry.register("GLProcessPipe", Box::new(devices::goldfish_pipe::GlProcess::default()));
+        // The GLES encoder's pipes on API 29–30 images, each to a render channel of its own.
+        let gl_backend = cfg
+            .gpu
+            .as_ref()
+            .filter(|s| s.pipe_gles)
+            .and(gpu_renderer.clone())
+            .map(|r| Arc::new(GlPipes::new(r)) as Arc<dyn pipe::opengles::GlBackend>);
+        if let Some(backend) = &gl_backend {
+            registry.register("opengles", Box::new(pipe::opengles::OpenglesService { backend: backend.clone() }));
+        }
+        registry.register("GLProcessPipe", Box::new(devices::goldfish_pipe::GlProcess::with_backend(gl_backend)));
         // API 30 and older: the reference RIL's modem and `logcat -Q`'s stream, which newer
         // images carry on virtio-console ports.
         registry.register("qemud:gsm", Box::new(pipe::gsm::GsmService { telephony: cfg.telephony.clone() }));
@@ -733,6 +763,81 @@ fn next_post_hold(verbose: bool) -> Option<(Arc<crate::display::PostTicker>, cra
 
 /// Holds the ticker's notices, then blanks: in the other order a notice between the two would
 /// have readers read the last boot's post back over the black frame.
+/// The renderer as the `opengles` and `GLProcessPipe` pipes use it. Process cleanups run on a
+/// thread of their own (they free a dead process's GL objects, and may wait on its render
+/// threads), never on the pipe device's.
+struct GlPipes {
+    renderer: Arc<emu_gfxstream::Renderer>,
+    dead: Mutex<Option<std::sync::mpsc::Sender<u64>>>,
+}
+
+impl GlPipes {
+    fn new(renderer: Arc<emu_gfxstream::Renderer>) -> GlPipes {
+        GlPipes { renderer, dead: Mutex::new(None) }
+    }
+}
+
+struct Channel(emu_gfxstream::RenderChannel);
+
+impl pipe::opengles::GlChannel for Channel {
+    fn try_write(&self, data: &[u8]) -> pipe::opengles::GlWrite {
+        match self.0.try_write(data) {
+            emu_gfxstream::ChannelWrite::Done => pipe::opengles::GlWrite::Done,
+            emu_gfxstream::ChannelWrite::Full => pipe::opengles::GlWrite::Full,
+            emu_gfxstream::ChannelWrite::Stopped => pipe::opengles::GlWrite::Stopped,
+        }
+    }
+    fn wait_writable(&self) {
+        self.0.wait_writable();
+    }
+    fn read(&self, timeout: Duration, out: &mut Vec<u8>) -> pipe::opengles::GlRead {
+        match self.0.read(timeout, out) {
+            emu_gfxstream::ChannelRead::Data(_) => pipe::opengles::GlRead::Data,
+            emu_gfxstream::ChannelRead::Timeout => pipe::opengles::GlRead::Timeout,
+            emu_gfxstream::ChannelRead::Closed => pipe::opengles::GlRead::Closed,
+        }
+    }
+    fn stop(&self) {
+        self.0.stop();
+    }
+}
+
+impl pipe::opengles::GlBackend for GlPipes {
+    fn open(&self) -> Option<Arc<dyn pipe::opengles::GlChannel>> {
+        match self.renderer.open_channel() {
+            Ok(c) => Some(Arc::new(Channel(c))),
+            Err(e) => {
+                eprintln!("emu: opengles pipe: {e}");
+                None
+            }
+        }
+    }
+
+    fn process_created(&self, puid: u64) {
+        if let Err(e) = self.renderer.graphics_process_created(puid) {
+            eprintln!("emu: GL process {puid}: {e}");
+        }
+    }
+
+    fn process_dead(&self, puid: u64) {
+        let mut dead = self.dead.lock().unwrap_or_else(PoisonError::into_inner);
+        if dead.as_ref().is_none_or(|tx| tx.send(puid).is_err()) {
+            let (tx, rx) = std::sync::mpsc::channel::<u64>();
+            let r = self.renderer.clone();
+            let started = std::thread::Builder::new().name("gl-process-cleanup".into()).spawn(move || {
+                for puid in rx {
+                    if let Err(e) = r.graphics_process_dead(puid) {
+                        eprintln!("emu: GL process {puid} cleanup: {e}");
+                    }
+                }
+            });
+            if started.is_ok() && tx.send(puid).is_ok() {
+                *dead = Some(tx);
+            }
+        }
+    }
+}
+
 fn hold_then_blank(display: &dyn crate::display::DisplaySink, hold: Option<(&crate::display::PostTicker, crate::display::Hold)>) {
     if let Some((ticker, until)) = hold {
         ticker.hold_until(until);
@@ -763,6 +868,7 @@ mod tests {
             display: Arc::new(crate::display::FrameStore::default()),
             vulkan_only: false,
             virtual_queue: false,
+            pipe_gles: false,
         }
     }
 
@@ -803,17 +909,27 @@ mod tests {
     #[test]
     fn the_renderer_offers_the_queues_hwui_on_vulkan_needs_only_to_images_that_take_them() {
         let has = |f: &str, want: &str| f.split(',').any(|x| x == want);
-        let f = renderer_features(true, None);
+        let f = renderer_features(true, false, None);
         for want in
             ["RefCountPipe:enabled", "GlDirectMem:enabled", "HasSharedSlotsHostMemoryAllocator:enabled", "VulkanVirtualQueue:enabled"]
         {
             assert!(has(&f, want), "{want} missing from {f}");
         }
         // An image that doesn't advertise it, or a guest on the GLES encoder: one queue.
-        let one = renderer_features(false, None);
+        let one = renderer_features(false, false, None);
         assert!(has(&one, "RefCountPipe:enabled") && !one.contains("VulkanVirtualQueue"), "{one}");
         // Overrides come last, so they win.
-        assert!(renderer_features(true, Some("VulkanVirtualQueue:disabled")).ends_with(",VulkanVirtualQueue:disabled"));
+        assert!(renderer_features(true, false, Some("VulkanVirtualQueue:disabled")).ends_with(",VulkanVirtualQueue:disabled"));
+    }
+
+    #[test]
+    fn pipe_guests_get_no_virtio_gpu_extensions() {
+        let has = |f: &str, want: &str| f.split(',').any(|x| x == want);
+        let pipe = renderer_features(false, true, None);
+        assert!(has(&pipe, "VirtioGpuNext:disabled") && has(&pipe, "VirtioGpuNativeSync:disabled"), "{pipe}");
+        assert!(has(&pipe, "RefCountPipe:enabled") && has(&pipe, "GlDirectMem:enabled"), "{pipe}");
+        assert!(!pipe.contains("HasSharedSlots"), "no shared slots for API 29-30 gralloc: {pipe}");
+        assert!(!renderer_features(false, false, None).contains("VirtioGpu"), "virtio-gpu guests keep the defaults");
     }
 
     /// Serializes the tests that use the process-wide `RUNNING` slot.

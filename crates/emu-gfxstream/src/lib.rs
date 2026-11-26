@@ -8,10 +8,16 @@
 // `sym!` transmutes dlsym results to the type of the struct field it initializes.
 #![allow(clippy::missing_transmute_annotations)]
 
+// The opengles pipe's channel reads the renderer's Mach-O code to size its objects.
+#[cfg(target_os = "macos")]
+mod channel;
 #[cfg(target_os = "linux")]
 mod elf;
 #[cfg(target_os = "macos")]
 mod macho;
+
+#[cfg(target_os = "macos")]
+pub use channel::{ChannelRead, ChannelWrite, RenderChannel};
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, c_char, c_int, c_void};
@@ -31,6 +37,8 @@ pub enum Error {
     Call(&'static str, i32),
     #[error("the gfxstream renderer is already initialized in this process")]
     AlreadyInitialized,
+    #[error("unavailable in this renderer: {0}")]
+    Unavailable(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
