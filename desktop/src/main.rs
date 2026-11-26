@@ -866,9 +866,10 @@ fn fit_window(size: (u32, u32), form_factor: Option<FormFactor>, bezel: bool) ->
     const CHROME_W: f32 = 240.0 + 32.0 + 340.0;
     let aspect = size.0 as f32 / size.1.max(1) as f32;
     let full_w = android::SCREEN_POINTS * aspect;
-    let screen_w = if form_factor == Some(FormFactor::Tablet) { full_w.min(MAX_WINDOW_W - CHROME_W) } else { full_w };
-    let screen_h = screen_w / aspect;
     let band = if bezel { 2.0 * bezel::BAND } else { 0.0 };
+    // A landscape tablet keeps its laptop-sized window: the band comes out of the screen there.
+    let screen_w = if form_factor == Some(FormFactor::Tablet) { full_w.min(MAX_WINDOW_W - CHROME_W - band) } else { full_w };
+    let screen_h = screen_w / aspect;
     (CHROME_W + (screen_w + band).max(420.0), screen_h + band + 110.0)
 }
 
@@ -1644,15 +1645,16 @@ mod tests {
     }
 
     /// A device with a bezel has a band of stage around its screen: the window budgets it, so
-    /// the screen is drawn as tall (and a landscape tablet as wide) as it was before the bezel.
+    /// the screen is drawn as tall as it was before the bezel; a landscape tablet keeps its
+    /// laptop-sized window instead, its screen narrower by the band.
     #[test]
     fn the_fitted_window_budgets_the_bezel_band() {
         let band = 2.0 * bezel::BAND;
         let phone = fit_window((720, 1280), Some(FormFactor::Phone), true);
         assert_eq!(phone, (612.0 + android::SCREEN_POINTS * 0.5625 + band, android::SCREEN_POINTS + 110.0 + band));
         let tablet = fit_window((2560, 1600), Some(FormFactor::Tablet), true);
-        assert_eq!(tablet.0, MAX_WINDOW_W + band, "the screen keeps its 828 points");
-        assert_eq!(tablet.1, (MAX_WINDOW_W - 612.0) / 1.6 + 110.0 + band);
+        assert_eq!(tablet.0, MAX_WINDOW_W, "a landscape tablet stays within the laptop cap");
+        assert_eq!(tablet.1, (MAX_WINDOW_W - 612.0 - band) / 1.6 + 110.0 + band);
         // No bezel, no band: a TV is the window it had.
         assert_eq!(
             fit_window((1920, 1080), Some(FormFactor::Tv), false),
