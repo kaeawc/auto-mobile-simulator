@@ -122,8 +122,9 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   gestures, orientations and the Purple orientation message), `carplay.rs` (StarkConfig, runtime
   gate), `goldfish.rs` (stock emulator key names, the `qwerty2` key set, sensor masks), `xr.rs`
   (Android XR commands and the `xr_service` messages), `vhal.rs` (the vehicle HAL's
-  `EmulatorMessage` codec, property names and values), BGRA→RGBA conversion, `Frame` and PNG
-  encoding. No FFI.
+  `EmulatorMessage` codec, property names and values), `network.rs` (the stock console's
+  `network speed|delay` presets, parsing and `network status` report), BGRA→RGBA conversion,
+  `Frame` and PNG encoding. No FFI.
 - `crates/sim-coresim` — the service boundary: `Context` (service + device set), `Device`
   (lifecycle, apps, settings, orientation, CarPlay), `Display` (framebuffer surface, capture; main
   or external), `Hid` (touch, buttons, keyboard, the Digital Crown, watch gestures, the Siri

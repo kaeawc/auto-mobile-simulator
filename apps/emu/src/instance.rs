@@ -265,7 +265,11 @@ impl Instance {
             battery: self.battery.clone(),
             telephony: self.telephony.clone(),
             car: self.car.clone(),
-            sound: plan.sound,
+            sound: plan.sound.then_some(emu_vmm::audio::Options {
+                output: !opts.no_audio,
+                input: opts.allow_host_audio && !opts.no_audio,
+                verbose: opts.verbose,
+            }),
             on_guest_event: {
                 let started = std::time::Instant::now();
                 Some(std::sync::Arc::new(move |event: &str| {
@@ -438,7 +442,7 @@ pub struct BootPlan {
     pub screen: (u32, u32, u32),
     /// The gfxstream renderer's `lib64`; None boots without graphics.
     pub renderer: Option<PathBuf>,
-    /// A silent virtio-snd card.
+    /// The virtio-snd card (ALSA card 0).
     pub sound: bool,
     /// `qemud:xr_service`.
     pub xr: bool,
@@ -490,7 +494,7 @@ impl BootPlan {
             ram_bytes: opts.memory_mb.map_or_else(|| avd.ram_bytes(), |mb| mb << 20),
             screen: avd.lcd(),
             renderer,
-            sound: sound(xr, car),
+            sound: sound(xr, car, avd.image_feature("VirtioSndCard").unwrap_or(false)),
             xr,
             car,
             sensor_mask: avd.sensor_mask(),
@@ -552,7 +556,7 @@ impl BootPlan {
             out.push("virtio-gpu (gfxstream), goldfish address space");
         }
         if self.sound {
-            out.push("virtio-snd (silent)");
+            out.push("virtio-snd");
         }
         out.push("goldfish battery, PL011, PL031");
         out.extend(["qemud:sensors", "qemud:gps", "qemud:fingerprintlisten", "qemud:camera", "qemud:boot-properties", "clipboard"]);
@@ -602,15 +606,15 @@ impl std::fmt::Display for BootPlan {
     }
 }
 
-/// A silent virtio-snd card for images whose audio HAL needs ALSA card 0: Automotive
-/// (`audio.primary.caremu` crashes without one) and Android XR (its images enable `VirtioSndCard`).
-/// `EMU_VIRTIO_SND=1` or `0` forces it on or off for any image. `-no-audio` leaves it alone:
-/// the card never plays on the host anyway.
-fn sound(xr: bool, car: bool) -> bool {
+/// The virtio-snd card, as stock adds it: for images that enable `VirtioSndCard` (phone, Wear,
+/// TV, XR from API 34; their ranchu audio HAL plays through ALSA card 0), and always for
+/// Automotive (`audio.primary.caremu` crashes without card 0) and XR. `EMU_VIRTIO_SND=1` or `0`
+/// forces it on or off for any image. `-no-audio` keeps the card (as stock does) but silent.
+fn sound(xr: bool, car: bool, feature: bool) -> bool {
     match std::env::var("EMU_VIRTIO_SND").as_deref() {
         Ok("1" | "on" | "yes") => true,
         Ok("0" | "off" | "no") => false,
-        _ => car || xr,
+        _ => car || xr || feature,
     }
 }
 
@@ -1090,9 +1094,9 @@ mod tests {
     fn each_form_factor_gets_its_devices() {
         let s = sdk("devices");
         let shape = |p: &BootPlan| (p.touch_screen, p.touchpad, p.dual_mode_mouse, p.xr, p.car, p.sound);
-        assert_eq!(shape(&plan(&s, "phone")), (true, None, false, false, false, false));
-        assert_eq!(shape(&plan(&s, "watch")), (true, None, false, false, false, false));
-        assert_eq!(shape(&plan(&s, "tv")), (false, None, false, false, false, false), "no touch screen");
+        assert_eq!(shape(&plan(&s, "phone")), (true, None, false, false, false, true), "the image enables VirtioSndCard");
+        assert_eq!(shape(&plan(&s, "watch")), (true, None, false, false, false, true));
+        assert_eq!(shape(&plan(&s, "tv")), (false, None, false, false, false, true), "no touch screen");
         assert_eq!(shape(&plan(&s, "car")), (true, None, false, false, true, true), "the VHAL and a sound card");
         assert_eq!(shape(&plan(&s, "headset")), (true, None, true, true, false, true));
         assert_eq!(shape(&plan(&s, "glasses")), (true, Some((1542, 297)), false, true, false, true), "a touchpad, no mouse");

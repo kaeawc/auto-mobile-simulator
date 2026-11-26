@@ -34,12 +34,13 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("delete", "device", "Delete a device"),
     (
         "boot",
-        "device, timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, settle_foreground?, settle_timeout_s?, profile?(slim)",
+        "device, timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, settle_foreground?, settle_timeout_s?, profile?(slim); \
+         Android: audio?(false)",
         "Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; settle also waits \
          up to settle_timeout_s (600) until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s \
          (settle_foreground: counting only foreground-QoS CPU) and returns the timings with cpu_pct, foreground_cpu_pct and \
          background_cpu_pct, settled false if it ran out of time; profile turns off a named set of daemons; Android: starts emu and \
-         waits for sys.boot_completed)",
+         waits for sys.boot_completed, silent unless audio, which plays the device on the host's default output)",
     ),
     (
         "boot_many",
@@ -654,6 +655,10 @@ mod tests {
         assert!(err.starts_with("`boot` takes `settle` for iOS devices only"), "{err}");
         let err = call(&mut s, "boot", &json!({"device": "pixel", "profile": "slim"})).expect_err("iOS-only parameter");
         assert!(err.starts_with("`boot` takes `profile` for iOS devices only"), "{err}");
+        let err = call(&mut s, "boot", &json!({"device": "pixel", "audio": "yes"})).expect_err("not a boolean");
+        assert!(err.starts_with("`audio` must be true or false"), "{err}");
+        let boot = METHODS.iter().find(|m| m.0 == "boot").expect("boot");
+        assert!(boot.1.contains("Android: audio?(false)"), "{}", boot.1);
         std::fs::remove_dir_all(root).ok();
     }
 

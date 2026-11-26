@@ -12,7 +12,8 @@ use sim_core::hid::Direction;
 use sim_core::xr::XrCommand;
 
 use crate::params::{
-    button, need_str, opt_u64, png_result, reading_json, str_param, swipe_samples, tap_samples, touch_sample, vehicle_area, vehicle_value,
+    button, need_str, opt_bool, opt_u64, png_result, reading_json, str_param, swipe_samples, tap_samples, touch_sample, vehicle_area,
+    vehicle_value,
 };
 
 /// The SDK and AVD home, read from the environment on first use.
@@ -118,7 +119,9 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
         "delete" => null(android.delete(&d)),
         "boot" => {
             reject_ios_boot_params(method, p)?;
-            null(d.boot(&android, Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300))))
+            // Silent unless asked: a tool or farm booting N devices would open N host streams.
+            let audio = opt_bool(p, "audio")?.unwrap_or(false);
+            null(d.boot(&android, Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)), audio))
         }
         "clone" => {
             if d.running.is_some() {
@@ -162,7 +165,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             let running = d
                 .running
                 .as_ref()
-                .map(|r| json!({"serial": r.serial(), "console_port": r.console_port, "adb_port": r.adb_port, "pid": r.pid}));
+                .map(|r| json!({"serial": r.serial(), "console_port": r.console_port, "adb_port": r.adb_port, "pid": r.pid, "emulator": r.emulator()}));
             Ok(json!({
                 "device": d.info,
                 "avd_dir": avd.map(|a| a.dir.display().to_string()),
