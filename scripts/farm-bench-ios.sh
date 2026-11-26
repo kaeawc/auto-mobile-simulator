@@ -148,7 +148,7 @@ measure() {
       echo "$u $(awk -v a="$t" -v b="$t0" 'BEGIN { printf "%.1f", a - b }') $pct $nproc" >> "$work/trace"
       if echo "$h" | awk -v m="$SETTLE_CPU" -v w="$SETTLE_WINDOW" '{ span = 0; used = 0; for (i = 1; i <= NF; i++) { split($i, e, ":"); span += e[1]; used += e[2] }
            exit !(span >= w && 100 * used / span < m) }'; then
-        # When it was known to be settled: the end of its first quiet window (as `boot --settle`).
+        # When it was known to be settled: the end of its first quiet window (as `boot --settle --settle-cpu all`: this script judges all CPU, `boot --settle` now only foreground).
         since "$t0" > "$work/settled-$u"
       fi
     done < <(trees "$prev" "$cur")

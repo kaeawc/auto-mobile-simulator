@@ -478,7 +478,7 @@ impl Device {
         let register = sel!(registerNotificationHandler:);
         rt::require(&self.obj, register)?;
         rt::require(&self.obj, sel!(unregisterNotificationHandler:error:))?;
-        let block = RcBlock::new(move |info: *mut AnyObject| {
+        let block = RcBlock::with_encoding::<_, _, _, rt::ObjBlock>(move |info: *mut AnyObject| {
             // A notification that can't be read counts as a change: reconnecting is always safe.
             let state = crate::autoreleasepool(|| {
                 // SAFETY: the service passes nil or a valid NSDictionary for the duration of the call.
@@ -835,7 +835,15 @@ impl Device {
 
     /// The device's main display. The device must be booted.
     pub fn display(&self) -> Result<Display> {
-        Display::main(&self.obj)
+        Display::main(&self.obj, self.main_screen())
+    }
+
+    /// The device type's main screen in pixels, when the service says.
+    fn main_screen(&self) -> Option<(u32, u32)> {
+        let ty = rt::optional_prop(&self.obj, sel!(deviceType))?;
+        let info = device_type_info(&ty);
+        let (w, h) = (info.screen_width.round(), info.screen_height.round());
+        (w >= 1.0 && h >= 1.0).then_some((w as u32, h as u32))
     }
 
     /// The external display (an iPhone's CarPlay screen once attached), not the main one.
@@ -872,6 +880,12 @@ impl Device {
     /// Rotates the device's interface to `orientation`: a GSEvent to SpringBoard's
     /// PurpleWorkspacePort, what Simulator.app's Rotate Left/Right send.
     pub fn set_orientation(&self, orientation: Orientation) -> Result<()> {
+        use sim_core::form_factor::FormFactor;
+        let info = self.info();
+        // Only SpringBoard takes the message; elsewhere (Apple TV's PineBoard) it's silently dropped.
+        if !matches!(info.form_factor, Some(FormFactor::Phone | FormFactor::Tablet) | None) {
+            return Err(Error::Invalid(format!("only an iPhone or iPad rotates; {} is {}", info.name, info.label())));
+        }
         let sel = sel!(lookup:error:);
         rt::require(&self.obj, sel)?;
         let mut error: *mut NSError = std::ptr::null_mut();

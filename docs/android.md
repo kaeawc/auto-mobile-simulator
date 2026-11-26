@@ -21,7 +21,7 @@ to use fewer resources.
 | VM core | vCPUs, the framework's in-kernel GICv3, PSCI (SMP, power off and reset), arch timer, PL011 console, PL031 RTC |
 | Board | Stock memory map and virtio-mmio slots, so the unmodified fstab and first-stage init find `vda`–`vde` and their by-name paths |
 | Storage | virtio-blk with indirect descriptors, event-idx, and discard/write-zeroes (hole punching). System and vendor are copy-on-write in memory; userdata, cache and metadata persist per AVD. Userdata is created by a native ext4 formatter (no `mkfs.ext4`) |
-| Boot | Full Android boot to `sys.boot_completed`: 9.5 s cold, 3.5 s warm (stock: 22.9 s and 17.1 s; [benchmarks](benchmarks.md)); first boot formats and encrypts `/data`. System images from API 34 on; emu refuses older ones up front with the reason, since they boot their kernel but get no graphics: API 29 and 30 use goldfish pipes emu doesn't serve ([#38](https://github.com/kaeawc/simee/issues/38)), API 31 to 33 a guest-backed graphics ring the renderer can't map ([#39](https://github.com/kaeawc/simee/issues/39)). `EMU_ALLOW_OLD_IMAGES=1` boots them anyway, for that work. Images without `AndroidbootProps2` (API 30 and older, kernels without bootconfig) get stock's legacy kernel command line (`qemu.*` names) instead of bootconfig |
+| Boot | Full Android boot to `sys.boot_completed`: 9.5 s cold, 3.5 s warm (stock: 22.9 s and 17.1 s; [benchmarks](benchmarks.md)); first boot formats and encrypts `/data`. System images from API 34 on; emu refuses older ones up front with the reason, since they boot their kernel but get no graphics: API 29 and 30 draw with the GLES encoder over the `opengles` goldfish pipe, which emu doesn't yet bridge to the renderer ([#38](https://github.com/kaeawc/simee/issues/38); emu now also serves what else they need, unit-tested but not yet booted: adb clients that connect before adbd opens `qemud:adb`, the reference RIL's `qemud:gsm` modem, `logcat -Q`'s `logcat` stream with stock's `qemu.cmdline` property, and `qemu.gltransport=pipe` as stock passes it), API 31 to 33 a guest-backed graphics ring the renderer can't map ([#39](https://github.com/kaeawc/simee/issues/39)). `EMU_ALLOW_OLD_IMAGES=1` boots them anyway, for that work. Images without `AndroidbootProps2` (API 30 and older, kernels without bootconfig) get stock's legacy kernel command line (`qemu.*` names) instead of bootconfig |
 | adb | virtio-vsock with a host bridge on `console port + 1`, announced to the adb server. `adb shell`/`root`/`push` work, and the device shows up about 8 s after launch on a warm boot |
 | Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot`, `network speed|delay|status` (stock's presets, numbers and report; recorded, and seeded by `-netspeed`/`-netdelay`, but guest traffic isn't shaped yet), `avd snapshot` (answers as stock does without snapshot support: `save`/`load` are a `KO`, `list` is empty, `del` succeeds), plus simee's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
 | Discovery | `-list-avds`, `pid_<pid>.ini` running-instance file, `emulator-<port>` serial on stdout |
@@ -103,6 +103,25 @@ the fix instead of failing on a missing socket. `shutdown` interrupts the qemu p
 (`kill -INT`, a clean exit for the stock emulator with no console session), after re-checking
 that the PID still is a qemu running that AVD. `simee list` does not mark the emulator yet: `DeviceInfo` has no
 field for it.
+
+## Rendering modes
+
+`emu -gpu MODE` takes the stock emulator's names, and an AVD's `hw.gpu.mode` in `config.ini`
+applies when no `-gpu` flag is given (the flag wins). An unknown mode is an error that lists
+the valid ones. Every mode renders through gfxstream; what differs is the Vulkan driver under it.
+
+| Mode | Runs on | Use it when |
+|---|---|---|
+| `auto`, `host` (default) | the host GPU through MoltenVK/KosmicKrisp; lavapipe if MoltenVK fails here | a normal desktop session |
+| `lavapipe`, `swangle`, `angle_indirect` | lavapipe, software Vulkan on the CPU | no GPU, CI, headless hosts |
+| `swiftshader`, `swiftshader_indirect` | SwiftShader, software Vulkan on the CPU | comparing against lavapipe |
+| `software`, `guest` | lavapipe, with stock's notice that guest rendering isn't supported | an AVD configured that way keeps booting |
+| `off`, `none` | no renderer; the guest boots without graphics | boot-only checks (flag only; `hw.gpu.mode=off` in `config.ini` is ignored) |
+
+Rendering inside the guest (virtio-gpu 2D with Mesa in the image) isn't possible with SDK
+images: a scan of the API 34 to 37 system images found none that ships a guest renderer, and
+stock 37.2.13 reports "the system image does not support guest rendering" and falls back to
+lavapipe for an AVD configured for it. `emu` does the same and prints that notice once.
 
 ## Benchmarks
 

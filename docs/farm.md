@@ -15,7 +15,8 @@ T=$(simee create farm-template "iPhone 17" com.apple.CoreSimulator.SimRuntime.iO
 simee boot "$T" --settle --timeout 600 && simee shutdown "$T"
 
 # Per farm: clones (APFS: ~15 MB of disk each), booted four at a time, each waited for until quiet,
-# optionally with the slim profile (applied per device: a clone doesn't inherit it).
+# optionally with the slim profile (per device: a clone doesn't inherit it; written before the
+# boot, so the clone never starts those daemons).
 for i in 1 2 3 4 5 6 7 8; do simee clone "$T" farm-$i; done
 simee boot-many farm-1 farm-2 farm-3 farm-4 farm-5 farm-6 farm-7 farm-8 --profile slim
 ```
@@ -38,7 +39,8 @@ and poster, widget and Siri extensions keep starting for minutes after.
 
 `boot --settle` (and `boot_many {settle}`, and `settle` for a device already booted) also waits
 until the device's whole process tree (its `launchd_sim` and every descendant) uses under 10 % of
-one core over 10 s with SpringBoard running (`settle_cpu_pct`, `settle_window_s` change the rule).
+one core in the foreground over 10 s with SpringBoard running (`settle_cpu_pct`,
+`settle_window_s`, `settle_foreground` change the rule; foreground below).
 CPU is each process's accumulated CPU time, so it is exact over the window and a process
 that exits doesn't make the tree look quieter. The threshold comes from the measurements: an idle
 device runs at 1-6 % (no client attached), so 10 % separates "storm over" from "idle" with room
@@ -58,11 +60,26 @@ Each process's CPU is split by QoS: the `background_cpu_pct` of a result is what
 maintenance or background QoS (launchd jobs of `ProcessType` Background, darwinbg tasks:
 priority 4, on the efficiency cores), `foreground_cpu_pct` the rest, `cpu_pct` all of it. Once a
 device is past its first-boot storm most of what it still runs is background work on the 4 E-cores
-while the P-cores idle. `settle_foreground: true` (`foreground: true` for `settle`) judges the
-tree on its foreground CPU only, so a device with only background work left counts as settled.
-The default is unchanged (all CPU). Not yet measured on a device: how much sooner it fires. The
-QoS split itself was checked on the host (`taskpolicy -b yes` lands 99.9 % in background CPU, plain
-`yes` 0 %: `procs::tests::background_cpu_is_attributed_to_background_qos`).
+while the P-cores idle. So the rule judges the tree on its foreground CPU only (the default
+since 2026-11-26): a device with only background work left counts as settled, and the next
+device's boot storm runs on the P-cores beside it. `settle_foreground: false` (`foreground:
+false` for `settle`, `--settle-cpu all` on the CLI) judges all of it, as before. The QoS split
+itself was checked on the host (`taskpolicy -b yes` lands 99.9 % in background CPU, plain `yes`
+0 %: `procs::tests::background_cpu_is_attributed_to_background_qos`). Measured on fresh clones of
+a booted-once template, `boot-many --profile slim`, 3 interleaved runs of each (2026-11-26, this
+host with other work: 1-minute load 25-550, so read the ranges):
+
+| N, K | judged on | each device settled | all settled | CPU-s per device to settle |
+| --- | --- | --- | --- | --- |
+| 1, 1 | all CPU | 46.8 s (46.4-79.5) | | 131 (128-138) |
+| 1, 1 | foreground | 33.3 s (28.3-44.2) | | 123 (117-128) |
+| 4, 4 | all CPU | 107 s (87-134) | 109 s (90-134) | 132 (128-135) |
+| 4, 4 | foreground | 41 s (34-71) | 43 s (35-71) | 76 (74-114) |
+
+At N = 4 the devices judged on all CPU wait out each other's background work on the 4 E-cores
+(28-35 background CPU-s each); judged on foreground they settle before most of it starts, at
+92-120 processes instead of 121-124. CPU-s to settle is lower partly because the wait ends
+sooner: the background work still runs after it.
 
 The settle wait has its own budget, `settle_timeout_s` (`--settle-timeout`), counted from the end
 of the boot, separate from `timeout_s` (the boot call). Its default is 600 s, and in `boot_many`
@@ -133,7 +150,7 @@ that has done its first boot skips the data migration and indexing storm.
 ### The `slim` profile
 
 `boot --profile slim` (or `simee profile <device> slim` on a booted one) disables (in the
-device's own launchd database) and stops 58 daemons no AutoMobile tool and no simee method needs: PosterBoard and the
+device's own launchd database) and stops 62 daemons no AutoMobile tool and no simee method needs: PosterBoard and the
 ~15 poster extensions it keeps alive (~30-45 MB footprint each), widgets (chronod), Siri and
 suggestions, photo and media analysis, Health, Home, fitness, the Store, iCloud sync, Mail, News,
 Weather, Wallet, Game Center, Screen Time, watch and Find My companions, experiments and ML hosts.
@@ -145,8 +162,37 @@ The list and what was kept on purpose is `SLIM` in `crates/sim-api/src/ios.rs`.
 | footprint (dirty memory, shared once) | 2.6-2.8 GB | 2.0-2.2 GB | 1.07-1.2 GB |
 | CPU of 8 devices together, 60 s after settle | 869 % | 25 % | 7 % |
 
-Applying the profile takes ~20 s on a quiet host, 24-66 s under load (the runtime has no shell, so
-`launchctl disable` and `bootout` are a spawn each per job), counted in `settle_s`. The result
+Where the disables live: `launchd_sim` keeps its `launchctl disable`/`enable` overrides on the
+host, in `/private/var/tmp/com.apple.CoreSimulator.SimDevice.<UDID>/disabled.plist` (an XML
+plist of label → bool, one file for all of the device's domains, read when it starts), not in
+the device's data directory. That is why a clone, a new UDID, starts with none. `boot --profile`
+of a shut-down device writes the profile's labels into that file before the boot
+(`sim_core::launchd`, keeping the file's other overrides; the result's `profile.preset` counts the
+labels it added), so the boot never starts those jobs, and the profile applied after the boot
+finds them all off and only reads `launchctl list` and `print-disabled`. On a runtime whose
+launchd keeps the file elsewhere the profile still applies the old way after the boot. `delete`
+also removes that directory (the service leaves it behind, ~2 MB of `launchd.log` per device).
+
+Applied after the boot instead (a device booted without it, or `simee profile` on a booted one),
+it takes ~20 s on a quiet host, 24-66 s under load (the runtime has no shell, so `launchctl
+disable` and `bootout` are a spawn each per job), counted in `settle_s`. A clone's first boot,
+`boot-many --profile slim`, fresh clones of a booted-once template, the old way against the
+disables written before the boot, both judged on all CPU (2026-11-26, this host with other
+work: 1-minute load 25-550; median of 3, interleaved; at N = 4 the median device of each run):
+
+| N, K | | profile | each device settled | all settled | CPU-s to settle | processes at settle |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1, 1 | after the boot | 32.1 s (27.2-39.1) | 95.0 s (52.7-97.2) | | 159 (133-163) | 139 |
+| 1, 1 | written before | 1.6 s (1.5-3.7) | 46.8 s (46.4-79.5) | | 131 (128-138) | 123 |
+| 4, 4 | after the boot | 42.9 s (39.0-45.1) | 227 s (167-238) | 229 s (170-238) | 167 (158-211) | 139-158 |
+| 4, 4 | written before | 5.4 s (3.7-8.5) | 107 s (87-134) | 109 s (90-134) | 132 (128-135) | 121-124 |
+
+With both changes (written before, judged on foreground) four clones were all settled in 43 s
+(35-71) against 229 s.
+
+CPU-s is what the device's process tree used from the boot until it settled (`cpu_s` in the
+result; `background_cpu_s` its background-QoS part), sampled once a second: a daemon the profile
+stopped before the first sample isn't counted, so the "after the boot" rows read low. The result
 reports what launchd did, not what was asked: `disabled` counts the labels `launchctl
 print-disabled system` lists as disabled afterwards, `failed` names the others (and any whose
 `disable` printed an error; the "Please switch to user/foreground/…" warning a running job's
@@ -156,10 +202,16 @@ shows up here).
 
 Most disables survive a plain reboot (measured, iOS 27.2: a slimmed device shut down and booted
 without `--profile` came up with 133 processes, its sampled jobs still listed disabled and none
-loaded). Three don't: companionappd, NPKCompanionAgent and brookcompaniond come back listed
-`enabled` and running after every reboot (measured on iOS 27.2: `launchctl print-disabled system`
-and `launchctl list` after a reboot of a slimmed device). A clone doesn't inherit any of them
-(`clone` resets them: a clone of a slimmed template came up with 221 processes). So pass
+loaded). Three used not to: companionappd, NPKCompanionAgent and brookcompaniond came back listed
+`enabled` and running after every reboot. They are paired-watch daemons (the runtime's
+`System/Library/NanoLaunchDaemons`, `Disabled` in their own plists), and `nanoregistrylaunchd`
+enables all 17 of them each time it runs, one to three minutes after a boot (its `Setting service
+… to enabled (initiated by nanoregistrylau…)` lines in `launchd.log`, iOS 27.2), which also
+started addressbooksyncd, bulletindistributord and pairedsyncd: the ~30 CPU-s burst 50-70 s after
+boot. The profile now disables nanoregistrylaunchd itself and those three as well; nanoregistryd,
+which asks for it, doesn't spin without it (the devices below settle and idle as before). A clone
+doesn't inherit any of the disables (`clone` resets them: a clone of a slimmed template came up
+with 221 processes). So pass
 `--profile slim` on every boot, not only a clone's first. Applying it again is cheap: it reads
 `launchctl list` and `print-disabled` first and leaves alone each job that is still disabled and
 not loaded (the result's `already` counts them, and they aren't listed in `not_loaded`), so a

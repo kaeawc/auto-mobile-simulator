@@ -140,6 +140,36 @@ this host varied during these runs, so treat them as a rough comparison.
 | default | 5 of 8 within 600 s | 2176 MB | 235 |
 | `slim` | 8 of 8 in 392 s | 1158 MB | 148 |
 
+Time to usable devices: fresh clones of one booted-once iPhone 17 (iOS 27.2) template, first boot
+through `simee boot-many <clones> -j K --profile slim --json`, 2026-11-26, M3 Max, 16 CPUs, macOS
+26.6, 3 interleaved runs of each with other work on the host (1-minute load 25-550: read the
+ranges). "Before" is the same build with the slim disables applied after the boot and settle
+judged on all CPU (`--settle-cpu all`), as until this change; the mechanism is in
+[farm.md](farm.md#the-slim-profile).
+
+| Measure | before | after |
+| --- | --- | --- |
+| 1 clone: booted until settled, median (runs) | 95.0 s (97.2, 95.0, 52.7) | 33.3 s (44.2, 33.3, 28.3) |
+| 4 clones at once (K=4): all settled, median (runs) | 229 s (229, 170, 238) | 43 s (35, 43, 71) |
+| 4 clones at once: CPU-s each device used until settled, median (not like for like: "before" waited on all CPU, "after" on foreground CPU only, so its wait ends earlier and background work keeps running after it; docs/farm.md) | 167 | 76 |
+| The slim profile's own time in that, 4 at once, median of 12 | 42.9 s | 5.4 s |
+
+Time per automation step on one booted iPhone 17 (iOS 27.2) through `simee serve`, one persistent
+connection, `python3 scripts/ios-step-bench.py <socket> <udid> 20` (medians of 20 calls; the
+median of 3 interleaved runs), 2026-11-26, same host, 48 AVDs and 100 simulators on it, 1-minute
+load 21-32. "Before" routed every call by listing both platforms' devices:
+
+| Measure | before | after |
+| --- | --- | --- |
+| tap (holds 60 ms) | 137.5 ms | 63.4 ms |
+| screenshot, PNG written to a file | 99.7 ms | 24.5 ms |
+| screenshot, base64 in the reply | 107.8 ms | 34.8 ms |
+| tap, then screenshot to a file | 241.2 ms | 88.9 ms |
+
+One screenshot as a command (a process per call), same device and hour, median of 7 interleaved
+(load 13-69): `simee screenshot` forwarded to `simee serve` 36 ms, `simee screenshot` in its own
+process (`SIMEE_IN_PROCESS=1`) 173 ms, `xcrun simctl io <udid> screenshot` 601 ms.
+
 ## Emulator internals
 
 These explain the table above. Each is a before and after of emu itself, with the mechanism
@@ -200,15 +230,55 @@ CASE=2480,1080,true cargo test --release -p emu frame_path_latency -- --ignored 
 The injected network shaper's cost per call is measured in
 [research/netshape-overhead.md](research/netshape-overhead.md).
 
+## Build times (local)
+
+Apple silicon Mac, 16 CPUs, macOS 26.6, 2026-11-26. The host was heavily loaded by other builds
+the whole time (load average 50 to 700), so wall-clock time is not comparable between runs; the
+rows give CPU seconds (user plus system of the build and its children, from `getrusage`), which
+load does not inflate. Each is a clean build into an empty target directory; "before" and
+"after" were run alternately, twice, and the range is both runs. Wall-clock times under that load
+were 20 to 34 s before and 10 to 14 s after for the workspace, 114 s before and 37 to 42 s after for the desktop.
+
+| Build | Before | After | Command |
+|---|---|---|---|
+| Workspace test build, clean | 131 to 136 CPU s | 74 to 77 CPU s | `cargo test --no-run` |
+| Desktop test build, clean | 614 CPU s | 147 CPU s | `cd desktop && cargo test --no-run` |
+| Workspace test run, warm | 12.5 to 13.7 s | 13.0 to 13.9 s | `cargo test --workspace` |
+| Desktop test run, warm | 0.55 to 0.99 s | 1.06 to 1.41 s | `cd desktop && cargo test` |
+
+What changed: the workspace's `dev` profile built every dependency at opt-level 2; it now builds
+them at 0 and keeps 2 or 3 only for the ones on a runtime path (zlib-rs and flate2 for the kernel's
+gunzip, smoltcp, crc32fast, adler2, base64, cpal, and the PNG crates that already had it). The
+desktop's `test` profile builds its dependencies (Rune's GPU stack) at 0: its view tests run in
+about a second either way. `cargo build` and `cargo run` in the desktop keep opt-level 2, since a
+debug window has to stay smooth.
+
+Measured and left alone:
+
+| Build | Result | Command |
+|---|---|---|
+| Release `emu`, clean | 13 s wall (57 CPU s) at load 17; release settings unchanged | `cargo build --release -p emu` |
+| Incremental after a one-line edit in `sim-core`, tests | 3.0 to 4.9 s; unchanged by `debug = 0` (3.1 to 3.6 s) or `-ld_classic` (3.6 to 4.1 s) | `cargo test --no-run` |
+| Incremental after a one-line edit in `emu-vmm`, `cargo c` / `cargo lint` | about 1 to 2 s each | `cargo c`, `cargo lint` |
+| `scripts/check.sh --all`, warm | 15 to 26 s, of which the test run is 13 to 22 s | `scripts/check.sh --all` |
+
+The incremental loop is already a few seconds, so no profile change helps it; the clean-build wins
+are what a fresh checkout, a CI cache miss or a Rune bump pays.
+
 ## Not yet measured
 
 Claims that would belong in the README once someone runs them:
 
 - First boot with and without interrupt kicks at a 1-minute load under 8: three more runs per arm (two `none` runs and three `targeted` runs are published), and the `targeted` default below macOS 26 has no measurement on that macOS.
-- `simee screenshot` against `xcrun simctl io screenshot` on a quiet host.
+- `simee screenshot` against `xcrun simctl io screenshot` on a quiet host (the run above had load
+  13-69).
 - iOS boot and settle on a quiet host (the runs above had other load).
-- Time per automation step (tap, then screenshot) through the socket API against `simctl` and
-  against `adb` on the SDK emulator.
+- Time per automation step (tap, then screenshot) through the socket API against `adb` on the SDK
+  emulator (`simctl` has no tap).
+- Host Spotlight indexing of simulator data: `mdfind` lists 13,858 items under one booted-once
+  device's directory (6,562 files), so the host's `mds_stores` indexes what devices write. What
+  excluding `~/Library/Developer/CoreSimulator` from Spotlight saves a farm needs a change to the
+  host's Spotlight privacy settings to measure.
 - Host CPU of an idle booted device, emu against the SDK emulator.
 - Network throughput and latency through emu's NAT against the SDK emulator's slirp.
 - Host CPU of an idle booted device with and without the virtio-snd card (`EMU_VIRTIO_SND=0`),
