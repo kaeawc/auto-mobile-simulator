@@ -119,9 +119,9 @@ impl Instance {
         // formatted by the guest (`formattable` in the fstab). The ext4 formatter is native
         // (`emu-ext4`) and writes only metadata, so the image stays sparse.
         let userdata = dir.join("userdata.img");
-        if !userdata.exists()
-            && let Err(e) = create_userdata(&userdata, avd.data_partition_bytes())
-        {
+        // A first boot, as stock tells one: no user data yet (a new AVD, or `-wipe-data`).
+        let first_boot = !userdata.exists();
+        if first_boot && let Err(e) = create_userdata(&userdata, avd.data_partition_bytes()) {
             let _ = std::fs::remove_file(&userdata);
             return Err(e);
         }
@@ -185,6 +185,12 @@ impl Instance {
             // `<sdk>/simee/renderer/<revision>/`; gfxstream finds `lib64/vulkan` and
             // `lib64/gles_*` under it.
             emu_gfxstream::link_beside_exe(lib64);
+            if let Some(platform) = first_boot_angle(avd.api_level(), first_boot) {
+                if opts.verbose && std::env::var_os("ANGLE_DEFAULT_PLATFORM").is_none() {
+                    eprintln!("emu: API 29 first boot: host GLES is ANGLE on {platform} (ANGLE_DEFAULT_PLATFORM=metal overrides)");
+                }
+                emu_gfxstream::prefer_angle_platform(platform);
+            }
             emu_gfxstream::configure_environment(emulator_dir, icd);
         }
         let display = gpu_lib64.as_ref().map(|_| std::sync::Arc::new(emu_vmm::display::FrameStore::default()));
@@ -712,6 +718,17 @@ fn takes_bootconfig(avd: &Avd) -> bool {
     avd.image_feature("AndroidbootProps2") == Some(true) || avd.api_level().is_none_or(|api| api >= 31)
 }
 
+/// The host ANGLE backend for a boot that can't use Metal, if any: SwiftShader for an API 29
+/// image's first boot. There a guest `glClear` reaches ANGLE's Metal clear with a color
+/// attachment whose texture is gone and faults; gfxstream's exception handler retries the load
+/// forever under ANGLE's global lock, and every render thread stops behind it (#94). Stock renders
+/// a headless first boot with ANGLE on SwiftShader too. Later boots (user data exists) and API 30
+/// run on Metal. `ANGLE_DEFAULT_PLATFORM` overrides it either way.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn first_boot_angle(api: Option<u32>, first_boot: bool) -> Option<&'static str> {
+    (first_boot && api == Some(29)).then_some("swiftshader")
+}
+
 /// Why emu can't run this AVD's image yet, if it can't: images below API 29, which emu has never
 /// been brought up on. emu refuses them up front with the reason; `EMU_ALLOW_OLD_IMAGES=1` boots
 /// them anyway, to work on them. (API 29–30 guests draw through the goldfish `opengles` pipe,
@@ -1040,6 +1057,15 @@ mod tests {
         for image in [vvq, xr, AngleImage::default()] {
             assert_eq!(guest_graphics("emulation", image), vec![("androidboot.hardwareegl", "emulation".to_string())]);
             assert!(!virtual_queue("emulation", image));
+        }
+    }
+
+    #[test]
+    fn only_an_api_29_first_boot_runs_angle_on_swiftshader() {
+        assert_eq!(first_boot_angle(Some(29), true), Some("swiftshader"));
+        assert_eq!(first_boot_angle(Some(29), false), None);
+        for api in [Some(30), Some(33), Some(36), None] {
+            assert_eq!(first_boot_angle(api, true), None, "{api:?}");
         }
     }
 

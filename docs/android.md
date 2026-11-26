@@ -21,7 +21,7 @@ to use fewer resources.
 | VM core | vCPUs, the framework's in-kernel GICv3, PSCI (SMP, power off and reset), arch timer, PL011 console, PL031 RTC |
 | Board | Stock memory map and virtio-mmio slots, so the unmodified fstab and first-stage init find `vda`–`vde` and their by-name paths |
 | Storage | virtio-blk with indirect descriptors, event-idx, and discard/write-zeroes (hole punching). System and vendor are copy-on-write in memory; userdata, cache and metadata persist per AVD. Userdata is created by a native ext4 formatter (no `mkfs.ext4`) |
-| Boot | Full Android boot to `sys.boot_completed`: 9.5 s cold, 3.5 s warm (stock: 22.9 s and 17.1 s; [benchmarks](benchmarks.md)); first boot formats and encrypts `/data`. System images from API 29 on; emu refuses older ones up front with the reason (`EMU_ALLOW_OLD_IMAGES=1` boots them anyway, to work on them). API 29 and 30 draw with the GLES encoder over the goldfish `opengles` pipe: each pipe gets a render channel of its own in the renderer, as stock gives it ([performance notes](#performance-notes)); the board has no virtio-gpu for them (their kernels oops on it, and stock gives them none). They also get adb over `qemud:adb` (a client that connects first waits for adbd's `accept`), the reference RIL's `qemud:gsm` modem, and `logcat -Q`'s `logcat` stream from stock's `qemu.cmdline` and `qemu.logcat` properties. API 29 `default` warm-boots in 4.8 s (stock 6.4 s), but its first boot hangs in the host renderer (a known gap: ANGLE on Metal faults, [performance notes](#performance-notes)); API 29 `default` and API 30 `google_apis` pass the AutoMobile harness (40 of 41 on API 30, 35 of 41 on API 29; device snapshots fail on every image, video recording as on API 31, and rotation and dark theme on API 29 fail on stock too; since the touch screen became stock's `virtio_input_multi_touch_1` (#69), AutoMobile's injected taps, multi-touch and pinch are cancelled on API 30, 2026-11-26). API 31 to 33 guests set up address-space graphics with the protocol before the renderer's; the GPU translates it (`virtio/legacy_asg.rs`, [#39](https://github.com/kaeawc/simee/issues/39)), and their GLES is the encoder on a renderer with GL, as stock runs them, since their ANGLE finds SurfaceFlinger no EGL config. Images without `AndroidbootProps2` (API 30 and older, kernels without bootconfig) get stock's legacy kernel command line (`qemu.*` names) instead of bootconfig |
+| Boot | Full Android boot to `sys.boot_completed`: 9.5 s cold, 3.5 s warm (stock: 22.9 s and 17.1 s; [benchmarks](benchmarks.md)); first boot formats and encrypts `/data`. System images from API 29 on; emu refuses older ones up front with the reason (`EMU_ALLOW_OLD_IMAGES=1` boots them anyway, to work on them). API 29 and 30 draw with the GLES encoder over the goldfish `opengles` pipe: each pipe gets a render channel of its own in the renderer, as stock gives it ([performance notes](#performance-notes)); the board has no virtio-gpu for them (their kernels oops on it, and stock gives them none). They also get adb over `qemud:adb` (a client that connects first waits for adbd's `accept`), the reference RIL's `qemud:gsm` modem, and `logcat -Q`'s `logcat` stream from stock's `qemu.cmdline` and `qemu.logcat` properties. API 29 `default` warm-boots in 4.8 s (stock 6.4 s); its first boot runs the host GLES on SwiftShader, since ANGLE on Metal faults there ([performance notes](#performance-notes)); API 29 `default` and API 30 `google_apis` pass the AutoMobile harness (40 of 41 on API 30, 35 of 41 on API 29; device snapshots fail on every image, video recording as on API 31, and rotation and dark theme on API 29 fail on stock too; since the touch screen became stock's `virtio_input_multi_touch_1` (#69), AutoMobile's injected taps, multi-touch and pinch are cancelled on API 30, 2026-11-26). API 31 to 33 guests set up address-space graphics with the protocol before the renderer's; the GPU translates it (`virtio/legacy_asg.rs`, [#39](https://github.com/kaeawc/simee/issues/39)), and their GLES is the encoder on a renderer with GL, as stock runs them, since their ANGLE finds SurfaceFlinger no EGL config. Images without `AndroidbootProps2` (API 30 and older, kernels without bootconfig) get stock's legacy kernel command line (`qemu.*` names) instead of bootconfig |
 | adb | virtio-vsock with a host bridge on `console port + 1`, announced to the adb server. `adb shell`/`root`/`push` work, and the device shows up about 8 s after launch on a warm boot |
 | Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot`, `network speed|delay|status` (stock's presets, numbers and report, seeded by `-netspeed`/`-netdelay`; applied live in the NAT, `crates/emu-vmm/src/net/shape.rs`: a token bucket per direction, 0 = unlimited, each direction holds about a second of its rate and drops past that, as a bottleneck does (except small control frames, ARP replies and payload-free TCP segments, which take a bounded reserve of 16 frames past it), with TCP held back by the download queue's room; unshaped devices take the plain path with no shaper; inbound frames are delayed by a latency between min and max, in order. Verified in unit tests over loopback only: not yet measured in a guest under `network speed edge`, and `network speed` doesn't change the radio's reported data type), `avd snapshot` (answers as stock does without snapshot support: `save`/`load` are a `KO`, `list` is empty, `del` succeeds), plus simee's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
 | Discovery | `-list-avds`, `pid_<pid>.ini` running-instance file, `emulator-<port>` serial on stdout |
@@ -364,32 +364,27 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   software-drawn windows never post and its watchdog restarts it; stock doesn't offer slots to
   these images either (its `HostComposition ext` line, 2026-11-26).
 
-- **Known gap: API 29's first boot hangs in the host renderer (ANGLE on Metal).** A fresh API 29
-  `default` AVD (or `-wipe-data`) stops before the launcher: about a minute in, system_server's
-  watchdog fires and restarts it, again and again (4 of 4 first boots, 2026-11-26; warm
-  boots of the same AVD reach the launcher). `-verbose` shows 42M to 97M MMIO writes per vCPU
-  (a warm boot: about 0.3M). `EMU_EXIT_PROFILE` puts them all on the goldfish pipe's `CMD`
-  register (36.5M in the first 40 s), and the guest's `top` on the composer HAL and
-  bootanimation, each at 100% system time in `goldfish_pipe_read_write`: they wait for
-  renderControl replies (`rcCompose`, `rcMakeCurrent`) on `opengles` pipes opened `O_NONBLOCK`,
-  and their encoder retries `EAGAIN` without sleeping, one pipe command per retry. The storm is
-  the symptom. The replies never come because one render thread faulted inside ANGLE's Metal
-  backend: a guest `glClear` reaches `rx::FramebufferMtl::clearWithLoadOpRenderPassNotStarted`
-  with a color attachment that has no texture (`EXC_BAD_ACCESS` at address `0x38`, lldb,
-  2026-11-26). gfxstream's Mach exception handler (`MacSegvHandler`) answers a fault outside its
-  registered ranges with success and hands it on only if an earlier exception port existed, so
-  instead of crashing, the thread re-runs the faulting load forever at 100% CPU while holding
-  ANGLE's global lock, and every other render thread waits on that lock. The first boot is
-  where it shows because the setup app changes the display configuration (`display_size_forced`,
-  "Window freeze timeout expired") while system windows are drawing. Stock 37.2.13 first-boots
-  the same image headless to the launcher in 35 s, but it renders headless with `swangle`
-  (ANGLE on SwiftShader), never with ANGLE on Metal. emu with ANGLE on SwiftShader
-  (`ANGLE_DEFAULT_PLATFORM=swiftshader`, which emu leaves alone when it is set) first-boots the
-  same AVD to the launcher within 25 s, with 0.16M to 0.33M MMIO writes per vCPU and no
-  watchdog (one run, 2026-11-26). The fault is in the SDK's ANGLE build (`fbf66f49c7cc`), not in
-  emu's pipe; what emu chooses is the backend. Until that choice changes, set
-  `ANGLE_DEFAULT_PLATFORM=swiftshader` for an API 29 AVD's first boot (software GL), then boot
-  it normally. API 30 `google_apis` first-boots on Metal to the launcher (one run).
+- **API 29's first boot runs the host GLES on SwiftShader (#94).** On ANGLE's Metal backend a
+  fresh API 29 `default` AVD (or `-wipe-data`) stops before the launcher: `sys.boot_completed`
+  comes, then system_server's watchdog fires and restarts it, again and again (5 of 5 first
+  boots, 2026-11-26; warm boots of the same AVD reach the launcher). A guest `glClear` on a user
+  framebuffer (a 16x32 texture attached at `GL_COLOR_ATTACHMENT0`, no EGL surface current;
+  lldb on the faulting render thread, 2026-11-26) reaches
+  `rx::FramebufferMtl::clearWithLoadOpRenderPassNotStarted` with a color attachment whose Metal
+  texture is gone (`EXC_BAD_ACCESS` at `0x38`). gfxstream's Mach exception handler
+  (`MacSegvHandler`) answers a fault outside its registered ranges with success, so the thread
+  re-runs the faulting load forever at 100% CPU while holding ANGLE's global lock, and every
+  other render thread waits on that lock; the composer HAL and bootanimation then spin on their
+  `O_NONBLOCK` `opengles` pipes (36.5M goldfish-pipe `CMD` writes in 40 s), a symptom. The fault
+  is timing-dependent: with lldb attached from launch the same first boot reached the launcher
+  (2 of 2), and the texture and framebuffer are the guest's Skia objects, which emu doesn't
+  create or size, so emu has no input to change; the bug is in the SDK's ANGLE build
+  (`fbf66f49c7cc`). Stock renders a headless first boot with `swangle` (ANGLE on SwiftShader)
+  too. So emu runs ANGLE on SwiftShader for an API 29 image's first boot (no `userdata.img`
+  yet, as stock tells a first boot) and on Metal afterwards; `-verbose` says so.
+  `ANGLE_DEFAULT_PLATFORM` overrides it (`metal` reproduces the hang). Times to the launcher are
+  in [benchmarks](benchmarks.md#api-29-gles-over-the-goldfish-pipe). API 30 `google_apis` and
+  API 36 first-boot on Metal to the launcher.
 
 - **In-kernel GICv3.** The stock board emulates a GICv2 in userspace. Here interrupt
   acknowledge, EOI and the virtual timer never leave the guest, and an idle vCPU parks inside

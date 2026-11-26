@@ -56,6 +56,28 @@ PORT=5612 scripts/android-bench.sh a29-stock-N <avd> stock
 | Guest CPU, 100k shell loop, warm | 0.29 s | 0.59 s | |
 | Guest CPU, 4× md5, warm | 0.43 s | 0.94 s | |
 
+First boots (`-wipe-data`) and warm boots of one API 29 `default` AVD under emu by host GLES
+backend (#94), same host, 2026-11-26, rounds of first boot, warm boot, warm boot on SwiftShader,
+3 rounds; host load average 10–14. Seconds from launch until `sys.boot_completed` and until the
+launcher has focus (`dumpsys window`), polled once a second, so whole seconds. On Metal a first
+boot never reaches the launcher (1 of 1 that day, 4 of 4 earlier: the renderer fault in
+[android.md](android.md#performance-notes)); emu now runs a first boot on SwiftShader. Not yet
+compared with stock's first boot.
+
+```bash
+target/release/emu -avd <avd> -port 5620 -wipe-data   # first boot; without -wipe-data: warm
+ANGLE_DEFAULT_PLATFORM=swiftshader target/release/emu -avd <avd> -port 5620   # warm, SwiftShader
+# then once a second: adb -s emulator-5620 shell getprop sys.boot_completed, and
+# adb -s emulator-5620 shell dumpsys window | grep mCurrentFocus (Launcher)
+```
+
+| Boot | Host GLES | `sys.boot_completed`, median (runs) | Launcher, median (runs) |
+| --- | --- | --- | --- |
+| First | ANGLE on SwiftShader (emu's default) | 4 s (4, 3, 4) | 4 s (4, 4, 5) |
+| First | ANGLE on Metal | 9 s (1 run) | never (watchdog restarts) |
+| Warm | ANGLE on Metal (emu's default) | 5 s (4, 5, 7) | 6 s (6, 5, 7) |
+| Warm | ANGLE on SwiftShader | 4 s (4, 3, 4) | 4 s (4, 4, 5) |
+
 ### Idle host CPU
 
 The same API 36 AVD, warm-booted under emu built without and with its network device (#29),
@@ -427,7 +449,7 @@ Claims that would belong in the README once someone runs them:
   with 6 halving steps is measured: 0.0 / 0.0 pt on iOS 26.5, 0.32 / 0.36 pt (median / max, 12
   targets) on 27.2.
 - Host CPU of an idle booted device, emu against the SDK emulator.
-- API 29 and 30 cold boots (a new AVD's first), API 30 warm boots, and their idle host CPU: an
+- API 29 first boots against stock, API 30 first and warm boots, and their idle host CPU: an
   API 29 or 30 device under emu sat at 150–170% of a core after the AutoMobile harness, with
   `com.android.phone`, `system_server` and `logd` busy in the guest; not yet compared with stock.
 - Network throughput and latency through emu's NAT against the SDK emulator's slirp.
