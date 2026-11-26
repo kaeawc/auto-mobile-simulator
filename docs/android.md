@@ -228,7 +228,14 @@ The numbers are in [benchmarks.md](benchmarks.md#android-software-mode-linux-wit
   (the virtio devices; QEMU 11's `SHMEM_MAP` lets a backend map GPU blobs into the guest) and
   vfio-user (goldfish address space, a plain PCI device). Goldfish pipe is an ACPI/DT platform
   device that neither protocol carries; whether gralloc runs without its `refcount` pipe (the
-  renderer's `RefCountPipe` off) is the open question.
+  renderer's `RefCountPipe` off) is the open question. The vhost-user backend is
+  `crates/emu-vmm/src/vhost_user.rs`: QEMU's guest RAM is a shared memfd
+  (`-object memory-backend-memfd,share=on`) that emu maps once (`GuestRam::map_shared`), rings are
+  translated through the memory table, kicks and calls are eventfds, and a raise calls only the
+  queues whose used ring moved. vsock runs on it: the guest's adbd and qemud pipes reach emu's
+  adb bridge and pipe services (`examples/vhost_user_vsock.rs`), with bulk transfers faster than
+  QEMU's own user network and round trips level with it
+  ([benchmarks](benchmarks.md#android-software-mode-linux-without-kvm)).
 - **Rendering: gfxstream on lavapipe**, from the SDK's Linux `emulator` package, whose `lib64`
   carries `libgfxstream_backend.so` and its own lavapipe (238 MB without the Qt UI).
 

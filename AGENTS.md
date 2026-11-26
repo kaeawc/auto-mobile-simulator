@@ -151,7 +151,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   rng, vsock, gpu with `legacy_asg.rs` (API 31–33's address-space graphics on the renderer's
   protocol), input incl. XR's dual-mode mouse, console, snd), `pipe/` (adb bridge, qemud
   services incl. `car.rs`, the vehicle HAL, and `xr.rs`, Android XR's `xr_service`), `modem/`,
-  `disk.rs`, `boot.rs`, `display.rs` (`FrameStore`). Everything but `machine.rs`, `vcpu.rs` and
+  `disk.rs`, `boot.rs`, `display.rs` (`FrameStore`), `vhost_user.rs` (serves a device to QEMU
+  over vhost-user, for software mode on Linux; `examples/vhost_user_vsock.rs`). Everything but `machine.rs`, `vcpu.rs` and
   `virtio/gpu.rs` builds and tests on Linux: put device logic there, not behind the hypervisor.
 - `crates/emu-avd` — `Env` (SDK/AVD paths), `Avd` (config, `profile()`), `NewAvd`
   (`for_profile`), running-instance advertisements (`Running`), `BootConfig`, ini parsing.
