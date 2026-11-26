@@ -125,14 +125,20 @@ struct OpenglesPipe {
 }
 
 impl OpenglesPipe {
-    /// Hands `held` to the render thread as it makes room, then tells the device.
+    /// Hands `held` to the render thread as it makes room, then tells the device. It polls
+    /// with a short backoff rather than waiting in the renderer: the renderer's
+    /// `waitUntilWritable` never returns once the guest closes the pipe, which would park this
+    /// thread and keep the queue alive.
     fn deliver_held(channel: &dyn GlChannel, held: &Mutex<VecDeque<Vec<u8>>>, ctx: &PipeCtx) {
+        let mut backoff = std::time::Duration::from_micros(50);
         loop {
-            channel.wait_writable();
             let mut q = held.lock().unwrap_or_else(PoisonError::into_inner);
             while let Some(front) = q.front() {
                 match channel.try_write(front) {
-                    GlWrite::Done => drop(q.pop_front()),
+                    GlWrite::Done => {
+                        drop(q.pop_front());
+                        backoff = std::time::Duration::from_micros(50);
+                    }
                     GlWrite::Full => break,
                     // The pipe is closing; its next write fails.
                     GlWrite::Stopped => return,
@@ -143,6 +149,9 @@ impl OpenglesPipe {
                 ctx.drained();
                 return;
             }
+            drop(q);
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(std::time::Duration::from_millis(1));
         }
     }
 }
