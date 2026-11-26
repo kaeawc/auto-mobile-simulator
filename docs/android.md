@@ -84,6 +84,12 @@ A release `emu` older than the sources (`apps/emu`, `crates/emu-*`, `crates/sim-
 used, with a note on stderr; simee never builds it for you (`cargo build --release -p emu`, then
 `codesign -s - -f --entitlements scripts/hypervisor.entitlements target/release/emu`).
 
+An AVD that `emu -create-avd` makes runs under the stock emulator too. Its `config.ini` has no
+`fastboot.*` keys, so stock keeps its own default and quick-boots it from a snapshot as it would
+an avdmanager AVD; emu has no snapshots and ignores those keys. (Earlier builds wrote
+`fastboot.forceColdBoot = yes`, which made every stock boot of such an AVD cold: 15 s instead of
+2.8 s. Delete that line from an older AVD's `config.ini` to get quick boots back.)
+
 AVDs the stock emulator runs list as `Booted`. The stock emulator (36.x, macOS) does not write the
 `pid_<pid>.ini` that simee's `emu` writes to `~/Library/Caches/TemporaryItems/avd/running`; it
 holds `<avd>/multiinstance.lock` and writes the qemu PID to `<avd>/hardware-qemu.ini.lock`. simee
@@ -283,12 +289,58 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
 - **In-kernel GICv3.** The stock board emulates a GICv2 in userspace. Here interrupt
   acknowledge, EOI and the virtual timer never leave the guest, and an idle vCPU parks inside
   the framework (zero WFI exits in practice).
-- **Kick on interrupt.** A vCPU idling inside the framework doesn't notice a newly raised SPI
-  until its own timer fires. Kicking vCPUs out of `hv_vcpu_run` after raising one cut
-  first-boot `/data` encryption from 22 s to 8 s. Only the SPI's target (`GICD_IROUTER`) is
-  kicked, and only while it is in the guest, once per entry (`crates/emu-vmm/src/wake.rs`).
-  Other VMMs on macOS 26 measured `hv_gic_set_spi` alone waking the target; A/B with
-  `EMU_VCPU_WAKE=none` (no kicks) and `EMU_VCPU_WAKE=all` (the old kick-everyone).
+- **No kick on interrupt (macOS 26 and later).** An earlier macOS left a vCPU idling inside the framework asleep
+  until its own timer fired when a device raised an SPI, and kicking vCPUs out of
+  `hv_vcpu_run` after raising one cut first-boot `/data` encryption from 22 s to 8 s. On macOS
+  26.6 `hv_gic_set_spi` alone wakes the target, as other VMMs on macOS 26 found, and the kicks
+  only cost exits. The guest routes every SPI to vCPU0 (Android has no irqbalance), so each
+  device completion cost vCPU0 an InterruptStatus read, an InterruptACK write and a kick, and
+  the kicks were 28% of its guest entries. A/B on an API 36 phone (720×1280, 4 vCPUs), M3 Max,
+  macOS 26.6.2, 2026-11-26, interleaved, `scripts/android-bench.sh`, median boot to
+  `sys.boot_completed` (runs), targeted kicks → none. The first-boot row is the runs at a 1-minute
+  load of 7.7 to 8.1 on 16 CPUs; an earlier set at load 9.5 to 20 had starved runs in it and is
+  not used. The warm row was measured at load 9.6 to 13.2.
+
+  | Boot | Targeted kicks | No kicks | vCPU0 guest entries at boot | emu CPU-s at boot |
+  | --- | --- | --- | --- | --- |
+  | First (`-wipe-data`: format, `/data` encryption, dexopt) | 11.4 s (11.4, 11.5, 11.4) | 11.6 s (11.8, 11.4) | 348k → 257k | 21.7 → 22.1 |
+  | Warm | 4.2 s (4.7, 3.5, 3.6, 3.9, 4.6, 4.4) | 3.7 s (3.7, 3.7, 3.7, 3.7, 5.2, 4.8) | 59.7k → 41.4k | 9.3 → 8.7 |
+
+  First boot is a tie: no kicks is 0.2 s slower on a median of two, inside the spread, with a
+  quarter fewer vCPU0 guest entries. Owed: a third low-load `none` run and more of both (the host
+  load climbed past 14 during the rest of the rerun, and those boots, 12.6 to 22.8 s, are not
+  published). The warm-boot, vCPU0-entry and jank rows are what the default rests on. The
+  default is chosen from the macOS version (`Mode::default_for_macos`): `none` on 26 and later,
+  `targeted` below 26 and when the version can't be read, because the 22 s to 8 s stall was
+  seen on an earlier macOS and nothing here measured those.
+
+  Without kicks vCPU0 had 1 canceled exit per boot instead of about 16k (warm) or 100k (first).
+  Launcher swipes (`scripts/android-jank.sh`, a minute after boot, 2 boots per arm, 3 runs
+  each, interleaved, host load 5 to 11) didn't move: janky frames median 0.4% with kicks and 0.2%
+  without, p90 5 ms in both, emu 28% and 25% of a core. (At host load 16 to 54 both arms were
+  janky, 2–66%, in step with the load, not the arm.) No boot or frame got slower, so `none` is
+  the default; `EMU_VCPU_WAKE=targeted` brings the targeted
+  kicks back (only the SPI's `GICD_IROUTER` target, only while it is in the guest, once per
+  entry; `crates/emu-vmm/src/wake.rs`) and `EMU_VCPU_WAKE=all` the old kick-everyone. Moving
+  SPIs off vCPU0 or suppressing more notifications would not pay yet: the MMIO handlers took
+  0.15 s of vCPU0's 20.7 s over a boot and 15 s of use (`EMU_EXIT_PROFILE=1`), and blk requests
+  arrive one at a time, so each is one QueueNotify and one interrupt with or without event-idx.
+- **Where a boot's host time goes** (same phone, `sample <pid> 5` during boot and during
+  `scripts/android-jank.sh`, 2026-11-26). Nearly all of emu's CPU is the guest running inside
+  `hv_trap`; VMM code (MMIO handlers, `preadv`/`pwritev`, the wake bookkeeping) was under 2% of
+  the samples. Ranked by what a user waits for:
+  1. *The renderer's Metal shader compiles.* gfxstream's compositor builds its Vulkan pipelines
+     at init, and MoltenVK compiles each through the Metal compiler service. With Metal's cache
+     warm the init takes 0.33 s; cold it took 4.5 and 5.1 s (2 of 20 launches that day: the
+     first launch of a new `emu` build, and one later), and the boot waits for it.
+  2. *The renderer's ring polling.* gfxstream's render threads yield-spin on the
+     address-space-graphics ring (`RingStream::readRaw` → `cthread_yield`) for about a fifth of a
+     core while the guest draws.
+  3. *Interrupt round trips on vCPU0*, now without the kicks (above): three exits per block
+     request, 0.15 s of handler time per 20 s.
+  4. *Teardown.* A stop takes 0.2–0.6 s; releasing the userdata disk took 0.3 s once (its
+     worker's last writes). `-verbose` prints every teardown step over 250 ms, and a stop that
+     overruns 5 s says which step it was waiting for and prints the exit counts before exiting.
 - **Plain `fsync` for guest flushes.** `std`'s `sync_data` is `F_FULLFSYNC` on macOS, which
   drains the drive cache. It was 75% of the userdata disk thread's time, and APEX
   decompression on first boot took more than 270 s; with plain `fsync` it takes about 70 s.

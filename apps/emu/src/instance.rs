@@ -277,10 +277,17 @@ impl Instance {
             }),
             on_guest_event: {
                 let started = std::time::Instant::now();
+                let verbose = opts.verbose;
                 Some(std::sync::Arc::new(move |event: &str| {
                     if event == "bootcomplete" {
                         // On stdout, like the launch line: tools can watch for it.
                         println!("emu: boot completed in {:.1}s", started.elapsed().as_secs_f64());
+                        // What the boot cost the vCPUs (scripts/android-bench.sh reads vcpu0's).
+                        if let Some(exits) = emu_vmm::exit_counts().filter(|_| verbose) {
+                            for line in crate::exit_lines(&exits) {
+                                eprintln!("emu: at boot completed:{line}");
+                            }
+                        }
                     }
                 }))
             },
