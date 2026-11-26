@@ -3,10 +3,11 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr::NonNull;
 
+use block2::ManualBlockEncoding;
 use objc2::encode::{Encode, Encoding, RefEncode};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Sel};
-use objc2::{class, msg_send};
+use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSError, NSString};
 
 use crate::error::{Error, Result};
@@ -50,6 +51,44 @@ unsafe impl Encode for CGPoint {
 // SAFETY: a pointer to `CGPoint` encodes as a pointer to its struct encoding.
 unsafe impl RefEncode for CGPoint {
     const ENCODING_REF: Encoding = Encoding::Pointer(&<Self as Encode>::ENCODING);
+}
+
+/// Block signatures. A block handed to a remote proxy (the screen adapter and framebuffer
+/// descriptors are ROCKit proxies under CoreSimulator 1174) is forwarded by its signature, and
+/// ROCKit throws an Objective-C exception, which aborts the process, for a block without one
+/// (`carplay` on iOS 18.0, `Display::watch_frames` on iOS 26.5); local objects ignore it. Every
+/// block given to the service carries one.
+///
+/// `void (^)(id)`.
+pub(crate) struct ObjBlock;
+
+// SAFETY: a block returning void and taking one object: `v`, a 16-byte frame, the block at 0 and
+// the object at 8 (what clang emits for `^(id o) {}`).
+unsafe impl ManualBlockEncoding for ObjBlock {
+    type Arguments = (*mut AnyObject,);
+    type Return = ();
+    const ENCODING_CSTR: &'static CStr = c"v16@?0@8";
+}
+
+/// `void (^)(NSError *)`.
+pub(crate) struct ErrorBlock;
+
+// SAFETY: as `ObjBlock`; an `NSError *` encodes as an object.
+unsafe impl ManualBlockEncoding for ErrorBlock {
+    type Arguments = (*mut NSError,);
+    type Return = ();
+    const ENCODING_CSTR: &'static CStr = c"v16@?0@8";
+}
+
+/// `void (^)(id, NSError *)`.
+pub(crate) struct ObjErrorBlock;
+
+// SAFETY: a block returning void and taking two objects: a 24-byte frame, the block at 0, the
+// objects at 8 and 16 (what clang emits for `^(id o, NSError *e) {}`).
+unsafe impl ManualBlockEncoding for ObjErrorBlock {
+    type Arguments = (*mut AnyObject, *mut NSError);
+    type Return = ();
+    const ENCODING_CSTR: &'static CStr = c"v24@?0@8@16";
 }
 
 /// A loaded dynamic library.
@@ -241,7 +280,28 @@ pub(crate) fn file_url(path: &str) -> Obj {
 
 /// Converts a service `NSError` into [`Error::Service`].
 pub(crate) fn service_error(op: &'static str, error: &NSError) -> Error {
-    Error::Service { op, message: error.localizedDescription().to_string() }
+    let mut message = error.localizedDescription().to_string();
+    // The service's own description is generic ("failed to complete the requested operation"); the
+    // runtime's reason, when there is one, is the underlying error ("Runtime does not support
+    // userInterfaceStyle" on tvOS).
+    if let Some(underlying) = underlying_error(error) {
+        let reason = string_prop(&underlying, sel!(localizedDescription));
+        if !reason.is_empty() && reason != message {
+            message = format!("{message} ({reason})");
+        }
+    }
+    Error::Service { op, message }
+}
+
+/// An error's `NSUnderlyingErrorKey` entry, when it is an error.
+fn underlying_error(error: &NSError) -> Option<Obj> {
+    let info = optional_prop(error, sel!(userInfo))?;
+    if !responds(&info, sel!(objectForKey:)) {
+        return None;
+    }
+    // SAFETY: `objectForKey:` takes a key object and returns an object or nil (checked to exist).
+    let value: Option<Obj> = unsafe { msg_send![&*info, objectForKey: &*nsstring("NSUnderlyingError")] };
+    value.filter(|v| responds(v, sel!(localizedDescription)))
 }
 
 /// Converts a raw out-parameter error (possibly null) into [`Error::Service`].
@@ -250,5 +310,37 @@ pub(crate) fn raw_error(op: &'static str, error: *mut NSError) -> Error {
     match unsafe { error.as_ref() } {
         Some(e) => service_error(op, e),
         None => Error::Service { op, message: "the service reported failure without an error".into() },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use block2::{ManualBlockEncoding, RcBlock};
+    use objc2::encode::EncodeArguments;
+
+    use super::*;
+
+    /// The signature clang writes for a block returning void: `v`, the frame size, the block
+    /// itself at 0, then each (pointer-sized) argument at its offset.
+    fn void_block_signature<E: ManualBlockEncoding<Return = ()>>() -> String {
+        let args = <E::Arguments as EncodeArguments>::ENCODINGS;
+        let each: String = args.iter().enumerate().map(|(i, arg)| format!("{arg}{}", 8 * (i + 1))).collect();
+        format!("v{}@?0{each}", 8 * (args.len() + 1))
+    }
+
+    #[test]
+    fn block_signatures_match_their_argument_types() {
+        assert_eq!(ObjBlock::ENCODING_CSTR.to_str(), Ok(void_block_signature::<ObjBlock>().as_str()));
+        assert_eq!(ErrorBlock::ENCODING_CSTR.to_str(), Ok(void_block_signature::<ErrorBlock>().as_str()));
+        assert_eq!(ObjErrorBlock::ENCODING_CSTR.to_str(), Ok(void_block_signature::<ObjErrorBlock>().as_str()));
+        assert_eq!(void_block_signature::<ObjErrorBlock>(), "v24@?0@8@16");
+    }
+
+    #[test]
+    fn encoded_blocks_still_call_their_closures() {
+        let block = RcBlock::with_encoding::<_, _, _, ObjErrorBlock>(|o: *mut AnyObject, e: *mut NSError| {
+            assert!(o.is_null() && e.is_null());
+        });
+        block.call((std::ptr::null_mut(), std::ptr::null_mut()));
     }
 }

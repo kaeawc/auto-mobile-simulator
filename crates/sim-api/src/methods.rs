@@ -346,8 +346,8 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
                 }
             }
         }
-        // Needs no device: resolving the default `booted` would fail with two simulators booted.
-        "device_types" => crate::ios::call(&mut s.ios, method, p),
+        // Need no device: resolving the default `booted` would fail with two simulators booted.
+        "device_types" | "audio_capture_stop" => crate::ios::call(&mut s.ios, method, p),
         "boot_many" => {
             // One platform per call: each backend boots its own devices its own way.
             let mut udids = Vec::new();

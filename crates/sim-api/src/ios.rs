@@ -70,9 +70,14 @@ fn closed_port() -> Result<u16, String> {
     l.local_addr().map(|a| a.port()).map_err(err)
 }
 
+/// The simulator SDK the device's shaper and proxy tool are built for (its runtime's platform).
+fn shaper_sdk(device: &Device) -> Result<sim_netshape::Sdk, String> {
+    sim_netshape::Sdk::for_runtime(&device.info().runtime_id)
+}
+
 /// Runs the in-device proxy tool; succeeds only if it reports success.
 fn device_proxy(device: &Device, args: &[&str]) -> Result<(), String> {
-    let tool = sim_netshape::scproxy_tool()?;
+    let tool = sim_netshape::scproxy_tool(shaper_sdk(device)?)?;
     let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
     let out = device.exec(&tool.display().to_string(), &args, &[]).map_err(err)?;
     if out.stdout.contains(" ok ") || out.stdout.starts_with("set ok") || out.stdout.starts_with("clear ok") {
@@ -83,11 +88,12 @@ fn device_proxy(device: &Device, args: &[&str]) -> Result<(), String> {
 }
 
 /// Whether the device was booted with the current shaper build in its environment: its
-/// SpringBoard maps that exact dylib. An older build counts as not injected (so it gets rebooted).
-fn boot_injected(udid: &str) -> bool {
-    let Ok(dylib) = sim_netshape::dylib() else { return false };
-    let Ok(procs) = sim_debug::process::collect(udid) else { return false };
-    let Some(sb) = procs.iter().find(|p| p.name == "SpringBoard") else { return false };
+/// SpringBoard (Apple TV: PineBoard) maps that exact dylib. An older build counts as not injected
+/// (so it gets rebooted).
+fn boot_injected(device: &Device) -> bool {
+    let Ok(dylib) = shaper_sdk(device).and_then(sim_netshape::dylib) else { return false };
+    let Ok(procs) = sim_debug::process::collect(&device.info().udid) else { return false };
+    let Some(sb) = procs.iter().find(|p| p.name == "SpringBoard" || p.name == "PineBoard") else { return false };
     std::process::Command::new("/usr/sbin/lsof")
         .args(["-p", &sb.pid.to_string(), "-Fn"])
         .output()
@@ -98,10 +104,11 @@ fn boot_injected(udid: &str) -> bool {
 /// WebKit's networking extension and system daemons) is shaped by the device's profile.
 fn boot_inject(device: &Device) -> Result<(), String> {
     let udid = device.info().udid;
-    if boot_injected(&udid) {
+    if boot_injected(device) {
         return Ok(());
     }
-    let env = sim_netshape::launch_env(&udid, &sim_netshape::dylib()?);
+    let env = sim_netshape::launch_env(&udid, &sim_netshape::dylib(shaper_sdk(device)?)?);
+    shaper_loads(device, &env)?;
     if device.state() == DeviceState::Booted {
         device.shutdown().map_err(err)?;
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
@@ -113,13 +120,25 @@ fn boot_inject(device: &Device) -> Result<(), String> {
     boot(device, Duration::from_secs(600))
 }
 
+/// Runs one program with the shaper injected first. A shaper the runtime can't load (a library
+/// the runtime lacks) would stop every process the device starts afterwards, `launchctl` too,
+/// so injection couldn't be undone without a reboot.
+fn shaper_loads(device: &Device, env: &[(String, String)]) -> Result<(), String> {
+    let out = device.exec("launchctl", &["getenv".to_owned(), "SIMEE_NETSHAPE".to_owned()], env).map_err(err)?;
+    match out.stderr.lines().find(|l| l.starts_with("dyld[") || l.contains("Library not loaded")) {
+        Some(line) => Err(format!("the network shaper doesn't load on this device's runtime: {}", line.trim())),
+        None => Ok(()),
+    }
+}
+
 /// Sets or removes device-wide socket-shaper injection for processes started from now on.
 fn device_inject(device: &Device, on: bool) -> Result<(), String> {
     let udid = device.info().udid;
     let args: Vec<String> = if on {
-        let dylib = sim_netshape::dylib()?;
+        let env = sim_netshape::launch_env(&udid, &sim_netshape::dylib(shaper_sdk(device)?)?);
+        shaper_loads(device, &env)?;
         let mut a = vec!["setenv".to_owned()];
-        for (k, v) in sim_netshape::launch_env(&udid, &dylib) {
+        for (k, v) in env {
             a.extend([k, v]);
         }
         a
@@ -935,8 +954,9 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             ok(s.ctx()?.delete(&d))
         }
         "boot" => {
-            let plan = boot_plan(p, 1, false, sim_netshape::dylib)?;
-            let timed = boot_device(&s.device(p)?, &plan)?;
+            let d = s.device(p)?;
+            let plan = boot_plan(p, 1, false, || sim_netshape::dylib(shaper_sdk(&d)?))?;
+            let timed = boot_device(&d, &plan)?;
             // Without settle or a profile, `boot` answers as it always has.
             Ok(if plan.settle.is_some() || plan.profile.is_some() { timed } else { Value::Null })
         }
@@ -948,7 +968,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let concurrency = crate::params::concurrency(p)?;
             // Settles by default: the slot is held through the settle wait, so K bounds the boot
             // storms in flight (what the K sweep measured), not just the service's boot calls.
-            let plan = boot_plan(p, concurrency.min(udids.len()), true, sim_netshape::dylib)?;
+            let plan = boot_plan(p, concurrency.min(udids.len()), true, || sim_netshape::dylib(sim_netshape::Sdk::Ios))?;
             let mut exact = Vec::with_capacity(udids.len());
             for q in &udids {
                 exact.push(s.ctx()?.resolve(q).map(|(_, info)| info.udid).map_err(err)?);
@@ -1015,7 +1035,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let d = s.device(p)?;
             let mut env = pairs(p, "env");
             if p.get("shaped").and_then(Value::as_bool).unwrap_or(false) {
-                env.extend(sim_netshape::launch_env(&d.info().udid, &sim_netshape::dylib()?));
+                env.extend(sim_netshape::launch_env(&d.info().udid, &sim_netshape::dylib(shaper_sdk(&d)?)?));
             }
             let pid = d.launch_with(need_str(p, "bundle_id")?, &strings(p, "args"), &env).map_err(err)?;
             Ok(json!({"pid": pid}))
@@ -1258,7 +1278,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
                 .map(|o| o.stdout.contains("netshape"))
                 .unwrap_or(false);
             Ok(
-                json!({"profile": sim_netshape::read_profile(&udid), "proxy_port": port, "injected": inject, "boot_injected": boot_injected(&udid)}),
+                json!({"profile": sim_netshape::read_profile(&udid), "proxy_port": port, "injected": inject, "boot_injected": boot_injected(&s.device(p)?)}),
             )
         }
         "network_flows" => {
@@ -1326,8 +1346,9 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             Ok(json!({"muted": with_captures(|m| m.contains_key(&format!("mute-{udid}")))}))
         }
         "network_env" => {
-            let udid = s.device(p)?.info().udid;
-            let dylib = sim_netshape::dylib()?;
+            let d = s.device(p)?;
+            let udid = d.info().udid;
+            let dylib = sim_netshape::dylib(shaper_sdk(&d)?)?;
             Ok(sim_netshape::launch_env(&udid, &dylib)
                 .into_iter()
                 .map(|(k, v)| (k, Value::String(v)))
