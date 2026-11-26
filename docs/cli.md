@@ -105,3 +105,9 @@ simee call ca_debug '{"device":"booted","option":"blended-layers","on":true}'
 The desktop window serves the same API on `$TMPDIR/simee-desktop.sock`. Full reference:
 [docs/api.md](api.md).
 
+## MCP server
+
+`simee mcp` serves [MCP](mcp.md) on stdin and stdout: every method above as a tool for an agent,
+with resources for devices and their screens, tasks for boots, and a device view. It runs the
+methods in its own process, like `--in-process`; configure it in the agent as the command `simee
+mcp`.

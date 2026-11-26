@@ -935,6 +935,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sim-mcp"
+version = "0.1.0"
+dependencies = [
+ "emu-avd",
+ "serde_json",
+ "sim-android",
+ "sim-api",
+]
+
+[[package]]
 name = "sim-netshape"
 version = "0.1.0"
 dependencies = [
@@ -975,6 +985,7 @@ dependencies = [
  "sim-android",
  "sim-api",
  "sim-core",
+ "sim-mcp",
 ]
 
 [[package]]

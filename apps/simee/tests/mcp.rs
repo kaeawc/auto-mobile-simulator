@@ -1,0 +1,198 @@
+//! `simee mcp` end to end, on any host: the real binary as a subprocess speaking MCP on stdio,
+//! with its own SDK, AVD home and `$HOME`, and a fake simee (`sim_android::testing`) standing in
+//! for a running emulator.
+
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+use sim_android::testing::{fake_emulator, wait_for};
+
+const VERSION: &str = "2026-07-28";
+const IMAGE: &str = "system-images;android-36;google_apis;arm64-v8a";
+
+struct Env {
+    root: PathBuf,
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+impl Env {
+    fn new(tag: &str) -> Env {
+        // Under /tmp: the fake display socket's path must fit a unix socket address.
+        let root = PathBuf::from("/tmp").join(format!("mcp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let d = root.join("sdk/system-images/android-36/google_apis/arm64-v8a");
+        std::fs::create_dir_all(&d).expect("image dir");
+        std::fs::write(d.join("system.img"), b"s").expect("system.img");
+        std::fs::write(d.join("source.properties"), "AndroidVersion.ApiLevel=36\nSystemImage.TagId=google_apis\n").expect("props");
+        std::fs::create_dir_all(root.join("home")).expect("home");
+        Env { root }
+    }
+
+    fn android(&self) -> sim_android::Android {
+        let mut a = sim_android::Android::new(emu_avd::Env { sdk_root: Some(self.root.join("sdk")), avd_home: self.root.join("avd") });
+        a.running_dir = Some(self.root.join("home/Library/Caches/TemporaryItems/avd/running"));
+        a
+    }
+
+    fn mcp(&self) -> Mcp {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_simee"))
+            .arg("mcp")
+            .env("HOME", self.root.join("home"))
+            .env("ANDROID_HOME", self.root.join("sdk"))
+            .env("ANDROID_AVD_HOME", self.root.join("avd"))
+            .env_remove("ANDROID_SDK_ROOT")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("simee mcp runs");
+        let stdin = child.stdin.take();
+        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        Mcp { child, stdin, stdout, next: 1 }
+    }
+}
+
+/// A client on the subprocess's pipes.
+struct Mcp {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+    next: u64,
+}
+
+impl Mcp {
+    fn send(&mut self, message: &Value) {
+        let stdin = self.stdin.as_mut().expect("stdin open");
+        writeln!(stdin, "{message}").expect("write");
+        stdin.flush().expect("flush");
+    }
+
+    fn line(&mut self) -> Value {
+        let mut line = String::new();
+        assert!(self.stdout.read_line(&mut line).expect("read") > 0, "the server closed stdout");
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("stdout carries only JSON-RPC, got {line:?}: {e}"))
+    }
+
+    /// A modern request; its response (notifications in between are skipped).
+    fn request(&mut self, method: &str, mut params: Value, tasks: bool) -> Value {
+        let id = self.next;
+        self.next += 1;
+        let caps = if tasks { json!({"extensions": {"io.modelcontextprotocol/tasks": {}}}) } else { json!({}) };
+        params["_meta"] = json!({"io.modelcontextprotocol/protocolVersion": VERSION, "io.modelcontextprotocol/clientCapabilities": caps});
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        loop {
+            let message = self.line();
+            if message["id"] == id {
+                return message;
+            }
+        }
+    }
+
+    fn call(&mut self, tool: &str, arguments: Value) -> Value {
+        self.request("tools/call", json!({"name": tool, "arguments": arguments}), false)["result"].clone()
+    }
+
+    /// A task for `tool`, polled to its end.
+    fn task(&mut self, tool: &str, arguments: Value) -> Value {
+        let created = self.request("tools/call", json!({"name": tool, "arguments": arguments}), true);
+        assert_eq!(created["result"]["resultType"], "task", "{created}");
+        let id = created["result"]["taskId"].clone();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let task = self.request("tasks/get", json!({"taskId": id}), true)["result"].clone();
+            if task["status"] != "working" {
+                return task;
+            }
+            assert!(Instant::now() < deadline, "the task never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Closes stdin and waits for the server to exit, as a client does to shut it down.
+    fn close(mut self) -> std::process::ExitStatus {
+        drop(self.stdin.take());
+        self.child.wait().expect("exits")
+    }
+}
+
+#[test]
+fn an_agent_discovers_creates_and_drives_a_device() {
+    let e = Env::new("drive");
+    let mut mcp = e.mcp();
+
+    let discover = mcp.request("server/discover", json!({}), false)["result"].clone();
+    assert_eq!(discover["supportedVersions"][0], VERSION);
+    assert_eq!(discover["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "simee");
+
+    // Every API method is a tool.
+    let tools = mcp.request("tools/list", json!({}), false)["result"]["tools"].clone();
+    for name in ["devices", "create", "boot", "tap", "swipe", "screenshot", "console", "fold", "device_view"] {
+        assert!(tools.as_array().is_some_and(|t| t.iter().any(|x| x["name"] == name)), "{name}");
+    }
+
+    // A device is created as a task (creating an AVD isn't instant on a real SDK) and then listed.
+    let created = mcp.task("create", json!({"name": "fold", "platform": "android", "system_image": IMAGE, "form_factor": "foldable"}));
+    assert_eq!(created["status"], "completed", "{created}");
+    assert_eq!(created["result"]["structuredContent"]["form_factor"], "foldable");
+    let devices = mcp.call("devices", json!({"platform": "android"}));
+    assert_eq!(devices["structuredContent"][0]["udid"], "fold");
+
+    // The device is a resource, and so is each thing about it.
+    let resources = mcp.request("resources/list", json!({}), false)["result"]["resources"].clone();
+    assert!(resources.as_array().is_some_and(|r| r.iter().any(|x| x["uri"] == "simee://devices/fold")));
+    let info = mcp.request("resources/read", json!({"uri": "simee://devices/fold"}), false);
+    assert!(info["result"]["contents"][0]["text"].as_str().is_some_and(|t| t.contains("fold")), "{info}");
+
+    // A stopped device refuses input: a tool error, not a protocol one.
+    let refused = mcp.call("tap", json!({"device": "fold", "x": 10, "y": 20}));
+    assert_eq!(refused["isError"], true);
+    assert!(refused["content"][0]["text"].as_str().is_some_and(|t| t.contains("isn't running")));
+
+    // Once it runs (a fake emulator stands in for the boot), the same tools drive it.
+    let fake = fake_emulator(&e.android(), "fold");
+    let tap = mcp.call("tap", json!({"device": "fold", "x": 10, "y": 20}));
+    assert_eq!(tap.get("isError"), None, "{tap}");
+    mcp.call("swipe", json!({"device": "fold", "x1": 300, "y1": 900, "x2": 300, "y2": 300, "duration_ms": 50}));
+    mcp.call("button", json!({"device": "fold", "button": "home"}));
+    mcp.call("fold", json!({"device": "fold", "posture": "half-opened"}));
+    let display = wait_for(&fake.display, 4);
+    assert_eq!(display[..2], ["touch 10 20 down", "touch 10 20 up"]);
+    let console = wait_for(&fake.console, 2);
+    assert!(console.iter().any(|l| l == "event send EV_KEY:KEY_HOME:1"), "{console:?}");
+
+    // Its screen is an image to the agent and a resource to the client.
+    let shot = mcp.call("screenshot", json!({"device": "fold"}));
+    assert_eq!(shot["content"][0]["type"], "image");
+    assert!(shot["content"][0]["data"].as_str().is_some_and(|d| d.starts_with("iVBOR")), "a PNG");
+    let resource = mcp.request("resources/read", json!({"uri": "simee://devices/fold/screenshot"}), false);
+    assert_eq!(resource["result"]["contents"][0]["mimeType"], "image/png");
+    let view = mcp.call("device_view", json!({"device": "fold"}));
+    assert!(view["structuredContent"]["screen"]["width"].is_number(), "{view}");
+
+    // Closing stdin is the client's goodbye: the server exits cleanly.
+    assert!(mcp.close().success());
+}
+
+#[test]
+fn a_client_of_an_older_revision_opens_with_initialize() {
+    let e = Env::new("legacy");
+    let mut mcp = e.mcp();
+    mcp.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}}));
+    let init = mcp.line();
+    assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+    mcp.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    mcp.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "form_factors", "arguments": {"platform": "android"}}}));
+    let result = mcp.line();
+    assert_eq!(result["id"], 2);
+    assert!(result["result"]["content"][0]["text"].as_str().is_some_and(|t| t.contains("Wear OS")), "{result}");
+    assert!(mcp.close().success());
+}

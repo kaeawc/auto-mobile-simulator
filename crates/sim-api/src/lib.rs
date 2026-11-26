@@ -21,6 +21,7 @@ mod ios;
 mod ios;
 mod methods;
 mod params;
+mod schema;
 pub mod settle;
 
 use std::io::{BufRead, BufReader, Write};
@@ -31,7 +32,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use forward::{HANDSHAKE_TIMEOUT, IN_CALLER, forwards, identity};
-pub use methods::{METHODS, Session, call as call_method};
+pub use methods::{METHODS, Session, call as call_method, platforms};
+pub use schema::input_schema;
 pub use sim_core::frame::encode_png;
 
 /// The default socket path: `$SIMEE_SOCKET`, else `$TMPDIR/simee.sock`.

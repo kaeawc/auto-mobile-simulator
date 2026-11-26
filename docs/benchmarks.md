@@ -223,6 +223,22 @@ CASE=2480,1080,true cargo test --release -p emu frame_path_latency -- --ignored 
 The injected network shaper's cost per call is measured in
 [research/netshape-overhead.md](research/netshape-overhead.md).
 
+## MCP server
+
+What the MCP server's protocol layer costs to build, against the official Rust SDK. Linux VM,
+4 vCPUs, 2026-11-26, `CARGO_BUILD_JOBS=2`, rustc 1.99.1.
+
+| Measure | `sim-mcp` (hand-written, on `serde_json`) | `rmcp` 3.11 |
+| --- | --- | --- |
+| Crates added to `Cargo.lock` | 1 (`sim-mcp`) | 75 in the normal dependency tree |
+| Clean dev build of a program that depends on it, empty `main` | not measured alone: 0 new dependencies to build | 41 s wall (62 s user, 11 s system) |
+
+`rmcp` was built from a scratch package with `rmcp = { version = "3.11", default-features = false,
+features = ["server", "transport-io"] }` and `tokio` with `rt`, `macros` and `io-std`; the crate
+count is `cargo tree --prefix none -e normal | sort -u | wc -l` in it (145 with its dev
+dependencies). `Cargo.lock` has 140 packages in all. Why this decides the protocol layer:
+[mcp.md](mcp.md#why-the-protocol-layer-is-hand-written).
+
 ## Build times (local)
 
 Apple silicon Mac, 16 CPUs, macOS 26.6, 2026-11-26. The host was heavily loaded by other builds
@@ -271,6 +287,8 @@ Claims that would belong in the README once someone runs them:
   device's directory (6,562 files), so the host's `mds_stores` indexes what devices write. What
   excluding `~/Library/Developer/CoreSimulator` from Spotlight saves a farm needs a change to the
   host's Spotlight privacy settings to measure.
+- Time per automation step through `simee mcp` (a `tools/call` of `tap`, then `screenshot`) against
+  the socket API and the CLI on the same device.
 - Host CPU of an idle booted device, emu against the SDK emulator.
 - Network throughput and latency through emu's NAT against the SDK emulator's slirp.
 - Host CPU of an idle booted device with and without the virtio-snd card (`EMU_VIRTIO_SND=0`),
