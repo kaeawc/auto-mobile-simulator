@@ -98,7 +98,9 @@ impl phy::Device for Wire {
 
     fn receive(&mut self, _: smoltcp::time::Instant) -> Option<(RxTok, TxTok<'_>)> {
         let f = self.rx.pop_front()?;
-        // A reply to what the guest sent (an ACK, an ARP reply) always goes.
+        // smoltcp answers some frames while taking them (an ARP reply, a RST) whatever `limit`
+        // says; `flush` finds those room. Its TCP ACKs and SYN-ACKs are sent from `transmit`,
+        // so `limit` holds them until the queue has room instead of losing them.
         Some((RxTok(f), TxTok(&mut self.tx)))
     }
 
@@ -464,6 +466,8 @@ impl Engine {
         self.service_datagrams();
         self.expire();
         self.flush();
+        #[cfg(test)]
+        self.shared.shaper_built.store(self.shaping.is_some(), Ordering::Relaxed);
         self.shared.flows.store(self.tcp.len() + self.udp.len() + self.ping.len(), Ordering::Relaxed);
     }
 
@@ -498,9 +502,15 @@ impl Engine {
             return;
         }
         let now = Instant::now();
-        // The pass was limited to the shaper's room, so these fit; a frame that doesn't is lost.
+        // The pass was limited to the shaper's room, but smoltcp's replies made while taking a
+        // guest frame (an ARP reply, a RST) ignore it, so they may not fit. Control frames take
+        // a small reserve past the cap; bulk past it is lost, as at a full link.
         for f in self.wire.tx.drain(..) {
-            s.down.push(now, f);
+            if packet::is_control(&f) {
+                s.down.push_control(now, f);
+            } else {
+                s.down.push(now, f);
+            }
         }
         let mut any = false;
         let mut q = lock(&self.shared.to_guest);
