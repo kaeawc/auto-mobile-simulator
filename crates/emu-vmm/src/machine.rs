@@ -99,6 +99,29 @@ fn renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     }
 }
 
+/// Initializes the renderer in `lib64` exactly as a boot would for a guest of that kind (no GL
+/// backend with `vulkan_only`, VulkanVirtualQueue with `virtual_queue`), with no guest, and
+/// returns how long it took. What the init compiles (ANGLE's Metal shader library, the
+/// compositor's pipelines) lands in Metal's shader cache, so the next process's init finds it
+/// there (`emu -provision-renderer` warms it this way, in a child per kind). Once per process,
+/// like any renderer init; call after `emu_gfxstream::configure_environment`.
+pub fn warm_renderer(lib64: PathBuf, vulkan_only: bool, virtual_queue: bool) -> Result<Duration> {
+    let t = Instant::now();
+    let spec = GpuSpec {
+        lib64,
+        width: 720,
+        height: 1280,
+        verbose: false,
+        display: Arc::new(crate::display::FrameStore::default()),
+        vulkan_only,
+        virtual_queue,
+        // Warming is for the guests that boot on bootconfig (API 31 and newer), not the GLES-pipe ones.
+        pipe_gles: false,
+    };
+    renderer(&spec)?;
+    Ok(t.elapsed())
+}
+
 /// Waits out an init [`start_renderer`] began that no boot claimed (a launch that fails before
 /// it reaches the GPU), so the process never exits while the renderer is inside dlopen or EGL
 /// init. The result is dropped: the launch is failing anyway.

@@ -126,10 +126,40 @@ pub fn provision_renderer(env: &Env, opts: &Opts) -> Result<()> {
     renderer(&sdk, opts, true)
 }
 
+/// Installs the gfxstream renderer out of the `emulator` package (see [`install_renderer`]),
+/// then, unless it's a dry run, initializes it once so the first boot finds Metal's shader
+/// cache warm ([`warm_renderer`]).
+fn renderer(sdk: &Sdk, opts: &Opts, update: bool) -> Result<()> {
+    install_renderer(sdk, opts, update)?;
+    if !opts.dry_run {
+        warm_renderer(sdk.root());
+    }
+    Ok(())
+}
+
+/// Initializes the renderer boots will use once, in a child process: its init compiles ANGLE's
+/// Metal shader library (about 4 s), which then sits in emu's own shader cache, so the first
+/// boot doesn't wait for it.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn warm_renderer(root: &std::path::Path) {
+    let Some(lib64) = renderer::find_lib64(root) else { return };
+    let (ok, warmed, took) = crate::vkprobe::warm(&lib64);
+    if !ok {
+        println!("renderer probed in {:.1} s; MoltenVK didn't come up, so boots use lavapipe (software Vulkan)", took.as_secs_f64());
+    } else if warmed {
+        println!("renderer initialized in {:.1} s, its Metal shaders now cached", took.as_secs_f64());
+    } else {
+        eprintln!("emu: warming the renderer failed after {:.1} s; the first boot compiles its shaders instead", took.as_secs_f64());
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn warm_renderer(_: &std::path::Path) {}
+
 /// Installs the gfxstream renderer out of the `emulator` package. With `update` the newest
 /// stable revision is installed unless it already is; without it (plain `-provision`) any
 /// renderer the SDK already has will do, including the SDK's own emulator package.
-fn renderer(sdk: &Sdk, opts: &Opts, update: bool) -> Result<()> {
+fn install_renderer(sdk: &Sdk, opts: &Opts, update: bool) -> Result<()> {
     let root = sdk.root();
     let sdk_package = renderer::sdk_emulator_lib64(root);
     let installed = renderer::installed(root);

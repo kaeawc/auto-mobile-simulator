@@ -5,22 +5,27 @@
 //! ```text
 //! cargo run -p emu-gfxstream --example renderer_caps -- <lib64> [moltenvk|swiftshader|lavapipe]
 //! cargo run -p emu-gfxstream --example renderer_caps -- -load-only <lib64>
+//! cargo run -p emu-gfxstream --example renderer_caps -- -emu <lib64>
 //! ```
 //!
 //! Like `emu`, it links `lib64` beside itself and sets the launcher directory to its parent.
 //! `-load-only` skips the link and stops after loading: the backend's dependencies then resolve
 //! through preloading alone (this binary's only rpath is `@executable_path/lib64` on macOS; on
 //! Linux it has none). The ICD defaults to MoltenVK on macOS and lavapipe on Linux. `-vulkan-only`
-//! initializes without the GL backend, as emu does.
+//! initializes without the GL backend, as emu does. `-emu` initializes the renderer as `emu` does
+//! for an API 36 guest (no GL, Vulkan composition, emu's features), and every run prints how long
+//! the init took: the cold init's Metal shader compiles show there (docs/android.md, "Renderer
+//! init and Metal's shader cache").
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::path::PathBuf;
 
-    const USAGE: &str = "usage: renderer_caps [-load-only|-vulkan-only] <lib64> [moltenvk|swiftshader|lavapipe]";
+    const USAGE: &str = "usage: renderer_caps [-load-only|-vulkan-only|-emu] <lib64> [moltenvk|swiftshader|lavapipe]";
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let load_only = args.first().is_some_and(|a| a == "-load-only");
     let vulkan_only = args.first().is_some_and(|a| a == "-vulkan-only");
-    if load_only || vulkan_only {
+    let as_emu = args.first().is_some_and(|a| a == "-emu");
+    if load_only || vulkan_only || as_emu {
         args.remove(0);
     }
     let lib64 = PathBuf::from(args.first().ok_or(USAGE)?);
@@ -48,13 +53,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if load_only {
         return Ok(());
     }
-    let flags = if vulkan_only {
-        emu_gfxstream::flags::USE_VK | emu_gfxstream::flags::VULKAN_NATIVE_SWAPCHAIN
-    } else {
-        emu_gfxstream::flags::USE_GLES | emu_gfxstream::flags::USE_VK
-    };
+    use emu_gfxstream::flags;
     let t = std::time::Instant::now();
-    r.init(720, 1280, flags, false, std::sync::Arc::new(|_| {}))?;
+    if as_emu {
+        let features = "RefCountPipe:enabled,GlDirectMem:enabled,HasSharedSlotsHostMemoryAllocator:enabled,VulkanVirtualQueue:enabled";
+        let flags = flags::USE_EGL | flags::USE_VK | flags::VULKAN_NATIVE_SWAPCHAIN;
+        r.init_with_features(720, 1280, flags, Some(features), false, std::sync::Arc::new(|_| {}))?;
+    } else {
+        let flags = if vulkan_only { flags::USE_VK | flags::VULKAN_NATIVE_SWAPCHAIN } else { flags::USE_GLES | flags::USE_VK };
+        r.init(720, 1280, flags, false, std::sync::Arc::new(|_| {}))?;
+    }
     println!(
         "initialized in {:.0} ms (Vulkan {})",
         t.elapsed().as_secs_f64() * 1e3,
