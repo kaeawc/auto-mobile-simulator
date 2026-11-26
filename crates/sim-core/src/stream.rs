@@ -8,8 +8,8 @@
 //! - `socket`: send frames on the socket again (a client that couldn't open the ring);
 //! - `rotates`: send frames as the panel lies and say how to turn them (`EMUO`), for a client
 //!   that turns them as it draws; without it a turned device's frames come turned upright;
-//! - `touch <x> <y> down|move|up` in pixels of the screen as the device is turned (the frames'
-//!   pixels, turned upright when the stream says to turn them);
+//! - `touch <x> <y> down|move|up` in pixels of the screen as the guest rotated its display (the
+//!   frames' pixels, turned upright when the stream says to turn them);
 //! - `key <name>`: press and release a key by its console name (`HOME`, `BACK`, `POWER`, `A`, ...);
 //! - `wheel <ticks>` on the rotary / scroll device.
 //!
@@ -20,8 +20,8 @@
 //! - `EMUS`: a frame whose RGBA rows are in a slot of the last announced ring (the header's last
 //!   u32 is the slot), so only these 32 bytes cross the socket;
 //! - `EMUO`: the frames after it are to be turned clockwise by the last u32's quarter turns
-//!   ([`Rotation`]) to show upright, as the device is turned. Only to clients that sent `rotates`,
-//!   before their first frame and whenever it changes.
+//!   ([`Rotation`]) to show upright, as the guest rotated its display. Only to clients that sent
+//!   `rotates`, before their first frame and whenever it changes.
 //!
 //! `EMUR` and `EMUS` go only to clients that sent `shm`; a server that predates it ignores the
 //! line and keeps sending `EMUF`, so clients read whichever arrives. The ring ([`ring`]) is a

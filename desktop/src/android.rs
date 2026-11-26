@@ -257,8 +257,8 @@ impl Screen {
         self.alive.load(Ordering::Relaxed)
     }
 
-    /// The device's display size as it's shown, turned with the device (input coordinates);
-    /// `None` until the first frame.
+    /// The device's display size as it's shown, turned as the guest rotated it (input
+    /// coordinates); `None` until the first frame.
     pub fn device_size(&self) -> Option<(u32, u32)> {
         let (w, h) = (self.device.0.load(Ordering::Relaxed), self.device.1.load(Ordering::Relaxed));
         (w > 0 && h > 0).then(|| self.rotation().turned((w, h)))

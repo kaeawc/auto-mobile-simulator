@@ -43,8 +43,10 @@ pinned at `7a70745`, the same rev sim-rs uses.
    client that stops reading paces itself (the write blocks); a ring client reads a slot within
    two intervals or sees it torn and skips it.
 6. **Window.** The desktop reads each frame into the buffer it hands to `Pixels`.
-7. **A turned device.** The accelerometer's coarse orientation (`rotate`, `sensor set
-   acceleration`) sets the store's turn. A client that sends `rotates` (the desktop) gets frames
+7. **A turned device.** The guest's own display rotation, read from the lines its window
+   manager logs as it rotates (emu's logcat watch, `sim_core::rotation::guest_rotation`), sets
+   the store's turn; the accelerometer alone (`rotate`, `sensor set acceleration`) doesn't, since
+   the guest may not follow it. A client that sends `rotates` (the desktop) gets frames
    as the panel lies and an `EMUO` record before its first frame and whenever the turn changes;
    the view draws the picture turned with Rune's `rotate` (on the GPU) inside a box of the upright
    screen's shape, which takes the pointer, so touches come in upright pixels. Other clients and

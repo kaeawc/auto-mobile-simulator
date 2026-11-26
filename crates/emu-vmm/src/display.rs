@@ -15,11 +15,11 @@
 //! timer of its own. Unread guest-composed frames are then read in place into the kept buffer,
 //! one buffer instead of three.
 //!
-//! A turned device ([`FrameStore::set_rotation`]) keeps its frames as the panel lies: readers that
-//! turn them as they draw (the desktop, on the GPU) take them that way ([`FrameStore::latest`]),
-//! and the rest get them turned upright ([`FrameStore::latest_upright`]), turned once per frame
-//! into a buffer of their own that every such reader shares. An unturned device never touches
-//! that buffer.
+//! A guest that rotated its display ([`FrameStore::set_rotation`]) still draws into the panel as
+//! it lies: readers that turn frames as they draw (the desktop, on the GPU) take them that way
+//! ([`FrameStore::latest`]), and the rest get them turned upright ([`FrameStore::latest_upright`]),
+//! turned once per frame into a buffer of their own that every such reader shares. An unturned
+//! display never touches that buffer.
 //!
 //! A renderer without GL can't report its posts (gfxstream's post callback reads every post back
 //! through GL); [`PostTicker`] stands in, driven by the renderer's fences.
@@ -102,10 +102,10 @@ pub struct FrameStore {
     /// The part of the scanout readers see (x, y, width, height): a folded foldable's outer
     /// screen. None: all of it.
     view: Mutex<Option<View>>,
-    /// How far the device is turned: the view turned by this much is what its viewer sees.
+    /// How far the guest rotated its display: the view turned by this much is its layout upright.
     rotation: Mutex<Rotation>,
     /// The capture turned upright, for readers that don't turn frames themselves, and the turn
-    /// it was made with; filled only while the device is turned.
+    /// it was made with; filled only while the display is turned.
     upright: Mutex<(Capture, Rotation)>,
 }
 
@@ -209,8 +209,9 @@ impl FrameStore {
         clip_view(*lock(&self.view), w, h).map_or((0, 0), |(x, y, ..)| (x, y))
     }
 
-    /// The device is turned by `rotation` (from its accelerometer), from the latest frame on:
-    /// the frame is counted again, so streams on a static screen send it turned.
+    /// The guest rotated its display by `rotation` (as its log reports it, not the
+    /// accelerometer: the guest may not follow that), from the latest frame on: the frame is
+    /// counted again, so streams on a static screen send it turned.
     pub fn set_rotation(&self, rotation: Rotation) {
         let mut r = lock(&self.rotation);
         if *r == rotation {
@@ -236,8 +237,8 @@ impl FrameStore {
     }
 
     /// The scanout pixel under point `(x, y)` of the screen readers are shown upright (the view,
-    /// turned as the device is): what a touch there presses. The view's size is the latest
-    /// frame's; before one, points are taken as scanout pixels.
+    /// turned as the guest's display is, which is uiautomator's): what a touch there presses. The
+    /// view's size is the latest frame's; before one, points are taken as scanout pixels.
     pub fn to_scanout(&self, x: f64, y: f64) -> (i32, i32) {
         let (w, h, frames) = self.geometry();
         let (ox, oy) = self.view_origin();

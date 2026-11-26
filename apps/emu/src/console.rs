@@ -142,7 +142,6 @@ fn sensor(info: &ConsoleInfo, words: &[&str]) -> String {
                 }
                 Ok(v) => {
                     if info.sensors.set(name, v) {
-                        follow_gravity(info);
                         "OK".into()
                     } else {
                         format!("KO: bad sensor '{name}' or value count")
@@ -159,16 +158,9 @@ fn sensor(info: &ConsoleInfo, words: &[&str]) -> String {
     }
 }
 
-/// Turns the display as the accelerometer says the device is turned (`rotate`, or `sensor set
-/// acceleration`), as the stock emulator's screenshots turn with its coarse orientation.
-fn follow_gravity(info: &ConsoleInfo) {
-    if let (Some(display), Some(&[x, y, _])) = (&info.display, info.sensors.get("acceleration").as_deref()) {
-        display.set_rotation(sim_core::rotation::Rotation::from_gravity(x, y));
-    }
-}
-
-/// A point on the screen as screenshots show it (turned with the device; a folded foldable's
-/// outer screen) as the scanout pixel under it, which the touch screen reports.
+/// A point on the screen as screenshots show it (the guest's layout, turned as the guest rotated
+/// its display; a folded foldable's outer screen) as the scanout pixel under it, which the touch
+/// screen reports.
 fn to_scanout(info: &ConsoleInfo, x: i32, y: i32) -> (i32, i32) {
     info.display.as_ref().map_or((x, y), |d| d.to_scanout(f64::from(x), f64::from(y)))
 }
@@ -252,8 +244,9 @@ fn event(info: &ConsoleInfo, words: &[&str]) -> String {
     }
 }
 
-/// `screenshot [path]`: the latest scanout frame as PNG, turned upright as the device is turned
-/// (as stock's gRPC `getScreenshot` and `screenrecord screenshot` are). Encoded straight from the
+/// `screenshot [path]`: the latest scanout frame as PNG, turned upright as the guest rotated its
+/// display (as `adb screencap` is; stock's gRPC `getScreenshot` follows the accelerometer instead,
+/// which shows the content sideways when the guest doesn't follow it). Encoded straight from the
 /// capture the display stream shares, so a screenshot of a frame already streamed reads nothing
 /// back.
 fn screenshot(info: &ConsoleInfo, path: Option<&str>) -> String {
@@ -501,6 +494,7 @@ const HELP: &[(&str, &str)] = &[
     ("ping", "check if the emulator is alive"),
     ("sensor", "manage emulator sensors"),
     ("screenshot", "take a screenshot of the display"),
+    ("rotation", "degrees the guest rotated its display, which screenshots and touches follow (simee)"),
     ("touch", "touch the screen at x y (simee)"),
     ("touchpad", "touch the touchpad at x y, display glasses (simee)"),
     ("pen", "a stylus on the screen at x y: hover, down, move, up, leave (simee)"),
@@ -629,12 +623,12 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
         "fold" if words.get(1) == Some(&"status") => crate::fold::status(info.fold.as_deref()),
         "fold" | "unfold" | "posture" => crate::fold::console(info.fold.as_deref(), words),
         // Stock: rotate the device 90° clockwise. Gravity in device coordinates turns the
-        // other way, and the guest's auto-rotation follows the accelerometer.
+        // other way, and the guest's auto-rotation follows the accelerometer if it will; the
+        // frames turn when the guest reports that it rotated (`crate::instance`'s logcat watch).
         "rotate" => match info.sensors.get("acceleration").as_deref() {
             Some(&[x, y, z]) => {
                 info.sensors.set("acceleration", vec![-y + 0.0, x + 0.0, z]);
                 info.sensors.set("acceleration-uncalibrated", vec![-y + 0.0, x + 0.0, z]);
-                follow_gravity(info);
                 "OK".into()
             }
             _ => "KO: no accelerometer".into(),
@@ -658,6 +652,13 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
                 "OK".into()
             }
             _ => "KO: usage: clipboard get|set <text>".into(),
+        },
+        // simee extension: how far the frames are turned clockwise to show the guest's display
+        // upright, in degrees (the guest's own rotation): what `touch`, `pen` and screenshots
+        // are turned by.
+        "rotation" => match &info.display {
+            Some(d) => format!("rotation: {}\r\nOK", d.rotation().degrees()),
+            None => "rotation: 0\r\nOK".into(),
         },
         "touch" => {
             // simee extension: `touch <x> <y> [down|up|tap]` in pixels of the screen as
@@ -973,26 +974,58 @@ mod tests {
         assert_eq!(run(&info, "sensor get acceleration"), "acceleration = 0:9.80665:0\r\nOK");
     }
 
+    /// The accelerometer alone never turns frames or touches: the guest decides whether its
+    /// display follows it (auto-rotate off, a portrait-locked app and a phone's 180° leave it as
+    /// it is), and the display turns only when the guest reports a rotation (the logcat watch in
+    /// `crate::instance`). A device lying flat, with noise, stays as it is.
     #[test]
-    fn the_display_turns_with_the_accelerometer_as_stock_screenshots_do() {
+    fn rotate_and_gravity_alone_dont_turn_the_display() {
         use sim_core::rotation::Rotation;
+        for form_factor in FormFactor::ALL {
+            let mut info = console(form_factor);
+            let store = Arc::new(emu_vmm::display::FrameStore::default());
+            info.display = Some(store.clone());
+            for _ in 0..4 {
+                assert_eq!(run(&info, "rotate"), "OK");
+                assert_eq!(store.rotation(), Rotation::Deg0, "{form_factor:?}");
+            }
+            if info.sensors.get("acceleration").is_some() {
+                for gravity in ["0.3:0.1:9.8", "-0.4:0.2:-9.8", "-9.81:0:0"] {
+                    assert_eq!(run(&info, &format!("sensor set acceleration {gravity}")), "OK");
+                    assert_eq!(store.rotation(), Rotation::Deg0, "{form_factor:?} {gravity}");
+                }
+            }
+        }
+    }
+
+    /// The guest kept its display upright (auto-rotate off) while `rotate` turned the
+    /// accelerometer: a touch and a pen at uiautomator's bounds press that panel pixel, unturned.
+    #[test]
+    fn touches_follow_the_guests_rotation_not_the_accelerometer() {
+        use emu_vmm::display::DisplaySink;
+        use emu_vmm::virtio::input::{ABS_MT_POSITION_X, ABS_MT_POSITION_Y, EV_ABS};
         let mut info = console(FormFactor::Phone);
         let store = Arc::new(emu_vmm::display::FrameStore::default());
         info.display = Some(store.clone());
-        // Each `rotate` a quarter clockwise, as stock's gRPC screenshots turn after each.
-        for want in [Rotation::Deg90, Rotation::Deg180, Rotation::Deg270, Rotation::Deg0] {
-            assert_eq!(run(&info, "rotate"), "OK");
-            assert_eq!(store.rotation(), want);
+        let devices = attach_inputs(&info, false);
+        store.present(720, 1280, 720 * 4, sim_core::pixels::PixelFormat::RGBA_VIRTIO, &vec![0u8; 720 * 1280 * 4]);
+        assert_eq!(run(&info, "rotate"), "OK");
+        assert_eq!(run(&info, "touch 540 1200 down"), "OK");
+        assert_eq!(run(&info, "pen 540 1200 down"), "OK");
+        let at = |batch: &[InputEvent]| {
+            let v = |code| batch.iter().find(|e| e.typ == EV_ABS && e.code == code).map(|e| e.value);
+            (v(ABS_MT_POSITION_X), v(ABS_MT_POSITION_Y))
+        };
+        let batches = devices.touch.expect("touch").take_queued();
+        assert_eq!(batches.len(), 2);
+        // (540, 1200) of the 720x1280 panel on the touch screen's 0..32768 axes.
+        for b in &batches {
+            assert_eq!(at(b), (Some(540 * 32768 / 720), Some(1200 * 32768 / 1280)), "{b:?}");
         }
-        // Gravity set directly turns it too (stock's screenshots follow the sensor, not `rotate`).
-        assert_eq!(run(&info, "sensor set acceleration -9.81:0:0"), "OK");
-        assert_eq!(store.rotation(), Rotation::Deg90);
-        assert_eq!(run(&info, "sensor set acceleration 0:9.81:0"), "OK");
-        assert_eq!(store.rotation(), Rotation::Deg0);
-        assert_eq!(run(&info, "sensor set temperature 30"), "OK");
-        assert_eq!(store.rotation(), Rotation::Deg0, "other sensors don't turn it");
     }
 
+    /// The guest rotated its display a quarter (its layout 1280x720): screenshots, touches and
+    /// pens are in that layout's pixels.
     #[test]
     fn a_turned_devices_screenshots_touches_and_pens_are_upright() {
         use emu_vmm::display::DisplaySink;
@@ -1005,7 +1038,9 @@ mod tests {
         let mut px = vec![0u8; 720 * 1280 * 4];
         px[..4].copy_from_slice(&[255, 0, 0, 255]);
         store.present(720, 1280, 720 * 4, sim_core::pixels::PixelFormat::RGBA_VIRTIO, &px);
-        assert_eq!(run(&info, "rotate"), "OK");
+        assert_eq!(run(&info, "rotation"), "rotation: 0\r\nOK");
+        store.set_rotation(sim_core::rotation::Rotation::Deg90);
+        assert_eq!(run(&info, "rotation"), "rotation: 90\r\nOK");
         let path = std::env::temp_dir().join(format!("emu-console-turned-{}.png", std::process::id()));
         let reply = run(&info, &format!("screenshot {}", path.display()));
         let png = std::fs::read(&path).expect("written");

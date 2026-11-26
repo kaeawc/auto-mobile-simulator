@@ -1,12 +1,19 @@
-//! How far a device has been turned from its natural orientation, in quarter turns clockwise,
-//! and what that does to its frames and touches.
+//! How far a device's display is rotated from its natural orientation, in quarter turns
+//! clockwise, and what that does to its frames and touches.
 //!
-//! The panel never turns: an Android guest that follows the accelerometer draws its turned
-//! layout into the same scanout, sideways on it. A viewer holding the turned device sees the
-//! panel turned with it, so the stock emulator's window turns the scanout by the same amount.
-//! Here a [`Rotation`] says how far to turn a panel frame clockwise to show it upright (the
-//! *screen*), and maps points both ways: a touch at screen pixels lands on the panel pixel shown
-//! there, which is what the touch screen (fixed to the panel) reports.
+//! The panel never turns: an Android guest that rotates its display draws its turned layout
+//! into the same scanout, sideways on it. Here a [`Rotation`] says how far to turn a panel frame
+//! clockwise to show that layout upright (the *screen*, what `adb screencap` and uiautomator's
+//! bounds are in), and maps points both ways: a touch at screen pixels lands on the panel pixel
+//! shown there, which is what the touch screen (fixed to the panel) reports.
+//!
+//! The turn is the guest's own display rotation, not the accelerometer's: the guest decides
+//! whether to follow gravity (auto-rotate, an app's orientation lock, a phone's refusal to turn
+//! upside down, a device lying flat), and its window manager logs each rotation it makes
+//! ([`guest_rotation`]), which emu reads from the guest's logcat stream. Only the form factors
+//! whose guests rotate ([`turns`]) are followed.
+
+use crate::form_factor::FormFactor;
 
 /// Quarter turns clockwise, from the device's natural orientation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -39,20 +46,13 @@ impl Rotation {
         degrees.is_multiple_of(90).then(|| Self::from_quarters(degrees / 90))
     }
 
-    /// How far a device is turned whose accelerometer reads `x`, `y` (m/s², device axes: x to
-    /// the panel's right, y to its top; a device at rest upright reads +g on y). The axis in the
-    /// panel's plane that gravity pulls along most wins, as the stock emulator's coarse
-    /// orientation (gRPC `getScreenshot`'s rotation) follows the accelerometer: turned a quarter
-    /// clockwise, the panel's right edge points down and x reads -g. A device lying flat, or
-    /// read with a tie, is upright.
-    pub fn from_gravity(x: f32, y: f32) -> Rotation {
-        if x.abs() > y.abs() {
-            if x < 0.0 { Self::Deg90 } else { Self::Deg270 }
-        } else if y < 0.0 {
-            Self::Deg180
-        } else {
-            Self::Deg0
-        }
+    /// The turn for Android's display rotation `surface` (`Surface.ROTATION_0..270`, 0 to 3:
+    /// quarter turns the layout is rotated counter-clockwise on the panel). A phone turned with
+    /// its top to the right is at `ROTATION_270`, and its panel's frames turn a quarter clockwise
+    /// to show it upright (checked on the stock emulator 37.2.13: after one `rotate` its guest
+    /// reports `ROTATION_270` and `adb screencap` is the panel turned so). None past 3.
+    pub fn from_surface(surface: u32) -> Option<Rotation> {
+        (surface < 4).then(|| Self::from_quarters(surface).inverse())
     }
 
     /// A further quarter turn clockwise (what Android's `rotate` console command does).
@@ -96,6 +96,37 @@ impl Rotation {
         // Undoing the turn on the screen's own size gives the panel pixel.
         self.inverse().panel_to_screen((sx, sy), (sw, sh))
     }
+}
+
+/// Whether a device of `form_factor` turns its display: phones, tablets and foldables. A TV, a
+/// car's display, a watch and an XR headset or glasses keep their panel's orientation (their
+/// guests don't rotate, and simee never turns their frames).
+pub fn turns(form_factor: FormFactor) -> bool {
+    matches!(form_factor, FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable)
+}
+
+/// The logcat tags whose lines say the guest rotated its display ([`guest_rotation`]), and the
+/// priority they're logged at.
+pub const ROTATION_TAGS: [(&str, char); 2] = [("WindowManager", 'I'), ("ActivityTaskManager", 'I')];
+
+/// The default display's new rotation, if logcat `line` reports one. The guest's window manager
+/// logs it two ways, both at info: `Display id=0 rotation changed to 3 from 0, ...`
+/// (`WindowManager`, API 36 and later) and the global configuration it then applies, `Config
+/// changes=... winConfig={ ... mDisplayRotation=ROTATION_270 ...}` (`ActivityTaskManager`, which
+/// API 34 and 35 log too). Other displays' lines and anything else are None.
+pub fn guest_rotation(line: &str) -> Option<Rotation> {
+    const CHANGED: &str = "Display id=0 rotation changed to ";
+    if let Some(at) = line.find(CHANGED) {
+        let n = line[at + CHANGED.len()..].chars().next()?.to_digit(10)?;
+        return Rotation::from_surface(n);
+    }
+    // Capitalised: WindowManager's per-display `Override config changes=` is the same change.
+    const CONFIG: &str = "Config changes=";
+    const DISPLAY: &str = "mDisplayRotation=ROTATION_";
+    let config = &line[line.find(CONFIG)?..];
+    let at = config.find(DISPLAY)? + DISPLAY.len();
+    let degrees: String = config[at..].chars().take_while(char::is_ascii_digit).collect();
+    Rotation::from_surface(degrees.parse::<u32>().ok().filter(|d| d % 90 == 0)? / 90)
 }
 
 /// Turns tightly packed RGBA (`width` x `height`, top row first) clockwise by `rotation` into
@@ -160,17 +191,52 @@ mod tests {
             assert_eq!(Rotation::from_degrees(r.degrees()), Some(r));
             assert_eq!(Rotation::from_quarters(r.quarters() + r.inverse().quarters()), Rotation::Deg0);
         }
-        // What the stock emulator's accelerometer reads after 0..3 `rotate`s (37.2.13), and the
-        // turn its gRPC screenshots then have.
-        for (x, y, r) in
-            [(0.0, 9.77, Rotation::Deg0), (-9.81, 0.0, Rotation::Deg90), (0.0, -9.81, Rotation::Deg180), (9.81, 0.0, Rotation::Deg270)]
-        {
-            assert_eq!(Rotation::from_gravity(x, y), r, "({x}, {y})");
+        // Android's ROTATION_270 (a phone turned with its top to the right, as after stock's
+        // first `rotate`) is the panel turned a quarter clockwise.
+        for (surface, r) in [(0, Rotation::Deg0), (1, Rotation::Deg270), (2, Rotation::Deg180), (3, Rotation::Deg90)] {
+            assert_eq!(Rotation::from_surface(surface), Some(r), "ROTATION_{}", surface * 90);
         }
-        assert_eq!(Rotation::from_gravity(0.0, 0.0), Rotation::Deg0, "lying flat");
-        assert_eq!(Rotation::from_gravity(-6.0, 7.0), Rotation::Deg0, "tilted, mostly upright");
+        assert_eq!(Rotation::from_surface(4), None);
         assert_eq!(Rotation::Deg90.turned((1080, 2400)), (2400, 1080));
         assert_eq!(Rotation::Deg180.turned((1080, 2400)), (1080, 2400));
+    }
+
+    /// The lines the guest logs when it rotates, as API 36 and API 34 images log them (captured
+    /// under simee, 2026-11-26), and lines that must not count.
+    #[test]
+    fn the_guests_rotation_is_read_from_its_log() {
+        let api36 = "11-26 09:58:57.210   642   680 I WindowManager: Display id=0 rotation changed to 3 from 0, lastOrientation=-1 userRotationMode=0 userRotation=0 lastSensorRotation=3";
+        assert_eq!(guest_rotation(api36), Some(Rotation::Deg90));
+        let back = "11-26 09:58:41.101   642   680 I WindowManager: Display id=0 rotation changed to 0 from 1, lastOrientation=-1";
+        assert_eq!(guest_rotation(back), Some(Rotation::Deg0));
+        let api34 = "11-26 10:07:09.487   540  1888 I ActivityTaskManager: Config changes=20000580 {1.0 310mcc260mnc [en_US] ldltr sw360dp w640dp h312dp 320dpi nrml long land finger qwerty/v/v dpad/v winConfig={ mBounds=Rect(0, 0 - 1280, 720) mAppBounds=Rect(0, 0 - 1280, 672) mMaxBounds=Rect(0, 0 - 1280, 720) mDisplayRotation=ROTATION_270 mWindowingMode=fullscreen mActivityType=undefined mAlwaysOnTop=undefined mRotation=ROTATION_270} s.6 fontWeightAdjustment=0}";
+        assert_eq!(guest_rotation(api34), Some(Rotation::Deg90));
+        assert_eq!(guest_rotation(&api34.replace("ROTATION_270", "ROTATION_90")), Some(Rotation::Deg270));
+        for not in [
+            // Another display, the per-display override (the same change again), a config change
+            // that says nothing of rotation, and noise.
+            "I WindowManager: Display id=2 rotation changed to 1 from 0",
+            "I WindowManager: Override config changes=20000480 {... mDisplayRotation=ROTATION_90 ...} for displayId=3",
+            "I ActivityTaskManager: Config changes=4 {1.0 ... }",
+            "I ActivityTaskManager: Config changes=20000480 {... mDisplayRotation=ROTATION_45 ...}",
+            "I WindowManager: Display id=0 rotation changed to x from 0",
+            "",
+        ] {
+            assert_eq!(guest_rotation(not), None, "{not}");
+        }
+    }
+
+    /// Phones, tablets and foldables turn; XR (headsets and glasses), TVs, cars and watches
+    /// never do.
+    #[test]
+    fn only_handheld_displays_turn() {
+        for ff in FormFactor::ALL {
+            let want = matches!(ff, FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable);
+            assert_eq!(turns(ff), want, "{ff:?}");
+        }
+        for never in [FormFactor::Vision, FormFactor::Tv, FormFactor::Auto, FormFactor::Watch] {
+            assert!(!turns(never), "{never:?}");
+        }
     }
 
     #[test]

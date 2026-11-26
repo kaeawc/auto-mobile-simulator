@@ -18,8 +18,8 @@ pub struct FakeEmulator {
     pub display: Arc<Mutex<Vec<String>>>,
     /// What `fold status` answers before its `OK` (simee's hinge report); None: a bare `OK`.
     pub fold_status: Arc<Mutex<Option<String>>>,
-    /// What `sensor get acceleration` reads, `x:y:z` (upright at first, `0:9.80665:0`).
-    pub acceleration: Arc<Mutex<String>>,
+    /// What simee's `rotation` answers: degrees the guest rotated its display (0 at first).
+    pub rotation: Arc<Mutex<u32>>,
 }
 
 /// Starts a fake emulator for AVD `avd` and advertises it in `android`'s running dir, so the AVD
@@ -39,8 +39,8 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
     let console = Arc::new(Mutex::new(Vec::new()));
     let fold_status: Arc<Mutex<Option<String>>> = Arc::default();
     let status = fold_status.clone();
-    let acceleration = Arc::new(Mutex::new("0:9.80665:0".to_owned()));
-    let gravity = acceleration.clone();
+    let rotation = Arc::new(Mutex::new(0));
+    let turned = rotation.clone();
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("console");
     let port = listener.local_addr().expect("addr").port();
     let log = console.clone();
@@ -62,7 +62,8 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
                     }
                     ["ping"] => "I am alive!\r\nOK".to_owned(),
                     ["frames"] => "3\r\nOK".to_owned(),
-                    ["sensor", "get", "acceleration"] => format!("acceleration = {}\r\nOK", gravity.lock().expect("gravity")),
+                    ["rotation"] if stock => "KO: unknown command, try 'help'".to_owned(),
+                    ["rotation"] => format!("rotation: {}\r\nOK", turned.lock().expect("rotation")),
                     ["fold", "status"] if stock => "KO: Usage: \"fold\"".to_owned(),
                     ["fold", "status"] => match status.lock().expect("status").as_deref() {
                         Some(lines) => format!("{lines}\r\nOK"),
@@ -104,7 +105,7 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
     let emulator = if stock { "" } else { "emulator=simee\n" };
     let ad = format!("port.serial={port}\nport.adb={}\navd.name={avd}\n{emulator}", port + 1);
     std::fs::write(running.join(format!("pid_{}.ini", std::process::id())), ad).expect("advertise");
-    FakeEmulator { console, display, fold_status, acceleration }
+    FakeEmulator { console, display, fold_status, rotation }
 }
 
 /// `lines` once it holds `n` entries (or after 5 s, whatever it holds).

@@ -42,15 +42,34 @@ fn full_console(opts: &Opts) -> bool {
     opts.show_kernel || std::env::var("EMU_CONSOLE").is_ok_and(|v| v == "full")
 }
 
-/// The guest's logcat filter for `goldfish-logcat` (`logcat -f /dev/hvc1 ${ro.boot.logcat}`):
-/// `-logcat`'s, everything with `-logcat-output` alone, else silent (`*:S`): the stream is
-/// discarded then (stock's null chardev), so formatting and writing it is wasted guest work.
-fn logcat_filter(opts: &Opts) -> &str {
+/// The logcat filter the user asked for: `-logcat`'s, everything with `-logcat-output` alone,
+/// else silent (`*:S`): the stream is discarded then (stock's null chardev).
+fn user_logcat_filter(opts: &Opts) -> &str {
     match (&opts.logcat, &opts.logcat_output) {
         (Some(tags), _) => tags,
         (None, Some(_)) => "*:V",
         (None, None) => "*:S",
     }
+}
+
+/// Whether emu follows the guest's display rotation: on the form factors whose displays turn
+/// ([`sim_core::rotation::turns`]), from the lines the guest logs when it rotates.
+fn follows_rotation(avd: &Avd) -> bool {
+    sim_core::rotation::turns(avd.profile().kind.form_factor)
+}
+
+/// The guest's logcat filter for `goldfish-logcat` (`logcat -f /dev/hvc1 ${ro.boot.logcat}`):
+/// the user's ([`user_logcat_filter`]), plus, on a device whose display turns, the lines that
+/// report its rotation ([`sim_core::rotation::ROTATION_TAGS`], a few per rotation or app start)
+/// for emu to read. Anything else stays unformatted in the guest unless the user asked for it.
+fn logcat_filter(avd: &Avd, opts: &Opts) -> String {
+    let user = user_logcat_filter(opts);
+    if !follows_rotation(avd) {
+        return user.to_owned();
+    }
+    let parsed = sim_core::logcat::Filter::parse(user);
+    let guest = sim_core::logcat::with_tags(&parsed, &sim_core::rotation::ROTATION_TAGS);
+    if guest == parsed { user.to_owned() } else { guest.spec() }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -148,8 +167,6 @@ impl Instance {
         // the boot before it wrote, panic text included.
         let console_log =
             File::create(dir.join("console.log")).with_context(|| format!("creating {}", dir.join("console.log").display()))?;
-        let logcat =
-            logcat_sink(opts).with_context(|| format!("opening -logcat-output {}", opts.logcat_output.as_deref().unwrap_or("")))?;
         let adb_port = console_port + 1;
         let adb = emu_vmm::pipe::adb::AdbListener::bind(adb_port).with_context(|| format!("binding adb port {adb_port}"))?;
         let gpu_lib64 = renderer(avd, opts);
@@ -188,6 +205,9 @@ impl Instance {
             emu_gfxstream::configure_environment(emulator_dir, icd);
         }
         let display = gpu_lib64.as_ref().map(|_| std::sync::Arc::new(emu_vmm::display::FrameStore::default()));
+        let watch = display.clone().filter(|_| follows_rotation(avd));
+        let logcat =
+            logcat_sink(opts, watch).with_context(|| format!("opening -logcat-output {}", opts.logcat_output.as_deref().unwrap_or("")))?;
         Ok(Instance {
             avd: avd.clone(),
             console_port,
@@ -375,15 +395,74 @@ pub const LOGCAT_ROTATE_BYTES: u64 = 4 << 20;
 const LOGCAT_SPOOL_DEPTH: usize = 1024;
 
 /// Where logcat's stream goes for this process: `-logcat-output`'s file (rotated), stdout with
-/// `-logcat` alone, else nowhere. Behind a spool either way.
+/// `-logcat` alone, and `watch`, the display that turns as the guest's log says it rotated
+/// ([`LogcatWatch`]); nowhere without either. Behind a spool either way.
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
-pub fn logcat_sink(opts: &Opts) -> std::io::Result<Option<emu_vmm::virtio::console::Spool>> {
-    let out: Box<dyn std::io::Write + Send> = match (&opts.logcat_output, &opts.logcat) {
-        (Some(path), _) => Box::new(RotatingFile::create(Path::new(path), LOGCAT_ROTATE_BYTES)?),
-        (None, Some(_)) => Box::new(std::io::stdout()),
+pub fn logcat_sink(
+    opts: &Opts,
+    watch: Option<std::sync::Arc<emu_vmm::display::FrameStore>>,
+) -> std::io::Result<Option<emu_vmm::virtio::console::Spool>> {
+    let out: Option<Box<dyn std::io::Write + Send>> = match (&opts.logcat_output, &opts.logcat) {
+        (Some(path), _) => Some(Box::new(RotatingFile::create(Path::new(path), LOGCAT_ROTATE_BYTES)?)),
+        (None, Some(_)) => Some(Box::new(std::io::stdout())),
+        (None, None) => None,
+    };
+    let out: Box<dyn std::io::Write + Send> = match (out, watch) {
         (None, None) => return Ok(None),
+        // Nothing but the user's: as they asked, untouched.
+        (Some(out), None) => out,
+        (out, Some(display)) => {
+            let filter = sim_core::logcat::Filter::parse(user_logcat_filter(opts));
+            Box::new(LogcatWatch { display, out: out.map(|o| (o, filter)), line: Vec::new() })
+        }
     };
     emu_vmm::virtio::console::Spool::new("logcat-out", out, LOGCAT_SPOOL_DEPTH).map(Some)
+}
+
+/// The guest's logcat stream as emu reads it, a line at a time: a line that reports the
+/// display's rotation ([`sim_core::rotation::guest_rotation`]) turns `display`'s frames and
+/// touches to match, and the lines the user's filter shows go on to `out` (the tags emu added
+/// for itself don't, unless the user's filter shows them too).
+struct LogcatWatch {
+    display: std::sync::Arc<emu_vmm::display::FrameStore>,
+    out: Option<(Box<dyn std::io::Write + Send>, sim_core::logcat::Filter)>,
+    /// The line so far.
+    line: Vec<u8>,
+}
+
+/// A line longer than this is taken as it is (logcat's own limit is about 4 KB a message).
+const LOGCAT_LINE_MAX: usize = 16 << 10;
+
+impl LogcatWatch {
+    fn end_line(&mut self) -> std::io::Result<()> {
+        let text = String::from_utf8_lossy(&self.line);
+        if let Some(r) = sim_core::rotation::guest_rotation(&text) {
+            self.display.set_rotation(r);
+        }
+        let written = match &mut self.out {
+            Some((out, filter)) if filter.passes(text.trim_end()) => out.write_all(&self.line),
+            _ => Ok(()),
+        };
+        // The line is done with even when its write failed (a full disk loses it, nothing more).
+        self.line.clear();
+        written
+    }
+}
+
+impl std::io::Write for LogcatWatch {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        for piece in buf.split_inclusive(|b| *b == b'\n') {
+            self.line.extend_from_slice(piece);
+            if piece.ends_with(b"\n") || self.line.len() >= LOGCAT_LINE_MAX {
+                self.end_line()?;
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.as_mut().map_or(Ok(()), |(out, _)| out.flush())
+    }
 }
 
 /// A log file that, before a write would take it past `cap` bytes, is renamed to `<path>.1`
@@ -530,7 +609,7 @@ impl BootPlan {
             plan.cmdline = plan.cmdline.replace(" bootconfig", "");
             plan.cmdline.push(' ');
             plan.cmdline.push_str(&legacy_cmdline(&bc, plan.renderer.is_some()));
-            plan.boot_props.push(("qemu.cmdline".to_string(), logcat_pipe_cmdline(logcat_filter(opts))));
+            plan.boot_props.push(("qemu.cmdline".to_string(), logcat_pipe_cmdline(&logcat_filter(avd, opts))));
         }
         plan
     }
@@ -646,7 +725,7 @@ fn bootconfig(avd: &Avd, opts: &Opts, graphics: bool) -> BootConfig {
         .set("androidboot.serialno", "EMULATOR0EMURS0")
         .set("androidboot.veritymode", "enforcing")
         .set("androidboot.dalvik.vm.heapsize", "576m")
-        .set("androidboot.logcat", logcat_filter(opts))
+        .set("androidboot.logcat", logcat_filter(avd, opts))
         .set("androidboot.qemu.skin", format!("{w}x{h}"))
         .set("androidboot.qemu.vsync", "60")
         .set("androidboot.qemu.settings.system.screen_off_timeout", "2147483647")
@@ -955,14 +1034,20 @@ mod tests {
             assert!(words.contains(&w), "{w} missing from {}", q.cmdline);
         }
         assert!(!q.cmdline.contains("androidboot.qemu"), "{}", q.cmdline);
-        // logcat -Q's filter and pipe (#38), silent without -logcat.
+        // logcat -Q's filter and pipe (#38), silent without -logcat but for the lines that say
+        // the display rotated.
         let cmdline_prop = |p: &BootPlan| p.boot_props.iter().find(|(k, _)| k == "qemu.cmdline").map(|(_, v)| v.clone());
-        assert_eq!(cmdline_prop(&q).as_deref(), Some("androidboot.logcat=*:S androidboot.consolepipe=qemu_pipe,pipe:logcat"));
+        assert_eq!(
+            cmdline_prop(&q).as_deref(),
+            Some("androidboot.logcat=WindowManager:I,ActivityTaskManager:I,*:S androidboot.consolepipe=qemu_pipe,pipe:logcat")
+        );
         let tags = Opts { logcat: Some("ActivityManager:I  *:S".into()), ..Opts::default() };
         let q_tags = BootPlan::new(&s.env.load("q").expect("load"), &tags, None);
         assert_eq!(
             cmdline_prop(&q_tags).as_deref(),
-            Some("androidboot.logcat=ActivityManager:I,*:S androidboot.consolepipe=qemu_pipe,pipe:logcat")
+            Some(
+                "androidboot.logcat=ActivityManager:I,WindowManager:I,ActivityTaskManager:I,*:S androidboot.consolepipe=qemu_pipe,pipe:logcat"
+            )
         );
 
         let new = plan(&s, "s");
@@ -1240,6 +1325,72 @@ mod tests {
         assert_eq!(plan(&s, "car").kind, "Android Automotive · Auto");
     }
 
+    /// Only phones, tablets and foldables follow their guest's rotation: an XR headset, display
+    /// glasses, a TV, a car and a watch log nothing for it and get no watch on their log.
+    #[test]
+    fn only_displays_that_turn_follow_the_guests_rotation() {
+        let s = sdk("turns");
+        for name in ["watch", "tv", "car", "headset", "glasses"] {
+            let avd = s.env.load(name).expect("load");
+            assert!(!follows_rotation(&avd), "{name}");
+            assert_eq!(BootPlan::new(&avd, &Opts::default(), None).bootconfig.get("androidboot.logcat"), Some("*:S"), "{name}");
+            let mine = Opts { logcat: Some("MyApp:D *:S".into()), ..Opts::default() };
+            assert_eq!(BootPlan::new(&avd, &mine, None).bootconfig.get("androidboot.logcat"), Some("MyApp:D *:S"), "{name}");
+        }
+        let phone = s.env.load("phone").expect("load");
+        assert!(follows_rotation(&phone));
+        let mine = Opts { logcat: Some("MyApp:D *:S".into()), ..Opts::default() };
+        assert_eq!(
+            BootPlan::new(&phone, &mine, None).bootconfig.get("androidboot.logcat"),
+            Some("MyApp:D WindowManager:I ActivityTaskManager:I *:S")
+        );
+        // Without a display to turn or output to write, there's no stream to keep.
+        assert!(logcat_sink(&Opts::default(), None).expect("sink").is_none());
+    }
+
+    /// The guest's log turns the display as each rotation line arrives (split across writes or
+    /// not), and the user's output keeps only what their filter shows.
+    #[test]
+    fn the_guests_log_turns_the_display_and_the_user_sees_their_own_lines() {
+        use sim_core::rotation::Rotation;
+        use std::io::Write as _;
+        #[derive(Clone, Default)]
+        struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("out").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let display = std::sync::Arc::new(emu_vmm::display::FrameStore::default());
+        let out = Shared::default();
+        let user = sim_core::logcat::Filter::parse("MyApp:D *:S");
+        let mut w = LogcatWatch { display: display.clone(), out: Some((Box::new(out.clone()), user)), line: Vec::new() };
+        let turn = "11-26 09:58:57.210   642   680 I WindowManager: Display id=0 rotation changed to 3 from 0, lastOrientation=-1\n";
+        let (a, b) = turn.split_at(60);
+        w.write_all(a.as_bytes()).expect("write");
+        assert_eq!(display.rotation(), Rotation::Deg0, "half a line");
+        w.write_all(
+            format!("{b}11-26 09:58:57.300  4242  4242 D MyApp: hello\n11-26 09:58:57.301  4242  4242 V MyApp: quiet\n").as_bytes(),
+        )
+        .expect("write");
+        assert_eq!(display.rotation(), Rotation::Deg90);
+        assert_eq!(String::from_utf8_lossy(&out.0.lock().expect("out")), "11-26 09:58:57.300  4242  4242 D MyApp: hello\n");
+        // API 34's line, back upright.
+        w.write_all(
+            b"11-26 10:07:09.487   540  1888 I ActivityTaskManager: Config changes=20000580 {winConfig={ mDisplayRotation=ROTATION_0 }}\n",
+        )
+        .expect("write");
+        assert_eq!(display.rotation(), Rotation::Deg0);
+        // With no user output, only the display hears it.
+        let mut quiet = LogcatWatch { display: display.clone(), out: None, line: Vec::new() };
+        quiet.write_all(b"x I WindowManager: Display id=0 rotation changed to 1 from 0\n").expect("write");
+        assert_eq!(display.rotation(), Rotation::Deg270);
+    }
+
     #[test]
     fn plans_follow_the_command_line_and_find_missing_files() {
         let s = sdk("opts");
@@ -1251,10 +1402,11 @@ mod tests {
         assert_eq!(p.bootconfig.get("androidboot.debug.sf.nobootanimation"), Some("1"));
         assert!(p.missing().is_empty(), "the AVD's own disks are made at boot");
 
-        // The console is quiet unless -show-kernel; logcat's stream is silent unless asked for.
+        // The console is quiet unless -show-kernel; logcat's stream is silent unless asked for,
+        // but for the lines that say the display rotated.
         let p = BootPlan::new(&avd, &Opts::default(), None);
         assert!(p.cmdline.contains(" loglevel=3") && p.cmdline.contains("console=ttyAMA0"), "{}", p.cmdline);
-        assert_eq!(p.bootconfig.get("androidboot.logcat"), Some("*:S"));
+        assert_eq!(p.bootconfig.get("androidboot.logcat"), Some("WindowManager:I ActivityTaskManager:I *:S"));
         let shown = BootPlan::new(&avd, &Opts { show_kernel: true, logcat: Some("*:I".into()), ..Opts::default() }, None);
         assert!(!shown.cmdline.contains("loglevel="), "{}", shown.cmdline);
         assert_eq!(shown.bootconfig.get("androidboot.logcat"), Some("*:I"));

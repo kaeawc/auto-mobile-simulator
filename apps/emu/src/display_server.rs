@@ -176,8 +176,8 @@ fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<e
             (Input::Socket, _) => wants.shared.store(false, Ordering::Relaxed),
             (Input::Rotates, _) => wants.rotates.store(true, Ordering::Relaxed),
             (Input::Touch { x, y, phase }, Some(emu_vmm::Inputs { touch: Some(touch), .. })) => {
-                // Clients point at the screen they show: upright as the device is turned, a
-                // folded foldable's view from its origin on the scanout.
+                // Clients point at the screen they show: upright as the guest rotated its
+                // display, a folded foldable's view from its origin on the scanout.
                 let (x, y) = display.to_scanout(f64::from(x), f64::from(y));
                 match phase {
                     Phase::Down | Phase::Move => {

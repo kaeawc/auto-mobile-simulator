@@ -415,6 +415,11 @@ fn boot(
         match out.reason {
             emu_vmm::StopReason::Reset if !stop.load(Ordering::SeqCst) => {
                 emu_vmm::teardown_step(None, opts.verbose);
+                // The guest boots again in its natural orientation, and logs a rotation only
+                // when it next makes one.
+                if let Some(display) = &inst.display {
+                    display.set_rotation(sim_core::rotation::Rotation::Deg0);
+                }
                 cfg = inst.machine_config(opts, launched)?;
                 announce_fold_at_boot(&mut cfg, fold.clone());
             }

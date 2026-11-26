@@ -13,6 +13,7 @@ pub mod goldfish;
 pub mod hid;
 pub mod indigo;
 pub mod launchd;
+pub mod logcat;
 pub mod network;
 pub mod pacing;
 pub mod pixels;
