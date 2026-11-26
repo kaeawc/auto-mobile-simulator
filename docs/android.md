@@ -98,6 +98,25 @@ the fix instead of failing on a missing socket. `shutdown` interrupts the qemu p
 that the PID still is a qemu running that AVD. `simee list` does not mark the emulator yet: `DeviceInfo` has no
 field for it.
 
+## Rendering modes
+
+`emu -gpu MODE` takes the stock emulator's names, and an AVD's `hw.gpu.mode` in `config.ini`
+applies when no `-gpu` flag is given (the flag wins). An unknown mode is an error that lists
+the valid ones. Every mode renders through gfxstream; what differs is the Vulkan driver under it.
+
+| Mode | Runs on | Use it when |
+|---|---|---|
+| `auto`, `host` (default) | the host GPU through MoltenVK/KosmicKrisp; lavapipe if MoltenVK fails here | a normal desktop session |
+| `lavapipe`, `swangle`, `angle_indirect` | lavapipe, software Vulkan on the CPU | no GPU, CI, headless hosts |
+| `swiftshader`, `swiftshader_indirect` | SwiftShader, software Vulkan on the CPU | comparing against lavapipe |
+| `software`, `guest` | lavapipe, with stock's notice that guest rendering isn't supported | an AVD configured that way keeps booting |
+| `off`, `none` | no renderer; the guest boots without graphics | boot-only checks (flag only; `hw.gpu.mode=off` in `config.ini` is ignored) |
+
+Rendering inside the guest (virtio-gpu 2D with Mesa in the image) isn't possible with SDK
+images: a scan of the API 34 to 37 system images found none that ships a guest renderer, and
+stock 37.2.13 reports "the system image does not support guest rendering" and falls back to
+lavapipe for an AVD configured for it. `emu` does the same and prints that notice once.
+
 ## Benchmarks
 
 `scripts/android-bench.sh` boots an AVD the same way under either emulator and measures it. The

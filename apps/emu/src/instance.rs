@@ -164,9 +164,13 @@ impl Instance {
         if let Some(lib64) = &gpu_lib64
             && let Some(emulator_dir) = lib64.parent()
         {
-            let icd = match opts.gpu.as_deref() {
-                Some("swiftshader" | "swiftshader_indirect") => emu_gfxstream::Icd::SwiftShader,
-                Some("lavapipe" | "swangle") => emu_gfxstream::Icd::Lavapipe,
+            let choice = emu_avd::gpu::resolve(opts.gpu.as_deref(), avd.get("hw.gpu.mode"));
+            if choice.guest_fallback {
+                eprintln!("{}", emu_avd::gpu::GUEST_FALLBACK_NOTICE);
+            }
+            let icd = match choice.backend {
+                emu_avd::gpu::Backend::SwiftShader => emu_gfxstream::Icd::SwiftShader,
+                emu_avd::gpu::Backend::Lavapipe => emu_gfxstream::Icd::Lavapipe,
                 // MoltenVK (host GPU) unless it fails on this machine; then software.
                 _ if crate::vkprobe::moltenvk_works(lib64) => emu_gfxstream::Icd::MoltenVk,
                 _ => {
