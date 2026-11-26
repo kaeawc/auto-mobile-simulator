@@ -46,7 +46,7 @@ fn effect(method: &str) -> Option<Effect> {
         | "audio_mute" | "fold" | "carplay" | "profile" | "privacy" => Set,
         "create" | "boot" | "boot_many" | "clone" | "tap" | "swipe" | "touch" | "button" | "type" | "key" | "open_url" | "install"
         | "memory_warning" | "notify" | "biometric" | "rotate" | "rotary" | "watch_gesture" | "remote_swipe" | "xr" | "touchpad"
-        | "stylus" | "vehicle" | "audio_capture_stop" => Act,
+        | "stylus" | "pointer" | "vehicle" | "audio_capture_stop" => Act,
         // Runs programs, starts apps with an environment, replaces a network profile (inject "boot"
         // reboots the device), delivers a payload, writes a recording to a path, drives the console.
         "exec" | "launch" | "push" | "network_shape" | "console" | "audio_capture_start" | "kill" => Danger,

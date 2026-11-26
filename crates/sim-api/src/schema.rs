@@ -52,7 +52,7 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         "hold_ms" | "duration_ms" | "timeout_s" | "settle_timeout_s" | "concurrency" | "first_port" | "usage" | "pid" | "signal"
         | "ticks" | "pressure" | "level" | "wifi_bars" | "cellular_bars" | "battery_level" | "state" | "port_base" | "port_count" => Int,
         "booted" | "on" | "suppressed" | "undo" | "shaped" | "settle" | "settle_foreground" | "audio" | "mute" | "sizes" | "offline"
-        | "proxy" | "face" | "foreground" | "eraser" => Bool,
+        | "proxy" | "face" | "foreground" | "eraser" | "folded" => Bool,
         "env" => StrMap,
         "payload" => Obj,
         "rules" => Objects,
@@ -203,7 +203,8 @@ const IRREGULAR: &[(&str, &[&str])] = &[("xr", &["x", "y", "z", "environment", "
 /// Methods whose grammar writes alternative forms with shared names (`touchpad`: a touch is `x, y`,
 /// a swipe adds `to_x, to_y`), which a per-name reading can't tell apart: the parameters every
 /// form needs.
-const REQUIRED: &[(&str, &[&str])] = &[("touchpad", &["device", "x", "y"]), ("stylus", &["device", "x", "y"])];
+const REQUIRED: &[(&str, &[&str])] =
+    &[("touchpad", &["device", "x", "y"]), ("stylus", &["device", "x", "y"]), ("pointer", &["device", "x", "y"])];
 
 /// The JSON Schema (an object schema) of `method`'s parameters, or `None` for a name that isn't in
 /// [`METHODS`]. Choices, ranges and defaults become `enum`, `minimum`/`maximum` and `default`;
@@ -360,7 +361,7 @@ mod tests {
         let rotary = schema("rotary");
         assert_eq!(rotary["required"], json!(["device"]));
         assert_eq!(rotary["properties"]["delta"]["description"], "Digital Crown units; iOS; give one of `ticks`, `delta`");
-        assert_eq!(one_of("fold"), [["angle", "posture"]]);
+        assert_eq!(one_of("fold"), [["folded", "angle", "posture"]]);
         assert_eq!(one_of("console"), [["command", "commands"]]);
         // `text? | base64?` are both optional, and a lone name or a quoted word is no group.
         assert!(one_of("write").is_empty() && one_of("audio_route").is_empty() && one_of("tap").is_empty());
@@ -395,6 +396,7 @@ mod tests {
         assert_eq!(schema("touchpad")["required"], json!(["device", "x", "y"]));
         // `ticks | delta`: an Apple Watch takes either, an Android watch only `ticks`, so neither is
         // required alone; each says it goes with the other.
+        assert_eq!(schema("pointer")["required"], json!(["device", "x", "y"]));
         assert_eq!(schema("rotary")["required"], json!(["device"]));
         assert_eq!(one_of("rotary"), [["ticks", "delta"]]);
         assert_eq!(schema("rotary")["properties"]["ticks"]["description"], "give one of `ticks`, `delta`");
