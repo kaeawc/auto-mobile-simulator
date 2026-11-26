@@ -148,7 +148,8 @@ in [android.md](android.md#performance-notes).
 | Change | Before | After | Measured on |
 | --- | --- | --- | --- |
 | Kick the target vCPU on an interrupt: first-boot `/data` encryption | 22 s | 8 s | M-series Mac, an earlier macOS |
-| No kicks on an interrupt (`EMU_VCPU_WAKE` default `targeted` → `none`): first boot (`-wipe-data`) of a 720×1280 API 36 phone, median (runs) | 14.3 s (14.3, 29.4 starved, 13.0) | 12.9 s (13.0, 12.9, 11.9 starved) | M3 Max, macOS 26.6.2, 2026-11-26, host load 9.5 to 20, arms interleaved, `EMU_VCPU_WAKE=targeted\|none scripts/android-bench.sh <label> <avd> emu -wipe-data` |
+| No kicks on an interrupt (`EMU_VCPU_WAKE` default `targeted` → `none` on macOS 26 and later): first boot (`-wipe-data`) of a 720×1280 API 36 phone, median (runs). A tie: the arms differ by less than the run-to-run spread | 11.4 s (11.4, 11.5, 11.4) | 11.6 s (11.8, 11.4; a third low-load run is owed) | M3 Max, macOS 26.6.2, 2026-11-26, runs at 1-minute load 7.7 to 8.1 (16 CPUs), arms interleaved, `EMU_VCPU_WAKE=targeted\|none scripts/android-bench.sh <label> <avd> emu -wipe-data` |
+| Same runs, vCPU0 guest entries / emu CPU-seconds to `sys.boot_completed`, first boot, median | 348k / 21.7 | 257k / 22.1 | same runs (`vcpu0_runs`, `cpu_s`) |
 | Same change, warm boot, median of 6 | 4.2 s (3.5 to 4.7) | 3.7 s (3.7 to 5.2) | same AVD and hour, host load 9.6 to 13.2 |
 | Same change, vCPU0 guest entries to `sys.boot_completed`, first / warm boot, median | 338k / 59.7k | 249k / 41.4k | same runs (`vcpu0_runs`) |
 | Same change, emu CPU-seconds to `sys.boot_completed`, first / warm boot, median | 25.0 / 9.3 | 23.4 / 8.7 | same runs (`cpu_s`) |
@@ -203,6 +204,7 @@ The injected network shaper's cost per call is measured in
 
 Claims that would belong in the README once someone runs them:
 
+- First boot with and without interrupt kicks at a 1-minute load under 8: three more runs per arm (two `none` runs and three `targeted` runs are published), and the `targeted` default below macOS 26 has no measurement on that macOS.
 - `simee screenshot` against `xcrun simctl io screenshot` on a quiet host.
 - iOS boot and settle on a quiet host (the runs above had other load).
 - Time per automation step (tap, then screenshot) through the socket API against `simctl` and

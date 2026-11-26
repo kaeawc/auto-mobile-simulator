@@ -384,7 +384,10 @@ fn boot(
             emu_vmm::teardown_step(Some(EXITING), opts.verbose);
         }
         match out.reason {
-            emu_vmm::StopReason::Reset if !stop.load(Ordering::SeqCst) => cfg = inst.machine_config(opts, launched)?,
+            emu_vmm::StopReason::Reset if !stop.load(Ordering::SeqCst) => {
+                emu_vmm::teardown_step(None, opts.verbose);
+                cfg = inst.machine_config(opts, launched)?
+            }
             emu_vmm::StopReason::Fault(msg) => {
                 eprintln!("emu: guest fault: {msg}");
                 return Ok(ExitCode::FAILURE);

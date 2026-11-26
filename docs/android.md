@@ -270,23 +270,30 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
 - **In-kernel GICv3.** The stock board emulates a GICv2 in userspace. Here interrupt
   acknowledge, EOI and the virtual timer never leave the guest, and an idle vCPU parks inside
   the framework (zero WFI exits in practice).
-- **No kick on interrupt.** An earlier macOS left a vCPU idling inside the framework asleep
+- **No kick on interrupt (macOS 26 and later).** An earlier macOS left a vCPU idling inside the framework asleep
   until its own timer fired when a device raised an SPI, and kicking vCPUs out of
   `hv_vcpu_run` after raising one cut first-boot `/data` encryption from 22 s to 8 s. On macOS
   26.6 `hv_gic_set_spi` alone wakes the target, as other VMMs on macOS 26 found, and the kicks
   only cost exits. The guest routes every SPI to vCPU0 (Android has no irqbalance), so each
   device completion cost vCPU0 an InterruptStatus read, an InterruptACK write and a kick, and
   the kicks were 28% of its guest entries. A/B on an API 36 phone (720×1280, 4 vCPUs), M3 Max,
-  macOS 26.6.2, 2026-11-26, interleaved, `scripts/android-bench.sh` at host load 9.5 to 20,
-  median boot to `sys.boot_completed` (runs), targeted kicks → none:
+  macOS 26.6.2, 2026-11-26, interleaved, `scripts/android-bench.sh`, median boot to
+  `sys.boot_completed` (runs), targeted kicks → none. The first-boot row is the runs at a 1-minute
+  load of 7.7 to 8.1 on 16 CPUs; an earlier set at load 9.5 to 20 had starved runs in it and is
+  not used. The warm row was measured at load 9.6 to 13.2.
 
   | Boot | Targeted kicks | No kicks | vCPU0 guest entries at boot | emu CPU-s at boot |
   | --- | --- | --- | --- | --- |
-  | First (`-wipe-data`: format, `/data` encryption, dexopt) | 14.3 s (14.3, 29.4\*, 13.0) | 12.9 s (13.0, 12.9, 11.9\*) | 338k → 249k | 25.0 → 23.4 |
+  | First (`-wipe-data`: format, `/data` encryption, dexopt) | 11.4 s (11.4, 11.5, 11.4) | 11.6 s (11.8, 11.4) | 348k → 257k | 21.7 → 22.1 |
   | Warm | 4.2 s (4.7, 3.5, 3.6, 3.9, 4.6, 4.4) | 3.7 s (3.7, 3.7, 3.7, 3.7, 5.2, 4.8) | 59.7k → 41.4k | 9.3 → 8.7 |
 
-  \* `starved=yes`: the 1-minute load passed 16 (the CPU count) during the boot. The 29.4 s
-  boot also waited 5.1 s for the renderer (below).
+  First boot is a tie: no kicks is 0.2 s slower on a median of two, inside the spread, with a
+  quarter fewer vCPU0 guest entries. Owed: a third low-load `none` run and more of both (the host
+  load climbed past 14 during the rest of the rerun, and those boots, 12.6 to 22.8 s, are not
+  published). The warm-boot, vCPU0-entry and jank rows are what the default rests on. The
+  default is chosen from the macOS version (`Mode::default_for_macos`): `none` on 26 and later,
+  `targeted` below 26 and when the version can't be read, because the 22 s to 8 s stall was
+  seen on an earlier macOS and nothing here measured those.
 
   Without kicks vCPU0 had 1 canceled exit per boot instead of about 16k (warm) or 100k (first).
   Launcher swipes (`scripts/android-jank.sh`, a minute after boot, 2 boots per arm, 3 runs

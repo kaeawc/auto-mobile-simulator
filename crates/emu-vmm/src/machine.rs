@@ -309,6 +309,12 @@ pub fn exit_counts() -> Option<Vec<Vec<(&'static str, u64)>>> {
 /// What the teardown is doing and since when ([`teardown_step`]).
 static TEARDOWN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 
+/// The last step [`boot_and_run`] marks: what runs after the machine is released and before
+/// the caller takes over, the drops of what the function still holds (the outcome's inputs, the
+/// renderer's handles). The caller's next [`teardown_step`] ends it, so a stop that stalls here
+/// is named, not reported as "no step".
+pub const RETURNING_STEP: &str = "dropping the machine's remaining state";
+
 /// A teardown step that takes longer than this is printed (`-verbose`).
 pub const SLOW_TEARDOWN_STEP: Duration = Duration::from_millis(250);
 
@@ -661,7 +667,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     teardown_step(Some("releasing guest RAM"), verbose);
     drop(as_area);
     drop(mem);
-    teardown_step(None, verbose);
+    teardown_step(Some(RETURNING_STEP), verbose);
     if let (StopReason::Reset, Some(spec)) = (&reason, &cfg.gpu) {
         blank_until_next_post(&*spec.display, spec.verbose);
     }
@@ -710,6 +716,16 @@ fn hold_then_blank(display: &dyn crate::display::DisplaySink, hold: Option<(&cra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_gap_after_the_machine_is_a_named_step() {
+        teardown_step(Some("releasing guest RAM"), false);
+        teardown_step(Some(RETURNING_STEP), false);
+        let (what, _) = teardown_status().expect("a step is under way");
+        assert_eq!(what, RETURNING_STEP);
+        teardown_step(None, false);
+        assert!(teardown_status().is_none());
+    }
 
     fn spec(lib64: PathBuf) -> GpuSpec {
         GpuSpec {

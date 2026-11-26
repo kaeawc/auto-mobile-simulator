@@ -3,11 +3,12 @@
 //! With the framework's in-kernel GIC an idle vCPU waits for interrupts inside `hv_vcpu_run`.
 //! simee once measured that wait not noticing an SPI raised by a device thread until the vCPU's
 //! own timer fired, and kicked vCPUs out of the run (`hv_vcpus_exit`) to see it (first-boot
-//! `/data` encryption: 22 s without, 8 s with). On macOS 26.6 the framework wakes the target
-//! itself, as other VMMs on the same API (QEMU's and libkrun's in-kernel GIC, arcbox on macOS
-//! 26.4) found: without kicks, first boots took 12.9 s against 14.3 s and warm boots 3.7 s against
-//! 4.2 s, with a third fewer vCPU0 guest entries, so [`Mode::NoKick`] is the default and kicks are
-//! kept for A/B runs. Kicking every vCPU for every SPI costs one forced exit per vCPU per
+//! `/data` encryption: 22 s without, 8 s with, on an earlier macOS). On macOS 26.6 the framework
+//! wakes the target itself, as other VMMs on the same API (QEMU's and libkrun's in-kernel GIC,
+//! arcbox on macOS 26.4) found: without kicks, warm boots took 3.7 s against 4.2 s, with a third
+//! fewer vCPU0 guest entries (first boots were a tie). So [`Mode::NoKick`] is the default on
+//! macOS 26 and later, and [`Mode::Targeted`] below it, where the stall was seen and nothing
+//! else has been measured ([`Mode::default_for_macos`]). Kicking every vCPU for every SPI costs one forced exit per vCPU per
 //! interrupt, busy vCPUs included. With kicks ([`Mode::Targeted`]) each vCPU publishes where it
 //! is, and an SPI rouses only its target (the vCPU `GICD_IROUTER` names), and only if it needs it:
 //!
@@ -28,8 +29,9 @@
 //!
 //! - an SPI set before the vCPU's `enter` is seen by that entry (the swap reads the source's flag
 //!   update, so the source's `hv_gic_set_spi` happens before `hv_vcpu_run`);
-//! - one set after `enter` finds `Guest` and kicks (the current run returns, or the next one if
-//!   the vCPU is just leaving);
+//! - one set after `enter` finds `Guest` and, when kicks are on ([`Mode::Targeted`] or
+//!   [`Mode::All`]), kicks it (the current run returns, or the next one if the vCPU is just
+//!   leaving); with [`Mode::NoKick`] the framework delivers it to the vCPU in the guest;
 //! - `leave` keeps `NOTIFY`, so an SPI that kicked a vCPU already trapping on WFI still stops the
 //!   park that follows;
 //! - a parked vCPU checks `NOTIFY` and starts waiting under its wait lock, and a source sets
@@ -86,8 +88,9 @@ pub enum Mode {
     /// Kick only the SPI's target, only when it needs it (`EMU_VCPU_WAKE=targeted`).
     Targeted,
     /// Never kick for an interrupt, only wake vCPUs parked on the host: the framework wakes a
-    /// vCPU waiting in the guest itself (the default; `EMU_VCPU_WAKE=none`). On macOS 26.6 the
-    /// kicks were a third of vCPU0's guest entries and bought no boot time (docs/android.md).
+    /// vCPU waiting in the guest itself (the default on macOS 26 and later; `EMU_VCPU_WAKE=none`).
+    /// On macOS 26.6 the kicks were a third of vCPU0's guest entries and bought no boot time
+    /// (docs/android.md).
     NoKick,
     /// Every vCPU for every SPI, host-side WFI waits bounded by [`SGI_POLL`]: the behaviour
     /// before targeted wakes, for A/B measurements (`EMU_VCPU_WAKE=all`).
@@ -95,17 +98,47 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub fn parse(value: Option<&str>) -> Mode {
+    /// The mode for `EMU_VCPU_WAKE`'s value; `default` when it is unset or not a mode name
+    /// (`none` is the name of [`Mode::NoKick`]).
+    pub fn parse(value: Option<&str>, default: Mode) -> Mode {
         match value {
             Some("all") => Mode::All,
             Some("targeted") => Mode::Targeted,
-            _ => Mode::NoKick,
+            Some("none") => Mode::NoKick,
+            _ => default,
         }
     }
 
-    pub fn from_env() -> Mode {
-        Mode::parse(std::env::var("EMU_VCPU_WAKE").ok().as_deref())
+    /// The default for a macOS major version (26.6.2 is 26): no kicks on 26 and later, where the
+    /// framework wakes the target itself; targeted kicks below it, and when the version is
+    /// unknown, since the kicks are what fixed the stall seen on an earlier macOS.
+    pub fn default_for_macos(major: Option<u32>) -> Mode {
+        match major {
+            Some(m) if m >= 26 => Mode::NoKick,
+            _ => Mode::Targeted,
+        }
     }
+
+    /// The major version in a product version string (`"26.6.2"` is 26).
+    pub fn macos_major(version: &str) -> Option<u32> {
+        version.trim().split('.').next()?.parse().ok()
+    }
+
+    /// `EMU_VCPU_WAKE`, or the default for this host's macOS (read once, from `sw_vers`).
+    pub fn from_env() -> Mode {
+        let value = std::env::var("EMU_VCPU_WAKE").ok();
+        let default = if value.is_some() { Mode::Targeted } else { Mode::default_for_macos(host_macos_major()) };
+        Mode::parse(value.as_deref(), default)
+    }
+}
+
+/// The host's macOS major version, `None` off macOS or when `sw_vers` can't say.
+fn host_macos_major() -> Option<u32> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let out = std::process::Command::new("sw_vers").arg("-productVersion").output().ok()?;
+    Mode::macos_major(std::str::from_utf8(&out.stdout).ok()?)
 }
 
 /// How a host-side WFI wait ended.
@@ -364,12 +397,26 @@ mod tests {
 
     #[test]
     fn mode_defaults_to_no_kick() {
-        assert_eq!(Mode::parse(None), Mode::NoKick);
-        assert_eq!(Mode::parse(Some("")), Mode::NoKick);
-        assert_eq!(Mode::parse(Some("bogus")), Mode::NoKick);
-        assert_eq!(Mode::parse(Some("targeted")), Mode::Targeted);
-        assert_eq!(Mode::parse(Some("all")), Mode::All);
-        assert_eq!(Mode::parse(Some("none")), Mode::NoKick);
+        assert_eq!(Mode::parse(None, Mode::NoKick), Mode::NoKick);
+        assert_eq!(Mode::parse(None, Mode::Targeted), Mode::Targeted);
+        assert_eq!(Mode::parse(Some(""), Mode::Targeted), Mode::Targeted);
+        assert_eq!(Mode::parse(Some("bogus"), Mode::NoKick), Mode::NoKick);
+        assert_eq!(Mode::parse(Some("targeted"), Mode::NoKick), Mode::Targeted);
+        assert_eq!(Mode::parse(Some("all"), Mode::NoKick), Mode::All);
+        assert_eq!(Mode::parse(Some("none"), Mode::Targeted), Mode::NoKick);
+    }
+
+    #[test]
+    fn default_follows_the_macos_version() {
+        assert_eq!(Mode::default_for_macos(Some(25)), Mode::Targeted);
+        assert_eq!(Mode::default_for_macos(Some(15)), Mode::Targeted);
+        assert_eq!(Mode::default_for_macos(Some(26)), Mode::NoKick);
+        assert_eq!(Mode::default_for_macos(Some(27)), Mode::NoKick);
+        assert_eq!(Mode::default_for_macos(None), Mode::Targeted);
+        assert_eq!(Mode::macos_major("26.6.2\n"), Some(26));
+        assert_eq!(Mode::macos_major("15.1"), Some(15));
+        assert_eq!(Mode::macos_major("junk"), None);
+        assert_eq!(Mode::macos_major(""), None);
     }
 
     #[test]
