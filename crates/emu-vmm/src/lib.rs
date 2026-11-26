@@ -18,6 +18,7 @@ pub mod layout;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod machine;
 pub mod modem;
+pub mod net;
 pub mod pipe;
 pub mod telephony;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

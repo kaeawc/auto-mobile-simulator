@@ -19,6 +19,7 @@ flate2.workspace = true
 libc.workspace = true
 rustix.workspace = true
 sim-core.workspace = true
+smoltcp.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cpal.workspace = true
