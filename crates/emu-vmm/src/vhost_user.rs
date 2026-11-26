@@ -52,22 +52,36 @@ pub mod req {
     pub const SET_PROTOCOL_FEATURES: u32 = 16;
     pub const GET_QUEUE_NUM: u32 = 17;
     pub const SET_VRING_ENABLE: u32 = 18;
+    pub const SET_BACKEND_REQ_FD: u32 = 21;
     pub const GET_CONFIG: u32 = 24;
     pub const SET_CONFIG: u32 = 25;
     pub const RESET_DEVICE: u32 = 34;
+    pub const GET_SHMEM_CONFIG: u32 = 44;
+}
+
+/// Backend requests, on the channel `SET_BACKEND_REQ_FD` hands over.
+pub mod backend_req {
+    pub const SHMEM_MAP: u32 = 9;
+    pub const SHMEM_UNMAP: u32 = 10;
 }
 
 /// Protocol feature bits (`GET_PROTOCOL_FEATURES`).
 pub mod proto {
     pub const MQ: u64 = 1 << 0;
     pub const REPLY_ACK: u64 = 1 << 3;
+    pub const BACKEND_REQ: u64 = 1 << 5;
     pub const CONFIG: u64 = 1 << 9;
     pub const RESET_DEVICE: u64 = 1 << 13;
+    pub const SHMEM: u64 = 1 << 22;
 }
 
 /// The device feature bit that says the backend speaks protocol features.
 pub const F_PROTOCOL_FEATURES: u64 = 1 << 30;
 const SUPPORTED_PROTOCOL: u64 = proto::MQ | proto::REPLY_ACK | proto::CONFIG | proto::RESET_DEVICE;
+/// Also offered to a device with shared memory regions (the GPU's host-visible blobs).
+const SHMEM_PROTOCOL: u64 = proto::BACKEND_REQ | proto::SHMEM;
+/// `VIRTIO_MAX_SHMEM_REGIONS`: the slots of a `GET_SHMEM_CONFIG` reply.
+const SHMEM_REGIONS: usize = 256;
 
 const VERSION: u32 = 1;
 const FLAG_REPLY: u32 = 1 << 2;
@@ -250,6 +264,7 @@ impl Active {
 /// One connection's state.
 pub struct Session {
     dev: Arc<Mutex<Box<dyn VirtioDevice>>>,
+    backend: BackendChannel,
     features: Option<u64>,
     protocol: u64,
     mem: Option<Memory>,
@@ -259,10 +274,11 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(dev: Arc<Mutex<Box<dyn VirtioDevice>>>) -> Session {
+    pub fn new(dev: Arc<Mutex<Box<dyn VirtioDevice>>>, backend: BackendChannel) -> Session {
         let n = dev.lock().unwrap_or_else(PoisonError::into_inner).num_queues();
         Session {
             dev,
+            backend,
             features: None,
             protocol: 0,
             mem: None,
@@ -274,6 +290,12 @@ impl Session {
 
     fn device(&self) -> std::sync::MutexGuard<'_, Box<dyn VirtioDevice>> {
         self.dev.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What this device can use: the backend channel and shared memory only with a region.
+    fn supported_protocol(&self) -> u64 {
+        let shm = (0..=u8::MAX).any(|id| self.device().shm_region(id).is_some());
+        SUPPORTED_PROTOCOL | if shm { SHMEM_PROTOCOL } else { 0 }
     }
 
     fn ring(&mut self, index: u64) -> Result<&mut Ring> {
@@ -330,37 +352,43 @@ impl Session {
         if n == 0 || n > MAX_FDS || m.fds.len() != n {
             return Err(protocol(format!("memory table of {n} regions with {} fds", m.fds.len())));
         }
-        let mut regions = Vec::with_capacity(n);
-        let mut file = None;
-        let mut delta = None;
+        // Each region with its fd's identity and guest-physical minus file offset.
+        let mut all = Vec::with_capacity(n);
         for i in 0..n {
             let o = 8 + i * 32;
             let (gpa, size, uaddr, offset) = (m.u64_at(o)?, m.u64_at(o + 8)?, m.u64_at(o + 16)?, m.u64_at(o + 24)?);
             let st = rustix::fs::fstat(&m.fds[i]).map_err(std::io::Error::from)?;
-            let this = (st.st_dev, st.st_ino);
-            let d = gpa.wrapping_sub(offset);
-            if file.is_some_and(|f| f != this) || delta.is_some_and(|x| x != d) {
-                return Err(protocol(
-                    "guest RAM in more than one fd or at more than one offset (QEMU: one memory-backend-memfd below 4 GiB)",
-                ));
-            }
-            (file, delta) = (Some(this), Some(d));
-            regions.push(Region { gpa, size, uaddr });
+            all.push(((st.st_dev, st.st_ino), gpa.wrapping_sub(offset), Region { gpa, size, uaddr }, i));
         }
-        let (file, delta) = (file.unwrap_or_default(), delta.unwrap_or_default());
+        let (file, delta, ram_fd) = ram_file(&all).ok_or_else(|| protocol("empty memory table"))?;
+        let mut regions = Vec::new();
+        for (f, d, r, _) in &all {
+            if *f != file {
+                // Another fd: memory the frontend maps into the guest besides its RAM (a GPU
+                // blob this backend or another one had it map). No ring or buffer of these
+                // devices lives there.
+                continue;
+            }
+            if *d != delta {
+                return Err(protocol("guest RAM at more than one offset in its fd (QEMU: one memory-backend-memfd below 4 GiB)"));
+            }
+            regions.push(*r);
+        }
         if let Some(mem) = &mut self.mem
             && mem.file == file
             && mem.delta == delta
         {
-            // Same RAM, another view of it (regions split or joined around ROM and PAM).
+            // Same RAM, another view of it (regions split or joined around ROM and PAM, or
+            // other memory coming and going beside it).
             mem.regions = regions;
             return Ok(());
         }
         if self.active.is_some() {
             return Err(protocol("the guest RAM moved to another fd while the device runs"));
         }
-        let len = rustix::fs::fstat(&m.fds[0]).map_err(std::io::Error::from)?.st_size as u64;
-        let ram = GuestRam::map_shared(delta, len, m.fds[0].as_fd(), 0).map_err(|e| protocol(format!("mapping guest RAM: {e}")))?;
+        let fd = &m.fds[ram_fd];
+        let len = rustix::fs::fstat(fd).map_err(std::io::Error::from)?.st_size as u64;
+        let ram = GuestRam::map_shared(delta, len, fd.as_fd(), 0).map_err(|e| protocol(format!("mapping guest RAM: {e}")))?;
         self.mem = Some(Memory { ram: Arc::new(ram), file, delta, regions });
         Ok(())
     }
@@ -375,10 +403,24 @@ impl Session {
                 self.try_activate()?;
                 Ok(None)
             }
-            req::GET_PROTOCOL_FEATURES => u64_reply(SUPPORTED_PROTOCOL),
+            req::GET_PROTOCOL_FEATURES => u64_reply(self.supported_protocol()),
             req::SET_PROTOCOL_FEATURES => {
-                self.protocol = m.u64_at(0)? & SUPPORTED_PROTOCOL;
+                self.protocol = m.u64_at(0)? & self.supported_protocol();
                 Ok(None)
+            }
+            req::SET_BACKEND_REQ_FD => {
+                let fd = m.fds.pop().ok_or_else(|| protocol("SET_BACKEND_REQ_FD without an fd"))?;
+                self.backend.attach(UnixStream::from(fd), self.protocol & proto::REPLY_ACK != 0);
+                Ok(None)
+            }
+            req::GET_SHMEM_CONFIG => {
+                let sizes: Vec<u64> = (0..SHMEM_REGIONS).map(|id| self.device().shm_region(id as u8).map_or(0, |(_, len)| len)).collect();
+                let mut out = (sizes.iter().filter(|&&n| n > 0).count() as u32).to_le_bytes().to_vec();
+                out.extend_from_slice(&[0; 4]);
+                for n in sizes {
+                    out.extend_from_slice(&n.to_le_bytes());
+                }
+                Ok(Some(out))
             }
             req::GET_QUEUE_NUM => u64_reply(self.rings.len() as u64),
             req::SET_OWNER => Ok(None),
@@ -484,6 +526,18 @@ impl Drop for Session {
     }
 }
 
+/// Which fd of a memory table is the guest's RAM: the one that maps guest-physical address 0,
+/// else the one covering the most guest memory. Returns its identity, its guest-physical minus
+/// file offset, and the index of a region (and so of an fd) of it.
+fn ram_file(all: &[((u64, u64), u64, Region, usize)]) -> Option<((u64, u64), u64, usize)> {
+    let at_zero = all.iter().find(|(_, _, r, _)| r.gpa == 0);
+    let pick = at_zero.or_else(|| {
+        let total = |f: (u64, u64)| all.iter().filter(|(g, ..)| *g == f).map(|(_, _, r, _)| r.size).sum::<u64>();
+        all.iter().max_by_key(|(f, ..)| total(*f))
+    })?;
+    Some((pick.0, pick.1, pick.3))
+}
+
 /// Waits on the kick eventfds and tells the device which queue was kicked, until `stop` fires.
 fn forward_kicks(dev: &Mutex<Box<dyn VirtioDevice>>, kicks: &[(usize, OwnedFd)], stop: &OwnedFd) {
     crate::device_thread();
@@ -508,9 +562,109 @@ fn forward_kicks(dev: &Mutex<Box<dyn VirtioDevice>>, kicks: &[(usize, OwnedFd)],
     }
 }
 
+/// The backend-to-frontend channel (`SET_BACKEND_REQ_FD`), shared with what sends on it (the
+/// GPU's [`ShmemWindow`]), which exists before a frontend connects.
+#[derive(Clone, Default)]
+pub struct BackendChannel(Arc<Mutex<Option<(UnixStream, bool)>>>);
+
+impl BackendChannel {
+    fn attach(&self, sock: UnixStream, ack: bool) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some((sock, ack));
+    }
+
+    /// Sends `request` with `payload` and `fd`, and waits for the frontend's answer when it gives
+    /// one (`REPLY_ACK`).
+    pub fn request(&self, request: u32, payload: &[u8], fd: Option<std::os::fd::BorrowedFd<'_>>) -> Result<()> {
+        use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
+        let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let (sock, ack) = guard.as_mut().ok_or_else(|| protocol("no backend channel (the frontend didn't send SET_BACKEND_REQ_FD)"))?;
+        let mut msg = Vec::with_capacity(HEADER + payload.len());
+        msg.extend_from_slice(&request.to_le_bytes());
+        msg.extend_from_slice(&(VERSION | if *ack { FLAG_NEED_REPLY } else { 0 }).to_le_bytes());
+        msg.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        msg.extend_from_slice(payload);
+        let fds: Vec<std::os::fd::BorrowedFd<'_>> = fd.into_iter().collect();
+        let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        if !fds.is_empty() && !control.push(SendAncillaryMessage::ScmRights(&fds)) {
+            return Err(protocol("backend request: no room for the fd"));
+        }
+        let sent = sendmsg(&*sock, &[std::io::IoSlice::new(&msg)], &mut control, SendFlags::empty()).map_err(std::io::Error::from)?;
+        if sent < msg.len() {
+            sock.write_all(&msg[sent..])?;
+        }
+        if *ack {
+            let mut reply = [0u8; HEADER + 8];
+            sock.read_exact(&mut reply)?;
+            let status = u64::from_le_bytes(reply[HEADER..].try_into().unwrap_or_default());
+            if status != 0 {
+                return Err(protocol(format!("backend request {request}: the frontend answered {status}")));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The GPU's host-visible region in a vhost-user frontend: each blob exported once as an fd
+/// (kept, since gfxstream hands its own over) and mapped by the frontend at the offset the guest
+/// picked (`SHMEM_MAP` into region `shmid`).
+pub struct ShmemWindow {
+    pub chan: BackendChannel,
+    pub shmid: u8,
+    pub renderer: Arc<emu_gfxstream::Renderer>,
+    fds: Mutex<std::collections::HashMap<u32, OwnedFd>>,
+}
+
+impl ShmemWindow {
+    pub fn new(chan: BackendChannel, shmid: u8, renderer: Arc<emu_gfxstream::Renderer>) -> ShmemWindow {
+        ShmemWindow { chan, shmid, renderer, fds: Mutex::new(std::collections::HashMap::new()) }
+    }
+
+    /// `VhostUserMMap`: shmid (u8, then 7 bytes of padding), fd offset, region offset, length,
+    /// flags (bit 0: read-write).
+    fn mmap_msg(&self, offset: u64, len: u64, rw: bool) -> [u8; 40] {
+        let mut m = [0u8; 40];
+        m[0] = self.shmid;
+        m[16..24].copy_from_slice(&offset.to_le_bytes());
+        m[24..32].copy_from_slice(&len.to_le_bytes());
+        m[32..40].copy_from_slice(&u64::from(rw).to_le_bytes());
+        m
+    }
+}
+
+impl crate::virtio::gpu::ShmWindow for ShmemWindow {
+    fn needs_host_mapping(&self) -> bool {
+        false
+    }
+
+    fn map(&self, id: u32, _host: Option<emu_hvf::HostRange>, offset: u64, len: usize) -> std::result::Result<(), String> {
+        let mut fds = self.fds.lock().unwrap_or_else(PoisonError::into_inner);
+        let fd = match fds.entry(id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(self.renderer.export_blob(id).map_err(|e| e.to_string())?.0),
+        };
+        self.chan.request(backend_req::SHMEM_MAP, &self.mmap_msg(offset, len as u64, true), Some(fd.as_fd())).map_err(|e| e.to_string())
+    }
+
+    fn unmap(&self, offset: u64, len: usize) {
+        if let Err(e) = self.chan.request(backend_req::SHMEM_UNMAP, &self.mmap_msg(offset, len as u64, false), None) {
+            eprintln!("emu: vhost-user gpu: unmapping +{offset:#x}: {e}");
+        }
+    }
+
+    fn forget(&self, id: u32) {
+        self.fds.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
+    }
+}
+
 /// Serves one frontend connection until it closes, then stops the device.
-pub fn serve_connection(mut sock: UnixStream, dev: Arc<Mutex<Box<dyn VirtioDevice>>>) -> Result<()> {
-    let mut s = Session::new(dev);
+pub fn serve_connection(sock: UnixStream, dev: Arc<Mutex<Box<dyn VirtioDevice>>>) -> Result<()> {
+    serve_connection_with(sock, dev, BackendChannel::default())
+}
+
+/// [`serve_connection`] with a backend channel the device's helpers share.
+pub fn serve_connection_with(mut sock: UnixStream, dev: Arc<Mutex<Box<dyn VirtioDevice>>>, backend: BackendChannel) -> Result<()> {
+    let mut s = Session::new(dev, backend);
     while let Some(mut m) = read_msg(&mut sock)? {
         let reply = s.handle(&mut m);
         let need_ack = s.protocol & proto::REPLY_ACK != 0 && m.flags & FLAG_NEED_REPLY != 0;
@@ -533,6 +687,11 @@ pub fn serve_connection(mut sock: UnixStream, dev: Arc<Mutex<Box<dyn VirtioDevic
 /// long as the process lives: QEMU reconnects after a restart of its own. Errors end the
 /// connection, not the listener.
 pub fn serve(path: &Path, name: &str, dev: Box<dyn VirtioDevice>) -> std::io::Result<JoinHandle<()>> {
+    serve_with(path, name, dev, BackendChannel::default())
+}
+
+/// [`serve`] with a backend channel the device's helpers share (the GPU's [`ShmemWindow`]).
+pub fn serve_with(path: &Path, name: &str, dev: Box<dyn VirtioDevice>, backend: BackendChannel) -> std::io::Result<JoinHandle<()>> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
     let dev = Arc::new(Mutex::new(dev));
@@ -540,7 +699,7 @@ pub fn serve(path: &Path, name: &str, dev: Box<dyn VirtioDevice>) -> std::io::Re
     std::thread::Builder::new().name(format!("vhost-{name}")).spawn(move || {
         for sock in listener.incoming() {
             let Ok(sock) = sock else { continue };
-            if let Err(e) = serve_connection(sock, dev.clone()) {
+            if let Err(e) = serve_connection_with(sock, dev.clone(), backend.clone()) {
                 eprintln!("emu: vhost-user {name}: {e}");
             }
         }
@@ -735,6 +894,38 @@ mod tests {
         assert_eq!((pending(0), pending(1)), (true, true));
         line.set(false);
         assert_eq!((pending(0), pending(1)), (false, false), "a lowered line is no call");
+    }
+
+    /// The GPU's mapped blobs show up in every device's memory table as more fds: the RAM is the
+    /// fd at guest-physical 0, and the rest are left alone (before: the table was refused).
+    #[test]
+    fn other_fds_in_the_memory_table_are_not_ram() {
+        let (mut fe, be) = Frontend::new();
+        let t = rng_backend(be);
+        fe.u64_req(req::SET_PROTOCOL_FEATURES, proto::REPLY_ACK);
+        let blob = rustix::fs::memfd_create("blob", rustix::fs::MemfdFlags::CLOEXEC).expect("memfd");
+        rustix::fs::ftruncate(&blob, 0x1_0000).expect("size");
+        let mut p = 2u32.to_le_bytes().to_vec();
+        p.extend_from_slice(&[0; 4]);
+        for (gpa, size, uaddr, off) in [(0x8_0000_0000u64, 0x1_0000u64, 0x7e00_0000_0000u64, 0u64), (0, RAM, UADDR, 0)] {
+            for v in [gpa, size, uaddr, off] {
+                p.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let ram = fe.memfd.try_clone().expect("dup");
+        fe.send(req::SET_MEM_TABLE, FLAG_NEED_REPLY, &p, &[&blob, &ram]);
+        assert_eq!(fe.reply(req::SET_MEM_TABLE), 0u64.to_le_bytes(), "accepted");
+        // The device still works on the RAM: the whole request path from the other test.
+        fe.u64_req(req::SET_FEATURES, F_VERSION_1);
+        let mut d = Driver::at(0x10_0000, 8);
+        let (kick, call) = (eventfd(0, EventfdFlags::CLOEXEC).expect("kick"), eventfd(0, EventfdFlags::CLOEXEC).expect("call"));
+        fe.ring(&d, &kick, &call);
+        fe.state(req::SET_VRING_ENABLE, 0, 1);
+        d.push(&fe.ram, &[(0x20_0000, 16, true)]);
+        rustix::io::write(&kick, &1u64.to_ne_bytes()).expect("kick");
+        assert!(wait_readable(&call), "the device called");
+        drop(fe);
+        t.join().expect("join").expect("clean end");
     }
 
     #[test]

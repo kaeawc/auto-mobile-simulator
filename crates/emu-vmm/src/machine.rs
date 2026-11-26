@@ -574,6 +574,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
                 height: spec.height,
                 renderer: r,
                 shm: (GPU_SHM_BASE, GPU_SHM_SIZE),
+                window: Arc::new(virtio::gpu::HvWindow { base: GPU_SHM_BASE }),
                 display: spec.display.clone(),
                 verbose: spec.verbose,
             });

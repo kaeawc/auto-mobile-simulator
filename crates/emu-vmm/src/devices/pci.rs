@@ -80,6 +80,27 @@ impl FnState {
         }
     }
 
+    /// A config write of `data` (1, 2 or 4 bytes) at `reg`, merged into its 32-bit word.
+    fn write_bytes(&mut self, reg: usize, data: &[u8]) {
+        let v = le_value(data) as u32;
+        if data.len() >= 4 {
+            self.write(reg & !3, v);
+        } else {
+            let shift = (reg & 3) * 8;
+            let mask = ((1u32 << (data.len() * 8)) - 1) << shift;
+            let old = self.read(reg & !3);
+            self.write(reg & !3, (old & !mask) | ((v << shift) & mask));
+        }
+    }
+
+    /// The guest-physical address BAR `i` decodes now (both halves of a 64-bit BAR).
+    fn bar_addr(&self, i: usize) -> u64 {
+        let lo = u64::from(self.bar_regs[i] & self.bar_masks[i]);
+        let wide = self.f.bars.iter().any(|&(j, b)| j == i && matches!(b.kind, BarKind::Mem64Prefetch));
+        let hi = if wide && i + 1 < 6 { u64::from(self.bar_regs[i + 1] & self.bar_masks[i + 1]) } else { 0 };
+        lo | (hi << 32)
+    }
+
     fn write(&mut self, reg: usize, v: u32) {
         match reg {
             0x04 => self.command = v as u16,
@@ -131,18 +152,37 @@ impl MmioDevice for PciHost {
         let (bus, dev, func, reg) = Self::locate(offset);
         let mut fns = self.fns.lock().unwrap_or_else(|e| e.into_inner());
         if bus == 0 && func == 0 && dev >= 1 && (dev as usize) <= fns.len() {
-            let f = &mut fns[dev as usize - 1];
-            let v = le_value(data) as u32;
-            if data.len() == 4 {
-                f.write(reg & !3, v);
-            } else {
-                // Sub-word writes (command register is written as u16): merge into the word.
-                let shift = (reg & 3) * 8;
-                let mask = if data.len() >= 4 { u32::MAX } else { ((1u32 << (data.len() * 8)) - 1) << shift };
-                let old = f.read(reg & !3);
-                f.write(reg & !3, (old & !mask) | ((v << shift) & mask));
-            }
+            // Sub-word writes (the command register is written as u16) merge into the word.
+            fns[dev as usize - 1].write_bytes(reg, data);
         }
+    }
+}
+
+/// One function's config space on its own, for a transport that delivers config cycles itself
+/// (vfio-user: the frontend forwards every config read and write).
+pub struct ConfigSpace(FnState);
+
+impl ConfigSpace {
+    pub fn new(f: PciFunction) -> ConfigSpace {
+        ConfigSpace(FnState::new(f))
+    }
+
+    /// Reads `data.len()` bytes at `offset`.
+    pub fn read(&self, offset: usize, data: &mut [u8]) {
+        for (i, b) in data.iter_mut().enumerate() {
+            let at = offset + i;
+            *b = (self.0.read(at & !3) >> ((at & 3) * 8)) as u8;
+        }
+    }
+
+    /// Writes 1, 2 or 4 bytes at `offset`.
+    pub fn write(&mut self, offset: usize, data: &[u8]) {
+        self.0.write_bytes(offset, data);
+    }
+
+    /// The address BAR `i` decodes now.
+    pub fn bar_addr(&self, i: usize) -> u64 {
+        self.0.bar_addr(i)
     }
 }
 
@@ -188,5 +228,31 @@ mod tests {
         wr(&h, dev1 + 0x10, 0x1000_0000);
         h.write(dev1 + 0x04, &6u16.to_le_bytes());
         assert_eq!(rd(&h, dev1 + 0x04) & 0xffff, 6);
+    }
+
+    /// The same function served alone: byte reads, and the address a 64-bit BAR decodes after the
+    /// guest assigns it.
+    #[test]
+    fn a_config_space_alone_tracks_where_the_guest_put_its_bars() {
+        let mut c = ConfigSpace::new(PciFunction {
+            vendor: 0x607d,
+            device: 0xf153,
+            class: 0x05_00_00,
+            bars: vec![
+                (0, Bar { kind: BarKind::Mem32, addr: 0, size: 0x1000 }),
+                (1, Bar { kind: BarKind::Mem64Prefetch, addr: 0, size: 16 << 30 }),
+            ],
+        });
+        let mut id = [0u8; 4];
+        c.read(0, &mut id);
+        assert_eq!(u32::from_le_bytes(id), 0xf153_607d);
+        let mut b = [0u8; 2];
+        c.read(2, &mut b);
+        assert_eq!(u16::from_le_bytes(b), 0xf153, "unaligned sub-word read");
+        c.write(0x14, &0x0u32.to_le_bytes());
+        c.write(0x18, &0x8u32.to_le_bytes());
+        assert_eq!(c.bar_addr(1), 0x8_0000_0000);
+        c.write(0x10, &0xfe00_0000u32.to_le_bytes());
+        assert_eq!(c.bar_addr(0), 0xfe00_0000);
     }
 }

@@ -24,6 +24,8 @@ pub mod telephony;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod vcpu;
 #[cfg(target_os = "linux")]
+pub mod vfio_user;
+#[cfg(target_os = "linux")]
 pub mod vhost_user;
 pub mod virtio;
 pub mod wake;
