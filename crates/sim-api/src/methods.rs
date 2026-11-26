@@ -178,6 +178,12 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "Touch or swipe the touchpad beside the screen, in touchpad units (Android XR display glasses: `hw.touchpad0`)",
     ),
     (
+        "stylus",
+        "device, x, y, phase?(tap|hover|down|move|up|leave), pressure?(1-255), button?, eraser? | x, y, to_x, to_y, duration_ms? (a stroke)",
+        "A stylus on the touch screen at pixels, what the stock emulator's gRPC pen events send: hover over it, touch, move, \
+         lift or leave, with the barrel button or the eraser end; or draw a stroke",
+    ),
+    (
         "rotary",
         "device, ticks | delta (Digital Crown units; iOS)",
         "Turn a watch's rotary input: the Wear OS crown or bezel, the Apple Watch Digital Crown",
@@ -238,7 +244,7 @@ const ALL_PLATFORMS: &[&str] = &[
     "rotary",
 ];
 /// Methods only Android devices have.
-const ANDROID_ONLY: &[&str] = &["console", "fold", "xr", "vehicle", "touchpad"];
+const ANDROID_ONLY: &[&str] = &["console", "fold", "xr", "vehicle", "touchpad", "stylus"];
 
 /// The platforms whose devices `method` works on.
 pub fn platforms(method: &str) -> &'static [Platform] {

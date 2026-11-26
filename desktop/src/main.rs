@@ -17,7 +17,8 @@
 //!
 //! `cargo run` opens the window (`SIMEE_DEVICE=<udid|name|booted>` preselects a device);
 //! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
-//! watch, tv, apple-watch, apple-tv, empty); a release build needs `--features tooling` for it.
+//! tablet, ipad, watch, tv, apple-watch, apple-tv, empty); a release build needs `--features
+//! tooling` for it.
 
 mod android;
 mod controls;
@@ -65,6 +66,8 @@ pub enum Action {
     Rotary(i32),
     /// Android XR: head pose and recentering.
     Xr(sim_core::xr::XrCommand),
+    /// Android tablets: the pointer becomes a stylus, or a finger again.
+    ToggleStylus,
     Debug(debug::DebugAction),
 }
 
@@ -74,6 +77,10 @@ pub enum Input {
     Down(f32, f32),
     Move(f32, f32),
     Up(f32, f32),
+    /// The pointer over the screen with no button held (the stylus hovering).
+    Hover(f32, f32),
+    /// The pointer left the screen (the stylus out of range).
+    Leave,
     Key(KeyAction),
 }
 
@@ -130,6 +137,10 @@ pub struct State {
     sized_for: Option<(u32, u32)>,
     /// Whether the window shows (not minimised, hidden, or covered where the system says so).
     visible: bool,
+    /// Android tablets: the pointer is a stylus (drags draw, moving over the screen hovers).
+    pub stylus: bool,
+    /// The screen element's size in points (pointer moves come in its own points).
+    pub screen_view: (f32, f32),
 }
 
 /// An Android screen switched away from, with what the window showed it with.
@@ -376,6 +387,8 @@ fn init() -> State {
         work_error: Arc::new(Mutex::new(None)),
         sized_for: None,
         visible: true,
+        stylus: false,
+        screen_view: (0.0, 0.0),
     }
 }
 
@@ -512,6 +525,16 @@ fn foldable_scene(s: &mut State) {
     select_running(s, "pixel_fold", (552, 460), Shape::Rectangle);
 }
 
+/// A Pixel Tablet in landscape (its natural orientation), at half size.
+fn tablet_scene(s: &mut State) {
+    select_running(s, "pixel_tablet", (1280, 800), Shape::Rounded);
+}
+
+/// An 11-inch iPad Pro, portrait, at half size.
+fn ipad_scene(s: &mut State) {
+    select_running(s, "D4", (834, 1210), Shape::Rounded);
+}
+
 fn watch_scene(s: &mut State) {
     select_running(s, "wear_round", (454, 454), Shape::Round);
 }
@@ -608,7 +631,7 @@ fn android_action(s: &State, f: impl FnOnce(&sim_android::Device) -> Result<(), 
 fn coalesce_moves(inputs: Vec<Input>) -> Vec<Input> {
     let mut out: Vec<Input> = Vec::with_capacity(inputs.len());
     for input in inputs {
-        if let (Input::Move(..), Some(Input::Move(..))) = (&input, out.last()) {
+        if let (Input::Move(..), Some(Input::Move(..))) | (Input::Hover(..), Some(Input::Hover(..))) = (&input, out.last()) {
             out.pop();
         }
         out.push(input);
@@ -642,6 +665,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
                 if s.selected.as_ref() != Some(&udid) {
                     // The scan of the new selection brings its log.
                     s.console_log.clear();
+                    s.stylus = false;
                 }
                 s.selected = Some(udid);
                 if let Some(sc) = &s.scanner {
@@ -697,6 +721,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
                 s.screen.iter().for_each(|sc| sc.wheel(ticks));
             }
             Action::Xr(command) => android_action(s, move |d| d.xr(&command).map(drop)),
+            Action::ToggleStylus => toggle_stylus(s),
             Action::Debug(a) => {
                 if let Some(udid) = s.live.as_ref().map(|l| l.udid.clone())
                     && let Some(msg) = s.debug.perform(&udid, a)
@@ -722,6 +747,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
                     sc.strokes(strokes);
                 }
             }
+            input if s.stylus && s.screen.is_some() => stylus_input(s, input),
             input => apply(s, input),
         }
     }
@@ -752,12 +778,61 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
         && s.sized_for != Some(size)
     {
         s.sized_for = Some(size);
-        let screen_h = android::SCREEN_POINTS;
-        let screen_w = screen_h * size.0 as f32 / size.1 as f32;
-        tx.resize_window((240.0 + 32.0 + screen_w.max(420.0) + 340.0, screen_h + 110.0));
+        tx.resize_window(fit_window(size));
         changed = true;
     }
     changed
+}
+
+/// The toolbar's Stylus button (Android tablets): the pointer becomes a pen (what stock's gRPC
+/// pen events send, through simee's `pen` console command); turning it off takes the pen out
+/// of range.
+fn toggle_stylus(s: &mut State) {
+    if s.screen.is_none() {
+        s.status = Some("The stylus needs a running Android device".into());
+        return;
+    }
+    s.stylus = !s.stylus;
+    if !s.stylus {
+        let leave = sim_core::stylus::PenSample::new(0, 0, sim_core::stylus::PenPhase::Leave);
+        android_action(s, move |d| d.stylus(&[leave], Duration::ZERO));
+    }
+    s.status = Some(if s.stylus { "Stylus on: drag to draw, move over the screen to hover" } else { "Stylus off" }.into());
+}
+
+/// Pointer input while the stylus is on: one pen sample per input, through the console worker
+/// (in order with the device's other console work). Anything else goes on as usual.
+fn stylus_input(s: &State, input: Input) {
+    use sim_core::stylus::{PenPhase, PenSample};
+    let (phase, x, y) = match input {
+        Input::Down(x, y) => (PenPhase::Down, x, y),
+        Input::Move(x, y) => (PenPhase::Move, x, y),
+        Input::Up(x, y) => (PenPhase::Up, x, y),
+        Input::Hover(x, y) => (PenPhase::Hover, x, y),
+        Input::Leave => (PenPhase::Leave, 0.0, 0.0),
+        other => return apply(s, other),
+    };
+    let (w, h) = s.screen_size();
+    let at = |v: f32, max: u32| (v.round().max(0.0) as i32).min(max.max(1) as i32 - 1);
+    let sample = PenSample::new(at(x, w), at(y, h), phase);
+    android_action(s, move |d| d.stylus(&[sample], Duration::ZERO));
+}
+
+/// The widest window the fit asks for, in points: a 13-inch laptop's display (1440 points)
+/// holds it whole.
+const MAX_WINDOW_W: f32 = 1440.0;
+
+/// The window that fits a device screen of `size` pixels: the sidebar (240), the gutters (32),
+/// the screen at [`android::SCREEN_POINTS`] tall (at least 420 wide, for the toolbar) and the
+/// Android panel (340); 110 points of toolbar and status around it. A landscape tablet's screen
+/// (2560x1600 is 1216 points wide at that height) would make the window wider than a laptop's
+/// display, so a wide screen is shown shorter instead, as far as fits [`MAX_WINDOW_W`].
+fn fit_window(size: (u32, u32)) -> (f32, f32) {
+    const CHROME_W: f32 = 240.0 + 32.0 + 340.0;
+    let aspect = size.0 as f32 / size.1.max(1) as f32;
+    let screen_w = (android::SCREEN_POINTS * aspect).min(MAX_WINDOW_W - CHROME_W);
+    let screen_h = screen_w / aspect;
+    (CHROME_W + screen_w.max(420.0), screen_h + 110.0)
 }
 
 /// Sends one touch or keystroke input to the device on screen.
@@ -770,7 +845,7 @@ fn apply(s: &State, input: Input) {
             s.live.iter().for_each(|l| l.strokes(&strokes));
             return;
         }
-        Input::Key(_) => return,
+        Input::Key(_) | Input::Hover(..) | Input::Leave => return,
     };
     if let Some(live) = &s.live {
         live.touch(x, y, phase);
@@ -813,6 +888,8 @@ fn main() {
             ("demo", demo),
             ("android", android_scene),
             ("foldable", foldable_scene),
+            ("tablet", tablet_scene),
+            ("ipad", ipad_scene),
             ("watch", watch_scene),
             ("tv", tv_scene),
             ("apple-watch", apple_watch_scene),
@@ -1285,5 +1362,44 @@ mod tests {
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.inputs.len(), 2, "{:?}", rt.state.inputs);
         assert!(matches!(&rt.state.inputs[0], Input::Key(KeyAction::Strokes(s)) if s[0].usage == 0x04));
+    }
+
+    #[test]
+    fn the_stylus_hovers_where_the_pointer_is_and_leaves_with_it() {
+        let mut rt = runtime(demo);
+        let (x, y) = rt.find("device-screen").expect("screen");
+        rt.state.inputs.clear();
+        rt.pointer_move(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.inputs.iter().any(|i| matches!(i, Input::Hover(..))), "no hover with the stylus off");
+        rt.update(|s, _| s.stylus = true);
+        rt.pointer_move(x + 1.0, y);
+        rt.frame(1.0 / 60.0);
+        let (w, h) = rt.state.screen_size();
+        let hover = rt.state.inputs.iter().find_map(|i| if let Input::Hover(hx, hy) = i { Some((*hx, *hy)) } else { None });
+        let (hx, hy) = hover.expect("a hover sample");
+        assert!((hx - w as f32 / 2.0).abs() < w as f32 * 0.02 && (hy - h as f32 / 2.0).abs() < h as f32 * 0.02, "{hover:?} on {w}x{h}");
+        rt.pointer_leave();
+        rt.frame(1.0 / 60.0);
+        assert!(matches!(rt.state.inputs.last(), Some(Input::Leave)), "{:?}", rt.state.inputs);
+        // Offline (no Android screen) the toggle says why it does nothing.
+        rt.update(|s, _| {
+            s.stylus = false;
+            toggle_stylus(s);
+        });
+        assert!(!rt.state.stylus && rt.state.status.as_deref() == Some("The stylus needs a running Android device"));
+    }
+
+    #[test]
+    fn landscape_tablets_fit_a_laptop_display() {
+        // Phones and portrait tablets keep the full-height screen.
+        let phone = fit_window((720, 1280));
+        assert_eq!(phone.1, android::SCREEN_POINTS + 110.0);
+        assert!(fit_window((1600, 2560)).1 == phone.1 && fit_window((1600, 2560)).0 < MAX_WINDOW_W);
+        // A Pixel Tablet in landscape would be 1828 points wide at full height: it is shorter.
+        let (w, h) = fit_window((2560, 1600));
+        assert_eq!(w, MAX_WINDOW_W);
+        let screen = (w - 612.0, h - 110.0);
+        assert!((screen.0 / screen.1 - 1.6).abs() < 1e-3, "the screen keeps its aspect: {screen:?}");
     }
 }

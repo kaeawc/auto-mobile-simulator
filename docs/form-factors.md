@@ -99,7 +99,7 @@ Foldable postures follow the stock emulator's hinge ranges: closed below 30°, h
 | Apple TV | `simee create TV "Apple TV 4K (3rd generation)" "tvOS 26.0" --form-factor tv` | `button select\|menu\|back\|home\|play-pause\|up\|down\|left\|right` (the Siri Remote), `remote-swipe up\|down\|left\|right` (its touch surface) |
 | Vision Pro | `simee create V "Apple Vision Pro" "visionOS 26.0" --form-factor vision` | touch (unverified), `button home` |
 | Android phone | `simee create P --platform android --system-image "system-images;android-36;google_apis;arm64-v8a"` | touch, `button back\|home\|recents`, `type`, `rotate` |
-| Android tablet | the same image, `--form-factor tablet` | as phone |
+| Android tablet | the same image, `--form-factor tablet` | as phone, plus `stylus X Y [hover\|down\|move\|up\|leave]` or `stylus X Y --to X2 Y2` (a pen; [Tablets](#tablets)) |
 | Android foldable | the same image, `--form-factor foldable` | as phone, plus `fold <closed\|half-opened\|opened\|angle>` |
 | Wear OS | `--system-image "system-images;android-34;android-wear;arm64-v8a"` | touch, `rotary <ticks>`, `button back\|home\|power` |
 | Android TV | `--system-image "system-images;android-34;google-tv;arm64-v8a"` | `button up\|down\|left\|right\|select\|back\|home` |
@@ -125,6 +125,25 @@ size, a foldable's hinge sensor). An image can't boot another family's form fact
 $ simee create T --platform android --system-image "system-images;android-34;android-wear;arm64-v8a" --form-factor tablet
 Error: system image `system-images;android-34;android-wear;arm64-v8a` (tag `android-wear`) boots Wear OS · Watch devices, not tablet
 ```
+
+## Tablets
+
+What a tablet has under the stock tools and under simee. The Android column for stock is read from
+the emulator's sources (`android-qemu2-glue/main.cpp`, `virtio-input-multi-touch.c`,
+`multitouch-screen.c`) and the SDK's `pixel_tablet` definition; it wasn't compared on a running
+stock tablet.
+
+| Feature | Stock | simee |
+| --- | --- | --- |
+| Android screen, density | `pixel_tablet`: 2560×1600 (landscape is its natural orientation), xhdpi | the same 2560×1600 at 320 dpi (`--form-factor tablet`) |
+| Android rotation | `rotate` turns the accelerometer's gravity | the same (`rotate`, the desktop's Rotate) |
+| Android stylus | every touch screen takes a pen on its own slot: `ABS_MT_TOOL_TYPE` pen, `MT_TOOL_MAX` with `BTN_TOOL_RUBBER` for the eraser, `BTN_STYLUS` for the barrel button, pressure, hover at zero pressure; sent through gRPC (`PenEvent`) | the same device codes and pen slot on every touch screen; `stylus` (API, CLI) and the console's `pen` send it; the desktop's Stylus button (tablets) makes the pointer a pen that hovers and draws |
+| Android mouse / trackpad | google_apis images enable neither `VirtioMouse` nor `VirtioTablet`, so stock gives a tablet no mouse device (a mouse device replaces the touch screen there); the host mouse is a finger | the same: the pointer is a finger, or the pen with the Stylus button |
+| Android hardware keyboard | `hw.keyboard=yes` (`qwerty2`) | the same |
+| Taskbar, split screen, freeform windows | the guest's own (large-screen launcher; split screen from the taskbar or recents; freeform behind the developer option) | the guest's own, unchanged |
+| Desktop window | — | a landscape tablet's screen is shown shorter so the window stays within 1440 points |
+| iPad rotation, keyboard | Simulator.app's Rotate, hardware keyboard | `rotate [--orientation]`, `type`, `key`, `hardware_keyboard` |
+| iPad pointer, Apple Pencil | Simulator.app can send the host pointer to the device (I/O › Input); what it offers for the Pencil wasn't checked | neither: simee has no pointer or Pencil HID messages yet |
 
 ## Apple inputs and CarPlay
 
