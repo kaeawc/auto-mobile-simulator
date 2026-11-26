@@ -637,10 +637,12 @@ fn bootconfig(avd: &Avd, opts: &Opts, graphics: bool) -> BootConfig {
         // gfxstream over virtio-gpu: GLES through the pipe stream, Vulkan and ANGLE through
         // address-space graphics, both on the host renderer.
         bc.set("androidboot.hardware.gltransport", "virtio-gpu-asg").set("androidboot.hardware.vulkan", "ranchu");
-        // Guest GLES through ANGLE on the guest's Vulkan, so every context uses
+        // API 34+: guest GLES through ANGLE on the guest's Vulkan, so every context uses
         // address-space graphics: with `emulation` GLES rides the virtio-gpu pipe stream,
-        // whose blocking reads serialize all processes on one queue (boots took 14–28 s with
-        // ANRs, against 5–8 s on ANGLE). EMU_GUEST_EGL=emulation restores it.
+        // whose blocking reads serialize all processes on one queue (API 34+ boots took
+        // 14–28 s with ANRs, against 5–8 s on ANGLE). Below API 34 the images' ANGLE aborts
+        // SurfaceFlinger, so they get the GLES encoder (`emulation`), as stock runs them; their
+        // boot times aren't measured yet. EMU_GUEST_EGL overrides either default.
         for (k, v) in guest_graphics(&guest_egl(avd), AngleImage::of(avd)) {
             bc.set(k, v);
         }
