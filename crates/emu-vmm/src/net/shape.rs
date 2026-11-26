@@ -87,6 +87,11 @@ pub fn queue_bits(bps: f64) -> Option<u64> {
     (bps > 0.0).then(|| ((bps * QUEUE) as u64).max(2 * FRAME_BITS))
 }
 
+/// Extra room, past the queue's cap, that control frames (ACKs, SYN-ACKs, ARP replies) may
+/// use, in bits: bulk data finds the queue full while a reply to the guest's own frame still
+/// gets through. It bounds the memory they can pin (about 24 kB however many arrive).
+const CONTROL_RESERVE_BITS: u64 = 16 * FRAME_BITS;
+
 /// A frame held for the guest: when it is due, when the bucket let it go (before the latency),
 /// and when it arrived.
 struct Held {
@@ -205,6 +210,18 @@ impl Downlink {
         true
     }
 
+    /// Holds a control frame (see [`CONTROL_RESERVE_BITS`]): it may use the reserve past the
+    /// cap, so a full queue of bulk data doesn't cost the guest its ACK. False (dropped) only
+    /// when the reserve is spent too.
+    pub fn push_control(&mut self, now: Instant, frame: Vec<u8>) -> bool {
+        let fits = queue_bits(self.bucket.rate_bps).is_none_or(|cap| self.held_bits + frame.len() as u64 * 8 <= cap + CONTROL_RESERVE_BITS);
+        if !fits {
+            return false;
+        }
+        self.enqueue(now, frame);
+        true
+    }
+
     /// The next frame whose time has come.
     pub fn pop_due(&mut self, now: Instant) -> Option<Vec<u8>> {
         if self.queue.front().is_some_and(|h| h.due <= now) {
@@ -265,6 +282,27 @@ mod tests {
             }
         }
         d.queue.back().expect("pushed").due
+    }
+
+    #[test]
+    fn control_frames_use_a_bounded_reserve_when_bulk_finds_the_queue_full() {
+        let t0 = Instant::now();
+        let mut d = Downlink::new();
+        d.set(&cond(0.0, 14_400.0, 0, 0));
+        while d.push(t0, vec![0; FRAME]) {}
+        assert!(!d.push(t0, vec![0; FRAME]), "bulk is refused");
+        assert!(d.push_control(t0, vec![0; 60]), "a control frame still fits");
+        let cap = queue_bits(14_400.0).expect("rate");
+        let mut taken = 0;
+        while d.push_control(t0, vec![0; 60]) {
+            taken += 1;
+            assert!(taken < 100_000, "the reserve is bounded");
+        }
+        assert!(d.held_bits <= cap + CONTROL_RESERVE_BITS, "{} bits held", d.held_bits);
+        assert!(!d.push(t0, vec![0; FRAME]), "bulk stays refused behind the reserve");
+        // Unlimited: nothing is ever refused.
+        d.set(&cond(0.0, 0.0, 0, 0));
+        assert!(d.push_control(t0, vec![0; 60]));
     }
 
     #[test]
