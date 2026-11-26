@@ -59,12 +59,21 @@ pub fn read_frame(r: &mut impl Read) -> std::io::Result<(FrameHeader, Vec<u8>)> 
 /// `len` bytes, read straight into reserved capacity: no zero-fill of a multi-megabyte frame
 /// first.
 fn read_exactly(r: &mut impl Read, len: usize) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(len);
-    r.take(len as u64).read_to_end(&mut out)?;
+    let mut out = Vec::new();
+    read_exactly_into(r, len, &mut out)?;
+    Ok(out)
+}
+
+/// [`read_exactly`] into `out`, replacing what it held: a buffer that already has room for `len`
+/// bytes is refilled without allocating.
+fn read_exactly_into(r: &mut impl Read, len: usize, out: &mut Vec<u8>) -> std::io::Result<()> {
+    out.clear();
+    out.reserve_exact(len);
+    r.take(len as u64).read_to_end(out)?;
     if out.len() != len {
         return Err(std::io::ErrorKind::UnexpectedEof.into());
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Bytes of socket input read ahead: room for 256 queued ring notices, so one `read` sees every
@@ -140,7 +149,21 @@ impl<R: Read> Frames<R> {
         self.read_next(true, wanted)
     }
 
+    /// [`Frames::newest_frame_when`], reading the frame's pixels into `buf` (replacing what it
+    /// held) rather than a new buffer: a window that gets its previous frame's buffer back
+    /// (Rune's `Pixels::replace`) refills it, so a steady stream allocates nothing per frame.
+    /// `buf` holds nothing useful after an error.
+    pub fn newest_frame_into(&mut self, buf: &mut Vec<u8>, wanted: impl Fn() -> bool) -> std::io::Result<FrameHeader> {
+        self.read_next_into(true, wanted, buf)
+    }
+
     fn read_next(&mut self, skip_to_newest: bool, wanted: impl Fn() -> bool) -> std::io::Result<(FrameHeader, Vec<u8>)> {
+        let mut rgba = Vec::new();
+        let header = self.read_next_into(skip_to_newest, wanted, &mut rgba)?;
+        Ok((header, rgba))
+    }
+
+    fn read_next_into(&mut self, skip_to_newest: bool, wanted: impl Fn() -> bool, buf: &mut Vec<u8>) -> std::io::Result<FrameHeader> {
         loop {
             let mut hdr = [0u8; HEADER_LEN];
             self.reader.read_exact(&mut hdr)?;
@@ -152,7 +175,10 @@ impl<R: Read> Frames<R> {
                     }
                     self.skipped += 1;
                 }
-                Record::Frame(header) => return Ok((header, read_exactly(&mut self.reader, header.len as usize)?)),
+                Record::Frame(header) => {
+                    read_exactly_into(&mut self.reader, header.len as usize, buf)?;
+                    return Ok(header);
+                }
                 Record::Ring { path_len } => {
                     let path = read_exactly(&mut self.reader, path_len as usize)?;
                     // A ring that can't be opened leaves none: its frames are skipped, and the
@@ -172,10 +198,10 @@ impl<R: Read> Frames<R> {
                         self.superseded += 1;
                         (header, slot) = newer;
                     }
-                    match self.ring.as_ref().map(|r| r.read(slot, &header)) {
-                        Some(Ok(Some(rgba))) => return Ok((header, rgba)),
+                    match self.ring.as_ref().map(|r| r.read_into(slot, &header, buf)) {
+                        Some(Ok(true)) => return Ok(header),
                         Some(Err(e)) => return Err(e),
-                        Some(Ok(None)) | None => self.torn += 1,
+                        Some(Ok(false)) | None => self.torn += 1,
                     }
                 }
             }
@@ -198,9 +224,9 @@ impl Ring {
         Ok(Ring { file, layout })
     }
 
-    /// Slot `slot`'s pixels if it still holds the frame `header` announced, whole; `None` if it
-    /// was being (or has been) rewritten.
-    fn read(&self, slot: u32, header: &FrameHeader) -> std::io::Result<Option<Vec<u8>>> {
+    /// Reads slot `slot`'s pixels into `buf`: `true` if it still held the frame `header`
+    /// announced, whole; `false` if it was being (or has been) rewritten.
+    fn read_into(&self, slot: u32, header: &FrameHeader, buf: &mut Vec<u8>) -> std::io::Result<bool> {
         if slot >= self.layout.slots || u64::from(header.len) > self.layout.capacity {
             return Err(std::io::Error::other(format!("frame ring slot {slot} out of range")));
         }
@@ -209,18 +235,18 @@ impl Ring {
         self.file.read_exact_at(&mut raw, at)?;
         let before = ring::Slot::decode(&raw).unwrap_or_default();
         if before.len != header.len || !before.read_is_whole(before.seq, header.frame) {
-            return Ok(None);
+            return Ok(false);
         }
         // The seqlock reader's barriers: the pixels are read after the header, and the second
         // read of the sequence number after the pixels (the syscalls order them in practice).
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         let mut f = &self.file;
         f.seek(SeekFrom::Start(self.layout.slot_data_offset(slot)))?;
-        let rgba = read_exactly(&mut f, header.len as usize)?;
+        read_exactly_into(&mut f, header.len as usize, buf)?;
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         let mut seq = [0u8; 8];
         self.file.read_exact_at(&mut seq, at)?;
-        Ok(before.read_is_whole(u64::from_le_bytes(seq), header.frame).then_some(rgba))
+        Ok(before.read_is_whole(u64::from_le_bytes(seq), header.frame))
     }
 }
 
@@ -298,14 +324,23 @@ mod tests {
             })
             .collect();
         write_ring(&path, layout, &slots);
-        // Every frame in order (`next_frame`), then the window's path (`newest_frame`).
-        for newest in [false, true] {
-            burst_run(&path, newest, SLOTS, BURSTS, (w, h));
+        // Every frame in order (`next_frame`), then the window's path: a new buffer per frame
+        // (`newest_frame`), and the buffer the frame before last came back in
+        // (`newest_frame_into`, two alternating as `Pixels::replace` hands them back).
+        for how in [How::Next, How::Newest, How::NewestInto] {
+            burst_run(&path, how, SLOTS, BURSTS, (w, h));
         }
         std::fs::remove_dir_all(dir).ok();
     }
 
-    fn burst_run(path: &Path, newest: bool, slots: u32, bursts: usize, (w, h): (u32, u32)) {
+    #[derive(Clone, Copy, Debug)]
+    enum How {
+        Next,
+        Newest,
+        NewestInto,
+    }
+
+    fn burst_run(path: &Path, how: How, slots: u32, bursts: usize, (w, h): (u32, u32)) {
         let len = w * h * 4;
         let (client, mut server) = UnixStream::pair().expect("pair");
         let (caught_up, wait) = std::sync::mpsc::channel::<()>();
@@ -326,11 +361,22 @@ mod tests {
         });
         let mut frames = Frames::new(client);
         let (mut read, mut times) = (0usize, Vec::new());
+        let mut bufs = [Vec::new(), Vec::new()];
         for _ in 0..bursts {
             let start = std::time::Instant::now();
             loop {
-                let (header, rgba) = if newest { frames.newest_frame() } else { frames.next_frame() }.expect("frame");
-                assert_eq!(rgba.len(), len as usize);
+                let header = match how {
+                    How::Next => frames.next_frame().map(|(h, px)| (h, px.len())),
+                    // Held until the next frame replaces it, as the window's `Pixels` holds it.
+                    How::Newest => frames.newest_frame().map(|(h, px)| {
+                        let n = px.len();
+                        bufs[0] = px;
+                        (h, n)
+                    }),
+                    How::NewestInto => frames.newest_frame_into(&mut bufs[read % 2], || true).map(|h| (h, bufs[read % 2].len())),
+                };
+                let (header, got) = header.expect("frame");
+                assert_eq!(got, len as usize);
                 read += 1;
                 if header.frame == u64::from(slots - 1) {
                     break;
@@ -342,8 +388,8 @@ mod tests {
         writer.join().expect("writer");
         times.sort();
         println!(
-            "{}: burst of {slots} {w}x{h} notices: median {:?} to catch up, {} frames read ({:.1} per burst, {:.0} MB per burst)",
-            if newest { "newest_frame" } else { "next_frame" },
+            "{:?}: burst of {slots} {w}x{h} notices: median {:?} to catch up, {} frames read ({:.1} per burst, {:.0} MB per burst)",
+            how,
             times[bursts / 2],
             read,
             read as f64 / bursts as f64,
@@ -455,6 +501,42 @@ mod tests {
         let mut line = String::new();
         BufReader::new(server).read_line(&mut line).expect("line");
         assert_eq!(line, "socket\n", "asked for socket frames");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A window hands back the buffer its previous frame was in: ring and socket frames are read
+    /// into that same allocation, so a steady stream allocates nothing per frame (#17).
+    #[test]
+    fn frames_refill_a_recycled_buffer_in_place() {
+        let dir = std::env::temp_dir().join(format!("sa-recycle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("frames.ring");
+        let layout = ring::Layout::new(2, 8);
+        let slot = |frame| ring::Slot { seq: 2, frame, width: 2, height: 1, device_width: 4, device_height: 2, len: 8 };
+        write_ring(&path, layout, &[(0, slot(1), &[1; 8]), (1, slot(3), &[3; 8])]);
+        let header = |frame| FrameHeader::new(2, 1, 4, 2, frame).expect("size");
+        let p = path.to_str().expect("utf8").as_bytes();
+        let mut stream = Vec::new();
+        stream.extend(Record::Ring { path_len: p.len() as u32 }.encode());
+        stream.extend(p);
+        stream.extend(Record::Shared { header: header(1), slot: 0 }.encode());
+        stream.extend(Record::Frame(header(2)).encode());
+        stream.extend([2; 8]);
+        stream.extend(Record::Shared { header: header(3), slot: 1 }.encode());
+        let mut frames = Frames::new(std::io::Cursor::new(stream));
+        let mut buf = vec![0xee; 8];
+        let at = buf.as_ptr();
+        for n in 1..=3u8 {
+            let h = frames.newest_frame_into(&mut buf, || true).expect("frame");
+            assert_eq!((h, buf.as_slice()), (header(u64::from(n)), &[n; 8][..]));
+            assert_eq!(buf.as_ptr(), at, "frame {n} was read into the same buffer");
+        }
+        assert!(frames.newest_frame_into(&mut buf, || true).is_err(), "end of stream");
+        // An empty buffer (the first frame) is filled without zeroing it first.
+        let mut frames = Frames::new(std::io::Cursor::new([Record::Frame(header(4)).encode().to_vec(), vec![4; 8]].concat()));
+        let mut empty = Vec::new();
+        assert_eq!(frames.newest_frame_into(&mut empty, || true).expect("frame"), header(4));
+        assert_eq!(empty, [4; 8]);
         std::fs::remove_dir_all(dir).ok();
     }
 

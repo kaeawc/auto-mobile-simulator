@@ -32,8 +32,8 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
 /// A toolbar button: an icon (labelled for accessibility), with visible text only for the primary
 /// action, which also gets the accent fill.
 fn button(key: &str, glyph: &'static Icon, label: &str, action: Action, primary: bool, t: Theme) -> El {
-    let b = crate::debug::icon_button(key, glyph, label, primary || key == "refresh-button", t, move |s: &mut State, tx: &mut Tx| {
-        crate::queue(s, tx, action.clone())
+    let b = crate::debug::icon_button(key, glyph, label, primary || key == "refresh-button", t, move |s: &mut State| {
+        s.actions.push(action.clone())
     });
     if primary { b.fill(tok::accent(0, true)) } else { b }
 }
@@ -88,7 +88,7 @@ fn sidebar(s: &State, t: Theme) -> El {
             .h(30.0)
             .center_y()
             .radius(radius::SM)
-            .on_press_tx(move |s: &mut State, tx: &mut Tx| crate::queue(s, tx, Action::Select(udid.clone())))
+            .on_press(move |s: &mut State| s.actions.push(Action::Select(udid.clone())))
             .child(bar)
             .child(
                 row()
@@ -212,7 +212,7 @@ fn screen(s: &State) -> El {
     };
     let device = device
         .focusable(true)
-        .on_drag(|s: &mut State, d: &mut Drag, tx: &mut Tx| {
+        .on_drag(|s: &mut State, d: &mut Drag, _: &mut Tx| {
             let (w, h) = s.screen_size();
             let to_device = |x: f32, y: f32| (x / d.w.max(1.0) * w as f32, y / d.h.max(1.0) * h as f32);
             let (x, y) = to_device(d.x, d.y);
@@ -222,14 +222,12 @@ fn screen(s: &State) -> El {
                 Phase::Up if d.cancelled() => Input::Up(x, y),
                 Phase::Up => Input::Up(x, y),
             });
-            crate::request_poll(tx);
         })
-        .on_key(|s: &mut State, k: &KeyEvent, tx: &mut Tx| {
+        .on_key(|s: &mut State, k: &KeyEvent, _: &mut Tx| {
             let action = crate::keys::map(k);
             let handled = action != crate::keys::KeyAction::Ignore;
             if handled {
                 s.inputs.push(Input::Key(action));
-                crate::request_poll(tx);
             }
             handled
         });
