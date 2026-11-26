@@ -348,6 +348,11 @@ Claims that would belong in the README once someone runs them:
   device's directory (6,562 files), so the host's `mds_stores` indexes what devices write. What
   excluding `~/Library/Developer/CoreSimulator` from Spotlight saves a farm needs a change to the
   host's Spotlight privacy settings to measure.
+- iPad `pointer` latency and placement error (`simee pointer <udid> X Y click`, `pointer … --to`)
+  with 6 halving steps (before: 10): per-call wall time, median of 3, and the error of 12 targets
+  on iOS 26.5 and 27.2 (`measure.sh`-style InputProbe run). Counted from the 16 ms report
+  interval only so far: homing 85 reports, 5 more per move; not timed, since the host's load was
+  198 on 2026-11-26.
 - Host CPU of an idle booted device, emu against the SDK emulator.
 - Network throughput and latency through emu's NAT against the SDK emulator's slirp.
 - Host CPU of an idle booted device with and without the virtio-snd card (`EMU_VIRTIO_SND=0`),
