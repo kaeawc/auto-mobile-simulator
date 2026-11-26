@@ -9,6 +9,10 @@
 //! again, it asks for frames and the emulator sends its newest at once.
 //! Switched away from, a screen pauses the same way and keeps its last frame in its `Pixels`;
 //! resumed, the window shows that frame at once and the emulator's newest replaces it.
+//! A turned device's frames arrive as the panel lies, with how far to turn them (the stream's
+//! `rotates`): the view turns them as it draws, on the GPU, so no frame is turned on the CPU,
+//! here or in the emulator. Touches go back in the upright screen's pixels, which emu maps onto
+//! the panel.
 //! What the socket doesn't carry (typing with shift, rotation, the hinge, screenshots) goes over
 //! the console through `sim-android`, on the screen's console worker: a console session can take
 //! seconds on a busy emulator, and the window never waits for one.
@@ -20,6 +24,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use rune::Pixels;
 use sim_core::gesture::Phase;
 use sim_core::hid::{KeyStroke, linux_keycode};
+use sim_core::rotation::Rotation;
 use sim_core::stream::Input;
 
 use crate::work::{Outcome, Worker};
@@ -47,6 +52,8 @@ pub struct Screen {
     pub pixels: Pixels,
     link: Arc<Mutex<sim_android::display::Display>>,
     device: Arc<(AtomicU32, AtomicU32)>,
+    /// Quarter turns clockwise that show the latest frame upright.
+    turn: Arc<AtomicU32>,
     alive: Arc<AtomicBool>,
     /// None while paused: dropping the worker drops its queued jobs, and the one running posts
     /// nothing, so a device that isn't shown never reports.
@@ -121,12 +128,14 @@ impl Screen {
     pub fn connect(udid: &str, avd_dir: PathBuf, max_width: u32, console: Worker<Lookup>) -> Result<Screen, String> {
         let mut display = sim_android::display::Display::connect(&avd_dir)?;
         display.request_shared()?;
+        display.request_rotation()?;
         display.send(&Input::Hello { max_width })?;
         let mut frames = sim_android::display::Frames::new(display.try_clone()?).with_fallback(display.try_clone()?);
         let (pixels, device, alive) = (Pixels::new(), Arc::new((AtomicU32::new(0), AtomicU32::new(0))), Arc::new(AtomicBool::new(true)));
         let shown = Arc::new(Shown { visible: Mutex::new(true), changed: Condvar::new() });
         let read = Arc::new(AtomicU64::new(0));
-        let (p, d, a, sh, r) = (pixels.clone(), device.clone(), alive.clone(), shown.clone(), read.clone());
+        let turn = Arc::new(AtomicU32::new(0));
+        let (p, d, a, sh, r, t) = (pixels.clone(), device.clone(), alive.clone(), shown.clone(), read.clone(), turn.clone());
         std::thread::Builder::new()
             .name("simee-android-frames".into())
             .spawn(move || {
@@ -142,6 +151,7 @@ impl Screen {
                     r.fetch_add(1, Ordering::Relaxed);
                     d.0.store(header.device_width, Ordering::Relaxed);
                     d.1.store(header.device_height, Ordering::Relaxed);
+                    t.store(frames.rotation.quarters(), Ordering::Relaxed);
                     spare = p.replace(header.width, header.height, std::mem::take(&mut spare));
                 }
                 a.store(false, Ordering::Relaxed);
@@ -149,7 +159,20 @@ impl Screen {
             .map_err(|e| e.to_string())?;
         let tail = Mutex::new(None);
         let link = Arc::new(Mutex::new(display));
-        Ok(Screen { udid: udid.to_owned(), avd_dir, pixels, link, device, alive, console: Some(console), tail, max_width, shown, read })
+        Ok(Screen {
+            udid: udid.to_owned(),
+            avd_dir,
+            pixels,
+            link,
+            device,
+            turn,
+            alive,
+            console: Some(console),
+            tail,
+            max_width,
+            shown,
+            read,
+        })
     }
 
     /// Switched away from: stops the stream as a hidden window does and drops the console work
@@ -234,10 +257,16 @@ impl Screen {
         self.alive.load(Ordering::Relaxed)
     }
 
-    /// The device's display size (input coordinates); `None` until the first frame.
+    /// The device's display size as it's shown, turned with the device (input coordinates);
+    /// `None` until the first frame.
     pub fn device_size(&self) -> Option<(u32, u32)> {
         let (w, h) = (self.device.0.load(Ordering::Relaxed), self.device.1.load(Ordering::Relaxed));
-        (w > 0 && h > 0).then_some((w, h))
+        (w > 0 && h > 0).then(|| self.rotation().turned((w, h)))
+    }
+
+    /// How far to turn [`Screen::pixels`] (as the panel lies) clockwise to show it upright.
+    pub fn rotation(&self) -> Rotation {
+        Rotation::from_quarters(self.turn.load(Ordering::Relaxed))
     }
 
     fn send(&self, input: &Input) {
@@ -433,7 +462,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (conn, _) = listener.accept().expect("accept");
             let mut lines = BufReader::new(conn).lines();
-            (0..5).map(|_| lines.next().expect("line").expect("utf8")).collect::<Vec<_>>()
+            (0..6).map(|_| lines.next().expect("line").expect("utf8")).collect::<Vec<_>>()
         });
         let outbox = Outbox::default();
         let screen = Screen::connect("pixel", dir.clone(), 1080, console(outbox.clone())).expect("connect");
@@ -457,11 +486,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         screen.strokes(vec![stroke('e')]);
-        assert_eq!(server.join().expect("server"), ["shm", "hello 1080", "key 30", "key 48", "key 18"]);
+        assert_eq!(server.join().expect("server"), ["shm", "rotates", "hello 1080", "key 30", "key 48", "key 18"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A fake emulator announces a ring and a frame in it; the window's pixels get that frame.
+    /// A fake emulator announces a ring and a frame in it; the window's pixels get that frame,
+    /// as the panel lies, and the screen says how to turn it (a quarter, here).
     #[test]
     fn frames_from_the_shared_ring_reach_the_window() {
         let dir = PathBuf::from("/tmp").join(format!("rs-android-{}", std::process::id()));
@@ -474,7 +504,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().expect("accept");
             let mut lines = BufReader::new(conn.try_clone().expect("clone")).lines();
-            let asked: Vec<String> = (0..2).map(|_| lines.next().expect("line").expect("utf8")).collect();
+            let asked: Vec<String> = (0..3).map(|_| lines.next().expect("line").expect("utf8")).collect();
             // A 2x1 frame of a 4x2 device in slot 1 of a 3-slot ring.
             let layout = ring::Layout::new(3, 8);
             let file = std::fs::File::create(&rp).expect("ring");
@@ -486,6 +516,7 @@ mod tests {
             let path = rp.to_str().expect("utf8").as_bytes();
             let mut msg = Record::Ring { path_len: path.len() as u32 }.encode().to_vec();
             msg.extend(path);
+            msg.extend(Record::Rotation(Rotation::Deg90).encode());
             msg.extend(Record::Shared { header: FrameHeader::new(2, 1, 4, 2, 7).expect("size"), slot: 1 }.encode());
             conn.write_all(&msg).expect("send");
             // Hold the connection open until the test has looked.
@@ -498,11 +529,11 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(5), "no frame");
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(screen.pixels.rgba(), [1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!(screen.device_size(), Some((4, 2)));
+        assert_eq!(screen.pixels.rgba(), [1, 2, 3, 4, 5, 6, 7, 8], "as the panel lies");
+        assert_eq!((screen.device_size(), screen.rotation()), (Some((2, 4)), Rotation::Deg90), "the upright screen's size");
         assert!(screen.alive());
         done.send(()).expect("done");
-        assert_eq!(server.join().expect("server"), ["shm", "hello 1080"]);
+        assert_eq!(server.join().expect("server"), ["shm", "rotates", "hello 1080"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -642,7 +673,7 @@ mod tests {
 
         screen.set_visible(false);
         screen.set_visible(false); // no change: nothing sent
-        wait_until("the emulator to hear the window hid", || seen.lines.lock().expect("lines").len() == 3);
+        wait_until("the emulator to hear the window hid", || seen.lines.lock().expect("lines").len() == 4);
         // The frame that was on its way goes out (and is passed over).
         wait_until("the frame on its way", || seen.sent_paused.load(Ordering::Relaxed) == 1);
         let (read, newest) = (screen.frames_read(), seen.newest.load(Ordering::Relaxed));
@@ -659,7 +690,7 @@ mod tests {
         println!("shown again: newest frame in {:.1} ms (the fake guest makes one every 4 ms)", start.elapsed().as_secs_f64() * 1000.0);
         wait_until("the newest frame", || shown(&screen) > before);
         assert!(shown(&screen) > last_shown);
-        assert_eq!(*seen.lines.lock().expect("lines"), ["shm", "hello 1080", "hello 0", "hello 1080"]);
+        assert_eq!(*seen.lines.lock().expect("lines"), ["shm", "rotates", "hello 1080", "hello 0", "hello 1080"]);
 
         drop(screen);
         server.join().expect("server");

@@ -15,6 +15,12 @@
 //! timer of its own. Unread guest-composed frames are then read in place into the kept buffer,
 //! one buffer instead of three.
 //!
+//! A turned device ([`FrameStore::set_rotation`]) keeps its frames as the panel lies: readers that
+//! turn them as they draw (the desktop, on the GPU) take them that way ([`FrameStore::latest`]),
+//! and the rest get them turned upright ([`FrameStore::latest_upright`]), turned once per frame
+//! into a buffer of their own that every such reader shares. An unturned device never touches
+//! that buffer.
+//!
 //! A renderer without GL can't report its posts (gfxstream's post callback reads every post back
 //! through GL); [`PostTicker`] stands in, driven by the renderer's fences.
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +28,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use sim_core::pixels::{PixelFormat, to_rgba_into};
+use sim_core::rotation::{Rotation, rotate_rgba_into};
 
 /// Reads the last posted frame back as tightly packed RGBA, top row first, `width` x `height`,
 /// into the buffer (exactly `width * height * 4` bytes). False when there's nothing to read.
@@ -95,6 +102,11 @@ pub struct FrameStore {
     /// The part of the scanout readers see (x, y, width, height): a folded foldable's outer
     /// screen. None: all of it.
     view: Mutex<Option<View>>,
+    /// How far the device is turned: the view turned by this much is what its viewer sees.
+    rotation: Mutex<Rotation>,
+    /// The capture turned upright, for readers that don't turn frames themselves, and the turn
+    /// it was made with; filled only while the device is turned.
+    upright: Mutex<(Capture, Rotation)>,
 }
 
 /// A rectangle of the scanout: x, y, width, height.
@@ -170,6 +182,8 @@ impl FrameStore {
             last_read: AtomicU64::new(0),
             idle_ms: idle.as_millis() as u64,
             view: Mutex::new(None),
+            rotation: Mutex::new(Rotation::Deg0),
+            upright: Mutex::default(),
         }
     }
 
@@ -186,6 +200,33 @@ impl FrameStore {
         }
         *v = view;
         drop(v);
+        self.recount();
+    }
+
+    /// Where readers' (0, 0) is on the scanout: the view's origin, clipped to the latest frame.
+    pub fn view_origin(&self) -> (u32, u32) {
+        let (w, h, _) = self.full_geometry();
+        clip_view(*lock(&self.view), w, h).map_or((0, 0), |(x, y, ..)| (x, y))
+    }
+
+    /// The device is turned by `rotation` (from its accelerometer), from the latest frame on:
+    /// the frame is counted again, so streams on a static screen send it turned.
+    pub fn set_rotation(&self, rotation: Rotation) {
+        let mut r = lock(&self.rotation);
+        if *r == rotation {
+            return;
+        }
+        *r = rotation;
+        drop(r);
+        self.recount();
+    }
+
+    pub fn rotation(&self) -> Rotation {
+        *lock(&self.rotation)
+    }
+
+    /// The latest frame counted again (a new view or turn): waiting streams send it.
+    fn recount(&self) {
         let mut s = lock(&self.inner);
         if s.frames > 0 {
             s.frames += 1;
@@ -194,10 +235,24 @@ impl FrameStore {
         self.posted.notify_all();
     }
 
-    /// Where readers' (0, 0) is on the scanout: the view's origin, clipped to the latest frame.
-    pub fn view_origin(&self) -> (u32, u32) {
-        let (w, h, _) = self.full_geometry();
-        clip_view(*lock(&self.view), w, h).map_or((0, 0), |(x, y, ..)| (x, y))
+    /// The scanout pixel under point `(x, y)` of the screen readers are shown upright (the view,
+    /// turned as the device is): what a touch there presses. The view's size is the latest
+    /// frame's; before one, points are taken as scanout pixels.
+    pub fn to_scanout(&self, x: f64, y: f64) -> (i32, i32) {
+        let (w, h, frames) = self.geometry();
+        let (ox, oy) = self.view_origin();
+        if frames == 0 || w == 0 || h == 0 {
+            return (x as i32 + ox as i32, y as i32 + oy as i32);
+        }
+        let (px, py) = self.rotation().screen_to_panel((x, y), (w, h));
+        (px as i32 + ox as i32, py as i32 + oy as i32)
+    }
+
+    /// [`FrameStore::geometry`] as the frames of [`FrameStore::latest_upright`] are: turned.
+    pub fn upright_geometry(&self) -> (u32, u32, u64) {
+        let (w, h, n) = self.geometry();
+        let (w, h) = self.rotation().turned((w, h));
+        (w, h, n)
     }
 
     /// The latest frame's width, height and number as readers see it (the view, if one is set),
@@ -263,13 +318,19 @@ impl FrameStore {
         {
             *spare = Vec::new();
         }
+        if let Ok(mut up) = self.upright.try_lock()
+            && up.0.rgba.capacity() > 0
+        {
+            up.0.rgba = Vec::new();
+            up.0.frame = 0;
+        }
     }
 
     /// Bytes of frame buffers the store holds (kept pixels, capture, spare), for tests and
     /// diagnostics.
     pub fn buffered_bytes(&self) -> usize {
         let pixels = lock(&self.inner).pixels.capacity();
-        pixels + lock(&self.capture).rgba.capacity() + lock(&self.spare).capacity()
+        pixels + lock(&self.capture).rgba.capacity() + lock(&self.spare).capacity() + lock(&self.upright).0.rgba.capacity()
     }
 
     pub fn frames(&self) -> u64 {
@@ -312,6 +373,31 @@ impl FrameStore {
             (cap.width, cap.height, cap.frame) = (seen_w, seen_h, frame);
         }
         Some(f(&cap))
+    }
+
+    /// [`FrameStore::latest`] turned upright, as a viewer of the turned device sees it (a screenshot,
+    /// a stream to a client that doesn't turn frames itself). Unturned, it is the capture itself;
+    /// turned, the capture is turned once per frame into a buffer every such reader shares.
+    pub fn latest_upright<R>(&self, f: impl FnOnce(&Capture) -> R) -> Option<R> {
+        self.latest(|cap| {
+            // Read after the frame's number: a turn counts the frame again after it's set, so a
+            // frame numbered after a turn is never turned the old way.
+            let rotation = self.rotation();
+            if rotation == Rotation::Deg0 {
+                return f(cap);
+            }
+            let (w, h) = rotation.turned((cap.width, cap.height));
+            let mut up = lock(&self.upright);
+            // Turned for this frame, this way (a square view keeps its size across a turn).
+            if (up.0.frame, up.0.width, up.0.height, up.1) != (cap.frame, w, h, rotation) {
+                let (turned, _) = &mut *up;
+                turned.rgba.resize(cap.rgba.len(), 0);
+                rotate_rgba_into(&cap.rgba, cap.width, cap.height, rotation, &mut turned.rgba);
+                (turned.width, turned.height, turned.frame) = (w, h, cap.frame);
+                up.1 = rotation;
+            }
+            f(&up.0)
+        })
     }
 
     /// Frame `frame` (`width` x `height`, the latest [`FrameStore::geometry`] gave) as RGBA into
@@ -825,6 +911,108 @@ mod tests {
         assert_eq!((store.geometry().0, store.geometry().1, store.view_origin()), (4, 2, (0, 0)));
         store.set_view(None);
         assert_eq!(reds(&store).map(|(w, h, _)| (w, h)), Some((4, 2)));
+    }
+
+    /// A `w` x `h` frame whose pixels hold their own index (little-endian, all four bytes).
+    fn indexed(w: u32, h: u32) -> Vec<u8> {
+        (0..w * h).flat_map(|i| i.to_le_bytes()).collect()
+    }
+
+    fn index_at(c: &Capture, (x, y): (u32, u32)) -> u32 {
+        let i = (y * c.width + x) as usize * 4;
+        u32::from_le_bytes(c.rgba[i..i + 4].try_into().expect("pixel"))
+    }
+
+    #[test]
+    fn an_unturned_device_reads_its_frames_unchanged_and_keeps_no_turned_copy() {
+        let store = FrameStore::default();
+        store.present(6, 4, 24, PixelFormat::RGBA_VIRTIO, &indexed(6, 4));
+        assert_eq!(store.rotation(), Rotation::Deg0);
+        let plain = store.latest(|c| c.rgba.clone()).expect("frame");
+        let bytes = store.buffered_bytes();
+        // The capture itself, not a copy: the same buffer.
+        let same = store.latest(|c| c.rgba.as_ptr()) == store.latest_upright(|c| c.rgba.as_ptr());
+        assert!(same, "upright is the capture when unturned");
+        assert_eq!(store.latest_upright(|c| c.rgba.clone()), Some(plain));
+        assert_eq!(store.buffered_bytes(), bytes, "no turned buffer");
+        assert_eq!(store.upright_geometry(), store.geometry());
+        assert_eq!(store.to_scanout(5.0, 3.0), (5, 3));
+        // Setting the same turn again isn't a new frame.
+        let n = store.frames();
+        store.set_rotation(Rotation::Deg0);
+        assert_eq!(store.frames(), n);
+    }
+
+    #[test]
+    fn a_turned_device_shows_readers_its_frames_upright_turned_once_per_frame() {
+        // A phone (portrait panel) and a tablet (landscape panel), scaled down.
+        for (w, h) in [(6u32, 10u32), (10, 6)] {
+            let store = FrameStore::default();
+            store.present(w, h, w * 4, PixelFormat::RGBA_VIRTIO, &indexed(w, h));
+            for r in [Rotation::Deg90, Rotation::Deg180, Rotation::Deg270, Rotation::Deg0] {
+                let n = store.frames();
+                store.set_rotation(r);
+                assert_eq!(store.frames(), n + 1, "{r:?}: counted again, so streams send it turned");
+                let (tw, th) = r.turned((w, h));
+                assert_eq!(store.upright_geometry(), (tw, th, n + 1));
+                assert_eq!(store.geometry(), (w, h, n + 1), "readers that turn frames themselves see the panel");
+                // Every panel pixel shows where the turn puts it.
+                store
+                    .latest_upright(|c| {
+                        assert_eq!((c.width, c.height, c.frame), (tw, th, n + 1));
+                        for y in 0..h {
+                            for x in 0..w {
+                                assert_eq!(index_at(c, r.panel_to_screen((x, y), (w, h))), y * w + x, "{r:?} ({x}, {y})");
+                            }
+                        }
+                    })
+                    .expect("frame");
+                // The panel's frame is untouched, and a second reader shares the turned copy.
+                assert_eq!(store.latest(|c| index_at(c, (1, 0))), Some(1));
+                if r != Rotation::Deg0 {
+                    let first = store.latest_upright(|c| c.rgba.as_ptr());
+                    assert_eq!(store.latest_upright(|c| c.rgba.as_ptr()), first, "one turned copy per frame");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn touches_on_the_upright_screen_land_on_the_scanout_pixel_shown_there() {
+        // Phone 1080x2400, a landscape tablet 2560x1600, and a folded Pixel Fold (its outer
+        // screen, 949x1840 at x 629 of the 2208x1840 scanout).
+        let cases: [((u32, u32), Option<View>); 3] =
+            [((1080, 2400), None), ((2560, 1600), None), ((2208, 1840), Some((629, 0, 949, 1840)))];
+        for ((sw, sh), view) in cases {
+            let store = FrameStore::default();
+            store.posted(sw, sh);
+            store.set_view(view);
+            let (ox, oy, vw, vh) = view.unwrap_or((0, 0, sw, sh));
+            for r in Rotation::ALL {
+                store.set_rotation(r);
+                let (tw, th, _) = store.upright_geometry();
+                assert_eq!((tw, th), r.turned((vw, vh)));
+                // Each corner of the screen, and a point inside, on the view's pixel there.
+                for (vx, vy) in [(0, 0), (vw - 1, 0), (0, vh - 1), (vw - 1, vh - 1), (vw / 3, vh / 5)] {
+                    let (x, y) = r.panel_to_screen((vx, vy), (vw, vh));
+                    let want = ((vx + ox) as i32, (vy + oy) as i32);
+                    assert_eq!(store.to_scanout(f64::from(x) + 0.5, f64::from(y) + 0.5), want, "{r:?} {sw}x{sh} {view:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn turned_buffers_go_with_the_rest_when_unread() {
+        let store = FrameStore::with_idle(Duration::from_millis(30));
+        store.present(8, 8, 32, PixelFormat::RGBA_VIRTIO, &indexed(8, 8));
+        store.set_rotation(Rotation::Deg90);
+        store.latest_upright(|_| ()).expect("frame");
+        assert!(lock(&store.upright).0.rgba.capacity() > 0);
+        std::thread::sleep(Duration::from_millis(40));
+        store.present(8, 8, 32, PixelFormat::RGBA_VIRTIO, &indexed(8, 8));
+        assert_eq!(lock(&store.upright).0.rgba.capacity(), 0, "freed with the capture");
+        assert_eq!(store.latest_upright(|c| index_at(c, (7, 0))), Some(0), "turned again when read");
     }
 
     #[test]

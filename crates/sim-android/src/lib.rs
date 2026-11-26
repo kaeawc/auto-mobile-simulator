@@ -28,6 +28,7 @@ use sim_core::frame::Frame;
 use sim_core::gesture::{Phase, Sample, pace, pace_samples};
 use sim_core::hid::{Button, Direction, KEY_LEFT_SHIFT, KeyStroke, keystroke, linux_keycode};
 use sim_core::platform::{AndroidOs, Platform, SubPlatform};
+use sim_core::rotation::Rotation;
 use sim_core::stream::Input;
 use sim_core::vhal;
 use sim_core::xr::XrCommand;
@@ -592,30 +593,45 @@ impl Device {
     }
 
     /// The size the guest lays out for, which [`play`](Self::play) and [`touch`](Self::touch)
-    /// points are in: the LCD, except on a folded foldable under simee, whose guest lays out for
-    /// its outer screen (a Pixel Fold's 1080x2092, as uiautomator's bounds are).
+    /// points are in, turned as the device is (a phone turned a quarter: 2400x1080, as
+    /// screenshots and uiautomator's bounds are then): the LCD, except on a folded foldable under
+    /// simee, whose guest lays out for its outer screen (a Pixel Fold's 1080x2092, as
+    /// uiautomator's bounds are).
     pub fn layout_size(&self) -> Result<(u32, u32), String> {
         match self.folded_view()? {
-            Some(s) => Ok((s.width, s.height)),
-            None => self.screen_size(),
+            Some((s, turn)) => Ok(turn.turned((s.width, s.height))),
+            None => Ok(self.rotation()?.turned(self.screen_size()?)),
         }
+    }
+
+    /// How far the running device is turned, as its accelerometer reads (`rotate` turns it a
+    /// quarter clockwise): simee's screenshots and frames are turned by this much, as stock's
+    /// gRPC screenshots are. Upright unless it runs under simee.
+    pub fn rotation(&self) -> Result<Rotation, String> {
+        if !self.running.as_ref().is_some_and(|r| r.simee) {
+            return Ok(Rotation::Deg0);
+        }
+        Ok(gravity_rotation(&self.console(&["sensor get acceleration".into()])?))
     }
 
     /// A folded foldable's hinge under simee, whose frames (the display socket, screenshots) show
     /// only the outer screen's region of the scanout (949x1840 of a Pixel Fold's 2208x1840) while
-    /// the guest lays out for the outer screen's own size: None for every other device, and
-    /// without asking the emulator unless the device is a foldable.
-    fn folded_view(&self) -> Result<Option<sim_core::fold::FoldState>, String> {
+    /// the guest lays out for the outer screen's own size, and how far the device is turned (in
+    /// the same console session): None for every other device, and without asking the emulator
+    /// unless the device is a foldable.
+    fn folded_view(&self) -> Result<Option<(sim_core::fold::FoldState, Rotation)>, String> {
         let foldable = self.info.kind().is_some_and(|k| k.accepts(InputMethod::Hinge));
         if !foldable || !self.running.as_ref().is_some_and(|r| r.simee) {
             return Ok(None);
         }
-        Ok(self.fold_state()?.filter(|s| s.folded))
+        let lines = self.console(&["fold status".into(), "sensor get acceleration".into()])?;
+        Ok(sim_core::fold::FoldState::parse(&lines).filter(|s| s.folded).map(|s| (s, gravity_rotation(&lines))))
     }
 
-    /// `point` in the guest's layout on the display socket's frames (see [`Device::layout_size`]).
-    fn to_view(view: Option<&sim_core::fold::FoldState>, x: f64, y: f64) -> (f32, f32) {
-        let (x, y) = view.map_or((x, y), |s| s.guest_to_view((x, y)));
+    /// `point` in the guest's layout on the display socket's frames (see [`Device::layout_size`]),
+    /// which emu turns onto the panel itself.
+    fn to_view(view: Option<&(sim_core::fold::FoldState, Rotation)>, x: f64, y: f64) -> (f32, f32) {
+        let (x, y) = view.map_or((x, y), |(s, turn)| s.guest_to_turned_view((x, y), *turn));
         (x as f32, y as f32)
     }
 
@@ -827,10 +843,11 @@ impl Device {
         pace(&delays, || start.elapsed(), sleep, |i| session.command(&lines[i]).map(drop))
     }
 
-    /// Stylus samples on the touch screen at device pixels, what stock's gRPC `PenEvent` sends,
-    /// spread over `duration` in one console session (simee's `pen` command).
+    /// Stylus samples on the touch screen at pixels of the screen as screenshots show it (turned
+    /// with the device), with the codes stock's gRPC `PenEvent` sends, spread over `duration` in
+    /// one console session (simee's `pen` command).
     pub fn stylus(&self, samples: &[sim_core::stylus::PenSample], duration: Duration) -> Result<(), String> {
-        let (w, h) = self.screen_size()?;
+        let (w, h) = self.rotation()?.turned(self.screen_size()?);
         if let Some(s) = samples.iter().find(|s| s.x as u32 >= w || s.y as u32 >= h) {
             return Err(format!("({}, {}) is off the {w}x{h} screen", s.x, s.y));
         }
@@ -1161,6 +1178,18 @@ fn file_tail(path: &Path, n: usize) -> Vec<String> {
     let text = String::from_utf8_lossy(&tail);
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].iter().map(|l| (*l).to_owned()).collect()
+}
+
+/// How far a device is turned whose console answered `sensor get acceleration` with `lines`
+/// (`acceleration = x:y:z`); upright when the reply has no such line.
+fn gravity_rotation(lines: &[String]) -> Rotation {
+    lines
+        .iter()
+        .find_map(|l| {
+            let mut v = l.strip_prefix("acceleration = ")?.split(':').map(|p| p.trim().parse::<f32>().ok());
+            Some(Rotation::from_gravity(v.next()??, v.next()??))
+        })
+        .unwrap_or_default()
 }
 
 /// Decodes an 8-bit RGBA PNG (what the emulator's `screenshot` writes).
@@ -1755,10 +1784,41 @@ mod tests {
             Some("angle: 0\r\nposture: closed (1)\r\nfolded: true\r\nvisible: 949x1840+629+0\r\nsize: 1080x2092\r\npostures: 1,2,3".into());
         let d = f.android.device("phone").expect("running");
         assert_eq!(d.layout_size(), d.screen_size());
+        assert_eq!(std::mem::take(&mut *fake.console.lock().expect("console")), ["sensor get acceleration"], "how it's turned");
         d.touch(1000.0, 2000.0, Phase::Down).expect("touch");
         d.play(&sim_core::gesture::tap(sim_core::geometry::Point::new(7.0, 9.0), Duration::ZERO)).expect("tap");
         assert_eq!(wait_for(&fake.display, 3), ["touch 1000 2000 down", "touch 7 9 down", "touch 7 9 up"]);
         assert!(fake.console.lock().expect("console").is_empty(), "no console round trip for a phone's touch");
+    }
+
+    #[test]
+    fn a_turned_devices_layout_and_folded_touches_are_turned() {
+        let f = fixture("turned");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let fake = fake_emulator(&f.android, "phone");
+        let d = f.android.device("phone").expect("running");
+        let panel = d.screen_size().expect("lcd");
+        // The accelerometer after stock's first, second and third `rotate`.
+        for (gravity, turn) in [("-9.80665:0:0", Rotation::Deg90), ("0:-9.80665:0", Rotation::Deg180), ("9.80665:0:0", Rotation::Deg270)] {
+            *fake.acceleration.lock().expect("gravity") = gravity.into();
+            assert_eq!(d.rotation(), Ok(turn));
+            assert_eq!(d.layout_size(), Ok(turn.turned(panel)), "{turn:?}");
+        }
+        // A phone's touches go as they are: emu turns them onto the panel.
+        d.touch(2000.0, 100.0, Phase::Down).expect("touch");
+        assert_eq!(wait_for(&fake.display, 1), ["touch 2000 100 down"]);
+        // A folded Pixel Fold turned a quarter: its layout is 2092x1080, its frames 1840x949.
+        let f = fixture("turnedfold");
+        f.android.create("fold", "system-images;android-36;google_apis;arm64-v8a", Some(FormFactor::Foldable)).expect("fold");
+        let fake = fake_emulator(&f.android, "fold");
+        *fake.fold_status.lock().expect("status") =
+            Some("angle: 0\r\nposture: closed (1)\r\nfolded: true\r\nvisible: 949x1840+629+0\r\nsize: 1080x2092\r\npostures: 1,2,3".into());
+        *fake.acceleration.lock().expect("gravity") = "-9.80665:0:0".into();
+        let d = f.android.device("fold").expect("running");
+        assert_eq!(d.layout_size(), Ok((2092, 1080)));
+        d.touch(2092.0, 1080.0, Phase::Down).expect("touch");
+        assert_eq!(wait_for(&fake.display, 1), ["touch 1840 949 down"], "the layout's corner on the frames' corner");
+        assert!(gravity_rotation(&["acceleration = nope".into()]) == Rotation::Deg0 && gravity_rotation(&[]) == Rotation::Deg0);
     }
 
     #[test]

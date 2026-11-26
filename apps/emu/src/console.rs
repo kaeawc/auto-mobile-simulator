@@ -142,6 +142,7 @@ fn sensor(info: &ConsoleInfo, words: &[&str]) -> String {
                 }
                 Ok(v) => {
                     if info.sensors.set(name, v) {
+                        follow_gravity(info);
                         "OK".into()
                     } else {
                         format!("KO: bad sensor '{name}' or value count")
@@ -155,6 +156,29 @@ fn sensor(info: &ConsoleInfo, words: &[&str]) -> String {
             format!("{}\r\nOK", names.iter().map(|n| format!("{n}: enabled.")).collect::<Vec<_>>().join("\r\n"))
         }
         _ => "KO: usage: sensor set <name> <v:v:v> | sensor get <name> | sensor status".into(),
+    }
+}
+
+/// Turns the display as the accelerometer says the device is turned (`rotate`, or `sensor set
+/// acceleration`), as the stock emulator's screenshots turn with its coarse orientation.
+fn follow_gravity(info: &ConsoleInfo) {
+    if let (Some(display), Some(&[x, y, _])) = (&info.display, info.sensors.get("acceleration").as_deref()) {
+        display.set_rotation(sim_core::rotation::Rotation::from_gravity(x, y));
+    }
+}
+
+/// A point on the screen as screenshots show it (turned with the device; a folded foldable's
+/// outer screen) as the scanout pixel under it, which the touch screen reports.
+fn to_scanout(info: &ConsoleInfo, x: i32, y: i32) -> (i32, i32) {
+    info.display.as_ref().map_or((x, y), |d| d.to_scanout(f64::from(x), f64::from(y)))
+}
+
+/// The screen's size as screenshots show it: the display's upright frames, or the panel before
+/// the first frame.
+fn shown_size(info: &ConsoleInfo, panel: (u32, u32)) -> (u32, u32) {
+    match info.display.as_ref().map(|d| d.upright_geometry()) {
+        Some((w, h, n)) if n > 0 && w > 0 && h > 0 => (w, h),
+        _ => panel,
     }
 }
 
@@ -228,14 +252,16 @@ fn event(info: &ConsoleInfo, words: &[&str]) -> String {
     }
 }
 
-/// `screenshot [path]`: the latest scanout frame as PNG. Encoded straight from the capture the
-/// display stream shares, so a screenshot of a frame already streamed reads nothing back.
+/// `screenshot [path]`: the latest scanout frame as PNG, turned upright as the device is turned
+/// (as stock's gRPC `getScreenshot` and `screenrecord screenshot` are). Encoded straight from the
+/// capture the display stream shares, so a screenshot of a frame already streamed reads nothing
+/// back.
 fn screenshot(info: &ConsoleInfo, path: Option<&str>) -> String {
     let Some(display) = &info.display else { return "KO: no display (started with -gpu off?)".into() };
     if display.frames() == 0 {
         return "KO: no frame presented yet".into();
     }
-    let Some(shot) = display.latest(|c| (c.width, c.height, c.frame, encode_rgba(c.width, c.height, &c.rgba))) else {
+    let Some(shot) = display.latest_upright(|c| (c.width, c.height, c.frame, encode_rgba(c.width, c.height, &c.rgba))) else {
         return "KO: the scanout frame couldn't be read".into();
     };
     let (width, height, frame, png) = shot;
@@ -608,6 +634,7 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
             Some(&[x, y, z]) => {
                 info.sensors.set("acceleration", vec![-y + 0.0, x + 0.0, z]);
                 info.sensors.set("acceleration-uncalibrated", vec![-y + 0.0, x + 0.0, z]);
+                follow_gravity(info);
                 "OK".into()
             }
             _ => "KO: no accelerometer".into(),
@@ -633,11 +660,13 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
             _ => "KO: usage: clipboard get|set <text>".into(),
         },
         "touch" => {
-            // simee extension: `touch <x> <y> [down|up|tap]` in device pixels.
+            // simee extension: `touch <x> <y> [down|up|tap]` in pixels of the screen as
+            // screenshots show it.
             let g = info.inputs.lock().unwrap_or_else(|e| e.into_inner());
             match (g.as_ref(), words.get(1).and_then(|v| v.parse().ok()), words.get(2).and_then(|v| v.parse().ok())) {
                 (Some(Inputs { touch: None, .. }), _, _) => NO_TOUCH.to_string(),
                 (Some(Inputs { touch: Some(touch), .. }), Some(x), Some(y)) => {
+                    let (x, y) = to_scanout(info, x, y);
                     match words.get(3).copied().unwrap_or("tap") {
                         "down" => touch.touch(x, y, true),
                         "up" => touch.touch(x, y, false),
@@ -675,18 +704,18 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
                 _ => "KO: usage: touchpad <x> <y> [down|move|up|tap]".to_string(),
             }
         }
-        // simee extension: a stylus on the touch screen at device pixels, what stock's gRPC
-        // `PenEvent` sends (`sim_core::stylus::USAGE`).
+        // simee extension: a stylus on the touch screen at pixels of the screen as screenshots
+        // show it, what stock's gRPC `PenEvent` sends (`sim_core::stylus::USAGE`).
         "pen" => {
             let g = info.inputs.lock().unwrap_or_else(|e| e.into_inner());
             let Some(inputs) = g.as_ref() else { return "KO: no input devices".into() };
             let Some(touch) = &inputs.touch else { return NO_TOUCH.into() };
+            let (w, h) = shown_size(info, inputs.screen);
             match sim_core::stylus::PenSample::parse(&words[1..]) {
-                Ok(s) if s.x as u32 >= inputs.screen.0 || s.y as u32 >= inputs.screen.1 => {
-                    format!("KO: ({}, {}) is off the {}x{} screen", s.x, s.y, inputs.screen.0, inputs.screen.1)
-                }
+                Ok(s) if s.x as u32 >= w || s.y as u32 >= h => format!("KO: ({}, {}) is off the {w}x{h} screen", s.x, s.y),
                 Ok(s) => {
-                    touch.pen(s);
+                    let (x, y) = to_scanout(info, s.x, s.y);
+                    touch.pen(sim_core::stylus::PenSample { x, y, ..s });
                     "OK".into()
                 }
                 Err(e) => format!("KO: {e}"),
@@ -942,6 +971,62 @@ mod tests {
             assert_eq!(run(&info, "rotate"), "OK");
         }
         assert_eq!(run(&info, "sensor get acceleration"), "acceleration = 0:9.80665:0\r\nOK");
+    }
+
+    #[test]
+    fn the_display_turns_with_the_accelerometer_as_stock_screenshots_do() {
+        use sim_core::rotation::Rotation;
+        let mut info = console(FormFactor::Phone);
+        let store = Arc::new(emu_vmm::display::FrameStore::default());
+        info.display = Some(store.clone());
+        // Each `rotate` a quarter clockwise, as stock's gRPC screenshots turn after each.
+        for want in [Rotation::Deg90, Rotation::Deg180, Rotation::Deg270, Rotation::Deg0] {
+            assert_eq!(run(&info, "rotate"), "OK");
+            assert_eq!(store.rotation(), want);
+        }
+        // Gravity set directly turns it too (stock's screenshots follow the sensor, not `rotate`).
+        assert_eq!(run(&info, "sensor set acceleration -9.81:0:0"), "OK");
+        assert_eq!(store.rotation(), Rotation::Deg90);
+        assert_eq!(run(&info, "sensor set acceleration 0:9.81:0"), "OK");
+        assert_eq!(store.rotation(), Rotation::Deg0);
+        assert_eq!(run(&info, "sensor set temperature 30"), "OK");
+        assert_eq!(store.rotation(), Rotation::Deg0, "other sensors don't turn it");
+    }
+
+    #[test]
+    fn a_turned_devices_screenshots_touches_and_pens_are_upright() {
+        use emu_vmm::display::DisplaySink;
+        use emu_vmm::virtio::input::{ABS_MT_POSITION_X, ABS_MT_POSITION_Y, EV_ABS};
+        let mut info = console(FormFactor::Tablet);
+        let store = Arc::new(emu_vmm::display::FrameStore::default());
+        info.display = Some(store.clone());
+        let devices = attach_inputs(&info, false);
+        // The 720x1280 panel, its top-left pixel red.
+        let mut px = vec![0u8; 720 * 1280 * 4];
+        px[..4].copy_from_slice(&[255, 0, 0, 255]);
+        store.present(720, 1280, 720 * 4, sim_core::pixels::PixelFormat::RGBA_VIRTIO, &px);
+        assert_eq!(run(&info, "rotate"), "OK");
+        let path = std::env::temp_dir().join(format!("emu-console-turned-{}.png", std::process::id()));
+        let reply = run(&info, &format!("screenshot {}", path.display()));
+        let png = std::fs::read(&path).expect("written");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(reply, format!("{} (1280x720, frame 2)\r\nOK", path.display()));
+        assert_eq!(sim_core::frame::png_size(&png), Some((1280, 720)));
+        let corner = store.latest_upright(|c| c.rgba[1279 * 4..1280 * 4].to_vec());
+        assert_eq!(corner.as_deref(), Some(&[255, 0, 0, 255][..]), "the panel's corner at the screen's top right");
+        // A touch and a pen at the screen's top right press the panel's top left.
+        let axes = |batch: &[InputEvent]| {
+            let at = |code| batch.iter().find(|e| e.typ == EV_ABS && e.code == code).map(|e| e.value);
+            (at(ABS_MT_POSITION_X), at(ABS_MT_POSITION_Y))
+        };
+        assert_eq!(run(&info, "touch 1279 0 down"), "OK");
+        assert_eq!(run(&info, "pen 1279 0 down"), "OK");
+        assert_eq!(run(&info, "pen 1279 720 down"), "KO: (1279, 720) is off the 1280x720 screen");
+        let batches = devices.touch.expect("touch").take_queued();
+        assert_eq!(batches.len(), 2);
+        for b in &batches {
+            assert_eq!(axes(b), (Some(0), Some(0)), "{b:?}");
+        }
     }
 
     #[test]

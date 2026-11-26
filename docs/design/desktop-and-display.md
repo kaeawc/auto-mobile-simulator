@@ -43,6 +43,14 @@ pinned at `7a70745`, the same rev sim-rs uses.
    client that stops reading paces itself (the write blocks); a ring client reads a slot within
    two intervals or sees it torn and skips it.
 6. **Window.** The desktop reads each frame into the buffer it hands to `Pixels`.
+7. **A turned device.** The accelerometer's coarse orientation (`rotate`, `sensor set
+   acceleration`) sets the store's turn. A client that sends `rotates` (the desktop) gets frames
+   as the panel lies and an `EMUO` record before its first frame and whenever the turn changes;
+   the view draws the picture turned with Rune's `rotate` (on the GPU) inside a box of the upright
+   screen's shape, which takes the pointer, so touches come in upright pixels. Other clients and
+   screenshots get frames turned upright by `FrameStore::latest_upright`, once per frame into a
+   shared buffer, and only while turned. Touches in upright pixels map to the panel in
+   `FrameStore::to_scanout`.
 7. **Screenshots.** The console's `screenshot` encodes the shared capture directly.
 
 Guest-composed scanouts (virtio-gpu `RESOURCE_FLUSH`) are read straight into the store

@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::rotation::Rotation;
+
 /// Stock's posture ids (`hw.sensor.posture_list`: 0 unknown, 1 closed, 2 half-open, 3 open,
 /// 4 flipped, 5 tent), as the console's `posture <id>` and the guest's `device_posture` setting
 /// number them.
@@ -331,6 +333,15 @@ impl FoldState {
         (rescale(x, self.visible.width, self.width), rescale(y, self.visible.height, self.height))
     }
 
+    /// [`FoldState::guest_to_view`] on a device turned by `rotation`: the guest lays out for its
+    /// screen turned (a folded Pixel Fold turned a quarter: 2092x1080) and readers' frames are
+    /// the visible region turned (1840x949). The region's place on the scanout doesn't move.
+    pub fn guest_to_turned_view(&self, (x, y): (f64, f64), rotation: Rotation) -> (f64, f64) {
+        let (vw, vh) = rotation.turned((self.visible.width, self.visible.height));
+        let (gw, gh) = rotation.turned((self.width, self.height));
+        (rescale(x, vw, gw), rescale(y, vh, gh))
+    }
+
     /// [`FoldState::guest_to_view`] the other way: a point on the frames in the guest's layout.
     pub fn view_to_guest(&self, (x, y): (f64, f64)) -> (f64, f64) {
         (rescale(x, self.width, self.visible.width), rescale(y, self.height, self.visible.height))
@@ -604,6 +615,15 @@ mod tests {
             ..folded.clone()
         };
         assert_eq!((open.guest_to_view((1000.0, 2000.0)), open.view_to_guest((7.5, 9.0))), ((1000.0, 2000.0), (7.5, 9.0)));
+        // Turned, the guest's turned layout maps onto the turned frames: corner to corner.
+        for r in Rotation::ALL {
+            let (gw, gh) = r.turned((1080, 2092));
+            let (vw, vh) = r.turned((949, 1840));
+            assert_eq!(folded.guest_to_turned_view((f64::from(gw), f64::from(gh)), r), (f64::from(vw), f64::from(vh)), "{r:?}");
+        }
+        assert_eq!(folded.guest_to_turned_view((1000.0, 2000.0), Rotation::Deg0), folded.guest_to_view((1000.0, 2000.0)));
+        let (x, y) = folded.guest_to_turned_view((2000.0, 1000.0), Rotation::Deg90);
+        assert!((x - 1759.1).abs() < 0.1 && (y - 878.7).abs() < 0.1, "({x}, {y})");
     }
 
     #[test]

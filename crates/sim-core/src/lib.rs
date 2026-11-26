@@ -19,6 +19,7 @@ pub mod pixels;
 pub mod platform;
 pub mod pointer;
 pub mod reuse;
+pub mod rotation;
 pub mod stream;
 pub mod stylus;
 pub mod vhal;
