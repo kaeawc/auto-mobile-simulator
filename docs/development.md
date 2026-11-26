@@ -18,6 +18,14 @@
 
 Build and check commands, the working rules and the code map are in [AGENTS.md](../AGENTS.md).
 
+## Build times
+
+Dependencies build unoptimized in the `dev` profile except the few on a runtime path (the kernel's
+gunzip, the NAT, checksums, base64, PNG, audio), which are listed in the root `Cargo.toml`: a
+dependency that a hot loop in `emu` or `simee` calls into belongs on that list, or a debug `emu`
+gets slow. The desktop's `cargo test` builds Rune unoptimized too; its `cargo build`/`run` keep
+opt-level 2. Numbers and what was tried are in [benchmarks.md](benchmarks.md#build-times-local).
+
 ## Harness
 
 [auto-mobile](https://github.com/kaeawc/auto-mobile) maps both the public and private Apple

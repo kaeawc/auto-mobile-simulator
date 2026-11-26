@@ -86,7 +86,9 @@ simee shutdown|delete <device>
 `<device>` is a UDID (an Android device's is its AVD name), an exact name, or `booted`.
 iOS-only commands: `install|uninstall|launch|terminate|apps`, `open-url`, `appearance`, `privacy`,
 `memory-warning`, `erase`, `exec`, `carplay`, `watch-gesture`, `remote-swipe`; Android-only:
-`fold`, `console`, `xr`. Using one
+`fold`, `console`, `xr`, `touchpad`, `vehicle`, `stylus` (a pen on the touch screen:
+`simee stylus <device> 400 300 hover`, `... down --pressure 200 --button`, `... 100 100 --to 900 600`
+for a stroke, `--eraser` for the eraser end). Using one
 on the other platform's device fails with the platforms it works on.
 
 

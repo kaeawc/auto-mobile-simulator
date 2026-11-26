@@ -445,7 +445,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         // vendor.qemu.vport.<name>); the unnamed port 2 becomes hvc1, logcat's (init.ranchu.rc's
         // goldfish-logcat runs `logcat -f /dev/hvc1` and restarted every ~5 s without it).
         use virtio::console::{Console, PortBackend, PortSpec, Sink, Writer};
-        let logcat: Box<dyn PortBackend> = match cfg.logcat {
+        let logcat: Box<dyn PortBackend> = match cfg.logcat.clone() {
             Some(w) => Box::new(Writer(w)),
             None => Box::new(Sink),
         };
@@ -521,7 +521,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     if let Some((w, h)) = cfg.input {
         use virtio::input::{Input, Kind};
         let th = cfg.touch_screen.then(|| {
-            let (touch, th) = Input::new(Kind::Touch { width: w, height: h }, "virtio_input_multi_touch_1");
+            let (touch, th) = Input::new(Kind::Touch { width: w, height: h, pen: true }, "virtio_input_multi_touch_1");
             slots[slots::TOUCH as usize] = Some(Box::new(touch));
             th
         });
@@ -535,7 +535,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
             mh
         });
         let touchpad = cfg.touchpad.map(|(tw, th)| {
-            let (pad, ph) = Input::new(Kind::Touch { width: tw, height: th }, virtio::input::TOUCHPAD_NAME);
+            let (pad, ph) = Input::new(Kind::Touch { width: tw, height: th, pen: false }, virtio::input::TOUCHPAD_NAME);
             slots[slots::TOUCHPAD as usize] = Some(Box::new(pad));
             ph
         });
@@ -570,6 +570,10 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         registry.register("multidisplay", Box::new(pipe::misc::Silent("multidisplay")));
         registry.register("qemud:camera", Box::new(pipe::fingerprint::CameraService));
         registry.register("GLProcessPipe", Box::new(devices::goldfish_pipe::GlProcess::default()));
+        // API 30 and older: the reference RIL's modem and `logcat -Q`'s stream, which newer
+        // images carry on virtio-console ports.
+        registry.register("qemud:gsm", Box::new(pipe::gsm::GsmService { telephony: cfg.telephony.clone() }));
+        registry.register("logcat", Box::new(pipe::logcat::LogcatService { out: cfg.logcat.clone() }));
         let registry = Arc::new(registry);
         // Graphics pipes never use vsock; they need the goldfish pipe device.
         if cfg.gpu.is_some() {

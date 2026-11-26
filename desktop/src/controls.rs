@@ -72,7 +72,11 @@ pub fn for_device(d: &DeviceInfo) -> Vec<Control> {
                 out.push(button("lock-button", &icons::LOCK, "Power", Button::Lock));
             }
             match form_factor {
-                FormFactor::Phone | FormFactor::Tablet => out.push(control("rotate-button", &icons::ROTATE, "Rotate", Action::Rotate)),
+                FormFactor::Phone => out.push(control("rotate-button", &icons::ROTATE, "Rotate", Action::Rotate)),
+                FormFactor::Tablet => {
+                    out.push(control("rotate-button", &icons::ROTATE, "Rotate", Action::Rotate));
+                    out.push(control("stylus-button", &icons::PEN, "Stylus", Action::ToggleStylus));
+                }
                 FormFactor::Foldable => {
                     out.push(control("rotate-button", &icons::ROTATE, "Rotate", Action::Rotate));
                     out.push(control("fold-closed", &icons::FOLD_CLOSED, "Fold", Action::Fold(Posture::Closed)));
@@ -155,6 +159,19 @@ mod tests {
         assert_eq!(
             android(FormFactor::Phone),
             ["back-button", "home-button", "recents-button", "lock-button", "rotate-button", "screenshot-button", "shutdown-button"]
+        );
+        assert_eq!(
+            android(FormFactor::Tablet),
+            [
+                "back-button",
+                "home-button",
+                "recents-button",
+                "lock-button",
+                "rotate-button",
+                "stylus-button",
+                "screenshot-button",
+                "shutdown-button"
+            ]
         );
         assert!(android(FormFactor::Foldable).ends_with(&[
             "fold-closed",

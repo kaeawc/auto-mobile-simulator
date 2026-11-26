@@ -41,7 +41,18 @@ options:
   -verbose          diagnostics, including vCPU exit counts at shutdown
   -no-boot-anim     skip the boot animation
   -disk-cache MODE  unsafe (default: guest flushes stay in the host page cache) or fsync
-  -gpu MODE         off disables host rendering; swiftshader/lavapipe pick software Vulkan
+  -gpu MODE         rendering mode, default auto (host GPU through MoltenVK):
+                      auto, host     host GPU through MoltenVK, software if that fails
+                      lavapipe, swangle, angle_indirect
+                                     software Vulkan (lavapipe): no GPU, CI, headless
+                      swiftshader, swiftshader_indirect
+                                     software Vulkan (SwiftShader)
+                      software, guest
+                                     lavapipe, with stock's notice: SDK images have no
+                                     in-guest renderer, so guest rendering isn't possible
+                      off, none      no renderer, no graphics
+                    An AVD's hw.gpu.mode (guest, software, lavapipe, ...) applies when -gpu
+                    isn't given; the flag wins.
   -no-audio         the sound card stays silent and no host audio device is opened (-audio none)
   -allow-host-audio the guest records from the host's default microphone (otherwise silence)
   -netspeed S       initial network speed: gsm, hscsd, gprs, umts, edge, hsdpa, lte, evdo, 5g,
@@ -178,7 +189,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
             "allow-host-audio" => o.allow_host_audio = true,
             // `-audio BACKEND`: QEMU's audio driver; only `none` means anything here.
             "audio" => o.no_audio |= value(flag)? == "none",
-            "gpu" => o.gpu = Some(value(flag)?),
+            "gpu" => {
+                let mode = value(flag)?;
+                emu_avd::gpu::parse_flag(&mode).map_err(|e| anyhow::anyhow!(e))?;
+                o.gpu = Some(mode);
+            }
             "netspeed" => {
                 let v = value(flag)?;
                 if !o.network.set_speed(&v) {
@@ -239,6 +254,15 @@ mod tests {
 
     fn p(s: &str) -> Opts {
         parse(s.split_whitespace().map(String::from)).expect("parse")
+    }
+
+    #[test]
+    fn gpu_modes_are_validated() {
+        for m in ["guest", "software", "swangle", "off"] {
+            assert_eq!(p(&format!("-gpu {m}")).gpu.as_deref(), Some(m));
+        }
+        assert!(parse("-gpu bogus".split_whitespace().map(String::from)).is_err());
+        assert_eq!(p("-avd x").gpu, None);
     }
 
     #[test]

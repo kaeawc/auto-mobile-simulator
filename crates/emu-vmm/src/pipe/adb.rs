@@ -93,15 +93,15 @@ impl AdbListener {
                 // macOS hands out accepted sockets with the listener's O_NONBLOCK.
                 let _ = stream.set_nonblocking(false);
                 let _ = stream.set_nodelay(true);
-                let (waiting, vsock) = {
+                let (waiting, vsock, mm) = {
                     let route = r.lock().unwrap_or_else(|e| e.into_inner());
-                    (route.mm.lock().unwrap_or_else(|e| e.into_inner()).guests.pop_front(), route.vsock.clone())
+                    (route.mm.lock().unwrap_or_else(|e| e.into_inner()).guests.pop_front(), route.vsock.clone(), route.mm.clone())
                 };
                 match (waiting, vsock) {
                     (Some(ctx), _) => {
                         ctx.send(HostMsg::Attach(stream));
                     }
-                    (None, Some(vsock)) => connect_vsock(Arc::new(stream), vsock, port),
+                    (None, Some(vsock)) => connect_vsock(Arc::new(stream), vsock, mm, port),
                     (None, None) => {}
                 }
             }
@@ -167,18 +167,29 @@ fn still_open(s: &TcpStream) -> bool {
     open
 }
 
-fn connect_vsock(stream: Arc<TcpStream>, vsock: Sender<WorkerEvent>, port: u16) {
+/// Offers a host client to adbd on vsock, retrying while nothing listens there. A legacy
+/// `qemud:adb` pipe that sends `accept` meanwhile (adbd on API 30 and older images, which never
+/// listens on vsock) takes the client instead, at the next retry: the adb server connects once,
+/// usually before that adbd is up, and the device would stay `offline` otherwise.
+fn connect_vsock(stream: Arc<TcpStream>, vsock: Sender<WorkerEvent>, mm: Arc<Mutex<Matchmaker>>, port: u16) {
     let (s1, s2, v) = (stream.clone(), stream, vsock.clone());
     let make: super::MakeHandler = Box::new(move |ctx| Box::new(TcpForward::start(&s1, ctx)) as Box<dyn PipeHandler>);
     let refused = Box::new(move || {
         let _ = std::thread::Builder::new().name("adb-retry".into()).spawn(move || {
             std::thread::sleep(RETRY);
-            if still_open(&s2) {
-                connect_vsock(s2, v, port);
-            } else {
+            if !still_open(&s2) {
                 // The adb server gave up on this attempt before adbd came up; ask it to
                 // reconnect so the device shows up as soon as adbd listens.
                 AdbService::announce_port(port);
+                return;
+            }
+            let waiting = mm.lock().unwrap_or_else(|e| e.into_inner()).guests.pop_front();
+            match (waiting, s2.try_clone()) {
+                (Some(ctx), Ok(stream)) => {
+                    ctx.send(HostMsg::Attach(stream));
+                }
+                (Some(ctx), Err(_)) => mm.lock().unwrap_or_else(|e| e.into_inner()).guests.push_front(ctx),
+                (None, _) => connect_vsock(s2, v, mm, port),
             }
         });
     });
@@ -646,6 +657,30 @@ mod tests {
         assert_eq!(to_guest, b"OKAY");
         pipe.closed();
         assert_eq!(client.read(&mut [0u8; 1]).expect("eof"), 0, "closing the pipe hangs up on the client");
+    }
+
+    /// #38: the adb server connects before an API 30-and-older adbd opens its pipe, so the
+    /// client starts on vsock, where nothing ever listens; the pipe's `accept` takes it over.
+    #[test]
+    fn a_client_waiting_on_vsock_goes_to_a_legacy_pipe_that_accepts_later() {
+        let (vsock, events) = channel();
+        let svc = AdbService::bind(0, vsock).expect("bind");
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, svc.port)).expect("connect");
+        let WorkerEvent::Connect { make, refused, .. } = next(&events) else { panic!("expected a connect") };
+        drop(make);
+        let (pipe_events, from_host) = channel();
+        let mut pipe = svc.open("qemud:adb", PipeCtx { conn: 4, events: pipe_events }).expect("adb pipe");
+        let mut to_guest = Vec::new();
+        assert!(pipe.guest_data(b"accept", &mut to_guest));
+        refused();
+        let attach = data(&from_host);
+        assert!(matches!(attach, HostMsg::Attach(_)), "the retry hands the client to the pipe");
+        assert!(events.recv_timeout(Duration::from_millis(100)).is_err(), "and stops offering it to vsock");
+        assert!(pipe.host_msg(attach, &mut to_guest));
+        assert_eq!(to_guest, b"ok");
+        assert!(pipe.guest_data(b"startCNXN", &mut Vec::new()));
+        assert_eq!(read_exactly(&mut client, 4), b"CNXN");
+        pipe.closed();
     }
 
     #[test]

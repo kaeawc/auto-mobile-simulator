@@ -763,7 +763,7 @@ mod tests {
 
     #[test]
     fn input_lines_reach_the_devices() {
-        let (touch, th) = emu_vmm::virtio::input::Input::new(Kind::Touch { width: 720, height: 1280 }, "touch");
+        let (touch, th) = emu_vmm::virtio::input::Input::new(Kind::Touch { width: 720, height: 1280, pen: false }, "touch");
         let (keyboard, kh) = emu_vmm::virtio::input::Input::new(Kind::Keyboard, "keyboard");
         let (rotary, rh) = emu_vmm::virtio::input::Input::new(Kind::Rotary, "rotary");
         let inputs = emu_vmm::Inputs { screen: (720, 1280), touch: Some(th), keyboard: kh, rotary: rh, mouse: None, touchpad: None };

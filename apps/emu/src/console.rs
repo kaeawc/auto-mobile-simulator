@@ -477,6 +477,7 @@ const HELP: &[(&str, &str)] = &[
     ("screenshot", "take a screenshot of the display"),
     ("touch", "touch the screen at x y (simee)"),
     ("touchpad", "touch the touchpad at x y, display glasses (simee)"),
+    ("pen", "a stylus on the screen at x y: hover, down, move, up, leave (simee)"),
     ("clipboard", "get or set the guest clipboard (simee)"),
     ("frames", "number of frames presented (simee)"),
     ("xr", "Android XR head pose, room, input mode and pointer (simee)"),
@@ -674,6 +675,23 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
                 _ => "KO: usage: touchpad <x> <y> [down|move|up|tap]".to_string(),
             }
         }
+        // simee extension: a stylus on the touch screen at device pixels, what stock's gRPC
+        // `PenEvent` sends (`sim_core::stylus::USAGE`).
+        "pen" => {
+            let g = info.inputs.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(inputs) = g.as_ref() else { return "KO: no input devices".into() };
+            let Some(touch) = &inputs.touch else { return NO_TOUCH.into() };
+            match sim_core::stylus::PenSample::parse(&words[1..]) {
+                Ok(s) if s.x as u32 >= inputs.screen.0 || s.y as u32 >= inputs.screen.1 => {
+                    format!("KO: ({}, {}) is off the {}x{} screen", s.x, s.y, inputs.screen.0, inputs.screen.1)
+                }
+                Ok(s) => {
+                    touch.pen(s);
+                    "OK".into()
+                }
+                Err(e) => format!("KO: {e}"),
+            }
+        }
         "frames" => match &info.display {
             Some(d) => format!("{}\r\nOK", d.frames()),
             None => "KO: no display".to_string(),
@@ -787,7 +805,7 @@ mod tests {
 
     fn attach(info: &ConsoleInfo, with_mouse: bool, touch_screen: bool) -> Devices {
         let (touch, th) = if touch_screen {
-            let (t, h) = Input::new(Kind::Touch { width: 720, height: 1280 }, "touch");
+            let (t, h) = Input::new(Kind::Touch { width: 720, height: 1280, pen: true }, "touch");
             (Some(t), Some(h))
         } else {
             (None, None)
@@ -986,11 +1004,33 @@ mod tests {
     }
 
     #[test]
+    fn pens_hover_touch_and_leave_on_the_screen() {
+        use emu_vmm::virtio::input::{ABS_MT_PRESSURE, ABS_MT_SLOT, ABS_MT_TOOL_TYPE, BTN_STYLUS, BTN_TOUCH, EV_ABS, EV_KEY, PEN_SLOT};
+        let info = console(FormFactor::Tablet);
+        let devices = attach_inputs(&info, false);
+        for line in ["pen 100 200", "pen 100 200 down pressure 200 button", "pen 120 200 move", "pen 120 200 up", "pen 120 200 leave"] {
+            assert_eq!(run(&info, line), "OK", "{line}");
+        }
+        let batches = devices.touch.expect("touch").take_queued();
+        assert_eq!(batches.len(), 5);
+        assert!(batches.iter().all(|b| b[0] == InputEvent::new(EV_ABS, ABS_MT_SLOT, PEN_SLOT)), "the pen's own slot");
+        assert!(batches[0].contains(&InputEvent::new(EV_ABS, ABS_MT_TOOL_TYPE, 1)) && !batches[0].iter().any(|e| e.code == BTN_TOUCH));
+        assert!(
+            batches[1].contains(&InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 200))
+                && batches[1].contains(&InputEvent::new(EV_KEY, BTN_STYLUS, 1))
+        );
+        assert!(batches[1].contains(&InputEvent::new(EV_KEY, BTN_TOUCH, 1)));
+        assert!(batches[3].contains(&InputEvent::new(EV_KEY, BTN_TOUCH, 0)), "up lifts to hovering");
+        assert_eq!(run(&info, "pen 720 10"), "KO: (720, 10) is off the 720x1280 screen");
+        assert_eq!(run(&info, "pen 1 2 press"), format!("KO: unknown word 'press' ({})", sim_core::stylus::USAGE));
+    }
+
+    #[test]
     fn glasses_touchpads_take_touches_in_their_own_units() {
         let info = console(FormFactor::Vision);
         let _devices = attach_inputs(&info, true);
         assert_eq!(run(&info, "touchpad 10 10"), "KO: this device has no touchpad (hw.touchpad0)");
-        let (pad, handle) = Input::new(Kind::Touch { width: 1542, height: 297 }, emu_vmm::virtio::input::TOUCHPAD_NAME);
+        let (pad, handle) = Input::new(Kind::Touch { width: 1542, height: 297, pen: false }, emu_vmm::virtio::input::TOUCHPAD_NAME);
         info.inputs.lock().expect("inputs").as_mut().expect("inputs").touchpad = Some(handle);
         for line in ["touchpad 100 150 down", "touchpad 900 150 move", "touchpad 900 150 up"] {
             assert_eq!(run(&info, line), "OK");

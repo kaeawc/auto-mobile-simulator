@@ -827,6 +827,31 @@ impl Device {
         pace(&delays, || start.elapsed(), sleep, |i| session.command(&lines[i]).map(drop))
     }
 
+    /// Stylus samples on the touch screen at device pixels, what stock's gRPC `PenEvent` sends,
+    /// spread over `duration` in one console session (simee's `pen` command).
+    pub fn stylus(&self, samples: &[sim_core::stylus::PenSample], duration: Duration) -> Result<(), String> {
+        let (w, h) = self.screen_size()?;
+        if let Some(s) = samples.iter().find(|s| s.x as u32 >= w || s.y as u32 >= h) {
+            return Err(format!("({}, {}) is off the {w}x{h} screen", s.x, s.y));
+        }
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let lines: Vec<String> = samples.iter().map(sim_core::stylus::PenSample::console).collect();
+        let mut session = self.pen_session()?;
+        let steps = u32::try_from(lines.len()).unwrap_or(u32::MAX);
+        let mut delays = vec![duration / steps; lines.len()];
+        delays[0] = Duration::ZERO;
+        let start = Instant::now();
+        pace(&delays, || start.elapsed(), sleep, |i| session.command(&lines[i]).map(drop))
+    }
+
+    /// A console session for `pen` lines (`PenSample::console`), for a caller that sends samples
+    /// as they come (the desktop's stylus) and keeps the session open across them.
+    pub fn pen_session(&self) -> Result<console::Session, String> {
+        console::Session::open(self.running_simee("the pen console command")?.console_port)
+    }
+
     /// The touchpad's size, if the AVD has one.
     fn touchpad_size(&self) -> Result<(u32, u32), String> {
         self.avd()?
