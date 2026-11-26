@@ -110,6 +110,38 @@ fn raise_nofile() -> u64 {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const ADB_REANNOUNCE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a stop may take before the stop watcher exits the process anyway.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+const SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The teardown step once the machine is down (`emu_vmm::teardown_step`).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+const EXITING: &str = "exiting after the machine stopped";
+
+/// What the stop watcher prints when a stop overran [`SHUTDOWN_LIMIT`]: the teardown step it was
+/// waiting for (as `emu_vmm::teardown_status` gives it) and for how long.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn overrun_line(step: Option<(String, std::time::Duration)>) -> String {
+    let limit = SHUTDOWN_LIMIT.as_secs();
+    match step {
+        Some((what, t)) => format!("shutdown took over {limit} s ({what}, for {:.1} s); exiting", t.as_secs_f64()),
+        None => format!("shutdown took over {limit} s (the machine had not started tearing down); exiting"),
+    }
+}
+
+/// `-verbose`'s exit-count lines, one per vCPU, without the zero counters.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn exit_lines(exits: &[Vec<(&'static str, u64)>]) -> Vec<String> {
+    exits
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let counts: Vec<String> = e.iter().filter(|(_, n)| *n > 0).map(|(k, n)| format!("{k}={n}")).collect();
+            format!("  vcpu{i}: {}", counts.join(" "))
+        })
+        .collect()
+}
+
 fn main() -> ExitCode {
     match real_main() {
         Ok(code) => code,
@@ -267,13 +299,22 @@ fn boot(
     {
         let stop = stop.clone();
         // Without it a SIGINT/SIGTERM would never stop the machine: fail the launch instead.
+        let verbose = opts.verbose;
         std::thread::Builder::new().name("stop-watch".into()).spawn(move || {
             if signals.recv().is_ok() {
                 emu_vmm::request_stop(&stop);
                 // Device threads blocked in native code (e.g. a wedged renderer) can stall an
                 // orderly teardown; don't let that keep the process alive.
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                eprintln!("emu: shutdown took over 5 s; exiting");
+                std::thread::sleep(SHUTDOWN_LIMIT);
+                let step = emu_vmm::teardown_status();
+                // The orderly path prints the counts once the machine is down; it didn't get there.
+                let counts = verbose && step.as_ref().is_none_or(|(s, _)| s != EXITING);
+                eprintln!("emu: {}", overrun_line(step));
+                if let Some(exits) = emu_vmm::exit_counts().filter(|_| counts) {
+                    for line in exit_lines(&exits) {
+                        eprintln!("emu: {line}");
+                    }
+                }
                 std::process::exit(0);
             }
         })?;
@@ -331,13 +372,16 @@ fn boot(
         let out = emu_vmm::run(cfg, stop.clone())?;
         if opts.verbose {
             eprintln!("emu: stopped after {:.1}s: {:?}", out.uptime.as_secs_f64(), out.reason);
-            for (i, exits) in out.exits.iter().enumerate() {
-                let line: Vec<String> = exits.iter().filter(|(_, n)| *n > 0).map(|(k, n)| format!("{k}={n}")).collect();
-                eprintln!("emu:   vcpu{i}: {}", line.join(" "));
+            for line in exit_lines(&out.exits) {
+                eprintln!("emu: {line}");
             }
             if let Some(spool) = &inst.logcat {
                 eprintln!("emu:   logcat bytes dropped (its output fell behind): {}", spool.dropped());
             }
+        }
+        if !matches!(out.reason, emu_vmm::StopReason::Reset) || stop.load(Ordering::SeqCst) {
+            // What runs from here to the exit: instance state, the renderer's static teardown.
+            emu_vmm::teardown_step(Some(EXITING), opts.verbose);
         }
         match out.reason {
             emu_vmm::StopReason::Reset if !stop.load(Ordering::SeqCst) => cfg = inst.machine_config(opts, launched)?,
@@ -387,6 +431,15 @@ mod tests {
         if soft >= want {
             assert_eq!(raise_nofile(), soft);
         }
+    }
+
+    #[test]
+    fn an_overrun_stop_names_its_step_and_keeps_the_exit_counts() {
+        let line = overrun_line(Some(("releasing virtio-gpu".into(), Duration::from_millis(4200))));
+        assert_eq!(line, "shutdown took over 5 s (releasing virtio-gpu, for 4.2 s); exiting");
+        assert!(overrun_line(None).contains("had not started tearing down"));
+        let exits = vec![vec![("mmio_read", 3), ("wfi", 0), ("canceled", 1)], vec![("mmio_read", 0)]];
+        assert_eq!(exit_lines(&exits), ["  vcpu0: mmio_read=3 canceled=1", "  vcpu1: "]);
     }
 
     #[test]

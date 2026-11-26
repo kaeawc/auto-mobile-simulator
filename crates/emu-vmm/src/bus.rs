@@ -68,6 +68,15 @@ impl Bus {
         (addr < self.ranges[i].base + self.ranges[i].len).then_some(i)
     }
 
+    /// Drops the devices one at a time, in base order, calling `before(name)` before each, so a
+    /// teardown that overruns can say whose release it was waiting for.
+    pub fn release_each(self, mut before: impl FnMut(&str)) {
+        for r in self.ranges {
+            before(&region_name(r.base));
+            drop(r.dev);
+        }
+    }
+
     /// `(base, len)` of every range, in the order [`Bus::read_at`] indexes them.
     pub fn regions(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.ranges.iter().map(|r| (r.base, r.len))
@@ -397,6 +406,32 @@ mod tests {
         assert_eq!(bus.write_at(0x30fc, &buf), Some((1, 0xfc)));
         assert_eq!(bus.read_at(0x2000, &mut buf), None);
         assert_eq!(bus.regions().collect::<Vec<_>>(), [(0x1000, 0x100), (0x3000, 0x100)]);
+    }
+
+    /// Notes in `log` when it is dropped.
+    struct DropNote(&'static str, Arc<Mutex<Vec<String>>>);
+    impl MmioDevice for DropNote {
+        fn read(&self, _: u64, _: &mut [u8]) {}
+        fn write(&self, _: u64, _: &[u8]) {}
+    }
+    impl Drop for DropNote {
+        fn drop(&mut self) {
+            self.1.lock().expect("lock").push(format!("dropped {}", self.0));
+        }
+    }
+
+    #[test]
+    fn release_names_each_device_before_it_goes() {
+        use crate::layout::*;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut bus = Bus::new();
+        bus.insert(virtio_slot_addr(slots::SYSTEM), VIRTIO_MMIO_STRIDE, Arc::new(DropNote("blk", log.clone())));
+        bus.insert(UART_BASE, 0x1000, Arc::new(DropNote("uart", log.clone())));
+        bus.release_each(|name| log.lock().expect("lock").push(format!("releasing {name}")));
+        let order = ["releasing pl011", "dropped uart", "releasing virtio-blk-system", "dropped blk"];
+        // Base order, as the bus indexes them; the UART sits below the virtio slots.
+        assert!(UART_BASE < virtio_slot_addr(0));
+        assert_eq!(*log.lock().expect("lock"), order);
     }
 
     #[test]
