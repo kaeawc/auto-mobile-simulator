@@ -250,12 +250,15 @@ without one fails that input with `Unavailable`, never a crash.
   `HIDMouseAcceleration` (1.0 on both) nor backboardd's pointer acceleration preference changes
   that. Ending each run slowing down and pausing after the push into the bottom edge makes it
   exact on both (median and maximum error 0.0 pt over the same 12 targets on 26.5 and 27.2 with ten
-  halving steps, read back by the probe app, 2026-11-26; six steps, which leave 0.16 pt, are not
-  re-measured on a device yet). Each report is 16 ms, so the halving steps cost time: homing is
+  halving steps, read back by the probe app, 2026-11-26). With the six steps simee uses, 26.5 is
+  still exact (0.0 / 0.0 pt) and 27.2 lands within a third of a point (median 0.32 pt, maximum
+  0.36 pt over the 12 targets: about 0.1-0.2 pt long in x and 0.2-0.3 pt short in y). Each
+  report is 16 ms, so the halving steps cost time: homing is
   85 reports (1.36 s of reports; 74 before the pause and tail) and every move after the first
-  adds 5 reports (80 ms; 144 ms with ten steps). Those are counted from the report interval, not
-  timed on a device (host load was 198 when this was written; see "Not yet measured" in
-  `benchmarks.md`). `pointer --to` drags in one call; a button held by `pointer … down`
+  adds 5 reports (80 ms; 144 ms with ten steps). Through `simee serve` a homed click took
+  3.36-3.48 s and a `--to` drag 4.01-4.08 s (median of 5, 2026-11-26), but at host load 294-642,
+  so those wall times are inflated; a quiet-host timing is under "Not yet measured" in
+  `benchmarks.md`. `pointer --to` drags in one call; a button held by `pointer … down`
   keeps the position for the next calls on the same server (`simee serve`) in the same boot. A
   `down` that runs in its own process (no server) is refused, since nothing would release it, as
   are an `up` with nothing held and a `move` or `up` after a failed call lost the held button

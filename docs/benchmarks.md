@@ -421,11 +421,11 @@ Claims that would belong in the README once someone runs them:
   host's Spotlight privacy settings to measure.
 - Time per automation step through `simee mcp` (a `tools/call` of `tap`, then `screenshot`) against
   the socket API and the CLI on the same device.
-- iPad `pointer` latency and placement error (`simee pointer <udid> X Y click`, `pointer … --to`)
-  with 6 halving steps (before: 10): per-call wall time, median of 3, and the error of 12 targets
-  on iOS 26.5 and 27.2 (`measure.sh`-style InputProbe run). Counted from the 16 ms report
-  interval only so far: homing 85 reports, 5 more per move; not timed, since the host's load was
-  198 on 2026-11-26.
+- iPad `pointer` latency on a quiet host (`simee pointer <udid> X Y click`, `pointer … --to`,
+  through `simee serve`). Measured 2026-11-26 only at host load 294-642: a homed click 3.36-3.48 s
+  and a `--to` drag 4.01-4.08 s (median of 5), against about 1.4 s of 16 ms reports. Placement
+  with 6 halving steps is measured: 0.0 / 0.0 pt on iOS 26.5, 0.32 / 0.36 pt (median / max, 12
+  targets) on 27.2.
 - Host CPU of an idle booted device, emu against the SDK emulator.
 - API 29 and 30 cold boots (a new AVD's first), API 30 warm boots, and their idle host CPU: an
   API 29 or 30 device under emu sat at 150–170% of a core after the AutoMobile harness, with
