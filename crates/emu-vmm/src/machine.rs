@@ -115,6 +115,8 @@ pub fn warm_renderer(lib64: PathBuf, vulkan_only: bool, virtual_queue: bool) -> 
         display: Arc::new(crate::display::FrameStore::default()),
         vulkan_only,
         virtual_queue,
+        // Warming is for the guests that boot on bootconfig (API 31 and newer), not the GLES-pipe ones.
+        pipe_gles: false,
     };
     renderer(&spec)?;
     Ok(t.elapsed())
