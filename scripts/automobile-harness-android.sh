@@ -81,6 +81,9 @@ tools=(
   "multiTouch --action tap --x 540 --y 1200"
   "pinchOn --direction in"
   "videoRecording --action start"
+  # Something to record: a stop right after the start can come before the encoder's first
+  # frame, which under software mode's TCG takes over half a second, and leaves an empty file.
+  "swipeOn --direction up"
   "videoRecording --action stop"
   "captureAudio --seconds 1"
   "injectAudioInput --tone {\"frequencyHz\":440,\"durationMs\":500}"
