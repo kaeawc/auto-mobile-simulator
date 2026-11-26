@@ -131,6 +131,11 @@ impl Hypervisor {
         Ok(())
     }
 
+    /// QueueNotify stores completed in the kernel: none here.
+    pub fn kernel_notifies(&self) -> u64 {
+        0
+    }
+
     /// Starts one thread per vCPU: the boot CPU at `entry` with x0 = `dtb`, the rest waiting for
     /// PSCI CPU_ON. The guest counter starts near zero, identical on every vCPU.
     pub fn start_vcpus(self: &Arc<Self>, cpus: &Arc<Cpus>, entry: u64, dtb: u64) -> anyhow::Result<Vec<JoinHandle<()>>> {

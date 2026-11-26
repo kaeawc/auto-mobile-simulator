@@ -1134,3 +1134,9 @@ Claims that would belong in the README once someone runs them:
   median of 3 boots each on the same host and day (an earlier sample on API 36 showed no
   difference, but its boots and command weren't recorded).
 - A farm of SDK emulators on the same host, to compare with the emu farm above.
+- Linux KVM (arm64 host): emu against the SDK emulator on the same host and day, median of at
+  least 3 cold boots to `sys.boot_completed`, idle host CPU, RSS per device, launcher frame
+  pacing (`scripts/android-jank.sh`) and screenshot/tap latency
+  ([#54](https://github.com/kaeawc/simee/issues/54)). Owed on arm64 KVM hardware: GitHub's
+  hosted arm64 runners have no `/dev/kvm`, and `scripts/kvm-smoke.sh` without `--native` runs
+  KVM inside an emulated machine, so its times aren't comparable to anything.

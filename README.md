@@ -127,7 +127,9 @@ Unsupported combinations are refused with the reason. The matrix and its gaps:
 ## Not yet
 
 - iOS needs an Apple silicon Mac. Android runs on Apple silicon, and on x86_64 Linux in software
-  mode (x86_64 images; slow frames, see above). KVM on Linux is in progress
+  mode (x86_64 images; slow frames, see above). arm64 Linux with KVM boots the board (a Linux
+  guest, under KVM inside an emulated machine in CI), but no Android image has been booted on
+  arm64 KVM hardware yet, and KVM boots have no host graphics yet
   ([#54](https://github.com/kaeawc/simee/issues/54)).
 - No Android snapshots, so every boot is a full boot.
 - AutoMobile's Android harness: 38 of 41 tools pass (2026-11-24). Open: network shaping and VM

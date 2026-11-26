@@ -1,0 +1,35 @@
+name: KVM arm64
+
+# The arm64 KVM backend on real hardware: a self-hosted arm64 Linux runner with /dev/kvm,
+# labelled `kvm-arm64` (GitHub's hosted arm64 runners have no KVM; see #54). Not run on pull
+# requests, so code from a fork never runs on the self-hosted machine. Runs on pushes to main
+# once the repository variable KVM_ARM64_RUNNER is `true`, and whenever it is dispatched.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: kvm-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  native:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.KVM_ARM64_RUNNER == 'true' }}
+    runs-on: [self-hosted, linux, ARM64, kvm-arm64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo run --locked --release -p emu -- -accel-check
+      - run: cargo test --locked --release -p emu-kvm -p emu-vmm
+      - run: scripts/kvm-smoke.sh --native

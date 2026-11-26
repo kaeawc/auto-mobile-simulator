@@ -9,7 +9,7 @@
 //!   the store completes in the kernel and the vCPU goes straight back into the guest.
 //! - **MMIO** arrives decoded (address, size, data), so there's no syndrome to parse.
 use std::os::fd::AsFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -40,10 +40,13 @@ static CURRENT: Mutex<Option<Arc<Vm>>> = Mutex::new(None);
 
 pub struct Hypervisor {
     vm: Arc<Vm>,
+    lines: Arc<EarlyLines>,
     cpus: u32,
     vgic: Mutex<Option<Vgic>>,
     kicks: Arc<Kicks>,
     kicking: AtomicBool,
+    /// QueueNotify stores the dispatcher delivered.
+    notified: Arc<AtomicU64>,
     /// The ioeventfd dispatcher: its stop signal and thread.
     notifies: Mutex<Option<(rustix::fd::OwnedFd, JoinHandle<()>)>>,
 }
@@ -59,11 +62,13 @@ impl Hypervisor {
         let vm = Arc::new(kvm.create_vm(40).context("creating the KVM VM")?);
         *CURRENT.lock().unwrap_or_else(PoisonError::into_inner) = Some(vm.clone());
         Ok(Hypervisor {
+            lines: Arc::new(EarlyLines { vm: vm.clone(), ready: AtomicBool::new(false), levels: Mutex::new(Vec::new()) }),
             vm,
             cpus,
             vgic: Mutex::new(None),
             kicks: Arc::new(Kicks::new(cpus as usize).context("installing the vCPU kick signal")?),
             kicking: AtomicBool::new(false),
+            notified: Arc::new(AtomicU64::new(0)),
             notifies: Mutex::new(None),
         })
     }
@@ -89,7 +94,7 @@ impl Hypervisor {
 
     /// The line for SPI `intid`: a level the vGIC holds until the device lowers it.
     pub fn spi(&self, intid: u32) -> Arc<dyn IrqLine> {
-        Arc::new(KvmSpi { vm: self.vm.clone(), irq: Vm::spi(intid), intid })
+        Arc::new(KvmSpi { lines: self.lines.clone(), irq: Vm::spi(intid), intid })
     }
 
     /// Completes each store of `value` to `addr` in the kernel (ioeventfd), then runs `on` on a
@@ -102,14 +107,21 @@ impl Hypervisor {
         }
         let stop = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK)?;
         let stop_for_thread = stop.try_clone()?;
+        let notified = self.notified.clone();
         let thread = std::thread::Builder::new().name("virtio-notify".into()).spawn(move || {
             crate::device_thread();
-            if let Err(e) = dispatch(&registered, &stop_for_thread) {
+            if let Err(e) = dispatch(&registered, &stop_for_thread, &notified) {
                 eprintln!("emu: virtio notifications stopped: {e}");
             }
         })?;
         *self.notifies.lock().unwrap_or_else(PoisonError::into_inner) = Some((stop, thread));
         Ok(())
+    }
+
+    /// QueueNotify stores completed in the kernel so far (an eventfd counts several stores that
+    /// arrive before the dispatcher reads it as one).
+    pub fn kernel_notifies(&self) -> u64 {
+        self.notified.load(Ordering::Relaxed)
     }
 
     /// Creates every vCPU (KVM wants them all before the vGIC initializes), then runs each on its
@@ -133,6 +145,7 @@ impl Hypervisor {
         if let Some(vgic) = self.vgic.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
             vgic.init()?;
         }
+        self.lines.ready();
         let mut threads = Vec::with_capacity(vcpus.len());
         for (idx, vcpu) in vcpus.into_iter().enumerate() {
             let (hv, cpus) = (self.clone(), cpus.clone());
@@ -212,7 +225,7 @@ impl Drop for Hypervisor {
 type Callback = Arc<dyn Fn() + Send + Sync>;
 
 /// Waits on every notifier and `stop` at once; runs a notifier's callback each time it fires.
-fn dispatch(notifies: &[(Notifier, Callback)], stop: &rustix::fd::OwnedFd) -> std::io::Result<()> {
+fn dispatch(notifies: &[(Notifier, Callback)], stop: &rustix::fd::OwnedFd, notified: &AtomicU64) -> std::io::Result<()> {
     use rustix::event::epoll;
     let ep = epoll::create(epoll::CreateFlags::CLOEXEC)?;
     let stop_key = notifies.len() as u64;
@@ -236,24 +249,66 @@ fn dispatch(notifies: &[(Notifier, Callback)], stop: &rustix::fd::OwnedFd) -> st
             if let Some((fd, on)) = notifies.get(key as usize)
                 && fd.drain()
             {
+                notified.fetch_add(1, Ordering::Relaxed);
                 on();
             }
         }
     }
 }
 
+/// Interrupt lines before and after the vGIC is initialized. KVM refuses `KVM_IRQ_LINE` until
+/// then (`EBUSY`), but devices drive their lines from the moment they're built (the battery's
+/// starts low): until then the last level of each line is kept, and replayed at init. After it,
+/// a level costs one atomic load more than the ioctl.
+struct EarlyLines {
+    vm: Arc<Vm>,
+    ready: AtomicBool,
+    /// `(irq, intid, level)`, the last of each line, while not ready.
+    levels: Mutex<Vec<(u32, u32, bool)>>,
+}
+
+impl EarlyLines {
+    fn set(&self, irq: u32, intid: u32, level: bool) {
+        if !self.ready.load(Ordering::Acquire) {
+            let mut levels = self.levels.lock().unwrap_or_else(PoisonError::into_inner);
+            if !self.ready.load(Ordering::Acquire) {
+                levels.retain(|&(i, _, _)| i != irq);
+                levels.push((irq, intid, level));
+                return;
+            }
+        }
+        self.drive(irq, intid, level);
+    }
+
+    fn drive(&self, irq: u32, intid: u32, level: bool) {
+        if let Err(e) = self.vm.set_irq_line(irq, level) {
+            eprintln!("emu: SPI {intid} -> {level}: {e}");
+        }
+    }
+
+    /// The vGIC is initialized: drives the lines set before, from now on directly.
+    fn ready(&self) {
+        let mut levels = self.levels.lock().unwrap_or_else(PoisonError::into_inner);
+        for (irq, intid, level) in levels.drain(..) {
+            // Low is where every line starts.
+            if level {
+                self.drive(irq, intid, level);
+            }
+        }
+        self.ready.store(true, Ordering::Release);
+    }
+}
+
 /// An SPI on the vGIC, driven with `KVM_IRQ_LINE`.
 struct KvmSpi {
-    vm: Arc<Vm>,
+    lines: Arc<EarlyLines>,
     irq: u32,
     intid: u32,
 }
 
 impl IrqLine for KvmSpi {
     fn set(&self, level: bool) {
-        if let Err(e) = self.vm.set_irq_line(self.irq, level) {
-            eprintln!("emu: SPI {} -> {level}: {e}", self.intid);
-        }
+        self.lines.set(self.irq, self.intid, level);
     }
 }
 

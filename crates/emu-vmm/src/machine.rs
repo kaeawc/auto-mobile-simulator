@@ -353,6 +353,9 @@ pub struct Outcome {
     pub uptime: Duration,
     /// Per-vCPU exit counters: (name, count).
     pub exits: Vec<Vec<(&'static str, u64)>>,
+    /// virtio QueueNotify stores the hypervisor completed in the kernel (ioeventfd), which never
+    /// show up as exits: 0 on Hypervisor.framework, which has no such path.
+    pub kernel_notifies: u64,
 }
 
 fn random_bytes<const N: usize>() -> [u8; N] {
@@ -726,6 +729,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         let _ = t.join();
     }
     let exits = cpus.stats.iter().map(|s| s.snapshot().to_vec()).collect();
+    let kernel_notifies = vm.kernel_notifies();
     // Devices (and their worker threads) go first, then the VM, then guest RAM. One device at a
     // time, so a stop that overruns names the one it waits for.
     let mut cpus = cpus;
@@ -747,7 +751,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     if let (StopReason::Reset, Some(spec)) = (&reason, &cfg.gpu) {
         blank_until_next_post(&*spec.display, spec.verbose);
     }
-    Ok(Outcome { reason, uptime: started.elapsed(), exits })
+    Ok(Outcome { reason, uptime: started.elapsed(), exits, kernel_notifies })
 }
 
 #[cfg(target_os = "macos")]

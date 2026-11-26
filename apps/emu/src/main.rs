@@ -443,6 +443,9 @@ fn boot(
             for line in exit_lines(&out.exits) {
                 eprintln!("emu: {line}");
             }
+            if out.kernel_notifies > 0 {
+                eprintln!("emu:   virtio notifies completed in the kernel (ioeventfd): {}", out.kernel_notifies);
+            }
             if let Some(spool) = &inst.logcat {
                 eprintln!("emu:   logcat bytes dropped (its output fell behind): {}", spool.dropped());
             }
