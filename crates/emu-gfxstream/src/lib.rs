@@ -8,7 +8,10 @@
 // `sym!` transmutes dlsym results to the type of the struct field it initializes.
 #![allow(clippy::missing_transmute_annotations)]
 
+mod channel;
 mod macho;
+
+pub use channel::{ChannelRead, RenderChannel};
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, c_char, c_int, c_void};
@@ -28,6 +31,8 @@ pub enum Error {
     Call(&'static str, i32),
     #[error("the gfxstream renderer is already initialized in this process")]
     AlreadyInitialized,
+    #[error("unavailable in this renderer: {0}")]
+    Unavailable(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

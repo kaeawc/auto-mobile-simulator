@@ -407,14 +407,23 @@ impl PipeHandler for RefPipe {
 }
 
 /// `GLProcessPipe`: each GL-using guest process writes a 4-byte confirm word and reads back a
-/// unique 64-bit process id.
+/// unique 64-bit process id. With a backend (images whose GLES goes over the `opengles` pipe),
+/// the renderer hears of each process when its pipe opens and again when it closes (the process
+/// exited), to set up and free that process's GL state, as the stock emulator's pipe does.
 pub struct GlProcess {
     next: std::sync::atomic::AtomicU64,
+    backend: Option<Arc<dyn crate::pipe::opengles::GlBackend>>,
 }
 
 impl Default for GlProcess {
     fn default() -> Self {
-        GlProcess { next: std::sync::atomic::AtomicU64::new(1) }
+        GlProcess::with_backend(None)
+    }
+}
+
+impl GlProcess {
+    pub fn with_backend(backend: Option<Arc<dyn crate::pipe::opengles::GlBackend>>) -> GlProcess {
+        GlProcess { next: std::sync::atomic::AtomicU64::new(1), backend }
     }
 }
 
@@ -422,7 +431,10 @@ impl crate::pipe::PipeService for GlProcess {
     fn open(&self, name: &str, _ctx: PipeCtx) -> Option<Box<dyn PipeHandler>> {
         (name == "GLProcessPipe").then(|| {
             let puid = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Box::new(ProcessPipe { puid, got: 0 }) as _
+            if let Some(b) = &self.backend {
+                b.process_created(puid);
+            }
+            Box::new(ProcessPipe { puid, got: 0, backend: self.backend.clone() }) as _
         })
     }
 }
@@ -430,6 +442,7 @@ impl crate::pipe::PipeService for GlProcess {
 struct ProcessPipe {
     puid: u64,
     got: usize,
+    backend: Option<Arc<dyn crate::pipe::opengles::GlBackend>>,
 }
 
 impl PipeHandler for ProcessPipe {
@@ -443,6 +456,18 @@ impl PipeHandler for ProcessPipe {
     }
     fn host_msg(&mut self, msg: HostMsg, _to_guest: &mut Vec<u8>) -> bool {
         !matches!(msg, HostMsg::Close)
+    }
+    fn closed(&mut self) {
+        if let Some(b) = self.backend.take() {
+            b.process_dead(self.puid);
+        }
+    }
+}
+
+/// A guest reset drops pipes without closing them: their processes are gone all the same.
+impl Drop for ProcessPipe {
+    fn drop(&mut self) {
+        PipeHandler::closed(self);
     }
 }
 
@@ -588,5 +613,74 @@ mod tests {
         mem.read(r2, &mut reply[3..]).expect("r2");
         assert_eq!(u64::from_le_bytes(reply), 1, "the first process id, whole");
         assert_eq!(run_bufs(&d, &mem, 5, cb, CMD_READ, &[(r1, 8)]).0, ERR_AGAIN, "all consumed");
+    }
+
+    /// Opens pipe `id` (command page `cb`) on `name`.
+    fn open_named(d: &GoldfishPipe, mem: &GuestRam, id: u32, cb: u64, name: &[u8]) -> (i32, i32) {
+        let open_buf = RAM + 0x1000;
+        mem.write(open_buf, &cb.to_le_bytes()).expect("w");
+        assert_eq!(run(d, mem, id, cb, CMD_OPEN, None).0, 0);
+        let data = RAM + 0x8000;
+        mem.write(data, name).expect("w");
+        run(d, mem, id, cb, CMD_WRITE, Some((data, name.len() as u32)))
+    }
+
+    fn device(reg: PipeRegistry) -> (Arc<GuestRam>, Arc<TestLine>, Arc<GoldfishPipe>) {
+        let mem = Arc::new(GuestRam::new(RAM, 0x10_0000).expect("ram"));
+        let line = Arc::new(TestLine::default());
+        let d = GoldfishPipe::new(mem.clone(), Arc::new(reg), line.clone());
+        wr(&d, REG_VERSION, 4);
+        wr(&d, REG_OPEN_BUFFER_HIGH, 0);
+        wr(&d, REG_OPEN_BUFFER, (RAM + 0x1000) as u32);
+        wr(&d, REG_SIGNAL_BUFFER_HIGH, 0);
+        wr(&d, REG_SIGNAL_BUFFER, (RAM + 0x2000) as u32);
+        wr(&d, REG_SIGNAL_BUFFER_COUNT, 64);
+        (mem, line, d)
+    }
+
+    /// The guest's GLES encoder on API 29–30: `pipe:opengles`, a command, a blocking read woken
+    /// by the render thread's reply.
+    #[test]
+    fn opengles_pipes_carry_the_gles_stream_both_ways() {
+        let backend = Arc::new(crate::pipe::opengles::tests::Backend::default());
+        let mut reg = PipeRegistry::default();
+        reg.register("opengles", Box::new(crate::pipe::opengles::OpenglesService { backend: backend.clone() }));
+        let (mem, line, d) = device(reg);
+        let cb = RAM + 0x3000;
+        assert_eq!(open_named(&d, &mem, 9, cb, b"pipe:opengles\0"), (14, 14));
+        let data = RAM + 0x8000;
+        mem.write(data, b"abc").expect("w");
+        assert_eq!(run(&d, &mem, 9, cb, CMD_WRITE, Some((data, 3))), (3, 3));
+        // The guest finds nothing yet or the reply already there; either way it gets it.
+        if run(&d, &mem, 9, cb, CMD_READ, Some((data + 0x100, 16))).0 == ERR_AGAIN {
+            assert_eq!(run(&d, &mem, 9, cb, CMD_WAKE_ON_READ, None).0, 0);
+            let t = std::time::Instant::now();
+            while !line.level() {
+                assert!(t.elapsed() < std::time::Duration::from_secs(5), "never woken");
+                std::thread::yield_now();
+            }
+            assert_eq!(rd(&d, REG_GET_SIGNALLED), 1);
+            assert_eq!(mem.read_u32(RAM + 0x2000 + 4).expect("flags"), WAKE_READ);
+            assert_eq!(run(&d, &mem, 9, cb, CMD_READ, Some((data + 0x100, 16))), (3, 3));
+        }
+        let mut reply = [0u8; 3];
+        mem.read(data + 0x100, &mut reply).expect("r");
+        assert_eq!(&reply, b"cba");
+        assert_eq!(run(&d, &mem, 9, cb, CMD_CLOSE, None).0, 0);
+        let c = backend.channels.lock().expect("lock")[0].clone();
+        assert!(!crate::pipe::opengles::GlChannel::write(&*c, b"x"), "the guest's close stopped the channel");
+    }
+
+    #[test]
+    fn gl_processes_are_announced_to_the_renderer_when_they_come_and_go() {
+        let backend = Arc::new(crate::pipe::opengles::tests::Backend::default());
+        let mut reg = PipeRegistry::default();
+        reg.register("GLProcessPipe", Box::new(GlProcess::with_backend(Some(backend.clone()))));
+        let (mem, _line, d) = device(reg);
+        for (id, cb) in [(3, RAM + 0x3000), (4, RAM + 0x4000)] {
+            assert_eq!(open_named(&d, &mem, id, cb, b"pipe:GLProcessPipe\0").0, 19);
+        }
+        assert_eq!(run(&d, &mem, 3, RAM + 0x3000, CMD_CLOSE, None).0, 0);
+        assert_eq!(*backend.processes.lock().expect("lock"), [(1, true), (2, true), (1, false)]);
     }
 }

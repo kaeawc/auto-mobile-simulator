@@ -21,7 +21,7 @@ to use fewer resources.
 | VM core | vCPUs, the framework's in-kernel GICv3, PSCI (SMP, power off and reset), arch timer, PL011 console, PL031 RTC |
 | Board | Stock memory map and virtio-mmio slots, so the unmodified fstab and first-stage init find `vda`–`vde` and their by-name paths |
 | Storage | virtio-blk with indirect descriptors, event-idx, and discard/write-zeroes (hole punching). System and vendor are copy-on-write in memory; userdata, cache and metadata persist per AVD. Userdata is created by a native ext4 formatter (no `mkfs.ext4`) |
-| Boot | Full Android boot to `sys.boot_completed`: 9.5 s cold, 3.5 s warm (stock: 22.9 s and 17.1 s; [benchmarks](benchmarks.md)); first boot formats and encrypts `/data`. System images from API 31 on; emu refuses older ones up front with the reason, since they boot their kernel but get no graphics: API 29 and 30 draw with the GLES encoder over the `opengles` goldfish pipe, which emu doesn't yet bridge to the renderer ([#38](https://github.com/kaeawc/simee/issues/38); emu now also serves what else they need, unit-tested but not yet booted: adb clients that connect before adbd opens `qemud:adb`, the reference RIL's `qemud:gsm` modem, `logcat -Q`'s `logcat` stream with stock's `qemu.cmdline` property, and `qemu.gltransport=pipe` as stock passes it). `EMU_ALLOW_OLD_IMAGES=1` boots them anyway, for that work. API 31 to 33 guests set up address-space graphics with the protocol before the renderer's; the GPU translates it (`virtio/legacy_asg.rs`, [#39](https://github.com/kaeawc/simee/issues/39)), and their GLES is the encoder on a renderer with GL, as stock runs them, since their ANGLE finds SurfaceFlinger no EGL config. Images without `AndroidbootProps2` (API 30 and older, kernels without bootconfig) get stock's legacy kernel command line (`qemu.*` names) instead of bootconfig |
+| Boot | Full Android boot to `sys.boot_completed`: 9.5 s cold, 3.5 s warm (stock: 22.9 s and 17.1 s; [benchmarks](benchmarks.md)); first boot formats and encrypts `/data`. System images from API 29 on; emu refuses older ones up front with the reason (`EMU_ALLOW_OLD_IMAGES=1` boots them anyway, to work on them). API 29 and 30 draw with the GLES encoder over the goldfish `opengles` pipe: each pipe gets a render channel of its own in the renderer, as stock gives it ([performance notes](#performance-notes)); the board has no virtio-gpu for them (their kernels oops on it, and stock gives them none). They also get adb over `qemud:adb` (a client that connects first waits for adbd's `accept`), the reference RIL's `qemud:gsm` modem, and `logcat -Q`'s `logcat` stream from stock's `qemu.cmdline` and `qemu.logcat` properties. API 29 `default` warm-boots in 4.8 s (stock 6.4 s); API 29 `default` and API 30 `google_apis` pass the AutoMobile harness (40 of 41 on API 30, 35 of 41 on API 29; device snapshots fail on every image, video recording as on API 31, and rotation and dark theme on API 29 fail on stock too). API 31 to 33 guests set up address-space graphics with the protocol before the renderer's; the GPU translates it (`virtio/legacy_asg.rs`, [#39](https://github.com/kaeawc/simee/issues/39)), and their GLES is the encoder on a renderer with GL, as stock runs them, since their ANGLE finds SurfaceFlinger no EGL config. Images without `AndroidbootProps2` (API 30 and older, kernels without bootconfig) get stock's legacy kernel command line (`qemu.*` names) instead of bootconfig |
 | adb | virtio-vsock with a host bridge on `console port + 1`, announced to the adb server. `adb shell`/`root`/`push` work, and the device shows up about 8 s after launch on a warm boot |
 | Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot`, `network speed|delay|status` (stock's presets, numbers and report; recorded, and seeded by `-netspeed`/`-netdelay`, but guest traffic isn't shaped yet), `avd snapshot` (answers as stock does without snapshot support: `save`/`load` are a `KO`, `list` is empty, `del` succeeds), plus simee's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
 | Discovery | `-list-avds`, `pid_<pid>.ini` running-instance file, `emulator-<port>` serial on stdout |
@@ -279,6 +279,33 @@ simee serves.
 ## Performance notes
 
 What has mattered so far, measured with `sample` and the `-verbose` exit counters:
+
+- **GLES over the goldfish pipe (API 29–30): the renderer's own render channels.** These
+  images' GLES encoder writes its stream to an `opengles` pipe per guest GL thread. The stock
+  emulator serves that pipe from `libandroid-emu-shared` (`EmuglPipe`), not from the renderer
+  library: `libgfxstream_backend` has no `opengles` service, and its exported
+  `android_pipe_guest_*` API only reaches the services it registers (`GLProcessPipe`,
+  `refcount`, adb), with no exported hook for host wakeups. What it does export is the class
+  `EmuglPipe` sits on, `RenderChannelImpl` (constructor, `tryWrite`, `readBefore`,
+  `waitUntilWritable`, `stop`, destructor): one channel is one render thread, and its two
+  buffer queues take their own lock. emu constructs one per pipe
+  (`crates/emu-gfxstream/src/channel.rs`), after checking the shape it relies on: the size
+  `createRenderChannel` allocates, decoded from its code, and the vtable of what it built. Guest
+  writes go into the channel from the vCPU (one copy into the channel's buffer); a reader thread
+  per pipe sleeps in `readBefore` and hands replies to the pipe device, which wakes the guest.
+  The alternatives were worse for a farm: virtio-gpu contexts with `PIPE_BUFFER` transfers
+  (`VirtioGpuRenderThreadPipe`) read exactly the size asked, block for it, and must stay on the
+  single thread that makes `stream_renderer_*` calls, so every guest process would wait on every
+  other; loading `libandroid-emu-shared` would bring AppKit, Qt-era agents and the stock
+  emulator's globals into emu. Like stock, each connection has its own render thread running in
+  parallel; emu adds one sleeping thread per connection. `GLProcessPipe` tells the renderer when
+  a guest process starts and exits (`FrameBuffer::createGraphicsProcessResources`,
+  `cleanupProcGLObjects` on a cleanup thread), as the stock pipe does. The renderer offers these
+  guests neither the virtio-gpu extensions (`VirtioGpuNext`, `VirtioGpuNativeSync`) nor shared
+  host-memory slots: API 29's gralloc takes a shared slot for each color buffer update and fails
+  on the large ones ("lockAndWriteDma: ERROR: No DMA context bound!"), so system_server's
+  software-drawn windows never post and its watchdog restarts it; stock doesn't offer slots to
+  these images either (its `HostComposition ext` line, 2026-11-26).
 
 - **In-kernel GICv3.** The stock board emulates a GICv2 in userspace. Here interrupt
   acknowledge, EOI and the virtual timer never leave the guest, and an idle vCPU parks inside

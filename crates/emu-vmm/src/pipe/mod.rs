@@ -11,6 +11,7 @@ pub mod gps;
 pub mod gsm;
 pub mod logcat;
 pub mod misc;
+pub mod opengles;
 pub mod qemud;
 pub mod sensors;
 pub mod xr;
