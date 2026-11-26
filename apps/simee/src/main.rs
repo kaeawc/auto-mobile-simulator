@@ -93,6 +93,10 @@ enum Cmd {
         /// Fail unless the device type or system image is this form factor; shapes a new AVD.
         #[arg(long)]
         form_factor: Option<String>,
+        /// Android: the hardware a new AVD follows, as avdmanager's `-d` (foldables: pixel_fold,
+        /// surface_duo).
+        #[arg(long)]
+        device: Option<String>,
     },
     /// Delete a device and its data.
     Delete { device: String },
@@ -221,6 +225,10 @@ enum Cmd {
         /// `carplay` for an iPhone's CarPlay screen.
         #[arg(long, default_value = "main")]
         display: String,
+        /// iOS: the touch comes in from this screen edge (top, bottom, left, right), as a drag from
+        /// Simulator.app's bezel: `--edge bottom` from the bottom goes home.
+        #[arg(long)]
+        edge: Option<String>,
     },
     /// Press a hardware button: home, lock (power), side, siri, apple-pay, action (iOS); back,
     /// volume-up, volume-down, recents, menu (Android); up, down, left, right, select, play-pause
@@ -264,7 +272,8 @@ enum Cmd {
         #[arg(long)]
         orientation: Option<String>,
     },
-    /// Set an Android foldable's hinge: a posture (closed, half-opened, opened) or an angle (0-180).
+    /// Set an Android foldable's hinge: fold, unfold, a posture (closed, half-opened, opened, flipped, tent) or an
+    /// angle (0-180; 0-360 on a dual-screen).
     Fold { device: String, posture: String },
     /// Android XR: recenter, rotate X Y Z (radians), move DX DY DZ (metres), options day|night
     /// PASSTHROUGH (0-1), input mouse|hand|eye, viewport pan|zoom|rotate, pointer X Y [PHASE].
@@ -288,18 +297,21 @@ enum Cmd {
         #[arg(long, default_value_t = 300)]
         duration_ms: u64,
     },
-    /// Android: a stylus on the touch screen, in pixels: X Y [tap|hover|down|move|up|leave], or a
-    /// stroke with --to X2 Y2; --button holds the barrel button, --eraser uses the eraser end.
+    /// A stylus on the touch screen, in pixels: X Y [tap|hover|down|move|up|leave], or a stroke
+    /// with --to X2 Y2; --button holds the barrel button, --eraser uses the eraser end. On an iPad
+    /// it is the Apple Pencil: tap, down, move, up and strokes only (no hover, pressure, button or
+    /// eraser in the simulator).
+    #[command(alias = "pencil")]
     Stylus {
         device: String,
         x: u32,
         y: u32,
-        /// tap (the default), hover, down, move, up or leave.
+        /// tap (the default), hover, down, move, up or leave (Android).
         phase: Option<String>,
         /// Draw a stroke to this point instead.
         #[arg(long, num_args = 2, value_names = ["X2", "Y2"])]
         to: Option<Vec<u32>>,
-        /// Pressure while touching, 1-255.
+        /// Pressure while touching, 1-255 (Android).
         #[arg(long)]
         pressure: Option<u8>,
         /// Hold the barrel button.
@@ -326,6 +338,24 @@ enum Cmd {
     WatchGesture { device: String, gesture: String },
     /// Swipe on the Siri Remote's touch surface (Apple TV): up, down, left or right.
     RemoteSwipe { device: String, direction: String },
+    /// The iPad's pointer: move it to a point in pixels and hover, or click, press (down) or
+    /// release (up) a button there, or drag with --to X2 Y2.
+    Pointer {
+        device: String,
+        x: f64,
+        y: f64,
+        /// move (the default), click, down or up.
+        action: Option<String>,
+        /// primary (the default) or secondary.
+        #[arg(long, default_value = "primary")]
+        button: String,
+        /// How long a click holds the button, in milliseconds.
+        #[arg(long, default_value_t = 80)]
+        hold: u64,
+        /// Drag to this point instead (press at X Y, move, release).
+        #[arg(long, num_args = 2, value_names = ["X2", "Y2"])]
+        to: Option<Vec<f64>>,
+    },
     /// Attach (`on`) or detach (`off`) an iPhone's CarPlay display (iOS 26 runtimes).
     Carplay { device: String, state: String },
     /// Android Automotive's vehicle HAL: list every property, read one, or set one, e.g.
@@ -546,9 +576,12 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
                 }
             }
         }
-        Cmd::Create { name, device_type, runtime, platform, system_image, form_factor } => {
-            let params = json!({"name": name, "device_type": device_type, "runtime": runtime, "platform": platform,
+        Cmd::Create { name, device_type, runtime, platform, system_image, form_factor, device } => {
+            let mut params = json!({"name": name, "device_type": device_type, "runtime": runtime, "platform": platform,
                 "system_image": system_image, "form_factor": form_factor});
+            if let Some(device) = device {
+                params["device"] = json!(device);
+            }
             let d = call("create", params)?;
             writeln!(out, "{}", text(&d["udid"]))?;
         }
@@ -635,9 +668,9 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             call("tap", json!({"device": device, "x": x, "y": y, "hold_ms": hold, "display": display}))?;
             input = true;
         }
-        Cmd::Swipe { device, x1, y1, x2, y2, duration, settle, display } => {
+        Cmd::Swipe { device, x1, y1, x2, y2, duration, settle, display, edge } => {
             let params = json!({"device": device, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": duration, "settle": settle,
-                "display": display});
+                "display": display, "edge": edge});
             call("swipe", params)?;
             input = true;
         }
@@ -676,12 +709,13 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             }
         }
         Cmd::Fold { device, posture } => {
-            let params = match posture.parse::<f64>() {
-                Ok(angle) => json!({"device": device, "angle": angle}),
-                Err(_) => json!({"device": device, "posture": posture}),
+            let params = match (posture.as_str(), posture.parse::<f64>()) {
+                // The console's `fold` and `unfold`: to the folded screen, or flat.
+                ("fold" | "unfold", _) => json!({"device": device, "folded": posture == "fold"}),
+                (_, Ok(angle)) => json!({"device": device, "angle": angle}),
+                (_, Err(_)) => json!({"device": device, "posture": posture}),
             };
-            let r = call("fold", params)?;
-            writeln!(out, "{} ({}°)", text(&r["posture"]), r["angle"])?;
+            writeln!(out, "{}", fold_line(&call("fold", params)?))?;
         }
         Cmd::Xr { device, command } => lines(out, &call("xr", xr_params(&device, &command)?)?)?,
         Cmd::Touchpad { device, x, y, phase, to, duration_ms } => {
@@ -702,6 +736,7 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
                 _ => params["phase"] = json!(phase.as_deref().unwrap_or("tap")),
             }
             call("stylus", params)?;
+            input = true;
         }
         Cmd::Rotary { device, ticks, delta } => {
             call("rotary", json!({"device": device, "ticks": ticks, "delta": delta}))?;
@@ -713,6 +748,15 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
         }
         Cmd::RemoteSwipe { device, direction } => {
             call("remote_swipe", json!({"device": device, "direction": direction}))?;
+            input = true;
+        }
+        Cmd::Pointer { device, x, y, action, button, hold, to } => {
+            let mut params = json!({"device": device, "x": x, "y": y, "action": action, "button": button, "hold_ms": hold});
+            if let Some([tx, ty]) = to.as_deref() {
+                params["to_x"] = json!(tx);
+                params["to_y"] = json!(ty);
+            }
+            call("pointer", params)?;
             input = true;
         }
         Cmd::Carplay { device, state } => {
@@ -875,6 +919,19 @@ fn form_factors_text(rows: &Value) -> String {
     out
 }
 
+/// `simee fold`'s line for the `fold` method's answer: the posture and angle, and the screen and
+/// its size when simee's emulator says them; the stock emulator's answer to a fold or unfold is
+/// only which was asked.
+fn fold_line(r: &Value) -> String {
+    let screen = |folded: bool| if folded { "folded" } else { "unfolded" };
+    match (r["posture"].as_str(), r["folded"].as_bool(), r["width"].as_u64(), r["height"].as_u64()) {
+        (Some(posture), Some(folded), Some(w), Some(h)) => format!("{posture} ({}°), {}, {w}x{h}", r["angle"], screen(folded)),
+        (Some(posture), ..) => format!("{posture} ({}°)", r["angle"]),
+        (None, Some(folded), ..) => screen(folded).to_owned(),
+        (None, None, ..) => r.to_string(),
+    }
+}
+
 /// The `xr` method's parameters for `simee xr DEVICE WORDS...` (the console's `xr` syntax).
 fn xr_params(device: &str, words: &[String]) -> Result<Value> {
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
@@ -952,6 +1009,16 @@ mod tests {
         ] {
             assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
         }
+    }
+
+    #[test]
+    fn fold_answers_print_what_the_emulator_said() {
+        let simee = json!({"angle": 0.0, "posture": "closed", "folded": true, "width": 1080, "height": 2092});
+        assert_eq!(fold_line(&simee), "closed (0.0°), folded, 1080x2092");
+        // The stock emulator doesn't report the hinge: what was asked.
+        assert_eq!(fold_line(&json!({"folded": true})), "folded", "not `null (null°)`");
+        assert_eq!(fold_line(&json!({"folded": false})), "unfolded");
+        assert_eq!(fold_line(&json!({"angle": 180.0, "posture": "opened"})), "opened (180.0°)");
     }
 
     #[test]
@@ -1135,6 +1202,13 @@ mod tests {
         // Android devices boot silent unless `--audio`.
         assert!(matches!(parse(&["boot", "a"]), Ok(Cmd::Boot { audio: false, .. })));
         assert!(matches!(parse(&["boot", "a", "--audio"]), Ok(Cmd::Boot { audio: true, .. })));
+    }
+
+    #[test]
+    fn pencil_is_the_stylus_command() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        assert!(matches!(parse(&["pencil", "iPad", "1", "2", "--to", "3", "4"]), Ok(Cmd::Stylus { to: Some(_), .. })));
+        assert!(matches!(parse(&["stylus", "iPad", "1", "2", "down"]), Ok(Cmd::Stylus { button: false, pressure: None, .. })));
     }
 
     /// A fake server's reply to a method: its result or its error.

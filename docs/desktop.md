@@ -8,7 +8,7 @@ One window for iOS and Android devices.
 cd desktop
 cargo run --release                     # SIMEE_DEVICE=<udid|name|booted> preselects a device
 cargo run -- --snap shot.png --scene demo   # headless render; scenes: demo, android, foldable,
-                                            # tablet, ipad, watch, tv, apple-watch, apple-tv, empty
+                                            # folded, tablet, ipad, watch, tv, apple-watch, apple-tv, empty
 cargo run --release --features tooling -- --snap shot.png --scene demo   # the same, optimized
 ```
 
@@ -29,7 +29,7 @@ needed): click and drag on the screen for touches; type to use the device keyboa
 | Apple Vision Pro | Home, Appearance |
 | Android phone | Back, Home, Recents, Power, Rotate |
 | Android tablet | the above, plus Stylus (the pointer becomes a pen: moving over the screen hovers, dragging draws) |
-| Android foldable | the above, plus Fold closed / Half open / Open flat |
+| Android foldable | the above, plus Fold / Half open / Unfold (folded, the view takes the outer screen's shape) |
 | Wear OS watch (round screen) | Back, Home, Power, Rotary up / down |
 | Android TV | Back, Home, Power, D-pad and Select |
 | Android Automotive | Back, Home |

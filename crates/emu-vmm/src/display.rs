@@ -92,6 +92,20 @@ pub struct FrameStore {
     last_read: AtomicU64,
     /// How long unread before the buffers go ([`IDLE`]; shorter in tests).
     idle_ms: u64,
+    /// The part of the scanout readers see (x, y, width, height): a folded foldable's outer
+    /// screen. None: all of it.
+    view: Mutex<Option<View>>,
+}
+
+/// A rectangle of the scanout: x, y, width, height.
+pub type View = (u32, u32, u32, u32);
+
+/// `view` clipped to a `width` x `height` frame; None when it covers all of it or nothing.
+fn clip_view(view: Option<View>, width: u32, height: u32) -> Option<View> {
+    let (x, y, w, h) = view?;
+    let (x, y) = (x.min(width), y.min(height));
+    let (w, h) = (w.min(width - x), h.min(height - y));
+    (w > 0 && h > 0 && (x, y, w, h) != (0, 0, width, height)).then_some((x, y, w, h))
 }
 
 impl Default for FrameStore {
@@ -129,6 +143,17 @@ pub struct Capture {
     pub rgba: Vec<u8>,
 }
 
+/// Cuts `view` out of the RGBA frame `rgba` (`width` pixels a row) in place: every row moves to an
+/// offset no later than where it was, so a forward copy never overwrites a row still to come.
+fn crop_in_place(rgba: &mut Vec<u8>, width: u32, (x, y, w, h): View) {
+    let (row, src_row, x) = (w as usize * 4, width as usize * 4, x as usize * 4);
+    for r in 0..h as usize {
+        let from = (y as usize + r) * src_row + x;
+        rgba.copy_within(from..from + row, r * row);
+    }
+    rgba.truncate(row * h as usize);
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -144,6 +169,7 @@ impl FrameStore {
             spare: Mutex::default(),
             last_read: AtomicU64::new(0),
             idle_ms: idle.as_millis() as u64,
+            view: Mutex::new(None),
         }
     }
 
@@ -151,8 +177,40 @@ impl FrameStore {
         lock(&self.inner).clone()
     }
 
-    /// The latest frame's width, height and number, without copying its pixels.
+    /// Shows readers only `view` of the scanout (None: all of it), from the latest frame on: the
+    /// frame is counted again, so streams on a static screen send it at the new size.
+    pub fn set_view(&self, view: Option<View>) {
+        let mut v = lock(&self.view);
+        if *v == view {
+            return;
+        }
+        *v = view;
+        drop(v);
+        let mut s = lock(&self.inner);
+        if s.frames > 0 {
+            s.frames += 1;
+        }
+        drop(s);
+        self.posted.notify_all();
+    }
+
+    /// Where readers' (0, 0) is on the scanout: the view's origin, clipped to the latest frame.
+    pub fn view_origin(&self) -> (u32, u32) {
+        let (w, h, _) = self.full_geometry();
+        clip_view(*lock(&self.view), w, h).map_or((0, 0), |(x, y, ..)| (x, y))
+    }
+
+    /// The latest frame's width, height and number as readers see it (the view, if one is set),
+    /// without copying its pixels.
     pub fn geometry(&self) -> (u32, u32, u64) {
+        let (w, h, n) = self.full_geometry();
+        match clip_view(*lock(&self.view), w, h) {
+            Some((_, _, vw, vh)) => (vw, vh, n),
+            None => (w, h, n),
+        }
+    }
+
+    fn full_geometry(&self) -> (u32, u32, u64) {
         let s = lock(&self.inner);
         (s.width, s.height, s.frames)
     }
@@ -229,8 +287,10 @@ impl FrameStore {
         if frame == 0 || width == 0 || height == 0 {
             return None;
         }
+        let view = clip_view(*lock(&self.view), width, height);
+        let (seen_w, seen_h) = view.map_or((width, height), |(_, _, w, h)| (w, h));
         let mut cap = lock(&self.capture);
-        if (cap.frame, cap.width, cap.height) != (frame, width, height) {
+        if (cap.frame, cap.width, cap.height) != (frame, seen_w, seen_h) {
             let len = width as usize * height as usize * 4;
             // A posted frame is the renderer's; a presented one is only in the store (the renderer
             // would answer with whatever it posted last, maybe before a guest reboot).
@@ -246,7 +306,10 @@ impl FrameStore {
                 cap.frame = 0;
                 return None;
             }
-            (cap.width, cap.height, cap.frame) = (width, height, frame);
+            if let Some(view) = view {
+                crop_in_place(&mut cap.rgba, width, view);
+            }
+            (cap.width, cap.height, cap.frame) = (seen_w, seen_h, frame);
         }
         Some(f(&cap))
     }
@@ -269,8 +332,10 @@ impl FrameStore {
                 return true;
             }
         }
-        let (_, _, _, posted) = self.state();
-        if posted {
+        let (full_w, full_h, _, posted) = self.state();
+        // A view is cut from the whole frame, which the capture reads.
+        let viewed = clip_view(*lock(&self.view), full_w, full_h).is_some();
+        if posted && !viewed {
             return self.readback.get().is_some_and(|r| r(width, height, dst));
         }
         let copied = self.latest(|c| {
@@ -401,7 +466,7 @@ impl DisplaySink for FrameStore {
     /// An opaque black frame of the current size, presented as pixels (nothing before the first
     /// frame).
     fn blank(&self) {
-        let (width, height, frames) = self.geometry();
+        let (width, height, frames) = self.full_geometry();
         if frames == 0 || width == 0 || height == 0 {
             return;
         }
@@ -729,6 +794,37 @@ mod tests {
         assert!(!s.posted && (s.width, s.height, s.frames) == (4, 2, 2));
         let rgba = store.latest(|c| c.rgba.clone()).expect("a frame");
         assert_eq!(rgba, [0, 0, 0, 0xff].repeat(8), "opaque black, not the readback");
+    }
+
+    #[test]
+    fn a_view_shows_readers_part_of_the_scanout() {
+        let store = FrameStore::default();
+        // 4x2, each pixel's red byte its index.
+        let pixels: Vec<u8> = (0..8u8).flat_map(|i| [i, 0, 0, 0xff]).collect();
+        store.present(4, 2, 16, PixelFormat::RGBA_VIRTIO, &pixels);
+        let n = store.frames();
+        store.set_view(Some((1, 0, 2, 2)));
+        assert_eq!(store.geometry(), (2, 2, n + 1), "counted again at the new size");
+        assert_eq!(store.view_origin(), (1, 0));
+        let reds = |store: &FrameStore| store.latest(|c| (c.width, c.height, c.rgba.chunks(4).map(|p| p[0]).collect::<Vec<_>>()));
+        assert_eq!(reds(&store), Some((2, 2, vec![1, 2, 5, 6])));
+        let mut dst = vec![0; 2 * 2 * 4];
+        assert!(store.read_into(2, 2, n + 1, &mut dst));
+        assert_eq!(dst.chunks(4).map(|p| p[0]).collect::<Vec<_>>(), [1, 2, 5, 6]);
+        // Posted frames are cut from the readback too.
+        store.set_readback(Box::new(|w, _, buf| {
+            buf.chunks_mut(4).enumerate().for_each(|(i, p)| p.copy_from_slice(&[(i as u32 % w) as u8 + 10, 0, 0, 0xff]));
+            true
+        }));
+        store.posted(4, 2);
+        let (_, _, m) = store.geometry();
+        assert!(store.read_into(2, 2, m, &mut dst));
+        assert_eq!(dst.chunks(4).map(|p| p[0]).collect::<Vec<_>>(), [11, 12, 11, 12]);
+        // A view as large as the frame, or none, shows all of it.
+        store.set_view(Some((0, 0, 9, 9)));
+        assert_eq!((store.geometry().0, store.geometry().1, store.view_origin()), (4, 2, (0, 0)));
+        store.set_view(None);
+        assert_eq!(reds(&store).map(|(w, h, _)| (w, h)), Some((4, 2)));
     }
 
     #[test]

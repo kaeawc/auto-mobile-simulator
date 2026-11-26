@@ -44,7 +44,8 @@ What a new device of each kind gets unless told otherwise. Real devices report t
 | --- | --- | --- | --- | --- | --- |
 | Android phone | 720×1280 | 320 dpi | rounded | — | touch, keyboard, buttons |
 | Android tablet | 2560×1600 | 320 dpi | rounded | — | touch, keyboard, buttons |
-| Android foldable | 2208×1840 (folded 1080×2092) | 420 dpi | rectangle | hinge at 180° | touch, keyboard, buttons, hinge |
+| Android foldable (the Pixel Fold) | 2208×1840 (folded 1080×2092) | 420 dpi | rectangle | hinge at 180°, 0–180° | touch, keyboard, buttons, hinge |
+| Android dual-screen (`--device surface_duo`) | 2784×1800 (two 1350×1800 screens, an 84 px hinge) | 401 dpi | rectangle | hinge at 180°, 0–360° | touch, keyboard, buttons, hinge |
 | Wear OS watch | 454×454 | 320 dpi | round | — | touch, rotary input, buttons |
 | Android TV | 1920×1080 | 320 dpi | rectangle | — | D-pad remote, keyboard |
 | Android Automotive | 1024×768 | 160 dpi | rectangle | — | touch, head unit |
@@ -72,7 +73,7 @@ The Android XR profiles are the SDK's own device definitions (`xr_headset_device
 `ai_glasses_device`, 2 GiB; both landscape), and a new XR AVD gets their RAM and
 `hw.initialOrientation=landscape` too.
 Foldable postures follow the stock emulator's hinge ranges: closed below 30°, half-opened below
-150°, opened from 150° to 180°.
+150°, opened from 150° to 180°. A dual-screen adds tent (210–330°) and flipped (330–360°).
 
 ## How a device's form factor is found
 
@@ -93,14 +94,14 @@ Foldable postures follow the stock emulator's hinge ranges: closed below 30°, h
 | Kind | Create | Drive |
 | --- | --- | --- |
 | iPhone | `simee create P "iPhone 17" "iOS 26.5"` | touch, `button home\|lock\|side\|action`, `type`, `rotate [--orientation …]` |
-| iPad | `simee create T "iPad Pro 11-inch (M4)" "iOS 26.5" --form-factor tablet` | as iPhone |
+| iPad | `simee create T "iPad Pro 11-inch (M4)" "iOS 26.5" --form-factor tablet` | as iPhone, plus `swipe --edge bottom\|top`, `pointer X Y [click\|down\|up]` or `pointer X Y --to X2 Y2`, and `stylus X Y [tap\|down\|move\|up]` or `stylus X Y --to X2 Y2` (the Apple Pencil) |
 | CarPlay | an iPhone on an iOS 26 runtime, booted: `simee carplay P on` | `tap\|swipe\|screenshot … --display carplay`; `carplay P off` |
 | Apple Watch | `simee create W "Apple Watch Series 10 (46mm)" "watchOS 26.0" --form-factor watch` | touch, `rotary <ticks> [--delta <crown units>]`, `button home` (the crown's press) `\|side\|action`, `watch-gesture double-tap\|wrist-flick` |
 | Apple TV | `simee create TV "Apple TV 4K (3rd generation)" "tvOS 26.0" --form-factor tv` | `button select\|menu\|back\|home\|play-pause\|up\|down\|left\|right` (the Siri Remote), `remote-swipe up\|down\|left\|right` (its touch surface) |
 | Vision Pro | `simee create V "Apple Vision Pro" "visionOS 26.0" --form-factor vision` | touch (unverified), `button home` |
 | Android phone | `simee create P --platform android --system-image "system-images;android-36;google_apis;arm64-v8a"` | touch, `button back\|home\|recents`, `type`, `rotate` |
 | Android tablet | the same image, `--form-factor tablet` | as phone, plus `stylus X Y [hover\|down\|move\|up\|leave]` or `stylus X Y --to X2 Y2` (a pen; [Tablets](#tablets)) |
-| Android foldable | the same image, `--form-factor foldable` | as phone, plus `fold <closed\|half-opened\|opened\|angle>` |
+| Android foldable | the same image, `--form-factor foldable` (a Pixel Fold) or `--device surface_duo` (a dual-screen) | as phone, plus `fold <fold\|unfold\|closed\|half-opened\|opened\|flipped\|tent\|angle>`; console `fold`, `unfold`, `posture <id>`, `fold status` |
 | Wear OS | `--system-image "system-images;android-34;android-wear;arm64-v8a"` | touch, `rotary <ticks>`, `button back\|home\|power` |
 | Android TV | `--system-image "system-images;android-34;google-tv;arm64-v8a"` | `button up\|down\|left\|right\|select\|back\|home` |
 | Automotive | `--system-image "system-images;android-34-ext9;android-automotive;arm64-v8a"` (API 34 and 35 Automotive images exist only at extension levels; `emu -provision 34 -tag android-automotive` picks `34-ext9`) | touch, `button back\|home`, `vehicle <property> [<value>]` (gear, speed, ignition, ...; unverified, see below) |
@@ -126,6 +127,67 @@ $ simee create T --platform android --system-image "system-images;android-34;and
 Error: system image `system-images;android-34;android-wear;arm64-v8a` (tag `android-wear`) boots Wear OS · Watch devices, not tablet
 ```
 
+## Foldables
+
+A new foldable AVD follows a device definition, with the `config.ini` keys avdmanager writes for
+it: `--form-factor foldable` is the SDK's Pixel Fold (`pixel_fold`: `hw.sensor.hinge.*`,
+`hw.sensor.posture_list`, the posture ranges, `hw.sensor.hinge.areas=1080-0-0-1840` and the
+1080×2092 outer screen as `hw.displayRegion.0.1.*`, checked key for key against
+`avdmanager create avd -d pixel_fold`), and `--device surface_duo` a dual-screen. The SDK has no
+dual-screen definition; that one uses Microsoft's published Surface Duo sizes (two 1350×1800
+screens either side of an 84 px hinge, 401 dpi), turns through 360° with stock's five postures,
+and shows its left screen when flipped. Both work with the SDK's `emulator` too: the keys are
+stock's own.
+
+The console takes stock's `fold` (to the AVD's fold posture,
+`hw.sensor.hinge.fold_to_displayRegion.0.1_at_posture`: a Pixel Fold shut, a dual-screen folded
+back), `unfold` (flat) and `posture <id>` (1 closed, 2 half-open, 3 open, 4 flipped, 5 tent), with
+stock's replies (`KO: Device is not foldable`, `KO: Posture 4 not supported`); `sensor set
+hinge-angle0` moves the posture too, and `fold status` (simee) reports the angle, posture, whether
+folded and the display size. `simee fold`, the API's `fold` and the desktop's Fold / Half open /
+Unfold buttons go through them.
+
+What the guest sees, as stock gives it:
+
+- **Pixel Fold images** (`DeviceStateOnBoot`, `DeviceSkinOverlay`) get the device states the
+  image ships for the AVD's device (`data/misc/pixel_fold/devicestate/`, sent at boot as
+  `androidboot.qemu.device_state`), so the guest follows the hinge sensor itself: `dumpsys
+  device_state` goes CLOSED, HALF_OPENED, OPENED with `fold`, `posture 2`, `unfold`. Once booted
+  the device's skin overlays are enabled (`com.android.internal.emulation.pixel_fold`, as stock
+  does), which give the framework the fold (`config_display_features` `fold-[1104,0,1104,1848]`)
+  and the posture of each device state, what Jetpack WindowManager's `FoldingFeature` is built
+  from. Folding shows Android's own "Swipe up to continue" over the app, as a real Pixel Fold does.
+- **Other foldables** (the dual-screen) get the `device_posture` and `display_features`
+  (`hinge-[1350,0,1434,1800]`) global settings on every posture change, as stock's
+  `sendPostureToSystem` writes them for Jetpack WindowManager's emulator support.
+
+Folded, the device shows its outer (or one) screen. Stock gives a Pixel Fold that screen as a
+second built-in display; simee's board has one display, so a folded device's display is forced to
+the folded screen's size (`wm size 1080x2092`, `1350x1800`), which the guest lays out for (an
+app's `screenWidthDp` becomes the outer screen's, `adb exec-out screencap` is 1080×2092), and
+readers of the scanout see only where the guest draws it: the display socket and `screenshot`
+stream 949×1840 for the Pixel Fold (the 1080×2092 screen at the inner screen's height) and
+1350×1800 for the dual-screen, and the desktop's view takes that shape. Touches on those frames
+(the display socket's, the desktop's) land on the folded screen. The API's `screen`, `tap`,
+`swipe` and `touch` are in the guest's layout instead (1080×2092, uiautomator's bounds): simee
+scales their points onto the frames, so a tap at an element's bounds hits it; a screenshot stays
+the 949×1840 frame. Unfolding resets the size, and so does stopping emu folded (`kill`, `adb emu
+kill`, SIGINT) before the guest goes, so the AVD boots under the stock emulator at its own size; a
+size emu couldn't reset (a crash) is recorded in `<avd>/simee/fold-wm-size` and reset at its next
+simee boot. A `wm size` simee didn't set is left alone.
+
+Checked on simee on 2026-11-26 (API 36 `google_apis` r7 image, Apple silicon host): a Pixel Fold
+AVD and a dual-screen AVD each booted, folded, half-opened, unfolded and rotated; Settings opened
+unfolded stayed in front through fold and unfold and was re-laid out for each screen; a tap on the
+folded frame opened Settings search. The AutoMobile harness passed on both (all but the audio
+tools, which reach a stock emulator's gRPC, and `deviceSnapshot`, which simee doesn't support),
+and its observe, tap, swipe, launch and button tools passed with each folded. Later the same day:
+folded, a `simee tap` at a Settings row's uiautomator bounds opened it, the harness passed folded
+(40 of 41 tools, all but `deviceSnapshot`; audio tools not run), and after `adb emu kill` or
+SIGINT folded the next boot's `wm size` had no override while a `wm size` set by hand survived a
+boot; `simee fold` folded, opened and unfolded a Pixel Fold AVD run by the stock emulator 37.2.13
+(its `dumpsys device_state` went CLOSED, OPENED).
+
 ## Tablets
 
 What a tablet has under the stock tools and under simee. The Android column for stock is read from
@@ -137,14 +199,14 @@ also compared on a running stock emulator (phone, tablet and Wear; `docs/referen
 | --- | --- | --- |
 | Android screen, density | `pixel_tablet`: 2560×1600 (landscape is its natural orientation), xhdpi | the same 2560×1600 at 320 dpi (`--form-factor tablet`) |
 | Android rotation | `rotate` turns the accelerometer's gravity; its window turns the screen to match | `rotate` turns the gravity and the guest rotates (checked: `ROTATION_270`, `adb screencap` 1600×2560), but simee's `screenshot` and the desktop show the panel unturned, so a rotated tablet's content lies sideways there ([Known gaps](#known-gaps)) |
-| Android stylus | every touch screen takes a pen on its own slot: `ABS_MT_TOOL_TYPE` pen, `MT_TOOL_MAX` with `BTN_TOOL_RUBBER` for the eraser, `BTN_STYLUS` for the barrel button, pressure, hover at zero pressure; sent through gRPC (`PenEvent`) | the same pen codes and pen slot on every touch screen, as stock has them on phones, tablets and Wear alike (`getevent -p` on both, 2026-11-26); `stylus` (API, CLI) and the console's `pen` send it; the desktop's Stylus button (tablets) makes the pointer a pen that hovers and draws. Checked on a Pixel Tablet-sized API 36 AVD: the guest lists the screen as `TOUCHSCREEN \| STYLUS`, a hovering pen reaches apps as `HOVER_ENTER`/`HOVER_MOVE`/`HOVER_EXIT` with tool type stylus (eraser: `ERASER`), a press with the button as `BUTTON_PRESS` with `BUTTON_STYLUS_PRIMARY`, and fingers stay `FINGER` after the pen; a finger held while the pen lifts stays touching, and so does a pen held while a finger lifts |
+| Android stylus | every touch screen takes a pen on its own slot: `ABS_MT_TOOL_TYPE` pen, `MT_TOOL_MAX` with `BTN_TOOL_RUBBER` for the eraser, `BTN_STYLUS` for the barrel button, pressure; sent through gRPC (`PenEvent`). A pen at zero pressure gets no tracking id, so the guest sees no hover (checked with `dumpsys input` on 37.2.13, `docs/reference/stock-board.md`) | the same pen codes and pen slot on every touch screen, as stock has them on phones, tablets and Wear alike (`getevent -p` on both, 2026-11-26); `stylus` (API, CLI) and the console's `pen` send it; the desktop's Stylus button (tablets) makes the pointer a pen that hovers and draws. Checked on a Pixel Tablet-sized API 36 AVD: the guest lists the screen as `TOUCHSCREEN \| STYLUS`, a hovering pen reaches apps as `HOVER_ENTER`/`HOVER_MOVE`/`HOVER_EXIT` with tool type stylus (eraser: `ERASER`), a press with the button as `BUTTON_PRESS` with `BUTTON_STYLUS_PRIMARY`, and fingers stay `FINGER` after the pen; a finger held while the pen lifts stays touching, and so does a pen held while a finger lifts |
 | Android mouse / trackpad | google_apis images enable neither `VirtioMouse` nor `VirtioTablet`, so stock gives a tablet no mouse device (a mouse device replaces the touch screen there); the host mouse is a finger | the same: the pointer is a finger, or the pen with the Stylus button |
 | Android hardware keyboard | `hw.keyboard=yes` (`qwerty2`) | the same |
 | Taskbar, split screen, freeform windows | the guest's own (large-screen launcher; split screen from the taskbar or recents; freeform behind the developer option) | the guest's own, unchanged. Checked on API 36: the 2560×1600 screen is `sw800dp xlrg land`; split screen (WMShell `splitscreen moveToSideStage`) put Settings and Clock side by side at 1270 and 1270 px; with `enable_freeform_support` a freeform Clock window opened at 776×1380 |
 | Desktop window | — | a landscape tablet's screen is shown shorter so the window stays within 1440 points (other form factors keep the full-height screen) |
 | iPad rotation, keyboard | Simulator.app's Rotate, hardware keyboard | `rotate [--orientation]`, `type`, `key`, `hardware_keyboard`. Checked on an iPad Pro 11-inch (M4), iOS 26.5: Safari turned to landscape and back, taps landed in the turned UI, and typing filled its address bar. Screenshots stay in the panel's portrait orientation, as `simctl io screenshot`'s do |
-| iPad multitasking gestures | Simulator.app's edge swipes (home, Dock, App Switcher) | not working: a swipe up from the bottom edge (`swipe`, 250 and 400 ms) stays in the app; `button home` goes home |
-| iPad pointer, Apple Pencil | Simulator.app can send the host pointer to the device (I/O › Input); what it offers for the Pencil wasn't checked | neither: simee has no pointer or Pencil HID messages yet |
+| iPad multitasking gestures | Simulator.app's edge swipes (home, Dock, App Switcher) | `swipe --edge bottom` (fast: home; slow or `--settle`: the app switcher), `--edge top` (Control Center, Notification Center); see [Apple inputs](#apple-inputs-and-carplay) |
+| iPad pointer, Apple Pencil | Simulator.app can send the host pointer to the device (I/O › Input); it has no Pencil input | `pointer` (hover, click, drag, both buttons) and `stylus` (Pencil taps and strokes, no pressure, tilt or hover); see [Apple inputs](#apple-inputs-and-carplay) |
 
 ## Apple inputs and CarPlay
 
@@ -164,6 +226,28 @@ without one fails that input with `Unavailable`, never a crash.
 - **iPhone and iPad**: `rotate` sends the GSEvent orientation message Simulator.app's Rotate
   Left/Right send, to SpringBoard's `PurpleWorkspacePort`; without `orientation` it turns 90°
   clockwise from the last orientation simee set.
+- **iPad**: `swipe --edge` (and `touch`'s `edge`) sets the edge flag Simulator.app sets on a
+  drag that starts on the bezel (`IndigoHIDMessageForMouseNSEvent`'s `IndigoHIDEdge`: top 1, left
+  2, bottom 3, right 4; SpringBoard logs them as `UIRectEdge` 1, 2, 4, 8). Without it a swipe from
+  the edge pixel is an ordinary touch: it scrolls or draws in the app and never goes home. From the
+  bottom a fast swipe goes home and a slow one (or `--settle`) opens the app switcher; from the top
+  left Notification Center, top right Control Center, top middle the iPadOS 26 menu bar. iPhones
+  take the same flag. `pointer` creates the guest's mouse service
+  (`IndigoHIDMessageToCreateMouseService`, whose message names the service's target) and sends it
+  relative motion and button events (event types `0x11` and `0x7a41`, the layout SimulatorKit's
+  `IndigoHIDMessageForPointerEventFromHIDEventRef` writes, built by `sim_core::indigo`); iPadOS
+  then shows its pointer (in screenshots too), hover effects and Trackpad & Mouse settings. Motion
+  is only relative, so each call homes the pointer against the left and bottom edges (never the top,
+  where iPadOS opens Notification or Control Center, nor a corner, which the rounded screen stops
+  short) and moves in 10 pt steps: exact on iOS 26.5, within ~20 pt on 27.2, whose pointer
+  accelerates even slow motion. `pointer --to` drags in one call; a button held by `pointer … down`
+  keeps the position for the next calls on the same server (`simee serve`) in the same boot. A
+  `down` that runs in its own process (no server) is refused, since nothing would release it, as
+  are an `up` with nothing held and a `move` or `up` after a failed call lost the held button
+  (`click`, `down` or a drag first lets go of both buttons and homes). `stylus` on an iPad sends a touch whose finger is a stylus (the guest's `SimulatorHID` copies
+  the transducer type into the `IOHIDEvent`), which apps see as `UITouch.type == .pencil` and
+  draw with. Checked on iPad Pro 13-inch (M5) clones on iOS 26.5 and 27.2 with a probe app that
+  logs every touch and hover, and with the AutoMobile harness.
 - **CarPlay**: `carplay on` writes the device's StarkConfig (`extended_display.plist`: 800×480 @2x,
   touch), sets the iPhone's TVOut screen to that mode with CarPlay properties (found through the
   framebuffer server's screen adapter; an already-on plain display is turned off first, or the
@@ -203,10 +287,13 @@ What is modelled and labelled but not (or not verifiably) working end to end:
 | CarPlay | Implemented as above but never run: no Mac was available. Whether `simctl io enumerate` then labels the screen "CarPlay" (what auto-mobile's CarPlay observe looks for, auto-mobile #18729) is unconfirmed. Only touch: the knob, back, home and Siri head-unit inputs aren't sent (auto-mobile #19059 is finding out whether SimulatorKit takes them). The desktop doesn't show the CarPlay screen. |
 | Android Automotive | simee serves the vehicle HAL channel (`qemud:car`, driven by `vehicle` / console `car`) and the virtio-snd card the car audio HAL needs, but no car image has been booted on them yet (checked offline against 34-ext9: [android.md](android.md#automotive)); EVS, the cluster display and the rotary controller aren't modelled ([android.md](android.md#automotive)). |
 | Android TV | `android-tv` 36 boots on simee with the virtio-snd card, as stock gives it (its ranchu audio HAL plays the UI sounds through ALSA card 0, like the phone images; [android.md](android.md#automotive)); the rest of this row is unchecked on a running TV image. Checked offline against `android-tv` 34 r3 (`emu -avd TV34 -dry-run` plus its unpacked ramdisk and vendor partition): the first-stage fstab addresses the board's slots (system at `a003600`, userdata `vdc`, metadata at `a003c00`), its first-stage modules are simee's devices, the vendor partition is the generic goldfish one (no HDMI-CEC or TV-input HAL), the `.idc` files match simee's input names, and every `button` key maps to its Android key in the `qwerty.kl` the guest uses. Its AVDs say `hw.screen=no-touch` like stock's, and simee then attaches no touch device, as stock doesn't; `tap`, `swipe` and console `touch` say so. |
+| Android foldable | Folded, a Pixel Fold's outer screen is the inner display forced to 1080×2092 and drawn at 949×1840 on the host (stock: a second 1080×2092 display, as on the device), so host frames of it are scaled by 0.88 and the image's own two-display layout (`display_layout_configuration.xml`, `REAR_DISPLAY_MODE`) isn't used. A dual-screen gets no device states (stock gives other foldables a lid-switch state machine and `wm folded-area` with a lid event; simee forces the size instead), and nothing masks its hinge. Jetpack WindowManager's `FoldingFeature` is configured as stock configures it (the overlays and settings above) but no app has read it on simee yet. The stock emulator itself wasn't run beside it: its behaviour is from its binary's strings, the image's files and avdmanager's output. |
 | Android XR | Not booted on simee yet. Checked offline against `google-xr` 34 r7: its fstab, modules and input `.idc` names match the board, and its features ask for what simee gives it (`GuestAngle`, `VirtioDualModeMouse`). It enables `VirtioSndCard`, so simee gives it the virtio-snd card as stock does; its ranchu audio HAL, the phones' one, plays through it (booted on phones, Wear and TV, not yet on XR). The room renders in the guest through gfxstream (simee already defaults to ANGLE), but stock's other XR feature flags (`XrModeUI`, `XrHandAndEyePointers`, `VirtioMouse`, `MultiDisplay`, `BluetoothEmulation`) have no simee equivalent yet. The dual-mode mouse matches stock's device (name, ids, event bits, axes); how the guest maps it to its hand ray and gaze pointers, and whether head pose, options, hand and eye events over `xr_service` take effect, is unverified. auto-mobile's `xrHeadsetInput` (auto-mobile #19076) sends hand and eye events over stock's gRPC `streamInputEvent`, which simee doesn't serve yet (its gRPC `EmulatorController` is on the roadmap); `xr hand`/`xr eye` put the same messages on the guest's pipe. The display glasses' temple touchpad (`hw.touchpad0`, 1542×297, which the `ai-glasses` image configures as `virtio_input_multi_touch_touchpad_0`) is attached and driven by `touchpad`, but how the guest's UI reacts to it is unverified. Only images that enable `VirtioDualModeMouse` (the headsets, not the glasses) get the dual-mode mouse, as on stock. |
 | Apple Watch, Apple TV | The crown, gestures, Siri Remote buttons and touch surface use the messages Simulator.app sends (confirmed live by other projects on watchOS/tvOS 26.5 and 27), but not run by simee. The crown's units per tick are a calibration. From Xcode 27 the guest can switch input to `dtuhidd` (once `com.apple.coredevice.dtuhidd.active` is set, e.g. by Device Hub), after which legacy HID buttons and keys are dropped; simee doesn't detect that yet. |
 | Vision Pro | Gaze, pinch and the camera (look around, pan, orbit) go through Xcode's visionOS UI plugin in Simulator.app, whose messages aren't public; simee sends plain touches, which no source confirms visionOS honours. auto-mobile can't script visionOS input either (auto-mobile #19055). |
+| iPad stylus (Apple Pencil) | Pressure, tilt, hover and the barrel (double-tap, squeeze) aren't reachable: the guest's `SimulatorHID` makes every touch with `IOHIDEventCreateDigitizerFingerEvent` and copies only position, the transducer type, radii and quality fields, so altitude and azimuth stay π/2 and 0; `UITouch.force` and `maximumPossibleForce` stay 0 because the screen's digitizer has no force (the iPad device types say `SupportsForceTouch` false; a pencil digitizer service, which backboardd looks for, isn't one Indigo can create), and Simulator.app's own pressure message (`IndigoHIDMessageForPressureEvent`) changes nothing on an iPad either. A contact in range but not touching makes no hover. Simulator.app has no Pencil input at all; the barrel gestures come from the Pencil's own accessory, which no HID message models. The simulator runtimes ship no Notes app, so drawing was checked in a probe app. |
+| iPad pointer | Positions are open loop (the guest takes relative motion only): ~20 pt off on iOS 27.2; turning off pointer acceleration in the guest's settings might make them exact (not tried). Pointer coordinates assume portrait. No scroll wheel or trackpad gestures yet (the guest also takes scroll and dock-swipe events). |
 | Android rotation (tablets, phones) | The guest rotates, but frames come from the panel as it lies, so after `rotate` simee's `screenshot`, the display stream and the desktop show the content turned 90° (`adb screencap` is upright); stock's window and screenshots follow its rotation. `tap`/`swipe` take panel pixels. A tablet's natural orientation is landscape, so it starts upright. |
-| iPad, Android tablet pointers | No mouse or trackpad is attached on either side (stock attaches none to google_apis tablets either); hover and right-click aren't available except as the Android stylus's hover and barrel button. |
+| Android tablet pointer | No mouse or trackpad is attached (stock attaches none to google_apis tablets either); hover and right-click aren't available except as the stylus's hover and barrel button. |
 | iOS rotation | Runtimes that report device motion can ignore the orientation event (idb switches to a vendor-defined HID message through `dtuhidd` there); not handled. |
 | Every Apple form factor | Needs a Mac with the runtime installed; none could be booted in the environment the combined project was built in. |

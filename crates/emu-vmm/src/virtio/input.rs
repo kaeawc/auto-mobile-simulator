@@ -1,10 +1,12 @@
 //! virtio-input (virtio 1.2 §5.8): evdev-style events from the host into the guest.
 //!
-//! Four device kinds: a multi-touch screen (INPUT_PROP_DIRECT, so Android treats it as a
-//! touchscreen), a keyboard (hardware keys incl. power/volume/back/home), a rotary encoder
-//! (REL_WHEEL, used by Wear OS) and the stock emulator's virtio dual-mode mouse (absolute and
-//! relative axes, mouse buttons; Android XR images expect it). Host code injects through an
-//! [`InputHandle`]. A touch screen also takes a stylus, as stock's do ([`PenState`]).
+//! Four device kinds: a multi-touch screen (stock's `virtio-input-multi-touch.c`: axes
+//! 0..=32767, no input properties; the images' `virtio_input_multi_touch_1.idc` makes it a touch
+//! screen, so its name must stay stock's), a
+//! keyboard (hardware keys incl. power/volume/back/home), a rotary encoder (REL_WHEEL, used by
+//! Wear OS) and the stock emulator's virtio dual-mode mouse (absolute and relative axes, mouse
+//! buttons; Android XR images expect it). Host code injects through an [`InputHandle`], in
+//! device pixels. A touch screen also takes a stylus, as stock's do ([`PenState`]).
 //!
 //! The keyboard looks like stock's (hw/input/virtio-input-hid.c): named `qwerty2` with ids
 //! 0627:0001, so the guest loads goldfish's `qwerty2.kl` (102 is HOME, 232 DPAD_CENTER, 580
@@ -47,9 +49,15 @@ pub const REL_X: u16 = 0x00;
 pub const REL_Y: u16 = 0x01;
 pub const REL_HWHEEL: u16 = 0x06;
 pub const REL_WHEEL: u16 = 0x08;
+pub const EV_SW: u16 = 0x05;
+pub const SW_LID: u16 = 0x00;
 pub const ABS_X: u16 = 0x00;
 pub const ABS_Y: u16 = 0x01;
+pub const ABS_Z: u16 = 0x02;
 pub const ABS_MT_SLOT: u16 = 0x2f;
+pub const ABS_MT_TOUCH_MAJOR: u16 = 0x30;
+pub const ABS_MT_TOUCH_MINOR: u16 = 0x31;
+pub const ABS_MT_ORIENTATION: u16 = 0x34;
 pub const ABS_MT_POSITION_X: u16 = 0x35;
 pub const ABS_MT_POSITION_Y: u16 = 0x36;
 pub const ABS_MT_TOOL_TYPE: u16 = 0x37;
@@ -64,11 +72,23 @@ pub const MT_TOOL_MAX: i32 = 0x0f;
 /// The stylus's slot and tracking id: the one after the fingers' (stock's `MTS_POINTER_PEN`), so
 /// a pen never takes a finger's contact.
 pub const PEN_SLOT: i32 = MAX_SLOTS as i32;
-/// Stock's pen pressure for a press without one (`MTS_PRESSURE_RANGE_MAX` is 0x400; simee's
-/// screens report 0..=0xff, so its touches' 0x81 stands in).
+/// Stock's pressure for a pen pressed without one (raw, on the 0..=[`SCREEN_PRESSURE_MAX`] axis).
 pub const PEN_PRESSURE: i32 = 0x81;
-/// The dual-mode mouse's absolute axes span 0..=32767 (stock `INPUT_EVENT_ABS_MAX`).
+/// A finger on the screen, as stock's mouse (its window, gRPC `sendMouse`) puts one down:
+/// full pressure and this touch size on both axes (stock 37.2.13, `getevent -lt`).
+pub const FINGER_PRESSURE: i32 = SCREEN_PRESSURE_MAX as i32;
+pub const FINGER_SIZE: i32 = 0x500;
+/// A finger on the touchpad: its pressure, and its tracking id (the screen's is its slot, 0).
+const PAD_PRESSURE: i32 = 0x81;
+const PAD_TRACKING_ID: i32 = 1;
+/// The dual-mode mouse's absolute axes and the touch screen's span 0..=32767 (stock
+/// `INPUT_EVENT_ABS_MAX`), whatever the display's size.
 pub const MOUSE_ABS_MAX: u32 = 0x7fff;
+pub const SCREEN_ABS_MAX: u32 = MOUSE_ABS_MAX;
+/// The touch screen's `ABS_MT_PRESSURE` max (stock's).
+pub const SCREEN_PRESSURE_MAX: u32 = 0x400;
+/// The touch screen's `ABS_MT_ORIENTATION` max (stock's, in degrees).
+pub const SCREEN_ORIENTATION_MAX: u32 = 90;
 /// The stock dual-mode mouse's name, which the guest matches on.
 pub const DUAL_MODE_MOUSE_NAME: &str = "QEMU Virtio Dual Mode Mouse";
 /// Buttons the stock dual-mode mouse declares (its `keymap_button`).
@@ -91,6 +111,8 @@ pub const TOUCHPAD_NAME: &str = "virtio_input_multi_touch_touchpad_0";
 const KEYBOARD_IDS: [u16; 4] = [0x06, 0x0627, 0x0001, 0x0001];
 /// Ids of the other devices.
 const OTHER_IDS: [u16; 4] = [0x06, 0x18d1, 0x0001, 0x0001];
+/// Stock's touch screens: BUS_VIRTUAL and no vendor, product or version.
+const SCREEN_IDS: [u16; 4] = [0x06, 0, 0, 0];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputEvent {
@@ -119,19 +141,72 @@ impl InputEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// A multi-touch surface in pixels. `pen`: it also takes a stylus, as stock's touch screens
-    /// do (`ABS_MT_TOOL_TYPE`, `BTN_TOOL_RUBBER`, `BTN_STYLUS` and a slot for the pen; see
-    /// [`PenState`]); the display glasses' touchpad doesn't.
+    /// A multi-touch surface of `width`×`height` pixels. `screen`: stock's touch screen
+    /// (`virtio-input-multi-touch.c`): axes 0..=[`SCREEN_ABS_MAX`] that host pixels are scaled
+    /// to, pressure 0..=[`SCREEN_PRESSURE_MAX`], touch size and orientation axes, `ABS_Z`,
+    /// `SW_LID`, no `BTN_TOUCH` and no input properties, and a stylus (`ABS_MT_TOOL_TYPE`,
+    /// `BTN_TOOL_RUBBER`, `BTN_STYLUS` and a slot for the pen; see [`PenState`]). Otherwise the
+    /// display glasses' touchpad: axes in its own units, `BTN_TOUCH`, pressure 0..=255,
+    /// `INPUT_PROP_DIRECT`, no pen.
     Touch {
         width: u32,
         height: u32,
-        pen: bool,
+        screen: bool,
     },
     Keyboard,
     Rotary,
     /// `virtio-dual-mode-mouse` (stock `hw/input/virtio-input-hid.c`): absolute X/Y, relative
     /// X/Y and both wheels, the mouse buttons. Named [`DUAL_MODE_MOUSE_NAME`].
     DualModeMouse,
+}
+
+impl Kind {
+    /// A position in device pixels as this device's axis values. The screen's span
+    /// 0..=[`SCREEN_ABS_MAX`]; Android maps a raw value `r` to `r × size / 32768` pixels, so `p`
+    /// goes to the smallest `r` at or past `p`: the guest's position is `p` plus under a pixel,
+    /// and lands on pixel `p` (any other device: unchanged).
+    pub fn axis(self, x: i32, y: i32) -> (i32, i32) {
+        match self {
+            Kind::Touch { width, height, screen: true } => (to_axis(x, width), to_axis(y, height)),
+            _ => (x, y),
+        }
+    }
+
+    /// What this device's contacts send (see [`Contact`]).
+    fn contact(self) -> Contact {
+        Contact { screen: matches!(self, Kind::Touch { screen: true, .. }) }
+    }
+}
+
+/// `p` pixels of `size` on a 0..=[`SCREEN_ABS_MAX`] axis (see [`Kind::axis`]).
+fn to_axis(p: i32, size: u32) -> i32 {
+    if size == 0 {
+        return 0;
+    }
+    let span = u64::from(SCREEN_ABS_MAX) + 1;
+    let r = (u64::from(p.max(0).unsigned_abs()) * span).div_ceil(u64::from(size));
+    r.min(u64::from(SCREEN_ABS_MAX)) as i32
+}
+
+/// How a touch device's contacts look on the wire: stock's screen's, or the touchpad's.
+///
+/// Stock's screen (`getevent -lt` on 37.2.13): a finger's down is its tracking id (its slot),
+/// position, pressure and touch size; a move only the position that changed; a lift zero
+/// pressure, then tracking id -1. No `BTN_TOUCH`, so Android reads a slot in use with zero
+/// pressure as hovering, any other as touching, and no single-touch `ABS_X`/`ABS_Y` (Android's
+/// multi-touch mapper reads only the slots). The touchpad's are simee's own: `BTN_TOUCH`, the
+/// single-touch axes beside the slot's, pressure 0..=255.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Contact {
+    screen: bool,
+}
+
+impl Contact {
+    /// A host's pressure (1..=255, as the console's `pen` takes) on this device's pressure axis,
+    /// rounded.
+    fn pressure(self, p: i32) -> i32 {
+        if self.screen { (p * SCREEN_PRESSURE_MAX as i32 + 127) / 255 } else { p }
+    }
 }
 
 enum Msg {
@@ -151,34 +226,29 @@ enum Msg {
 
 /// The stylus as the queued events leave it. Stock's pen protocol (`multitouch-screen.c`): its
 /// own slot ([`PEN_SLOT`]), `ABS_MT_TOOL_TYPE` pen, or `MT_TOOL_MAX` with `BTN_TOOL_RUBBER` for
-/// the eraser, the barrel button as `BTN_STYLUS`, and the changed axes on a move. simee's screens
-/// also advertise `BTN_TOUCH`, so contact is `BTN_TOUCH` (and pressure): a pen in range that
-/// isn't touching is hovering, which Android reports as hover events from a stylus.
-/// `BTN_TOUCH` is one key for the whole screen, so the pen clears it only while no finger is down
-/// (and the finger only while the pen isn't touching): the contact still down keeps reading as
-/// touching, and a pen lifted beside a finger hovers by its zero pressure.
+/// the eraser, the barrel button as `BTN_STYLUS`, and the changed axes on a move. Contact is
+/// pressure alone (the screen has no `BTN_TOUCH`): a pen in range with none is hovering, which
+/// Android reports as hover events from a stylus, and a finger's contact is its own slot's.
 #[derive(Default)]
 struct PenState {
     in_range: bool,
     touching: bool,
     x: i32,
     y: i32,
+    /// On the device's axis ([`Contact::pressure`]).
     pressure: i32,
     button: bool,
     eraser: bool,
 }
 
 impl PenState {
-    /// The batch for a sample; `None` when nothing changes (a leave while out of range, a
-    /// repeated sample). `finger_down`: a finger touches the screen too.
-    fn batch(&mut self, s: &PenSample, finger_down: bool) -> Option<Batch> {
+    /// The batch for a sample (its position already on the device's axes); `None` when nothing
+    /// changes (a leave while out of range, a repeated sample).
+    fn batch(&mut self, s: &PenSample, c: Contact) -> Option<Batch> {
         let mut ev = vec![InputEvent::new(EV_ABS, ABS_MT_SLOT, PEN_SLOT)];
         // A leave, or the other end of the pen: the contact ends.
         if self.in_range && (s.phase == PenPhase::Leave || s.eraser != self.eraser) {
             ev.push(InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 0));
-            if self.touching && !finger_down {
-                ev.push(InputEvent::new(EV_KEY, BTN_TOUCH, 0));
-            }
             if self.eraser {
                 ev.push(InputEvent::new(EV_KEY, BTN_TOOL_RUBBER, 0));
             }
@@ -199,7 +269,7 @@ impl PenState {
         };
         // Touching without a pressure keeps the one it has (a press's default to begin with).
         let kept = if self.touching { self.pressure } else { PEN_PRESSURE };
-        let pressure = if touching { s.pressure.map_or(kept, i32::from) } else { 0 };
+        let pressure = if touching { s.pressure.map_or(kept, |p| c.pressure(i32::from(p)).max(1)) } else { 0 };
         let start = ev.len();
         if !self.in_range {
             if start > 1 {
@@ -218,9 +288,6 @@ impl PenState {
             if s.button {
                 ev.push(InputEvent::new(EV_KEY, BTN_STYLUS, 1));
             }
-            if touching {
-                ev.push(InputEvent::new(EV_KEY, BTN_TOUCH, 1));
-            }
         } else {
             if s.x != self.x {
                 ev.push(InputEvent::new(EV_ABS, ABS_MT_POSITION_X, s.x));
@@ -233,9 +300,6 @@ impl PenState {
             }
             if s.button != self.button {
                 ev.push(InputEvent::new(EV_KEY, BTN_STYLUS, i32::from(s.button)));
-            }
-            if touching != self.touching && (touching || !finger_down) {
-                ev.push(InputEvent::new(EV_KEY, BTN_TOUCH, i32::from(touching)));
             }
         }
         *self = PenState { in_range: true, touching, x: s.x, y: s.y, pressure, button: s.button, eraser: s.eraser };
@@ -271,18 +335,22 @@ struct TouchState {
 }
 
 impl TouchState {
-    /// The batch for a touch: the full set on a down (or when the state isn't known), the axes
-    /// that changed on a move (none when nothing did), the lift on an up, which leaves
-    /// `BTN_TOUCH` set while `pen_touching` (see [`PenState`]).
-    fn batch(&mut self, x: i32, y: i32, down: bool, pen_touching: bool) -> Option<Batch> {
+    /// The batch for a touch (at the device's axis values): the full set on a down (or when the
+    /// state isn't known), the axes that changed on a move (none when nothing did), the lift on
+    /// an up; `BTN_TOUCH` with the down and the up where the device has it.
+    fn batch(&mut self, x: i32, y: i32, down: bool, c: Contact) -> Option<Batch> {
         let batch = |events: Vec<InputEvent>, move_from| Some(Batch { events, sent: 0, move_from });
+        let abs = |code, value| InputEvent::new(EV_ABS, code, value);
         if !down {
-            let mut ev = Vec::with_capacity(4);
+            let mut ev = Vec::with_capacity(5);
             if !self.known {
-                ev.push(InputEvent::new(EV_ABS, ABS_MT_SLOT, 0));
+                ev.push(abs(ABS_MT_SLOT, 0));
             }
-            ev.push(InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, -1));
-            if !pen_touching {
+            if c.screen {
+                ev.push(abs(ABS_MT_PRESSURE, 0));
+            }
+            ev.push(abs(ABS_MT_TRACKING_ID, -1));
+            if !c.screen {
                 ev.push(InputEvent::new(EV_KEY, BTN_TOUCH, 0));
             }
             ev.push(InputEvent::syn());
@@ -292,24 +360,35 @@ impl TouchState {
         if self.known && self.down {
             let from = (self.x, self.y);
             (self.x, self.y) = (x, y);
-            let ev = move_events(from, (x, y));
+            let ev = move_events(from, (x, y), c);
             return if ev.is_empty() { None } else { batch(ev, Some(from)) };
         }
         (self.known, self.down, self.x, self.y) = (true, true, x, y);
-        batch(
+        let ev = if c.screen {
             vec![
-                InputEvent::new(EV_ABS, ABS_MT_SLOT, 0),
-                InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, 1),
-                InputEvent::new(EV_ABS, ABS_MT_POSITION_X, x),
-                InputEvent::new(EV_ABS, ABS_MT_POSITION_Y, y),
-                InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 0x81),
-                InputEvent::new(EV_KEY, BTN_TOUCH, 1),
-                InputEvent::new(EV_ABS, ABS_X, x),
-                InputEvent::new(EV_ABS, ABS_Y, y),
+                abs(ABS_MT_SLOT, 0),
+                abs(ABS_MT_TRACKING_ID, 0),
+                abs(ABS_MT_POSITION_X, x),
+                abs(ABS_MT_POSITION_Y, y),
+                abs(ABS_MT_PRESSURE, FINGER_PRESSURE),
+                abs(ABS_MT_TOUCH_MAJOR, FINGER_SIZE),
+                abs(ABS_MT_TOUCH_MINOR, FINGER_SIZE),
                 InputEvent::syn(),
-            ],
-            None,
-        )
+            ]
+        } else {
+            vec![
+                abs(ABS_MT_SLOT, 0),
+                abs(ABS_MT_TRACKING_ID, PAD_TRACKING_ID),
+                abs(ABS_MT_POSITION_X, x),
+                abs(ABS_MT_POSITION_Y, y),
+                abs(ABS_MT_PRESSURE, PAD_PRESSURE),
+                InputEvent::new(EV_KEY, BTN_TOUCH, 1),
+                abs(ABS_X, x),
+                abs(ABS_Y, y),
+                InputEvent::syn(),
+            ]
+        };
+        batch(ev, None)
     }
 
     /// Raw events for this device: if they set any axis or `BTN_TOUCH`, the kernel's slot state
@@ -321,9 +400,9 @@ impl TouchState {
     }
 }
 
-/// What a move from `from` to `to` sends: the multi-touch position and the single-touch axes
-/// that changed, then `SYN_REPORT`; nothing when neither did.
-fn move_events(from: (i32, i32), to: (i32, i32)) -> Vec<InputEvent> {
+/// What a move from `from` to `to` sends: the multi-touch position that changed (and on the
+/// touchpad its single-touch axis), then `SYN_REPORT`; nothing when neither did.
+fn move_events(from: (i32, i32), to: (i32, i32), c: Contact) -> Vec<InputEvent> {
     let (dx, dy) = (from.0 != to.0, from.1 != to.1);
     if !dx && !dy {
         return Vec::new();
@@ -335,10 +414,10 @@ fn move_events(from: (i32, i32), to: (i32, i32)) -> Vec<InputEvent> {
     if dy {
         ev.push(InputEvent::new(EV_ABS, ABS_MT_POSITION_Y, to.1));
     }
-    if dx {
+    if !c.screen && dx {
         ev.push(InputEvent::new(EV_ABS, ABS_X, to.0));
     }
-    if dy {
+    if !c.screen && dy {
         ev.push(InputEvent::new(EV_ABS, ABS_Y, to.1));
     }
     ev.push(InputEvent::syn());
@@ -362,12 +441,14 @@ impl InputHandle {
     /// already down this is a move: it sends only the axes that changed, and replaces an older
     /// move the guest hasn't started taking yet (downs, ups and keys are never dropped).
     pub fn touch(&self, x: i32, y: i32, down: bool) {
+        let (x, y) = self.kind.axis(x, y);
         let _ = self.tx.send(Msg::Touch { x, y, down });
     }
 
-    /// One stylus sample at device pixels (a touch screen made with `pen`; see [`PenState`]).
+    /// One stylus sample at device pixels (a touch screen; see [`PenState`]).
     pub fn pen(&self, sample: PenSample) {
-        let _ = self.tx.send(Msg::Pen(sample));
+        let (x, y) = self.kind.axis(sample.x, sample.y);
+        let _ = self.tx.send(Msg::Pen(PenSample { x, y, ..sample }));
     }
 
     /// Press and release a key (Linux keycode).
@@ -407,15 +488,15 @@ impl Input {
     /// as the host sent them: what an input would deliver, for tests and diagnostics.
     pub fn take_queued(&self) -> Vec<Vec<InputEvent>> {
         let Some(rx) = &self.rx else { return Vec::new() };
-        let (mut touch, mut pen) = (TouchState::default(), PenState::default());
+        let (mut touch, mut pen, c) = (TouchState::default(), PenState::default(), self.kind.contact());
         rx.try_iter()
             .filter_map(|m| match m {
                 Msg::Events(e) => {
                     touch.raw(&e);
                     Some(e)
                 }
-                Msg::Touch { x, y, down } => touch.batch(x, y, down, pen.touching).map(|b| b.events),
-                Msg::Pen(s) => pen.batch(&s, touch.down).map(|b| {
+                Msg::Touch { x, y, down } => touch.batch(x, y, down, c).map(|b| b.events),
+                Msg::Pen(s) => pen.batch(&s, c).map(|b| {
                     touch.raw(&b.events);
                     b.events
                 }),
@@ -448,22 +529,21 @@ impl Input {
             }
         };
         match (self.kind, u16::from(typ)) {
-            (Kind::Touch { pen, .. }, EV_KEY) => {
-                set(BTN_TOUCH);
-                // Stock's touch screens: the eraser end and the barrel button.
-                if pen {
-                    set(BTN_TOOL_RUBBER);
-                    set(BTN_STYLUS);
-                }
-            }
-            (Kind::Touch { pen, .. }, EV_ABS) => {
+            // Stock's touch screens: the pen's eraser end and barrel button, no BTN_TOUCH.
+            (Kind::Touch { screen: true, .. }, EV_KEY) => [BTN_TOOL_RUBBER, BTN_STYLUS].into_iter().for_each(&mut set),
+            (Kind::Touch { screen: false, .. }, EV_KEY) => set(BTN_TOUCH),
+            (Kind::Touch { screen, .. }, EV_ABS) => {
                 for c in [ABS_X, ABS_Y, ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID, ABS_MT_PRESSURE] {
                     set(c);
                 }
-                if pen {
-                    set(ABS_MT_TOOL_TYPE);
+                if screen {
+                    for c in [ABS_Z, ABS_MT_TOUCH_MAJOR, ABS_MT_TOUCH_MINOR, ABS_MT_ORIENTATION, ABS_MT_TOOL_TYPE] {
+                        set(c);
+                    }
                 }
             }
+            // Stock's screens have a lid switch, open: Android's lid state is open, not absent.
+            (Kind::Touch { screen: true, .. }, EV_SW) => set(SW_LID),
             (Kind::Keyboard, EV_KEY) => {
                 for c in (0..1024u16).filter(|&c| keyboard_has(c)) {
                     set(c);
@@ -483,13 +563,18 @@ impl Input {
 
     fn abs_info(&self, axis: u8) -> Vec<u8> {
         let (min, max) = match (self.kind, u16::from(axis)) {
+            (Kind::Touch { screen: true, .. }, ABS_X | ABS_Y | ABS_MT_POSITION_X | ABS_MT_POSITION_Y) => (0, SCREEN_ABS_MAX),
             (Kind::Touch { width, .. }, ABS_X | ABS_MT_POSITION_X) => (0, width.saturating_sub(1)),
             (Kind::Touch { height, .. }, ABS_Y | ABS_MT_POSITION_Y) => (0, height.saturating_sub(1)),
+            (Kind::Touch { screen: true, .. }, ABS_Z) => (0, 1),
+            (Kind::Touch { screen: true, .. }, ABS_MT_TOUCH_MAJOR | ABS_MT_TOUCH_MINOR) => (0, i32::MAX as u32),
+            (Kind::Touch { screen: true, .. }, ABS_MT_ORIENTATION) => (0, SCREEN_ORIENTATION_MAX),
             // The pen's slot comes after the fingers' (stock's slot range is 0..=10 too).
-            (Kind::Touch { pen: true, .. }, ABS_MT_SLOT) => (0, PEN_SLOT as u32),
+            (Kind::Touch { screen: true, .. }, ABS_MT_SLOT) => (0, PEN_SLOT as u32),
             (Kind::Touch { .. }, ABS_MT_SLOT) => (0, MAX_SLOTS - 1),
-            (Kind::Touch { pen: true, .. }, ABS_MT_TOOL_TYPE) => (0, MT_TOOL_MAX as u32),
+            (Kind::Touch { screen: true, .. }, ABS_MT_TOOL_TYPE) => (0, MT_TOOL_MAX as u32),
             (Kind::Touch { .. }, ABS_MT_TRACKING_ID) => (0, 0xffff),
+            (Kind::Touch { screen: true, .. }, ABS_MT_PRESSURE) => (0, SCREEN_PRESSURE_MAX),
             (Kind::Touch { .. }, ABS_MT_PRESSURE) => (0, 0xff),
             (Kind::DualModeMouse, ABS_X | ABS_Y) => (0, MOUSE_ABS_MAX),
             _ => return Vec::new(),
@@ -506,6 +591,7 @@ impl Input {
             // ids: QEMU's USB HID vendor and the product numbers their guest drivers bind to.
             CFG_ID_DEVIDS => match self.kind {
                 Kind::Keyboard => KEYBOARD_IDS,
+                Kind::Touch { screen: true, .. } => SCREEN_IDS,
                 Kind::DualModeMouse => [BUS_VIRTUAL, 0x0627, 0x0004, 0x0001],
                 _ => OTHER_IDS,
             }
@@ -513,7 +599,10 @@ impl Input {
             .flat_map(|v| v.to_le_bytes())
             .collect(),
             CFG_PROP_BITS => match self.kind {
-                Kind::Touch { .. } => vec![1 << INPUT_PROP_DIRECT],
+                // Stock's screen has none. Without INPUT_PROP_DIRECT Android would make it a
+                // pointer; the image's `virtio_input_multi_touch_1.idc` (`touch.deviceType =
+                // touchScreen`, matched by the device name) is what makes it a touch screen.
+                Kind::Touch { screen: false, .. } => vec![1 << INPUT_PROP_DIRECT],
                 _ => Vec::new(),
             },
             CFG_EV_BITS => self.ev_bits(sub),
@@ -571,7 +660,7 @@ impl VirtioDevice for Input {
         self.stop_worker();
         let rx = self.rx.take().ok_or("input worker receiver missing")?;
         let event_idx = act.features & F_RING_EVENT_IDX != 0;
-        let w = Worker::new(act.mem, act.irq, Queue::new(eventq, event_idx), statusq.map(|q| Queue::new(q, event_idx)));
+        let w = Worker::new(act.mem, act.irq, Queue::new(eventq, event_idx), statusq.map(|q| Queue::new(q, event_idx)), self.kind);
         let h = std::thread::Builder::new()
             .name(format!("input-{}", self.name))
             .spawn(move || {
@@ -602,13 +691,15 @@ struct Worker {
     queued: usize,
     touch: TouchState,
     pen: PenState,
+    contact: Contact,
 }
 
 impl Worker {
     const MAX_PENDING: usize = 4096;
 
-    fn new(mem: Arc<GuestRam>, irq: Arc<Interrupt>, eventq: Queue, statusq: Option<Queue>) -> Worker {
-        Worker { mem, irq, eventq, statusq, pending: VecDeque::new(), queued: 0, touch: TouchState::default(), pen: PenState::default() }
+    fn new(mem: Arc<GuestRam>, irq: Arc<Interrupt>, eventq: Queue, statusq: Option<Queue>, kind: Kind) -> Worker {
+        let (touch, pen, contact) = (TouchState::default(), PenState::default(), kind.contact());
+        Worker { mem, irq, eventq, statusq, pending: VecDeque::new(), queued: 0, touch, pen, contact }
     }
 
     /// Handles messages until `Stop` (or every sender is gone), taking everything already
@@ -637,12 +728,12 @@ impl Worker {
                 self.push(Batch { events, sent: 0, move_from: None });
             }
             Msg::Touch { x, y, down } => {
-                if let Some(b) = self.touch.batch(x, y, down, self.pen.touching) {
+                if let Some(b) = self.touch.batch(x, y, down, self.contact) {
                     self.push(b);
                 }
             }
             Msg::Pen(s) => {
-                if let Some(b) = self.pen.batch(&s, self.touch.down) {
+                if let Some(b) = self.pen.batch(&s, self.contact) {
                     // The pen selects its own slot: the finger's next batch selects slot 0 again.
                     self.touch.raw(&b.events);
                     self.push(b);
@@ -664,7 +755,7 @@ impl Worker {
             self.queued -= last.events.len();
             self.pending.pop_back();
             // The touch state is where this move ends.
-            b.events = move_events(from, (self.touch.x, self.touch.y));
+            b.events = move_events(from, (self.touch.x, self.touch.y), self.contact);
             if b.events.is_empty() {
                 return; // back where the older move started: nothing to send
             }
@@ -753,42 +844,122 @@ mod tests {
     }
 
     #[test]
-    fn touch_config_describes_a_direct_multitouch_screen() {
-        let (mut dev, _h) = Input::new(Kind::Touch { width: 1080, height: 2400, pen: false }, "virtio_input_multi_touch_1");
-        assert_eq!(cfg(&mut dev, CFG_ID_NAME, 0), b"virtio_input_multi_touch_1");
+    fn touchpads_keep_their_units_btn_touch_and_direct() {
+        let (mut dev, h) = Input::new(Kind::Touch { width: 1542, height: 297, screen: false }, TOUCHPAD_NAME);
+        assert_eq!(cfg(&mut dev, CFG_ID_NAME, 0), TOUCHPAD_NAME.as_bytes());
         assert_eq!(cfg(&mut dev, CFG_PROP_BITS, 0), vec![1 << INPUT_PROP_DIRECT]);
         let abs = cfg(&mut dev, CFG_EV_BITS, EV_ABS as u8);
-        assert!(abs[(ABS_MT_POSITION_X / 8) as usize] & (1 << (ABS_MT_POSITION_X % 8)) != 0);
+        assert!(has(&abs, ABS_MT_POSITION_X));
         let info = cfg(&mut dev, CFG_ABS_INFO, ABS_MT_POSITION_Y as u8);
-        assert_eq!(u32::from_le_bytes([info[4], info[5], info[6], info[7]]), 2399);
+        assert_eq!(u32::from_le_bytes([info[4], info[5], info[6], info[7]]), 296);
         assert!(cfg(&mut dev, CFG_EV_BITS, EV_REL as u8).is_empty());
+        assert!(cfg(&mut dev, CFG_EV_BITS, EV_SW as u8).is_empty());
+        let keys = cfg(&mut dev, CFG_EV_BITS, EV_KEY as u8);
+        assert_eq!((0..1024u16).filter(|&c| has(&keys, c)).collect::<Vec<_>>(), [BTN_TOUCH]);
         // No pen: no tool type, the fingers' ten slots.
-        let has = |bits: &[u8], code: u16| bits.get(code as usize / 8).is_some_and(|b| b & (1 << (code % 8)) != 0);
-        assert!(!has(&abs, ABS_MT_TOOL_TYPE));
+        assert!(!has(&abs, ABS_MT_TOOL_TYPE) && !has(&abs, ABS_MT_TOUCH_MAJOR));
         let slot = cfg(&mut dev, CFG_ABS_INFO, ABS_MT_SLOT as u8);
         assert_eq!(u32::from_le_bytes([slot[4], slot[5], slot[6], slot[7]]), MAX_SLOTS - 1);
+        // Touches go as they come, with BTN_TOUCH.
+        h.touch(900, 150, true);
+        h.touch(900, 150, false);
+        let b = dev.take_queued();
+        assert!(b[0].contains(&InputEvent::new(EV_ABS, ABS_MT_POSITION_X, 900)) && b[0].contains(&InputEvent::new(EV_KEY, BTN_TOUCH, 1)));
+        assert!(b[1].contains(&InputEvent::new(EV_KEY, BTN_TOUCH, 0)));
     }
 
-    /// Stock's touch screens (`virtio-input-multi-touch.c`) advertise the pen's tool type, the
-    /// eraser and the barrel button, and one slot past the fingers' for the pen.
+    /// Stock 37.2.13's `virtio_input_multi_touch_1` (`getevent -p` on the phone, tablet and
+    /// Wear AVDs): the pen's eraser and barrel keys and no `BTN_TOUCH`; axes 0..=32767 whatever
+    /// the display, `ABS_Z` 0..=1, touch size 0..=i32::MAX, orientation 0..=90, slots 0..=10,
+    /// tool type 0..=15, pressure 0..=1024; `SW_LID`; no input properties; no ids.
     #[test]
-    fn pen_screens_advertise_stocks_stylus_codes() {
-        let (mut dev, _h) = Input::new(Kind::Touch { width: 2560, height: 1600, pen: true }, "virtio_input_multi_touch_1");
-        let has = |bits: &[u8], code: u16| bits.get(code as usize / 8).is_some_and(|b| b & (1 << (code % 8)) != 0);
-        let keys = cfg(&mut dev, CFG_EV_BITS, EV_KEY as u8);
-        for k in [BTN_TOUCH, BTN_TOOL_RUBBER, BTN_STYLUS] {
-            assert!(has(&keys, k), "{k:#x}");
+    fn screens_look_like_stocks_virtio_multi_touch() {
+        for (w, h) in [(720, 1280), (2560, 1600), (454, 454)] {
+            let (mut dev, _h) = Input::new(Kind::Touch { width: w, height: h, screen: true }, "virtio_input_multi_touch_1");
+            let set = |bits: Vec<u8>| (0..1024u16).filter(|&c| has(&bits, c)).collect::<Vec<_>>();
+            assert_eq!(set(cfg(&mut dev, CFG_EV_BITS, EV_KEY as u8)), [BTN_TOOL_RUBBER, BTN_STYLUS]);
+            let max = |info: Vec<u8>| {
+                (u32::from_le_bytes([info[0], info[1], info[2], info[3]]), u32::from_le_bytes([info[4], info[5], info[6], info[7]]))
+            };
+            let stock: [(u16, u32); 12] = [
+                (ABS_X, 32767),
+                (ABS_Y, 32767),
+                (ABS_Z, 1),
+                (ABS_MT_SLOT, 10),
+                (ABS_MT_TOUCH_MAJOR, i32::MAX as u32),
+                (ABS_MT_TOUCH_MINOR, i32::MAX as u32),
+                (ABS_MT_ORIENTATION, 90),
+                (ABS_MT_POSITION_X, 32767),
+                (ABS_MT_POSITION_Y, 32767),
+                (ABS_MT_TOOL_TYPE, 15),
+                (ABS_MT_TRACKING_ID, 65535),
+                (ABS_MT_PRESSURE, 1024),
+            ];
+            assert_eq!(set(cfg(&mut dev, CFG_EV_BITS, EV_ABS as u8)), stock.map(|(c, _)| c));
+            for (axis, m) in stock {
+                assert_eq!(max(cfg(&mut dev, CFG_ABS_INFO, axis as u8)), (0, m), "{axis:#x}");
+            }
+            assert_eq!(set(cfg(&mut dev, CFG_EV_BITS, EV_SW as u8)), [SW_LID]);
+            assert!(cfg(&mut dev, CFG_EV_BITS, EV_REL as u8).is_empty());
+            assert!(cfg(&mut dev, CFG_PROP_BITS, 0).is_empty(), "no INPUT_PROP_DIRECT");
+            assert_eq!(cfg(&mut dev, CFG_ID_DEVIDS, 0), [0x06, 0, 0, 0, 0, 0, 0, 0]);
         }
-        assert!(has(&cfg(&mut dev, CFG_EV_BITS, EV_ABS as u8), ABS_MT_TOOL_TYPE));
-        let max = |info: Vec<u8>| u32::from_le_bytes([info[4], info[5], info[6], info[7]]);
-        assert_eq!(max(cfg(&mut dev, CFG_ABS_INFO, ABS_MT_SLOT as u8)), 10);
-        assert_eq!(max(cfg(&mut dev, CFG_ABS_INFO, ABS_MT_TOOL_TYPE as u8)), 15);
+    }
+
+    /// Android maps a raw `r` on a 0..=32767 axis to `r × size / 32768` pixels: every pixel of
+    /// every reference screen comes back as itself (plus under a pixel), in order.
+    #[test]
+    fn screen_pixels_land_on_the_same_pixel() {
+        for size in [297u32, 454, 720, 1080, 1280, 1600, 1840, 2092, 2208, 2400, 2560, 32768] {
+            let mut last = -1;
+            for p in 0..size as i32 {
+                let r = to_axis(p, size);
+                assert!(r > last && r <= SCREEN_ABS_MAX as i32, "{p} of {size}: {r}");
+                let guest = f64::from(r) * f64::from(size) / 32768.0;
+                assert!(guest >= f64::from(p) && guest < f64::from(p) + 1.0, "{p} of {size}: {r} maps to {guest}");
+                last = r;
+            }
+        }
+        assert_eq!((to_axis(-5, 720), to_axis(720, 720), to_axis(5000, 720)), (0, 32767, 32767), "off the screen: clamped");
+        assert_eq!(to_axis(10, 0), 0);
+        let screen = Kind::Touch { width: 2560, height: 1600, screen: true };
+        assert_eq!((screen.axis(0, 0), screen.axis(1280, 800), screen.axis(2559, 1599)), ((0, 0), (16384, 16384), (32756, 32748)));
+        assert_eq!(Kind::Touch { width: 1542, height: 297, screen: false }.axis(900, 150), (900, 150));
+        assert_eq!(Kind::DualModeMouse.axis(7, 8), (7, 8));
+    }
+
+    #[test]
+    fn screen_touches_scale_and_carry_no_btn_touch() {
+        let (dev, h) = Input::new(Kind::Touch { width: 720, height: 1280, screen: true }, "t");
+        h.touch(360, 640, true);
+        h.touch(361, 640, true);
+        h.touch(361, 640, false);
+        let abs = |c: u16, v: i32| InputEvent::new(EV_ABS, c, v);
+        assert_eq!(
+            dev.take_queued(),
+            [
+                // Stock's mouse down: tracking id (the slot), position, full pressure, touch size.
+                vec![
+                    abs(ABS_MT_SLOT, 0),
+                    abs(ABS_MT_TRACKING_ID, 0),
+                    abs(ABS_MT_POSITION_X, 16384),
+                    abs(ABS_MT_POSITION_Y, 16384),
+                    abs(ABS_MT_PRESSURE, 1024),
+                    abs(ABS_MT_TOUCH_MAJOR, 0x500),
+                    abs(ABS_MT_TOUCH_MINOR, 0x500),
+                    InputEvent::syn()
+                ],
+                // The position that changed, no single-touch axes; the lift zeroes the pressure.
+                vec![abs(ABS_MT_POSITION_X, 16430), InputEvent::syn()],
+                vec![abs(ABS_MT_PRESSURE, 0), abs(ABS_MT_TRACKING_ID, -1), InputEvent::syn()],
+            ]
+        );
     }
 
     #[test]
     fn a_pen_hovers_touches_and_leaves_on_its_own_slot() {
         use sim_core::stylus::{PenPhase::*, PenSample};
-        let (dev, h) = Input::new(Kind::Touch { width: 2560, height: 1600, pen: true }, "t");
+        let (dev, h) = Input::new(Kind::Touch { width: 2560, height: 1600, screen: true }, "t");
         let s = |x, y, phase| PenSample::new(x, y, phase);
         h.pen(s(10, 20, Hover));
         h.pen(s(10, 20, Hover)); // nothing changed: nothing sent
@@ -799,38 +970,46 @@ mod tests {
         h.pen(s(30, 20, Leave)); // out of range already
         let b = dev.take_queued();
         let abs = |c: u16, v: i32| InputEvent::new(EV_ABS, c, v);
-        let key = |c: u16, v: i32| InputEvent::new(EV_KEY, c, v);
         let slot = abs(ABS_MT_SLOT, PEN_SLOT);
+        // Pixels on stock's axes (10 of 2560 is 128, 20 of 1600 is 410, 30 is 384); the
+        // console's pressure 50 of 255 is 201 of 1024; contact is pressure alone.
         assert_eq!(
             b,
             [
                 vec![
                     slot,
                     abs(ABS_MT_TRACKING_ID, PEN_SLOT),
-                    abs(ABS_MT_POSITION_X, 10),
-                    abs(ABS_MT_POSITION_Y, 20),
+                    abs(ABS_MT_POSITION_X, 128),
+                    abs(ABS_MT_POSITION_Y, 410),
                     abs(ABS_MT_TOOL_TYPE, MT_TOOL_PEN),
                     abs(ABS_MT_PRESSURE, 0),
                     InputEvent::syn()
                 ],
-                vec![slot, abs(ABS_MT_PRESSURE, 50), key(BTN_TOUCH, 1), InputEvent::syn()],
-                vec![slot, abs(ABS_MT_POSITION_X, 30), InputEvent::syn()],
-                vec![slot, abs(ABS_MT_PRESSURE, 0), key(BTN_TOUCH, 0), InputEvent::syn()],
+                vec![slot, abs(ABS_MT_PRESSURE, 201), InputEvent::syn()],
+                vec![slot, abs(ABS_MT_POSITION_X, 384), InputEvent::syn()],
+                vec![slot, abs(ABS_MT_PRESSURE, 0), InputEvent::syn()],
                 vec![slot, abs(ABS_MT_PRESSURE, 0), abs(ABS_MT_TRACKING_ID, -1), InputEvent::syn()],
             ]
         );
+        // A press without a pressure has stock's raw default.
+        let (dev, h) = Input::new(Kind::Touch { width: 2560, height: 1600, screen: true }, "t");
+        h.pen(s(10, 20, Down));
+        assert!(dev.take_queued()[0].contains(&abs(ABS_MT_PRESSURE, PEN_PRESSURE)));
     }
 
     #[test]
     fn the_eraser_end_is_a_new_contact_and_fingers_reselect_their_slot() {
         use sim_core::stylus::{PenPhase::*, PenSample};
-        let (dev, h) = Input::new(Kind::Touch { width: 2560, height: 1600, pen: true }, "t");
+        let (dev, h) = Input::new(Kind::Touch { width: 2560, height: 1600, screen: true }, "t");
         h.pen(PenSample { button: true, ..PenSample::new(5, 5, Down) });
         h.pen(PenSample { eraser: true, ..PenSample::new(5, 5, Down) });
         h.pen(PenSample { eraser: true, ..PenSample::new(5, 5, Leave) });
         h.touch(100, 100, true);
         let b = dev.take_queued();
-        assert!(b[0].contains(&InputEvent::new(EV_KEY, BTN_STYLUS, 1)) && b[0].contains(&InputEvent::new(EV_KEY, BTN_TOUCH, 1)));
+        assert!(
+            b[0].contains(&InputEvent::new(EV_KEY, BTN_STYLUS, 1))
+                && b[0].contains(&InputEvent::new(EV_ABS, ABS_MT_PRESSURE, PEN_PRESSURE))
+        );
         // The pen end lifts and leaves (button up, contact ended), then the eraser comes in.
         let leave = b[1].iter().position(|e| *e == InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, -1)).expect("leave");
         assert!(b[1][..leave].contains(&InputEvent::new(EV_KEY, BTN_STYLUS, 0)));
@@ -841,15 +1020,13 @@ mod tests {
         assert_eq!(b[3][0], InputEvent::new(EV_ABS, ABS_MT_SLOT, 0));
     }
 
-    /// `BTN_TOUCH` is one bit for the whole screen: a pen lifting (or leaving) while a finger is
-    /// down, or a finger lifting under a touching pen, leaves it set, or the contact still down
-    /// would read as hovering.
+    /// Without `BTN_TOUCH` each contact is its own slot's: a pen lifting (to hover) or leaving
+    /// beside a held finger, or a finger lifting under a touching pen, sends nothing for the
+    /// other contact.
     #[test]
-    fn btn_touch_clears_only_when_neither_pen_nor_finger_touches() {
+    fn pen_and_finger_contacts_are_their_own_slots() {
         use sim_core::stylus::{PenPhase::*, PenSample};
-        let lifts = |b: &[InputEvent]| b.contains(&InputEvent::new(EV_KEY, BTN_TOUCH, 0));
-        // A finger held while the pen taps and leaves.
-        let (dev, h) = Input::new(Kind::Touch { width: 2560, height: 1600, pen: true }, "t");
+        let (dev, h) = Input::new(Kind::Touch { width: 2560, height: 1600, screen: true }, "t");
         h.touch(100, 100, true);
         h.pen(PenSample::new(500, 500, Down));
         h.pen(PenSample::new(500, 500, Up));
@@ -858,18 +1035,14 @@ mod tests {
         h.touch(100, 100, false);
         let b = dev.take_queued();
         assert_eq!(b.len(), 6, "{b:?}");
-        assert!(!lifts(&b[2]) && !lifts(&b[4]), "the finger still touches: {:?} {:?}", b[2], b[4]);
-        assert!(b[2].contains(&InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 0)), "the pen hovers by its pressure");
-        assert!(lifts(&b[5]), "the last contact lifts: {:?}", b[5]);
-        // A pen held while a finger taps.
-        let (dev, h) = Input::new(Kind::Touch { width: 2560, height: 1600, pen: true }, "t");
-        h.pen(PenSample::new(500, 500, Down));
-        h.touch(100, 100, true);
-        h.touch(100, 100, false);
-        h.pen(PenSample::new(500, 500, Up));
-        let b = dev.take_queued();
-        assert!(!lifts(&b[2]), "the pen still touches: {:?}", b[2]);
-        assert!(lifts(&b[3]), "the pen's lift clears it: {:?}", b[3]);
+        assert!(b.iter().flatten().all(|e| e.code != BTN_TOUCH || e.typ != EV_KEY), "{b:?}");
+        assert_eq!(
+            b[2],
+            [InputEvent::new(EV_ABS, ABS_MT_SLOT, PEN_SLOT), InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 0), InputEvent::syn()],
+            "the pen hovers by its pressure"
+        );
+        let abs = |c: u16, v: i32| InputEvent::new(EV_ABS, c, v);
+        assert_eq!(b[5], [abs(ABS_MT_SLOT, 0), abs(ABS_MT_PRESSURE, 0), abs(ABS_MT_TRACKING_ID, -1), InputEvent::syn()]);
     }
 
     #[test]
@@ -930,7 +1103,7 @@ mod tests {
         for i in 0..4 {
             drv.push(&mem, &[(RAM_BASE + 0x20000 + i * 8, 8, true)]);
         }
-        let mut w = Worker::new(mem.clone(), Arc::new(Interrupt::new(line.clone())), Queue::new(drv.cfg, false), None);
+        let mut w = Worker::new(mem.clone(), Arc::new(Interrupt::new(line.clone())), Queue::new(drv.cfg, false), None, Kind::Keyboard);
         w.handle(Msg::Events(vec![InputEvent::new(EV_KEY, 116, 1), InputEvent::syn()]));
         w.flush();
         assert!(line.level());
@@ -952,7 +1125,8 @@ mod tests {
 
     const BUFS: u64 = RAM_BASE + 0x20000;
 
-    /// A touch worker over a 64-entry event queue (the device's size) with `bufs` buffers posted.
+    /// A touch worker over a 64-entry event queue (the device's size) with `bufs` buffers posted:
+    /// the touchpad's contacts (pixels, `BTN_TOUCH`), or with [`Rig::screen`] the screen's.
     struct Rig {
         mem: Arc<GuestRam>,
         drv: Driver,
@@ -972,11 +1146,19 @@ mod tests {
 
         /// A rig whose queue runs with event-idx (`event_idx`) or the flags.
         fn with(bufs: u64, event_idx: bool) -> Rig {
+            Rig::of(bufs, event_idx, Kind::Touch { width: 1080, height: 2400, screen: false })
+        }
+
+        fn screen(bufs: u64) -> Rig {
+            Rig::of(bufs, false, Kind::Touch { width: 720, height: 1280, screen: true })
+        }
+
+        fn of(bufs: u64, event_idx: bool, kind: Kind) -> Rig {
             let mem = Arc::new(GuestRam::new(RAM_BASE, 0x10_0000).expect("ram"));
             let raises = Arc::new(Raises::default());
             let irq = Arc::new(Interrupt::new(raises.clone()));
             let drv = Driver::new(64);
-            let w = Worker::new(mem.clone(), irq.clone(), Queue::new(drv.cfg, event_idx), None);
+            let w = Worker::new(mem.clone(), irq.clone(), Queue::new(drv.cfg, event_idx), None, kind);
             let mut rig = Rig { mem, drv, irq, raises, w, posted: 0, read: 0, event_idx, kicks: 0 };
             rig.post(bufs);
             rig
@@ -1029,7 +1211,7 @@ mod tests {
     /// guest no exits; with the flags every refill kicks. Interrupts are one per flush either way.
     #[test]
     fn refills_cost_no_kicks_under_event_idx() {
-        let (dev, _h) = Input::new(Kind::Touch { width: 1080, height: 2400, pen: false }, "t");
+        let (dev, _h) = Input::new(Kind::Touch { width: 1080, height: 2400, screen: false }, "t");
         assert!(dev.features() & F_RING_EVENT_IDX != 0, "the device offers event-idx");
         for (event_idx, want) in [(true, 0), (false, 100)] {
             let mut rig = Rig::with(64, event_idx);
@@ -1177,6 +1359,28 @@ mod tests {
         assert_eq!(stalled.w.pending.len(), 1, "just the down");
     }
 
+    /// The screen's moves collapse the same way, into its two-axis move.
+    #[test]
+    fn screen_moves_the_guest_has_not_taken_collapse_too() {
+        let mut rig = Rig::screen(0);
+        rig.send([touch(0, 0, true)]);
+        for i in 1..=100 {
+            rig.send([touch(i, 2 * i, true)]);
+        }
+        assert_eq!((rig.w.pending.len(), rig.w.queued), (2, 8 + 3));
+        rig.post(64);
+        rig.send([Msg::Kick, touch(100, 200, false)]);
+        let ev = rig.take();
+        assert_eq!(
+            ev[8..11],
+            [InputEvent::new(EV_ABS, ABS_MT_POSITION_X, 100), InputEvent::new(EV_ABS, ABS_MT_POSITION_Y, 200), InputEvent::syn()]
+        );
+        assert_eq!(
+            ev[11..],
+            [InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 0), InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, -1), InputEvent::syn()]
+        );
+    }
+
     #[test]
     fn downs_ups_and_keys_are_never_dropped_or_reordered() {
         let mut rig = Rig::new(0);
@@ -1258,7 +1462,7 @@ mod tests {
         let mem = Arc::new(GuestRam::new(RAM_BASE, 0x10_0000).expect("ram"));
         let raises = Arc::new(Raises::default());
         let irq = Arc::new(Interrupt::new(raises.clone()));
-        let (mut dev, h) = Input::new(Kind::Touch { width: 100, height: 100, pen: false }, "touch");
+        let (mut dev, h) = Input::new(Kind::Touch { width: 100, height: 100, screen: false }, "touch");
         let mut drv = Driver::new(64);
         let cfg = drv.cfg;
         let mut posted = 0u64;

@@ -127,6 +127,75 @@ Both display at 60 Hz. The stock emulator's tablet rendered about 1350 frames ov
 emu's about 530; emu with the guest on stock's GLES driver (`EMU_GUEST_EGL=emulation`) rendered
 1254, so the count follows the guest's driver. On the phone both render about 790.
 
+## Android: software mode (Linux without KVM)
+
+The CPU decision for hosts with no hardware virtualization
+([#55](https://github.com/kaeawc/simee/issues/55)), measured on its motivating host: a
+Firecracker x86_64 guest (Ubuntu 22.04, 4 vCPUs of a Xeon at 2.2 GHz with AVX-512, 3.8 GiB RAM,
+no `/dev/kvm`, no GPU), 2026-11-26. One API 36 `default` image of each architecture (r2; the
+google_apis x86_64 image's 4.2 GB `system.img` didn't fit this host's 10 GB disk beside the
+toolchain), 4 vCPUs and 2 GB, booted by plain QEMU 11.1.3 TCG with stock's disk layout and no GPU,
+so these time the translator alone, before any of emu's devices. Without a GPU SurfaceFlinger
+can't start, so the milestones are a root shell on the console and zygote's first start
+(`boot_progress_start`, in guest uptime). Then the framework is stopped and android-bench.sh's
+guest CPU microbenchmarks run. Medians of 3 warm boots after one uncounted first boot; each boot's
+microbenchmarks are the median of 3 rounds.
+
+```bash
+scripts/tcg-bench.py <sysdir> <workdir> --qemu <qemu-system-x86_64|aarch64> [--cpu MODEL] [--boots 3]
+```
+
+| Guest | CPU model | Shell | Zygote starts | 100k shell loop | 4× md5 of 64 MiB | QEMU peak RSS |
+| --- | --- | --- | --- | --- | --- | --- |
+| x86_64 | `max,-erms,-fsrm,-fzrm,-fsrs,-fsrc` | 16.5 s | 49.4 s | 9.8 s | 1.82 s | 1138 MB |
+| x86_64 | `max` | 18.9 s | 54.5 s | 10.1 s | 2.75 s | 1126 MB |
+| arm64 | `max,pauth=off,sve=off` | 13.8 s | 55.6 s | 17.3 s | 3.67 s | 1113 MB |
+
+The same microbenchmarks under emu on Hypervisor.framework take 0.22 s and 0.43 s (M3 Max,
+[above](#android-emu-against-the-sdk-emulator)). Single boots of other configurations on the same host and day, each with the median of 3
+microbenchmark rounds (`--cpu`, `--tb-size`, `--threads`; the x86_64 ones with the guest's
+`mitigations=off`, which made no difference, see below), which decided the defaults:
+
+| Configuration (single boot) | Zygote starts | 100k shell loop | 4× md5 |
+| --- | --- | --- | --- |
+| x86_64, `max` without the fast-string features (the best row's model) | 50.1 s | 11.0 s | 1.98 s |
+| x86_64, Haswell model (AVX2) without ERMS | 56.3 s | 10.7 s | 2.23 s |
+| x86_64, Haswell model with ERMS | not recorded | 10.2 s | 3.03 s |
+| x86_64, SSE4.2-only model (`qemu64,+ssse3,+sse4.1,+sse4.2,+popcnt,+cx16`) | 66.0 s | 10.4 s | 2.84 s |
+| x86_64, Haswell without ERMS, translation cache 256 MiB instead of QEMU's default 1 GiB | 54.5 s | 13.9 s | 3.43 s |
+| x86_64, Haswell without ERMS, one translator thread for all vCPUs (`thread=single`) | 115.0 s | 17.7 s | 11.7 s |
+| arm64, `max,pauth=off,sve=off`, booted in the same sequence as the next three | 72.4 s | 19.3 s | 4.53 s |
+| arm64, pointer authentication emulated (`pauth-impdef=on`) | 78.3 s | 19.9 s | 4.85 s |
+| arm64, `max` (QARMA pointer authentication) | 77.1 s | 20.2 s | 4.55 s |
+| arm64, `cortex-a76` | 97.0 s | 19.4 s | 6.33 s |
+
+The arm64 single boots ran second to fifth after a first boot and reached zygote later than the
+three counted boots above; compare them with each other.
+
+What decided it:
+
+- **x86_64 images on x86_64 hosts.** Same-ISA translation runs guest code 1.8 (shell loop) to
+  2.0 (md5) times faster than the best arm64 configuration, and arm64 takes 13% longer to reach
+  zygote, though it reaches the shell sooner (its kernel and first-stage init are lighter). What
+  comes after zygote (the framework, ART) is guest code, so the guest-code ratio decides.
+- **QEMU 11 or newer.** Ubuntu 22.04's QEMU 6.2 panics this guest within seconds under
+  multi-threaded TCG (`int3` in `kmem_cache_alloc`: a stale translated block running the
+  kernel's live-patching breakpoint); 11.1.3 booted it every time, over 20 boots.
+- **Hide the fast-string features.** With ERMS/FSRM advertised the guest kernel's memcpy is
+  `rep movsb`, which TCG runs as a byte loop: md5 of `/dev/zero` takes 51% longer and zygote
+  starts 10% later.
+- **Keep the 1 GiB translation cache and one translator thread per vCPU.** A single translator
+  thread, the model a translator library such as Unicorn offers, takes twice as long to reach
+  zygote (115 s against 56.3 s for the same CPU model) and five times as long for the parallel
+  md5s, so option 2 of #55 is not pursued.
+- `mitigations=off` in the guest made no difference: a single boot with it (zygote 50.1 s, md5
+  1.98 s) falls inside the spread of an earlier set of 3 boots without it (48.8 to 50.1 s, 1.84 to
+  2.05 s).
+
+The SDK emulator (37.3.10) does not start on this host: it requires 7.37 GB of free disk to
+create userdata whatever the AVD's data size (2.2 GB was free), and warns that 3939 MiB is under
+its suggested 4096 MiB of RAM. Its `-accel-check` reports `/dev/kvm is not found`.
+
 ## Android farm
 
 Clones of one settled golden AVD booted together, each until it is settled (boot complete and

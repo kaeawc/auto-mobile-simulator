@@ -85,11 +85,13 @@ Linux path.
   Guest pixel = `x / w * guest_w`, so no HiDPI code is needed.
   - Events go to a virtio-input multi-touch device (`ABS_MT_*`, protocol B) as they arrive.
     Unlike sim-rs's HID path, moves aren't coalesced at 16 ms.
-  - A down sends the full set (slot, tracking id, position, pressure, `BTN_TOUCH`, `ABS_X/Y`); a
-    move sends only the axes that changed and `SYN` (3–5 events instead of 9), as stock's
-    `_mts_pointer_move` does; the kernel keeps each slot's values and drops repeats, so the
-    guest's readers see the same events. A raw `event send` on the touch device makes the next
-    touch send the full set again.
+  - The device is stock's (`virtio_input_multi_touch_1`): guest pixels are scaled to its
+    0..32767 axes in emu, so every caller (this window, the console, `display.sock`) speaks
+    pixels. A down sends what stock's mouse down does (slot, tracking id, position, full
+    pressure, touch size); a move sends only the position that changed and `SYN` (2–3 events),
+    as stock's `_mts_pointer_move` does; a lift zeroes the pressure and ends the tracking id. The
+    kernel keeps each slot's values and drops repeats, so the guest's readers see the same
+    events. A raw `event send` on the touch device makes the next touch send the full set again.
   - Moves the guest hasn't started taking collapse into the newest (a stalled guest gets the
     current position, not a backlog); downs, ups and keys are never dropped or reordered. Events
     that arrive together go out with one interrupt.

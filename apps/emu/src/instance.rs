@@ -71,6 +71,9 @@ pub struct Instance {
     pub gps: std::sync::Arc<emu_vmm::pipe::gps::Gps>,
     pub battery: std::sync::Arc<emu_vmm::devices::goldfish_battery::Battery>,
     pub telephony: std::sync::Arc<emu_vmm::telephony::Telephony>,
+    /// What `network speed|delay` (and `-netspeed`/`-netdelay`) ask for: the console writes it,
+    /// the guest's NAT shapes by it, and it survives a guest reset.
+    pub network: std::sync::Arc<std::sync::Mutex<sim_core::network::Conditions>>,
     /// Android XR images: the guest's XR service link.
     pub xr: Option<std::sync::Arc<emu_vmm::pipe::xr::Xr>>,
     /// The vehicle HAL channel, for Automotive images only (as stock).
@@ -197,6 +200,7 @@ impl Instance {
             gps: Default::default(),
             battery: Default::default(),
             telephony: Default::default(),
+            network: std::sync::Arc::new(std::sync::Mutex::new(opts.network)),
             xr: is_xr(avd).then(Default::default),
             car: avd.is_car().then(Default::default),
             adb: std::sync::Arc::new(adb),
@@ -271,6 +275,7 @@ impl Instance {
             gps: self.gps.clone(),
             battery: self.battery.clone(),
             telephony: self.telephony.clone(),
+            network: self.network.clone(),
             car: self.car.clone(),
             sound: plan.sound.then_some(emu_vmm::audio::Options {
                 output: !opts.no_audio,
@@ -683,6 +688,10 @@ fn bootconfig(avd: &Avd, opts: &Opts, graphics: bool) -> BootConfig {
     // A round screen (boot.prop's `ro.emulator.circular`), as stock tells the guest.
     if avd.circular() {
         bc.set("androidboot.emulator.circular", "1");
+    }
+    // A Pixel Fold image's device states for its hinge, as stock sends them.
+    if let Some(states) = crate::fold::guest_device_states(avd) {
+        bc.set("androidboot.qemu.device_state", states);
     }
     for (k, v) in avd.vbmeta_params() {
         bc.set(k, v);
@@ -1214,6 +1223,41 @@ mod tests {
         assert!(glasses.contains("virtio-input: touchpad") && !glasses.contains("dual-mode mouse"), "{glasses}");
         assert!(plan(&s, "car").devices().contains(&"qemud:car (vehicle HAL)"));
         assert!(plan(&s, "headset").devices().contains(&"qemud:xr_service"));
+    }
+
+    #[test]
+    fn a_pixel_fold_gets_its_images_device_states_and_skin_overlays() {
+        let s = sdk("fold");
+        let rel = "system-images/android-36/google_apis/arm64-v8a";
+        let image = s.root.join("sdk").join(rel);
+        std::fs::write(image.join("advancedFeatures.ini"), "VirtioSndCard = on\nDeviceStateOnBoot = on\nDeviceSkinOverlay = on\n")
+            .expect("features");
+        let states = image.join("data/misc/pixel_fold/devicestate");
+        std::fs::create_dir_all(&states).expect("mkdir");
+        std::fs::write(states.join("device_state_configuration.xml"), "<device-state-config>\n  <device-state/>\n</device-state-config>\n")
+            .expect("xml");
+        let fold = sim_core::form_factor::Kind::new(sim_core::platform::Platform::Android, sim_core::form_factor::FormFactor::Foldable)
+            .expect("fold")
+            .profile();
+        s.env.create_avd(&NewAvd::for_profile("pf", rel, &fold)).expect("create");
+        let avd = s.env.load("pf").expect("load");
+        let p = plan(&s, "pf");
+        assert_eq!(p.bootconfig.get("androidboot.qemu.device_state"), Some("<device-state-config><device-state/></device-state-config>"));
+        assert_eq!(
+            crate::fold::skin_overlays(&avd),
+            [
+                "cmd overlay enable com.android.internal.emulation.pixel_fold",
+                "cmd overlay enable com.android.systemui.emulation.pixel_fold"
+            ]
+        );
+        // A phone on the same image gets neither.
+        assert_eq!(plan(&s, "phone").bootconfig.get("androidboot.qemu.device_state"), None);
+        assert!(crate::fold::skin_overlays(&s.env.load("phone").expect("load")).is_empty());
+        // Nor does a foldable whose image doesn't ship its device.
+        s.env
+            .create_avd(&NewAvd::for_profile("duo", rel, &fold.clone().with_screen(2784, 1800, sim_core::form_factor::Density::Dpi(401))))
+            .expect("duo");
+        assert_eq!(plan(&s, "duo").bootconfig.get("androidboot.qemu.device_state"), None);
     }
 
     #[test]
