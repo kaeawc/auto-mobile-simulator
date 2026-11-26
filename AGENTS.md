@@ -158,8 +158,9 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   services incl. `car.rs`, the vehicle HAL, and `xr.rs`, Android XR's `xr_service`), `modem/`,
   `disk.rs`, `boot.rs`, `display.rs` (`FrameStore`), `vhost_user.rs` (serves a device to QEMU
   over vhost-user, for software mode on Linux; `examples/vhost_user_vsock.rs`), `vfio_user.rs`
-  (serves a PCI function, the goldfish address space, over vfio-user; `examples/soft_devices.rs`
-  serves the whole software-mode device set). Everything but `machine.rs`, `vcpu.rs` and
+  (serves a PCI function over vfio-user: the goldfish address space, and the goldfish pipe's
+  carrier), `acpi.rs` (the SSDT that describes the pipe to x86 guests); `examples/soft_devices.rs`
+  serves the whole software-mode device set. Everything but `machine.rs`, `vcpu.rs` and
   `virtio/gpu.rs` builds and tests on Linux: put device logic there, not behind the hypervisor.
 - `crates/emu-avd` — `Env` (SDK/AVD paths), `Avd` (config, `profile()`), `NewAvd`
   (`for_profile`), running-instance advertisements (`Running`), `BootConfig`, ini parsing.

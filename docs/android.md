@@ -211,7 +211,9 @@ The numbers are in [benchmarks.md](benchmarks.md#android-software-mode-linux-wit
 - **CPU: QEMU's TCG, 11.1 or newer, one translator thread per vCPU.** It is the fastest
   translator available and is multi-threaded; a translator library (Unicorn) runs one thread
   for all vCPUs, which took twice as long to reach zygote. QEMU 6.2 (Ubuntu 22.04's)
-  panics the guest under multi-threaded TCG.
+  panics the guest under multi-threaded TCG within seconds (`int3` in the kernel's
+  live-patching window); 11.1 has QEMU's fix, but one full boot in about a dozen still hit
+  it.
 - **Guest: the x86_64 images on x86_64 hosts**, with stock's x86 board (virtio-pci: `system.img`
   at `00:03.0`, so `androidboot.boot_devices=pci0000:00/0000:00:03.0`, and the fstab's metadata at
   `00:06.0`). They run guest code 1.8 to 2.0 times as fast as arm64 images, which take 13% longer to
@@ -250,16 +252,42 @@ The numbers are in [benchmarks.md](benchmarks.md#android-software-mode-linux-wit
   mapper aborts without it ("GoldfishAddressSpaceHostMemoryAllocator failed to open"). emu serves
   its config space and registers by message, and its 16 GiB area as a sparse memfd QEMU maps into
   the guest; the device model is emu's own, built once the guest has placed BAR1.
-- **Open: the goldfish pipe.** `libqemupipe.ranchu.so` opens `opengles`, `GLProcessPipe` and
-  `refcount` on `/dev/goldfish_pipe_dprctd` and falls back to vsock only when that open fails
-  with `EAGAIN` (its other pipes go to vsock port 5000 first). Without the device the allocator
-  can't open `refcount`, the composer gets no swapchain and SurfaceFlinger aborts ("Can't create
-  AidlComposerClient"); SELinux isn't the cause (the vendor policy allows the allocator vsock, and
-  permissive changes nothing). On x86 the pipe driver binds only by ACPI (`GFSH0003`) or DT, so
-  it needs an ACPI device whose registers QEMU forwards to emu; the plan is a vfio-user PCI
-  function carrying them and an SSDT whose `_CRS` reads that function's BAR and interrupt line.
-- **Rendering: gfxstream on lavapipe**, from the SDK's Linux `emulator` package, whose `lib64`
-  carries `libgfxstream_backend.so` and its own lavapipe (238 MB without the Qt UI).
+- **Goldfish pipe over vfio-user, described by an ACPI table.** `libqemupipe.ranchu.so` opens
+  `opengles`, `GLProcessPipe` and `refcount` on `/dev/goldfish_pipe_dprctd` and falls back to
+  vsock only when that open fails with `EAGAIN` (read from its disassembly; its other pipes go to
+  vsock port 5000 first). Without the device the allocator can't open `refcount`, the composer
+  gets no swapchain and SurfaceFlinger aborts ("Can't create AidlComposerClient"). On x86 the
+  pipe driver binds only by ACPI (`GFSH0003`) or DT, and QEMU has no such device, so emu carries
+  the pipe's registers in BAR0 of a vfio-user PCI function (607d:f154, INTA) at slot 0x1e, and an
+  SSDT it generates (`crates/emu-vmm/src/acpi.rs`, QEMU's `-acpitable`) declares `GFSH0003` with a
+  `_CRS` that reads that BAR through config I/O (0xCF8/0xCFC) and its IRQ from PIIX3's PIRQ
+  route (`pc` routes slot S's INTA to PIRQ `(S - 1) & 3`). The function then hides from the OS
+  (vendor `0xffff` once the firmware has placed BAR0 and turned decoding on): otherwise Linux
+  finds the BAR overlapping the ACPI device's range, fails to claim it and moves it, away from
+  where the pipe driver looks. INTx follows vfio's automasked model: raise, trigger and mask;
+  QEMU unmasks when the guest next touches the device, and a line still up triggers again.
+  Both goldfish functions need `x-no-posted-writes=true` (`vfio_user::qemu_device`): QEMU posts
+  BAR writes by default, so the vCPU runs on before emu has seen a write. The pipe's guest reads a
+  command's status from memory right after writing `CMD`, and frees the command page on close;
+  posted, emu answered into a page that was by then something else, and guests panicked in
+  `zap_huge_pmd` on a PMD of `0xffffffff` (a status of -1).
+- **vhost-user memory slots.** With GPU blobs and the goldfish address space mapped, the guest's
+  memory outgrows `SET_MEM_TABLE`'s 8 regions (QEMU: "Failed preparing vhost-user memory table
+  msg", and every device's memory update fails), so the backend takes regions one at a time
+  (`CONFIGURE_MEM_SLOTS`: `ADD_MEM_REG`/`REM_MEM_REG`, 256 slots).
+- **Boots to `sys.boot_completed`.** With all of the above, the API 36 image boots under QEMU
+  TCG on emu's devices with no KVM and no GPU
+  ([benchmarks](benchmarks.md#boot-to-sysboot_completed-with-emus-devices)): 168 s warm, 0 of 5
+  boots failed. Open: the launcher's workspace composes black (the navigation bar and
+  FallbackHome draw); the launcher once failed to make a bitmap at unlock (`DotRenderer`, null
+  `Bitmap`); and under emulation apps can overrun Android's startup timeouts and show "isn't
+  responding" dialogs.
+- **Rendering: gfxstream on SwiftShader**, both from the SDK's Linux `emulator` package
+  (`lib64` carries `libgfxstream_backend.so`, its lavapipe and SwiftShader; 238 MB without the Qt
+  UI). gfxstream picks the driver itself (`ANDROID_EMU_VK_ICD`; it refuses the host's own
+  lavapipe). The SDK's lavapipe (Mesa 26.2-devel, LLVM 21) crashes in a render thread minutes
+  into a boot (a SIGSEGV inside `libvulkan_lvp.so` under `RenderThread::main`, every lavapipe
+  boot); SwiftShader ran without one and booted faster.
 
 When the host has KVM, use it ([#54](https://github.com/kaeawc/simee/issues/54)): the guest runs
 natively there, and software mode is the fallback.
