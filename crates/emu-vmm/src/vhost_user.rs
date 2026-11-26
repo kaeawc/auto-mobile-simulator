@@ -605,19 +605,29 @@ impl BackendChannel {
     }
 }
 
+/// Exports a blob's memory as an fd (the renderer's `export_blob`).
+pub type Exporter = Box<dyn Fn(u32) -> std::result::Result<OwnedFd, String> + Send + Sync>;
+
 /// The GPU's host-visible region in a vhost-user frontend: each blob exported once as an fd
 /// (kept, since gfxstream hands its own over) and mapped by the frontend at the offset the guest
 /// picked (`SHMEM_MAP` into region `shmid`).
 pub struct ShmemWindow {
     pub chan: BackendChannel,
     pub shmid: u8,
-    pub renderer: Arc<emu_gfxstream::Renderer>,
+    export: Exporter,
     fds: Mutex<std::collections::HashMap<u32, OwnedFd>>,
+    /// Unmaps a stopping device couldn't send (the frontend was waiting for the stop), sent
+    /// before the next map: (offset, length).
+    deferred: Mutex<Vec<(u64, u64)>>,
 }
 
 impl ShmemWindow {
     pub fn new(chan: BackendChannel, shmid: u8, renderer: Arc<emu_gfxstream::Renderer>) -> ShmemWindow {
-        ShmemWindow { chan, shmid, renderer, fds: Mutex::new(std::collections::HashMap::new()) }
+        Self::with_exporter(chan, shmid, Box::new(move |id| renderer.export_blob(id).map(|(fd, _)| fd).map_err(|e| e.to_string())))
+    }
+
+    pub fn with_exporter(chan: BackendChannel, shmid: u8, export: Exporter) -> ShmemWindow {
+        ShmemWindow { chan, shmid, export, fds: Mutex::default(), deferred: Mutex::default() }
     }
 
     /// `VhostUserMMap`: shmid (u8, then 7 bytes of padding), fd offset, region offset, length,
@@ -630,6 +640,16 @@ impl ShmemWindow {
         m[32..40].copy_from_slice(&u64::from(rw).to_le_bytes());
         m
     }
+
+    /// Sends the unmaps a stop deferred.
+    fn send_deferred(&self) {
+        let pending = std::mem::take(&mut *self.deferred.lock().unwrap_or_else(PoisonError::into_inner));
+        for (offset, len) in pending {
+            if let Err(e) = self.chan.request(backend_req::SHMEM_UNMAP, &self.mmap_msg(offset, len, false), None) {
+                eprintln!("emu: vhost-user gpu: unmapping +{offset:#x}: {e}");
+            }
+        }
+    }
 }
 
 impl crate::virtio::gpu::ShmWindow for ShmemWindow {
@@ -638,10 +658,11 @@ impl crate::virtio::gpu::ShmWindow for ShmemWindow {
     }
 
     fn map(&self, id: u32, _host: Option<emu_hvf::HostRange>, offset: u64, len: usize) -> std::result::Result<(), String> {
+        self.send_deferred();
         let mut fds = self.fds.lock().unwrap_or_else(PoisonError::into_inner);
         let fd = match fds.entry(id) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => e.insert(self.renderer.export_blob(id).map_err(|e| e.to_string())?.0),
+            std::collections::hash_map::Entry::Vacant(e) => e.insert((self.export)(id)?),
         };
         self.chan.request(backend_req::SHMEM_MAP, &self.mmap_msg(offset, len as u64, true), Some(fd.as_fd())).map_err(|e| e.to_string())
     }
@@ -650,6 +671,10 @@ impl crate::virtio::gpu::ShmWindow for ShmemWindow {
         if let Err(e) = self.chan.request(backend_req::SHMEM_UNMAP, &self.mmap_msg(offset, len as u64, false), None) {
             eprintln!("emu: vhost-user gpu: unmapping +{offset:#x}: {e}");
         }
+    }
+
+    fn unmap_stopping(&self, offset: u64, len: usize) {
+        self.deferred.lock().unwrap_or_else(PoisonError::into_inner).push((offset, len as u64));
     }
 
     fn forget(&self, id: u32) {
@@ -926,6 +951,41 @@ mod tests {
         assert!(wait_readable(&call), "the device called");
         drop(fe);
         t.join().expect("join").expect("clean end");
+    }
+
+    /// Stopping the GPU must not wait on the frontend (QEMU waits for the stop in GET_VRING_BASE
+    /// before it reads the backend channel: before, the two deadlocked at QEMU's shutdown). Its
+    /// unmaps go out before the next map instead, unmap then map, in order.
+    #[test]
+    fn a_stopping_gpu_defers_its_unmaps_to_the_next_map() {
+        use crate::virtio::gpu::ShmWindow;
+        let (fe, be) = UnixStream::pair().expect("pair");
+        let chan = BackendChannel::default();
+        chan.attach(be, true);
+        let blob = rustix::fs::memfd_create("blob", rustix::fs::MemfdFlags::CLOEXEC).expect("memfd");
+        let window = Arc::new(ShmemWindow::with_exporter(chan, 1, Box::new(move |_| blob.try_clone().map_err(|e| e.to_string()))));
+        window.unmap_stopping(0x1_0000, 0x4000);
+        fe.set_nonblocking(true).expect("nonblocking");
+        let mut probe = [0u8; 1];
+        assert!((&fe).read(&mut probe).is_err(), "nothing sent while stopping");
+        fe.set_nonblocking(false).expect("blocking");
+        // The frontend acks each request, as QEMU does with REPLY_ACK.
+        let frontend = std::thread::spawn(move || {
+            let mut fe = fe;
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let m = read_msg(&mut fe).expect("read").expect("message");
+                seen.push((m.request, u64::from_le_bytes(m.payload[16..24].try_into().unwrap_or_default()), m.fds.len()));
+                let mut ack = m.request.to_le_bytes().to_vec();
+                ack.extend_from_slice(&(VERSION | FLAG_REPLY).to_le_bytes());
+                ack.extend_from_slice(&8u32.to_le_bytes());
+                ack.extend_from_slice(&0u64.to_le_bytes());
+                fe.write_all(&ack).expect("ack");
+            }
+            seen
+        });
+        window.map(7, None, 0x2_0000, 0x4000).expect("map");
+        assert_eq!(frontend.join().expect("join"), [(backend_req::SHMEM_UNMAP, 0x1_0000, 0), (backend_req::SHMEM_MAP, 0x2_0000, 1)]);
     }
 
     #[test]

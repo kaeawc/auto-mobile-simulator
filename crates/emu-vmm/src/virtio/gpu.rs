@@ -89,6 +89,12 @@ pub trait ShmWindow: Send + Sync {
     fn map(&self, id: u32, host: Option<HostRange>, offset: u64, len: usize) -> Result<(), String>;
     /// Removes the mapping at `offset` (`len` bytes) that [`ShmWindow::map`] made.
     fn unmap(&self, offset: u64, len: usize);
+    /// [`ShmWindow::unmap`] while the device is being stopped. A frontend may be the one stopping
+    /// it and wait for that to finish before it reads anything else, so a window that would ask
+    /// the frontend to unmap defers it (to before its next map) instead of waiting on an answer.
+    fn unmap_stopping(&self, offset: u64, len: usize) {
+        self.unmap(offset, len);
+    }
     /// Blob `id` is gone: anything kept to map it again can go.
     fn forget(&self, _id: u32) {}
 }
@@ -654,7 +660,7 @@ impl Worker {
         let release = release_all(&mut self.resources, &mut self.contexts);
         self.legacy_asg.clear();
         for &(id, offset, len) in &release.unmap {
-            self.cfg.window.unmap(offset, len);
+            self.cfg.window.unmap_stopping(offset, len);
             let _ = r.unmap(id);
         }
         for &id in &release.resources {
