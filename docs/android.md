@@ -191,6 +191,40 @@ AVD defaults favour cheap, fast boots: 720×1280 screen, 2 GB RAM, 4 vCPU, 4 GB 
 Benchmarks of the stock emulator found that smaller screens boot markedly faster and that RAM
 above 2 GB slows cold boots down.
 
+## Software mode (Linux without KVM)
+
+In progress ([#55](https://github.com/kaeawc/simee/issues/55)). Cloud and CI workers often have no
+`/dev/kvm` and no GPU, so every guest instruction has to be translated in software and every
+frame drawn on the CPU. emu doesn't boot guests there yet; this records what was decided and why.
+The numbers are in [benchmarks.md](benchmarks.md#android-software-mode-linux-without-kvm).
+
+- **CPU: QEMU's TCG, 11.1 or newer, one translator thread per vCPU.** It is the fastest
+  translator available and is multi-threaded; a translator library (Unicorn) runs one thread
+  for all vCPUs, which took twice as long to reach zygote. QEMU 6.2 (Ubuntu 22.04's)
+  panics the guest under multi-threaded TCG.
+- **Guest: the x86_64 images on x86_64 hosts**, with stock's x86 board (virtio-pci: `system.img`
+  at `00:03.0`, so `androidboot.boot_devices=pci0000:00/0000:00:03.0`, and the fstab's metadata at
+  `00:06.0`). They run guest code 1.8 to 2.0 times as fast as arm64 images, which take 13% longer to
+  reach zygote. arm64 images under QEMU's `virt` board work too: its memory map and virtio-mmio
+  slot order are stock's arm64 board's. There the debug console is `hvc0`, and `goldfish-logcat`
+  expects `hvc1`.
+- **Guest CPU model `max,-erms,-fsrm,-fzrm,-fsrs,-fsrc`** (x86_64): without the fast-string
+  features the guest kernel copies memory with plain moves, which TCG translates, instead of
+  `rep movsb`, which it runs as a byte loop. Keep QEMU's 1 GiB translation cache.
+- **Devices: emu, out of process.** Upstream QEMU can't run these images to `sys.boot_completed`
+  on its own: without a gfxstream GPU, SurfaceFlinger aborts (`no suitable EGLConfig found`) and
+  zygote restarts every 5 s, and the sensors HAL has no `qemud:sensors`. emu keeps the devices,
+  console, adb bridge, display socket and frame ring, and serves them to QEMU over vhost-user
+  (the virtio devices; QEMU 11's `SHMEM_MAP` lets a backend map GPU blobs into the guest) and
+  vfio-user (goldfish address space, a plain PCI device). Goldfish pipe is an ACPI/DT platform
+  device that neither protocol carries; whether gralloc runs without its `refcount` pipe (the
+  renderer's `RefCountPipe` off) is the open question.
+- **Rendering: gfxstream on lavapipe**, from the SDK's Linux `emulator` package, whose `lib64`
+  carries `libgfxstream_backend.so` and its own lavapipe (238 MB without the Qt UI).
+
+When the host has KVM, use it ([#54](https://github.com/kaeawc/simee/issues/54)): the guest runs
+natively there, and software mode is the fallback.
+
 ## Automotive
 
 What the AAOS sources show (`device/generic/car/emulator`, `hardware/interfaces/automotive/vehicle`,
