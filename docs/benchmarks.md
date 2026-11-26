@@ -193,6 +193,41 @@ CASE=2480,1080,true cargo test --release -p emu frame_path_latency -- --ignored 
 The injected network shaper's cost per call is measured in
 [research/netshape-overhead.md](research/netshape-overhead.md).
 
+## Build times (local)
+
+Apple silicon Mac, 16 CPUs, macOS 26.6, 2026-11-26. The host was heavily loaded by other builds
+the whole time (load average 50 to 700), so wall-clock time is not comparable between runs; the
+rows give CPU seconds (user plus system of the build and its children, from `getrusage`), which
+load does not inflate. Each is a clean build into an empty target directory; "before" and
+"after" were run alternately, twice, and the range is both runs. Wall-clock times under that load
+were 20 to 34 s before and 10 to 14 s after for the workspace, 114 s before and 37 to 42 s after for the desktop.
+
+| Build | Before | After | Command |
+|---|---|---|---|
+| Workspace test build, clean | 131 to 136 CPU s | 74 to 77 CPU s | `cargo test --no-run` |
+| Desktop test build, clean | 614 CPU s | 147 CPU s | `cd desktop && cargo test --no-run` |
+| Workspace test run, warm | 12.5 to 13.7 s | 13.0 to 13.9 s | `cargo test --workspace` |
+| Desktop test run, warm | 0.55 to 0.99 s | 1.06 to 1.41 s | `cd desktop && cargo test` |
+
+What changed: the workspace's `dev` profile built every dependency at opt-level 2; it now builds
+them at 0 and keeps 2 or 3 only for the ones on a runtime path (zlib-rs and flate2 for the kernel's
+gunzip, smoltcp, crc32fast, adler2, base64, cpal, and the PNG crates that already had it). The
+desktop's `test` profile builds its dependencies (Rune's GPU stack) at 0: its view tests run in
+about a second either way. `cargo build` and `cargo run` in the desktop keep opt-level 2, since a
+debug window has to stay smooth.
+
+Measured and left alone:
+
+| Build | Result | Command |
+|---|---|---|
+| Release `emu`, clean | 13 s wall (57 CPU s) at load 17; release settings unchanged | `cargo build --release -p emu` |
+| Incremental after a one-line edit in `sim-core`, tests | 3.0 to 4.9 s; unchanged by `debug = 0` (3.1 to 3.6 s) or `-ld_classic` (3.6 to 4.1 s) | `cargo test --no-run` |
+| Incremental after a one-line edit in `emu-vmm`, `cargo c` / `cargo lint` | about 1 to 2 s each | `cargo c`, `cargo lint` |
+| `scripts/check.sh --all`, warm | 15 to 26 s, of which the test run is 13 to 22 s | `scripts/check.sh --all` |
+
+The incremental loop is already a few seconds, so no profile change helps it; the clean-build wins
+are what a fresh checkout, a CI cache miss or a Rune bump pays.
+
 ## Not yet measured
 
 Claims that would belong in the README once someone runs them:

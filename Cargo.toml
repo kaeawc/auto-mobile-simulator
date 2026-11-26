@@ -79,6 +79,28 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+opt-level = 0
+
+# The dependencies on a runtime hot path stay optimized in dev builds: the kernel's gunzip, the
+# NAT's TCP state machine, checksums and PNG encoding. Everything else (serde, clap and their
+# proc macros, syn, the Objective-C bindings) costs ~40% of a clean build's CPU time at opt-level 2
+# and runs only at startup.
+[profile.dev.package.zlib-rs]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.smoltcp]
+opt-level = 2
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.adler2]
+opt-level = 3
+[profile.dev.package.base64]
+opt-level = 3
+# `-provision` checks each multi-GB system image download's SHA-1.
+[profile.dev.package.sha1_smol]
+opt-level = 3
+[profile.dev.package.cpal]
 opt-level = 2
 
 # The Android VMM sits on the guest's hot path (every MMIO exit, every block request); unoptimized
