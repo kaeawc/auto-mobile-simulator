@@ -1,4 +1,5 @@
-//! Guest RAM: an anonymous host mapping addressed by guest physical address.
+//! Guest RAM addressed by guest physical address: an anonymous host mapping, or a shared one of
+//! another process's memory fd (a vhost-user frontend's guest RAM, [`GuestRam::map_shared`]).
 use std::sync::atomic::AtomicU64;
 
 use crate::{Error, Result};
@@ -63,6 +64,9 @@ pub struct GuestRam {
     /// isn't: [`GuestRam::discard`] has to replace the guest's view of the pages too.
     #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
     hv_flags: AtomicU64,
+    /// A shared mapping of another process's memory ([`GuestRam::map_shared`]): pages are
+    /// freed in the file, not replaced in this mapping.
+    shared: bool,
 }
 
 /// [`GuestRam::discard`] works in host pages; 16 KiB is the host page size on Apple silicon and a
@@ -89,7 +93,29 @@ impl GuestRam {
         if ptr == libc::MAP_FAILED {
             return Err(Error::Mmap(len as usize));
         }
-        Ok(GuestRam { ptr: ptr.cast(), len, base, hv_flags: AtomicU64::new(0) })
+        Ok(GuestRam { ptr: ptr.cast(), len, base, hv_flags: AtomicU64::new(0), shared: false })
+    }
+
+    /// Maps `len` bytes of `fd` from `offset` as guest RAM at `base`, shared: the memory another
+    /// process (a vhost-user frontend such as QEMU) gives its guest, so device threads here read
+    /// and write what the guest sees. The mapping stays valid after `fd` is closed.
+    pub fn map_shared(base: u64, len: u64, fd: std::os::fd::BorrowedFd<'_>, offset: u64) -> Result<GuestRam> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+        if len == 0 || !len.is_multiple_of(page) || !offset.is_multiple_of(page) {
+            return Err(Error::Invalid("shared guest RAM must be a non-zero whole number of pages at a page offset"));
+        }
+        let off = libc::off_t::try_from(offset).map_err(|_| Error::Invalid("shared guest RAM offset out of range"))?;
+        // SAFETY: a new shared mapping of a caller-provided descriptor, no address hint; the
+        // result is checked. The descriptor is borrowed only for the call.
+        let ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), len as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), off)
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(Error::Mmap(len as usize));
+        }
+        Ok(GuestRam { ptr: ptr.cast(), len, base, hv_flags: AtomicU64::new(0), shared: true })
     }
 
     pub fn base(&self) -> u64 {
@@ -146,6 +172,9 @@ impl GuestRam {
         let n = (end - start) as usize;
         // SAFETY: `start + n` is inside the mapping (checked and rounded inward above).
         let host = unsafe { self.ptr.add(start as usize) };
+        if self.shared {
+            return remove_shared(host, n).map(|()| n as u64);
+        }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             let flags = self.hv_flags.load(std::sync::atomic::Ordering::Acquire);
@@ -432,6 +461,25 @@ fn replace_pages(host: *mut u8, n: usize) -> Result<()> {
     Ok(())
 }
 
+/// Frees the pages behind `n` bytes of a shared file mapping at `host`, in the file itself, so
+/// every process mapping it reads zeroes there afterwards (`MADV_REMOVE`, Linux's hole punch
+/// through a mapping; elsewhere there's no equivalent and nothing is freed).
+fn remove_shared(host: *mut u8, n: usize) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `host..host + n` is page aligned and inside a shared mapping this module owns.
+        if unsafe { libc::madvise(host.cast(), n, libc::MADV_REMOVE) } != 0 {
+            return Err(Error::Invalid("MADV_REMOVE failed on shared guest RAM"));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (host, n);
+        Err(Error::Invalid("discarding shared guest RAM needs Linux's MADV_REMOVE"))
+    }
+}
+
 /// The calling process's `phys_footprint` in bytes (Activity Monitor's Memory column, what jetsam
 /// limits), for measuring what [`GuestRam::discard`] gives back. Measured caveat
 /// (`tests/discard_probe.rs`): a page of VM-mapped RAM that both the host and the guest touched
@@ -596,6 +644,32 @@ mod tests {
         let r = ram.resident(B, 0x10_0000).expect("resident");
         assert!((0x8000..=0x10000).contains(&r), "{r:#x}");
         assert_eq!(ram.resident(B, 0x20_0000), None, "outside the RAM");
+    }
+
+    /// Two shared mappings of one memfd, as QEMU's guest RAM and a vhost-user backend's view of
+    /// it: writes show through both ways, and a discard frees the pages for both.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_ram_is_one_memory_for_both_sides() {
+        use std::os::fd::AsFd;
+        const B: u64 = 0;
+        let fd = rustix::fs::memfd_create("guest-ram", rustix::fs::MemfdFlags::CLOEXEC).expect("memfd");
+        rustix::fs::ftruncate(&fd, 0x40_0000).expect("size");
+        let frontend = GuestRam::map_shared(B, 0x40_0000, fd.as_fd(), 0).expect("frontend map");
+        let backend = GuestRam::map_shared(0x10_0000, 0x20_0000, fd.as_fd(), 0x10_0000).expect("backend map at an offset");
+        drop(fd);
+        frontend.write(0x10_0010, b"from the guest").expect("w");
+        let mut got = [0u8; 14];
+        backend.read(0x10_0010, &mut got).expect("r");
+        assert_eq!(&got, b"from the guest", "same guest address, same bytes, fd already closed");
+        backend.write(0x20_0000, &[7u8; 0x10_0000]).expect("w");
+        assert_eq!(frontend.read_u32(0x20_0000), Ok(0x0707_0707));
+        assert_eq!(backend.discard(0x20_0000, 0x10_0000).expect("discard"), 0x10_0000);
+        assert_eq!(frontend.resident(0x20_0000, 0x10_0000), Some(0), "freed in the file, so for the other side too");
+        assert_eq!(frontend.read_u64(0x28_0000), Ok(0));
+        let fd = rustix::fs::memfd_create("x", rustix::fs::MemfdFlags::CLOEXEC).expect("memfd");
+        assert!(GuestRam::map_shared(0, 0x1001, fd.as_fd(), 0).is_err(), "not whole pages");
+        assert!(GuestRam::map_shared(0, 0x1000, fd.as_fd(), 0x10).is_err(), "unaligned offset");
     }
 
     #[test]

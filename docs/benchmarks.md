@@ -173,6 +173,24 @@ What decided it:
   1.98 s) falls inside the spread of an earlier set of 3 boots without it (48.8 to 50.1 s, 1.84 to
   2.05 s).
 
+adb into the same guest under QEMU 11 TCG on the same host, through emu's virtio-vsock served
+over vhost-user (`crates/emu-vmm/examples/vhost_user_vsock.rs`, emu's adb bridge on the host
+side) and, for comparison on the same boot, through QEMU's own user-mode network to adbd's TCP
+listener (`-netdev user,hostfwd`). Framework stopped; 21 `adb shell echo` round trips and 3
+transfers of 64 MiB each way per round, two rounds alternating, every transfer byte-checked.
+
+| Transport | `adb shell echo`, median (2 rounds) | 64 MiB push | 64 MiB pull |
+| --- | --- | --- | --- |
+| emu's vsock over vhost-user | 149, 131 ms | 42 to 54 MiB/s | 62 to 99 MiB/s |
+| QEMU's user network to adbd's TCP port | 134, 125 ms | 38 to 45 MiB/s | 13 to 18 MiB/s |
+| emu's vsock, every queue called on each raise (before) | 157, 171 ms | 38 to 48 MiB/s | 47 to 66 MiB/s |
+
+Calling every queue on each raise cost the guest a spurious interrupt per completion, because
+vsock's queues share one MSI vector: 14 vsock interrupts per round trip before, 9 after
+(`/proc/interrupts`, 20 round trips). emu's vsock server used 0.53 s of CPU for a whole boot plus
+the 384 MiB of transfers, 21 MB peak RSS: what's left per round trip is the guest under
+translation. The SDK emulator's own adb path has no row: it doesn't start on this host (below).
+
 The SDK emulator (37.3.10) does not start on this host: it requires 7.37 GB of free disk to
 create userdata whatever the AVD's data size (2.2 GB was free), and warns that 3939 MiB is under
 its suggested 4096 MiB of RAM. Its `-accel-check` reports `/dev/kvm is not found`.
