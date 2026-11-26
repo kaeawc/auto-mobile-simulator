@@ -379,7 +379,7 @@ fn boot(
             telephony: inst.telephony.clone(),
             xr: inst.xr.clone(),
             car: inst.car.clone(),
-            network: Arc::new(std::sync::Mutex::new(opts.network)),
+            network: inst.network.clone(),
             fold: fold.clone(),
         },
     )?;

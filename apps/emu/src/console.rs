@@ -29,7 +29,7 @@ pub struct ConsoleInfo {
     pub xr: Option<Arc<emu_vmm::pipe::xr::Xr>>,
     pub car: Option<Arc<emu_vmm::pipe::car::Car>>,
     /// What `network speed|delay` asked for (seeded by `-netspeed`/`-netdelay`). Reported by
-    /// `network status`; the guest's traffic isn't shaped by it yet.
+    /// `network status` and shared with the guest's NAT, which shapes its traffic by it.
     pub network: Arc<std::sync::Mutex<sim_core::network::Conditions>>,
     /// A foldable's hinge (`fold`, `unfold`, `posture`).
     pub fold: Option<Arc<crate::fold::Foldable>>,

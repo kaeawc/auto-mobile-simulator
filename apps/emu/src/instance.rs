@@ -71,6 +71,9 @@ pub struct Instance {
     pub gps: std::sync::Arc<emu_vmm::pipe::gps::Gps>,
     pub battery: std::sync::Arc<emu_vmm::devices::goldfish_battery::Battery>,
     pub telephony: std::sync::Arc<emu_vmm::telephony::Telephony>,
+    /// What `network speed|delay` (and `-netspeed`/`-netdelay`) ask for: the console writes it,
+    /// the guest's NAT shapes by it, and it survives a guest reset.
+    pub network: std::sync::Arc<std::sync::Mutex<sim_core::network::Conditions>>,
     /// Android XR images: the guest's XR service link.
     pub xr: Option<std::sync::Arc<emu_vmm::pipe::xr::Xr>>,
     /// The vehicle HAL channel, for Automotive images only (as stock).
@@ -197,6 +200,7 @@ impl Instance {
             gps: Default::default(),
             battery: Default::default(),
             telephony: Default::default(),
+            network: std::sync::Arc::new(std::sync::Mutex::new(opts.network)),
             xr: is_xr(avd).then(Default::default),
             car: avd.is_car().then(Default::default),
             adb: std::sync::Arc::new(adb),
@@ -269,6 +273,7 @@ impl Instance {
             gps: self.gps.clone(),
             battery: self.battery.clone(),
             telephony: self.telephony.clone(),
+            network: self.network.clone(),
             car: self.car.clone(),
             sound: plan.sound.then_some(emu_vmm::audio::Options {
                 output: !opts.no_audio,

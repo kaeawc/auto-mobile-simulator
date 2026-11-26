@@ -15,6 +15,9 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListe
 
 use super::host::{self, Resolver};
 use super::packet::{self, Frame, Link};
+use super::shape::{self, Bucket, Downlink};
+use sim_core::network::Conditions;
+
 use super::{Config, Shared, TO_GUEST, lock};
 
 /// Per-connection buffers: guest to host, host to guest. Allocated zeroed, so the pages a
@@ -35,13 +38,18 @@ pub struct Wire {
     limit: Option<usize>,
     /// smoltcp wanted to send and `limit` refused it.
     blocked: bool,
+    /// `limit` is the download shaper's room, not the guest's queue: the shaper frees it on
+    /// its own clock, so the guest has nothing to wake the thread for.
+    by_shaper: bool,
+    /// The most frames the download shaper holds at once (`usize::MAX`: no shaper).
+    shaper_cap: usize,
     verify: bool,
 }
 
 impl Wire {
     /// `verify`: check checksums on frames received (a virtio link never corrupts one).
     pub fn new(verify: bool, limit: Option<usize>) -> Wire {
-        Wire { rx: VecDeque::new(), tx: Vec::new(), limit, blocked: false, verify }
+        Wire { rx: VecDeque::new(), tx: Vec::new(), limit, blocked: false, by_shaper: false, shaper_cap: usize::MAX, verify }
     }
 
     /// How many more frames the guest's queue takes this pass.
@@ -239,6 +247,30 @@ pub struct Engine {
     epoch: Instant,
     /// Run the next pass at once (the guest drained its queue while this one was blocked).
     again: bool,
+    /// The conditions last applied, and when they were last read.
+    applied: Conditions,
+    checked: Option<Instant>,
+    /// The shaping those conditions set; none when they set none, and then nothing here
+    /// touches it.
+    shaping: Option<Shaping>,
+}
+
+/// How often an unshaped engine looks at the console's conditions (a shaped one looks every
+/// pass): a change reaches the next traffic within this, and the lock isn't taken per pass.
+const CONDITIONS_POLL: Duration = Duration::from_millis(50);
+
+/// The state of a shaped link: frames for the guest wait in `down`; frames from the guest
+/// wait in `inbox` for `up`'s bucket.
+struct Shaping {
+    up: Bucket,
+    down: Downlink,
+    /// When `up` lets the next guest frame through, while `inbox` is held back.
+    up_due: Option<Instant>,
+}
+
+/// Whether the conditions shape anything.
+fn shapes(c: &Conditions) -> bool {
+    c.upload_bps > 0.0 || c.download_bps > 0.0 || c.min_latency_ms > 0 || c.max_latency_ms > 0
 }
 
 impl Engine {
@@ -269,6 +301,9 @@ impl Engine {
             inbox: VecDeque::new(),
             epoch: Instant::now(),
             again: false,
+            applied: Conditions::default(),
+            checked: None,
+            shaping: None,
         }
     }
 
@@ -355,6 +390,13 @@ impl Engine {
             self.iface.poll_delay(now, &self.sockets).map(|d| Duration::from_micros(d.total_micros()).max(Duration::from_millis(1)))
         };
         let now = Instant::now();
+        // Shaping timers: the next held frame for the guest, and the guest's held frames.
+        if let Some(s) = &self.shaping {
+            for due in s.down.next_due().into_iter().chain(s.up_due) {
+                let left = due.saturating_duration_since(now);
+                t = Some(t.map_or(left, |t| t.min(left)));
+            }
+        }
         let deadlines = self.udp.values().map(|f| f.deadline).chain(self.ping.values().map(|f| f.deadline));
         for d in deadlines {
             let left = d.saturating_duration_since(now);
@@ -367,11 +409,52 @@ impl Engine {
         if self.shared.reset.swap(false, Ordering::AcqRel) {
             self.clear();
         }
-        std::mem::swap(&mut *lock(&self.shared.to_host), &mut self.inbox);
-        self.wire.limit = Some(TO_GUEST.saturating_sub(lock(&self.shared.to_guest).len()));
+        self.apply_conditions();
+        // Held back by the upload bucket, `inbox` can be nonempty here; unshaped it never is.
+        let held_back = !self.inbox.is_empty();
+        if !held_back {
+            std::mem::swap(&mut *lock(&self.shared.to_host), &mut self.inbox);
+        }
+        let queued = lock(&self.shared.to_guest).len();
         self.wire.blocked = false;
-        while let Some(f) = self.inbox.pop_front() {
-            self.input(f);
+        match self.shaping.take() {
+            None => {
+                self.wire.limit = Some(TO_GUEST.saturating_sub(queued));
+                self.wire.by_shaper = false;
+                self.wire.shaper_cap = usize::MAX;
+                while let Some(f) = self.inbox.pop_front() {
+                    self.input(f);
+                }
+            }
+            Some(mut s) => {
+                let guest = TO_GUEST.saturating_sub(queued + s.down.len());
+                self.wire.limit = Some(guest.min(s.down.room()));
+                self.wire.by_shaper = s.down.room() < guest;
+                self.wire.shaper_cap = s.down.capacity();
+                // The upload bucket lets frames through while it isn't in debt; the rest wait
+                // here, and then in `to_host`, which holds about a second of the rate and
+                // drops past that, as a full link does.
+                s.up_due = None;
+                while !self.inbox.is_empty() {
+                    let now = Instant::now();
+                    let wait = s.up.wait(now);
+                    if !wait.is_zero() {
+                        s.up_due = Some(now + wait);
+                        break;
+                    }
+                    if let Some(f) = self.inbox.pop_front() {
+                        s.up.take(now, f.len());
+                        self.shared.up_released(f.len());
+                        self.input(f);
+                    }
+                }
+                self.shaping = Some(s);
+                // Frames the guest queued while `inbox` was held back rang no wakeup (it only
+                // rings for the first in an empty queue): take them on the next pass.
+                if held_back && self.inbox.is_empty() && !lock(&self.shared.to_host).is_empty() {
+                    self.again = true;
+                }
+            }
         }
         self.poll_iface();
         self.service_connects();
@@ -391,14 +474,43 @@ impl Engine {
 
     /// Hands this pass's frames to the guest's queue and rings the device once.
     fn flush(&mut self) {
-        if self.wire.tx.is_empty() && !self.wire.blocked {
+        let Some(s) = &mut self.shaping else {
+            if self.wire.tx.is_empty() && !self.wire.blocked {
+                return;
+            }
+            let any = !self.wire.tx.is_empty();
+            let mut q = lock(&self.shared.to_guest);
+            q.extend(self.wire.tx.drain(..));
+            if self.wire.blocked {
+                if q.len() <= TO_GUEST / 2 {
+                    self.again = true;
+                } else {
+                    self.shared.guest_full.store(true, Ordering::Release);
+                }
+            }
+            drop(q);
+            if any {
+                self.shared.ring_guest();
+            }
+            return;
+        };
+        if self.wire.tx.is_empty() && !self.wire.blocked && s.down.is_empty() {
             return;
         }
-        let any = !self.wire.tx.is_empty();
+        let now = Instant::now();
+        // The pass was limited to the shaper's room, so these fit; a frame that doesn't is lost.
+        for f in self.wire.tx.drain(..) {
+            s.down.push(now, f);
+        }
+        let mut any = false;
         let mut q = lock(&self.shared.to_guest);
-        q.extend(self.wire.tx.drain(..));
-        if self.wire.blocked {
-            if q.len() <= TO_GUEST / 2 {
+        while let Some(f) = s.down.pop_due(now) {
+            q.push_back(f);
+            any = true;
+        }
+        // Blocked by the shaper's room: its next due frame wakes the thread, not the guest.
+        if self.wire.blocked && !self.wire.by_shaper {
+            if q.len() + s.down.len() <= TO_GUEST / 2 {
                 self.again = true;
             } else {
                 self.shared.guest_full.store(true, Ordering::Release);
@@ -410,8 +522,39 @@ impl Engine {
         }
     }
 
+    /// Takes the console's conditions if they changed since the last look.
+    fn apply_conditions(&mut self) {
+        let at = Instant::now();
+        if self.shaping.is_none() && self.checked.is_some_and(|c| at.duration_since(c) < CONDITIONS_POLL) {
+            return;
+        }
+        self.checked = Some(at);
+        let c = *lock(&self.cfg.network);
+        if c == self.applied {
+            return;
+        }
+        self.applied = c;
+        self.shared.shaped.store(shapes(&c), Ordering::Relaxed);
+        if shapes(&c) {
+            let s = self.shaping.get_or_insert_with(|| Shaping { up: Bucket::new(), down: Downlink::new(), up_due: None });
+            s.up.set_rate(c.upload_bps);
+            s.down.set(&c);
+            let held: usize = self.inbox.iter().map(Vec::len).sum();
+            self.shared.set_up_cap(shape::queue_bits(c.upload_bps).map(|b| (b / 8) as usize), held);
+        } else if let Some(mut s) = self.shaping.take() {
+            // Back to the plain path: what was held reaches the guest now.
+            self.wire.tx.splice(0..0, s.down.drain());
+            self.shared.set_up_cap(None, 0);
+        }
+    }
+
     /// Drops every flow: the guest's stack was reset, so none of its connections exist.
     fn clear(&mut self) {
+        self.inbox.clear();
+        if let Some(s) = &mut self.shaping {
+            s.down.clear();
+        }
+        self.shared.up_held.store(0, Ordering::Relaxed);
         for f in self.tcp.values() {
             if let TcpState::Open(h) = &f.state {
                 let h = *h;
@@ -711,8 +854,14 @@ impl Engine {
             for _ in 0..DATAGRAMS_PER_PASS {
                 let room = self.wire.room();
                 if room < packet::MAX_FRAGMENTS
-                    && f.sock.peek(&mut self.scratch[packet::UDP_HDR..]).is_ok_and(|n| packet::fragments(packet::UDP_HDR + n) > room)
+                    && let Ok(n) = f.sock.peek(&mut self.scratch[packet::UDP_HDR..])
+                    && packet::fragments(packet::UDP_HDR + n) > room
                 {
+                    // Too big for the download queue ever: lost, as at a real bottleneck.
+                    if packet::fragments(packet::UDP_HDR + n) > self.wire.shaper_cap {
+                        let _ = f.sock.recv(&mut self.scratch[packet::UDP_HDR..]);
+                        continue;
+                    }
                     self.wire.blocked = true;
                     break;
                 }
@@ -741,7 +890,14 @@ impl Engine {
             }
             for _ in 0..DATAGRAMS_PER_PASS {
                 let room = self.wire.room();
-                if room < packet::MAX_FRAGMENTS && f.sock.peek_from(&mut self.scratch).is_ok_and(|(n, _)| packet::fragments(n) > room) {
+                if room < packet::MAX_FRAGMENTS
+                    && let Ok((n, _)) = f.sock.peek_from(&mut self.scratch)
+                    && packet::fragments(n) > room
+                {
+                    if packet::fragments(n) > self.wire.shaper_cap {
+                        let _ = f.sock.recv_from(&mut self.scratch);
+                        continue;
+                    }
                     self.wire.blocked = true;
                     break;
                 }

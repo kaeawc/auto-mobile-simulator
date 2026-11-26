@@ -16,6 +16,7 @@ pub mod op {
     pub const PIN_CODE_REQUEST_NEGATIVE_REPLY: u16 = 0x040E;
     pub const REMOTE_NAME_REQUEST: u16 = 0x0419;
     pub const REMOTE_NAME_REQUEST_CANCEL: u16 = 0x041A;
+    pub const READ_ENCRYPTION_KEY_SIZE: u16 = 0x1408;
     pub const READ_DEFAULT_LINK_POLICY_SETTINGS: u16 = 0x080E;
     pub const WRITE_DEFAULT_LINK_POLICY_SETTINGS: u16 = 0x080F;
     pub const SET_EVENT_MASK: u16 = 0x0C01;

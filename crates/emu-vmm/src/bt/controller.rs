@@ -74,6 +74,7 @@ pub const COMMANDS: &[(u16, u16)] = &[
     (op::READ_DEFAULT_ERRONEOUS_DATA_REPORTING, 182),
     (op::WRITE_DEFAULT_ERRONEOUS_DATA_REPORTING, 183),
     (op::SET_EVENT_MASK_PAGE_2, 222),
+    (op::READ_ENCRYPTION_KEY_SIZE, 204),
     (op::READ_LE_HOST_SUPPORT, 245),
     (op::WRITE_LE_HOST_SUPPORT, 246),
     (op::LE_SET_EVENT_MASK, 250),
@@ -294,6 +295,13 @@ impl Controller {
             | op::LINK_KEY_REQUEST_NEGATIVE_REPLY
             | op::PIN_CODE_REQUEST_REPLY
             | op::PIN_CODE_REQUEST_NEGATIVE_REPLY => fail(status::UNKNOWN_CONNECTION, &addr_of(p)),
+
+            // Android's stack (API 31-32) requires this on every encrypted link; no link ever
+            // exists here, so the answer is the full 128-bit key for whatever handle it names.
+            op::READ_ENCRYPTION_KEY_SIZE => match u16_at(p, 0) {
+                Some(h) => ok(&[&h.to_le_bytes()[..], &[16]].concat()),
+                None => bad(),
+            },
 
             // Link policy.
             op::READ_DEFAULT_LINK_POLICY_SETTINGS => ok(&s.default_link_policy.to_le_bytes()),
@@ -583,6 +591,16 @@ mod tests {
         assert_eq!(complete(&mut c, op::READ_LOCAL_EXTENDED_FEATURES, &[0])[3..], page0[1..]);
         assert_eq!(complete(&mut c, op::READ_LOCAL_EXTENDED_FEATURES, &[2])[0], status::INVALID_PARAMETERS);
         assert_eq!(complete(&mut c, op::LE_READ_SUPPORTED_STATES, &[]), [0, 0xff, 0xff, 0xff, 0xff, 0xff, 0x03, 0, 0]);
+    }
+
+    #[test]
+    fn read_encryption_key_size_answers_sixteen() {
+        let mut c = Controller::new(ADDR);
+        // Status, the handle echoed, a 128-bit key.
+        assert_eq!(complete(&mut c, op::READ_ENCRYPTION_KEY_SIZE, &[0x2a, 0x00]), [0, 0x2a, 0x00, 16]);
+        assert_eq!(complete(&mut c, op::READ_ENCRYPTION_KEY_SIZE, &[0x01]), [status::INVALID_PARAMETERS]);
+        // Advertised: octet 20, bit 4.
+        assert!(c.supported_commands()[20] & 1 << 4 != 0);
     }
 
     #[test]
