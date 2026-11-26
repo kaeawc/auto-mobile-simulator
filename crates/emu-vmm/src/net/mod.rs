@@ -20,6 +20,7 @@
 mod engine;
 mod host;
 mod packet;
+mod shape;
 #[cfg(test)]
 mod tests;
 
@@ -55,6 +56,8 @@ pub struct Config {
     pub dns: Dns,
     /// How many flows (each a host socket) the guest may hold open.
     pub limits: Limits,
+    /// The console's `network speed|delay`: read live, so a change applies to the next frame.
+    pub network: Arc<Mutex<sim_core::network::Conditions>>,
 }
 
 /// Caps on the guest's flows. The guest is untrusted and every flow is a host file descriptor
@@ -105,6 +108,7 @@ impl Default for Config {
             loopback: IpAddr::V4(Ipv4Addr::LOCALHOST),
             dns: Dns::System,
             limits: Limits::from_rlimit(),
+            network: Arc::default(),
         }
     }
 }

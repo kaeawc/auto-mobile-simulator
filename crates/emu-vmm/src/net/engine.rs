@@ -15,6 +15,9 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListe
 
 use super::host::{self, Resolver};
 use super::packet::{self, Frame, Link};
+use super::shape::{Bucket, Downlink};
+use sim_core::network::Conditions;
+
 use super::{Config, Shared, TO_GUEST, lock};
 
 /// Per-connection buffers: guest to host, host to guest. Allocated zeroed, so the pages a
@@ -239,6 +242,13 @@ pub struct Engine {
     epoch: Instant,
     /// Run the next pass at once (the guest drained its queue while this one was blocked).
     again: bool,
+    /// The conditions last applied, and the shaping they set: frames for the guest wait in
+    /// `down`; frames from the guest wait in `inbox` for `up`'s bucket.
+    applied: Conditions,
+    up: Bucket,
+    down: Downlink,
+    /// When `up` lets the next guest frame through, while `inbox` is held back.
+    up_due: Option<Instant>,
 }
 
 impl Engine {
@@ -269,6 +279,10 @@ impl Engine {
             inbox: VecDeque::new(),
             epoch: Instant::now(),
             again: false,
+            applied: Conditions::default(),
+            up: Bucket::new(),
+            down: Downlink::new(),
+            up_due: None,
         }
     }
 
@@ -355,6 +369,11 @@ impl Engine {
             self.iface.poll_delay(now, &self.sockets).map(|d| Duration::from_micros(d.total_micros()).max(Duration::from_millis(1)))
         };
         let now = Instant::now();
+        // Shaping timers: the next held frame for the guest, and the guest's held frames.
+        for due in self.down.next_due().into_iter().chain(self.up_due) {
+            let left = due.saturating_duration_since(now);
+            t = Some(t.map_or(left, |t| t.min(left)));
+        }
         let deadlines = self.udp.values().map(|f| f.deadline).chain(self.ping.values().map(|f| f.deadline));
         for d in deadlines {
             let left = d.saturating_duration_since(now);
@@ -367,11 +386,31 @@ impl Engine {
         if self.shared.reset.swap(false, Ordering::AcqRel) {
             self.clear();
         }
-        std::mem::swap(&mut *lock(&self.shared.to_host), &mut self.inbox);
-        self.wire.limit = Some(TO_GUEST.saturating_sub(lock(&self.shared.to_guest).len()));
+        self.apply_conditions();
+        if self.inbox.is_empty() {
+            std::mem::swap(&mut *lock(&self.shared.to_host), &mut self.inbox);
+        }
+        self.wire.limit = Some(TO_GUEST.saturating_sub(lock(&self.shared.to_guest).len() + self.down.len()));
         self.wire.blocked = false;
-        while let Some(f) = self.inbox.pop_front() {
-            self.input(f);
+        // The upload bucket lets frames through while it isn't in debt; the rest wait here,
+        // and then in `to_host`, which drops past its cap as a full link does.
+        self.up_due = None;
+        while !self.inbox.is_empty() {
+            let now = Instant::now();
+            let wait = self.up.wait(now);
+            if !wait.is_zero() {
+                self.up_due = Some(now + wait);
+                break;
+            }
+            if let Some(f) = self.inbox.pop_front() {
+                self.up.take(now, f.len());
+                self.input(f);
+            }
+        }
+        // Frames the guest queued while `inbox` was held back rang no wakeup (it only rings
+        // for the first in an empty queue): take them on the next pass.
+        if self.inbox.is_empty() && !lock(&self.shared.to_host).is_empty() {
+            self.again = true;
         }
         self.poll_iface();
         self.service_connects();
@@ -391,14 +430,21 @@ impl Engine {
 
     /// Hands this pass's frames to the guest's queue and rings the device once.
     fn flush(&mut self) {
-        if self.wire.tx.is_empty() && !self.wire.blocked {
+        if self.wire.tx.is_empty() && !self.wire.blocked && self.down.is_empty() {
             return;
         }
-        let any = !self.wire.tx.is_empty();
+        let now = Instant::now();
+        for f in self.wire.tx.drain(..) {
+            self.down.push(now, f);
+        }
+        let mut any = false;
         let mut q = lock(&self.shared.to_guest);
-        q.extend(self.wire.tx.drain(..));
+        while let Some(f) = self.down.pop_due(now) {
+            q.push_back(f);
+            any = true;
+        }
         if self.wire.blocked {
-            if q.len() <= TO_GUEST / 2 {
+            if q.len() + self.down.len() <= TO_GUEST / 2 {
                 self.again = true;
             } else {
                 self.shared.guest_full.store(true, Ordering::Release);
@@ -410,8 +456,22 @@ impl Engine {
         }
     }
 
+    /// Takes the console's conditions if they changed since the last pass.
+    fn apply_conditions(&mut self) {
+        let now = *lock(&self.cfg.network);
+        if now == self.applied {
+            return;
+        }
+        self.applied = now;
+        let at = Instant::now();
+        self.up.set_rate(now.upload_bps);
+        self.down.set(at, &now);
+    }
+
     /// Drops every flow: the guest's stack was reset, so none of its connections exist.
     fn clear(&mut self) {
+        self.inbox.clear();
+        self.down.clear();
         for f in self.tcp.values() {
             if let TcpState::Open(h) = &f.state {
                 let h = *h;
