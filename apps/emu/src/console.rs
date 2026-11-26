@@ -28,7 +28,78 @@ pub struct ConsoleInfo {
     /// The `qemud:xr_service` link, on Android XR images.
     pub xr: Option<Arc<emu_vmm::pipe::xr::Xr>>,
     pub car: Option<Arc<emu_vmm::pipe::car::Car>>,
+    /// What `network speed|delay` asked for (seeded by `-netspeed`/`-netdelay`). Reported by
+    /// `network status`; the guest's traffic isn't shaped by it yet.
+    pub network: Arc<std::sync::Mutex<sim_core::network::Conditions>>,
 }
+
+/// Stock's reply to a command group without, or with an unknown, sub-command: the group's
+/// description and sub-commands (`dump_help`), then the KO.
+fn sub_help(description: &str, subcommands: &[(&str, &str)], ko: &str) -> String {
+    let mut s = format!("{description}\r\n\r\navailable sub-commands:\r\n");
+    for (name, what) in subcommands {
+        s.push_str(&format!("    {name:<15}  {what}\r\n"));
+    }
+    s.push_str("\r\n");
+    s.push_str(ko);
+    s
+}
+
+/// `network status|speed <speed>|delay <latency>` (stock syntax and replies; names and
+/// values in [`sim_core::network`]). Stock reads the whole rest of the line as the argument.
+fn network(info: &ConsoleInfo, words: &[&str]) -> String {
+    const SUBCOMMANDS: &[(&str, &str)] =
+        &[("status", "dump network status"), ("speed", "change network speed"), ("delay", "change network latency")];
+    const ABOUT: &str = "allows you to manage the settings related to the network data connection of the\r\nemulated device.";
+    let mut conditions = info.network.lock().unwrap_or_else(|e| e.into_inner());
+    match words {
+        [] => sub_help(ABOUT, SUBCOMMANDS, "KO: missing sub-command"),
+        ["status", ..] => format!("{}\r\nOK", conditions.status()),
+        ["speed"] => "KO: missing <speed> argument, see 'help network speed'".into(),
+        ["speed", arg @ ..] if conditions.set_speed(&arg.join(" ")) => "OK".into(),
+        ["speed", ..] => "KO: invalid <speed> argument, see 'help network speed' for valid values".into(),
+        ["delay"] => "KO: missing <delay> argument, see 'help network delay'".into(),
+        ["delay", arg @ ..] if conditions.set_latency(&arg.join(" ")) => "OK".into(),
+        ["delay", ..] => "KO: invalid <delay> argument, see 'help network delay' for valid values".into(),
+        _ => sub_help(ABOUT, SUBCOMMANDS, "KO:  bad sub-command"),
+    }
+}
+
+/// `avd snapshot ...`, answered as stock answers when it can't snapshot: simee's renderer
+/// can't save its state yet (docs/roadmap-android.md, "Snapshots"), so `save` and `load` fail
+/// with the stock Snapshotter's unsupported-graphics messages, `list` finds none and `del`
+/// has nothing to delete (stock's delete of a missing snapshot succeeds). Tools see a `KO`
+/// and fall back to app-level state.
+fn avd_snapshot(words: &[&str]) -> String {
+    const SUBCOMMANDS: &[(&str, &str)] = &[
+        ("list", "list available state snapshots"),
+        ("save", "save state snapshot"),
+        ("load", "load state snapshot"),
+        ("del", "delete state snapshot"),
+        ("delete", "delete state snapshot"),
+    ];
+    const ABOUT: &str = "allows you to save and restore the virtual device state in snapshots";
+    match words {
+        [] => sub_help(ABOUT, SUBCOMMANDS, "KO: missing sub-command"),
+        // qemu_listvms with no snapshots; stock ends that line with a bare LF.
+        ["list", ..] => "There is no snapshot available.\nOK".into(),
+        ["save"] => "KO: Argument missing, try 'avd snapshot save <name>'".into(),
+        ["save", ..] => format!(
+            "KO: Unable to save snapshot: This feature is not currently supported with your selected graphics settings. ({SNAPSHOT_RENDERER})"
+        ),
+        ["load"] => "KO: Argument missing, try 'avd snapshot load <name>'".into(),
+        ["load", ..] => {
+            format!("KO: Unable to load snapshot: Snapshots are not supported with the current graphics settings. ({SNAPSHOT_RENDERER})")
+        }
+        // Stock's message names `list` here.
+        ["del" | "delete"] => "KO: Argument missing, try 'avd snapshot list <name>'".into(),
+        ["del" | "delete", ..] => "OK".into(),
+        _ => sub_help(ABOUT, SUBCOMMANDS, "KO:  bad sub-command"),
+    }
+}
+
+/// The renderer stock names in its snapshot errors.
+const SNAPSHOT_RENDERER: &str = "gfxstream";
 
 /// simee extension (stock has no console command for the vehicle HAL; its car controls live
 /// in the UI and gRPC): `car set <property> [<area>] <value>`, `car get <property> [<area>]`,
@@ -388,6 +459,7 @@ const HELP: &[(&str, &str)] = &[
     ("rotate", "rotate the screen clockwise by 90 degrees"),
     ("sms", "SMS related commands"),
     ("gsm", "GSM related commands"),
+    ("network", "manage network settings"),
     ("ping", "check if the emulator is alive"),
     ("sensor", "manage emulator sensors"),
     ("screenshot", "take a screenshot of the display"),
@@ -510,6 +582,7 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
         "gsm" => gsm(info, &words[1..]),
         "xr" => xr(info, &words[1..]),
         "car" => car(info, &words[1..]),
+        "network" => network(info, &words[1..]),
         // Stock: rotate the device 90° clockwise. Gravity in device coordinates turns the
         // other way, and the guest's auto-rotation follows the accelerometer.
         "rotate" => match info.sensors.get("acceleration").as_deref() {
@@ -591,6 +664,7 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
             Some("name") => format!("{}\r\nOK", info.avd_name),
             Some("status") => "virtual device is running\r\nOK".to_string(),
             Some("id") => format!("{}\r\nOK", info.avd_name),
+            Some("snapshot") => avd_snapshot(&words[2..]),
             _ => "KO: unsupported 'avd' subcommand in simee".to_string(),
         },
         other => format!("KO: '{other}' is not implemented in simee yet"),
@@ -672,6 +746,7 @@ mod tests {
             telephony: Arc::default(),
             xr: (form_factor == FormFactor::Vision).then(Arc::default),
             car: (form_factor == FormFactor::Auto).then(Arc::default),
+            network: Arc::default(),
         }
     }
 
@@ -755,7 +830,67 @@ mod tests {
         }
         assert_eq!(run(&info, "ping"), "I am alive!\r\nOK");
         assert_eq!(run(&info, "avd name"), "Test_AVD\r\nOK");
-        assert_eq!(run(&info, "network status"), "KO: 'network' is not implemented in simee yet");
+        assert_eq!(run(&info, "redir list"), "KO: 'redir' is not implemented in simee yet");
+    }
+
+    /// AutoMobile's `setDeviceState --networkCondition`: a profile's delay and speed, the
+    /// `network status` readback, then the reset to `none`/`full`.
+    #[test]
+    fn network_speed_and_delay_answer_as_stock_and_show_in_status() {
+        let info = console(FormFactor::Phone);
+        let unshaped = "Current network status:\r\n  download speed:          0 bits/s (0.0 KB/s)\r\n  upload speed:            0 bits/s (0.0 KB/s)\r\n  minimum latency:  0 ms\r\n  maximum latency:  0 ms\r\nOK";
+        assert_eq!(run(&info, "network status"), unshaped);
+        assert_eq!(run(&info, "network delay umts"), "OK");
+        assert_eq!(run(&info, "network speed umts"), "OK");
+        assert_eq!(
+            run(&info, "network status"),
+            "Current network status:\r\n  download speed:     384000 bits/s (46.9 KB/s)\r\n  upload speed:       384000 bits/s (46.9 KB/s)\r\n  minimum latency:  35 ms\r\n  maximum latency:  200 ms\r\nOK"
+        );
+        assert_eq!(run(&info, "network speed 14.4:80"), "OK");
+        assert!(
+            run(&info, "network status").contains("  download speed:      80000 bits/s (9.8 KB/s)\r\n  upload speed:        14400 bits/s")
+        );
+        assert_eq!(run(&info, "network speed warp"), "KO: invalid <speed> argument, see 'help network speed' for valid values");
+        assert_eq!(run(&info, "network delay slow"), "KO: invalid <delay> argument, see 'help network delay' for valid values");
+        assert!(run(&info, "network status").contains("minimum latency:  35 ms"), "a rejected argument changes nothing");
+        assert_eq!(run(&info, "network speed"), "KO: missing <speed> argument, see 'help network speed'");
+        assert_eq!(run(&info, "network delay"), "KO: missing <delay> argument, see 'help network delay'");
+        assert_eq!(run(&info, "network delay none"), "OK");
+        assert_eq!(run(&info, "network speed full"), "OK");
+        assert_eq!(run(&info, "network status"), unshaped);
+        assert!(!info.network.lock().expect("network").is_shaped());
+
+        let missing = run(&info, "network");
+        assert!(missing.starts_with("allows you to manage the settings related to the network data connection of the\r\n"), "{missing}");
+        assert!(missing.contains("\r\navailable sub-commands:\r\n    status           dump network status\r\n"), "{missing}");
+        assert!(missing.ends_with("\r\n\r\nKO: missing sub-command"), "{missing}");
+        assert!(run(&info, "network warp").ends_with("\r\nKO:  bad sub-command"));
+    }
+
+    /// Stock's replies when it can't snapshot: every `save`/`load` is a KO a tool can fall
+    /// back on, nothing is listed, and deleting succeeds with nothing to delete.
+    #[test]
+    fn avd_snapshot_answers_as_stock_does_without_snapshot_support() {
+        let info = console(FormFactor::Phone);
+        assert_eq!(
+            run(&info, "avd snapshot save am_capture"),
+            "KO: Unable to save snapshot: This feature is not currently supported with your selected graphics settings. (gfxstream)"
+        );
+        assert_eq!(
+            run(&info, "avd snapshot load am_capture"),
+            "KO: Unable to load snapshot: Snapshots are not supported with the current graphics settings. (gfxstream)"
+        );
+        assert_eq!(run(&info, "avd snapshot del am_capture"), "OK");
+        assert_eq!(run(&info, "avd snapshot delete am_capture"), "OK");
+        assert_eq!(run(&info, "avd snapshot list"), "There is no snapshot available.\nOK");
+        assert_eq!(run(&info, "avd snapshot save"), "KO: Argument missing, try 'avd snapshot save <name>'");
+        assert_eq!(run(&info, "avd snapshot load"), "KO: Argument missing, try 'avd snapshot load <name>'");
+        assert_eq!(run(&info, "avd snapshot del"), "KO: Argument missing, try 'avd snapshot list <name>'");
+        let missing = run(&info, "avd snapshot");
+        assert!(missing.starts_with("allows you to save and restore the virtual device state in snapshots\r\n"), "{missing}");
+        assert!(missing.ends_with("KO: missing sub-command"), "{missing}");
+        assert!(run(&info, "avd snapshot remap 0").ends_with("KO:  bad sub-command"));
+        assert_eq!(run(&info, "avd pause"), "KO: unsupported 'avd' subcommand in simee", "other avd subcommands are unchanged");
     }
 
     #[test]

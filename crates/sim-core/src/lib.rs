@@ -9,6 +9,7 @@ pub mod geometry;
 pub mod gesture;
 pub mod goldfish;
 pub mod hid;
+pub mod network;
 pub mod pacing;
 pub mod pixels;
 pub mod platform;
