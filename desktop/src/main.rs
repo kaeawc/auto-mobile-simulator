@@ -17,7 +17,7 @@
 //!
 //! `cargo run` opens the window (`SIMEE_DEVICE=<udid|name|booted>` preselects a device);
 //! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
-//! watch, tv, apple-watch, apple-tv, empty).
+//! watch, tv, apple-watch, apple-tv, empty); a release build needs `--features tooling` for it.
 
 mod android;
 mod controls;
