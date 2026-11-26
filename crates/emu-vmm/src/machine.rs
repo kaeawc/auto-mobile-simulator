@@ -314,6 +314,46 @@ pub fn request_stop(stop: &AtomicBool) {
     }
 }
 
+/// The exit counters of the machine running (or the last one that ran), readable while it tears
+/// down: a stop that overruns still reports them ([`exit_counts`]).
+static EXIT_STATS: Mutex<Option<Arc<[crate::vcpu::ExitStats]>>> = Mutex::new(None);
+
+/// Per-vCPU exit counters (name, count) of the running or last machine; `None` before any ran.
+pub fn exit_counts() -> Option<Vec<Vec<(&'static str, u64)>>> {
+    let stats = EXIT_STATS.lock().unwrap_or_else(PoisonError::into_inner).clone()?;
+    Some(stats.iter().map(|s| s.snapshot().to_vec()).collect())
+}
+
+/// What the teardown is doing and since when ([`teardown_step`]).
+static TEARDOWN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+
+/// The last step [`boot_and_run`] marks: what runs after the machine is released and before
+/// the caller takes over, the drops of what the function still holds (the outcome's inputs, the
+/// renderer's handles). The caller's next [`teardown_step`] ends it, so a stop that stalls here
+/// is named, not reported as "no step".
+pub const RETURNING_STEP: &str = "dropping the machine's remaining state";
+
+/// A teardown step that takes longer than this is printed (`-verbose`).
+pub const SLOW_TEARDOWN_STEP: Duration = Duration::from_millis(250);
+
+/// Marks the start of teardown step `what` (and so the end of the one before; `None` ends the
+/// last). With `verbose`, a step that took over [`SLOW_TEARDOWN_STEP`] is printed.
+pub fn teardown_step(what: Option<&str>, verbose: bool) {
+    let mut t = TEARDOWN.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((prev, since)) = t.take()
+        && verbose
+        && since.elapsed() > SLOW_TEARDOWN_STEP
+    {
+        eprintln!("emu: teardown: {prev} took {} ms", since.elapsed().as_millis());
+    }
+    *t = what.map(|w| (w.to_owned(), Instant::now()));
+}
+
+/// The teardown step under way and how long it has run, if one is.
+pub fn teardown_status() -> Option<(String, Duration)> {
+    TEARDOWN.lock().unwrap_or_else(PoisonError::into_inner).as_ref().map(|(w, since)| (w.clone(), since.elapsed()))
+}
+
 /// How often the stop loop wakes on its own to look at the flag: a stop set without
 /// [`request_stop`] costs at most this long, not a hang.
 const STOP_BACKSTOP: Duration = Duration::from_secs(1);
@@ -621,6 +661,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
 
     // Guest counter starts near zero, identical on every vCPU.
     let cpus = Arc::new(Cpus::new(bus, wakers, emu_hvf::host_ticks()));
+    *EXIT_STATS.lock().unwrap_or_else(PoisonError::into_inner) = Some(cpus.stats.clone());
     let mut threads = Vec::new();
     for idx in 0..cpus.count() {
         let c = cpus.clone();
@@ -636,19 +677,31 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     }
 
     let (reason, _) = wait_for_stop(&cpus, &stop);
+    let verbose = cfg.launched.is_some();
+    teardown_step(Some("stopping the vCPUs"), verbose);
     cpus.request_stop(reason.clone());
-    for t in threads {
+    for (i, t) in threads.into_iter().enumerate() {
+        teardown_step(Some(&format!("joining vcpu{i}")), verbose);
         let _ = t.join();
     }
     let exits = cpus.stats.iter().map(|s| s.snapshot().to_vec()).collect();
-    // Devices (and their worker threads) go first, then the VM, then guest RAM.
+    // Devices (and their worker threads) go first, then the VM, then guest RAM. One device at a
+    // time, so a stop that overruns names the one it waits for.
+    let mut cpus = cpus;
+    if let Some(c) = Arc::get_mut(&mut cpus) {
+        std::mem::take(&mut c.bus).release_each(|name| teardown_step(Some(&format!("releasing {name}")), verbose));
+    }
+    teardown_step(Some("releasing the vCPUs"), verbose);
     drop(cpus);
     if let Some(r) = dma_renderer {
         let _ = r.set_dma_translator(None);
     }
+    teardown_step(Some("destroying the VM"), verbose);
     drop(vm);
+    teardown_step(Some("releasing guest RAM"), verbose);
     drop(as_area);
     drop(mem);
+    teardown_step(Some(RETURNING_STEP), verbose);
     if let (StopReason::Reset, Some(spec)) = (&reason, &cfg.gpu) {
         blank_until_next_post(&*spec.display, spec.verbose);
     }
@@ -765,6 +818,16 @@ fn hold_then_blank(display: &dyn crate::display::DisplaySink, hold: Option<(&cra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_gap_after_the_machine_is_a_named_step() {
+        teardown_step(Some("releasing guest RAM"), false);
+        teardown_step(Some(RETURNING_STEP), false);
+        let (what, _) = teardown_status().expect("a step is under way");
+        assert_eq!(what, RETURNING_STEP);
+        teardown_step(None, false);
+        assert!(teardown_status().is_none());
+    }
 
     fn spec(lib64: PathBuf) -> GpuSpec {
         GpuSpec {
