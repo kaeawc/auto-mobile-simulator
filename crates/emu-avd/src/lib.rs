@@ -4,6 +4,7 @@
 //! `<name>.avd/config.ini`, the system image directory) so existing AVDs boot unchanged.
 
 mod bootconfig;
+pub mod gpu;
 mod ini;
 pub mod sdk_device;
 
