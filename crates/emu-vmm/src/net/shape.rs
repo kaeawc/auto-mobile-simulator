@@ -45,6 +45,12 @@ impl Bucket {
         }
     }
 
+    /// Starts over with a full bucket and no debt (the rate stays).
+    pub fn reset(&mut self) {
+        self.tokens = if self.rate_bps > 0.0 { self.capacity() } else { 0.0 };
+        self.last = None;
+    }
+
     fn refill(&mut self, now: Instant) {
         if let Some(last) = self.last.replace(now).filter(|_| self.rate_bps > 0.0) {
             let gained = now.saturating_duration_since(last).as_secs_f64() * self.rate_bps;
@@ -69,22 +75,45 @@ impl Bucket {
     }
 }
 
+/// The bits of a full-size frame, which `Downlink::room` counts in.
+const FRAME_BITS: u64 = 1514 * 8;
+/// A rate holds this long a backlog and refuses what comes past it, as a real bottleneck's
+/// queue does: a sender that dumps a whole window must not park seconds of data in the link.
+const QUEUE: f64 = 1.0;
+
+/// How many bits a link at `bps` holds: [`QUEUE`] seconds of it, and never less than two
+/// frames (so a frame always fits). `None` for an unlimited link.
+pub fn queue_bits(bps: f64) -> Option<u64> {
+    (bps > 0.0).then(|| ((bps * QUEUE) as u64).max(2 * FRAME_BITS))
+}
+
+/// A frame held for the guest: when it is due, when the bucket let it go (before the latency),
+/// and when it arrived.
+struct Held {
+    due: Instant,
+    sent: Instant,
+    at: Instant,
+    frame: Vec<u8>,
+}
+
 /// Frames for the guest, each held until its time: the download rate first, then a latency
 /// between the minimum and maximum. Frames leave in the order they came in (a TCP flow
-/// would read reordering as loss), so a short delay behind a long one waits for it.
+/// would read reordering as loss), so a short delay behind a long one waits for it. At a rate
+/// the queue holds about a second of it; frames past that are refused.
 pub struct Downlink {
     bucket: Bucket,
     min_ms: u32,
     max_ms: u32,
     rng: u64,
     last_due: Option<Instant>,
-    queue: VecDeque<(Instant, Vec<u8>)>,
+    queue: VecDeque<Held>,
+    held_bits: u64,
 }
 
 impl Downlink {
     pub fn new() -> Downlink {
         let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
-        Downlink { bucket: Bucket::new(), min_ms: 0, max_ms: 0, rng: seed | 1, last_due: None, queue: VecDeque::new() }
+        Downlink { bucket: Bucket::new(), min_ms: 0, max_ms: 0, rng: seed | 1, last_due: None, queue: VecDeque::new(), held_bits: 0 }
     }
 
     pub fn len(&self) -> usize {
@@ -95,17 +124,29 @@ impl Downlink {
         self.queue.is_empty()
     }
 
-    /// Applies new conditions. Frames already held are timed again under them, so lifting a
-    /// throttle frees the backlog now rather than at the old rate.
-    pub fn set(&mut self, now: Instant, c: &Conditions) {
-        let held = std::mem::take(&mut self.queue);
-        self.bucket.set_rate(c.download_bps);
+    /// Applies new conditions to the frames already held. A new rate times them again from
+    /// when they arrived, as if it had always applied (lifting a throttle frees the backlog
+    /// now); the same rate keeps each frame's turn, and a new latency alone only redraws the
+    /// latency. Either way a frame is charged once.
+    pub fn set(&mut self, c: &Conditions) {
+        let rate = if c.download_bps.is_finite() && c.download_bps > 0.0 { c.download_bps } else { 0.0 };
+        let retime = rate != self.bucket.rate_bps;
+        self.bucket.set_rate(rate);
         // Stock stores the latencies as ints and a negative one is no delay.
         self.min_ms = c.min_latency_ms.max(0) as u32;
         self.max_ms = (c.max_latency_ms.max(0) as u32).max(self.min_ms);
         self.last_due = None;
-        for (_, f) in held {
-            self.push(now, f);
+        let held = std::mem::take(&mut self.queue);
+        self.held_bits = 0;
+        if retime {
+            self.bucket.reset();
+        }
+        for h in held {
+            if retime {
+                self.enqueue(h.at, h.frame);
+            } else {
+                self.hold(h);
+            }
         }
     }
 
@@ -122,32 +163,73 @@ impl Downlink {
         Duration::from_micros(u64::from(self.min_ms) * 1000 + r % span)
     }
 
-    /// Holds a frame for the guest.
-    pub fn push(&mut self, now: Instant, frame: Vec<u8>) {
-        let sent = now + self.bucket.take(now, frame.len());
-        let mut due = sent + self.jitter();
+    /// Whether `bytes` more fit in the queue: always, with no rate.
+    fn fits(&self, bytes: usize) -> bool {
+        queue_bits(self.bucket.rate_bps).is_none_or(|cap| self.held_bits + bytes as u64 * 8 <= cap)
+    }
+
+    /// How many more full-size frames the queue takes (any number, with no rate).
+    pub fn room(&self) -> usize {
+        queue_bits(self.bucket.rate_bps).map_or(usize::MAX, |cap| (cap.saturating_sub(self.held_bits) / FRAME_BITS) as usize)
+    }
+
+    /// How many full-size frames the queue holds in all (any number, with no rate): a
+    /// datagram of more fragments than this can never fit.
+    pub fn capacity(&self) -> usize {
+        queue_bits(self.bucket.rate_bps).map_or(usize::MAX, |cap| (cap / FRAME_BITS) as usize)
+    }
+
+    /// Charges a frame that arrived at `at` and queues it.
+    fn enqueue(&mut self, at: Instant, frame: Vec<u8>) {
+        let sent = at + self.bucket.take(at, frame.len());
+        self.hold(Held { due: sent, sent, at, frame });
+    }
+
+    /// Queues a frame after the latency, behind the frame before it.
+    fn hold(&mut self, mut h: Held) {
+        h.due = h.sent + self.jitter();
         if let Some(last) = self.last_due {
-            due = due.max(last);
+            h.due = h.due.max(last);
         }
-        self.last_due = Some(due);
-        self.queue.push_back((due, frame));
+        self.last_due = Some(h.due);
+        self.held_bits += h.frame.len() as u64 * 8;
+        self.queue.push_back(h);
+    }
+
+    /// Holds a frame for the guest; false (the frame is dropped) when the queue is full.
+    pub fn push(&mut self, now: Instant, frame: Vec<u8>) -> bool {
+        if !self.fits(frame.len()) {
+            return false;
+        }
+        self.enqueue(now, frame);
+        true
     }
 
     /// The next frame whose time has come.
     pub fn pop_due(&mut self, now: Instant) -> Option<Vec<u8>> {
-        match self.queue.front() {
-            Some((due, _)) if *due <= now => self.queue.pop_front().map(|(_, f)| f),
-            _ => None,
+        if self.queue.front().is_some_and(|h| h.due <= now) {
+            let h = self.queue.pop_front()?;
+            self.held_bits -= h.frame.len() as u64 * 8;
+            return Some(h.frame);
         }
+        None
+    }
+
+    /// Every held frame, in order, due or not (the shaping ended).
+    pub fn drain(&mut self) -> impl Iterator<Item = Vec<u8>> + '_ {
+        self.held_bits = 0;
+        self.last_due = None;
+        self.queue.drain(..).map(|h| h.frame)
     }
 
     /// When the oldest held frame is due.
     pub fn next_due(&self) -> Option<Instant> {
-        self.queue.front().map(|(d, _)| *d)
+        self.queue.front().map(|h| h.due)
     }
 
     pub fn clear(&mut self) {
         self.queue.clear();
+        self.held_bits = 0;
         self.last_due = None;
     }
 }
@@ -167,16 +249,31 @@ mod tests {
         for _ in 0..n {
             d.push(t0, vec![0; FRAME]);
         }
-        d.queue.back().expect("pushed").0
+        d.queue.back().expect("pushed").due
+    }
+
+    /// Feeds `n` frames as a sender does when the queue is full: it waits for room. Returns
+    /// when the last is due.
+    fn feed(d: &mut Downlink, t0: Instant, n: usize) -> Instant {
+        let (mut now, mut sent) = (t0, 0);
+        while sent < n {
+            if d.push(now, vec![0; FRAME]) {
+                sent += 1;
+            } else {
+                now = d.next_due().expect("full means held");
+                while d.pop_due(now).is_some() {}
+            }
+        }
+        d.queue.back().expect("pushed").due
     }
 
     #[test]
     fn download_rate_holds_per_direction_within_tolerance() {
         let t0 = Instant::now();
         let mut d = Downlink::new();
-        d.set(t0, &cond(0.0, 473_600.0, 0, 0));
+        d.set(&cond(0.0, 473_600.0, 0, 0));
         // 200 frames = 2.4 Mbit at 473.6 kbit/s: 5.07 s less the opening burst.
-        let secs = last_due(&mut d, t0, 200).duration_since(t0).as_secs_f64();
+        let secs = feed(&mut d, t0, 200).duration_since(t0).as_secs_f64();
         let ideal = 200.0 * FRAME as f64 * 8.0 / 473_600.0;
         assert!((ideal - 0.05..=ideal).contains(&secs), "{secs} vs {ideal}");
     }
@@ -205,7 +302,7 @@ mod tests {
     fn zero_is_unlimited_and_undelayed() {
         let t0 = Instant::now();
         let mut d = Downlink::new();
-        d.set(t0, &cond(0.0, 0.0, 0, 0));
+        d.set(&cond(0.0, 0.0, 0, 0));
         for _ in 0..5000 {
             d.push(t0, vec![0; FRAME]);
         }
@@ -223,22 +320,22 @@ mod tests {
     fn latency_stays_between_min_and_max_and_keeps_order() {
         let t0 = Instant::now();
         let mut d = Downlink::new();
-        d.set(t0, &cond(0.0, 0.0, 35, 200));
+        d.set(&cond(0.0, 0.0, 35, 200));
         let mut dues = Vec::new();
         for i in 0..500u32 {
             let at = t0 + Duration::from_millis(u64::from(i) * 2);
             d.push(at, vec![i as u8]);
-            let due = d.queue.back().expect("pushed").0;
+            let due = d.queue.back().expect("pushed").due;
             assert!(due >= at + Duration::from_millis(35), "frame {i} early");
             dues.push(due);
         }
         // Order is kept, and no frame waits past the max after the one before it.
         assert!(dues.windows(2).all(|w| w[0] <= w[1]));
-        let first = d.queue.front().expect("held").0;
+        let first = d.queue.front().expect("held").due;
         assert!(first <= t0 + Duration::from_millis(200));
         // The first frame, undisturbed by one ahead, sits inside [min, max].
         let mut lone = Downlink::new();
-        lone.set(t0, &cond(0.0, 0.0, 35, 200));
+        lone.set(&cond(0.0, 0.0, 35, 200));
         lone.push(t0, vec![0]);
         let wait = lone.next_due().expect("held").duration_since(t0);
         assert!((Duration::from_millis(35)..=Duration::from_millis(200)).contains(&wait));
@@ -248,7 +345,7 @@ mod tests {
     fn fixed_latency_is_exact() {
         let t0 = Instant::now();
         let mut d = Downlink::new();
-        d.set(t0, &cond(0.0, 0.0, 40, 40));
+        d.set(&cond(0.0, 0.0, 40, 40));
         d.push(t0, vec![1]);
         assert_eq!(d.next_due(), Some(t0 + Duration::from_millis(40)));
         assert!(d.pop_due(t0 + Duration::from_millis(39)).is_none());
@@ -259,22 +356,22 @@ mod tests {
     fn changing_conditions_mid_stream_retimes_held_frames() {
         let t0 = Instant::now();
         let mut d = Downlink::new();
-        d.set(t0, &cond(0.0, 14_400.0, 0, 0));
-        let slow = last_due(&mut d, t0, 20).duration_since(t0);
-        assert!(slow > Duration::from_secs(10), "{slow:?}");
+        d.set(&cond(0.0, 100_000.0, 0, 0));
+        let slow = last_due(&mut d, t0, 8).duration_since(t0);
+        assert!(slow > Duration::from_millis(800), "{slow:?}");
         // `network speed full`: the backlog is due now.
-        let t1 = t0 + Duration::from_secs(1);
-        d.set(t1, &cond(0.0, 0.0, 0, 0));
-        assert_eq!(d.len(), 20);
+        let t1 = t0 + Duration::from_millis(100);
+        d.set(&cond(0.0, 0.0, 0, 0));
+        assert_eq!(d.len(), 8);
         let mut n = 0;
         while d.pop_due(t1).is_some() {
             n += 1;
         }
-        assert_eq!(n, 20);
+        assert_eq!(n, 8);
         // And a throttle applied later takes hold for the frames after it.
-        d.set(t1, &cond(0.0, 100_000.0, 0, 0));
-        let secs = last_due(&mut d, t1, 20).duration_since(t1).as_secs_f64();
-        assert!(secs > 2.0, "{secs}");
+        d.set(&cond(0.0, 100_000.0, 0, 0));
+        let secs = last_due(&mut d, t1, 8).duration_since(t1).as_secs_f64();
+        assert!(secs > 0.8, "{secs}");
     }
 
     #[test]
@@ -282,22 +379,94 @@ mod tests {
         let t0 = Instant::now();
         let mut b = Bucket::new();
         b.set_rate(100_000.0);
-        // A long quiet spell doesn't bank more than the burst: 100 frames still take their time.
+        // Spend the opening burst so the refill clock is running, then go quiet for an hour.
+        while b.take(t0, FRAME).is_zero() {}
+        // The hour banks no more than the burst (2000 bits here, one frame floor 12144): the
+        // third frame after it is already in debt, where an unclamped bucket owes nothing.
         let t1 = t0 + Duration::from_secs(3600);
-        let mut wait = Duration::ZERO;
-        for _ in 0..100 {
-            wait = b.take(t1, FRAME);
-        }
-        let ideal = 100.0 * FRAME as f64 * 8.0 / 100_000.0;
-        assert!(wait.as_secs_f64() > ideal - 0.2, "{wait:?}");
+        let waits: Vec<Duration> = (0..3).map(|_| b.take(t1, FRAME)).collect();
+        assert!(waits[0].is_zero(), "the burst covers one frame: {waits:?}");
+        assert!(waits[2] > Duration::from_millis(200), "an hour's idle is not 3 frames of credit: {waits:?}");
     }
 
     #[test]
     fn negative_or_invalid_settings_mean_unshaped() {
         let t0 = Instant::now();
         let mut d = Downlink::new();
-        d.set(t0, &cond(-5.0, f64::NAN, -10, -1));
+        d.set(&cond(-5.0, f64::NAN, -10, -1));
         d.push(t0, vec![0; FRAME]);
         assert_eq!(d.next_due(), Some(t0));
+    }
+
+    fn secs(t: Instant, from: Instant) -> f64 {
+        t.duration_since(from).as_secs_f64()
+    }
+
+    #[test]
+    fn a_new_rate_times_held_frames_once_not_on_top_of_their_first_charge() {
+        let t0 = Instant::now();
+        let mut d = Downlink::new();
+        d.set(&cond(0.0, 100_000.0, 0, 0));
+        // 8 frames = 96 kbit: 0.96 s at 100 kbit/s; the rate doubles to 200 kbit/s.
+        for _ in 0..8 {
+            assert!(d.push(t0, vec![0; FRAME]), "fits in the second's queue? {}", d.len());
+        }
+        d.set(&cond(0.0, 200_000.0, 0, 0));
+        // As if 200 kbit/s had always applied: 0.48 s (less the opening burst), not the old
+        // 0.96 s of debt kept and the 8 frames charged again on top.
+        let last = secs(d.queue.back().expect("held").due, t0);
+        assert!((0.38..=0.49).contains(&last), "{last}");
+        assert_eq!(d.len(), 8);
+    }
+
+    #[test]
+    fn a_new_latency_alone_leaves_held_frames_their_place_in_the_rate() {
+        let t0 = Instant::now();
+        let mut d = Downlink::new();
+        d.set(&cond(0.0, 100_000.0, 0, 0));
+        for _ in 0..8 {
+            d.push(t0, vec![0; FRAME]);
+        }
+        let before = secs(d.queue.back().expect("held").due, t0);
+        // `network delay` alone: 100 ms on top, nothing more.
+        d.set(&cond(0.0, 100_000.0, 100, 100));
+        let after = secs(d.queue.back().expect("held").due, t0);
+        assert!((after - before - 0.1).abs() < 0.001, "{before} -> {after}");
+        // And back to none.
+        d.set(&cond(0.0, 100_000.0, 0, 0));
+        assert!((secs(d.queue.back().expect("held").due, t0) - before).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_burst_at_gsm_never_queues_more_than_a_second() {
+        let t0 = Instant::now();
+        let mut d = Downlink::new();
+        let gsm = 14_400.0;
+        d.set(&cond(0.0, gsm, 0, 0));
+        // A sender that dumps 500 frames at once: what is held stays within a second of the rate
+        // (two frames' worth at this speed), and the rest is refused.
+        let kept = (0..500).filter(|_| d.push(t0, vec![0; FRAME])).count();
+        assert!((1..=3).contains(&kept), "{kept}");
+        let last = secs(d.queue.back().expect("held").due, t0);
+        assert!(last <= 1.0 + FRAME as f64 * 8.0 / gsm, "{last} s of queue");
+        // Room tells the engine how much the next pass may add, and shrinks as frames queue.
+        assert_eq!(d.room(), 0);
+        assert!(d.capacity() >= 2);
+        // Draining makes room again.
+        while d.pop_due(t0 + Duration::from_secs(5)).is_some() {}
+        assert!(d.room() >= 2);
+    }
+
+    #[test]
+    fn the_queue_holds_a_seconds_of_a_fast_rate_and_none_is_unbounded() {
+        let t0 = Instant::now();
+        let mut d = Downlink::new();
+        d.set(&cond(0.0, 1_000_000.0, 0, 0));
+        let kept = (0..1000).filter(|_| d.push(t0, vec![0; FRAME])).count();
+        // 1 Mbit is 83 full-size frames of 1514 bytes; ours are 1500 bytes: 83.
+        assert!((80..=85).contains(&kept), "{kept}");
+        d.set(&cond(0.0, 0.0, 0, 0));
+        assert_eq!(d.room(), usize::MAX);
+        assert!((0..5000).all(|_| d.push(t0, vec![0; FRAME])));
     }
 }

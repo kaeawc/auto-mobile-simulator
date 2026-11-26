@@ -735,3 +735,86 @@ fn inbound_latency_lies_between_min_and_max_and_none_removes_it() {
     assert!(t1.elapsed() < Duration::from_millis(150), "undelayed: {:?}", t1.elapsed());
     echo.join().expect("echo");
 }
+
+/// One datagram out to a host echo and back through `n`.
+fn echo_once(n: &mut Nat, sport: u16, payload: &[u8]) {
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let port = server.local_addr().expect("addr").port();
+    server.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    let echo = std::thread::spawn(move || {
+        let mut b = [0u8; 2048];
+        let (len, from) = server.recv_from(&mut b).expect("recv");
+        server.send_to(&b[..len], from).expect("send");
+    });
+    n.transmit(&udp_frame(SocketAddrV4::new(GUEST, sport), SocketAddrV4::new(GW, port), payload));
+    next_frame(n, Duration::from_secs(5), |f| matches!(packet::parse(f), Frame::Udp { .. })).expect("reply");
+    echo.join().expect("echo");
+}
+
+#[test]
+fn an_unshaped_nat_never_builds_the_shaper_and_drops_it_when_the_conditions_set_none() {
+    // Pin: with both rates 0 and no latency (the default), traffic takes the plain path.
+    let (shared, mut n) = shaped(cond(0.0, 0.0, 0, 0));
+    echo_once(&mut n, 40010, b"plain");
+    assert!(!n.shaped(), "no shaper for unshaped conditions");
+    // Shaping on builds it; the same traffic still flows. (An unshaped engine reads the
+    // conditions every 50 ms, not every pass.)
+    *shared.lock().expect("conditions") = cond(0.0, 0.0, 30, 30);
+    std::thread::sleep(Duration::from_millis(120));
+    echo_once(&mut n, 40011, b"delayed");
+    assert!(n.shaped());
+    // Off again: the shaper is gone.
+    *shared.lock().expect("conditions") = cond(0.0, 0.0, 0, 0);
+    echo_once(&mut n, 40012, b"plain again");
+    assert!(!n.shaped(), "the shaper is dropped when the conditions set none");
+}
+
+#[test]
+fn tcp_through_the_shaper_finishes_at_the_set_rates() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let download: Vec<u8> = (0..50_000u32).map(|i| (i * 13) as u8).collect();
+    let reply = download.clone();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().expect("accept");
+        let mut got = Vec::new();
+        s.read_to_end(&mut got).expect("read to the guest's FIN");
+        s.write_all(&reply).expect("write");
+        got.len()
+    });
+    // 50 kB down at 400 kbit/s is 1 s; 12.5 kB up at 400 kbit/s is 0.25 s.
+    let network = Arc::new(std::sync::Mutex::new(cond(400_000.0, 400_000.0, 0, 0)));
+    let mut g = Guest::new(Config { network, ..Config::default() });
+    let t0 = Instant::now();
+    let h = g.connect(port, 49170);
+    g.until("established", |g| g.sock(h).state() == tcp::State::Established);
+    let up = vec![5u8; 12_500];
+    let mut sent = 0;
+    g.until("upload", |g| {
+        let s = g.sock(h);
+        if s.can_send() {
+            sent += s.send_slice(&up[sent..]).expect("send");
+        }
+        sent == up.len()
+    });
+    g.sock(h).close();
+    let mut got = Vec::new();
+    g.until("download", |g| {
+        let s = g.sock(h);
+        while s.can_recv() {
+            s.recv(|b| {
+                got.extend_from_slice(b);
+                (b.len(), ())
+            })
+            .expect("recv");
+        }
+        matches!(s.state(), tcp::State::TimeWait | tcp::State::Closed)
+    });
+    let took = t0.elapsed();
+    assert_eq!(server.join().expect("server"), up.len(), "the upload arrived whole");
+    assert!(got == download, "the download is intact");
+    // The rates are a floor (1.25 s of data in all); retransmits past the queue's cap and
+    // timer granularity stretch it, but not without bound.
+    assert!(took >= Duration::from_millis(900), "throttled: {took:?}");
+    assert!(took <= Duration::from_secs(9), "{took:?}");
+}
