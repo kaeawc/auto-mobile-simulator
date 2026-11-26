@@ -29,6 +29,7 @@ emu-gfxstream = { path = "crates/emu-gfxstream" }
 emu-ext4 = { path = "crates/emu-ext4" }
 emu-fdt = { path = "crates/emu-fdt" }
 emu-hvf = { path = "crates/emu-hvf" }
+emu-kvm = { path = "crates/emu-kvm" }
 emu-sdk = { path = "crates/emu-sdk" }
 emu-vmm = { path = "crates/emu-vmm" }
 
@@ -56,6 +57,11 @@ roxmltree = { version = "0.21", default-features = false, features = ["std"] }
 sha1_smol = { version = "1", default-features = false }
 # Host audio for emu's virtio-snd card (CoreAudio on macOS; emu-vmm only, macOS only).
 cpal = { version = "0.18", default-features = false }
+# Linux KVM (emu-kvm only): the rust-vmm ioctl wrappers Firecracker and Cloud Hypervisor use,
+# the generated uapi structs, and their eventfd/signal helpers.
+kvm-ioctls = { version = "0.25", default-features = false }
+kvm-bindings = { version = "0.14", default-features = false }
+vmm-sys-util = { version = "0.15", default-features = false }
 # Objective-C runtime bindings. Only sim-coresim may depend on these.
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError"] }
@@ -63,7 +69,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 block2 = { version = "0.6", default-features = false, features = ["std"] }
 
 # unsafe is forbidden everywhere except the FFI crates, which set their own lints: sim-coresim
-# (Objective-C), emu-hvf (Hypervisor.framework, guest RAM), emu-gfxstream (the renderer) and
+# (Objective-C), emu-hvf (Hypervisor.framework, guest RAM), emu-kvm (Linux KVM), emu-gfxstream (the renderer) and
 # apps/emu (one signal-mask function, so `deny` there instead of `forbid`).
 [workspace.lints.rust]
 unsafe_code = "forbid"
