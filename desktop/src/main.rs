@@ -21,6 +21,7 @@
 //! tooling` for it.
 
 mod android;
+mod bezel;
 mod controls;
 mod debug;
 mod device;
@@ -82,6 +83,9 @@ pub enum Input {
     Hover(f32, f32),
     /// The pointer left the screen (the stylus out of range).
     Leave,
+    /// One sample of a touch that came in from the screen's edge: a drag that started on the
+    /// bezel ([`bezel`]).
+    Edge(f32, f32, Phase, sim_core::gesture::ScreenEdge),
     Key(KeyAction),
 }
 
@@ -145,6 +149,8 @@ pub struct State {
     pen: Option<stylus::Pen>,
     /// The screen element's size in points (pointer moves come in its own points).
     pub screen_view: (f32, f32),
+    /// Where the screen and its bezel are, and the edge touch in progress.
+    pub bezel: bezel::Bezel,
 }
 
 /// An Android screen switched away from, with what the window showed it with.
@@ -394,6 +400,7 @@ fn init() -> State {
         stylus: false,
         pen: None,
         screen_view: (0.0, 0.0),
+        bezel: bezel::Bezel::default(),
     }
 }
 
@@ -569,6 +576,7 @@ fn headless() -> bool {
 fn setup(s: &mut State, waker: Waker) {
     s.native.set_waker(waker.clone());
     s.outbox = work::Outbox::new(Some(waker.clone()));
+    s.bezel.set_outbox(s.outbox.clone());
     s.waker = Some(waker);
     if s.offline || headless() {
         s.offline = true;
@@ -636,7 +644,10 @@ fn android_action(s: &State, f: impl FnOnce(&sim_android::Device) -> Result<(), 
 fn coalesce_moves(inputs: Vec<Input>) -> Vec<Input> {
     let mut out: Vec<Input> = Vec::with_capacity(inputs.len());
     for input in inputs {
-        if let (Input::Move(..), Some(Input::Move(..))) | (Input::Hover(..), Some(Input::Hover(..))) = (&input, out.last()) {
+        if let (Input::Move(..), Some(Input::Move(..)))
+        | (Input::Hover(..), Some(Input::Hover(..)))
+        | (Input::Edge(.., Phase::Move, _), Some(Input::Edge(.., Phase::Move, _))) = (&input, out.last())
+        {
             out.pop();
         }
         out.push(input);
@@ -867,10 +878,21 @@ fn apply(s: &State, input: Input) {
             s.live.iter().for_each(|l| l.strokes(&strokes));
             return;
         }
+        Input::Edge(x, y, phase, edge) => return edge_touch(s, x, y, phase, edge),
         Input::Key(_) | Input::Hover(..) | Input::Leave => return,
     };
     if let Some(live) = &s.live {
         live.touch(x, y, phase);
+    } else if let Some(sc) = &s.screen {
+        sc.touch(x, y, phase);
+    }
+}
+
+/// Sends one sample of a touch from the screen's `edge` (a drag from the bezel): on iOS through the
+/// API's `touch` with `edge`, on Android as an ordinary touch, already on the edge.
+fn edge_touch(s: &State, x: f32, y: f32, phase: Phase, edge: sim_core::gesture::ScreenEdge) {
+    if let Some(live) = &s.live {
+        s.bezel.send(&live.udid, (x, y), phase, edge);
     } else if let Some(sc) = &s.screen {
         sc.touch(x, y, phase);
     }
@@ -1061,6 +1083,100 @@ mod tests {
             matches!(rt.state.inputs.first(), Some(Input::Down(px, py)) if near(*px, 180.0) && near(*py, 200.0)),
             "{:?}",
             rt.state.inputs
+        );
+    }
+
+    /// A drag that starts just below an iPad's screen is a touch from its bottom edge, from the
+    /// edge pixel up to where the pointer goes; one on the screen stays an ordinary touch.
+    #[test]
+    fn a_drag_from_the_bezel_comes_in_from_that_edge() {
+        use sim_core::gesture::ScreenEdge;
+        let mut rt = runtime(ipad_scene);
+        let ([x, y, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+        let (dw, dh) = rt.state.screen_size();
+        let near = |a: f32, b: f32| (a - b).abs() < 2.0;
+        rt.pointer_down(x + w * 0.5, y + h + bezel::BAND * 0.5);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_move(x + w * 0.5, y + h * 0.5);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_up(x + w * 0.5, y + h * 0.5);
+        rt.frame(1.0 / 60.0);
+        let inputs = std::mem::take(&mut rt.state.inputs);
+        assert!(
+            matches!(inputs.first(), Some(Input::Edge(px, py, Phase::Down, ScreenEdge::Bottom)) if near(*px, dw as f32 * 0.5) && near(*py, dh as f32 - 1.0)),
+            "{inputs:?}"
+        );
+        assert!(
+            inputs.iter().any(|i| matches!(i, Input::Edge(_, py, Phase::Move, ScreenEdge::Bottom) if near(*py, dh as f32 * 0.5))),
+            "{inputs:?}"
+        );
+        assert!(matches!(inputs.last(), Some(Input::Edge(_, _, Phase::Up, ScreenEdge::Bottom))), "{inputs:?}");
+        assert_eq!(rt.state.bezel.edge, None, "the drag ended");
+
+        // Above the top-right corner: Control Center's edge.
+        rt.pointer_down(x + w - 4.0, y - bezel::BAND * 0.5);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_up(x + w - 4.0, y + h * 0.3);
+        rt.frame(1.0 / 60.0);
+        let inputs = std::mem::take(&mut rt.state.inputs);
+        assert!(matches!(inputs.first(), Some(Input::Edge(_, py, Phase::Down, ScreenEdge::Top)) if *py == 0.0), "{inputs:?}");
+
+        // On the screen it's a touch; far outside the bezel, nothing.
+        rt.pointer_down(x + w * 0.5, y + h - 2.0);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_up(x + w * 0.5, y + h * 0.5);
+        rt.frame(1.0 / 60.0);
+        let inputs = std::mem::take(&mut rt.state.inputs);
+        assert!(matches!(inputs.first(), Some(Input::Down(..))), "{inputs:?}");
+        assert!(!inputs.iter().any(|i| matches!(i, Input::Edge(..))), "{inputs:?}");
+        if x > bezel::BAND * 2.0 + 10.0 {
+            rt.pointer_down(x - bezel::BAND * 2.0, y + h * 0.5);
+            rt.frame(1.0 / 60.0);
+            rt.pointer_up(x, y + h * 0.5);
+            rt.frame(1.0 / 60.0);
+            assert!(rt.state.inputs.is_empty(), "{:?}", rt.state.inputs);
+        }
+    }
+
+    /// Android's edge gestures are ordinary touches from the edge: a bezel drag on an Android phone
+    /// starts on the left edge pixel (gesture navigation's back); a TV has no bezel.
+    #[test]
+    fn android_bezel_drags_start_on_the_edge_and_tvs_have_no_bezel() {
+        use sim_core::gesture::ScreenEdge;
+        let mut rt = runtime(android_scene);
+        let ([x, y, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+        assert!(rt.find("device-bezel").is_some());
+        rt.pointer_down(x - bezel::BAND * 0.5, y + h * 0.5);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_up(x + w * 0.3, y + h * 0.5);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            matches!(rt.state.inputs.first(), Some(Input::Edge(px, _, Phase::Down, ScreenEdge::Left)) if *px == 0.0),
+            "{:?}",
+            rt.state.inputs
+        );
+        let rt = runtime(tv_scene);
+        assert!(rt.find("device-bezel").is_none());
+        let rt = runtime(apple_tv_scene);
+        assert!(rt.find("device-bezel").is_none());
+    }
+
+    #[test]
+    fn edge_moves_coalesce_but_keep_their_ends() {
+        use sim_core::gesture::ScreenEdge::Bottom;
+        let inputs = vec![
+            Input::Edge(1.0, 9.0, Phase::Down, Bottom),
+            Input::Edge(1.0, 8.0, Phase::Move, Bottom),
+            Input::Edge(1.0, 7.0, Phase::Move, Bottom),
+            Input::Edge(1.0, 6.0, Phase::Up, Bottom),
+        ];
+        assert_eq!(
+            coalesce_moves(inputs),
+            [
+                Input::Edge(1.0, 9.0, Phase::Down, Bottom),
+                Input::Edge(1.0, 7.0, Phase::Move, Bottom),
+                Input::Edge(1.0, 6.0, Phase::Up, Bottom)
+            ]
         );
     }
 
