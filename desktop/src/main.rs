@@ -795,7 +795,8 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     {
         s.sized_for = Some(size);
         let form_factor = s.selected_info().and_then(|i| i.form_factor);
-        tx.resize_window(fit_window(size, form_factor));
+        let bezel = s.selected_info().and_then(controls::bezel).is_some();
+        tx.resize_window(fit_window(size, form_factor, bezel));
         changed = true;
     }
     changed
@@ -855,17 +856,20 @@ const MAX_WINDOW_W: f32 = 1440.0;
 
 /// The window that fits a device screen of `size` pixels: the sidebar (240), the gutters (32),
 /// the screen at [`android::SCREEN_POINTS`] tall (at least 420 wide, for the toolbar) and the
-/// Android panel (340); 110 points of toolbar and status around it. A landscape tablet's screen
+/// Android panel (340); 110 points of toolbar and status around it. A device with a bezel
+/// ([`controls::bezel`]) has a [`bezel::BAND`] of stage around its screen on every side, which the
+/// window budgets on top, so the screen is drawn at the size it has without one. A landscape tablet's screen
 /// (2560x1600 is 1216 points wide at that height) would make the window wider than a laptop's
 /// display, so a tablet's wide screen is shown shorter instead, as far as fits [`MAX_WINDOW_W`].
 /// Other form factors (an unfolded foldable, automotive, TV) keep the full-height screen.
-fn fit_window(size: (u32, u32), form_factor: Option<FormFactor>) -> (f32, f32) {
+fn fit_window(size: (u32, u32), form_factor: Option<FormFactor>, bezel: bool) -> (f32, f32) {
     const CHROME_W: f32 = 240.0 + 32.0 + 340.0;
     let aspect = size.0 as f32 / size.1.max(1) as f32;
     let full_w = android::SCREEN_POINTS * aspect;
     let screen_w = if form_factor == Some(FormFactor::Tablet) { full_w.min(MAX_WINDOW_W - CHROME_W) } else { full_w };
     let screen_h = screen_w / aspect;
-    (CHROME_W + screen_w.max(420.0), screen_h + 110.0)
+    let band = if bezel { 2.0 * bezel::BAND } else { 0.0 };
+    (CHROME_W + (screen_w + band).max(420.0), screen_h + band + 110.0)
 }
 
 /// Sends one touch or keystroke input to the device on screen.
@@ -882,7 +886,13 @@ fn apply(s: &State, input: Input) {
         Input::Key(_) | Input::Hover(..) | Input::Leave => return,
     };
     if let Some(live) = &s.live {
-        live.touch(x, y, phase);
+        // Edge touches go through the API's worker; while any are still on their way, this one
+        // follows them there, so a tap after a bezel swipe can't overtake it.
+        if s.bezel.busy() {
+            s.bezel.send(&live.udid, (x, y), phase, None);
+        } else {
+            live.touch(x, y, phase);
+        }
     } else if let Some(sc) = &s.screen {
         sc.touch(x, y, phase);
     }
@@ -892,7 +902,7 @@ fn apply(s: &State, input: Input) {
 /// API's `touch` with `edge`, on Android as an ordinary touch, already on the edge.
 fn edge_touch(s: &State, x: f32, y: f32, phase: Phase, edge: sim_core::gesture::ScreenEdge) {
     if let Some(live) = &s.live {
-        s.bezel.send(&live.udid, (x, y), phase, edge);
+        s.bezel.send(&live.udid, (x, y), phase, Some(edge));
     } else if let Some(sc) = &s.screen {
         sc.touch(x, y, phase);
     }
@@ -1135,6 +1145,44 @@ mod tests {
             rt.pointer_up(x, y + h * 0.5);
             rt.frame(1.0 / 60.0);
             assert!(rt.state.inputs.is_empty(), "{:?}", rt.state.inputs);
+        }
+    }
+
+    /// A click on the bezel that never moves does nothing (on Android its touch would tap the
+    /// screen's edge pixel); the touch-down is held until the drag has moved a few points.
+    #[test]
+    fn a_click_on_the_bezel_does_nothing_until_it_drags() {
+        use sim_core::gesture::ScreenEdge;
+        for scene in [ipad_scene as fn(&mut State), android_scene] {
+            let mut rt = runtime(scene);
+            let ([x, y, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+            let at = (x + w * 0.5, y + h + bezel::BAND * 0.5);
+            rt.pointer_down(at.0, at.1);
+            rt.frame(1.0 / 60.0);
+            rt.pointer_move(at.0 + 1.0, at.1 - 2.0);
+            rt.frame(1.0 / 60.0);
+            rt.pointer_up(at.0 + 1.0, at.1 - 2.0);
+            rt.frame(1.0 / 60.0);
+            assert!(rt.state.inputs.is_empty(), "a click sends nothing: {:?}", rt.state.inputs);
+            assert_eq!(rt.state.bezel.press, None);
+
+            // Past the threshold: down at the press, then the moves, then up.
+            rt.pointer_down(at.0, at.1);
+            rt.frame(1.0 / 60.0);
+            rt.pointer_move(at.0, at.1 - 3.0);
+            rt.frame(1.0 / 60.0);
+            assert!(rt.state.inputs.is_empty(), "still under the threshold: {:?}", rt.state.inputs);
+            rt.pointer_move(at.0, at.1 - bezel::DRAG_THRESHOLD - 4.0);
+            rt.frame(1.0 / 60.0);
+            rt.pointer_move(at.0, y + h * 0.5);
+            rt.frame(1.0 / 60.0);
+            rt.pointer_up(at.0, y + h * 0.5);
+            rt.frame(1.0 / 60.0);
+            let inputs = std::mem::take(&mut rt.state.inputs);
+            let phases: Vec<_> = inputs.iter().map(|i| if let Input::Edge(_, _, p, e) = i { (*p, *e) } else { panic!("{i:?}") }).collect();
+            assert_eq!(phases.first(), Some(&(Phase::Down, ScreenEdge::Bottom)), "{inputs:?}");
+            assert!(phases.len() >= 3 && phases[1..phases.len() - 1].iter().all(|p| p.0 == Phase::Move), "{inputs:?}");
+            assert_eq!(phases.last(), Some(&(Phase::Up, ScreenEdge::Bottom)), "{inputs:?}");
         }
     }
 
@@ -1565,11 +1613,11 @@ mod tests {
     fn landscape_tablets_fit_a_laptop_display() {
         // Phones and portrait tablets keep the full-height screen.
         let tablet = Some(FormFactor::Tablet);
-        let phone = fit_window((720, 1280), Some(FormFactor::Phone));
+        let phone = fit_window((720, 1280), Some(FormFactor::Phone), false);
         assert_eq!(phone.1, android::SCREEN_POINTS + 110.0);
-        assert!(fit_window((1600, 2560), tablet).1 == phone.1 && fit_window((1600, 2560), tablet).0 < MAX_WINDOW_W);
+        assert!(fit_window((1600, 2560), tablet, false).1 == phone.1 && fit_window((1600, 2560), tablet, false).0 < MAX_WINDOW_W);
         // A Pixel Tablet in landscape would be 1828 points wide at full height: it is shorter.
-        let (w, h) = fit_window((2560, 1600), tablet);
+        let (w, h) = fit_window((2560, 1600), tablet, false);
         assert_eq!(w, MAX_WINDOW_W);
         let screen = (w - 612.0, h - 110.0);
         assert!((screen.0 / screen.1 - 1.6).abs() < 1e-3, "the screen keeps its aspect: {screen:?}");
@@ -1589,9 +1637,42 @@ mod tests {
             ((1920, 1080), FormFactor::Tv),
             ((720, 1280), FormFactor::Phone),
         ] {
-            assert_eq!(fit_window(size, Some(ff)), full(size), "{ff:?} {size:?}");
+            assert_eq!(fit_window(size, Some(ff), false), full(size), "{ff:?} {size:?}");
         }
-        assert_eq!(fit_window((2208, 1840), None), full((2208, 1840)), "an unknown form factor keeps its size");
-        assert_eq!(fit_window((2560, 1600), Some(FormFactor::Tablet)).0, MAX_WINDOW_W);
+        assert_eq!(fit_window((2208, 1840), None, false), full((2208, 1840)), "an unknown form factor keeps its size");
+        assert_eq!(fit_window((2560, 1600), Some(FormFactor::Tablet), false).0, MAX_WINDOW_W);
+    }
+
+    /// A device with a bezel has a band of stage around its screen: the window budgets it, so
+    /// the screen is drawn as tall (and a landscape tablet as wide) as it was before the bezel.
+    #[test]
+    fn the_fitted_window_budgets_the_bezel_band() {
+        let band = 2.0 * bezel::BAND;
+        let phone = fit_window((720, 1280), Some(FormFactor::Phone), true);
+        assert_eq!(phone, (612.0 + android::SCREEN_POINTS * 0.5625 + band, android::SCREEN_POINTS + 110.0 + band));
+        let tablet = fit_window((2560, 1600), Some(FormFactor::Tablet), true);
+        assert_eq!(tablet.0, MAX_WINDOW_W + band, "the screen keeps its 828 points");
+        assert_eq!(tablet.1, (MAX_WINDOW_W - 612.0) / 1.6 + 110.0 + band);
+        // No bezel, no band: a TV is the window it had.
+        assert_eq!(
+            fit_window((1920, 1080), Some(FormFactor::Tv), false),
+            (612.0 + android::SCREEN_POINTS * 1920.0 / 1080.0, android::SCREEN_POINTS + 110.0)
+        );
+    }
+
+    /// In the fitted window the screen is drawn at least [`android::SCREEN_POINTS`] tall, bezel or
+    /// not (the headless layout has less chrome than the app, so more).
+    #[test]
+    fn a_phone_with_a_bezel_is_drawn_full_height_in_its_fitted_window() {
+        let mut s = init();
+        android_scene(&mut s);
+        let size = s.screen_size();
+        let bezel = s.selected_info().and_then(controls::bezel).is_some();
+        assert!(bezel);
+        let window = fit_window(size, Some(FormFactor::Phone), bezel);
+        let mut rt = Runtime::new(s, view::view, window, Env::new(true, 2.0));
+        rt.frame(0.0);
+        let ([_, _, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+        assert!(h >= android::SCREEN_POINTS - 1.0, "the band took height from the screen: {w}x{h} in {window:?}");
     }
 }

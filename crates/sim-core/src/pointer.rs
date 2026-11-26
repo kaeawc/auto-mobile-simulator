@@ -15,7 +15,7 @@
 //! keeps going after the next move starts. Neither the device's pointer acceleration
 //! (`HIDMouseAcceleration`, 1.0 on both) nor backboardd's pointer
 //! preferences change it (measured 2026-11-26). So every run ends with [`TAIL`] halving steps
-//! (the overrun of the last, 1/1024 of a step, is under 0.01 pt) and homing pauses after the push
+//! (the overrun of the last, 1/64 of a 10 pt step, is 0.16 pt) and homing pauses after the push
 //! into the bottom edge before it rises: exact on both.
 
 use std::time::Duration;
@@ -26,7 +26,7 @@ use crate::reuse::BootKey;
 /// The longest step, in points, sent in one report.
 pub const MAX_STEP: f64 = 10.0;
 /// How many halving steps end a run in place of its last step.
-pub const TAIL: usize = 10;
+pub const TAIL: usize = 6;
 /// Reports of no motion after the push into the bottom edge: a pause (~100 ms) in which iOS 27.2's
 /// overrun of the push goes into the edge instead of into the rise that follows.
 const PAUSE: usize = 6;
@@ -190,6 +190,13 @@ mod tests {
         moves.iter().fold((0.0, 0.0), |(x, y), (dx, dy)| (x + dx, y + dy))
     }
 
+    /// Homing is 85 reports (74 before its pause and the halving tail): each costs 16 ms.
+    #[test]
+    fn homing_is_85_reports() {
+        assert_eq!(home().len(), 85);
+        assert_eq!(steps(0.0, 100.0).len(), 9 + TAIL, "a move costs its steps plus the tail");
+    }
+
     #[test]
     fn steps_are_short_and_add_up() {
         let s = steps(100.0, -45.0);
@@ -201,7 +208,7 @@ mod tests {
     }
 
     /// iOS 27.2 carries the pointer on by half the last report of a run: the run ends slowing
-    /// down, so that overrun is under 0.01 pt.
+    /// down, so that overrun is at most 0.16 pt.
     #[test]
     fn runs_end_slowing_to_a_stop() {
         let s = steps(500.0, -376.0);
@@ -210,7 +217,7 @@ mod tests {
         assert!(tail.windows(2).all(|w| w[1].0 <= w[0].0), "{tail:?}");
         assert_eq!(tail[0], (5.0, -3.76));
         let (last_x, last_y) = *s.last().expect("steps");
-        assert!(last_x * 0.5 < 0.01 && (last_y * 0.5).abs() < 0.01, "overrun {last_x}, {last_y}");
+        assert!(last_x * 0.5 <= 0.16 && (last_y * 0.5).abs() <= 0.16, "overrun {last_x}, {last_y}");
         assert_eq!(steps(3.0, 0.0)[0], (1.5, 0.0), "a short move is all tail");
     }
 

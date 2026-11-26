@@ -182,13 +182,18 @@ without one fails that input with `Unavailable`, never a crash.
   then shows its pointer (in screenshots too), hover effects and Trackpad & Mouse settings. Motion
   is only relative, so each call homes the pointer against the left and bottom edges (never the top,
   where iPadOS opens Notification or Control Center, nor a corner, which the rounded screen stops
-  short) and moves in 10 pt steps that slow to a stop, halving over the last 10 pt. iOS 27.2 carries
+  short) and moves in 10 pt steps that slow to a stop, halving over the last six reports (the last one is 0.3 pt, so the overrun is 0.16 pt). iOS 27.2 carries
   the pointer on past a run of reports by half its last report (10 pt steps landed 5–11 pt long,
   median 7.9 pt over 12 targets), and pushes into an edge carry on into the next move; neither
   `HIDMouseAcceleration` (1.0 on both) nor backboardd's pointer acceleration preference changes
   that. Ending each run slowing down and pausing after the push into the bottom edge makes it
-  exact on both (median and maximum error 0.0 pt over the same 12 targets on 26.5 and 27.2, read
-  back by the probe app, 2026-11-26). `pointer --to` drags in one call; a button held by `pointer … down`
+  exact on both (median and maximum error 0.0 pt over the same 12 targets on 26.5 and 27.2 with ten
+  halving steps, read back by the probe app, 2026-11-26; six steps, which leave 0.16 pt, are not
+  re-measured on a device yet). Each report is 16 ms, so the halving steps cost time: homing is
+  85 reports (1.36 s of reports; 74 before the pause and tail) and every move after the first
+  adds 5 reports (80 ms; 144 ms with ten steps). Those are counted from the report interval, not
+  timed on a device (host load was 198 when this was written; see "Not yet measured" in
+  `benchmarks.md`). `pointer --to` drags in one call; a button held by `pointer … down`
   keeps the position for the next calls on the same server (`simee serve`) in the same boot. A
   `down` that runs in its own process (no server) is refused, since nothing would release it, as
   are an `up` with nothing held and a `move` or `up` after a failed call lost the held button
