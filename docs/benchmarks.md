@@ -272,6 +272,29 @@ Under emulation, apps can exceed Android's startup timeouts. One interactive boo
 UI isn't responding" after com.android.phone overran its startup (its main thread runnable, not
 blocked).
 
+The SDK emulator's software mode on the same host and day: 37.3.10 with the same image in an AVD
+of the same shape (4 vCPUs; stock raised its 2 GB to 2560 MB). It runs with `-accel off`, which
+it refuses unless `ANDROID_I_WANT_MY_TCG=yes` is set, plus SwiftShader and `-no-snapshot`. One
+uncounted first boot, then three, each with a 40-minute budget.
+
+```bash
+scripts/tcg-bench.py <sysdir> <workdir> --stock <sdk>/emulator/emulator --avd <x86_64 avd> --boots 3 --budget 2400
+```
+
+| Run | Boot to `sys.boot_completed`, median of 3 (runs) | Host CPU 60–120 s after | 240–300 s after | Peak RSS |
+| --- | --- | --- | --- | --- |
+| emu's devices (above) | 168 s | 2.14 cores | 0.75 cores | 3058 + 233 MB |
+| The SDK emulator, `-accel off` | 2302 s (over 2400, 1603.3, 2301.9) | 1.08 cores | 1.09 cores | 3116 MB |
+
+The SDK emulator's software mode runs every vCPU on one translator thread (`top -H`: one QEMU thread
+at 93% of a core, the rest near idle). Its first boot and first counted boot didn't reach
+`sys.boot_completed` in 40 minutes. In the guest, `system_server` was killed by its watchdog 4
+times, and zygote started 5 times in the first. The two that completed took 27 and 38 minutes,
+13.7 times emu's median. Stock idles at about one core because its single translator thread
+never goes idle. In this mode it also gives the guest GLES over the pipe (`gltransport=pipe`,
+`skiagl`) rather than ANGLE. Builds of emu ran at the lowest priority on 2 of the 4 cores during
+some of the counted boots.
+
 ## Android farm
 
 Clones of one settled golden AVD booted together, each until it is settled (boot complete and
