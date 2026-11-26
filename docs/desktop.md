@@ -9,6 +9,7 @@ cd desktop
 cargo run --release                     # SIMEE_DEVICE=<udid|name|booted> preselects a device
 cargo run -- --snap shot.png --scene demo   # headless render; scenes: demo, android, foldable,
                                             # watch, tv, apple-watch, apple-tv, empty
+cargo run --release --features tooling -- --snap shot.png --scene demo   # the same, optimized
 ```
 
 Devices are listed under iOS and Android, each with its sub-platform. Pick one (boot it if

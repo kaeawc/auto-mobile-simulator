@@ -132,13 +132,17 @@ impl Screen {
             .spawn(move || {
                 // Only the newest announced frame (the window shows nothing older), and none
                 // while the window is hidden: one announced just before it hid is passed over.
+                // Each frame is read into the buffer the previous one came back in, so a steady
+                // stream allocates nothing per frame (`spare` is empty only for the first frame,
+                // or while Rune is still copying the previous one out).
+                let mut spare = Vec::new();
                 while sh.wait(&a)
-                    && let Ok((header, rgba)) = frames.newest_frame_when(|| sh.get())
+                    && let Ok(header) = frames.newest_frame_into(&mut spare, || sh.get())
                 {
                     r.fetch_add(1, Ordering::Relaxed);
                     d.0.store(header.device_width, Ordering::Relaxed);
                     d.1.store(header.device_height, Ordering::Relaxed);
-                    p.set(header.width, header.height, rgba);
+                    spare = p.replace(header.width, header.height, std::mem::take(&mut spare));
                 }
                 a.store(false, Ordering::Relaxed);
             })
@@ -499,6 +503,46 @@ mod tests {
         assert!(screen.alive());
         done.send(()).expect("done");
         assert_eq!(server.join().expect("server"), ["shm", "hello 1080"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #17: each frame is read into the buffer the frame before last was in (Rune's
+    /// `Pixels::replace` hands it back), so a steady stream alternates two buffers and allocates
+    /// none after its second frame. Between frames the test holds a same-size allocation, so a
+    /// path that frees each frame's buffer and allocates the next can't pass by being handed the
+    /// freed address back.
+    #[test]
+    fn a_steady_stream_alternates_two_frame_buffers() {
+        let dir = PathBuf::from("/tmp").join(format!("rs-recycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("simee")).expect("dir");
+        let listener = UnixListener::bind(sim_android::display::socket(&dir)).expect("bind");
+        let (w, h) = (64u32, 64u32);
+        let len = (w * h * 4) as usize;
+        let (next, go) = std::sync::mpsc::channel::<u32>();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            for n in go {
+                let mut msg = Record::Frame(FrameHeader::new(w, h, w, h, u64::from(n)).expect("size")).encode().to_vec();
+                msg.extend(n.to_le_bytes().repeat(len / 4));
+                conn.write_all(&msg).expect("send");
+            }
+        });
+        let screen = Screen::connect("pixel", dir.clone(), 1080, console(Outbox::default())).expect("connect");
+        let (mut at, mut soak) = (Vec::new(), Vec::new());
+        for n in 1..=8u32 {
+            next.send(n).expect("send");
+            wait_until("the frame", || screen.pixels.size() == (w, h) && shown(&screen) == u64::from(n));
+            at.push(screen.pixels.with_rgba(|_, _, px| px.as_ptr() as usize).expect("a frame"));
+            soak.push(Vec::<u8>::with_capacity(len));
+        }
+        assert_ne!(at[0], at[1], "two buffers");
+        for k in 2..at.len() {
+            assert_eq!(at[k], at[k - 2], "frame {} refilled frame {}'s buffer: {at:x?}", k + 1, k - 1);
+        }
+        assert_eq!(screen.frames_read(), 8);
+        drop((next, screen, soak));
+        server.join().expect("server");
         let _ = std::fs::remove_dir_all(dir);
     }
 

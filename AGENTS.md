@@ -178,8 +178,9 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `android.rs` (live Android device: frames and input over `display.sock`), `controls.rs` (the
   toolbar each platform and form factor gets), `debug.rs` (debug panel: tabs, API worker thread, views), `icons.rs` (SVG
   icons), `keys.rs` (host keys → HID), `view.rs`, `main.rs` (state, actions, poll, tests).
-  Headless `--snap` needs a debug build (release builds lack Rune's tooling feature); scenes:
-  demo, android, foldable, watch, tv, empty. On Linux it renders with Mesa's lavapipe.
+  Headless `--snap` works in debug builds, and in release builds with `--features tooling`
+  (Rune's agent tooling, left out of the shipped release); scenes: demo, android, foldable,
+  watch, tv, empty. On Linux it renders with Mesa's lavapipe.
 - `scripts/` — `parity.sh`, `automobile-harness.sh`, `automobile-farm.sh` (every device through
   one private AutoMobile daemon; `automobile-daemon.sh` starts, joins and stops it, and the
   harnesses join it through `AM_DAEMON_ENV`), `pf-shape.sh` (pf/dummynet, needs sudo);
