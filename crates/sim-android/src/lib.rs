@@ -1365,11 +1365,13 @@ mod tests {
         let d = f.android.device("phone").expect("stopped");
         let _fake = fake_emulator(&f.android, "phone"); // the advertisement and console of the "launched" emu
         let t = Instant::now();
-        d.boot_with(&f.android, Duration::from_secs(30), sh("sleep 0.5; echo 'emu: boot completed in 0.5s'; sleep 1")).expect("boots");
+        d.boot_with(&f.android, Duration::from_secs(30), sh("sleep 0.5; echo 'emu: boot completed in 0.5s'; sleep 10")).expect("boots");
         let took = t.elapsed();
         println!("detected {:?} after the line", took.saturating_sub(Duration::from_millis(500)));
         assert!(took >= Duration::from_millis(500), "not before the line: {took:?}");
-        assert!(took < Duration::from_millis(1500), "within a poll or two of the line: {took:?}");
+        // Seen from the log, well before the "emulator" exits 10 s after the line; the bound leaves
+        // room for a loaded host, where the fake adb's spawn alone can take a second.
+        assert!(took < Duration::from_secs(5), "from the log, not the process exit: {took:?}");
         assert_eq!(adb_runs(&runs), 1, "no adb until the line, then one confirmation");
     }
 
