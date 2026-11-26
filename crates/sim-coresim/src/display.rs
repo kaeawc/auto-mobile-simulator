@@ -7,6 +7,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use sim_core::frame::Frame;
+use sim_core::framebuffer::{self, Port};
 use sim_core::pixels::bgra_to_rgba;
 
 use crate::error::{Error, Result};
@@ -57,14 +58,23 @@ pub struct Display {
 }
 
 impl Display {
-    /// Finds the main display among the device's I/O ports: the class-0 framebuffer, else the
-    /// first one (Apple TV renders only to its TVOut port).
-    pub(crate) fn main(device: &AnyObject) -> Result<Self> {
+    /// Finds the main display among the device's I/O ports: the class-0 framebuffer (with several,
+    /// as on the iPhone Duo, the one the size of the device type's main `screen`), else the first
+    /// one (Apple TV renders only to its TVOut port). See [`sim_core::framebuffer::main_port`].
+    pub(crate) fn main(device: &AnyObject, screen: Option<(u32, u32)>) -> Result<Self> {
         let ports = framebuffer_ports(device)?;
-        let main = ports.iter().position(|d| display_class(d) == Some(0)).unwrap_or(0);
-        ports
-            .into_iter()
-            .nth(main)
+        let classes: Vec<Option<u16>> = ports.iter().map(|d| display_class(d)).collect();
+        let sizes = framebuffer::needs_sizes(&classes);
+        let described: Vec<Port> = ports
+            .iter()
+            .zip(&classes)
+            .map(|(d, &class)| Port {
+                class,
+                size: if sizes && class == Some(0) { Self { descriptor: d.clone() }.size().ok() } else { None },
+            })
+            .collect();
+        framebuffer::main_port(&described, screen)
+            .and_then(|main| ports.into_iter().nth(main))
             .map(|descriptor| Self { descriptor })
             .ok_or_else(|| Error::NoDisplay("no framebuffer port; is the device booted?".into()))
     }
@@ -113,7 +123,7 @@ impl Display {
         rt::require(&self.descriptor, sel!(unregisterDamageRectanglesCallbackWithUUID:))?;
         // SAFETY: `+[NSUUID UUID]` returns a new random UUID.
         let uuid: Obj = unsafe { msg_send![class!(NSUUID), UUID] };
-        let block = RcBlock::new(move |_rects: *mut AnyObject| on_frame());
+        let block = RcBlock::with_encoding::<_, _, _, rt::ObjBlock>(move |_rects: *mut AnyObject| on_frame());
         type RegisterFn = unsafe extern "C" fn(*const AnyObject, Sel, *const AnyObject, *const Block<dyn Fn(*mut AnyObject)>);
         // SAFETY: the method's signature is (NSUUID *, void (^)(NSArray *)) -> void; the descriptor
         // is a remote proxy, so it's called through `objc_msgSend`, not `msg_send!`.

@@ -164,9 +164,13 @@ impl Instance {
         if let Some(lib64) = &gpu_lib64
             && let Some(emulator_dir) = lib64.parent()
         {
-            let icd = match opts.gpu.as_deref() {
-                Some("swiftshader" | "swiftshader_indirect") => emu_gfxstream::Icd::SwiftShader,
-                Some("lavapipe" | "swangle") => emu_gfxstream::Icd::Lavapipe,
+            let choice = emu_avd::gpu::resolve(opts.gpu.as_deref(), avd.get("hw.gpu.mode"));
+            if choice.guest_fallback {
+                eprintln!("{}", emu_avd::gpu::GUEST_FALLBACK_NOTICE);
+            }
+            let icd = match choice.backend {
+                emu_avd::gpu::Backend::SwiftShader => emu_gfxstream::Icd::SwiftShader,
+                emu_avd::gpu::Backend::Lavapipe => emu_gfxstream::Icd::Lavapipe,
                 // MoltenVK (host GPU) unless it fails on this machine; then software.
                 _ if crate::vkprobe::moltenvk_works(lib64) => emu_gfxstream::Icd::MoltenVk,
                 _ => {
@@ -215,7 +219,8 @@ impl Instance {
             height: self.avd.lcd().1,
             verbose: opts.verbose,
             display: display.clone(),
-            vulkan_only: guest_egl(&self.avd) == "angle",
+            // Images without bootconfig have no ANGLE: their GLES is the encoder, on the host's GL.
+            vulkan_only: guest_egl(&self.avd) == "angle" && takes_bootconfig(&self.avd),
             virtual_queue: virtual_queue(&guest_egl(&self.avd), AngleImage::of(&self.avd)),
         })
     }
@@ -513,6 +518,7 @@ impl BootPlan {
             plan.cmdline = plan.cmdline.replace(" bootconfig", "");
             plan.cmdline.push(' ');
             plan.cmdline.push_str(&legacy_cmdline(&bc, plan.renderer.is_some()));
+            plan.boot_props.push(("qemu.cmdline".to_string(), logcat_pipe_cmdline(logcat_filter(opts))));
         }
         plan
     }
@@ -682,7 +688,7 @@ pub fn unsupported(avd: &Avd) -> Option<String> {
     let api = avd.api_level()?;
     let why = match api {
         ..=30 => {
-            "its graphics, modem and logcat use goldfish pipes emu doesn't serve yet (`opengles`, `qemud:gsm`; https://github.com/kaeawc/simee/issues/38)"
+            "its GLES goes over the `opengles` goldfish pipe, which emu doesn't bridge to the renderer yet (https://github.com/kaeawc/simee/issues/38)"
         }
         _ => return None,
     };
@@ -716,7 +722,12 @@ fn legacy_cmdline(bc: &BootConfig, graphics: bool) -> String {
             "androidboot.qemu" => "qemu".to_string(),
             "androidboot.dalvik.vm.heapsize" => "qemu.dalvik.vm.heapsize".to_string(),
             "androidboot.opengles.version" => "qemu.opengles.version".to_string(),
-            "androidboot.hardware.gltransport" => "qemu.gltransport".to_string(),
+            // These images' GLES encoder has no address-space graphics: stock gives them the
+            // goldfish pipe.
+            "androidboot.hardware.gltransport" => {
+                out.push("qemu.gltransport=pipe".to_string());
+                continue;
+            }
             _ => match k.strip_prefix("androidboot.qemu.") {
                 Some(rest) => format!("qemu.{rest}"),
                 None => k.clone(),
@@ -725,6 +736,16 @@ fn legacy_cmdline(bc: &BootConfig, graphics: bool) -> String {
         out.push(format!("{key}={v}"));
     }
     out.join(" ")
+}
+
+/// `qemu.cmdline` for images without a logcat console (API 30 and older): their
+/// `goldfish-logcat` runs `logcat -Q`, which takes its filter and destination from this property
+/// (SELinux keeps it from `/proc/cmdline`), as stock sets it: `androidboot.logcat=<filter>` and
+/// `androidboot.consolepipe=qemu_pipe,pipe:logcat`. logcat stops the filter at the first space
+/// and splits it on commas, so the filter's spaces become commas.
+fn logcat_pipe_cmdline(filter: &str) -> String {
+    let filter: Vec<&str> = filter.split_whitespace().collect();
+    format!("androidboot.logcat={} androidboot.consolepipe=qemu_pipe,pipe:logcat", filter.join(","))
 }
 
 /// The guest's GLES driver: `EMU_GUEST_EGL` if set, else [`default_egl`]. Under ANGLE no guest
@@ -918,8 +939,18 @@ mod tests {
             assert!(words.contains(&w), "{w} missing from {}", q.cmdline);
         }
         assert!(!q.cmdline.contains("androidboot.qemu"), "{}", q.cmdline);
+        // logcat -Q's filter and pipe (#38), silent without -logcat.
+        let cmdline_prop = |p: &BootPlan| p.boot_props.iter().find(|(k, _)| k == "qemu.cmdline").map(|(_, v)| v.clone());
+        assert_eq!(cmdline_prop(&q).as_deref(), Some("androidboot.logcat=*:S androidboot.consolepipe=qemu_pipe,pipe:logcat"));
+        let tags = Opts { logcat: Some("ActivityManager:I  *:S".into()), ..Opts::default() };
+        let q_tags = BootPlan::new(&s.env.load("q").expect("load"), &tags, None);
+        assert_eq!(
+            cmdline_prop(&q_tags).as_deref(),
+            Some("androidboot.logcat=ActivityManager:I,*:S androidboot.consolepipe=qemu_pipe,pipe:logcat")
+        );
 
         let new = plan(&s, "s");
+        assert_eq!(cmdline_prop(&new), None, "bootconfig images have a logcat console");
         assert_eq!(new.bootconfig.get("androidboot.qemu.avd_name"), Some("s"));
         assert!(new.cmdline.split(' ').any(|w| w == "bootconfig") && !new.cmdline.contains("qemu.avd_name"), "{}", new.cmdline);
         let phone = plan(&s, "phone");
@@ -938,7 +969,7 @@ mod tests {
         }
         let line = legacy_cmdline(&bc, true);
         // No ANGLE on these images: neither its driver nor what the UI draws with under it.
-        assert_eq!(line, "android.qemud=1 qemu.encrypt=1 qemu.gles=1 qemu.gltransport=virtio-gpu-asg androidboot.vbmeta.size=4352");
+        assert_eq!(line, "android.qemud=1 qemu.encrypt=1 qemu.gles=1 qemu.gltransport=pipe androidboot.vbmeta.size=4352");
         assert!(!legacy_cmdline(&bc, false).contains("qemu.gles"));
     }
 

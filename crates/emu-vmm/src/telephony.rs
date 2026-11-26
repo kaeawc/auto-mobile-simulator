@@ -1,15 +1,23 @@
-//! The modem behind the guest's `modem` virtio-console port, shared with the console's `sms` and
-//! `gsm` commands. Each guest boot gets a fresh modem (the radio HAL re-initializes it); host
-//! events produce unsolicited bytes that go out through the port.
+//! The modem behind the guest's `modem` virtio-console port (or, on API 30 and older images, its
+//! `qemud:gsm` pipe), shared with the console's `sms` and `gsm` commands. Each guest boot gets a
+//! fresh modem (the radio HAL re-initializes it); host events produce unsolicited bytes that go
+//! out through whichever of the two the guest's radio opened last.
 use std::sync::{Arc, Mutex};
 
 use crate::modem::{Modem, ModemError, RegState};
+use crate::pipe::{HostMsg, PipeCtx};
 use crate::virtio::console::{PortBackend, PortHandle};
 
 #[derive(Default)]
 pub struct Telephony {
     modem: Mutex<Modem>,
-    port: Mutex<Option<PortHandle>>,
+    port: Mutex<Option<Out>>,
+}
+
+/// Where unsolicited modem bytes go.
+enum Out {
+    Console(PortHandle),
+    Pipe(PipeCtx),
 }
 
 impl Telephony {
@@ -18,15 +26,41 @@ impl Telephony {
     }
 
     fn push(&self, bytes: Vec<u8>) {
-        if let Some(p) = self.port.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            p.send(bytes);
+        if bytes.is_empty() {
+            return;
+        }
+        match self.port.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(Out::Console(p)) => p.send(bytes),
+            Some(Out::Pipe(ctx)) => {
+                ctx.send(HostMsg::Data(bytes));
+            }
+            None => {}
         }
     }
 
     /// A new guest boot: fresh modem state, new port.
     pub fn attach(&self, port: PortHandle) {
         self.with(|m| *m = Modem::new());
-        *self.port.lock().unwrap_or_else(|e| e.into_inner()) = Some(port);
+        *self.port.lock().unwrap_or_else(|e| e.into_inner()) = Some(Out::Console(port));
+    }
+
+    /// The guest's radio opened `qemud:gsm` (API 30 and older): unsolicited bytes go there from
+    /// now on. The modem keeps its state, as it does when the console port is reopened.
+    pub fn attach_pipe(&self, ctx: PipeCtx) {
+        *self.port.lock().unwrap_or_else(|e| e.into_inner()) = Some(Out::Pipe(ctx));
+    }
+
+    /// The `qemud:gsm` pipe `conn` closed: nothing to send unsolicited bytes to until it's reopened.
+    pub fn detach_pipe(&self, conn: u64) {
+        let mut port = self.port.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(port.as_ref(), Some(Out::Pipe(ctx)) if ctx.conn == conn) {
+            *port = None;
+        }
+    }
+
+    /// AT commands from the guest; returns the modem's answers.
+    pub fn guest_input(&self, data: &[u8]) -> Vec<u8> {
+        self.with(|m| m.input(data))
     }
 
     /// Delivers an SMS from `from` to the guest.
@@ -99,7 +133,7 @@ struct ModemPort(Arc<Telephony>);
 
 impl PortBackend for ModemPort {
     fn guest_data(&mut self, data: &[u8]) -> Vec<u8> {
-        self.0.with(|m| m.input(data))
+        self.0.guest_input(data)
     }
 }
 

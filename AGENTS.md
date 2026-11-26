@@ -123,7 +123,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   gate), `goldfish.rs` (stock emulator key names, the `qwerty2` key set, sensor masks), `xr.rs`
   (Android XR commands and the `xr_service` messages), `vhal.rs` (the vehicle HAL's
   `EmulatorMessage` codec, property names and values), `network.rs` (the stock console's
-  `network speed|delay` presets, parsing and `network status` report), BGRA→RGBA conversion,
+  `network speed|delay` presets, parsing and `network status` report), `framebuffer.rs` (which
+  framebuffer port is an Apple device's main display), BGRA→RGBA conversion,
   `Frame` and PNG encoding. No FFI.
 - `crates/sim-coresim` — the service boundary: `Context` (service + device set), `Device`
   (lifecycle, apps, settings, orientation, CarPlay), `Display` (framebuffer surface, capture; main
@@ -185,7 +186,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `cargo run --release --features tooling -- --snap /tmp/x.png --scene demo`. Scenes: demo,
   android, foldable, watch, tv, apple-watch, apple-tv, empty. On Linux it renders with Mesa's
   lavapipe.
-- `scripts/` — `parity.sh`, `automobile-harness.sh`, `automobile-farm.sh` (every device through
+- `scripts/` — `parity.sh`, `ios-matrix.sh` (every iOS feature on one device: the
+  `docs/ios-versions.md` table), `automobile-harness.sh`, `automobile-farm.sh` (every device through
   one private AutoMobile daemon; `automobile-daemon.sh` starts, joins and stops it, and the
   harnesses join it through `AM_DAEMON_ENV`), `pf-shape.sh` (pf/dummynet, needs sudo);
   Android: `sign-run.sh` (the cargo runner: hypervisor entitlement), `sdk-shim.sh` (SDK overlay
@@ -195,6 +197,7 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   modules, input names, vendor HALs).
 - `docs/research/` — `network-shaping.md`, `audio-camera.md`; `docs/automobile-tool-matrix.md`.
   `docs/architecture.md` (layers, process model, shared logic, the conflict decisions),
-  `docs/form-factors.md` (support matrix, profiles, inference, launching each kind, known gaps).
+  `docs/form-factors.md` (support matrix, profiles, inference, launching each kind, known gaps),
+  `docs/ios-versions.md` (each feature on each iOS and tvOS runtime).
   Android: `docs/android.md` (status, provisioning, benchmarks, performance notes),
   `docs/reference/stock-board.md`, `docs/design/desktop-and-display.md`, `docs/roadmap-android.md`.

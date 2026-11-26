@@ -35,6 +35,7 @@ when the guest touches it.
 | | simee | Simulator.app and `simctl` |
 | --- | --- | --- |
 | Booting a device | headless, no app window | opens Simulator.app, or `simctl boot` with no screen |
+| Screenshot as a command, median (loaded host) | **36 ms** through `simee serve`, 173 ms alone | 601 ms (`simctl io screenshot`) |
 | Touch, keys, buttons, Digital Crown, Siri Remote | CLI and API | by hand in the window |
 | Network conditions | per device, per host, live, no root | Network Link Conditioner: whole Mac, needs install |
 | Audio | capture or mute one device, no driver | host output only |

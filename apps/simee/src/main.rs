@@ -32,6 +32,13 @@ struct Cli {
     command: Cmd,
 }
 
+/// Which CPU an iOS settle wait judges (`settle_foreground`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum SettleCpu {
+    All,
+    Foreground,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// List devices.
@@ -101,14 +108,18 @@ enum Cmd {
         /// Seconds to wait for the first frame.
         #[arg(long, default_value_t = 120)]
         timeout: u64,
-        /// iOS: also wait until the device is quiet (its processes under 10 % of a core for 10 s)
-        /// and print the timings. A device booted but not settled in time prints "booted, not
-        /// settled" and still exits 0.
+        /// iOS: also wait until the device is quiet (its processes' foreground CPU under 10 % of a
+        /// core for 10 s) and print the timings. A device booted but not settled in time prints
+        /// "booted, not settled" and still exits 0.
         #[arg(long)]
         settle: bool,
         /// iOS: seconds the settle wait may take after the boot (default 600).
         #[arg(long)]
         settle_timeout: Option<u64>,
+        /// iOS: which CPU the settle wait judges: `all`, or `foreground` (background-QoS work on
+        /// the efficiency cores doesn't count). Default: foreground.
+        #[arg(long, value_enum)]
+        settle_cpu: Option<SettleCpu>,
         /// iOS: turn off a named set of daemons once booted (`slim`).
         #[arg(long)]
         profile: Option<String>,
@@ -137,6 +148,9 @@ enum Cmd {
         /// iOS: seconds each settle wait may take after the boot (default 600, more above K=4).
         #[arg(long)]
         settle_timeout: Option<u64>,
+        /// iOS: which CPU each settle wait judges: `all`, or `foreground`. Default: foreground.
+        #[arg(long, value_enum)]
+        settle_cpu: Option<SettleCpu>,
         /// iOS: turn off a named set of daemons on each device (`slim`).
         #[arg(long)]
         profile: Option<String>,
@@ -152,6 +166,9 @@ enum Cmd {
         device: String,
         #[arg(long, default_value_t = 600)]
         timeout: u64,
+        /// Which CPU to judge: `all`, or `foreground` (background-QoS work doesn't count). Default: foreground.
+        #[arg(long, value_enum)]
+        settle_cpu: Option<SettleCpu>,
     },
     /// iOS: turn a named set of daemons off on a booted simulator (`slim`), or back on with --undo.
     Profile {
@@ -512,7 +529,7 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             writeln!(out, "{}", text(&d["udid"]))?;
         }
         Cmd::Delete { device } => drop(call("delete", json!({"device": device}))?),
-        Cmd::Boot { device, timeout, env, shaped, settle, settle_timeout, profile, audio } => {
+        Cmd::Boot { device, timeout, env, shaped, settle, settle_timeout, settle_cpu, profile, audio } => {
             let env: serde_json::Map<String, Value> =
                 env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), Value::from(v))).collect();
             let mut params = json!({"device": device, "timeout_s": timeout, "env": env, "shaped": shaped});
@@ -523,6 +540,9 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             }
             if let Some(s) = settle_timeout {
                 params["settle_timeout_s"] = json!(s);
+            }
+            if let Some(c) = settle_cpu {
+                params["settle_foreground"] = json!(c == SettleCpu::Foreground);
             }
             if let Some(profile) = profile {
                 params["profile"] = json!(profile);
@@ -538,13 +558,14 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
                 }
             }
         }
-        Cmd::BootMany { devices, concurrency, timeout, settle: _, no_settle, settle_timeout, profile, first_port, json } => {
+        Cmd::BootMany { devices, concurrency, timeout, settle: _, no_settle, settle_timeout, settle_cpu, profile, first_port, json } => {
             let mut params = json!({"devices": devices, "concurrency": concurrency, "timeout_s": timeout});
             // Each only when given: the backend has the defaults (iOS settles; Android has no
             // settle and rejects iOS-only parameters).
             for (key, v) in [
                 ("settle", no_settle.then_some(json!(false))),
                 ("settle_timeout_s", settle_timeout.map(Value::from)),
+                ("settle_foreground", settle_cpu.map(|c| json!(c == SettleCpu::Foreground))),
                 ("profile", profile.map(Value::from)),
                 ("first_port", first_port.map(Value::from)),
             ] {
@@ -555,8 +576,12 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             let r = call("boot_many", params)?;
             print_boot_many(&r, devices.len(), json, out, err)?;
         }
-        Cmd::Settle { device, timeout } => {
-            let r = call("settle", json!({"device": device, "timeout_s": timeout}))?;
+        Cmd::Settle { device, timeout, settle_cpu } => {
+            let mut params = json!({"device": device, "timeout_s": timeout});
+            if let Some(c) = settle_cpu {
+                params["foreground"] = json!(c == SettleCpu::Foreground);
+            }
+            let r = call("settle", params)?;
             let mut line = format!("settle_s={} procs={} cpu_pct={}", r["settle_s"], r["procs"], r["cpu_pct"]);
             for key in ["foreground_cpu_pct", "background_cpu_pct"] {
                 if let Some(v) = r.get(key) {
@@ -706,6 +731,8 @@ fn boot_line(d: &Value) -> String {
         "cpu_pct",
         "foreground_cpu_pct",
         "background_cpu_pct",
+        "cpu_s",
+        "background_cpu_s",
         "started_s",
         "done_s",
         "console_port",
@@ -1056,6 +1083,16 @@ mod tests {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
         assert!(matches!(parse(&["boot-many", "a", "--settle"]), Ok(Cmd::BootMany { no_settle: false, .. })));
         assert!(matches!(parse(&["boot-many", "a", "--no-settle"]), Ok(Cmd::BootMany { no_settle: true, .. })));
+        assert!(matches!(parse(&["boot-many", "a"]), Ok(Cmd::BootMany { settle_cpu: None, .. })), "the API's default");
+        assert!(matches!(parse(&["boot-many", "a", "--settle-cpu", "all"]), Ok(Cmd::BootMany { settle_cpu: Some(SettleCpu::All), .. })));
+        assert!(matches!(
+            parse(&["boot", "a", "--settle", "--settle-cpu", "foreground"]),
+            Ok(Cmd::Boot { settle_cpu: Some(SettleCpu::Foreground), .. })
+        ));
+        assert!(parse(&["boot", "a", "--settle-cpu", "background"]).is_err());
+        assert!(matches!(parse(&["settle", "a"]), Ok(Cmd::Settle { settle_cpu: None, .. })), "the API's default");
+        assert!(matches!(parse(&["settle", "a", "--settle-cpu", "all"]), Ok(Cmd::Settle { settle_cpu: Some(SettleCpu::All), .. })));
+        assert!(parse(&["settle", "a", "--settle-cpu", "background"]).is_err());
         assert!(parse(&["boot-many", "a", "--settle", "--no-settle"]).is_err());
         assert!(matches!(parse(&["boot-many", "a", "--first-port", "5600"]), Ok(Cmd::BootMany { first_port: Some(5600), .. })));
         // Android devices boot silent unless `--audio`.
