@@ -213,6 +213,7 @@ kill` work as on a Mac. What follows records what was decided and why. The numbe
 ```bash
 emu -provision 36 -tag default -abi x86_64 -create-avd phone
 emu -provision-renderer
+emu -accel-check    # which QEMU would run the guest, or what's missing (Ubuntu 22.04's 6.2 is too old)
 EMU_QEMU=/path/to/qemu-system-x86_64 emu -avd phone   # QEMU 11.1 or newer; without it, PATH's
 ```
 
