@@ -54,6 +54,14 @@ const REGION_READ: u32 = 1 << 0;
 const REGION_WRITE: u32 = 1 << 1;
 const REGION_MMAP: u32 = 1 << 2;
 const IRQ_INFO_EVENTFD: u32 = 1 << 0;
+const IRQ_INFO_MASKABLE: u32 = 1 << 1;
+const IRQ_INFO_AUTOMASKED: u32 = 1 << 2;
+/// `DEVICE_SET_IRQS` flags.
+const IRQ_SET_DATA_EVENTFD: u32 = 1 << 2;
+const IRQ_SET_ACTION_UNMASK: u32 = 1 << 4;
+const IRQ_SET_ACTION_TRIGGER: u32 = 1 << 5;
+/// `<linux/vfio.h>`: INTx is IRQ index 0.
+pub const INTX: u32 = 0;
 
 const ENOSYS: u32 = 38;
 const EINVAL: u32 = 22;
@@ -77,6 +85,54 @@ pub trait Function: Send {
     /// Guest RAM, once the frontend has shared it.
     fn guest_ram(&mut self, _ram: Arc<GuestRam>) {}
     fn reset(&mut self) {}
+    /// The function's INTx line, if its config space has an interrupt pin.
+    fn intx(&self) -> Option<Arc<IntxLine>> {
+        None
+    }
+}
+
+/// A function's INTx as vfio delivers it: level-triggered and automasked. Raising the line writes
+/// the trigger eventfd and masks it; the frontend asserts the guest's interrupt, and on the
+/// guest's next access to the device (QEMU without KVM takes that as the end of the interrupt)
+/// deasserts it and sends `UNMASK`, which triggers again if the line is still up.
+#[derive(Default)]
+pub struct IntxLine {
+    trigger: Mutex<Option<OwnedFd>>,
+    level: std::sync::atomic::AtomicBool,
+    masked: std::sync::atomic::AtomicBool,
+}
+
+impl IntxLine {
+    fn fire(&self) {
+        use std::sync::atomic::Ordering::AcqRel;
+        if self.masked.swap(true, AcqRel) {
+            return;
+        }
+        if let Some(fd) = self.trigger.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            let _ = rustix::io::write(fd, &1u64.to_ne_bytes());
+        }
+    }
+
+    fn set_trigger(&self, fd: Option<OwnedFd>) {
+        *self.trigger.lock().unwrap_or_else(PoisonError::into_inner) = fd;
+        self.masked.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn unmask(&self) {
+        self.masked.store(false, std::sync::atomic::Ordering::Release);
+        if self.level.load(std::sync::atomic::Ordering::Acquire) {
+            self.fire();
+        }
+    }
+}
+
+impl crate::irq::IrqLine for IntxLine {
+    fn set(&self, level: bool) {
+        self.level.store(level, std::sync::atomic::Ordering::Release);
+        if level {
+            self.fire();
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -221,14 +277,26 @@ fn handle(f: &mut dyn Function, dma: &mut Dma, m: &mut Msg) -> Result<std::resul
         }
         cmd::DEVICE_GET_IRQ_INFO => {
             let index = u32_at(p, 8)?;
-            // No interrupts: the function's config space says so (interrupt pin 0).
+            // INTx when the function has a pin; nothing else (no MSI or MSI-X capability).
+            let count = u32::from(index == INTX && f.intx().is_some());
             let mut out = 16u32.to_le_bytes().to_vec();
-            out.extend_from_slice(&IRQ_INFO_EVENTFD.to_le_bytes());
+            out.extend_from_slice(&(IRQ_INFO_EVENTFD | IRQ_INFO_MASKABLE | IRQ_INFO_AUTOMASKED).to_le_bytes());
             out.extend_from_slice(&index.to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&count.to_le_bytes());
             Ok(out)
         }
-        cmd::DEVICE_SET_IRQS => Ok(Vec::new()),
+        cmd::DEVICE_SET_IRQS => {
+            let (flags, index) = (u32_at(p, 4)?, u32_at(p, 8)?);
+            if let (INTX, Some(line)) = (index, f.intx()) {
+                if flags & IRQ_SET_ACTION_TRIGGER != 0 {
+                    // An eventfd to trigger, or none (DATA_NONE, count 0): interrupts off.
+                    line.set_trigger(if flags & IRQ_SET_DATA_EVENTFD != 0 { m.fds.pop() } else { None });
+                } else if flags & IRQ_SET_ACTION_UNMASK != 0 {
+                    line.unmask();
+                }
+            }
+            Ok(Vec::new())
+        }
         cmd::REGION_READ => {
             let (offset, region, count) = (u64_at(p, 0)?, u32_at(p, 8)?, u32_at(p, 12)? as usize);
             if count > MAX_XFER {
@@ -308,6 +376,17 @@ pub fn serve(path: &Path, name: &str, f: Box<dyn Function>) -> std::io::Result<J
             }
         }
     })
+}
+
+/// QEMU's `-device` JSON for the function served on `path`, at PCI slot `slot` if given.
+///
+/// QEMU posts BAR writes by default (the vCPU goes on before the server has seen them). Goldfish
+/// devices are synchronous: the pipe's guest reads a command's status from memory right after
+/// writing `CMD`, then frees the command page on close, so a posted write lets emu answer into a
+/// page that is already something else (a page table: `zap_huge_pmd` panics on a PMD of -1).
+pub fn qemu_device(path: &Path, slot: Option<u8>) -> String {
+    let addr = slot.map(|s| format!(r#","addr":"{s:x}""#)).unwrap_or_default();
+    format!(r#"{{"driver":"vfio-user-pci","socket":{{"path":"{}","type":"unix"}},"x-no-posted-writes":true{addr}}}"#, path.display())
 }
 
 /// The goldfish address space's host-memory area, as the renderer's DMA path needs to see it: the
@@ -430,9 +509,123 @@ impl Function for GoldfishAs {
     }
 }
 
+/// The goldfish pipe (`google,android-pipe`, x86's `GFSH0003`) carried by a PCI function: its
+/// registers are BAR0 (by message) and its interrupt INTA. An ACPI device describes that BAR and
+/// IRQ to the pipe driver ([`crate::acpi::goldfish_pipe_ssdt`]). The device model is emu's, built
+/// once guest RAM is shared.
+///
+/// The function shows itself only to the firmware: once BAR0 is placed and memory decoding is on,
+/// its config space reads as no device (vendor `0xffff`). Otherwise the OS finds the BAR overlapping
+/// the ACPI device's identical range, fails to claim it and moves it, away from where the ACPI
+/// device (and so the pipe driver) looks (measured: Linux moved it from `0xfebf2000` to
+/// `0x80000000` and the driver read version 0). The frontend keeps the BAR mapped where the
+/// firmware put it, since it emulates BARs itself. A reset shows the function again, for the next
+/// boot's firmware.
+pub struct GoldfishPipeCarrier {
+    config: ConfigSpace,
+    registry: Arc<crate::pipe::PipeRegistry>,
+    ram: Option<Arc<GuestRam>>,
+    dev: Option<Arc<crate::devices::goldfish_pipe::GoldfishPipe>>,
+    irq: Arc<IntxLine>,
+}
+
+/// The carrier's PCI ids: the goldfish vendor with a device id no driver claims.
+pub const PIPE_CARRIER_DEVICE: u16 = 0xf154;
+
+impl GoldfishPipeCarrier {
+    pub fn new(registry: Arc<crate::pipe::PipeRegistry>) -> GoldfishPipeCarrier {
+        let config = ConfigSpace::with_interrupt_pin(
+            PciFunction {
+                vendor: VENDOR,
+                device: PIPE_CARRIER_DEVICE,
+                class: 0xff_00_00,
+                bars: vec![(0, Bar { kind: BarKind::Mem32, addr: 0, size: crate::layout::GOLDFISH_PIPE_SIZE })],
+            },
+            1,
+        );
+        GoldfishPipeCarrier { config, registry, ram: None, dev: None, irq: Arc::default() }
+    }
+
+    fn device(&mut self) -> Option<&Arc<crate::devices::goldfish_pipe::GoldfishPipe>> {
+        if self.dev.is_none() {
+            let ram = self.ram.clone()?;
+            self.dev = Some(crate::devices::goldfish_pipe::GoldfishPipe::new(ram, self.registry.clone(), self.irq.clone()));
+        }
+        self.dev.as_ref()
+    }
+}
+
+impl Function for GoldfishPipeCarrier {
+    fn region(&self, index: u32) -> RegionInfo {
+        match index {
+            0 => RegionInfo { size: crate::layout::GOLDFISH_PIPE_SIZE, flags: REGION_READ | REGION_WRITE },
+            CONFIG_REGION => RegionInfo { size: 256, flags: REGION_READ | REGION_WRITE },
+            _ => RegionInfo::default(),
+        }
+    }
+
+    fn read(&mut self, region: u32, offset: u64, data: &mut [u8]) {
+        data.fill(0);
+        match region {
+            CONFIG_REGION => {
+                self.config.read(offset as usize, data);
+                if self.hidden() && offset < 4 {
+                    data.fill(0xff);
+                }
+            }
+            0 => {
+                if let Some(d) = self.device() {
+                    d.read(offset, data);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn write(&mut self, region: u32, offset: u64, data: &[u8]) {
+        match region {
+            CONFIG_REGION => self.config.write(offset as usize, data),
+            0 => {
+                if let Some(d) = self.device() {
+                    d.write(offset, data);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn guest_ram(&mut self, ram: Arc<GuestRam>) {
+        self.ram = Some(ram);
+    }
+
+    fn reset(&mut self) {
+        self.config.reset();
+    }
+
+    fn intx(&self) -> Option<Arc<IntxLine>> {
+        Some(self.irq.clone())
+    }
+}
+
+impl GoldfishPipeCarrier {
+    /// Placed and decoding: from now on the function is the ACPI device's alone.
+    fn hidden(&self) -> bool {
+        self.config.bar_addr(0) != 0 && self.config.command() & 0x2 != 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qemu_devices_complete_bar_writes_before_the_guest_moves_on() {
+        // A posted CMD write lets the guest free a command page that is then written to.
+        let any = qemu_device(Path::new("/tmp/x.sock"), None);
+        assert_eq!(any, r#"{"driver":"vfio-user-pci","socket":{"path":"/tmp/x.sock","type":"unix"},"x-no-posted-writes":true}"#);
+        let at = qemu_device(Path::new("/tmp/p.sock"), Some(0x1e));
+        assert!(at.ends_with(r#","x-no-posted-writes":true,"addr":"1e"}"#), "{at}");
+    }
 
     /// QEMU's side of the conversation.
     struct Client {
@@ -478,6 +671,69 @@ mod tests {
     /// What QEMU's vfio-user-pci does at realize and the guest then: version, regions (the area
     /// comes with its fd), config space and BAR sizing, guest RAM by DMA_MAP, BAR placement, and
     /// a register write and read the device model handles.
+    /// INTx the way QEMU without KVM runs it: a raise triggers once and masks; further raises
+    /// wait for the unmask, which triggers again while the line is still up.
+    #[test]
+    fn intx_triggers_once_per_unmask_while_the_line_is_up() {
+        use crate::irq::IrqLine;
+        let line = IntxLine::default();
+        let efd = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK).expect("eventfd");
+        line.set_trigger(Some(efd.try_clone().expect("dup")));
+        let count = || {
+            let mut b = [0u8; 8];
+            rustix::io::read(&efd, &mut b).map_or(0, |_| u64::from_ne_bytes(b))
+        };
+        line.set(true);
+        line.set(true);
+        assert_eq!(count(), 1, "masked after the first trigger");
+        line.unmask();
+        assert_eq!(count(), 1, "still up: triggered again");
+        line.set(false);
+        line.unmask();
+        assert_eq!(count(), 0, "down: nothing");
+        line.set(true);
+        assert_eq!(count(), 1);
+    }
+
+    /// The carrier reports INTA and takes QEMU's trigger eventfd.
+    #[test]
+    fn the_pipe_carrier_has_an_interrupt_pin_and_takes_an_eventfd() {
+        let (a, b) = UnixStream::pair().expect("pair");
+        let f: Box<dyn Function> = Box::new(GoldfishPipeCarrier::new(Arc::new(crate::pipe::PipeRegistry::default())));
+        let f = Arc::new(Mutex::new(f));
+        let server = {
+            let f = f.clone();
+            std::thread::spawn(move || serve_connection(b, &f))
+        };
+        let mut c = Client { sock: a, id: 0 };
+        assert_eq!(c.region(None, CONFIG_REGION, 0x3c, 2), [0xff, 1], "INTA");
+        let mut irq = 16u32.to_le_bytes().to_vec();
+        irq.extend_from_slice(&[0; 4]);
+        irq.extend_from_slice(&INTX.to_le_bytes());
+        irq.extend_from_slice(&[0; 4]);
+        let (_, info, _) = c.call(cmd::DEVICE_GET_IRQ_INFO, &irq, None);
+        assert_eq!(u32_at(&info, 12).ok(), Some(1));
+        let efd = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC).expect("eventfd");
+        let mut set = 20u32.to_le_bytes().to_vec();
+        set.extend_from_slice(&(IRQ_SET_DATA_EVENTFD | IRQ_SET_ACTION_TRIGGER).to_le_bytes());
+        set.extend_from_slice(&INTX.to_le_bytes());
+        set.extend_from_slice(&0u32.to_le_bytes());
+        set.extend_from_slice(&1u32.to_le_bytes());
+        assert_eq!(c.call(cmd::DEVICE_SET_IRQS, &set, Some(&efd)).0 & FLAG_ERROR, 0);
+        let line = f.lock().unwrap_or_else(PoisonError::into_inner).intx().expect("intx");
+        assert!(line.trigger.lock().unwrap_or_else(PoisonError::into_inner).is_some(), "the eventfd is the trigger");
+        // The firmware places BAR0 and turns decoding on; then the function is gone for the OS.
+        assert_eq!(c.region(None, CONFIG_REGION, 0, 4), 0xf154_607du32.to_le_bytes());
+        c.region(Some(&0xfebf_2000u32.to_le_bytes()), CONFIG_REGION, 0x10, 4);
+        assert_eq!(c.region(None, CONFIG_REGION, 0, 4), 0xf154_607du32.to_le_bytes(), "placed but not decoding: still there");
+        c.region(Some(&2u16.to_le_bytes()), CONFIG_REGION, 0x04, 2);
+        assert_eq!(c.region(None, CONFIG_REGION, 0, 4), [0xff; 4], "hidden from the OS");
+        assert_eq!(c.call(cmd::DEVICE_RESET, &[], None).0 & FLAG_ERROR, 0);
+        assert_eq!(c.region(None, CONFIG_REGION, 0, 4), 0xf154_607du32.to_le_bytes(), "back for the next boot's firmware");
+        drop(c);
+        server.join().expect("join").expect("clean end");
+    }
+
     #[test]
     fn the_goldfish_address_space_comes_up_the_way_qemu_drives_it() {
         let (a, b) = UnixStream::pair().expect("pair");
@@ -525,6 +781,12 @@ mod tests {
         assert_eq!(area.size, 64 << 20);
         let (flags, _, _) = c.call(99, &[], None);
         assert_ne!(flags & FLAG_ERROR, 0, "unknown commands get an error reply");
+        let mut irq = 16u32.to_le_bytes().to_vec();
+        irq.extend_from_slice(&[0; 4]);
+        irq.extend_from_slice(&INTX.to_le_bytes());
+        irq.extend_from_slice(&[0; 4]);
+        let (_, info, _) = c.call(cmd::DEVICE_GET_IRQ_INFO, &irq, None);
+        assert_eq!(u32_at(&info, 12).ok(), Some(0), "no pin, no INTx");
         drop(c);
         server.join().expect("join").expect("clean end");
     }
