@@ -845,6 +845,17 @@ pub fn configure_environment(emulator_dir: &Path, icd: Icd) {
     }
 }
 
+/// Runs the renderer's host GLES (ANGLE) on `platform` (`metal`, `swiftshader`, ...) instead of
+/// what [`configure_environment`] picks, unless `ANGLE_DEFAULT_PLATFORM` is already set (the
+/// user's choice wins). Call before [`configure_environment`], under the same precondition.
+pub fn prefer_angle_platform(platform: &str) {
+    if std::env::var_os("ANGLE_DEFAULT_PLATFORM").is_none() {
+        // SAFETY: documented precondition: called while the process is single-threaded with
+        // respect to environment access.
+        unsafe { std::env::set_var("ANGLE_DEFAULT_PLATFORM", platform) };
+    }
+}
+
 /// Makes `<exe dir>/lib64` lead to `lib64`. gfxstream `dlopen`s some libraries by bare name
 /// (`libshadertranslator.dylib`), which dyld resolves only through the executable's rpaths, one
 /// of which is `@executable_path/lib64` (`apps/emu/build.rs`). In an SDK overlay `lib64` is
