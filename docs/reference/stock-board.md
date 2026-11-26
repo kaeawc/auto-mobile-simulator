@@ -43,6 +43,20 @@ virtio-snd, 2× virtio-console (logcat on `hvc1`, modem/bluetooth/uwb vports), 1
 goldfish address space (`607d:f153`, host-visible memory for graphics), virtio-wifi
 (mac80211_hwsim), virtio-vsock (guest CID 77).
 
+The virtio-console ports (`/sys/class/virtio-ports/*/name`, emulator 37.2.13, 2026-11-25):
+
+| Stock port | Name | Guest device | simee (one device, slot 19) |
+| --- | --- | --- | --- |
+| `vport8p0` | (console) | `hvc0` | port 0 |
+| `vport8p1` | (console) | `hvc1`, goldfish-logcat | port 2 |
+| `vport8p2` | `uwb`, a named console port | `hvc2`: the UWB HAL opens the tty | port 3 |
+| `vport8p3` | `bluetooth` | `/dev/bluetooth0`, `bt_vhci_forwarder` | port 4 |
+| `vport9p1` | `modem` | the radio HAL | port 1 |
+
+The guest finds ports by name and numbers console ports in port order, so only the console
+ports' relative order matters (uwb must be the third). Stock serves bluetooth and uwb from
+netsimd; simee from a built-in controller with no peers (docs/research/bluetooth.md).
+
 ## Kernel command line and bootconfig
 
 Kernel, stock's `-show-kernel` command line (its `console=ttyAMA0,38400` and `printk.devkmsg=on`
