@@ -57,6 +57,13 @@ The guest finds ports by name and numbers console ports in port order, so only t
 ports' relative order matters (uwb must be the third). Stock serves bluetooth and uwb from
 netsimd; simee from a built-in controller with no peers (docs/research/bluetooth.md).
 
+The touch screen, `adb shell getevent -p` and `dumpsys input` on the same AVDs under both
+(emulator 37.2.13, 2026-11-26; API 36 phone 720×1280, API 36 tablet 2560×1600, API 37 Wear 454×454):
+
+| Device | Stock (identical on all three) | simee (identical on all three) |
+| --- | --- | --- |
+| `virtio_input_multi_touch_1` | keys `BTN_TOOL_RUBBER`, `BTN_STYLUS`; `ABS_MT_SLOT` 0..10, `ABS_MT_TOOL_TYPE` 0..15, axes 0..32767, pressure 0..1024, also `ABS_Z`, touch/orientation axes, `SW_LID`, no props (×11, one per display); sources `TOUCHSCREEN \| STYLUS` | the same pen keys, slots and tool type, plus `BTN_TOUCH`; axes in pixels, pressure 0..255, `INPUT_PROP_DIRECT` (×1); sources `TOUCHSCREEN \| STYLUS` |
+
 ## Kernel command line and bootconfig
 
 Kernel, stock's `-show-kernel` command line (its `console=ttyAMA0,38400` and `printk.devkmsg=on`
