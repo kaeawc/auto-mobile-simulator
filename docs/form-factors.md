@@ -2,7 +2,7 @@
 
 Every device has a platform (`android` or `ios`), a form factor and the sub-platform that pairs
 them. The model is `sim_core::form_factor`; `simee form-factors` and the API's `form_factors`
-print it.
+print it. Which iOS and tvOS runtime versions each feature works on: [ios-versions.md](ios-versions.md).
 
 ## Support
 
