@@ -73,6 +73,10 @@ ship no guest software renderer to fall back to. Options: build gfxstream with s
 (the frontend snapshot is meant for all-Vulkan guests, which simee now runs via guest ANGLE), or
 report snapshots as unsupported so tools fall back to app-level state.
 
+Until then the console reports them as unsupported in stock's words (`apps/emu/src/console.rs`,
+`avd_snapshot`): `save` and `load` reply with the stock Snapshotter's unsupported-graphics `KO`,
+`list` finds none, and `del` succeeds with nothing to delete.
+
 ## 3. AutoMobile harness parity
 
 Point AutoMobile at simee through the SDK overlay (`make shim`, `ANDROID_HOME=~/.simee/sdk`)

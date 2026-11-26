@@ -122,8 +122,9 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   gestures, orientations and the Purple orientation message), `carplay.rs` (StarkConfig, runtime
   gate), `goldfish.rs` (stock emulator key names, the `qwerty2` key set, sensor masks), `xr.rs`
   (Android XR commands and the `xr_service` messages), `vhal.rs` (the vehicle HAL's
-  `EmulatorMessage` codec, property names and values), BGRA→RGBA conversion, `Frame` and PNG
-  encoding. No FFI.
+  `EmulatorMessage` codec, property names and values), `network.rs` (the stock console's
+  `network speed|delay` presets, parsing and `network status` report), BGRA→RGBA conversion,
+  `Frame` and PNG encoding. No FFI.
 - `crates/sim-coresim` — the service boundary: `Context` (service + device set), `Device`
   (lifecycle, apps, settings, orientation, CarPlay), `Display` (framebuffer surface, capture; main
   or external), `Hid` (touch, buttons, keyboard, the Digital Crown, watch gestures, the Siri
@@ -178,8 +179,11 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `android.rs` (live Android device: frames and input over `display.sock`), `controls.rs` (the
   toolbar each platform and form factor gets), `debug.rs` (debug panel: tabs, API worker thread, views), `icons.rs` (SVG
   icons), `keys.rs` (host keys → HID), `view.rs`, `main.rs` (state, actions, poll, tests).
-  Headless `--snap` needs a debug build (release builds lack Rune's tooling feature); scenes:
-  demo, android, foldable, watch, tv, empty. On Linux it renders with Mesa's lavapipe.
+  Headless `--snap` works in debug builds, and in release with the `tooling` feature (Rune's
+  headless flags; off in the shipped build, +1.3 MB stripped):
+  `cargo run --release --features tooling -- --snap /tmp/x.png --scene demo`. Scenes: demo,
+  android, foldable, watch, tv, apple-watch, apple-tv, empty. On Linux it renders with Mesa's
+  lavapipe.
 - `scripts/` — `parity.sh`, `automobile-harness.sh`, `automobile-farm.sh` (every device through
   one private AutoMobile daemon; `automobile-daemon.sh` starts, joins and stops it, and the
   harnesses join it through `AM_DAEMON_ENV`), `pf-shape.sh` (pf/dummynet, needs sudo);
