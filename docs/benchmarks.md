@@ -294,6 +294,76 @@ Under emulation, apps can exceed Android's startup timeouts. One interactive boo
 UI isn't responding" after com.android.phone overran its startup (its main thread runnable, not
 blocked).
 
+The SDK emulator's software mode on the same host and day: 37.3.10 with the same image in an AVD
+of the same shape (4 vCPUs; stock raised its 2 GB to 2560 MB). It runs with `-accel off`, which
+it refuses unless `ANDROID_I_WANT_MY_TCG=yes` is set, plus SwiftShader and `-no-snapshot`. One
+uncounted first boot, then three, each with a 40-minute budget.
+
+```bash
+scripts/tcg-bench.py <sysdir> <workdir> --stock <sdk>/emulator/emulator --avd <x86_64 avd> --boots 3 --budget 2400
+```
+
+| Run | Boot to `sys.boot_completed`, median of 3 (runs) | Host CPU 60–120 s after | 240–300 s after | Peak RSS |
+| --- | --- | --- | --- | --- |
+| emu's devices (above) | 168 s | 2.14 cores | 0.75 cores | 3058 + 233 MB (3.29 GB) |
+| The SDK emulator, `-accel off` | 2302 s (over 2400, 1603.3, 2301.9) | 1.08 cores | 1.09 cores | 3116 MB (3.12 GB) |
+
+The SDK emulator's software mode runs every vCPU on one translator thread (`top -H`: one QEMU thread
+at 93% of a core, the rest near idle). Its first boot and first counted boot didn't reach
+`sys.boot_completed` in 40 minutes. In the guest, `system_server` was killed by its watchdog 4
+times, and zygote started 5 times in the first. The two that completed took 27 and 38 minutes,
+13.7 times emu's median. Stock idles at about one core because its single translator thread
+never goes idle. In this mode it also gives the guest GLES over the pipe (`gltransport=pipe`,
+`skiagl`) rather than ANGLE. Builds of emu ran at the lowest priority on 2 of the 4 cores during
+some of the counted boots.
+
+### Software mode through `emu -avd`
+
+`emu -avd` booting the same AVD itself (#106), same host and day, three rounds. Each round is a
+warm boot, a 60 s settle, three runs of `scripts/android-jank.sh emulator-5554 <emu pid>` (10
+launcher swipes up and down, then the launcher's `dumpsys gfxinfo`; host CPU covers emu and its
+QEMU), and `scripts/ios-step-bench.py <socket> x86_36 20 360 600` through `simee serve` (20 calls
+of each step on an empty spot of the workspace, after a warm-up). Boot times are emu's own `boot
+completed` line. Medians of the 3 boots, the 9 jank runs, and the 3 step runs' medians.
+
+| Measure | emu, software mode | The SDK emulator, `-accel off` (one boot) |
+| --- | --- | --- |
+| Warm boot to `sys.boot_completed` | 161.0 s (156.2, 165.5, 161.0) | 850 s, then unusable (below) |
+| Launcher swipes: frame time p50 / p90 / p99 | 150 / 300 / 400 ms | not measurable |
+| Launcher swipes: janky frames | 96.7% | not measurable |
+| Host CPU while swiping | 2.46 cores | 1.06 cores |
+| `tap` (holds 60 ms) | 60.8 ms | no display socket (adb only) |
+| `screenshot` to a file / as base64 | 36.9 / 61.1 ms | no display socket |
+| `tap`, then `screenshot` to a file | 101.4 ms | no display socket |
+
+The stock emulator's boot set `sys.boot_completed` after 850 s. In the minutes after it, the guest
+had no `package`, `window`, `input` or `gfxinfo` service (`cmd: Can't find service`), so every
+swipe and frame query failed. It then crashed with SIGSEGV when told `emu kill`. simee's step
+bench drives input and frames over emu's display socket, which the stock emulator doesn't have.
+
+The launcher draws at about 7 frames a second in software mode: every frame's guest-side work runs
+translated, and SwiftShader renders it on the same 4 cores. Taps and screenshots don't depend on
+the guest's speed. A tap is the API's 60 ms hold plus under 1 ms, and a screenshot reads the last
+frame emu already holds.
+
+`kfence.sample_interval=0` (#106, the `int3` panics) against the image's KFENCE sampling (every
+500 ms), through `scripts/tcg-bench.py --emu-devices ... --append`, four alternating rounds, one
+boot of each per round:
+
+| Arm | Boot, median (runs) | Host CPU 60–120 s after | 240–300 s after | Panics |
+| --- | --- | --- | --- | --- |
+| KFENCE sampling off | 165.4 s (175.9, 160.7, 161.1, 169.6) | 1.82 cores | 0.73 cores | 0 of 4 |
+| KFENCE every 500 ms | 167.3 s (167.3, 164.3, 184.6, 167.2) | 1.67 cores | 0.74 cores | 0 of 4 |
+
+Turning sampling off costs nothing measurable. The fix rests on the mechanism, not on a panic
+rate, which these 8 boots are too few to show. A warm `emu -avd` boot had panicked with `int3`
+in `__kmem_cache_alloc_node` 101 s in, on three CPUs at once. Lowest-priority builds of emu ran
+on 2 cores during the 184.6 s run.
+
+On GitHub's `ubuntu-latest` (4 vCPUs, `.github/workflows/software-mode.yml`), the first boot of
+a fresh userdata reached `sys.boot_completed` in 243.9 s (one run). This host's first boot took
+381.4 s.
+
 ## Android farm
 
 Clones of one settled golden AVD booted together, each until it is settled (boot complete and

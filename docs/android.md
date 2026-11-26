@@ -231,6 +231,19 @@ EMU_QEMU=/path/to/qemu-system-x86_64 emu -avd phone   # QEMU 11.1 or newer; with
   panics the guest under multi-threaded TCG within seconds (`int3` in the kernel's
   live-patching window); 11.1 has QEMU's fix, but one full boot in about a dozen still hit
   it.
+- **AutoMobile drives it.** `scripts/automobile-harness-android.sh emulator-5554` on an `emu -avd`
+  device (2026-11-26, AutoMobile 0.0.96 from source): 39 of 43 tools pass. Every interaction and
+  device-state tool passes (observe, taps, swipes, pinch, rotation, apps, sensors, SMS, calls,
+  biometrics, network conditions, the system tray), at a median of 6.8 s per tool. The 4 that
+  fail: `captureAudio` and `injectAudioInput` (AutoMobile reaches audio over the stock
+  emulator's gRPC endpoint, which emu doesn't serve), `deviceSnapshot` (emu has no snapshots),
+  and `videoRecording` stop (the guest's `screenrecord` wrote zero bytes; not yet explained).
+- **KFENCE sampling off** (`kfence.sample_interval=0` on the x86 board's command line). These
+  kernels build KFENCE with static keys, so every 500 ms its sampler flips a branch inside every
+  slab allocation, live-patching kernel text through an `int3`. Under multi-threaded TCG another
+  vCPU can run the breakpoint after the patch finished: that was the `int3` panic in
+  `__kmem_cache_alloc_node`, three CPUs at once. Turning it off cost nothing measurable
+  ([benchmarks](benchmarks.md#software-mode-through-emu--avd)).
 - **Guest: the x86_64 images on x86_64 hosts**, with stock's x86 board (virtio-pci: `system.img`
   at `00:03.0`, so `androidboot.boot_devices=pci0000:00/0000:00:03.0`, and the fstab's metadata at
   `00:06.0`). They run guest code 1.8 to 2.0 times as fast as arm64 images, which take 13% longer to
@@ -295,7 +308,9 @@ EMU_QEMU=/path/to/qemu-system-x86_64 emu -avd phone   # QEMU 11.1 or newer; with
 - **Boots to `sys.boot_completed`.** With all of the above, the API 36 image boots under QEMU
   TCG on emu's devices with no KVM and no GPU
   ([benchmarks](benchmarks.md#boot-to-sysboot_completed-with-emus-devices)): 168 s warm, 0 of 5
-  boots failed. Open: the launcher's workspace composes black (the navigation bar and
+  boots failed. The SDK emulator's own software mode (`-accel off`, refused without
+  `ANDROID_I_WANT_MY_TCG=yes`) runs all vCPUs on one translator thread and took 2302 s (median
+  of 3, one of which didn't finish in 40 minutes) on the same host. Open: the launcher's workspace composes black (the navigation bar and
   FallbackHome draw); the launcher once failed to make a bitmap at unlock (`DotRenderer`, null
   `Bitmap`); and under emulation apps can overrun Android's startup timeouts and show "isn't
   responding" dialogs.

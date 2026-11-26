@@ -30,6 +30,22 @@ Guest code runs natively under both. The gap is the emulator itself: an
 in-kernel interrupt controller, zero-copy disk and adb paths, and memory that is committed only
 when the guest touches it.
 
+### Android on Linux without KVM
+
+Software mode, for cloud and CI machines with no `/dev/kvm` and no GPU: QEMU's TCG runs the
+guest's CPU and emu serves its devices. The API 36 x86_64 image on a 4-vCPU Xeon VM with 8 GiB,
+2026-11-26 ([benchmarks](docs/benchmarks.md#android-software-mode-linux-without-kvm)).
+
+| | emu | SDK emulator, `-accel off` |
+| --- | --- | --- |
+| Warm boot, until `sys.boot_completed`, median of 3 or more | **168 s** | 2302 s (1 of 3 never finished in 40 minutes) |
+| Host CPU once idle | **0.75 cores** | 1.09 cores |
+| Peak memory, QEMU and emu | 3.29 GB | **3.12 GB** |
+| Tap / screenshot through the API, median | **60.8 ms / 36.9 ms** | no display socket; its framework kept restarting |
+
+The SDK emulator runs every vCPU on one translator thread, and emu's QEMU runs one per vCPU.
+Everything is drawn on the CPU, so the launcher draws about 7 frames a second.
+
 ### iOS: simee against Simulator.app and `simctl`
 
 | | simee | Simulator.app and `simctl` |
@@ -85,7 +101,9 @@ Unsupported combinations are refused with the reason. The matrix and its gaps:
 
 ## Not yet
 
-- Apple silicon Macs only. Linux builds and tests everything but cannot run devices.
+- iOS needs an Apple silicon Mac. Android runs on Apple silicon, and on x86_64 Linux in software
+  mode (x86_64 images; slow frames, see above). KVM on Linux is in progress
+  ([#54](https://github.com/kaeawc/simee/issues/54)).
 - No Android snapshots, so every boot is a full boot.
 - AutoMobile's Android harness: 38 of 41 tools pass (2026-11-24). Open: network shaping and VM
   snapshots.

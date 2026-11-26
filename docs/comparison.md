@@ -84,7 +84,11 @@ name and that screen's coordinates.
 ## Where the stock tools are still ahead
 
 - Android snapshots: the SDK emulator restores a saved state in seconds. emu always boots.
-- Hosts: the SDK emulator runs on Intel Macs, Linux and Windows. emu needs Apple silicon.
+- Hosts: the SDK emulator runs on Intel Macs, Linux and Windows with hardware virtualization.
+  emu needs Apple silicon, or x86_64 Linux in software mode, which boots in 168 s against the
+  SDK emulator's 2302 s there but draws about 7 frames a second
+  ([benchmarks](benchmarks.md#android-software-mode-linux-without-kvm)). It has no Linux KVM,
+  Intel Mac or Windows backend yet.
 - Android coverage: 38 of 44 AutoMobile harness tools pass on API 37. Automotive and XR images
   have not been booted.
 - iOS graphics debugging that lives in Xcode (view debugger, Instruments) is unchanged: use
