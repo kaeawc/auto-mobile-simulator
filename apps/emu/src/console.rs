@@ -783,7 +783,7 @@ mod tests {
 
     fn attach(info: &ConsoleInfo, with_mouse: bool, touch_screen: bool) -> Devices {
         let (touch, th) = if touch_screen {
-            let (t, h) = Input::new(Kind::Touch { width: 720, height: 1280, pen: true }, "touch");
+            let (t, h) = Input::new(Kind::Touch { width: 720, height: 1280, screen: true }, "touch");
             (Some(t), Some(h))
         } else {
             (None, None)
@@ -963,7 +963,9 @@ mod tests {
 
     #[test]
     fn pens_hover_touch_and_leave_on_the_screen() {
-        use emu_vmm::virtio::input::{ABS_MT_PRESSURE, ABS_MT_SLOT, ABS_MT_TOOL_TYPE, BTN_STYLUS, BTN_TOUCH, EV_ABS, EV_KEY, PEN_SLOT};
+        use emu_vmm::virtio::input::{
+            ABS_MT_POSITION_X, ABS_MT_PRESSURE, ABS_MT_SLOT, ABS_MT_TOOL_TYPE, BTN_STYLUS, BTN_TOUCH, EV_ABS, EV_KEY, PEN_SLOT,
+        };
         let info = console(FormFactor::Tablet);
         let devices = attach_inputs(&info, false);
         for line in ["pen 100 200", "pen 100 200 down pressure 200 button", "pen 120 200 move", "pen 120 200 up", "pen 120 200 leave"] {
@@ -972,13 +974,15 @@ mod tests {
         let batches = devices.touch.expect("touch").take_queued();
         assert_eq!(batches.len(), 5);
         assert!(batches.iter().all(|b| b[0] == InputEvent::new(EV_ABS, ABS_MT_SLOT, PEN_SLOT)), "the pen's own slot");
-        assert!(batches[0].contains(&InputEvent::new(EV_ABS, ABS_MT_TOOL_TYPE, 1)) && !batches[0].iter().any(|e| e.code == BTN_TOUCH));
+        assert!(batches[0].contains(&InputEvent::new(EV_ABS, ABS_MT_TOOL_TYPE, 1)));
+        // Pixels and the console's pressure (of 255) on stock's axes (0..=32767, 0..=1024).
+        assert!(batches[0].contains(&InputEvent::new(EV_ABS, ABS_MT_POSITION_X, 4552)), "100 of 720: {:?}", batches[0]);
         assert!(
-            batches[1].contains(&InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 200))
+            batches[1].contains(&InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 803))
                 && batches[1].contains(&InputEvent::new(EV_KEY, BTN_STYLUS, 1))
         );
-        assert!(batches[1].contains(&InputEvent::new(EV_KEY, BTN_TOUCH, 1)));
-        assert!(batches[3].contains(&InputEvent::new(EV_KEY, BTN_TOUCH, 0)), "up lifts to hovering");
+        assert!(batches[3].contains(&InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 0)), "up lifts to hovering");
+        assert!(batches.iter().flatten().all(|e| e.typ != EV_KEY || e.code != BTN_TOUCH), "contact is pressure alone");
         assert_eq!(run(&info, "pen 720 10"), "KO: (720, 10) is off the 720x1280 screen");
         assert_eq!(run(&info, "pen 1 2 press"), format!("KO: unknown word 'press' ({})", sim_core::stylus::USAGE));
     }
@@ -988,7 +992,7 @@ mod tests {
         let info = console(FormFactor::Vision);
         let _devices = attach_inputs(&info, true);
         assert_eq!(run(&info, "touchpad 10 10"), "KO: this device has no touchpad (hw.touchpad0)");
-        let (pad, handle) = Input::new(Kind::Touch { width: 1542, height: 297, pen: false }, emu_vmm::virtio::input::TOUCHPAD_NAME);
+        let (pad, handle) = Input::new(Kind::Touch { width: 1542, height: 297, screen: false }, emu_vmm::virtio::input::TOUCHPAD_NAME);
         info.inputs.lock().expect("inputs").as_mut().expect("inputs").touchpad = Some(handle);
         for line in ["touchpad 100 150 down", "touchpad 900 150 move", "touchpad 900 150 up"] {
             assert_eq!(run(&info, line), "OK");
@@ -1018,8 +1022,11 @@ mod tests {
         assert_eq!(run(&info, "touch 10 20"), "OK");
         let batches = devices.touch.expect("touch").take_queued();
         assert_eq!(batches.len(), 2, "down then up");
-        assert!(batches[0].contains(&InputEvent::new(EV_KEY, emu_vmm::virtio::input::BTN_TOUCH, 1)));
-        assert!(batches[1].contains(&InputEvent::new(EV_KEY, emu_vmm::virtio::input::BTN_TOUCH, 0)));
+        use emu_vmm::virtio::input::{ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID, EV_ABS};
+        // Device pixels on stock's 0..=32767 axes: 10 of 720 and 20 of 1280.
+        assert!(batches[0].contains(&InputEvent::new(EV_ABS, ABS_MT_POSITION_X, 456)), "{:?}", batches[0]);
+        assert!(batches[0].contains(&InputEvent::new(EV_ABS, ABS_MT_POSITION_Y, 512)), "{:?}", batches[0]);
+        assert!(batches[1].contains(&InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, -1)));
     }
 
     /// Opens the guest end of a qemud pipe the way the guest's service does.
