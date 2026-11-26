@@ -140,6 +140,36 @@ this host varied during these runs, so treat them as a rough comparison.
 | default | 5 of 8 within 600 s | 2176 MB | 235 |
 | `slim` | 8 of 8 in 392 s | 1158 MB | 148 |
 
+Time to usable devices: fresh clones of one booted-once iPhone 17 (iOS 27.2) template, first boot
+through `simee boot-many <clones> -j K --profile slim --json`, 2026-11-26, M3 Max, 16 CPUs, macOS
+26.6, 3 interleaved runs of each with other work on the host (1-minute load 25-550: read the
+ranges). "Before" is the same build with the slim disables applied after the boot and settle
+judged on all CPU (`--settle-cpu all`), as until this change; the mechanism is in
+[farm.md](farm.md#the-slim-profile).
+
+| Measure | before | after |
+| --- | --- | --- |
+| 1 clone: booted until settled, median (runs) | 95.0 s (97.2, 95.0, 52.7) | 33.3 s (44.2, 33.3, 28.3) |
+| 4 clones at once (K=4): all settled, median (runs) | 229 s (229, 170, 238) | 43 s (35, 43, 71) |
+| 4 clones at once: CPU-s each device used until settled, median (not like for like: "before" waited on all CPU, "after" on foreground CPU only, so its wait ends earlier and background work keeps running after it; docs/farm.md) | 167 | 76 |
+| The slim profile's own time in that, 4 at once, median of 12 | 42.9 s | 5.4 s |
+
+Time per automation step on one booted iPhone 17 (iOS 27.2) through `simee serve`, one persistent
+connection, `python3 scripts/ios-step-bench.py <socket> <udid> 20` (medians of 20 calls; the
+median of 3 interleaved runs), 2026-11-26, same host, 48 AVDs and 100 simulators on it, 1-minute
+load 21-32. "Before" routed every call by listing both platforms' devices:
+
+| Measure | before | after |
+| --- | --- | --- |
+| tap (holds 60 ms) | 137.5 ms | 63.4 ms |
+| screenshot, PNG written to a file | 99.7 ms | 24.5 ms |
+| screenshot, base64 in the reply | 107.8 ms | 34.8 ms |
+| tap, then screenshot to a file | 241.2 ms | 88.9 ms |
+
+One screenshot as a command (a process per call), same device and hour, median of 7 interleaved
+(load 13-69): `simee screenshot` forwarded to `simee serve` 36 ms, `simee screenshot` in its own
+process (`SIMEE_IN_PROCESS=1`) 173 ms, `xcrun simctl io <udid> screenshot` 601 ms.
+
 ## Emulator internals
 
 These explain the table above. Each is a before and after of emu itself, with the mechanism
@@ -232,10 +262,15 @@ are what a fresh checkout, a CI cache miss or a Rune bump pays.
 
 Claims that would belong in the README once someone runs them:
 
-- `simee screenshot` against `xcrun simctl io screenshot` on a quiet host.
+- `simee screenshot` against `xcrun simctl io screenshot` on a quiet host (the run above had load
+  13-69).
 - iOS boot and settle on a quiet host (the runs above had other load).
-- Time per automation step (tap, then screenshot) through the socket API against `simctl` and
-  against `adb` on the SDK emulator.
+- Time per automation step (tap, then screenshot) through the socket API against `adb` on the SDK
+  emulator (`simctl` has no tap).
+- Host Spotlight indexing of simulator data: `mdfind` lists 13,858 items under one booted-once
+  device's directory (6,562 files), so the host's `mds_stores` indexes what devices write. What
+  excluding `~/Library/Developer/CoreSimulator` from Spotlight saves a farm needs a change to the
+  host's Spotlight privacy settings to measure.
 - Host CPU of an idle booted device, emu against the SDK emulator.
 - Network throughput and latency through emu's NAT against the SDK emulator's slirp.
 - Host CPU of an idle booted device with and without the virtio-snd card (`EMU_VIRTIO_SND=0`),

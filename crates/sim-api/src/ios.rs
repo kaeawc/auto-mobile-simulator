@@ -481,10 +481,17 @@ pub struct Profile {
 }
 
 /// Profiles `boot {profile}` applies. Each job is disabled in the device's own launchd database
-/// and booted out (stopped now). A plain reboot keeps most of the disables, but the paired-watch
-/// companions (companionappd, NPKCompanionAgent, brookcompaniond) come back enabled and running on
-/// every boot, and a clone of the device keeps none (all measured): apply the profile on every
-/// boot. Again it touches only the jobs that came back, and `profile {undo}` enables the jobs.
+/// and booted out (stopped now). `boot` of a shut-down device writes the disables into that
+/// database before the boot ([`preset_profile`]), so the jobs never start. A plain reboot keeps
+/// the disables and a clone of the device keeps none (a new UDID, a new database): apply the
+/// profile on every boot. Again it touches only the jobs that came back, and `profile {undo}`
+/// enables the jobs.
+///
+/// The paired-watch daemons (the runtime's `NanoLaunchDaemons`: companionappd, NPKCompanionAgent,
+/// brookcompaniond, addressbooksyncd, bulletindistributord, pairedsyncd and 11 more) are
+/// `Disabled` in their own plists; nanoregistrylaunchd enables all 17 each time it runs (one to
+/// three minutes after a boot, measured on iOS 27.2), which is why they came back on every boot.
+/// The profile disables nanoregistrylaunchd itself, and the ones that run once enabled.
 pub const PROFILES: &[Profile] = &[Profile { name: "slim", disabled: SLIM }];
 
 /// The `slim` profile: daemons that burn CPU or memory on an idle booted device and that no
@@ -557,7 +564,12 @@ const SLIM: &[&str] = &[
     "com.apple.ScreenTimeAgent",
     "com.apple.UsageTrackingAgent",
     "com.apple.FamilyControlsAgent",
-    // Paired-watch and Find My companions.
+    // Paired-watch and Find My companions: nanoregistrylaunchd enables the paired-watch daemons
+    // (see `PROFILES`); the rest are those that then run on an idle phone.
+    "com.apple.nanoregistrylaunchd",
+    "com.apple.addressbooksyncd",
+    "com.apple.bulletindistributord",
+    "com.apple.pairedsyncd",
     "com.apple.NPKCompanionAgent",
     "com.apple.companionappd",
     "com.apple.wcd",
@@ -639,6 +651,9 @@ fn boot_device(device: &Device, plan: &BootPlan) -> Result<Value, String> {
         env.extend(sim_netshape::launch_env(&udid, dylib));
     }
     let was_booted = device.state() == DeviceState::Booted;
+    // Before the boot, so this boot never starts the profile's jobs (a clone starts with no
+    // disables of its own).
+    let preset = plan.profile.filter(|_| !was_booted).map(|profile| preset_profile(&udid, profile));
     if !was_booted && !env.is_empty() {
         device.boot_with_env(&env).map_err(err)?;
     }
@@ -653,11 +668,16 @@ fn boot_device(device: &Device, plan: &BootPlan) -> Result<Value, String> {
         };
         r["name"] = json!(profile.name);
         r["took_s"] = json!(round(t.elapsed().as_secs_f64()));
+        match preset {
+            Some(Ok(n)) => r["preset"] = json!(n),
+            Some(Err(e)) => r["preset_error"] = json!(e),
+            None => {}
+        }
         result["profile"] = r;
     }
     if let Some(rule) = plan.settle {
         // From the start of the boot call, the profile included.
-        let Settled { at, settler } = wait_settled(&udid, rule, plan.settle_timeout);
+        let Settled { at, settler } = wait_settled(&udid, rule, plan.settle_timeout, !was_booted);
         if at.is_some() {
             result["settled"] = json!(true);
             result["settle_s"] = json!(round(start.elapsed().as_secs_f64()));
@@ -679,9 +699,13 @@ fn not_settled(settler: &crate::settle::Settler, rule: crate::settle::Rule, time
 }
 
 /// A settle wait's last figures: processes, and CPU over the window (all of it, and the
-/// background-QoS and foreground parts).
+/// background-QoS and foreground parts); and the CPU seconds the tree used over the whole wait
+/// (from the boot when the wait followed one).
 fn put_load(result: &mut Value, settler: &crate::settle::Settler) {
     let load = settler.load();
+    let used = settler.used();
+    result["cpu_s"] = json!(round(used.total_s));
+    result["background_cpu_s"] = json!(round(used.background_s));
     result["procs"] = json!(settler.procs());
     result["cpu_pct"] = json!(load.map(|l| round(l.total_pct)));
     result["background_cpu_pct"] = json!(load.map(|l| round(l.background_pct)));
@@ -786,12 +810,8 @@ fn apply_profile(device: &Device, profile: &Profile, undo: bool) -> Result<Appli
     // launchd's own lists.
     let run = |args: &[&str]| device.exec("launchctl", &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(), &[]);
     let loaded = if undo { String::new() } else { run(&["list"]).map(|o| o.stdout).unwrap_or_default() };
-    let todo = if undo {
-        profile.disabled.to_vec()
-    } else {
-        let before = run(&["print-disabled", "system"]).map(|o| o.stdout).unwrap_or_default();
-        still_on(profile.disabled, &loaded, &before)
-    };
+    let before = if undo { String::new() } else { run(&["print-disabled", "system"]).map(|o| o.stdout).unwrap_or_default() };
+    let todo = if undo { profile.disabled.to_vec() } else { still_on(profile.disabled, &loaded, &before) };
     let already: Vec<&str> = profile.disabled.iter().copied().filter(|l| !todo.contains(l)).collect();
     let mut refused = Vec::new();
     for label in &todo {
@@ -805,8 +825,70 @@ fn apply_profile(device: &Device, profile: &Profile, undo: bool) -> Result<Appli
             let _ = run(&["bootout", &target]);
         }
     }
-    let disabled = run(&["print-disabled", "system"]).map_err(err)?.stdout;
+    // Nothing changed (a device whose disables were preset before its boot): the listing read
+    // before is the one after.
+    let disabled = if todo.is_empty() { before } else { run(&["print-disabled", "system"]).map_err(err)?.stdout };
     Ok(profile_outcome(profile.disabled, &loaded, &already, &refused, &disabled, undo))
+}
+
+/// Writes `profile`'s disables into the shut-down device `udid`'s launchd overrides file (see
+/// [`sim_core::launchd`]) before it boots, so that boot never loads the profile's jobs: a clone's
+/// first boot then skips starting ~60 daemons and the disable and bootout spawns that would stop
+/// them (measured, docs/farm.md). Keeps the file's other overrides; returns how many labels it
+/// newly disabled. [`apply_profile`] still runs after the boot and does whatever this couldn't
+/// (a runtime whose launchd keeps the file elsewhere).
+fn preset_profile(udid: &str, profile: &Profile) -> Result<usize, String> {
+    preset_disables(&sim_core::launchd::disabled_plist_path(udid), profile.disabled)
+}
+
+/// Disables `labels` in the launchd overrides file at `path` (made, with its directory, when
+/// missing); returns how many weren't disabled there already.
+fn preset_disables(path: &Path, labels: &[&str]) -> Result<usize, String> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let entries = match std::fs::read_to_string(path) {
+        Ok(text) => sim_core::launchd::parse(&text).ok_or_else(|| format!("{} isn't a property list simee reads", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let off: std::collections::HashSet<&str> = sim_core::launchd::disabled(&entries).collect();
+    let new = labels.iter().filter(|l| !off.contains(*l)).count();
+    if new == 0 {
+        return Ok(0);
+    }
+    let dir = path.parent().ok_or("no directory")?;
+    // launchd_sim makes it 0700 when it doesn't exist.
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // The directory is under world-writable /private/var/tmp: a unique name, created exclusively.
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let tmp = dir.join(format!("disabled.plist.simee.{}.{nanos}", std::process::id()));
+    write_new(&tmp, dir, sim_core::launchd::render(&entries, labels, true).as_bytes())?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })?;
+    Ok(new)
+}
+
+/// Writes `bytes` to a file that must not exist yet in `dir` (`create_new` is `O_CREAT|O_EXCL`,
+/// which never follows a symlink planted at the name), and refuses a `dir` owned by another user:
+/// the file just made is ours, so its owner is this process's uid (no libc needed).
+fn write_new(path: &Path, dir: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|e| fail(&e))?;
+    let checked = file.metadata().and_then(|m| Ok((m.uid(), std::fs::symlink_metadata(dir)?))).map_err(|e| fail(&e));
+    let result = checked.and_then(|(uid, d)| {
+        if d.file_type().is_symlink() || d.uid() != uid {
+            Err(format!("{} isn't a directory owned by the current user; refusing to write the launchd overrides there", dir.display()))
+        } else {
+            file.write_all(bytes).map_err(|e| fail(&e))
+        }
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
 }
 
 /// A device's processes read through libproc (see [`crate::settle::Procs`]).
@@ -834,10 +916,11 @@ struct Settled {
 }
 
 /// Waits until the booted device `udid` is settled by `rule`, reading its process tree (its
-/// `launchd_sim` and descendants, nothing else on the host) once a second.
-fn wait_settled(udid: &str, rule: crate::settle::Rule, timeout: Duration) -> Settled {
+/// `launchd_sim` and descendants, nothing else on the host) once a second. `since_boot`: the
+/// device was just booted, so the CPU its tree used before the first sample counts too.
+fn wait_settled(udid: &str, rule: crate::settle::Rule, timeout: Duration, since_boot: bool) -> Settled {
     let start = std::time::Instant::now();
-    let mut settler = crate::settle::Settler::new(rule);
+    let mut settler = if since_boot { crate::settle::Settler::since_boot(rule) } else { crate::settle::Settler::new(rule) };
     // Found by a scan of the host's processes, then reused while it is still a launchd_sim.
     let mut root: Option<i32> = None;
     loop {
@@ -932,7 +1015,14 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         }
         "delete" => {
             let d = s.device(p)?;
-            ok(s.ctx()?.delete(&d))
+            let udid = d.info().udid;
+            s.ctx()?.delete(&d).map_err(err)?;
+            // The service leaves launchd_sim's directory (its log, ~1-3 MB, and the disables)
+            // behind; it is keyed by the UDID, so nothing reads it again.
+            if let Some(dir) = sim_core::launchd::disabled_plist_path(&udid).parent().filter(|_| !udid.is_empty()) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            Ok(Value::Null)
         }
         "boot" => {
             let plan = boot_plan(p, 1, false, sim_netshape::dylib)?;
@@ -967,7 +1057,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             }
             let rule = settle_rule(p, "")?;
             let timeout = opt_u64(p, "timeout_s").map_or_else(|| crate::settle::default_settle_timeout(1), Duration::from_secs);
-            let Settled { at, settler } = wait_settled(&d.info().udid, rule, timeout);
+            let Settled { at, settler } = wait_settled(&d.info().udid, rule, timeout, false);
             let settle_s = at.ok_or_else(|| not_settled(&settler, rule, timeout))?;
             let mut result = json!({"settle_s": round(settle_s)});
             put_load(&mut result, &settler);
@@ -1511,9 +1601,97 @@ mod tests {
         // later boot and the device never settles (docs/farm.md).
         let slim = profile("slim").expect("slim");
         assert!(!slim.disabled.contains(&"com.apple.sleepd"));
-        assert_eq!(slim.disabled.len(), 58);
+        assert_eq!(slim.disabled.len(), 62);
         for companion in ["com.apple.companionappd", "com.apple.NPKCompanionAgent", "com.apple.brook.brookcompaniond"] {
             assert!(slim.disabled.contains(&companion), "{companion} stays in: re-applied on every boot");
+        }
+    }
+
+    #[test]
+    fn the_slim_profile_turns_off_what_reenables_the_watch_daemons() {
+        // nanoregistrylaunchd enables the 17 NanoLaunchDaemons whenever it runs; without it off,
+        // the companions come back one to three minutes after every boot (docs/farm.md).
+        let slim = profile("slim").expect("slim");
+        for label in
+            ["com.apple.nanoregistrylaunchd", "com.apple.addressbooksyncd", "com.apple.bulletindistributord", "com.apple.pairedsyncd"]
+        {
+            assert!(slim.disabled.contains(&label), "{label}");
+        }
+        let unique: std::collections::HashSet<_> = slim.disabled.iter().collect();
+        assert_eq!(unique.len(), slim.disabled.len(), "no label twice");
+    }
+
+    #[test]
+    fn a_preset_disables_the_profile_before_boot_and_keeps_other_overrides() {
+        let dir = std::env::temp_dir().join(format!("simee-preset-{}", std::process::id()));
+        let path = dir.join("com.apple.CoreSimulator.SimDevice.X").join("disabled.plist");
+        let _ = std::fs::remove_dir_all(&dir);
+        // A clone's first boot: no directory yet.
+        assert_eq!(preset_disables(&path, &["a", "b"]), Ok(2));
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(path.parent().expect("dir")).expect("made").permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "as launchd_sim makes it");
+        }
+        // A later boot: launchd (or nanoregistrylaunchd) enabled `b` and kept its own `c`.
+        std::fs::write(&path, sim_core::launchd::render(&[("b".into(), false), ("c".into(), false)], &["a"], true)).expect("write");
+        assert_eq!(preset_disables(&path, &["a", "b"]), Ok(1), "only b is new");
+        let back = sim_core::launchd::parse(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        assert_eq!(back, [("b".to_owned(), true), ("c".to_owned(), false), ("a".to_owned(), true)]);
+        assert_eq!(preset_disables(&path, &["a", "b"]), Ok(0), "nothing to write");
+        // A file simee can't read is left alone.
+        std::fs::write(&path, "bplist00").expect("write");
+        assert!(preset_disables(&path, &["a"]).is_err());
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "bplist00");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_temp_file_for_the_disables_is_never_a_planted_symlink() {
+        let dir = std::env::temp_dir().join(format!("simee-write-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep").expect("victim");
+        let tmp = dir.join("disabled.plist.simee");
+        std::os::unix::fs::symlink(&victim, &tmp).expect("plant");
+        assert!(write_new(&tmp, &dir, b"x").is_err(), "an existing name, symlink or not, is refused");
+        assert_eq!(std::fs::read_to_string(&victim).expect("read"), "keep", "not written through the link");
+        // A dangling link too (O_EXCL fails on the link itself).
+        std::fs::remove_file(&tmp).expect("rm");
+        std::os::unix::fs::symlink(dir.join("missing"), &tmp).expect("plant dangling");
+        assert!(write_new(&tmp, &dir, b"x").is_err());
+        assert!(!dir.join("missing").exists());
+        std::fs::remove_file(&tmp).expect("rm");
+        // A free name works and has the bytes.
+        write_new(&tmp, &dir, b"ok").expect("free name");
+        assert_eq!(std::fs::read_to_string(&tmp).expect("read"), "ok");
+        // A directory that is itself a symlink is refused, and leaves no file behind.
+        let link = std::env::temp_dir().join(format!("simee-write-new-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&dir, &link).expect("dir link");
+        let via = link.join("new");
+        assert!(write_new(&via, &link, b"x").is_err());
+        assert!(!dir.join("new").exists());
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_disables_are_not_written_into_another_users_directory() {
+        // The sticky, world-writable /private/tmp (macOS) or /tmp is root's: anyone can create a
+        // file in it, which is what a hostile directory looks like. Skipped as root (the owner).
+        let dir = std::path::Path::new(if std::path::Path::new("/private/tmp").is_dir() { "/private/tmp" } else { "/tmp" });
+        let tmp = dir.join(format!("simee-foreign-dir-{}", std::process::id()));
+        match write_new(&tmp, dir, b"x") {
+            Err(e) => {
+                assert!(e.contains("isn't a directory owned by the current user"), "{e}");
+                assert!(!tmp.exists(), "nothing left behind");
+            }
+            Ok(()) => {
+                eprintln!("skipped: running as the directory's owner (root), no other uid to test with");
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
 
@@ -1521,13 +1699,13 @@ mod tests {
     fn settle_rules_read_their_keys() {
         let none = || -> Result<std::path::PathBuf, String> { Err("unused".into()) };
         let plan = boot_plan(&json!({"settle": true}), 1, false, none).expect("boot");
-        assert_eq!(plan.settle, Some(crate::settle::Rule::default()), "all CPU by default");
-        let p = json!({"settle": true, "settle_cpu_pct": 5.0, "settle_window_s": 20, "settle_foreground": true});
+        assert_eq!(plan.settle, Some(crate::settle::Rule::default()), "foreground CPU by default");
+        let p = json!({"settle": true, "settle_cpu_pct": 5.0, "settle_window_s": 20, "settle_foreground": false});
         let rule = boot_plan(&p, 1, false, none).expect("boot").settle.expect("settle");
-        assert_eq!(rule, crate::settle::Rule { cpu_pct: 5.0, window: Duration::from_secs(20), foreground: true });
-        let rule = settle_rule(&json!({"cpu_pct": 7.0, "window_s": 3, "foreground": true}), "").expect("settle");
-        assert_eq!(rule, crate::settle::Rule { cpu_pct: 7.0, window: Duration::from_secs(3), foreground: true });
-        assert!(!settle_rule(&json!({"settle_foreground": true}), "").expect("settle").foreground, "settle's own keys have no prefix");
+        assert_eq!(rule, crate::settle::Rule { cpu_pct: 5.0, window: Duration::from_secs(20), foreground: false });
+        let rule = settle_rule(&json!({"cpu_pct": 7.0, "window_s": 3, "foreground": false}), "").expect("settle");
+        assert_eq!(rule, crate::settle::Rule { cpu_pct: 7.0, window: Duration::from_secs(3), foreground: false });
+        assert!(settle_rule(&json!({"settle_foreground": false}), "").expect("settle").foreground, "settle's own keys have no prefix");
         // A mistyped option is refused, not silently replaced by the default.
         for bad in [
             json!({"settle": true, "settle_foreground": "true"}),
@@ -1551,14 +1729,18 @@ mod tests {
         settler.push(10.0, tree(3.0, 2.0));
         let mut r = json!({});
         put_load(&mut r, &settler);
-        assert_eq!(r, json!({"procs": 1, "cpu_pct": 30.0, "background_cpu_pct": 20.0, "foreground_cpu_pct": 10.0}));
+        assert_eq!(
+            r,
+            json!({"procs": 1, "cpu_pct": 30.0, "background_cpu_pct": 20.0, "foreground_cpu_pct": 10.0, "cpu_s": 3.0,
+                   "background_cpu_s": 2.0})
+        );
         let rule = crate::settle::Rule { foreground: true, ..Default::default() };
         assert_eq!(
             not_settled(&settler, rule, Duration::from_secs(60)),
             "device did not settle within 60s (10 % of a core in the foreground over the last 10s)"
         );
         assert_eq!(
-            not_settled(&settler, crate::settle::Rule::default(), Duration::from_secs(60)),
+            not_settled(&settler, crate::settle::Rule { foreground: false, ..Default::default() }, Duration::from_secs(60)),
             "device did not settle within 60s (30 % of a core over the last 10s)"
         );
     }
