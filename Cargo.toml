@@ -97,6 +97,9 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.base64]
 opt-level = 3
+# `-provision` checks each multi-GB system image download's SHA-1.
+[profile.dev.package.sha1_smol]
+opt-level = 3
 [profile.dev.package.cpal]
 opt-level = 2
 
