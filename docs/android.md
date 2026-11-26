@@ -233,12 +233,15 @@ EMU_QEMU=/path/to/qemu-system-x86_64 emu -avd phone   # QEMU 11.1 or newer; with
   live-patching window); 11.1 has QEMU's fix, but one full boot in about a dozen still hit
   it.
 - **AutoMobile drives it.** `scripts/automobile-harness-android.sh emulator-5554` on an `emu -avd`
-  device (2026-11-26, AutoMobile 0.0.96 from source): 39 of 43 tools pass. Every interaction and
-  device-state tool passes (observe, taps, swipes, pinch, rotation, apps, sensors, SMS, calls,
-  biometrics, network conditions, the system tray), at a median of 6.8 s per tool. The 4 that
-  fail: `captureAudio` and `injectAudioInput` (AutoMobile reaches audio over the stock
-  emulator's gRPC endpoint, which emu doesn't serve), `deviceSnapshot` (emu has no snapshots),
-  and `videoRecording` stop (the guest's `screenrecord` wrote zero bytes; not yet explained).
+  device (2026-11-26, AutoMobile 0.0.96 from source): 41 of 44 tools pass, at a median of 7.9 s
+  per tool. Every interaction and device-state tool passes (observe, taps, swipes, pinch,
+  rotation, apps, sensors, SMS, calls, biometrics, network conditions, the system tray, video
+  recording). The 3 that fail fail on a Mac too: `captureAudio` and `injectAudioInput` (AutoMobile
+  reaches audio over the stock emulator's gRPC endpoint, which emu doesn't serve) and
+  `deviceSnapshot` (emu has no snapshots). The harness records a swipe between `videoRecording`
+  start and stop. Stopped right after starting, under TCG the guest's software encoder hadn't
+  produced its first frame, so the muxer never started (`MediaMuxer: stop() is called in invalid
+  state 1`) and the file stayed empty, in 2 of 2 full runs.
 - **Idle cost.** Settled, a software-mode device takes about 0.7 of a host core. A quiet
   Perfetto trace of the guest puts about a third of that on vsync: the ranchu composer marks its
   present fences unreliable, so SurfaceFlinger keeps hardware vsync on and handles 60 composer
