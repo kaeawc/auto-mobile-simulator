@@ -1,14 +1,15 @@
 //! Which vCPUs a raised interrupt must rouse, and how: the wake/park state machine.
 //!
 //! With the framework's in-kernel GIC an idle vCPU waits for interrupts inside `hv_vcpu_run`.
-//! simee measured that wait not noticing an SPI raised by a device thread until the vCPU's own
-//! timer fired, so raising one kicks vCPUs out of the run (`hv_vcpus_exit`) to see it (first-boot
-//! `/data` encryption: 22 s without, 8 s with). Other VMMs on the same API (QEMU's and libkrun's
-//! in-kernel GIC, arcbox on macOS 26.4) only raise the SPI and measured kicks as pure cost, so
-//! the framework may wake the target itself on newer macOS; [`Mode::NoKick`] tries that.
-//! Kicking every vCPU for every SPI costs one forced exit per vCPU per interrupt, busy vCPUs
-//! included. Here each vCPU publishes where it is, and an SPI rouses only its target (the vCPU
-//! `GICD_IROUTER` names), and only if it needs it:
+//! simee once measured that wait not noticing an SPI raised by a device thread until the vCPU's
+//! own timer fired, and kicked vCPUs out of the run (`hv_vcpus_exit`) to see it (first-boot
+//! `/data` encryption: 22 s without, 8 s with). On macOS 26.6 the framework wakes the target
+//! itself, as other VMMs on the same API (QEMU's and libkrun's in-kernel GIC, arcbox on macOS
+//! 26.4) found: without kicks, first boots took 12.9 s against 14.3 s and warm boots 3.7 s against
+//! 4.2 s, with a third fewer vCPU0 guest entries, so [`Mode::NoKick`] is the default and kicks are
+//! kept for A/B runs. Kicking every vCPU for every SPI costs one forced exit per vCPU per
+//! interrupt, busy vCPUs included. With kicks ([`Mode::Targeted`]) each vCPU publishes where it
+//! is, and an SPI rouses only its target (the vCPU `GICD_IROUTER` names), and only if it needs it:
 //!
 //! - **Guest** (inside `hv_vcpu_run`): kick it, at most once per entry into the guest.
 //! - **Parked** (in a host-side WFI wait): wake it.
@@ -82,10 +83,11 @@ impl Target {
 /// How interrupts rouse vCPUs (`EMU_VCPU_WAKE`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// Only the SPI's target, only when it needs it (the default).
+    /// Kick only the SPI's target, only when it needs it (`EMU_VCPU_WAKE=targeted`).
     Targeted,
-    /// Never kick for an interrupt, only wake vCPUs parked on the host: for when the framework
-    /// wakes a vCPU waiting in the guest itself (`EMU_VCPU_WAKE=none`).
+    /// Never kick for an interrupt, only wake vCPUs parked on the host: the framework wakes a
+    /// vCPU waiting in the guest itself (the default; `EMU_VCPU_WAKE=none`). On macOS 26.6 the
+    /// kicks were a third of vCPU0's guest entries and bought no boot time (docs/android.md).
     NoKick,
     /// Every vCPU for every SPI, host-side WFI waits bounded by [`SGI_POLL`]: the behaviour
     /// before targeted wakes, for A/B measurements (`EMU_VCPU_WAKE=all`).
@@ -96,8 +98,8 @@ impl Mode {
     pub fn parse(value: Option<&str>) -> Mode {
         match value {
             Some("all") => Mode::All,
-            Some("none") => Mode::NoKick,
-            _ => Mode::Targeted,
+            Some("targeted") => Mode::Targeted,
+            _ => Mode::NoKick,
         }
     }
 
@@ -361,9 +363,10 @@ mod tests {
     }
 
     #[test]
-    fn mode_defaults_to_targeted() {
-        assert_eq!(Mode::parse(None), Mode::Targeted);
-        assert_eq!(Mode::parse(Some("")), Mode::Targeted);
+    fn mode_defaults_to_no_kick() {
+        assert_eq!(Mode::parse(None), Mode::NoKick);
+        assert_eq!(Mode::parse(Some("")), Mode::NoKick);
+        assert_eq!(Mode::parse(Some("bogus")), Mode::NoKick);
         assert_eq!(Mode::parse(Some("targeted")), Mode::Targeted);
         assert_eq!(Mode::parse(Some("all")), Mode::All);
         assert_eq!(Mode::parse(Some("none")), Mode::NoKick);

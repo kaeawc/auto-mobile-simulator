@@ -147,7 +147,13 @@ in [android.md](android.md#performance-notes).
 
 | Change | Before | After | Measured on |
 | --- | --- | --- | --- |
-| Kick the target vCPU on an interrupt: first-boot `/data` encryption | 22 s | 8 s | M-series Mac |
+| Kick the target vCPU on an interrupt: first-boot `/data` encryption | 22 s | 8 s | M-series Mac, an earlier macOS |
+| No kicks on an interrupt (`EMU_VCPU_WAKE` default `targeted` → `none`): first boot (`-wipe-data`) of a 720×1280 API 36 phone, median (runs) | 14.3 s (14.3, 29.4 starved, 13.0) | 12.9 s (13.0, 12.9, 11.9 starved) | M3 Max, macOS 26.6.2, 2026-11-26, host load 9.5 to 20, arms interleaved, `EMU_VCPU_WAKE=targeted\|none scripts/android-bench.sh <label> <avd> emu -wipe-data` |
+| Same change, warm boot, median of 6 | 4.2 s (3.5 to 4.7) | 3.7 s (3.7 to 5.2) | same AVD and hour, host load 9.6 to 13.2 |
+| Same change, vCPU0 guest entries to `sys.boot_completed`, first / warm boot, median | 338k / 59.7k | 249k / 41.4k | same runs (`vcpu0_runs`) |
+| Same change, emu CPU-seconds to `sys.boot_completed`, first / warm boot, median | 25.0 / 9.3 | 23.4 / 8.7 | same runs (`cpu_s`) |
+| Same change, launcher swipes a minute after boot: janky frames, median of 6 (2 boots × 3 runs) / emu CPU | 0.40% / 28% of a core | 0.20% / 25% | same AVD, host load 5 to 11, `scripts/android-jank.sh emulator-5600 <pid>` |
+| Renderer init with Metal's shader cache cold / warm (gfxstream's compositor pipelines through MoltenVK) | 4.5 and 5.1 s (2 of 20 launches) | 0.33 s (median of the other 18) | M3 Max, 2026-11-26, `emu -verbose` (`renderer initialized in`) |
 | Plain `fsync` for guest flushes: first-boot APEX decompression | over 270 s | about 70 s | M-series Mac |
 | Screenshot of a 2480×1740 screen (convert and encode) | 86 ms | 19 ms | `cargo run --release -p sim-core --example frame_bench` |
 | Display stream: emulator CPU per frame besides the readback, tablet / phone | 12.8 / 7.1 ms | 2.0 / 0 ms | 4-core Linux VM |
