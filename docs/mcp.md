@@ -96,6 +96,12 @@ crate:
   (`settle_foreground?(true)`), and which platform reads a parameter (`iOS: device_type`). A
   parameter's type comes from its name, in `crates/sim-api/src/schema.rs`; a test lists any name
   that doesn't have one yet.
+  JSON Schema can't say "one of `ticks` or `delta`" without `anyOf` at the top, which tool
+  clients refuse, so such a group's members are each optional and their descriptions say which they
+  go with; `required` holds what every platform needs. A test checks the lists against the
+  dispatchers: the Android dispatcher is driven on running fake devices (a method it refuses before
+  reading parameters doesn't count as probed, and fails the test), and the iOS arms' own required
+  reads are scanned from their source, since that backend only builds on macOS.
 - Annotations follow what the method does, from one table in `crates/sim-mcp/src/tools.rs` that
   classifies every method (a test fails for one that isn't listed). Read-only means it changes
   nothing on the device or the host: listings, reads, `screenshot`. Settings are idempotent;

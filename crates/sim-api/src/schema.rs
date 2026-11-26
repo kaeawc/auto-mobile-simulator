@@ -137,7 +137,12 @@ fn parse_atom(atom: &str, only: Option<&'static str>) -> Option<Param> {
         } else if alts.len() > 1 && alts.iter().all(|a| is_choice(a)) {
             param.choices = alts.iter().map(|a| literal(a)).collect();
         } else if alts.len() == 1 && is_choice(body) && !body.trim().starts_with('.') {
-            param.default = Some(literal(body));
+            // `timeout_s?(600)` is a default; `name(slim)`, with no `?`, is the one choice there is.
+            if optional {
+                param.default = Some(literal(body));
+            } else {
+                param.choices = vec![literal(body)];
+            }
         } else if !body.trim().is_empty() && !body.trim_start().starts_with(['[', '{']) {
             param.note = Some(inner.trim().to_owned());
         }
@@ -148,9 +153,13 @@ fn parse_atom(atom: &str, only: Option<&'static str>) -> Option<Param> {
     Some(param)
 }
 
-/// Every parameter of a method's grammar, with whether it is required.
-fn parse(spec: &str) -> Vec<(Param, bool)> {
+/// Every parameter of a method's grammar, with whether it is required, and the groups of
+/// alternatives of which the method wants one (`ticks | delta`; JSON Schema can't say so without
+/// `anyOf` at the top, which tool clients refuse, so a group's members are each optional in the
+/// schema and say which others they go with).
+fn parse(spec: &str) -> (Vec<(Param, bool)>, Vec<Vec<String>>) {
     let mut out: Vec<(Param, bool)> = Vec::new();
+    let mut groups: Vec<Vec<String>> = Vec::new();
     for (i, section) in split_top(spec, ';').into_iter().enumerate() {
         let section = section.trim();
         let (only, section) = if let Some(rest) = section.strip_prefix("iOS:") {
@@ -162,9 +171,13 @@ fn parse(spec: &str) -> Vec<(Param, bool)> {
         };
         for item in split_top(section, ',') {
             let alts = split_top(item, '|');
-            let one_of = alts.len() > 1;
-            for atom in alts {
-                let Some(param) = parse_atom(atom, only) else { continue };
+            let parsed: Vec<Param> = alts.iter().filter_map(|atom| parse_atom(atom, only)).collect();
+            // Alternatives are names to choose between; a quoted word beside one name is a value it may take.
+            let one_of = parsed.len() > 1;
+            if one_of && i == 0 && only.is_none() && parsed.iter().all(|p| !p.optional) {
+                groups.push(parsed.iter().map(|p| p.name.clone()).collect());
+            }
+            for param in parsed {
                 // Required: written without `?` or a default, alone, in the section every device reads.
                 let required = !param.optional && param.default.is_none() && !one_of && i == 0 && only.is_none();
                 match out.iter_mut().find(|(p, _)| p.name == param.name) {
@@ -174,7 +187,13 @@ fn parse(spec: &str) -> Vec<(Param, bool)> {
             }
         }
     }
-    out
+    (out, groups)
+}
+
+/// The groups of alternatives of which `method` wants one of each (`console`'s `command | commands`).
+#[cfg(test)]
+pub(crate) fn one_of(method: &str) -> Vec<Vec<String>> {
+    METHODS.iter().find(|(name, ..)| *name == method).map(|(_, spec, _)| parse(spec).1).unwrap_or_default()
 }
 
 /// Parameters a method takes that its grammar can't write as a list of names (`xr`'s actions each
@@ -183,10 +202,8 @@ const IRREGULAR: &[(&str, &[&str])] = &[("xr", &["x", "y", "z", "environment", "
 
 /// Methods whose grammar writes alternative forms with shared names (`touchpad`: a touch is `x, y`,
 /// a swipe adds `to_x, to_y`), which a per-name reading can't tell apart: the parameters every
-/// form needs. (`rotary`: an Apple Watch also takes `delta` instead of `ticks`, but `ticks` works on
-/// both.)
-const REQUIRED: &[(&str, &[&str])] =
-    &[("touchpad", &["device", "x", "y"]), ("stylus", &["device", "x", "y"]), ("rotary", &["device", "ticks"])];
+/// form needs.
+const REQUIRED: &[(&str, &[&str])] = &[("touchpad", &["device", "x", "y"]), ("stylus", &["device", "x", "y"])];
 
 /// The JSON Schema (an object schema) of `method`'s parameters, or `None` for a name that isn't in
 /// [`METHODS`]. Choices, ranges and defaults become `enum`, `minimum`/`maximum` and `default`;
@@ -195,7 +212,7 @@ pub fn input_schema(method: &str) -> Option<Value> {
     let (_, spec, _) = METHODS.iter().find(|(name, ..)| *name == method)?;
     let mut properties = Map::new();
     let mut required = Vec::new();
-    let mut params = parse(spec);
+    let (mut params, groups) = parse(spec);
     for name in IRREGULAR.iter().filter(|(m, _)| *m == method).flat_map(|(_, names)| names.iter()) {
         if !params.iter().any(|(p, _)| p.name == *name) {
             let param =
@@ -211,7 +228,16 @@ pub fn input_schema(method: &str) -> Option<Value> {
         if is_required {
             required.push(Value::String(param.name.clone()));
         }
-        properties.insert(param.name.clone(), property(method, &param));
+        let mut prop = property(method, &param);
+        if let Some(group) = groups.iter().find(|g| g.contains(&param.name)) {
+            let names: Vec<String> = group.iter().map(|n| format!("`{n}`")).collect();
+            let note = format!("give one of {}", names.join(", "));
+            prop["description"] = match prop["description"].as_str() {
+                Some(text) => format!("{text}; {note}").into(),
+                None => note.into(),
+            };
+        }
+        properties.insert(param.name.clone(), prop);
     }
     let mut schema = json!({"type": "object", "properties": properties});
     if !required.is_empty() {
@@ -312,6 +338,10 @@ mod tests {
         assert_eq!(boot["properties"]["env"]["type"], "object");
         assert_eq!(boot["properties"]["settle_foreground"]["default"], true);
         assert_eq!(boot["properties"]["profile"]["default"], "slim");
+        // `profile`'s `name(slim)` has no `?`: the iOS dispatcher requires it, and `slim` is its one value.
+        let profile = schema("profile");
+        assert_eq!(profile["required"], json!(["device", "name"]));
+        assert_eq!((profile["properties"]["name"]["enum"].clone(), profile["properties"]["name"].get("default")), (json!(["slim"]), None));
         assert_eq!(boot["properties"]["audio"]["default"], false);
         assert_eq!(schema("boot_many")["properties"]["first_port"]["default"], 5554);
         assert_eq!(schema("boot_many")["properties"]["devices"], json!({"type": "array", "items": {"type": "string"}}));
@@ -324,11 +354,16 @@ mod tests {
         assert!(write["properties"]["text"].is_object() && write["properties"]["base64"].is_object());
         assert_eq!(schema("console")["required"], json!(["device"]));
         assert!(schema("console")["properties"]["commands"].is_object());
-        // `audio_route`'s `uid | "default"` is the uid alone: the quoted word is a value, not a name.
+        // `audio_route`'s `uid | "default"` is the uid alone, and required: the quoted word is a value, not a name.
         assert_eq!(schema("audio_route")["properties"].as_object().map(|p| p.len()), Some(3));
+        assert_eq!(schema("audio_route")["required"], json!(["device", "scope", "uid"]));
         let rotary = schema("rotary");
-        assert_eq!(rotary["required"], json!(["device", "ticks"]), "Android needs ticks; an Apple Watch may give delta instead");
-        assert_eq!(rotary["properties"]["delta"]["description"], "Digital Crown units; iOS");
+        assert_eq!(rotary["required"], json!(["device"]));
+        assert_eq!(rotary["properties"]["delta"]["description"], "Digital Crown units; iOS; give one of `ticks`, `delta`");
+        assert_eq!(one_of("fold"), [["angle", "posture"]]);
+        assert_eq!(one_of("console"), [["command", "commands"]]);
+        // `text? | base64?` are both optional, and a lone name or a quoted word is no group.
+        assert!(one_of("write").is_empty() && one_of("audio_route").is_empty() && one_of("tap").is_empty());
     }
 
     #[test]
@@ -358,7 +393,11 @@ mod tests {
         assert_eq!(schema("touchpad")["properties"]["to_x"]["type"], "number");
         // A touch is `x, y`; only a swipe adds `to_x, to_y`.
         assert_eq!(schema("touchpad")["required"], json!(["device", "x", "y"]));
-        assert_eq!(schema("rotary")["required"], json!(["device", "ticks"]));
+        // `ticks | delta`: an Apple Watch takes either, an Android watch only `ticks`, so neither is
+        // required alone; each says it goes with the other.
+        assert_eq!(schema("rotary")["required"], json!(["device"]));
+        assert_eq!(one_of("rotary"), [["ticks", "delta"]]);
+        assert_eq!(schema("rotary")["properties"]["ticks"]["description"], "give one of `ticks`, `delta`");
         let stylus = schema("stylus");
         assert_eq!(stylus["required"], json!(["device", "x", "y"]));
         assert_eq!(
