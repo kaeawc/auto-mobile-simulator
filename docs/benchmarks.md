@@ -177,6 +177,24 @@ The SDK emulator (37.3.10) does not start on this host: it requires 7.37 GB of f
 create userdata whatever the AVD's data size (2.2 GB was free), and warns that 3939 MiB is under
 its suggested 4096 MiB of RAM. Its `-accel-check` reports `/dev/kvm is not found`.
 
+The renderer on the same host, no VM: the SDK's Linux `libgfxstream_backend.so` (37.3.10, from
+`emu -provision-renderer`) on lavapipe, initialized Vulkan-only as emu runs it, then a 720×1280
+RGBA color buffer uploaded and read back the way frames are (median of 9 reads per run), 5 runs
+each. Before this, `-provision-renderer` fetched Apple silicon's archive on every host, so Linux
+had no renderer it could load.
+
+```bash
+cargo run --release -p emu-gfxstream --example renderer_caps -- -vulkan-only <lib64>
+```
+
+| Vulkan driver | Renderer init, median (runs) | 720×1280 readback, median of the runs' medians |
+| --- | --- | --- |
+| The SDK's lavapipe (`lib64/vulkan`) | 108 ms (108, 112, 140, 104, 91) | 1.26 ms |
+| The host's Mesa lavapipe (Ubuntu 22.04, LLVM 15) | 143 ms (105, 155, 143, 140, 146) | 1.21 ms |
+
+emu uses the SDK's: the two are equal here, and the SDK's is the same on every host. Rendering
+throughput, where they could differ, needs a booted guest.
+
 ## Android farm
 
 Clones of one settled golden AVD booted together, each until it is settled (boot complete and

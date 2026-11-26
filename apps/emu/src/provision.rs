@@ -141,7 +141,7 @@ fn renderer(sdk: &Sdk, opts: &Opts, update: bool) -> Result<()> {
         println!("have renderer ({})", lib64.display());
         return Ok(());
     }
-    let d = sdk.manifest(&emu_sdk::repository_url())?.resolve(renderer::PACKAGE, Host::MACOS_ARM64)?;
+    let d = sdk.manifest(&emu_sdk::repository_url())?.resolve(renderer::PACKAGE, renderer::host())?;
     let have = installed.iter().find(|i| i.marker.revision == d.revision);
     if opts.dry_run {
         let state = match (have, &existing) {
