@@ -72,6 +72,8 @@ pub struct Interrupt {
     /// The level last driven on the line; held while driving it.
     level: Mutex<bool>,
     line: Arc<dyn IrqLine>,
+    /// Every used-ring raise signals the line and nothing is held ([`Interrupt::edge`]).
+    edge: bool,
 }
 
 pub const INT_USED_RING: u32 = 1;
@@ -79,7 +81,16 @@ pub const INT_CONFIG: u32 = 2;
 
 impl Interrupt {
     pub fn new(line: Arc<dyn IrqLine>) -> Interrupt {
-        Interrupt { status: AtomicU32::new(0), level: Mutex::new(false), line }
+        Interrupt { status: AtomicU32::new(0), level: Mutex::new(false), line, edge: false }
+    }
+
+    /// For a transport whose interrupt is a message with no status for the driver to read and
+    /// acknowledge (a vhost-user call eventfd, which the frontend turns into the queue's MSI):
+    /// every used-ring raise signals the line, which coalesces signals itself, and no status is
+    /// kept, since nothing would clear it. Config-change raises are dropped: they'd need a
+    /// backend message, and no device served this way changes its config.
+    pub fn edge(line: Arc<dyn IrqLine>) -> Interrupt {
+        Interrupt { status: AtomicU32::new(0), level: Mutex::new(false), line, edge: true }
     }
 
     pub fn status(&self) -> u32 {
@@ -87,6 +98,12 @@ impl Interrupt {
     }
 
     pub fn raise(&self, bits: u32) {
+        if self.edge {
+            if bits & INT_USED_RING != 0 {
+                self.line.set(true);
+            }
+            return;
+        }
         let was = self.status.fetch_or(bits, Ordering::AcqRel);
         if was == 0 && bits != 0 {
             self.sync_line();
@@ -252,6 +269,18 @@ mod tests {
         });
         assert_eq!((irq.status(), line.level()), (0, false), "quiescent: line follows the status");
         assert_eq!(line.calls(), line.transitions(), "only edges reach the controller");
+    }
+
+    #[test]
+    fn an_edge_interrupt_signals_every_used_ring_raise_and_holds_nothing() {
+        let line = Arc::new(CountLine::default());
+        let irq = Interrupt::edge(line.clone());
+        for _ in 0..3 {
+            irq.raise(INT_USED_RING);
+        }
+        irq.raise(INT_CONFIG);
+        irq.ack(INT_USED_RING);
+        assert_eq!((line.calls(), irq.status()), (3, 0), "one signal per used-ring raise, no status kept");
     }
 
     #[test]

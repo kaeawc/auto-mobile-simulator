@@ -151,13 +151,15 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   rng, vsock, gpu with `legacy_asg.rs` (API 31–33's address-space graphics on the renderer's
   protocol), input incl. XR's dual-mode mouse, console, snd), `pipe/` (adb bridge, qemud
   services incl. `car.rs`, the vehicle HAL, and `xr.rs`, Android XR's `xr_service`), `modem/`,
-  `disk.rs`, `boot.rs`, `display.rs` (`FrameStore`). Everything but `machine.rs`, `vcpu.rs` and
+  `disk.rs`, `boot.rs`, `display.rs` (`FrameStore`), `vhost_user.rs` (serves a device to QEMU
+  over vhost-user, for software mode on Linux; `examples/vhost_user_vsock.rs`). Everything but `machine.rs`, `vcpu.rs` and
   `virtio/gpu.rs` builds and tests on Linux: put device logic there, not behind the hypervisor.
 - `crates/emu-avd` — `Env` (SDK/AVD paths), `Avd` (config, `profile()`), `NewAvd`
   (`for_profile`), running-instance advertisements (`Running`), `BootConfig`, ini parsing.
 - `crates/emu-sdk` — Java-free provisioning: repository manifests, verified downloads, the
   on-demand gfxstream renderer.
-- `crates/emu-gfxstream` — `stream_renderer_*` FFI; `examples/renderer_caps.rs` checks a renderer.
+- `crates/emu-gfxstream` — `stream_renderer_*` FFI (macOS `.dylib`, Linux `.so`; `macho.rs` and
+  `elf.rs` list what to preload); `examples/renderer_caps.rs` checks a renderer.
 - `crates/emu-ext4` — the native ext4 formatter for first-boot userdata. `crates/emu-fdt` — the
   device tree writer.
 - `crates/sim-api` — the JSON-lines unix socket API: `METHODS` table and dispatcher
@@ -194,7 +196,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   whose `emulator` is simee), `automobile-harness-android.sh`, `android-bench.sh`, `android-jank.sh` (frame pacing under
   launcher swipes), `net-bench.sh` (idle CPU with the NAT and link only, throughput through the NAT),
   `inspect-image.py` (what a system image expects of the board, unpacked without booting: fstab,
-  modules, input names, vendor HALs).
+  modules, input names, vendor HALs), `tcg-bench.py` (an image under plain QEMU TCG with stock's
+  disk layout: the software-mode CPU spike, no KVM or GPU needed).
 - `docs/research/` — `network-shaping.md`, `audio-camera.md`; `docs/automobile-tool-matrix.md`.
   `docs/architecture.md` (layers, process model, shared logic, the conflict decisions),
   `docs/form-factors.md` (support matrix, profiles, inference, launching each kind, known gaps),

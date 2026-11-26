@@ -256,6 +256,8 @@ pub struct MachineConfig {
     pub battery: Arc<devices::goldfish_battery::Battery>,
     /// The modem on the `modem` vport (console `sms`, `gsm`).
     pub telephony: Arc<telephony::Telephony>,
+    /// The console's network conditions: the guest's NAT shapes its traffic by them, live.
+    pub network: Arc<Mutex<sim_core::network::Conditions>>,
     /// The vehicle HAL channel (`qemud:car`, console `car`). Like stock, only for car images;
     /// other guests asking for the pipe are refused.
     pub car: Option<Arc<pipe::car::Car>>,
@@ -538,7 +540,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     let net: Box<dyn virtio::net::Backend> = if std::env::var("EMU_NET").is_ok_and(|v| v == "link") {
         Box::new(virtio::net::LinkOnly)
     } else {
-        match crate::net::Nat::new(crate::net::Config::default()) {
+        match crate::net::Nat::new(crate::net::Config { network: cfg.network.clone(), ..Default::default() }) {
             Ok(n) => Box::new(n),
             Err(e) => {
                 eprintln!("emu: net: no NAT ({e}); the network is link only");
@@ -582,7 +584,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     if let Some((w, h)) = cfg.input {
         use virtio::input::{Input, Kind};
         let th = cfg.touch_screen.then(|| {
-            let (touch, th) = Input::new(Kind::Touch { width: w, height: h, pen: true }, "virtio_input_multi_touch_1");
+            let (touch, th) = Input::new(Kind::Touch { width: w, height: h, screen: true }, "virtio_input_multi_touch_1");
             slots[slots::TOUCH as usize] = Some(Box::new(touch));
             th
         });
@@ -596,7 +598,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
             mh
         });
         let touchpad = cfg.touchpad.map(|(tw, th)| {
-            let (pad, ph) = Input::new(Kind::Touch { width: tw, height: th, pen: false }, virtio::input::TOUCHPAD_NAME);
+            let (pad, ph) = Input::new(Kind::Touch { width: tw, height: th, screen: false }, virtio::input::TOUCHPAD_NAME);
             slots[slots::TOUCHPAD as usize] = Some(Box::new(pad));
             ph
         });

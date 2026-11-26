@@ -11,6 +11,8 @@ mod console;
 // Builds and tests everywhere; only an Apple silicon boot serves it.
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 mod display_server;
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+mod fold;
 mod instance;
 mod provision;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -277,6 +279,21 @@ fn boot(_: &emu_avd::Env, name: &str, _: &args::Opts, _: std::sync::mpsc::Receiv
     anyhow::bail!("cannot boot {name}: simee needs Hypervisor.framework on an Apple silicon Mac")
 }
 
+/// Once the guest has booted, a foldable tells it its posture (stock sends it after boot).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn announce_fold_at_boot(cfg: &mut emu_vmm::MachineConfig, fold: Option<std::sync::Arc<fold::Foldable>>) {
+    let Some(fold) = fold else { return };
+    let before = cfg.on_guest_event.take();
+    cfg.on_guest_event = Some(std::sync::Arc::new(move |event: &str| {
+        if let Some(f) = &before {
+            f(event);
+        }
+        if event == "bootcomplete" {
+            fold.announce();
+        }
+    }));
+}
+
 /// Boots the AVD and runs it until the guest powers off or a signal arrives.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn boot(
@@ -301,12 +318,18 @@ fn boot(
     }
 
     let stop = Arc::new(AtomicBool::new(false));
+    // A foldable, once there is one: it resets a size it forced before the guest stops.
+    let foldable: Arc<std::sync::OnceLock<Arc<fold::Foldable>>> = Arc::default();
     {
         let stop = stop.clone();
+        let foldable = foldable.clone();
         // Without it a SIGINT/SIGTERM would never stop the machine: fail the launch instead.
         let verbose = opts.verbose;
         std::thread::Builder::new().name("stop-watch".into()).spawn(move || {
             if signals.recv().is_ok() {
+                if let Some(f) = foldable.get() {
+                    f.release();
+                }
                 emu_vmm::request_stop(&stop);
                 // Device threads blocked in native code (e.g. a wedged renderer) can stall an
                 // orderly teardown; don't let that keep the process alive.
@@ -342,6 +365,10 @@ fn boot(
             }
         });
     }
+    let fold = fold::for_avd(&avd, inst.sensors.clone(), inst.display.clone(), inst.console_port).map(Arc::new);
+    if let Some(f) = &fold {
+        let _ = foldable.set(f.clone());
+    }
     console::serve(
         inst.console_port,
         console::ConsoleInfo {
@@ -357,7 +384,8 @@ fn boot(
             telephony: inst.telephony.clone(),
             xr: inst.xr.clone(),
             car: inst.car.clone(),
-            network: Arc::new(std::sync::Mutex::new(opts.network)),
+            network: inst.network.clone(),
+            fold: fold.clone(),
         },
     )?;
     let _advert = console::Advertisement::write(&avd.name, &avd.dir, inst.console_port);
@@ -366,6 +394,7 @@ fn boot(
     // On stdout: launchers watch for the first line and the `emulator-<port>` serial.
     println!("emu: {} on emulator-{} (adb port {})", avd.name, inst.console_port, inst.console_port + 1);
     let mut cfg = inst.machine_config(opts, launched)?;
+    announce_fold_at_boot(&mut cfg, fold.clone());
     // The cheap checks passed (console port bound, the boot files exist) and `prepare` has set
     // the renderer's environment: bring the renderer up beside kernel load and VM setup. Nothing
     // fallible runs between here and `run`, which claims it (or, failing before the GPU, waits
@@ -391,7 +420,8 @@ fn boot(
         match out.reason {
             emu_vmm::StopReason::Reset if !stop.load(Ordering::SeqCst) => {
                 emu_vmm::teardown_step(None, opts.verbose);
-                cfg = inst.machine_config(opts, launched)?
+                cfg = inst.machine_config(opts, launched)?;
+                announce_fold_at_boot(&mut cfg, fold.clone());
             }
             emu_vmm::StopReason::Fault(msg) => {
                 eprintln!("emu: guest fault: {msg}");

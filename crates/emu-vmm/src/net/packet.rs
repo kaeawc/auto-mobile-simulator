@@ -73,6 +73,27 @@ pub fn parse(frame: &[u8]) -> Frame<'_> {
     }
 }
 
+/// Whether a frame is link control the guest's stack needs more than any bulk data: an ARP
+/// message, or a TCP segment with no payload (an ACK, SYN-ACK, FIN or RST).
+pub fn is_control(frame: &[u8]) -> bool {
+    if frame.len() < ETH_HDR {
+        return false;
+    }
+    let b = &frame[ETH_HDR..];
+    match be16(frame, 12) {
+        ETHERTYPE_ARP => true,
+        ETHERTYPE_IPV4 if b.len() >= IP_HDR && b[0] >> 4 == 4 && b[9] == PROTO_TCP => {
+            let ihl = usize::from(b[0] & 0x0f) * 4;
+            let total = usize::from(be16(b, 2)).min(b.len());
+            match b.get(ihl..total) {
+                Some(l4) if l4.len() >= 20 => l4.len() <= usize::from(l4[12] >> 4) * 4,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 fn parse_arp(b: &[u8]) -> Frame<'_> {
     // Ethernet/IPv4 ARP only: htype 1, ptype 0x0800, hlen 6, plen 4.
     if b.len() < 28 || be16(b, 0) != 1 || be16(b, 2) != ETHERTYPE_IPV4 || b[4] != 6 || b[5] != 4 {

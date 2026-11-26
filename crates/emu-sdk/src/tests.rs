@@ -224,6 +224,21 @@ fn resolves_emulator_for_host() {
     assert_eq!(renderer::dir(Path::new("/sdk"), d.revision), PathBuf::from("/sdk/simee/renderer/37.3.10"));
     let intel = Host { os: "macosx", arch: "x64" };
     assert!(repo().resolve(renderer::PACKAGE, intel).expect("x64").url.ends_with("darwin_x64-16970787.zip"));
+    // Linux x64 gets its own archive (the .so renderer); there is none for arm64 Linux.
+    let linux = Host { os: "linux", arch: "x64" };
+    assert!(repo().resolve(renderer::PACKAGE, linux).expect("linux").url.ends_with("emulator-linux_x64-16970787.zip"));
+    assert!(repo().resolve(renderer::PACKAGE, Host { os: "linux", arch: "aarch64" }).is_err());
+}
+
+#[test]
+fn the_renderer_comes_from_the_package_this_host_can_load() {
+    if cfg!(target_os = "macos") {
+        assert_eq!((renderer::host(), renderer::BACKEND), (Host::MACOS_ARM64, "libgfxstream_backend.dylib"));
+    } else {
+        // Before: every host fetched Apple silicon's archive, whose .dylib Linux can't load.
+        assert_eq!((renderer::host(), renderer::BACKEND), (Host::current(), "libgfxstream_backend.so"));
+        assert_eq!(renderer::host().os, "linux");
+    }
 }
 
 #[test]
@@ -393,22 +408,24 @@ fn installs_renderer_from_a_local_archive() {
     let inst = sdk.install_renderer(&d).expect("install renderer");
     assert_eq!(inst.dir, sdk.root().join("simee/renderer/37.3.10"));
     assert_eq!((inst.marker.revision, inst.marker.sha1.as_str(), inst.marker.url.as_str()), (d.revision, d.sha1.as_str(), d.url.as_str()));
-    assert_eq!(
-        tree(&inst.dir),
-        [
-            "LICENSE",
-            "NOTICE.txt",
-            "lib64/gles_angle/libEGL.dylib",
-            "lib64/libemugl_common.dylib",
-            "lib64/libgfxstream_backend.dylib",
-            "lib64/libprotobuf.28.4.0.dylib",
-            "lib64/libprotobuf.dylib -> libprotobuf.28.4.0.dylib",
-            "lib64/vulkan/MoltenVK_icd.json",
-            "lib64/vulkan/layers/VkLayer_khronos_validation.json",
-            "lib64/vulkan/libvulkan.dylib",
-            "renderer.properties",
-        ]
-    );
+    // The backend is this host's (`.dylib` on macOS, `.so` elsewhere); the other files are the
+    // fixture's own.
+    let backend = format!("lib64/{}", renderer::BACKEND);
+    let mut want = vec![
+        "LICENSE",
+        "NOTICE.txt",
+        "lib64/gles_angle/libEGL.dylib",
+        "lib64/libemugl_common.dylib",
+        backend.as_str(),
+        "lib64/libprotobuf.28.4.0.dylib",
+        "lib64/libprotobuf.dylib -> libprotobuf.28.4.0.dylib",
+        "lib64/vulkan/MoltenVK_icd.json",
+        "lib64/vulkan/layers/VkLayer_khronos_validation.json",
+        "lib64/vulkan/libvulkan.dylib",
+        "renderer.properties",
+    ];
+    want.sort_unstable();
+    assert_eq!(tree(&inst.dir), want);
     // Nothing that would make sdkmanager think an `emulator` package lives here.
     assert!(!inst.dir.join("source.properties").exists() && !sdk.root().join("emulator").exists());
     assert_eq!(std::fs::read_link(&current).expect("current"), PathBuf::from("37.3.10"));

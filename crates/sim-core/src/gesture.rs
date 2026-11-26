@@ -12,6 +12,54 @@ pub enum Phase {
     Up,
 }
 
+/// The screen edge a touch comes in from: what a system edge gesture needs (iOS: home or the app
+/// switcher from the bottom, Notification Center from the top, Control Center from the top right,
+/// the menu bar from the top of an iPad). A touch that merely starts at the edge pixel is an
+/// ordinary touch to iOS; the edge is a flag on the contact, which Simulator.app sets when a drag
+/// starts on the bezel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenEdge {
+    Top,
+    Left,
+    Bottom,
+    Right,
+}
+
+impl ScreenEdge {
+    pub const NAMES: &'static str = "top, bottom, left, right";
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "top" => Self::Top,
+            "left" => Self::Left,
+            "bottom" => Self::Bottom,
+            "right" => Self::Right,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Left => "left",
+            Self::Bottom => "bottom",
+            Self::Right => "right",
+        }
+    }
+
+    /// The simulator HID's edge value (`IndigoHIDEdge`), which its touch builder turns into the
+    /// contact's edge bits; SpringBoard logs the edge it recognized as top 1, left 2, bottom 4,
+    /// right 8 (`UIRectEdge`) for 1, 2, 3 and 4.
+    pub fn apple_edge(self) -> u32 {
+        match self {
+            Self::Top => 1,
+            Self::Left => 2,
+            Self::Bottom => 3,
+            Self::Right => 4,
+        }
+    }
+}
+
 /// One touch sample: where, which phase, and how long to wait before sending it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sample {
@@ -102,6 +150,17 @@ mod tests {
         assert_eq!(s.iter().filter(|x| x.phase == Phase::Move).count(), 10);
         let total: Duration = s.iter().filter(|x| x.phase == Phase::Move).map(|x| x.delay).sum();
         assert_eq!(total, Duration::from_millis(160));
+    }
+
+    #[test]
+    fn edges_parse_and_map_to_the_simulator_values() {
+        for (name, edge, apple) in
+            [("top", ScreenEdge::Top, 1), ("left", ScreenEdge::Left, 2), ("bottom", ScreenEdge::Bottom, 3), ("right", ScreenEdge::Right, 4)]
+        {
+            assert_eq!(ScreenEdge::parse(name), Some(edge));
+            assert_eq!((edge.as_str(), edge.apple_edge()), (name, apple));
+        }
+        assert_eq!(ScreenEdge::parse("bezel"), None);
     }
 
     #[test]

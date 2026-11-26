@@ -23,7 +23,7 @@ to use fewer resources.
 | Storage | virtio-blk with indirect descriptors, event-idx, and discard/write-zeroes (hole punching). System and vendor are copy-on-write in memory; userdata, cache and metadata persist per AVD. Userdata is created by a native ext4 formatter (no `mkfs.ext4`) |
 | Boot | Full Android boot to `sys.boot_completed`: 9.5 s cold, 3.5 s warm (stock: 22.9 s and 17.1 s; [benchmarks](benchmarks.md)); first boot formats and encrypts `/data`. System images from API 31 on; emu refuses older ones up front with the reason, since they boot their kernel but get no graphics: API 29 and 30 draw with the GLES encoder over the `opengles` goldfish pipe, which emu doesn't yet bridge to the renderer ([#38](https://github.com/kaeawc/simee/issues/38); emu now also serves what else they need, unit-tested but not yet booted: adb clients that connect before adbd opens `qemud:adb`, the reference RIL's `qemud:gsm` modem, `logcat -Q`'s `logcat` stream with stock's `qemu.cmdline` property, and `qemu.gltransport=pipe` as stock passes it). `EMU_ALLOW_OLD_IMAGES=1` boots them anyway, for that work. API 31 to 33 guests set up address-space graphics with the protocol before the renderer's; the GPU translates it (`virtio/legacy_asg.rs`, [#39](https://github.com/kaeawc/simee/issues/39)), and their GLES is the encoder on a renderer with GL, as stock runs them, since their ANGLE finds SurfaceFlinger no EGL config. Images without `AndroidbootProps2` (API 30 and older, kernels without bootconfig) get stock's legacy kernel command line (`qemu.*` names) instead of bootconfig |
 | adb | virtio-vsock with a host bridge on `console port + 1`, announced to the adb server. `adb shell`/`root`/`push` work, and the device shows up about 8 s after launch on a warm boot |
-| Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot`, `network speed|delay|status` (stock's presets, numbers and report; recorded, and seeded by `-netspeed`/`-netdelay`, but guest traffic isn't shaped yet), `avd snapshot` (answers as stock does without snapshot support: `save`/`load` are a `KO`, `list` is empty, `del` succeeds), plus simee's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
+| Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot`, `network speed|delay|status` (stock's presets, numbers and report, seeded by `-netspeed`/`-netdelay`; applied live in the NAT, `crates/emu-vmm/src/net/shape.rs`: a token bucket per direction, 0 = unlimited, each direction holds about a second of its rate and drops past that, as a bottleneck does (except small control frames, ARP replies and payload-free TCP segments, which take a bounded reserve of 16 frames past it), with TCP held back by the download queue's room; unshaped devices take the plain path with no shaper; inbound frames are delayed by a latency between min and max, in order. Verified in unit tests over loopback only: not yet measured in a guest under `network speed edge`, and `network speed` doesn't change the radio's reported data type), `avd snapshot` (answers as stock does without snapshot support: `save`/`load` are a `KO`, `list` is empty, `del` succeeds), plus simee's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
 | Discovery | `-list-avds`, `pid_<pid>.ini` running-instance file, `emulator-<port>` serial on stdout |
 | Graphics | Home screen and apps render. virtio-gpu with gfxstream contexts on the host GPU: the guest's GLES through ANGLE on its Vulkan and, on images that map it (API 36 and newer, `VulkanVirtualQueue`), its UI and SurfaceFlinger drawn with Skia on that Vulkan, as stock's `GuestAngle` mode does, so the renderer runs without a GL backend (see "Vulkan-only renderer" below); Vulkan on MoltenVK (lavapipe fallback), Vulkan composition. Host-visible memory via blob mapping; goldfish address space (PCIe, shared-slot allocator) and goldfish pipe (refcounted color buffers) for the ranchu gralloc; guest `screencap` and host screenshots both work |
 | Input & sensors | virtio-input touchscreen, keyboard and rotary, plus stock's dual-mode mouse on XR images. The keyboard is stock's `qwerty2` (0627:0001, stock's key set), so goldfish's `qwerty2.kl` applies: HOME, D-pad centre (`KEY_CENTER`), Recents (580), media and stem keys arrive. The console takes every stock `KEY_*` name and numeric codes. `qemud:sensors` lists the AVD's sensors by stock's rules (`hw.sensor*` flags; heart rate and wrist tilt on Wear OS API 28+; the hinge on foldables) with live values; GNSS over `qemud:gps`; goldfish battery; fingerprint; clipboard |
@@ -152,7 +152,8 @@ emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a -lcd
 `crates/emu-sdk` reads Google's repository manifests (`repository2-3.xml`, and
 `sys-img/<tag>/sys-img2-3.xml` per tag), picks the newest stable archive for the host
 (platform-tools for the machine it runs on; system images are host-independent; the renderer is
-always macOS/arm64's), downloads it with the system's `/usr/bin/curl` (resumable, into `$ANDROID_HOME/.downloads`),
+Apple silicon's on macOS and the host's own elsewhere, so Linux x86_64 gets the `.so` one; Google
+publishes none for arm64 Linux), downloads it with the system's `/usr/bin/curl` (resumable, into `$ANDROID_HOME/.downloads`),
 checks size and sha1, unpacks it with `/usr/bin/unzip` and moves it into the standard SDK layout.
 Installed packages are skipped, manifests are cached for a day, and the archive is deleted once
 unpacked. Disk images (`*.img`) don't go through a plain unzip: each streams out of the archive
@@ -164,7 +165,8 @@ reading it back to punch holes) on a Linux VM, against a 40 s floor for inflatin
 a mirror or a `file://` copy. An API level a tag publishes only
 at extension levels (Automotive's API 34 and 35) resolves to the newest of them. Provisioning
 works on Linux too, for preparing images and AVDs; there `-provision` skips the renderer, since
-only Apple silicon boots guests.
+only Apple silicon boots guests so far, and `-provision-renderer` installs the Linux one (267 MB
+on disk from a 350 MB archive, 37.3.10).
 
 **The renderer** comes out of the SDK's `emulator` package, fetched on demand: the archive
 (420.6 MB for 37.3.10) is verified like any other, but only `emulator/lib64/**` minus
@@ -180,16 +182,65 @@ older ones.
 
 At boot emu uses the SDK's own `emulator/lib64` when present, else the newest
 `simee/renderer/*/lib64`, and points gfxstream's launcher directory at its parent (where it
-finds `lib64/vulkan` and `lib64/gles_*`). `emu-gfxstream` preloads the backend's `@rpath`
-dependencies leaves-first from that directory, so they resolve without any rpath; libraries
-gfxstream `dlopen`s by bare name resolve through the binary's rpaths (`@executable_path/lib64`,
-which emu links to the chosen `lib64`, then the build machine's `emulator/lib64` and
-`simee/renderer/current/lib64`). To check an install without a VM:
-`cargo run -p emu-gfxstream --example renderer_caps -- <lib64> moltenvk` prints capsets 3, 8, 9.
+finds `lib64/vulkan` and `lib64/gles_*`). `emu-gfxstream` preloads the backend's dependencies
+leaves-first from that directory (`@rpath` load commands on macOS, `DT_NEEDED` on Linux, whose
+backend has no `RUNPATH`), so they resolve without any rpath. On macOS libraries gfxstream
+`dlopen`s by bare name resolve through the binary's rpaths (`@executable_path/lib64`, which emu
+links to the chosen `lib64`, then the build machine's `emulator/lib64` and
+`simee/renderer/current/lib64`); on Linux they're preloaded too, since glibc matches a bare name
+against what is already loaded: the shader translator, and ANGLE's `libEGL.so`/`libGLESv2.so`
+from `gles_angle`, which the backend opens during init even without a GL backend (it crashes when
+it finds no EGL). The Linux backend's symbol table is stripped, so the direct Vulkan readback
+macOS uses isn't there; without a GL backend the exported `FrameBuffer::readColorBuffer` reads
+the Vulkan image instead (byte-exact, 1.3 ms for 720×1280 on lavapipe; with GL it returned
+wrong pixels and took 7 ms), so Linux runs the Vulkan-only renderer too. To check an install
+without a VM: `cargo run -p emu-gfxstream --example renderer_caps -- [-vulkan-only] <lib64>
+[moltenvk|lavapipe|swiftshader]` prints capsets 3, 8, 9 and checks a 720×1280 readback.
 
 AVD defaults favour cheap, fast boots: 720×1280 screen, 2 GB RAM, 4 vCPU, 4 GB data.
 Benchmarks of the stock emulator found that smaller screens boot markedly faster and that RAM
 above 2 GB slows cold boots down.
+
+## Software mode (Linux without KVM)
+
+In progress ([#55](https://github.com/kaeawc/simee/issues/55)). Cloud and CI workers often have no
+`/dev/kvm` and no GPU, so every guest instruction has to be translated in software and every
+frame drawn on the CPU. emu doesn't boot guests there yet; this records what was decided and why.
+The numbers are in [benchmarks.md](benchmarks.md#android-software-mode-linux-without-kvm).
+
+- **CPU: QEMU's TCG, 11.1 or newer, one translator thread per vCPU.** It is the fastest
+  translator available and is multi-threaded; a translator library (Unicorn) runs one thread
+  for all vCPUs, which took twice as long to reach zygote. QEMU 6.2 (Ubuntu 22.04's)
+  panics the guest under multi-threaded TCG.
+- **Guest: the x86_64 images on x86_64 hosts**, with stock's x86 board (virtio-pci: `system.img`
+  at `00:03.0`, so `androidboot.boot_devices=pci0000:00/0000:00:03.0`, and the fstab's metadata at
+  `00:06.0`). They run guest code 1.8 to 2.0 times as fast as arm64 images, which take 13% longer to
+  reach zygote. arm64 images under QEMU's `virt` board work too: its memory map and virtio-mmio
+  slot order are stock's arm64 board's. There the debug console is `hvc0`, and `goldfish-logcat`
+  expects `hvc1`.
+- **Guest CPU model `max,-erms,-fsrm,-fzrm,-fsrs,-fsrc`** (x86_64): without the fast-string
+  features the guest kernel copies memory with plain moves, which TCG translates, instead of
+  `rep movsb`, which it runs as a byte loop. Keep QEMU's 1 GiB translation cache.
+- **Devices: emu, out of process.** Upstream QEMU can't run these images to `sys.boot_completed`
+  on its own: without a gfxstream GPU, SurfaceFlinger aborts (`no suitable EGLConfig found`) and
+  zygote restarts every 5 s, and the sensors HAL has no `qemud:sensors`. emu keeps the devices,
+  console, adb bridge, display socket and frame ring, and serves them to QEMU over vhost-user
+  (the virtio devices; QEMU 11's `SHMEM_MAP` lets a backend map GPU blobs into the guest) and
+  vfio-user (goldfish address space, a plain PCI device). Goldfish pipe is an ACPI/DT platform
+  device that neither protocol carries; whether gralloc runs without its `refcount` pipe (the
+  renderer's `RefCountPipe` off) is the open question. The vhost-user backend is
+  `crates/emu-vmm/src/vhost_user.rs`: QEMU's guest RAM is a shared memfd
+  (`-object memory-backend-memfd,share=on`) that emu maps once (`GuestRam::map_shared`), rings are
+  translated through the memory table, kicks and calls are eventfds, and a raise calls only the
+  queues whose used ring moved. vsock runs on it: the guest's adbd and qemud pipes reach emu's
+  adb bridge and pipe services (`examples/vhost_user_vsock.rs`), with bulk transfers faster than
+  QEMU's own user network and round trips level with it
+  ([benchmarks](benchmarks.md#android-software-mode-linux-without-kvm)).
+- **Rendering: gfxstream on lavapipe**, from the SDK's Linux `emulator` package, whose `lib64`
+  carries `libgfxstream_backend.so` and its own lavapipe (238 MB without the Qt UI).
+
+When the host has KVM, use it ([#54](https://github.com/kaeawc/simee/issues/54)): the guest runs
+natively there, and software mode is the fallback.
 
 ## Automotive
 

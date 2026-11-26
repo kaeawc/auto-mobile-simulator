@@ -108,6 +108,111 @@ Both display at 60 Hz. The stock emulator's tablet rendered about 1350 frames ov
 emu's about 530; emu with the guest on stock's GLES driver (`EMU_GUEST_EGL=emulation`) rendered
 1254, so the count follows the guest's driver. On the phone both render about 790.
 
+## Android: software mode (Linux without KVM)
+
+The CPU decision for hosts with no hardware virtualization
+([#55](https://github.com/kaeawc/simee/issues/55)), measured on its motivating host: a
+Firecracker x86_64 guest (Ubuntu 22.04, 4 vCPUs of a Xeon at 2.2 GHz with AVX-512, 3.8 GiB RAM,
+no `/dev/kvm`, no GPU), 2026-11-26. One API 36 `default` image of each architecture (r2; the
+google_apis x86_64 image's 4.2 GB `system.img` didn't fit this host's 10 GB disk beside the
+toolchain), 4 vCPUs and 2 GB, booted by plain QEMU 11.1.3 TCG with stock's disk layout and no GPU,
+so these time the translator alone, before any of emu's devices. Without a GPU SurfaceFlinger
+can't start, so the milestones are a root shell on the console and zygote's first start
+(`boot_progress_start`, in guest uptime). Then the framework is stopped and android-bench.sh's
+guest CPU microbenchmarks run. Medians of 3 warm boots after one uncounted first boot; each boot's
+microbenchmarks are the median of 3 rounds.
+
+```bash
+scripts/tcg-bench.py <sysdir> <workdir> --qemu <qemu-system-x86_64|aarch64> [--cpu MODEL] [--boots 3]
+```
+
+| Guest | CPU model | Shell | Zygote starts | 100k shell loop | 4× md5 of 64 MiB | QEMU peak RSS |
+| --- | --- | --- | --- | --- | --- | --- |
+| x86_64 | `max,-erms,-fsrm,-fzrm,-fsrs,-fsrc` | 16.5 s | 49.4 s | 9.8 s | 1.82 s | 1138 MB |
+| x86_64 | `max` | 18.9 s | 54.5 s | 10.1 s | 2.75 s | 1126 MB |
+| arm64 | `max,pauth=off,sve=off` | 13.8 s | 55.6 s | 17.3 s | 3.67 s | 1113 MB |
+
+The same microbenchmarks under emu on Hypervisor.framework take 0.22 s and 0.43 s (M3 Max,
+[above](#android-emu-against-the-sdk-emulator)). Single boots of other configurations on the same host and day, each with the median of 3
+microbenchmark rounds (`--cpu`, `--tb-size`, `--threads`; the x86_64 ones with the guest's
+`mitigations=off`, which made no difference, see below), which decided the defaults:
+
+| Configuration (single boot) | Zygote starts | 100k shell loop | 4× md5 |
+| --- | --- | --- | --- |
+| x86_64, `max` without the fast-string features (the best row's model) | 50.1 s | 11.0 s | 1.98 s |
+| x86_64, Haswell model (AVX2) without ERMS | 56.3 s | 10.7 s | 2.23 s |
+| x86_64, Haswell model with ERMS | not recorded | 10.2 s | 3.03 s |
+| x86_64, SSE4.2-only model (`qemu64,+ssse3,+sse4.1,+sse4.2,+popcnt,+cx16`) | 66.0 s | 10.4 s | 2.84 s |
+| x86_64, Haswell without ERMS, translation cache 256 MiB instead of QEMU's default 1 GiB | 54.5 s | 13.9 s | 3.43 s |
+| x86_64, Haswell without ERMS, one translator thread for all vCPUs (`thread=single`) | 115.0 s | 17.7 s | 11.7 s |
+| arm64, `max,pauth=off,sve=off`, booted in the same sequence as the next three | 72.4 s | 19.3 s | 4.53 s |
+| arm64, pointer authentication emulated (`pauth-impdef=on`) | 78.3 s | 19.9 s | 4.85 s |
+| arm64, `max` (QARMA pointer authentication) | 77.1 s | 20.2 s | 4.55 s |
+| arm64, `cortex-a76` | 97.0 s | 19.4 s | 6.33 s |
+
+The arm64 single boots ran second to fifth after a first boot and reached zygote later than the
+three counted boots above; compare them with each other.
+
+What decided it:
+
+- **x86_64 images on x86_64 hosts.** Same-ISA translation runs guest code 1.8 (shell loop) to
+  2.0 (md5) times faster than the best arm64 configuration, and arm64 takes 13% longer to reach
+  zygote, though it reaches the shell sooner (its kernel and first-stage init are lighter). What
+  comes after zygote (the framework, ART) is guest code, so the guest-code ratio decides.
+- **QEMU 11 or newer.** Ubuntu 22.04's QEMU 6.2 panics this guest within seconds under
+  multi-threaded TCG (`int3` in `kmem_cache_alloc`: a stale translated block running the
+  kernel's live-patching breakpoint); 11.1.3 booted it every time, over 20 boots.
+- **Hide the fast-string features.** With ERMS/FSRM advertised the guest kernel's memcpy is
+  `rep movsb`, which TCG runs as a byte loop: md5 of `/dev/zero` takes 51% longer and zygote
+  starts 10% later.
+- **Keep the 1 GiB translation cache and one translator thread per vCPU.** A single translator
+  thread, the model a translator library such as Unicorn offers, takes twice as long to reach
+  zygote (115 s against 56.3 s for the same CPU model) and five times as long for the parallel
+  md5s, so option 2 of #55 is not pursued.
+- `mitigations=off` in the guest made no difference: a single boot with it (zygote 50.1 s, md5
+  1.98 s) falls inside the spread of an earlier set of 3 boots without it (48.8 to 50.1 s, 1.84 to
+  2.05 s).
+
+adb into the same guest under QEMU 11 TCG on the same host, through emu's virtio-vsock served
+over vhost-user (`crates/emu-vmm/examples/vhost_user_vsock.rs`, emu's adb bridge on the host
+side) and, for comparison on the same boot, through QEMU's own user-mode network to adbd's TCP
+listener (`-netdev user,hostfwd`). Framework stopped; 21 `adb shell echo` round trips and 3
+transfers of 64 MiB each way per round, two rounds alternating, every transfer byte-checked.
+
+| Transport | `adb shell echo`, median (2 rounds) | 64 MiB push | 64 MiB pull |
+| --- | --- | --- | --- |
+| emu's vsock over vhost-user | 149, 131 ms | 42 to 54 MiB/s | 62 to 99 MiB/s |
+| QEMU's user network to adbd's TCP port | 134, 125 ms | 38 to 45 MiB/s | 13 to 18 MiB/s |
+| emu's vsock, every queue called on each raise (before) | 157, 171 ms | 38 to 48 MiB/s | 47 to 66 MiB/s |
+
+Calling every queue on each raise cost the guest a spurious interrupt per completion, because
+vsock's queues share one MSI vector: 14 vsock interrupts per round trip before, 9 after
+(`/proc/interrupts`, 20 round trips). emu's vsock server used 0.53 s of CPU for a whole boot plus
+the 384 MiB of transfers, 21 MB peak RSS: what's left per round trip is the guest under
+translation. The SDK emulator's own adb path has no row: it doesn't start on this host (below).
+
+The SDK emulator (37.3.10) does not start on this host: it requires 7.37 GB of free disk to
+create userdata whatever the AVD's data size (2.2 GB was free), and warns that 3939 MiB is under
+its suggested 4096 MiB of RAM. Its `-accel-check` reports `/dev/kvm is not found`.
+
+The renderer on the same host, no VM: the SDK's Linux `libgfxstream_backend.so` (37.3.10, from
+`emu -provision-renderer`) on lavapipe, initialized Vulkan-only as emu runs it, then a 720×1280
+RGBA color buffer uploaded and read back the way frames are (median of 9 reads per run), 5 runs
+each. Before this, `-provision-renderer` fetched Apple silicon's archive on every host, so Linux
+had no renderer it could load.
+
+```bash
+cargo run --release -p emu-gfxstream --example renderer_caps -- -vulkan-only <lib64>
+```
+
+| Vulkan driver | Renderer init, median (runs) | 720×1280 readback, median of the runs' medians |
+| --- | --- | --- |
+| The SDK's lavapipe (`lib64/vulkan`) | 108 ms (108, 112, 140, 104, 91) | 1.26 ms |
+| The host's Mesa lavapipe (Ubuntu 22.04, LLVM 15) | 143 ms (105, 155, 143, 140, 146) | 1.21 ms |
+
+emu uses the SDK's: the two are equal here, and the SDK's is the same on every host. Rendering
+throughput, where they could differ, needs a booted guest.
+
 ## Android farm
 
 Clones of one settled golden AVD booted together, each until it is settled (boot complete and
@@ -290,6 +395,11 @@ Claims that would belong in the README once someone runs them:
   device's directory (6,562 files), so the host's `mds_stores` indexes what devices write. What
   excluding `~/Library/Developer/CoreSimulator` from Spotlight saves a farm needs a change to the
   host's Spotlight privacy settings to measure.
+- iPad `pointer` latency and placement error (`simee pointer <udid> X Y click`, `pointer … --to`)
+  with 6 halving steps (before: 10): per-call wall time, median of 3, and the error of 12 targets
+  on iOS 26.5 and 27.2 (`measure.sh`-style InputProbe run). Counted from the 16 ms report
+  interval only so far: homing 85 reports, 5 more per move; not timed, since the host's load was
+  198 on 2026-11-26.
 - Host CPU of an idle booted device, emu against the SDK emulator.
 - Network throughput and latency through emu's NAT against the SDK emulator's slirp.
 - Host CPU of an idle booted device with and without the virtio-snd card (`EMU_VIRTIO_SND=0`),

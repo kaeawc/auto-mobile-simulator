@@ -296,6 +296,7 @@ name = "emu-hvf"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustix",
  "thiserror 2.0.21",
 ]
 
@@ -325,6 +326,7 @@ dependencies = [
  "rustix",
  "sim-core",
  "smoltcp",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
