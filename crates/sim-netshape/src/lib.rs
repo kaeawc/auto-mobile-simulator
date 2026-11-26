@@ -25,6 +25,61 @@ pub const DNS_SERVICES_TBD: &str = include_str!("../native/libdns_services.tbd")
 /// The in-device proxy tool's source (sets the device's proxy in its own `configd_sim`).
 pub const SCPROXY_SOURCE: &str = include_str!("../native/scproxy.m");
 
+/// The simulator SDK the shaper and the proxy tool are built for: a program built for one
+/// platform's simulator doesn't start in another's (dyld refuses its `dyld_sim`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sdk {
+    /// iPhone and iPad simulators.
+    Ios,
+    /// Apple TV simulators.
+    Tvos,
+}
+
+impl Sdk {
+    /// The SDK for a runtime identifier (`com.apple.CoreSimulator.SimRuntime.tvOS-26-5`), or why
+    /// there is none.
+    pub fn for_runtime(runtime_id: &str) -> Result<Self, String> {
+        let name = runtime_id.rsplit('.').next().unwrap_or(runtime_id);
+        if name.starts_with("iOS-") {
+            Ok(Self::Ios)
+        } else if name.starts_with("tvOS-") {
+            Ok(Self::Tvos)
+        } else {
+            Err(format!("network shaping runs on iOS, iPadOS and tvOS devices; `{runtime_id}` isn't one"))
+        }
+    }
+
+    fn sdk(self) -> &'static str {
+        match self {
+            Self::Ios => "iphonesimulator",
+            Self::Tvos => "appletvsimulator",
+        }
+    }
+
+    fn target(self) -> &'static str {
+        match self {
+            Self::Ios => "arm64-apple-ios15.0-simulator",
+            Self::Tvos => "arm64-apple-tvos15.0-simulator",
+        }
+    }
+
+    /// Cached products' name suffix: none for iOS, so its paths stay what they were.
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Ios => "",
+            Self::Tvos => "-tvos",
+        }
+    }
+
+    /// The link stub for this SDK's simulator platform.
+    fn dns_services_tbd(self) -> String {
+        match self {
+            Self::Ios => DNS_SERVICES_TBD.to_owned(),
+            Self::Tvos => DNS_SERVICES_TBD.replace("-ios-simulator", "-tvos-simulator"),
+        }
+    }
+}
+
 /// A network profile. Zero means "no limit" for every field.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -226,9 +281,10 @@ fn fnv1a(text: &str) -> u64 {
     text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3))
 }
 
-/// Builds `source` for the iOS simulator once per source version and returns the cached product.
-fn build(name: &str, ext: &str, source: &str, flags: &[&str]) -> Result<PathBuf, String> {
+/// Builds `source` for `sdk`'s simulator once per source version and returns the cached product.
+fn build(sdk: Sdk, name: &str, ext: &str, source: &str, flags: &[&str]) -> Result<PathBuf, String> {
     let dir = cache_dir();
+    let name = format!("{name}{}", sdk.suffix());
     let out = dir.join(format!("{name}-{:016x}{ext}", fnv1a(source)));
     if out.is_file() {
         return Ok(out);
@@ -239,7 +295,7 @@ fn build(name: &str, ext: &str, source: &str, flags: &[&str]) -> Result<PathBuf,
     std::fs::write(&src, source).map_err(|e| e.to_string())?;
     let tmp = dir.join(format!("{name}.building"));
     run(Command::new("/usr/bin/xcrun")
-        .args(["--sdk", "iphonesimulator", "clang", "-target", "arm64-apple-ios15.0-simulator", "-O2"])
+        .args(["--sdk", sdk.sdk(), "clang", "-target", sdk.target(), "-O2"])
         .args(flags)
         .arg("-o")
         .arg(&tmp)
@@ -249,26 +305,29 @@ fn build(name: &str, ext: &str, source: &str, flags: &[&str]) -> Result<PathBuf,
     Ok(out)
 }
 
-/// Builds (or reuses) the shaper dylib for the iOS simulator and returns its path.
-pub fn dylib() -> Result<PathBuf, String> {
+/// Builds (or reuses) the shaper dylib for `sdk`'s simulator and returns its path.
+pub fn dylib(sdk: Sdk) -> Result<PathBuf, String> {
     // The resolver hook binds to libdns_services, which lives in the simulator runtime, not the SDK:
-    // link against a stub that names its two symbols.
+    // link against a stub that names its two symbols. Weakly: iOS 18 runtimes don't have it, and a
+    // missing library would stop every injected process from launching.
     std::fs::create_dir_all(cache_dir()).map_err(|e| e.to_string())?;
-    let tbd = cache_dir().join("libdns_services.tbd");
-    std::fs::write(&tbd, DNS_SERVICES_TBD).map_err(|e| e.to_string())?;
-    let tbd = tbd.display().to_string();
+    let stub = sdk.dns_services_tbd();
+    let tbd = cache_dir().join(format!("libdns_services{}.tbd", sdk.suffix()));
+    std::fs::write(&tbd, &stub).map_err(|e| e.to_string())?;
+    let weak = format!("-Wl,-weak_library,{}", tbd.display());
     build(
+        sdk,
         "netshape",
         ".dylib",
-        &format!("{SOURCE}// link: {}\n", fnv1a(DNS_SERVICES_TBD)),
-        &["-dynamiclib", "-framework", "Network", "-framework", "SystemConfiguration", &tbd],
+        &format!("{SOURCE}// link: {} weak\n", fnv1a(&stub)),
+        &["-dynamiclib", "-framework", "Network", "-framework", "SystemConfiguration", &weak],
     )
 }
 
-/// Builds (or reuses) the in-device proxy tool. Run it inside a device with
+/// Builds (or reuses) the in-device proxy tool for `sdk`'s simulator. Run it inside a device with
 /// `set <host> <port>`, `clear` or `get`.
-pub fn scproxy_tool() -> Result<PathBuf, String> {
-    build("scproxy", "", SCPROXY_SOURCE, &["-fobjc-arc", "-framework", "Foundation", "-framework", "CFNetwork"])
+pub fn scproxy_tool(sdk: Sdk) -> Result<PathBuf, String> {
+    build(sdk, "scproxy", "", SCPROXY_SOURCE, &["-fobjc-arc", "-framework", "Foundation", "-framework", "CFNetwork"])
 }
 
 fn run(cmd: &mut Command) -> Result<(), String> {
@@ -284,6 +343,23 @@ pub fn launch_env(udid: &str, dylib: &Path) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_runtime_gets_its_own_simulator_sdk() {
+        let rt = "com.apple.CoreSimulator.SimRuntime.";
+        assert_eq!(Sdk::for_runtime(&format!("{rt}iOS-18-0")), Ok(Sdk::Ios));
+        // Device-specific runtimes (iOS 27.2 for the iPhone Duo) are iOS too.
+        assert_eq!(Sdk::for_runtime(&format!("{rt}iOS-27-2-iPhone19-4")), Ok(Sdk::Ios));
+        assert_eq!(Sdk::for_runtime(&format!("{rt}tvOS-26-5")), Ok(Sdk::Tvos));
+        for other in ["watchOS-26-5", "xrOS-26-5"] {
+            assert!(Sdk::for_runtime(&format!("{rt}{other}")).expect_err(other).contains("iOS, iPadOS and tvOS"));
+        }
+        assert_eq!((Sdk::Ios.sdk(), Sdk::Ios.target(), Sdk::Ios.suffix()), ("iphonesimulator", "arm64-apple-ios15.0-simulator", ""));
+        assert_eq!((Sdk::Tvos.sdk(), Sdk::Tvos.target()), ("appletvsimulator", "arm64-apple-tvos15.0-simulator"));
+        let tv = Sdk::Tvos.dns_services_tbd();
+        assert!(tv.contains("arm64-tvos-simulator") && !tv.contains("ios-simulator"));
+        assert_eq!(Sdk::Ios.dns_services_tbd(), DNS_SERVICES_TBD);
+    }
 
     #[test]
     fn rates_match_the_hosts_profile() {

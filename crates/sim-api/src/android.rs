@@ -221,6 +221,10 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
                 _ => Err("a swipe needs both `to_x` and `to_y`".into()),
             }
         }
+        "stylus" => {
+            let (samples, duration) = crate::params::stylus_samples(p)?;
+            null(d.stylus(&samples, duration))
+        }
         "xr" => {
             let command: XrCommand = serde_json::from_value(p.clone()).map_err(|e| format!("xr: {e} ({})", sim_core::xr::USAGE))?;
             d.xr(&command).map(|lines| json!(lines))

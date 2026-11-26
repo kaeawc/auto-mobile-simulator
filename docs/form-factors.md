@@ -2,7 +2,7 @@
 
 Every device has a platform (`android` or `ios`), a form factor and the sub-platform that pairs
 them. The model is `sim_core::form_factor`; `simee form-factors` and the API's `form_factors`
-print it.
+print it. Which iOS and tvOS runtime versions each feature works on: [ios-versions.md](ios-versions.md).
 
 ## Support
 
@@ -99,7 +99,7 @@ Foldable postures follow the stock emulator's hinge ranges: closed below 30°, h
 | Apple TV | `simee create TV "Apple TV 4K (3rd generation)" "tvOS 26.0" --form-factor tv` | `button select\|menu\|back\|home\|play-pause\|up\|down\|left\|right` (the Siri Remote), `remote-swipe up\|down\|left\|right` (its touch surface) |
 | Vision Pro | `simee create V "Apple Vision Pro" "visionOS 26.0" --form-factor vision` | touch (unverified), `button home` |
 | Android phone | `simee create P --platform android --system-image "system-images;android-36;google_apis;arm64-v8a"` | touch, `button back\|home\|recents`, `type`, `rotate` |
-| Android tablet | the same image, `--form-factor tablet` | as phone |
+| Android tablet | the same image, `--form-factor tablet` | as phone, plus `stylus X Y [hover\|down\|move\|up\|leave]` or `stylus X Y --to X2 Y2` (a pen; [Tablets](#tablets)) |
 | Android foldable | the same image, `--form-factor foldable` | as phone, plus `fold <closed\|half-opened\|opened\|angle>` |
 | Wear OS | `--system-image "system-images;android-34;android-wear;arm64-v8a"` | touch, `rotary <ticks>`, `button back\|home\|power` |
 | Android TV | `--system-image "system-images;android-34;google-tv;arm64-v8a"` | `button up\|down\|left\|right\|select\|back\|home` |
@@ -125,6 +125,26 @@ size, a foldable's hinge sensor). An image can't boot another family's form fact
 $ simee create T --platform android --system-image "system-images;android-34;android-wear;arm64-v8a" --form-factor tablet
 Error: system image `system-images;android-34;android-wear;arm64-v8a` (tag `android-wear`) boots Wear OS · Watch devices, not tablet
 ```
+
+## Tablets
+
+What a tablet has under the stock tools and under simee. The Android column for stock is read from
+the emulator's sources (`android-qemu2-glue/main.cpp`, `virtio-input-multi-touch.c`,
+`multitouch-screen.c`) and the SDK's `pixel_tablet` definition; the touch screen's device codes were
+also compared on a running stock emulator (phone, tablet and Wear; `docs/reference/stock-board.md`).
+
+| Feature | Stock | simee |
+| --- | --- | --- |
+| Android screen, density | `pixel_tablet`: 2560×1600 (landscape is its natural orientation), xhdpi | the same 2560×1600 at 320 dpi (`--form-factor tablet`) |
+| Android rotation | `rotate` turns the accelerometer's gravity; its window turns the screen to match | `rotate` turns the gravity and the guest rotates (checked: `ROTATION_270`, `adb screencap` 1600×2560), but simee's `screenshot` and the desktop show the panel unturned, so a rotated tablet's content lies sideways there ([Known gaps](#known-gaps)) |
+| Android stylus | every touch screen takes a pen on its own slot: `ABS_MT_TOOL_TYPE` pen, `MT_TOOL_MAX` with `BTN_TOOL_RUBBER` for the eraser, `BTN_STYLUS` for the barrel button, pressure, hover at zero pressure; sent through gRPC (`PenEvent`) | the same pen codes and pen slot on every touch screen, as stock has them on phones, tablets and Wear alike (`getevent -p` on both, 2026-11-26); `stylus` (API, CLI) and the console's `pen` send it; the desktop's Stylus button (tablets) makes the pointer a pen that hovers and draws. Checked on a Pixel Tablet-sized API 36 AVD: the guest lists the screen as `TOUCHSCREEN \| STYLUS`, a hovering pen reaches apps as `HOVER_ENTER`/`HOVER_MOVE`/`HOVER_EXIT` with tool type stylus (eraser: `ERASER`), a press with the button as `BUTTON_PRESS` with `BUTTON_STYLUS_PRIMARY`, and fingers stay `FINGER` after the pen; a finger held while the pen lifts stays touching, and so does a pen held while a finger lifts |
+| Android mouse / trackpad | google_apis images enable neither `VirtioMouse` nor `VirtioTablet`, so stock gives a tablet no mouse device (a mouse device replaces the touch screen there); the host mouse is a finger | the same: the pointer is a finger, or the pen with the Stylus button |
+| Android hardware keyboard | `hw.keyboard=yes` (`qwerty2`) | the same |
+| Taskbar, split screen, freeform windows | the guest's own (large-screen launcher; split screen from the taskbar or recents; freeform behind the developer option) | the guest's own, unchanged. Checked on API 36: the 2560×1600 screen is `sw800dp xlrg land`; split screen (WMShell `splitscreen moveToSideStage`) put Settings and Clock side by side at 1270 and 1270 px; with `enable_freeform_support` a freeform Clock window opened at 776×1380 |
+| Desktop window | — | a landscape tablet's screen is shown shorter so the window stays within 1440 points (other form factors keep the full-height screen) |
+| iPad rotation, keyboard | Simulator.app's Rotate, hardware keyboard | `rotate [--orientation]`, `type`, `key`, `hardware_keyboard`. Checked on an iPad Pro 11-inch (M4), iOS 26.5: Safari turned to landscape and back, taps landed in the turned UI, and typing filled its address bar. Screenshots stay in the panel's portrait orientation, as `simctl io screenshot`'s do |
+| iPad multitasking gestures | Simulator.app's edge swipes (home, Dock, App Switcher) | `swipe --edge bottom` (fast: home; slow or `--settle`: the app switcher), `--edge top` (Control Center, Notification Center); see [Apple inputs](#apple-inputs-and-carplay) |
+| iPad pointer, Apple Pencil | Simulator.app can send the host pointer to the device (I/O › Input); it has no Pencil input | `pointer` (hover, click, drag, both buttons) and `stylus` (Pencil taps and strokes, no pressure, tilt or hover); see [Apple inputs](#apple-inputs-and-carplay) |
 
 ## Apple inputs and CarPlay
 
@@ -160,7 +180,7 @@ without one fails that input with `Unavailable`, never a crash.
   short) and moves in 10 pt steps: exact on iOS 26.5, within ~20 pt on 27.2, whose pointer
   accelerates even slow motion. `pointer --to` drags in one call; a button held by `pointer … down`
   keeps the position for the next calls on the same server (`simee serve`), while separate CLI
-  processes home the pointer again. `pencil` sends a touch whose finger is a stylus (the guest's `SimulatorHID` copies
+  processes home the pointer again. `stylus` on an iPad sends a touch whose finger is a stylus (the guest's `SimulatorHID` copies
   the transducer type into the `IOHIDEvent`), which apps see as `UITouch.type == .pencil` and
   draw with. Checked on iPad Pro 13-inch (M5) clones on iOS 26.5 and 27.2 with a probe app that
   logs every touch and hover, and with the AutoMobile harness.
@@ -206,7 +226,9 @@ What is modelled and labelled but not (or not verifiably) working end to end:
 | Android XR | Not booted on simee yet. Checked offline against `google-xr` 34 r7: its fstab, modules and input `.idc` names match the board, and its features ask for what simee gives it (`GuestAngle`, `VirtioDualModeMouse`). It enables `VirtioSndCard`, so simee gives it the virtio-snd card as stock does; its ranchu audio HAL, the phones' one, plays through it (booted on phones, Wear and TV, not yet on XR). The room renders in the guest through gfxstream (simee already defaults to ANGLE), but stock's other XR feature flags (`XrModeUI`, `XrHandAndEyePointers`, `VirtioMouse`, `MultiDisplay`, `BluetoothEmulation`) have no simee equivalent yet. The dual-mode mouse matches stock's device (name, ids, event bits, axes); how the guest maps it to its hand ray and gaze pointers, and whether head pose, options, hand and eye events over `xr_service` take effect, is unverified. auto-mobile's `xrHeadsetInput` (auto-mobile #19076) sends hand and eye events over stock's gRPC `streamInputEvent`, which simee doesn't serve yet (its gRPC `EmulatorController` is on the roadmap); `xr hand`/`xr eye` put the same messages on the guest's pipe. The display glasses' temple touchpad (`hw.touchpad0`, 1542×297, which the `ai-glasses` image configures as `virtio_input_multi_touch_touchpad_0`) is attached and driven by `touchpad`, but how the guest's UI reacts to it is unverified. Only images that enable `VirtioDualModeMouse` (the headsets, not the glasses) get the dual-mode mouse, as on stock. |
 | Apple Watch, Apple TV | The crown, gestures, Siri Remote buttons and touch surface use the messages Simulator.app sends (confirmed live by other projects on watchOS/tvOS 26.5 and 27), but not run by simee. The crown's units per tick are a calibration. From Xcode 27 the guest can switch input to `dtuhidd` (once `com.apple.coredevice.dtuhidd.active` is set, e.g. by Device Hub), after which legacy HID buttons and keys are dropped; simee doesn't detect that yet. |
 | Vision Pro | Gaze, pinch and the camera (look around, pan, orbit) go through Xcode's visionOS UI plugin in Simulator.app, whose messages aren't public; simee sends plain touches, which no source confirms visionOS honours. auto-mobile can't script visionOS input either (auto-mobile #19055). |
-| iPad Pencil | Pressure, tilt, hover and the barrel (double-tap, squeeze) aren't reachable: the guest's `SimulatorHID` makes every touch with `IOHIDEventCreateDigitizerFingerEvent` and copies only position, the transducer type, radii and quality fields, so altitude and azimuth stay π/2 and 0; `UITouch.force` and `maximumPossibleForce` stay 0 because the screen's digitizer has no force (the iPad device types say `SupportsForceTouch` false; a pencil digitizer service, which backboardd looks for, isn't one Indigo can create), and Simulator.app's own pressure message (`IndigoHIDMessageForPressureEvent`) changes nothing on an iPad either. A contact in range but not touching makes no hover. Simulator.app has no Pencil input at all; the barrel gestures come from the Pencil's own accessory, which no HID message models. The simulator runtimes ship no Notes app, so drawing was checked in a probe app. |
+| iPad stylus (Apple Pencil) | Pressure, tilt, hover and the barrel (double-tap, squeeze) aren't reachable: the guest's `SimulatorHID` makes every touch with `IOHIDEventCreateDigitizerFingerEvent` and copies only position, the transducer type, radii and quality fields, so altitude and azimuth stay π/2 and 0; `UITouch.force` and `maximumPossibleForce` stay 0 because the screen's digitizer has no force (the iPad device types say `SupportsForceTouch` false; a pencil digitizer service, which backboardd looks for, isn't one Indigo can create), and Simulator.app's own pressure message (`IndigoHIDMessageForPressureEvent`) changes nothing on an iPad either. A contact in range but not touching makes no hover. Simulator.app has no Pencil input at all; the barrel gestures come from the Pencil's own accessory, which no HID message models. The simulator runtimes ship no Notes app, so drawing was checked in a probe app. |
 | iPad pointer | Positions are open loop (the guest takes relative motion only): ~20 pt off on iOS 27.2; turning off pointer acceleration in the guest's settings might make them exact (not tried). Pointer coordinates assume portrait. No scroll wheel or trackpad gestures yet (the guest also takes scroll and dock-swipe events). |
+| Android rotation (tablets, phones) | The guest rotates, but frames come from the panel as it lies, so after `rotate` simee's `screenshot`, the display stream and the desktop show the content turned 90° (`adb screencap` is upright); stock's window and screenshots follow its rotation. `tap`/`swipe` take panel pixels. A tablet's natural orientation is landscape, so it starts upright. |
+| Android tablet pointer | No mouse or trackpad is attached (stock attaches none to google_apis tablets either); hover and right-click aren't available except as the stylus's hover and barrel button. |
 | iOS rotation | Runtimes that report device motion can ignore the orientation event (idb switches to a vendor-defined HID message through `dtuhidd` there); not handled. |
 | Every Apple form factor | Needs a Mac with the runtime installed; none could be booted in the environment the combined project was built in. |

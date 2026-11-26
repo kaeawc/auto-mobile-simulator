@@ -3,7 +3,7 @@
 //! Android: the guest log, logcat and the console's critical lines).
 
 use rune::tok::{self, Theme, radius, type_};
-use rune::{Color, Cx, Drag, El, Icon, KeyEvent, Phase, ScrollSpec, SurfaceFit, Tx, col, el, row, text};
+use rune::{Color, Cx, Drag, El, Icon, KeyEvent, Phase, PointerEvent, ScrollSpec, SurfaceFit, Tx, col, el, row, text};
 use sim_core::device::{DeviceInfo, DeviceState};
 use sim_core::form_factor::Shape;
 use sim_core::platform::Platform;
@@ -222,6 +222,20 @@ fn screen(s: &State) -> El {
                 Phase::Up if d.cancelled() => Input::Up(x, y),
                 Phase::Up => Input::Up(x, y),
             });
+        })
+        // With the stylus on (Android tablets), the pointer over the screen is the pen hovering.
+        .on_layout(|s: &mut State, r: [f32; 4]| s.screen_view = (r[2], r[3]))
+        .on_pointer_move_local(|s: &mut State, p: PointerEvent, _: &mut Tx| {
+            if s.stylus && !p.pressing {
+                let (w, h) = s.screen_size();
+                let (vw, vh) = s.screen_view;
+                s.inputs.push(Input::Hover(p.x / vw.max(1.0) * w as f32, p.y / vh.max(1.0) * h as f32));
+            }
+        })
+        .on_hover_change(|s: &mut State, inside: bool, _: &mut Tx| {
+            if s.stylus && !inside {
+                s.inputs.push(Input::Leave);
+            }
         })
         .on_key(|s: &mut State, k: &KeyEvent, _: &mut Tx| {
             let action = crate::keys::map(k);

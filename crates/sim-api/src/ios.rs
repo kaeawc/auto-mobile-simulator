@@ -72,9 +72,50 @@ fn closed_port() -> Result<u16, String> {
     l.local_addr().map(|a| a.port()).map_err(err)
 }
 
+/// The simulator SDK the device's shaper and proxy tool are built for (its runtime's platform).
+fn shaper_sdk(device: &Device) -> Result<sim_netshape::Sdk, String> {
+    sim_netshape::Sdk::for_runtime(&device.info().runtime_id)
+}
+
+/// The launch environment that injects the device's shaper (built on first use).
+fn shaper_env(device: &Device) -> Result<Vec<(String, String)>, String> {
+    Ok(sim_netshape::launch_env(&device.info().udid, &sim_netshape::dylib(shaper_sdk(device)?)?))
+}
+
+/// The simulator SDKs a set of devices' runtimes need a shaper for, each once, in first-seen
+/// order (`boot_many` may mix iPhones and Apple TVs: each needs its own build).
+fn shaper_sdks<'a>(runtime_ids: impl IntoIterator<Item = &'a str>) -> Result<Vec<sim_netshape::Sdk>, String> {
+    let mut sdks = Vec::new();
+    for id in runtime_ids {
+        let sdk = sim_netshape::Sdk::for_runtime(id)?;
+        if !sdks.contains(&sdk) {
+            sdks.push(sdk);
+        }
+    }
+    Ok(sdks)
+}
+
+/// Shapers built for a boot plan, one per simulator SDK.
+type Shapers = Vec<(sim_netshape::Sdk, std::path::PathBuf)>;
+
+/// Builds (or reuses) one shaper per SDK the runtimes need.
+fn build_shapers(runtime_ids: &[String]) -> Result<Shapers, String> {
+    shaper_sdks(runtime_ids.iter().map(String::as_str))?.into_iter().map(|sdk| Ok((sdk, sim_netshape::dylib(sdk)?))).collect()
+}
+
+/// The shaper among `shapers` for a device on `runtime_id`.
+fn shaper_for<'a>(shapers: &'a [(sim_netshape::Sdk, std::path::PathBuf)], runtime_id: &str) -> Result<&'a Path, String> {
+    let sdk = sim_netshape::Sdk::for_runtime(runtime_id)?;
+    shapers
+        .iter()
+        .find(|(s, _)| *s == sdk)
+        .map(|(_, dylib)| dylib.as_path())
+        .ok_or_else(|| format!("no network shaper was built for `{runtime_id}`"))
+}
+
 /// Runs the in-device proxy tool; succeeds only if it reports success.
 fn device_proxy(device: &Device, args: &[&str]) -> Result<(), String> {
-    let tool = sim_netshape::scproxy_tool()?;
+    let tool = sim_netshape::scproxy_tool(shaper_sdk(device)?)?;
     let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
     let out = device.exec(&tool.display().to_string(), &args, &[]).map_err(err)?;
     if out.stdout.contains(" ok ") || out.stdout.starts_with("set ok") || out.stdout.starts_with("clear ok") {
@@ -85,11 +126,12 @@ fn device_proxy(device: &Device, args: &[&str]) -> Result<(), String> {
 }
 
 /// Whether the device was booted with the current shaper build in its environment: its
-/// SpringBoard maps that exact dylib. An older build counts as not injected (so it gets rebooted).
-fn boot_injected(udid: &str) -> bool {
-    let Ok(dylib) = sim_netshape::dylib() else { return false };
-    let Ok(procs) = sim_debug::process::collect(udid) else { return false };
-    let Some(sb) = procs.iter().find(|p| p.name == "SpringBoard") else { return false };
+/// SpringBoard (Apple TV: PineBoard) maps that exact dylib. An older build counts as not injected
+/// (so it gets rebooted).
+fn boot_injected(device: &Device) -> bool {
+    let Ok(dylib) = shaper_sdk(device).and_then(sim_netshape::dylib) else { return false };
+    let Ok(procs) = sim_debug::process::collect(&device.info().udid) else { return false };
+    let Some(sb) = procs.iter().find(|p| p.name == "SpringBoard" || p.name == "PineBoard") else { return false };
     std::process::Command::new("/usr/sbin/lsof")
         .args(["-p", &sb.pid.to_string(), "-Fn"])
         .output()
@@ -99,11 +141,10 @@ fn boot_injected(udid: &str) -> bool {
 /// Reboots the device with the shaper in its launchd environment, so every process (including
 /// WebKit's networking extension and system daemons) is shaped by the device's profile.
 fn boot_inject(device: &Device) -> Result<(), String> {
-    let udid = device.info().udid;
-    if boot_injected(&udid) {
+    if boot_injected(device) {
         return Ok(());
     }
-    let env = sim_netshape::launch_env(&udid, &sim_netshape::dylib()?);
+    let env = shaper_env(device)?;
     if device.state() == DeviceState::Booted {
         device.shutdown().map_err(err)?;
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
@@ -115,13 +156,54 @@ fn boot_inject(device: &Device) -> Result<(), String> {
     boot(device, Duration::from_secs(600))
 }
 
+/// Runs one program with the shaper injected first (the device must be booted). A shaper the
+/// runtime can't load (a library the runtime lacks) would stop every process the device starts
+/// afterwards, `launchctl` too, so injection couldn't be undone without a reboot.
+fn shaper_loads(device: &Device, env: &[(String, String)]) -> Result<(), String> {
+    let out = device.exec("launchctl", &["getenv".to_owned(), "SIMEE_NETSHAPE".to_owned()], env).map_err(err)?;
+    match out.stderr.lines().find(|l| l.starts_with("dyld[") || l.contains("Library not loaded")) {
+        Some(line) => Err(format!("the network shaper doesn't load on this device's runtime: {}", line.trim())),
+        None => Ok(()),
+    }
+}
+
+/// One step of `network_shape`, in the order [`shape_steps`] gives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShapeStep {
+    /// Check the shaper loads on the device's runtime ([`shaper_loads`]).
+    Preflight,
+    WriteProfile,
+    /// Start the shaping proxy and point the device at it.
+    Proxy,
+    /// Inject the shaper (`launchd` or `boot`).
+    Inject,
+}
+
+/// `network_shape`'s steps for `inject_mode` ("none", "launchd" or "boot"), with or without the
+/// proxy, on a booted device or not. The preflight comes first, so a shaper the runtime can't load
+/// is refused before the profile, proxy or injection changes. It runs only on a booted device:
+/// programs run only there, and a shut-down device given "boot" is booted with the shaper.
+fn shape_steps(inject_mode: &str, proxy: bool, booted: bool) -> Vec<ShapeStep> {
+    let inject = inject_mode != "none";
+    let mut steps = Vec::with_capacity(4);
+    if inject && booted {
+        steps.push(ShapeStep::Preflight);
+    }
+    steps.push(ShapeStep::WriteProfile);
+    if proxy {
+        steps.push(ShapeStep::Proxy);
+    }
+    if inject {
+        steps.push(ShapeStep::Inject);
+    }
+    steps
+}
+
 /// Sets or removes device-wide socket-shaper injection for processes started from now on.
 fn device_inject(device: &Device, on: bool) -> Result<(), String> {
-    let udid = device.info().udid;
     let args: Vec<String> = if on {
-        let dylib = sim_netshape::dylib()?;
         let mut a = vec!["setenv".to_owned()];
-        for (k, v) in sim_netshape::launch_env(&udid, &dylib) {
+        for (k, v) in shaper_env(device)? {
             a.extend([k, v]);
         }
         a
@@ -543,9 +625,10 @@ struct BootPlan {
     /// For the boot itself (until the service reports it booted and the display has a frame).
     timeout: Duration,
     env: Vec<(String, String)>,
-    /// The network shaper to inject (its environment names the device), resolved once by the
-    /// caller: `boot_many`'s workers must not each build it into the same cache.
-    shaper: Option<std::path::PathBuf>,
+    /// The network shapers to inject, one per simulator SDK among the devices (empty: unshaped),
+    /// resolved once by the caller: `boot_many`'s workers must not each build one into the same
+    /// cache.
+    shapers: Shapers,
     /// Wait until the device is quiet too (see [`crate::settle`]), for at most `settle_timeout`
     /// after the boot.
     settle: Option<crate::settle::Rule>,
@@ -697,13 +780,13 @@ fn settle_rule(p: &Value, prefix: &str) -> Result<crate::settle::Rule, String> {
 }
 
 /// The plan for `p`, booting `concurrent` devices at once (1 for `boot`); `settle_default` when
-/// `settle` isn't given. `shaper` resolves the network shaper (built on first use), called at
-/// most once, here on the caller's thread.
+/// `settle` isn't given. `shapers` resolves the network shapers the devices need (built on first
+/// use), called at most once, here on the caller's thread.
 fn boot_plan(
     p: &Value,
     concurrent: usize,
     settle_default: bool,
-    shaper: impl FnOnce() -> Result<std::path::PathBuf, String>,
+    shapers: impl FnOnce() -> Result<Shapers, String>,
 ) -> Result<BootPlan, String> {
     let settle = match p.get("settle") {
         None | Some(Value::Null) => settle_default,
@@ -714,7 +797,7 @@ fn boot_plan(
     Ok(BootPlan {
         timeout: Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)),
         env: pairs(p, "env"),
-        shaper: if shaped { Some(shaper()?) } else { None },
+        shapers: if shaped { shapers()? } else { Vec::new() },
         settle: if settle { Some(settle_rule(p, "settle_")?) } else { None },
         settle_timeout: opt_u64(p, "settle_timeout_s")
             .map_or_else(|| crate::settle::default_settle_timeout(concurrent), Duration::from_secs),
@@ -727,10 +810,11 @@ fn boot_plan(
 /// timings (`profile.error`; `settled: false` with `settle_error`), the device left booted.
 fn boot_device(device: &Device, plan: &BootPlan) -> Result<Value, String> {
     let start = std::time::Instant::now();
-    let udid = device.info().udid;
+    let info = device.info();
+    let udid = info.udid;
     let mut env = plan.env.clone();
-    if let Some(dylib) = &plan.shaper {
-        env.extend(sim_netshape::launch_env(&udid, dylib));
+    if !plan.shapers.is_empty() {
+        env.extend(sim_netshape::launch_env(&udid, shaper_for(&plan.shapers, &info.runtime_id)?));
     }
     let was_booted = device.state() == DeviceState::Booted;
     // Before the boot, so this boot never starts the profile's jobs (a clone starts with no
@@ -1107,8 +1191,9 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             Ok(Value::Null)
         }
         "boot" => {
-            let plan = boot_plan(p, 1, false, sim_netshape::dylib)?;
-            let timed = boot_device(&s.device(p)?, &plan)?;
+            let d = s.device(p)?;
+            let plan = boot_plan(p, 1, false, || build_shapers(&[d.info().runtime_id]))?;
+            let timed = boot_device(&d, &plan)?;
             // Without settle or a profile, `boot` answers as it always has.
             Ok(if plan.settle.is_some() || plan.profile.is_some() { timed } else { Value::Null })
         }
@@ -1120,11 +1205,14 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let concurrency = crate::params::concurrency(p)?;
             // Settles by default: the slot is held through the settle wait, so K bounds the boot
             // storms in flight (what the K sweep measured), not just the service's boot calls.
-            let plan = boot_plan(p, concurrency.min(udids.len()), true, sim_netshape::dylib)?;
             let mut exact = Vec::with_capacity(udids.len());
+            let mut runtimes = Vec::with_capacity(udids.len());
             for q in &udids {
-                exact.push(s.ctx()?.resolve(q).map(|(_, info)| info.udid).map_err(err)?);
+                let (_, info) = s.ctx()?.resolve(q).map_err(err)?;
+                exact.push(info.udid);
+                runtimes.push(info.runtime_id);
             }
+            let plan = boot_plan(p, concurrency.min(udids.len()), true, || build_shapers(&runtimes))?;
             let start = std::time::Instant::now();
             let results = boot_many(&exact, concurrency, &plan);
             let failed = results.iter().filter(|r| r.get("error").is_some()).count();
@@ -1187,7 +1275,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let d = s.device(p)?;
             let mut env = pairs(p, "env");
             if p.get("shaped").and_then(Value::as_bool).unwrap_or(false) {
-                env.extend(sim_netshape::launch_env(&d.info().udid, &sim_netshape::dylib()?));
+                env.extend(shaper_env(&d)?);
             }
             let pid = d.launch_with(need_str(p, "bundle_id")?, &strings(p, "args"), &env).map_err(err)?;
             Ok(json!({"pid": pid}))
@@ -1386,7 +1474,6 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let d = s.device(p)?;
             let udid = d.info().udid;
             let profile = profile_from(p, sim_netshape::read_profile(&udid))?;
-            let path = sim_netshape::write_profile(&udid, &profile)?;
             let use_proxy = p.get("proxy").and_then(Value::as_bool).unwrap_or(true);
             // inject: false | true (launchd setenv: new processes) | "boot" (reboot: every process).
             let inject_mode = match p.get("inject") {
@@ -1397,27 +1484,30 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
                 Some(other) => return Err(format!("inject must be true, false, \"launchd\" or \"boot\", not {other}")),
             };
             let inject = inject_mode != "none";
-            let mut port = None;
-            if use_proxy {
-                let started = with_proxies(|m| -> Result<u16, String> {
-                    if let Some(px) = m.get(&udid) {
-                        return Ok(px.port);
+            let (mut path, mut port) = (std::path::PathBuf::new(), None);
+            for step in shape_steps(inject_mode, use_proxy, d.state() == DeviceState::Booted) {
+                match step {
+                    ShapeStep::Preflight => shaper_loads(&d, &shaper_env(&d)?)?,
+                    ShapeStep::WriteProfile => path = sim_netshape::write_profile(&udid, &profile)?,
+                    ShapeStep::Proxy => {
+                        let started = with_proxies(|m| -> Result<u16, String> {
+                            if let Some(px) = m.get(&udid) {
+                                return Ok(px.port);
+                            }
+                            let px = sim_netshape::proxy::Proxy::start(path.clone()).map_err(err)?;
+                            let port = px.port;
+                            m.insert(udid.clone(), px);
+                            Ok(port)
+                        })?;
+                        // Offline points the device at a closed port: clients then fail exactly as
+                        // with no network ("could not connect to the server"), not a proxy error.
+                        let target = if profile.offline { closed_port()? } else { started };
+                        device_proxy(&d, &["set", "127.0.0.1", &target.to_string()])?;
+                        port = Some(started);
                     }
-                    let px = sim_netshape::proxy::Proxy::start(path.clone()).map_err(err)?;
-                    let port = px.port;
-                    m.insert(udid.clone(), px);
-                    Ok(port)
-                })?;
-                // Offline points the device at a closed port: clients then fail exactly as with no
-                // network ("could not connect to the server"), rather than seeing a proxy error.
-                let target = if profile.offline { closed_port()? } else { started };
-                device_proxy(&d, &["set", "127.0.0.1", &target.to_string()])?;
-                port = Some(started);
-            }
-            match inject_mode {
-                "launchd" => device_inject(&d, true)?,
-                "boot" => boot_inject(&d)?,
-                _ => {}
+                    ShapeStep::Inject if inject_mode == "boot" => boot_inject(&d)?,
+                    ShapeStep::Inject => device_inject(&d, true)?,
+                }
             }
             Ok(json!({"profile": profile, "proxy_port": port, "injected": inject, "inject_mode": inject_mode, "profile_path": path}))
         }
@@ -1430,7 +1520,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
                 .map(|o| o.stdout.contains("netshape"))
                 .unwrap_or(false);
             Ok(
-                json!({"profile": sim_netshape::read_profile(&udid), "proxy_port": port, "injected": inject, "boot_injected": boot_injected(&udid)}),
+                json!({"profile": sim_netshape::read_profile(&udid), "proxy_port": port, "injected": inject, "boot_injected": boot_injected(&s.device(p)?)}),
             )
         }
         "network_flows" => {
@@ -1498,13 +1588,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             Ok(json!({"muted": with_captures(|m| m.contains_key(&format!("mute-{udid}")))}))
         }
         "network_env" => {
-            let udid = s.device(p)?.info().udid;
-            let dylib = sim_netshape::dylib()?;
-            Ok(sim_netshape::launch_env(&udid, &dylib)
-                .into_iter()
-                .map(|(k, v)| (k, Value::String(v)))
-                .collect::<serde_json::Map<_, _>>()
-                .into())
+            Ok(shaper_env(&s.device(p)?)?.into_iter().map(|(k, v)| (k, Value::String(v))).collect::<serde_json::Map<_, _>>().into())
         }
         other => Err(format!("unknown method `{other}`; call `help`")),
     }
@@ -1588,14 +1672,45 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let resolve = || {
             calls.set(calls.get() + 1);
-            Ok(std::path::PathBuf::from("/cache/netshape.dylib"))
+            Ok(vec![(sim_netshape::Sdk::Ios, std::path::PathBuf::from("/cache/netshape.dylib"))])
         };
         let plan = boot_plan(&json!({"shaped": true}), 8, true, resolve).expect("plan");
         assert_eq!(calls.get(), 1);
-        assert_eq!(plan.shaper.as_deref(), Some(Path::new("/cache/netshape.dylib")), "every worker uses this path");
+        let ios = "com.apple.CoreSimulator.SimRuntime.iOS-26-5";
+        assert_eq!(shaper_for(&plan.shapers, ios), Ok(Path::new("/cache/netshape.dylib")), "every worker uses this path");
         let plan = boot_plan(&json!({}), 1, false, || Err("not built".into())).expect("unshaped plans don't build it");
-        assert!(plan.shaper.is_none());
+        assert!(plan.shapers.is_empty());
         assert_eq!(boot_plan(&json!({"shaped": true}), 1, false, || Err("clang failed".into())).expect_err("build error"), "clang failed");
+    }
+
+    #[test]
+    fn a_mixed_boot_many_gets_one_shaper_per_runtime_sdk() {
+        use sim_netshape::Sdk;
+        let rt = "com.apple.CoreSimulator.SimRuntime.";
+        let (ios, tv, ios18) = (format!("{rt}iOS-26-5"), format!("{rt}tvOS-26-5"), format!("{rt}iOS-18-0"));
+        let sdks = shaper_sdks([ios.as_str(), tv.as_str(), ios18.as_str()]).expect("sdks");
+        assert_eq!(sdks, [Sdk::Ios, Sdk::Tvos], "each SDK once, the Apple TV's included");
+        let shapers: Shapers = sdks.iter().map(|&s| (s, std::path::PathBuf::from(format!("/cache/{s:?}.dylib")))).collect();
+        assert_eq!(shaper_for(&shapers, &tv), Ok(Path::new("/cache/Tvos.dylib")), "the Apple TV gets the tvOS build");
+        assert_eq!(shaper_for(&shapers, &ios18), Ok(Path::new("/cache/Ios.dylib")));
+        // A set with a runtime that has no shaper is refused before anything boots.
+        assert!(shaper_sdks([ios.as_str(), &format!("{rt}watchOS-26-5")]).is_err());
+        assert!(shaper_for(&shapers[..1], &tv).is_err(), "a device whose SDK wasn't built fails, not given the wrong build");
+    }
+
+    #[test]
+    fn network_shape_preflights_first_and_only_on_a_booted_device() {
+        use ShapeStep::{Inject, Preflight, Proxy, WriteProfile};
+        // A shut-down device given inject "boot" is booted with the shaper: nothing runs in it first.
+        assert_eq!(shape_steps("boot", false, false), [WriteProfile, Inject]);
+        assert_eq!(shape_steps("boot", true, false), [WriteProfile, Proxy, Inject]);
+        // On a booted device a shaper that won't load is refused before anything changes.
+        assert_eq!(shape_steps("boot", true, true), [Preflight, WriteProfile, Proxy, Inject]);
+        assert_eq!(shape_steps("launchd", true, true), [Preflight, WriteProfile, Proxy, Inject]);
+        assert_eq!(shape_steps("launchd", false, true), [Preflight, WriteProfile, Inject]);
+        // Without injection nothing is preflighted.
+        assert_eq!(shape_steps("none", true, true), [WriteProfile, Proxy]);
+        assert_eq!(shape_steps("none", false, false), [WriteProfile]);
     }
 
     #[test]
@@ -1779,7 +1894,7 @@ mod tests {
 
     #[test]
     fn settle_rules_read_their_keys() {
-        let none = || -> Result<std::path::PathBuf, String> { Err("unused".into()) };
+        let none = || -> Result<Shapers, String> { Err("unused".into()) };
         let plan = boot_plan(&json!({"settle": true}), 1, false, none).expect("boot");
         assert_eq!(plan.settle, Some(crate::settle::Rule::default()), "foreground CPU by default");
         let p = json!({"settle": true, "settle_cpu_pct": 5.0, "settle_window_s": 20, "settle_foreground": false});

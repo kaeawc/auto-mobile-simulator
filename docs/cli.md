@@ -33,7 +33,7 @@ simee swipe iPad 1032 2748 1032 1600 --duration 150 --edge bottom   # home (slow
 simee swipe iPad 1960 4 1960 1200 --edge top # Control Center (top right), Notification Center (top left)
 simee pointer iPad 500 520                   # the iPad's pointer: hover there (pixels)
 simee pointer iPad 500 520 click             # or click; --to X2 Y2 drags
-simee pencil iPad 400 1300 --to 1400 1700    # an Apple Pencil stroke (or X Y [tap|down|move|up])
+simee stylus iPad 400 1300 --to 1400 1700    # an Apple Pencil stroke (or X Y [tap|down|move|up])
 ```
 
 `--form-factor` is checked against the device type (an iPhone is not a tablet). CarPlay is an
@@ -89,9 +89,13 @@ simee shutdown|delete <device>
 
 `<device>` is a UDID (an Android device's is its AVD name), an exact name, or `booted`.
 iOS-only commands: `install|uninstall|launch|terminate|apps`, `open-url`, `appearance`, `privacy`,
-`memory-warning`, `erase`, `exec`, `carplay`, `watch-gesture`, `remote-swipe`, `pointer`, `pencil`
+`memory-warning`, `erase`, `exec`, `carplay`, `watch-gesture`, `remote-swipe`, `pointer`
 (and `swipe --edge`); Android-only:
-`fold`, `console`, `xr`. Using one
+`fold`, `console`, `xr`, `touchpad`, `vehicle`. `stylus` works on both: a pen on the touch screen
+(`simee stylus <device> 400 300 hover`, `... down --pressure 200 --button`, `... 100 100 --to 900 600`
+for a stroke, `--eraser` for the eraser end); on an iPad it is the Apple Pencil, which takes taps,
+`down`/`move`/`up` and strokes but no hover, pressure, button or eraser (the simulator's touch
+screen has none). Using one
 on the other platform's device fails with the platforms it works on.
 
 
