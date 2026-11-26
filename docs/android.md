@@ -231,6 +231,12 @@ EMU_QEMU=/path/to/qemu-system-x86_64 emu -avd phone   # QEMU 11.1 or newer; with
   panics the guest under multi-threaded TCG within seconds (`int3` in the kernel's
   live-patching window); 11.1 has QEMU's fix, but one full boot in about a dozen still hit
   it.
+- **KFENCE sampling off** (`kfence.sample_interval=0` on the x86 board's command line). These
+  kernels build KFENCE with static keys, so every 500 ms its sampler flips a branch inside every
+  slab allocation, live-patching kernel text through an `int3`. Under multi-threaded TCG another
+  vCPU can run the breakpoint after the patch finished: that was the `int3` panic in
+  `__kmem_cache_alloc_node`, three CPUs at once. Turning it off cost nothing measurable
+  ([benchmarks](benchmarks.md#software-mode-through-emu--avd)).
 - **Guest: the x86_64 images on x86_64 hosts**, with stock's x86 board (virtio-pci: `system.img`
   at `00:03.0`, so `androidboot.boot_devices=pci0000:00/0000:00:03.0`, and the fstab's metadata at
   `00:06.0`). They run guest code 1.8 to 2.0 times as fast as arm64 images, which take 13% longer to
