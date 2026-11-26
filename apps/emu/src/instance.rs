@@ -4,13 +4,13 @@
 //! touched, so the same AVD keeps working with both. What a boot involves is decided first, with
 //! no side effects, as a [`BootPlan`] (`emu -avd NAME -dry-run` prints it on any host); the
 //! [`Instance`] that creates the disks and runs the plan exists only on Apple silicon.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 use std::fs::File;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 use anyhow::{Context, Result, bail};
 use emu_avd::{Avd, BootConfig};
 use emu_vmm::layout::slots;
@@ -19,12 +19,17 @@ use sim_core::platform::{AndroidOs, SubPlatform};
 
 use crate::args::Opts;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 const CACHE_BYTES: u64 = 66 << 20;
 
 /// Kernel arguments the stock board passes for ranchu images.
 const BASE_CMDLINE: &str = "8250.nr_uarts=1 no_timer_check console=ttyAMA0,38400 keep_bootcon earlyprintk=ttyAMA0 \
                             ndns=2 loop.max_part=7 printk.devkmsg=on bootconfig mac80211_hwsim.radios=0";
+
+/// Kernel arguments stock's x86 board passes (software mode, #55), with the console on the first
+/// 8250 UART instead of stock's `console=0`, as on arm64. The image's own `kernel_cmdline.txt`
+/// adds the rest (`clocksource=pit` on x86_64).
+const X86_CMDLINE: &str = "8250.nr_uarts=1 no_timer_check console=ttyS0,38400 keep_bootcon ndns=2 loop.max_part=7 printk.devkmsg=on bootconfig mac80211_hwsim.radios=0";
 
 /// Without `-show-kernel`, only messages below KERN_ERR reach the console (emergencies, alerts,
 /// criticals, so init's FATAL lines). The PL011 traps twice per byte, and booting printed 230 KB
@@ -84,7 +89,7 @@ fn logcat_filter(avd: &Avd, opts: &Opts) -> String {
     if guest == parsed { user.to_owned() } else { guest.spec() }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 pub struct Instance {
     avd: Avd,
     /// Console port (the `emulator-<port>` serial); adb listens on port + 1.
@@ -120,7 +125,7 @@ pub struct Instance {
     pub logcat: Option<emu_vmm::virtio::console::Spool>,
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 impl Instance {
     pub fn prepare(avd: &Avd, opts: &Opts) -> Result<Instance> {
         let dir = emu_avd::state_dir(&avd.dir);
@@ -193,6 +198,7 @@ impl Instance {
         {
             eprintln!("emu: gfxstream renderer from {}", lib64.display());
         }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if let Some(lib64) = &gpu_lib64
             && let Some(emulator_dir) = lib64.parent()
         {
@@ -254,6 +260,7 @@ impl Instance {
     }
 
     /// The GPU this boot gets, if any (`emu_vmm::start_renderer` takes it early, `run` again).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn gpu_spec(&self, opts: &Opts) -> Option<emu_vmm::GpuSpec> {
         self.gpu_lib64.as_ref().zip(self.display.as_ref()).map(|(lib64, display)| emu_vmm::GpuSpec {
             lib64: lib64.clone(),
@@ -270,6 +277,7 @@ impl Instance {
     }
 
     /// `launched`: when the process started, for `-verbose` launch timings.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn machine_config(&self, opts: &Opts, launched: std::time::Instant) -> Result<emu_vmm::MachineConfig> {
         let plan = self.plan(opts);
         if let Some(missing) = plan.missing().first() {
@@ -347,13 +355,87 @@ impl Instance {
     }
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl Instance {
+    /// Software mode's config (#55): the plan on QEMU's TCG with emu's devices
+    /// (`emu_vmm::soft`). The renderer runs on SwiftShader: the SDK's lavapipe crashed in a render
+    /// thread on every booted guest (docs/android.md); `-gpu lavapipe` picks it anyway.
+    pub fn soft_config(&self, opts: &Opts, qemu: PathBuf) -> Result<emu_vmm::soft::Config> {
+        let plan = self.plan(opts);
+        if !plan.x86 {
+            bail!(
+                "{}: software mode runs x86_64 images on stock's x86 board; this AVD's image is arm64 (create one from an x86_64 image)",
+                self.avd.name
+            );
+        }
+        if let Some(missing) = plan.missing().first() {
+            bail!("missing {}", missing.display());
+        }
+        let mut initrd = std::fs::read(&plan.ramdisk).with_context(|| format!("reading {}", plan.ramdisk.display()))?;
+        if !plan.bootconfig.entries().is_empty() {
+            initrd.extend_from_slice(&plan.bootconfig.encode());
+        }
+        let log = self.console_log.try_clone().context("console.log")?;
+        let console: Box<dyn Write + Send> = if opts.show_kernel { Box::new(Tee(std::io::stdout(), log)) } else { Box::new(log) };
+        let icd = if opts.gpu.as_deref() == Some("lavapipe") { emu_gfxstream::Icd::Lavapipe } else { emu_gfxstream::Icd::SwiftShader };
+        let (w, h, _) = self.avd.lcd();
+        let gpu = self.gpu_lib64.as_ref().zip(self.display.as_ref()).map(|(lib64, display)| emu_vmm::soft::Gpu {
+            lib64: lib64.clone(),
+            icd,
+            width: w,
+            height: h,
+            display: display.clone(),
+            verbose: opts.verbose,
+        });
+        let started = std::time::Instant::now();
+        Ok(emu_vmm::soft::Config {
+            qemu,
+            // Short: unix socket paths are limited to 108 bytes.
+            dir: std::env::temp_dir().join(format!("simee-{}", std::process::id())),
+            cpus: plan.cpus,
+            ram_bytes: plan.ram_bytes,
+            kernel: plan.kernel,
+            initrd,
+            cmdline: plan.cmdline,
+            disks: plan.disks,
+            disk_fsync: opts.disk_fsync,
+            adb: self.adb.clone(),
+            gpu,
+            boot_props: plan.boot_props,
+            on_guest_event: Some(std::sync::Arc::new(move |event: &str| {
+                if event == "bootcomplete" {
+                    // On stdout, like the launch line: tools can watch for it.
+                    println!("emu: boot completed in {:.1}s", started.elapsed().as_secs_f64());
+                }
+            })),
+            sensors: self.sensors.clone(),
+            clipboard: self.clipboard.clone(),
+            fingerprint: self.fingerprint.clone(),
+            gps: self.gps.clone(),
+            telephony: self.telephony.clone(),
+            network: self.network.clone(),
+            car: self.car.clone(),
+            xr: self.xr.clone(),
+            input: Some((w, h)),
+            touch_screen: plan.touch_screen,
+            on_input: {
+                let slot = self.inputs.clone();
+                Some(std::sync::Arc::new(move |i| *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(i)))
+            },
+            console,
+            logcat: self.logcat.clone(),
+            verbose: opts.verbose,
+        })
+    }
+}
+
 /// Console ports stock and simee pick from (adb is each one + 1); stock's ceiling.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))), allow(dead_code))]
 pub const PORTS: std::ops::RangeInclusive<u16> = 5554..=5682;
 
 /// Claims console port `port` for this process: its lock file, held until the returned file is
 /// dropped or the process exits. None when another simee instance holds it.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))), allow(dead_code))]
 pub fn claim_port(dir: &Path, port: u16) -> Option<std::fs::File> {
     std::fs::create_dir_all(dir).ok()?;
     let f = std::fs::File::create(dir.join(format!("{port}.lock"))).ok()?;
@@ -365,7 +447,7 @@ pub fn claim_port(dir: &Path, port: u16) -> Option<std::fs::File> {
 /// probing a pair free and binding it (both picked the same pair, one then failed); the claim is
 /// taken before the probe and kept, so two simee instances never pick one pair. A stock
 /// emulator doesn't take claims, so the bind probe still keeps clear of the ones it holds.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))), allow(dead_code))]
 pub fn pick_port(dir: &Path, range: std::ops::RangeInclusive<u16>, free: impl Fn(u16) -> bool) -> Option<(u16, std::fs::File)> {
     range.step_by(2).find_map(|p| {
         let claim = claim_port(dir, p)?;
@@ -373,12 +455,12 @@ pub fn pick_port(dir: &Path, range: std::ops::RangeInclusive<u16>, free: impl Fn
     })
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 fn port_free(p: u16) -> bool {
     std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, p)).is_ok()
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 /// Creates `image` as a sparse, empty ext4 filesystem of `size` bytes.
 fn create_userdata(image: &std::path::Path, size: u64) -> Result<()> {
     let mut uuid = [0u8; 16];
@@ -389,10 +471,10 @@ fn create_userdata(image: &std::path::Path, size: u64) -> Result<()> {
     emu_ext4::format(&file, size, "userdata", uuid).with_context(|| format!("formatting {} as ext4", image.display()))
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 struct Tee<A, B>(A, B);
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 impl<A: Write, B: Write> Write for Tee<A, B> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.write_all(buf)?;
@@ -420,7 +502,7 @@ const LOGCAT_SPOOL_DEPTH: usize = 1024;
 /// drops output when its writer falls behind; the watch reads every chunk inline, before the
 /// spool's queue, on the thread that hands it the guest's log (the console worker), so it never
 /// misses a rotation line.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))), allow(dead_code))]
 pub fn logcat_sink(
     opts: &Opts,
     watch: Option<std::sync::Arc<emu_vmm::display::FrameStore>>,
@@ -596,6 +678,8 @@ pub struct BootPlan {
     /// The GLES encoder goes over the goldfish `opengles` pipe and the board has no virtio-gpu
     /// (images without bootconfig: API 30 and older).
     pub pipe_gles: bool,
+    /// An x86_64 image: stock's x86 board under QEMU's TCG (software mode, #55).
+    pub x86: bool,
 }
 
 impl BootPlan {
@@ -603,7 +687,7 @@ impl BootPlan {
         let dir = emu_avd::state_dir(&avd.dir);
         let user_mode = if opts.read_only { DiskMode::Ephemeral } else { DiskMode::Persistent };
         let disk = |slot, path: PathBuf, mode, serial: &str| DiskSpec { slot, path, mode, serial: serial.to_string() };
-        let mut cmdline = String::from(BASE_CMDLINE);
+        let mut cmdline = String::from(if avd.is_x86_64() { X86_CMDLINE } else { BASE_CMDLINE });
         if !full_console(opts) {
             cmdline.push(' ');
             cmdline.push_str(QUIET_CONSOLE);
@@ -641,6 +725,7 @@ impl BootPlan {
             touchpad: avd.touchpad(),
             dual_mode_mouse: xr && avd.image_feature("VirtioDualModeMouse").unwrap_or(true),
             pipe_gles: !takes_bootconfig(avd),
+            x86: avd.is_x86_64(),
         };
         let bc = bootconfig(avd, opts, plan.renderer.is_some());
         if takes_bootconfig(avd) {
@@ -710,7 +795,7 @@ impl BootPlan {
         if self.sound {
             out.push("virtio-snd");
         }
-        out.push("goldfish battery, PL011, PL031");
+        out.push(if self.x86 { "QEMU's pc board (8250 UART, RTC), CPU in TCG" } else { "goldfish battery, PL011, PL031" });
         out.extend(["qemud:sensors", "qemud:gps", "qemud:fingerprintlisten", "qemud:camera", "qemud:boot-properties", "clipboard"]);
         if self.xr {
             out.push("qemud:xr_service");
@@ -744,7 +829,10 @@ impl std::fmt::Display for BootPlan {
                 DiskMode::Persistent => "",
                 DiskMode::Ephemeral => " (writes discarded)",
             };
-            writeln!(f, "  {:<9} slot {:<2} {}{mode}", d.serial, d.slot, d.path.display())?;
+            match emu_vmm::layout::x86::disk_slot(&d.serial).filter(|_| self.x86) {
+                Some(pci) => writeln!(f, "  {:<9} pci 00:{pci:02x}.0 {}{mode}", d.serial, d.path.display())?,
+                None => writeln!(f, "  {:<9} slot {:<2} {}{mode}", d.serial, d.slot, d.path.display())?,
+            }
         }
         writeln!(f, "bootconfig")?;
         for (k, v) in self.bootconfig.entries() {
@@ -774,7 +862,7 @@ fn bootconfig(avd: &Avd, opts: &Opts, graphics: bool) -> BootConfig {
     let (w, h, _density) = avd.lcd();
     let mut bc = BootConfig::new();
     bc.set("androidboot.hardware", "ranchu")
-        .set("androidboot.boot_devices", "a003600.virtio_mmio")
+        .set("androidboot.boot_devices", if avd.is_x86_64() { emu_vmm::layout::x86::BOOT_DEVICES } else { "a003600.virtio_mmio" })
         .set("androidboot.qemu", "1")
         .set("androidboot.qemu.avd_name", avd.name.as_str())
         .set("androidboot.serialno", "EMULATOR0EMURS0")
@@ -1030,13 +1118,14 @@ mod tests {
     fn sdk(tag: &str) -> Sdk {
         let root = std::env::temp_dir().join(format!("emu-plan-{tag}-{}", std::process::id()));
         let sdk = root.join("sdk");
-        let images: [(&str, &str, &str); 6] = [
+        let images: [(&str, &str, &str); 7] = [
             ("android-36/google_apis/arm64-v8a", "ro.product.name=sdk_gphone64_arm64\n", "VirtioSndCard = on\nVulkanVirtualQueue = on\n"),
             ("android-36/android-wear-signed/arm64-v8a", "", "VirtioSndCard = on\n"),
             ("android-34/android-tv/arm64-v8a", "", "VirtioSndCard = on\n"),
             ("android-34-ext9/android-automotive/arm64-v8a", "ro.product.name=sdk_car_arm64\n", "VirtioSndCard = on\n"),
             ("android-34/google-xr/arm64-v8a", "", "GuestAngle = on\nVirtioDualModeMouse = on\n"),
             ("android-36/ai-glasses/arm64-v8a", "", "VirtioSndCard = on\nXrStatusLed = on\nVulkanVirtualQueue = on\n"),
+            ("android-36/default/x86_64", "ro.product.name=sdk_phone64_x86_64\n", "VirtioSndCard = on\nVulkanVirtualQueue = on\n"),
         ];
         for (dir, build_prop, features) in images {
             let d = sdk.join("system-images").join(dir);
@@ -1059,6 +1148,7 @@ mod tests {
             ("car", "android-34-ext9/android-automotive/arm64-v8a"),
             ("headset", "android-34/google-xr/arm64-v8a"),
             ("glasses", "android-36/ai-glasses/arm64-v8a"),
+            ("x86", "android-36/default/x86_64"),
         ] {
             env.create_avd(&NewAvd::for_image(name, &format!("system-images/{dir}"))).expect("create");
         }
@@ -1583,5 +1673,24 @@ mod tests {
         ] {
             assert!(text.contains(line), "{line:?} missing from\n{text}");
         }
+    }
+
+    /// x86_64 images get stock's x86 board (software mode, #55): the console on the first 8250
+    /// UART and the disks on PCI, where the image's fstab looks for them.
+    #[test]
+    fn an_x86_64_image_gets_stocks_x86_board() {
+        let s = sdk("x86");
+        let boot_devices =
+            |p: &BootPlan| p.bootconfig.entries().iter().find(|(k, _)| k == "androidboot.boot_devices").map(|(_, v)| v.clone());
+        let x86 = BootPlan::new(&s.env.load("x86").expect("load"), &Opts::default(), Some(PathBuf::from("/r/lib64")));
+        assert!(x86.cmdline.starts_with("8250.nr_uarts=1 no_timer_check console=ttyS0,38400 "), "{}", x86.cmdline);
+        assert!(!x86.cmdline.contains("ttyAMA0"), "{}", x86.cmdline);
+        assert_eq!(boot_devices(&x86).as_deref(), Some(emu_vmm::layout::x86::BOOT_DEVICES));
+        assert!(x86.devices().iter().any(|d| d.contains("QEMU")), "{:?}", x86.devices());
+        assert!(x86.to_string().contains("userdata  pci 00:05.0 "), "{x86}");
+        let arm = BootPlan::new(&s.env.load("phone").expect("load"), &Opts::default(), None);
+        assert_eq!(boot_devices(&arm).as_deref(), Some("a003600.virtio_mmio"));
+        assert!(arm.cmdline.contains("console=ttyAMA0"));
+        let _ = std::fs::remove_dir_all(&s.root);
     }
 }

@@ -99,6 +99,29 @@ pub mod slots {
     pub const VENDOR: u32 = 31;
 }
 
+/// Stock's x86 board (`pc`), which software mode gives x86_64 images under QEMU (#55): from a
+/// running stock emulator's `/proc/bootconfig` and the images' fstab.
+pub mod x86 {
+    /// `androidboot.boot_devices`: system (00:03.0) and metadata (00:06.0).
+    pub const BOOT_DEVICES: &str = "pci0000:00/0000:00:03.0 pci0000:00/0000:00:06.0";
+    /// virtio-rng's PCI slot, after the disks.
+    pub const RNG_SLOT: u8 = 8;
+    /// The goldfish pipe's PCI function (emu's carrier for it), out of the way of stock's slots.
+    pub const PIPE_SLOT: u8 = 0x1e;
+
+    /// The PCI slot of each of the five disks, by serial.
+    pub fn disk_slot(serial: &str) -> Option<u8> {
+        match serial {
+            "system" => Some(3),
+            "cache" => Some(4),
+            "userdata" => Some(5),
+            "metadata" => Some(6),
+            "vendor" => Some(7),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

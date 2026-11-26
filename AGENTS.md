@@ -159,7 +159,9 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `disk.rs`, `boot.rs`, `display.rs` (`FrameStore`), `vhost_user.rs` (serves a device to QEMU
   over vhost-user, for software mode on Linux; `examples/vhost_user_vsock.rs`), `vfio_user.rs`
   (serves a PCI function over vfio-user: the goldfish address space, and the goldfish pipe's
-  carrier), `acpi.rs` (the SSDT that describes the pipe to x86 guests); `examples/soft_devices.rs`
+  carrier), `acpi.rs` (the SSDT that describes the pipe to x86 guests), `soft.rs` (software mode:
+  QEMU's command line for stock's x86 board, the device set it serves, QEMU's supervision);
+  `examples/soft_devices.rs`
   serves the whole software-mode device set. Everything but `machine.rs`, `vcpu.rs` and
   `virtio/gpu.rs` builds and tests on Linux: put device logic there, not behind the hypervisor.
 - `crates/emu-avd` — `Env` (SDK/AVD paths), `Avd` (config, `profile()`), `NewAvd`
@@ -191,8 +193,9 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   running-instance file; its commands build and test on any host), `display_server.rs` (frames
   and input on `display.sock`, frames through a shared ring for clients that ask; builds and
   tests on any host),
-  `provision.rs` (`-provision`, `-list-images`). Boots only on Apple silicon; elsewhere it lists,
-  creates and provisions AVDs.
+  `provision.rs` (`-provision`, `-list-images`), `software.rs` (software mode's boot on x86_64
+  Linux: QEMU's TCG with emu's devices). Boots on Apple silicon, and x86_64 images on x86_64
+  Linux in software mode; elsewhere it lists, creates and provisions AVDs.
 - `desktop/` — Rune app, one window for both platforms: `device.rs` (the live iOS device facade; a
   stub where there's no simulator service, so the window builds and tests on Linux), `ios.rs`
   (live iOS device, capture thread; macOS), `surface.rs` (zero-copy IOSurface bridge; macOS),

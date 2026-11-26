@@ -205,8 +205,25 @@ above 2 GB slows cold boots down.
 
 In progress ([#55](https://github.com/kaeawc/simee/issues/55)). Cloud and CI workers often have no
 `/dev/kvm` and no GPU, so every guest instruction has to be translated in software and every
-frame drawn on the CPU. emu doesn't boot guests there yet; this records what was decided and why.
-The numbers are in [benchmarks.md](benchmarks.md#android-software-mode-linux-without-kvm).
+frame drawn on the CPU. On an x86_64 Linux host, `emu -avd NAME` boots an AVD made from an
+x86_64 image this way. The console port, adb, `display.sock` (screenshots and input) and `emu
+kill` work as on a Mac. What follows records what was decided and why. The numbers are in
+[benchmarks.md](benchmarks.md#android-software-mode-linux-without-kvm).
+
+```bash
+emu -provision 36 -tag default -abi x86_64 -create-avd phone
+emu -provision-renderer
+EMU_QEMU=/path/to/qemu-system-x86_64 emu -avd phone   # QEMU 11.1 or newer; without it, PATH's
+```
+
+- **Host:** x86_64 Linux with QEMU 11.1 or newer and the SDK's Linux renderer
+  (`emu -provision-renderer`); no GPU. The smallest host it has run on is 4 cores and 8 GiB.
+  QEMU's peak RSS is about 3 GB for a 2 GB guest, and emu's about 0.25 GB. When the host has `/dev/kvm`, use the KVM backend
+  ([#54](https://github.com/kaeawc/simee/issues/54)) instead: the guest runs natively there.
+- **What runs where:** `emu_vmm::soft` builds QEMU's command line for stock's x86 board, serves
+  every device but the disks, and supervises QEMU. QEMU resets the machine itself when the guest
+  reboots. `apps/emu/src/software.rs` is the boot. AVDs from arm64 images are refused with the
+  reason, since software mode has only the x86 board.
 
 - **CPU: QEMU's TCG, 11.1 or newer, one translator thread per vCPU.** It is the fastest
   translator available and is multi-threaded; a translator library (Unicorn) runs one thread

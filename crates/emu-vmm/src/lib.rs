@@ -21,6 +21,8 @@ mod machine;
 pub mod modem;
 pub mod net;
 pub mod pipe;
+#[cfg(target_os = "linux")]
+pub mod soft;
 pub mod telephony;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod vcpu;
