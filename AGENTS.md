@@ -194,7 +194,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   whose `emulator` is simee), `automobile-harness-android.sh`, `android-bench.sh`, `android-jank.sh` (frame pacing under
   launcher swipes), `net-bench.sh` (idle CPU with the NAT and link only, throughput through the NAT),
   `inspect-image.py` (what a system image expects of the board, unpacked without booting: fstab,
-  modules, input names, vendor HALs).
+  modules, input names, vendor HALs), `tcg-bench.py` (an image under plain QEMU TCG with stock's
+  disk layout: the software-mode CPU spike, no KVM or GPU needed).
 - `docs/research/` — `network-shaping.md`, `audio-camera.md`; `docs/automobile-tool-matrix.md`.
   `docs/architecture.md` (layers, process model, shared logic, the conflict decisions),
   `docs/form-factors.md` (support matrix, profiles, inference, launching each kind, known gaps),
