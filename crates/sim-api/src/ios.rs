@@ -294,10 +294,16 @@ struct Screens {
 /// main digitizer, as before).
 type Touched = (Size, Option<u32>);
 
+/// A second built-in screen counts as an iPhone Duo's inner screen only on that device type (as
+/// the desktop decides), so no other device's touches change path.
+fn inner_for<T>(device_type_id: &str, second: Option<T>) -> Option<T> {
+    second.filter(|_| duo::folds(device_type_id))
+}
+
 impl Screens {
     fn open(device: &Device) -> Result<Self, String> {
         let (main, inner) = device.builtin_displays().map_err(err)?;
-        Ok(Self { main, inner })
+        Ok(Self { main, inner: inner_for(&device.info().device_type_id, inner) })
     }
 
     /// The display `which` names and, on a device with two built-in screens, the screen ID of its
@@ -1709,6 +1715,15 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_second_built_in_screen_is_an_inner_screen_only_on_the_duo() {
+        let duo = "com.apple.CoreSimulator.SimDeviceType.iPhone-Duo";
+        assert_eq!(super::inner_for(duo, Some(3)), Some(3));
+        assert_eq!(super::inner_for(duo, None::<u32>), None);
+        assert_eq!(super::inner_for("com.apple.CoreSimulator.SimDeviceType.iPad-Pro", Some(3)), None);
+        assert_eq!(super::inner_for("", Some(3)), None);
+    }
+
     use super::*;
 
     #[test]

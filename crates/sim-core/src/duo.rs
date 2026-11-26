@@ -64,6 +64,30 @@ pub fn active(outer_lit: bool, inner_lit: bool) -> Screen {
     if inner_lit && !outer_lit { Screen::Inner } else { Screen::Outer }
 }
 
+/// The screen a sweep to `angle` ends on when the angle alone says: the outer one when closed, the
+/// inner one when open flat, none in between (SpringBoard's swap boundary decides).
+pub fn expected_screen(angle: f64) -> Option<Screen> {
+    match posture(angle) {
+        "closed" => Some(Screen::Outer),
+        "opened" => Some(Screen::Inner),
+        _ => None,
+    }
+}
+
+/// The screen in use once a swap has landed, or `None` while it hasn't: exactly one screen is lit
+/// and it is the `expected` one, or, when none is expected, not the one `before` the swap (one
+/// screen is lit before the swap lands too, so lit alone is not enough).
+pub fn settled(before: Screen, expected: Option<Screen>, outer_lit: bool, inner_lit: bool) -> Option<Screen> {
+    if outer_lit == inner_lit {
+        return None;
+    }
+    let now = active(outer_lit, inner_lit);
+    match expected {
+        Some(e) => (now == e).then_some(now),
+        None => (now != before).then_some(now),
+    }
+}
+
 /// The screen a live view keeps showing: the lit one when just one is, else (mid-swap, or a black
 /// app) the one it showed.
 pub fn follow(shown: Screen, outer_lit: bool, inner_lit: bool) -> Screen {
@@ -174,6 +198,27 @@ mod tests {
         assert_eq!(follow(Screen::Inner, true, true), Screen::Inner);
         assert_eq!(follow(Screen::Inner, true, false), Screen::Outer);
         assert_eq!(follow(Screen::Outer, false, true), Screen::Inner);
+    }
+
+    #[test]
+    fn a_swap_has_not_landed_while_the_old_screen_is_still_the_only_lit_one() {
+        use Screen::{Inner, Outer};
+        // Unfolding: the outer screen alone is lit before the swap lands.
+        assert_eq!(settled(Outer, Some(Inner), true, false), None);
+        assert_eq!(settled(Outer, Some(Inner), true, true), None, "mid-sweep");
+        assert_eq!(settled(Outer, Some(Inner), false, false), None);
+        assert_eq!(settled(Outer, Some(Inner), false, true), Some(Inner));
+        // Folding.
+        assert_eq!(settled(Inner, Some(Outer), false, true), None);
+        assert_eq!(settled(Inner, Some(Outer), true, false), Some(Outer));
+        // Already on the expected screen: done at once.
+        assert_eq!(settled(Inner, Some(Inner), false, true), Some(Inner));
+        // No expectation (an angle between): wait for a change.
+        assert_eq!(settled(Outer, None, true, false), None);
+        assert_eq!(settled(Outer, None, false, true), Some(Inner));
+        assert_eq!(expected_screen(0.0), Some(Outer));
+        assert_eq!(expected_screen(180.0), Some(Inner));
+        assert_eq!(expected_screen(100.0), None);
     }
 
     #[test]

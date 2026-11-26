@@ -57,7 +57,10 @@ int main(int argc, char **argv) {
             dispatch_semaphore_signal(done);
         });
         long timedOut = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
-        ((void (*)(id, SEL))objc_msgSend)(service, sel_registerName("invalidate"));
+        SEL invalidate = sel_registerName("invalidate");
+        if ([service respondsToSelector:invalidate]) {
+            ((void (*)(id, SEL))objc_msgSend)(service, invalidate);
+        }
         if (timedOut) {
             printf("timeout: SpringBoard didn't answer within 30 s\n");
             return 75;

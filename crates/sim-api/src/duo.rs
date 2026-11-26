@@ -44,12 +44,13 @@ pub fn fold(device: &Device, p: &Value) -> Result<Value, String> {
         return Err(format!("folding needs an iPhone Duo (two built-in screens); {} is {}", info.name, info.label()));
     };
     let tool = tool(device)?;
+    let before = duo::active(outer.lit(), inner.lit());
     let out = device.exec(&tool.display().to_string(), &duo::swap_args(angle), &[]).map_err(err)?;
     let said = out.stdout.trim();
     if said != "swap ok" {
         return Err(format!("fold: {}", if said.is_empty() { out.stderr.trim() } else { said }));
     }
-    let screen = settle(&outer, &inner);
+    let screen = settle(&outer, &inner, before, duo::expected_screen(angle));
     if folded.is_some_and(|f| f != (screen == Screen::Outer)) {
         return Err(format!(
             "SpringBoard swept the hinge but the {} screen still shows the device; it may not serve simee's display tool on {}",
@@ -69,13 +70,16 @@ pub fn fold(device: &Device, p: &Value) -> Result<Value, String> {
     }))
 }
 
-/// The screen in use once the swap has landed: as soon as just one screen is lit, else (both dark
-/// or both lit after [`SETTLE`]) what [`duo::active`] says.
-fn settle(outer: &Display, inner: &Display) -> Screen {
+/// The screen in use once the swap has landed ([`duo::settled`]: the screen in use `before` the
+/// swap stays lit until the content moves), else, after [`SETTLE`], what [`duo::active`] says.
+fn settle(outer: &Display, inner: &Display, before: Screen, expected: Option<Screen>) -> Screen {
     let deadline = Instant::now() + SETTLE;
     loop {
         let (o, i) = (outer.lit(), inner.lit());
-        if o != i || Instant::now() >= deadline {
+        if let Some(screen) = duo::settled(before, expected, o, i) {
+            return screen;
+        }
+        if Instant::now() >= deadline {
             return duo::active(o, i);
         }
         std::thread::sleep(Duration::from_millis(100));
