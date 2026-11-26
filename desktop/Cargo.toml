@@ -29,8 +29,9 @@ rune = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111a
 [features]
 # Live Rust editing through Rune's devserver (`scripts/rune-dev` in the Rune repo).
 hot = ["rune/hot"]
-# Rune's agent tooling (`--snap`, `--tree`, `--script`, `--video`) in a release build; debug builds
-# always have it. Off in the shipped release, which then links only its window.
+# Rune's headless flags (`--snap`, `--tree`, `--script`, `--video`, …) in release builds; debug
+# builds always have them. Off by default: the shipped release app parses no Rune flags and links
+# only its window. `cargo run --release --features tooling -- --snap shot.png --scene demo`.
 tooling = ["rune/tooling"]
 
 # Rune doesn't propagate its patches; apps must repeat them at the same rev. Bump all of these

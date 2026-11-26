@@ -12,6 +12,11 @@ cargo run -- --snap shot.png --scene demo   # headless render; scenes: demo, and
 cargo run --release --features tooling -- --snap shot.png --scene demo   # the same, optimized
 ```
 
+Rune's headless flags (`--snap`, `--tree`, `--script`, `--video`) are always in debug builds; a
+release build has them only with the `tooling` feature. The shipped release build leaves it off:
+it adds 1,338,496 B to the stripped binary (32,950,904 → 34,289,400 B, Linux x86_64, 2026-11-26)
+and no measurable startup time.
+
 Devices are listed under iOS and Android, each with its sub-platform. Pick one (boot it if
 needed): click and drag on the screen for touches; type to use the device keyboard. ⌘⇧H is Home,
 ⌘L Lock/Power, ⌘S saves a screenshot to the Desktop. The toolbar follows the form factor:
