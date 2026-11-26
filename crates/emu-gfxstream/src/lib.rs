@@ -1,16 +1,22 @@
 //! Runtime binding to gfxstream's `stream_renderer_*` C API (virtio-gpu 3D on the host).
 //!
-//! The Android SDK ships the renderer as `emulator/lib64/libgfxstream_backend.dylib`; it is
-//! `dlopen`ed here so simee needs no build-time dependency on it. The renderer is process-wide
-//! state, so there is at most one [`Renderer`] per process. Signatures follow
-//! `docs/reference/gfxstream/virtio-gpu-gfxstream-renderer.h`.
-#![cfg(target_os = "macos")]
+//! The Android SDK ships the renderer as `emulator/lib64/libgfxstream_backend.dylib` (macOS) or
+//! `.so` (Linux x86_64); it is `dlopen`ed here so simee needs no build-time dependency on it. The
+//! renderer is process-wide state, so there is at most one [`Renderer`] per process. Signatures
+//! follow `docs/reference/gfxstream/virtio-gpu-gfxstream-renderer.h`.
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 // `sym!` transmutes dlsym results to the type of the struct field it initializes.
 #![allow(clippy::missing_transmute_annotations)]
 
+// The opengles pipe's channel reads the renderer's Mach-O code to size its objects.
+#[cfg(target_os = "macos")]
 mod channel;
+#[cfg(target_os = "linux")]
+mod elf;
+#[cfg(target_os = "macos")]
 mod macho;
 
+#[cfg(target_os = "macos")]
 pub use channel::{ChannelRead, ChannelWrite, RenderChannel};
 
 use std::collections::{HashMap, HashSet};
@@ -175,6 +181,20 @@ fn dlopen(path: &Path, global: bool) -> Result<*mut c_void> {
 }
 
 macro_rules! sym {
+    // A name chosen per platform (a `&'static str` constant without the NUL).
+    ($h:expr, @$name:expr) => {{
+        let name: &'static str = $name;
+        let Ok(c) = CString::new(name) else { return Err(Error::Symbol(name)) };
+        // SAFETY: NUL-terminated name; the transmute target matches the C++ member's prototype
+        // (`this` first, Itanium ABI).
+        unsafe {
+            let p = libc::dlsym($h, c.as_ptr());
+            if p.is_null() {
+                return Err(Error::Symbol(name));
+            }
+            std::mem::transmute::<*mut c_void, _>(p)
+        }
+    }};
     ($h:expr, $name:literal) => {{
         // SAFETY: the symbol name is a NUL-terminated literal; the transmute target matches the
         // C prototype in virtio-gpu-gfxstream-renderer.h.
@@ -364,21 +384,50 @@ unsafe impl Send for Renderer {}
 unsafe impl Sync for Renderer {}
 
 /// The renderer library inside `lib64`.
+#[cfg(target_os = "macos")]
 pub const BACKEND: &str = "libgfxstream_backend.dylib";
+#[cfg(target_os = "linux")]
+pub const BACKEND: &str = "libgfxstream_backend.so";
+
+/// Libraries in `lib64` the backend `dlopen`s by bare name at run time. dyld finds them through
+/// the executable's rpath (`@executable_path/lib64`, see [`link_beside_exe`]); glibc's `dlopen`
+/// matches a bare name against libraries already loaded, so on Linux they're preloaded. That
+/// includes an EGL and GLES: the backend opens `libEGL.so` and `libGLESv2.so` during init even
+/// without a GL backend, and crashes when neither loads. ANGLE's (`gles_angle`) carry exactly
+/// those sonames, and ANGLE is the GLES emu gives the renderer on macOS too.
+#[cfg(target_os = "linux")]
+const DLOPENED: &[&str] = &["libshadertranslator.so", "gles_angle/libGLESv2.so", "gles_angle/libEGL.so"];
+#[cfg(target_os = "macos")]
+const DLOPENED: &[&str] = &[];
+
+/// The `lib64` libraries `path` links at load time, by file name.
+fn linked_names(path: &Path) -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    let names = macho::dylib_deps(path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|dep| dep.strip_prefix("@rpath/").or_else(|| dep.strip_prefix("@loader_path/")).map(str::to_string))
+        .collect();
+    // DT_NEEDED holds bare sonames; the renderer's own ones are files in lib64, the system's
+    // (libc, libX11, ...) aren't and are left to the loader.
+    #[cfg(target_os = "linux")]
+    let names = elf::needed(path).unwrap_or_default();
+    names
+}
 
 /// The libraries `root` (a file in `lib64`) links from `lib64` itself, directly or indirectly,
-/// dependencies before their dependents; `root` is not included. Only `@rpath/<name>` and
-/// `@loader_path/<name>` references to files present in `lib64` count.
+/// dependencies before their dependents; `root` is not included. Only references to files
+/// present in `lib64` count: `@rpath/<name>` and `@loader_path/<name>` on macOS, `DT_NEEDED`
+/// names on Linux.
 pub fn bundled_deps(lib64: &Path, root: &str) -> Vec<PathBuf> {
     fn visit(lib64: &Path, name: &str, seen: &mut HashSet<String>, out: &mut Vec<PathBuf>) {
         if !seen.insert(name.to_string()) {
             return;
         }
         let path = lib64.join(name);
-        for dep in macho::dylib_deps(&path).unwrap_or_default() {
-            let Some(dep) = dep.strip_prefix("@rpath/").or_else(|| dep.strip_prefix("@loader_path/")) else { continue };
-            if !dep.contains('/') && lib64.join(dep).is_file() {
-                visit(lib64, dep, seen, out);
+        for dep in linked_names(&path) {
+            if !dep.contains('/') && lib64.join(&dep).is_file() {
+                visit(lib64, &dep, seen, out);
             }
         }
         out.push(path);
@@ -389,13 +438,27 @@ pub fn bundled_deps(lib64: &Path, root: &str) -> Vec<PathBuf> {
     out
 }
 
+/// What [`Renderer::load`] loads before the backend, in order: the backend's bundled
+/// dependencies, then each library it `dlopen`s by bare name ([`DLOPENED`]) with its own.
+pub fn preloads(lib64: &Path) -> Vec<PathBuf> {
+    let mut out = bundled_deps(lib64, BACKEND);
+    for name in DLOPENED.iter().filter(|n| lib64.join(n).is_file()) {
+        for p in bundled_deps(lib64, name).into_iter().chain([lib64.join(name)]) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 impl Renderer {
     /// Loads the renderer from a `lib64` directory: the SDK's `emulator/lib64` or one installed by
-    /// `emu -provision-renderer`. The backend's `@rpath` dependencies are preloaded from the same
-    /// directory, leaves first, so dyld finds each one already loaded by install name and the
-    /// executable needs no rpath to it.
+    /// `emu -provision-renderer`. The backend's dependencies are preloaded from the same
+    /// directory ([`preloads`]), leaves first, so the loader finds each one already loaded by
+    /// install name (dyld) or soname (glibc) and the executable needs no rpath to it.
     pub fn load(lib64: &Path) -> Result<Renderer> {
-        for dep in bundled_deps(lib64, BACKEND) {
+        for dep in preloads(lib64) {
             dlopen(&dep, true)?;
         }
         let backend = lib64.join(BACKEND);
@@ -705,7 +768,7 @@ static VULKAN_FAILED: AtomicBool = AtomicBool::new(false);
 /// Call before spawning threads that might read the environment.
 pub fn configure_environment(emulator_dir: &Path, icd: Icd) {
     let vk = emulator_dir.join("lib64/vulkan");
-    let loader = vk.join("libvulkan.dylib");
+    let loader = vk.join(if cfg!(target_os = "macos") { "libvulkan.dylib" } else { "libvulkan.so.1" });
     let mut vars = vec![("ANDROID_EMULATOR_LAUNCHER_DIR", emulator_dir.as_os_str().to_owned())];
     if loader.is_file() {
         vars.push(("ANDROID_EMU_VK_LOADER_PATH", loader.into_os_string()));
@@ -722,7 +785,9 @@ pub fn configure_environment(emulator_dir: &Path, icd: Icd) {
     // ANGLE's default display on macOS is its CGL backend, whose context setup for a
     // ColorBuffer's display surface hangs inside libGL (blocking that render thread and with it
     // the guest's pipe reads). Metal is what the backend is meant to run on here.
-    vars.push(("ANGLE_DEFAULT_PLATFORM", "metal".into()));
+    if cfg!(target_os = "macos") {
+        vars.push(("ANGLE_DEFAULT_PLATFORM", "metal".into()));
+    }
     if icd == Icd::MoltenVk {
         // What gfxstream configures for MoltenVK: its compositor shaders fail to convert with
         // Metal argument buffers on.
@@ -840,6 +905,21 @@ type ReadColorBuffer = unsafe extern "C" fn(*mut c_void, u32, i32, i32, i32, i32
 /// `GfxstreamFormat::R8G8B8A8_UNORM`.
 const GFXSTREAM_RGBA8: u32 = 1;
 
+/// Members whose signature has a `uint64_t`, which Itanium mangles as the type it is on the
+/// platform: `unsigned long long` (`y`) on macOS, `unsigned long` (`m`) on LP64 Linux.
+#[cfg(target_os = "macos")]
+mod mangled {
+    pub const READ_COLOR_BUFFER: &str = "_ZN9gfxstream4host11FrameBuffer15readColorBufferEjiiiiNS0_15GfxstreamFormatEPvy";
+    pub const SET_DMA_GET_HOST_ADDR: &str = "_ZN9gfxstream4host31set_gfxstream_dma_get_host_addrEPFPvyE";
+    pub const SET_DMA_UNLOCK: &str = "_ZN9gfxstream4host24set_gfxstream_dma_unlockEPFvyE";
+}
+#[cfg(target_os = "linux")]
+mod mangled {
+    pub const READ_COLOR_BUFFER: &str = "_ZN9gfxstream4host11FrameBuffer15readColorBufferEjiiiiNS0_15GfxstreamFormatEPvm";
+    pub const SET_DMA_GET_HOST_ADDR: &str = "_ZN9gfxstream4host31set_gfxstream_dma_get_host_addrEPFPvmE";
+    pub const SET_DMA_UNLOCK: &str = "_ZN9gfxstream4host24set_gfxstream_dma_unlockEPFvmE";
+}
+
 /// The renderer's `FrameBuffer` members simee calls directly.
 #[derive(Clone, Copy)]
 struct FbApi {
@@ -856,7 +936,7 @@ impl FbApi {
             get_fb: sym!(h, "_ZN9gfxstream4host11FrameBuffer5getFBEv"),
             last: sym!(h, "_ZN9gfxstream4host11FrameBuffer24getLastPostedColorBufferEv"),
             flush: sym!(h, "_ZN9gfxstream4host11FrameBuffer22flushColorBufferFromVkEj"),
-            read: sym!(h, "_ZN9gfxstream4host11FrameBuffer15readColorBufferEjiiiiNS0_15GfxstreamFormatEPvy"),
+            read: sym!(h, @mangled::READ_COLOR_BUFFER),
             on_last: sym!(h, "_ZN9gfxstream4host11FrameBuffer20onLastColorBufferRefEj"),
         })
     }
@@ -879,10 +959,13 @@ impl Renderer {
         self.fb_api().is_ok()
     }
 
-    /// Whether this renderer build has the direct Vulkan readback ([`VkRead`]) emu knows how to
-    /// call. Checked before init: a renderer without GL reads frames only that way.
+    /// Whether frames can be read back from the Vulkan image without a GL backend, so the
+    /// renderer may run without one. Checked before init. On macOS that takes the direct Vulkan
+    /// readback ([`VkRead`]), which this build must have in the expected shape (the exported read
+    /// aborts there without GL). On Linux the exported `FrameBuffer::readColorBuffer` reads the
+    /// Vulkan image when there is no GL (SDK 37.3, `renderer_caps -vulkan-only`: byte-exact).
     pub fn can_read_vulkan_directly(&self) -> bool {
-        self.can_read_last_posted() && VkRead::symbols(self.handle, &self.backend).is_some()
+        self.can_read_last_posted() && (cfg!(target_os = "linux") || VkRead::symbols(self.handle, &self.backend).is_some())
     }
 
     /// The renderer has a GL backend: [`Renderer::set_post_callback`] works only then.
@@ -964,9 +1047,42 @@ impl Renderer {
             _ => {}
         }
         if !self.has_gl() {
+            if cfg!(target_os = "linux") {
+                return Self::read_exported(&f, fb, cb, width, height, px);
+            }
             return Err(Error::Call("read_last_posted_to: Vulkan readback (no GL backend)", 0));
         }
         Self::read_through_gl(&f, fb, cb, width, height, px)
+    }
+
+    /// Color buffer `cb` (`width` x `height`) read back as RGBA through the exported
+    /// `FrameBuffer::readColorBuffer`, `px` exactly `width * height * 4` bytes: through GL when the
+    /// renderer has it, else (Linux) straight from the Vulkan image. macOS without GL refuses:
+    /// the exported read aborts in the renderer there.
+    pub fn read_color_buffer(&self, cb: u32, width: u32, height: u32, px: &mut [u8]) -> Result<()> {
+        if px.len() != width as usize * height as usize * 4 {
+            return Err(Error::Call("read_color_buffer: buffer size", -22));
+        }
+        let f = self.fb_api()?;
+        // SAFETY: getFB returns the renderer's singleton or null.
+        let fb = unsafe { (f.get_fb)() };
+        if fb.is_null() {
+            return Err(Error::Call("FrameBuffer::getFB", 0));
+        }
+        match (self.has_gl(), cfg!(target_os = "linux")) {
+            (true, _) => Self::read_through_gl(&f, fb, cb, width, height, px),
+            (false, true) => Self::read_exported(&f, fb, cb, width, height, px),
+            (false, false) => Err(Error::Call("read_color_buffer: no GL backend", 0)),
+        }
+    }
+
+    /// `FrameBuffer::readColorBuffer` alone: without a GL backend the renderer reads the color
+    /// buffer's Vulkan image (`ColorBuffer::readToBytes` falls through to it).
+    fn read_exported(f: &FbApi, fb: *mut c_void, cb: u32, width: u32, height: u32, px: &mut [u8]) -> Result<()> {
+        // SAFETY: a member function with `this` first (Itanium ABI) that writes at most the size
+        // we pass, which is `px`'s length.
+        unsafe { (f.read)(fb, cb, 0, 0, width as i32, height as i32, GFXSTREAM_RGBA8, px.as_mut_ptr().cast(), px.len() as u64) };
+        Ok(())
     }
 
     fn read_through_gl(f: &FbApi, fb: *mut c_void, cb: u32, width: u32, height: u32, px: &mut [u8]) -> Result<()> {
@@ -1059,12 +1175,16 @@ unsafe impl Send for VkRead {}
 // SAFETY: as above.
 unsafe impl Sync for VkRead {}
 
+#[cfg(target_os = "macos")]
 const GET_FB: &str = "_ZN9gfxstream4host11FrameBuffer5getFBEv";
+#[cfg(target_os = "macos")]
 const HAS_EMULATION_VK: &str = "_ZNK9gfxstream4host11FrameBuffer14hasEmulationVkEv";
+#[cfg(target_os = "macos")]
 const READ_COLOR_BUFFER_VK: &str = "_ZN9gfxstream4host2vk11VkEmulation22readColorBufferToBytesEjjjjjPvy";
 
 /// What [`VkRead::resolve`] finds in the loaded image before it needs a live FrameBuffer: the
 /// image's slide, `hasEmulationVk`'s live address, and `readColorBufferToBytes`'s file address.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 struct VkSymbols {
     slide: u64,
     has_vk_live: u64,
@@ -1072,7 +1192,15 @@ struct VkSymbols {
 }
 
 impl VkRead {
+    /// The direct readback's symbols, from the renderer file that's loaded. The SDK's Linux
+    /// backend is stripped of its symbol table, so there it's never found.
+    #[cfg(target_os = "linux")]
+    fn symbols(_handle: *mut c_void, _backend: &Path) -> Option<VkSymbols> {
+        None
+    }
+
     /// The direct readback's symbols, from the renderer file that's loaded.
+    #[cfg(target_os = "macos")]
     fn symbols(handle: *mut c_void, backend: &Path) -> Option<VkSymbols> {
         if std::env::var("EMU_READBACK").is_ok_and(|v| v == "gl") {
             return None;
@@ -1100,6 +1228,12 @@ impl VkRead {
         Some(VkSymbols { slide, has_vk_live, read })
     }
 
+    #[cfg(target_os = "linux")]
+    fn resolve(_handle: *mut c_void, _backend: &Path, _fb: *mut c_void) -> Option<VkRead> {
+        None
+    }
+
+    #[cfg(target_os = "macos")]
     fn resolve(handle: *mut c_void, backend: &Path, fb: *mut c_void) -> Option<VkRead> {
         let VkSymbols { slide, has_vk_live, read } = Self::symbols(handle, backend)?;
         // SAFETY: the address is the entry of an exported function in the loaded image, whose
@@ -1138,6 +1272,7 @@ impl VkRead {
 }
 
 /// The `LC_UUID` of the image `handle` loaded, read from its Mach-O header in memory.
+#[cfg(target_os = "macos")]
 fn loaded_uuid(handle: *mut c_void) -> Option<[u8; 16]> {
     let c = CString::new(GET_FB).ok()?;
     // SAFETY: dlsym with a live handle and a NUL-terminated name.
@@ -1191,8 +1326,8 @@ impl Renderer {
     pub fn set_dma_translator(&self, translate: Option<DmaTranslator>) -> Result<()> {
         *DMA.write().unwrap_or_else(|e| e.into_inner()) = translate;
         let h = self.handle;
-        let set_addr: SetDmaGetHostAddr = sym!(h, "_ZN9gfxstream4host31set_gfxstream_dma_get_host_addrEPFPvyE");
-        let set_unlock: SetDmaUnlock = sym!(h, "_ZN9gfxstream4host24set_gfxstream_dma_unlockEPFvyE");
+        let set_addr: SetDmaGetHostAddr = sym!(h, @mangled::SET_DMA_GET_HOST_ADDR);
+        let set_unlock: SetDmaUnlock = sym!(h, @mangled::SET_DMA_UNLOCK);
         // SAFETY: both setters store a plain function pointer; ours stay valid for the process.
         unsafe {
             set_addr(Some(dma_get_host_addr));
@@ -1310,25 +1445,61 @@ mod tests {
         println!("  runs before {old_us:.1?} after {new_us:.1?}; leaked before: {} KiB per create", N * std::mem::size_of::<Iov>() / 1024);
     }
 
+    /// A library file named `name` in `dir` linking `deps` (written as the platform links them).
+    fn write_lib(dir: &Path, name: &str, deps: &[&str]) {
+        #[cfg(target_os = "macos")]
+        let bytes = {
+            let deps: Vec<String> =
+                deps.iter().map(|d| if d.starts_with('/') || d.starts_with('@') { d.to_string() } else { format!("@rpath/{d}") }).collect();
+            let deps: Vec<&str> = deps.iter().map(String::as_str).collect();
+            macho::tests::fake_dylib(&format!("@rpath/{name}"), &deps)
+        };
+        #[cfg(target_os = "linux")]
+        let bytes = elf::tests::fake_so(deps);
+        std::fs::write(dir.join(name), bytes).expect("write");
+    }
+
+    fn file_names(paths: &[PathBuf]) -> Vec<String> {
+        paths.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect()
+    }
+
     #[test]
     fn bundled_deps_are_ordered_leaves_first() {
         let dir = std::env::temp_dir().join(format!("emu-gfxstream-deps-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let write = |name: &str, deps: &[&str]| {
-            std::fs::write(dir.join(name), macho::tests::fake_dylib(&format!("@rpath/{name}"), deps)).expect("write");
-        };
+        let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+        let lib = |n: &str| format!("lib{n}.{ext}");
         // backend -> common -> {metrics -> abseil, abseil}; backend -> abseil; a cycle back to
         // common; system and missing libraries are skipped; unrelated files aren't loaded.
-        write(BACKEND, &["@rpath/libcommon.dylib", "@rpath/libabseil.dylib", "/usr/lib/libc++.1.dylib", "@rpath/libmissing.dylib"]);
-        write("libcommon.dylib", &["@rpath/libmetrics.dylib", "@loader_path/libabseil.dylib"]);
-        write("libmetrics.dylib", &["@rpath/libabseil.dylib", "@rpath/libcommon.dylib"]);
-        write("libabseil.dylib", &[]);
-        write("libunrelated.dylib", &[]);
-        let order: Vec<String> =
-            bundled_deps(&dir, BACKEND).iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
-        assert_eq!(order, ["libabseil.dylib", "libmetrics.dylib", "libcommon.dylib"]);
+        let system = if cfg!(target_os = "macos") { "/usr/lib/libc++.1.dylib" } else { "libc.so.6" };
+        write_lib(&dir, BACKEND, &[&lib("common"), &lib("abseil"), system, &lib("missing")]);
+        #[cfg(target_os = "macos")]
+        write_lib(&dir, &lib("common"), &[&lib("metrics"), "@loader_path/libabseil.dylib"]);
+        #[cfg(target_os = "linux")]
+        write_lib(&dir, &lib("common"), &[&lib("metrics"), &lib("abseil")]);
+        write_lib(&dir, &lib("metrics"), &[&lib("abseil"), &lib("common")]);
+        write_lib(&dir, &lib("abseil"), &[]);
+        write_lib(&dir, &lib("unrelated"), &[]);
+        assert_eq!(file_names(&bundled_deps(&dir, BACKEND)), [lib("abseil"), lib("metrics"), lib("common")]);
         assert!(bundled_deps(&dir.join("nowhere"), BACKEND).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Libraries the backend opens by bare name come after its link-time dependencies, each after
+    /// its own, with nothing loaded twice; a missing one is skipped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preloads_add_the_dlopened_libraries_after_the_backends_deps() {
+        let dir = std::env::temp_dir().join(format!("emu-gfxstream-preloads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        write_lib(&dir, BACKEND, &["libcommon.so", "libc.so.6"]);
+        write_lib(&dir, "libcommon.so", &[]);
+        assert_eq!(file_names(&preloads(&dir)), ["libcommon.so"], "no shader translator in lib64");
+        write_lib(&dir, "libshadertranslator.so", &["libcommon.so", "libglsl.so"]);
+        write_lib(&dir, "libglsl.so", &[]);
+        assert_eq!(file_names(&preloads(&dir)), ["libcommon.so", "libglsl.so", "libshadertranslator.so"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

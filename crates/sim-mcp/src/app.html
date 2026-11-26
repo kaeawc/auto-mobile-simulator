@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>simee device view</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px; display: flex; flex-direction: column; gap: 10px; align-items: center;
+    font-family: var(--font-sans, system-ui, sans-serif); font-size: var(--font-text-sm-size, 13px);
+    color: var(--color-text-primary, light-dark(#171717, #fafafa));
+    background: var(--color-background-primary, light-dark(#ffffff, #171717));
+  }
+  header { width: 100%; display: flex; justify-content: space-between; gap: 8px; }
+  #title { font-weight: var(--font-weight-semibold, 600); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #status { color: var(--color-text-secondary, light-dark(#525252, #a3a3a3)); text-align: right; }
+  #status.error { color: var(--color-text-danger, light-dark(#b91c1c, #f87171)); }
+  #screen {
+    position: relative; line-height: 0; user-select: none; touch-action: none; cursor: crosshair;
+    border: var(--border-width-regular, 1px) solid var(--color-border-primary, light-dark(#d4d4d4, #404040));
+    border-radius: var(--border-radius-md, 8px); overflow: hidden;
+    background: var(--color-background-secondary, light-dark(#f5f5f5, #262626));
+  }
+  #frame { display: block; max-width: 100%; max-height: 520px; min-width: 160px; min-height: 160px; -webkit-user-drag: none; }
+  #dot {
+    position: absolute; width: 18px; height: 18px; margin: -9px 0 0 -9px; border-radius: 50%; pointer-events: none;
+    background: var(--color-ring-primary, light-dark(#2563eb, #60a5fa)); opacity: 0; transition: opacity 0.4s;
+  }
+  #dot.on { opacity: 0.6; transition: none; }
+  .row { display: flex; gap: 6px; width: 100%; max-width: 520px; }
+  button, input {
+    font: inherit; color: inherit; padding: 6px 10px; border-radius: var(--border-radius-sm, 6px);
+    border: var(--border-width-regular, 1px) solid var(--color-border-primary, light-dark(#d4d4d4, #404040));
+    background: var(--color-background-secondary, light-dark(#f5f5f5, #262626));
+  }
+  button { cursor: pointer; }
+  button:hover { background: var(--color-background-tertiary, light-dark(#e5e5e5, #333333)); }
+  input { flex: 1; min-width: 0; }
+</style>
+</head>
+<body>
+<header><span id="title">Device</span><span id="status">connecting…</span></header>
+<div id="screen"><img id="frame" alt="device screen" draggable="false"><div id="dot"></div></div>
+<div class="row">
+  <button data-button="home">Home</button><button data-button="back">Back</button>
+  <button data-button="recents">Recents</button><button data-button="lock">Lock</button>
+</div>
+<form class="row" id="typing"><input id="text" placeholder="Type on the device" autocomplete="off"><button type="submit">Send</button></form>
+<script>
+'use strict';
+// The page talks to its host over postMessage in JSON-RPC (the MCP Apps protocol), and drives the
+// device by calling the server's own tools through the host: screenshot, tap, swipe, type, button.
+const host = window.parent;
+const el = (id) => document.getElementById(id);
+const state = { device: null, size: null, busy: false, stopped: false, nextId: 1, pending: new Map() };
+
+function send(message) { host.postMessage({ jsonrpc: '2.0', ...message }, '*'); }
+function request(method, params) {
+  const id = state.nextId++;
+  send({ id, method, params });
+  return new Promise((resolve, reject) => state.pending.set(id, { resolve, reject }));
+}
+function notify(method, params) { send({ method, params }); }
+
+function say(text, isError) {
+  el('status').textContent = text;
+  el('status').className = isError ? 'error' : '';
+}
+
+function applyTheme(context) {
+  const variables = context && context.styles && context.styles.variables;
+  for (const [name, value] of Object.entries(variables || {})) if (value) document.documentElement.style.setProperty(name, value);
+  if (context && context.theme) document.documentElement.style.colorScheme = context.theme;
+}
+
+async function callTool(name, args) {
+  const result = await request('tools/call', { name, arguments: args });
+  if (result && result.isError) {
+    const text = (result.content || []).map((c) => c.text || '').join(' ');
+    throw new Error(text || name + ' failed');
+  }
+  return result;
+}
+
+function target() { return state.device ? { device: state.device } : {}; }
+
+async function refresh() {
+  if (state.busy || state.stopped) return;
+  state.busy = true;
+  try {
+    const result = await callTool('screenshot', target());
+    const image = (result.content || []).find((c) => c.type === 'image');
+    if (image) el('frame').src = 'data:' + image.mimeType + ';base64,' + image.data;
+    const shape = result.structuredContent;
+    if (shape && shape.width) state.size = { width: shape.width, height: shape.height };
+    say(state.size ? state.size.width + '×' + state.size.height + ' px' : 'connected');
+  } catch (e) {
+    say(e.message, true);
+  } finally {
+    state.busy = false;
+  }
+}
+
+async function act(name, args) {
+  try {
+    await callTool(name, { ...target(), ...args });
+    say(name + ' sent');
+  } catch (e) {
+    say(e.message, true);
+  }
+  setTimeout(refresh, 250);
+}
+
+// A point on the picture, in the device's pixels.
+function devicePoint(event) {
+  const box = el('frame').getBoundingClientRect();
+  const size = state.size || { width: el('frame').naturalWidth, height: el('frame').naturalHeight };
+  return {
+    x: Math.round(((event.clientX - box.left) / box.width) * size.width),
+    y: Math.round(((event.clientY - box.top) / box.height) * size.height),
+  };
+}
+
+function showDot(event) {
+  const box = el('screen').getBoundingClientRect();
+  const dot = el('dot');
+  dot.style.left = event.clientX - box.left + 'px';
+  dot.style.top = event.clientY - box.top + 'px';
+  dot.className = 'on';
+  setTimeout(() => { dot.className = ''; }, 120);
+}
+
+let drag = null;
+el('screen').addEventListener('pointerdown', (event) => {
+  drag = { at: devicePoint(event), px: [event.clientX, event.clientY], time: Date.now() };
+  el('screen').setPointerCapture(event.pointerId);
+});
+el('screen').addEventListener('pointerup', (event) => {
+  if (!drag) return;
+  const start = drag;
+  drag = null;
+  showDot(event);
+  const end = devicePoint(event);
+  const moved = Math.hypot(event.clientX - start.px[0], event.clientY - start.px[1]);
+  if (moved < 10) {
+    act('tap', start.at);
+  } else {
+    const duration = Math.min(800, Math.max(80, Date.now() - start.time));
+    act('swipe', { x1: start.at.x, y1: start.at.y, x2: end.x, y2: end.y, duration_ms: duration });
+  }
+});
+document.querySelectorAll('[data-button]').forEach((b) => b.addEventListener('click', () => act('button', { button: b.dataset.button })));
+el('typing').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const text = el('text').value;
+  if (!text) return;
+  el('text').value = '';
+  act('type', { text });
+});
+
+function useDevice(device) {
+  if (!device || device === state.device) return;
+  state.device = device;
+  el('title').textContent = device;
+  refresh();
+}
+
+// What the host tells the view.
+function fromHost(message) {
+  switch (message.method) {
+    case 'ui/notifications/tool-input':
+      useDevice(message.params && message.params.arguments && message.params.arguments.device);
+      break;
+    case 'ui/notifications/tool-result': {
+      const data = message.params && message.params.structuredContent;
+      if (data && data.device) useDevice(data.device);
+      if (data && data.screen) state.size = { width: data.screen.width, height: data.screen.height };
+      refresh();
+      break;
+    }
+    case 'ui/notifications/host-context-changed':
+      applyTheme(message.params);
+      break;
+    case 'ui/resource-teardown':
+      state.stopped = true;
+      send({ id: message.id, result: {} });
+      break;
+    case 'ping':
+      send({ id: message.id, result: {} });
+      break;
+    default:
+      break;
+  }
+}
+
+window.addEventListener('message', (event) => {
+  const message = event.data;
+  if (event.source !== host || !message || message.jsonrpc !== '2.0') return;
+  if (message.id !== undefined && !message.method) {
+    const waiting = state.pending.get(message.id);
+    if (!waiting) return;
+    state.pending.delete(message.id);
+    if (message.error) waiting.reject(new Error(message.error.message || 'request failed'));
+    else waiting.resolve(message.result);
+  } else if (message.method) {
+    fromHost(message);
+  }
+});
+
+async function start() {
+  if (host === window) {
+    say('open this view from an MCP host (the device_view tool)', true);
+    return;
+  }
+  try {
+    const init = await request('ui/initialize', {
+      protocolVersion: '2026-01-26', appInfo: { name: 'simee-device-view', version: '1' }, appCapabilities: {},
+    });
+    applyTheme(init && init.hostContext);
+    notify('ui/notifications/initialized', {});
+    say('waiting for the device…');
+  } catch (e) {
+    say(e.message, true);
+  }
+  // The loop keeps the screen current while the view is on screen.
+  setInterval(() => { if (!document.hidden && state.device) refresh(); }, 1000);
+}
+start();
+</script>
+</body>
+</html>

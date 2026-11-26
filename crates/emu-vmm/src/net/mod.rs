@@ -124,6 +124,9 @@ struct Shared {
     up_held: AtomicUsize,
     /// Whether the thread holds a shaper (for tests: unshaped, none exists).
     shaped: AtomicBool,
+    /// Whether the engine holds a shaper at all, as the engine sees it (for tests).
+    #[cfg(test)]
+    shaper_built: AtomicBool,
     ready: Mutex<Option<RxReady>>,
     /// The net thread stopped taking smoltcp's frames because `to_guest` was full: the worker
     /// wakes it once the guest has taken half.
@@ -187,6 +190,8 @@ impl Nat {
             up_cap: AtomicUsize::new(usize::MAX),
             up_held: AtomicUsize::new(0),
             shaped: AtomicBool::new(false),
+            #[cfg(test)]
+            shaper_built: AtomicBool::new(false),
             ready: Mutex::new(None),
             guest_full: AtomicBool::new(false),
             stop: AtomicBool::new(false),
@@ -206,6 +211,12 @@ impl Nat {
     #[cfg(test)]
     fn shaped(&self) -> bool {
         self.shared.shaped.load(Ordering::Relaxed)
+    }
+
+    /// Whether the engine holds a shaper (not whether the conditions ask for one).
+    #[cfg(test)]
+    fn shaper_built(&self) -> bool {
+        self.shared.shaper_built.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]

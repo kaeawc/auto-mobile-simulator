@@ -20,6 +20,7 @@ clap.workspace = true
 serde_json.workspace = true
 sim-api.workspace = true
 sim-core.workspace = true
+sim-mcp.workspace = true
 
 [dev-dependencies]
 emu-avd.workspace = true

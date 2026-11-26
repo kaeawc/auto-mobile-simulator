@@ -14,6 +14,9 @@ doctest = false
 libc.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+rustix.workspace = true
+
 [lints.rust]
 unused_must_use = "deny"
 
