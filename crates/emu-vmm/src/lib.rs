@@ -5,6 +5,7 @@
 //! the GPU renderer) needs Hypervisor.framework on Apple silicon.
 #![cfg(unix)]
 
+pub mod acpi;
 pub mod audio;
 pub mod board;
 pub mod boot;

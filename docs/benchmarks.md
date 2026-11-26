@@ -179,8 +179,11 @@ What decided it:
   zygote, though it reaches the shell sooner (its kernel and first-stage init are lighter). What
   comes after zygote (the framework, ART) is guest code, so the guest-code ratio decides.
 - **QEMU 11 or newer.** Ubuntu 22.04's QEMU 6.2 panics this guest within seconds under
-  multi-threaded TCG (`int3` in `kmem_cache_alloc`: a stale translated block running the
-  kernel's live-patching breakpoint); 11.1.3 booted it every time, over 20 boots.
+  multi-threaded TCG (`int3` in `kmem_cache_alloc`: a CPU running the kernel's live-patching
+  breakpoint after the patch finished); 11.1.3, which has QEMU's fix for it
+  ([LP #2051965](https://bugs.launchpad.net/ubuntu/+source/qemu/+bug/2051965)), booted these
+  20-odd boots without it. The window isn't closed: one of about a dozen full boots on emu's
+  devices, before the boot rows below, hit the same panic.
 - **Hide the fast-string features.** With ERMS/FSRM advertised the guest kernel's memcpy is
   `rep movsb`, which TCG runs as a byte loop: md5 of `/dev/zero` takes 51% longer and zygote
   starts 10% later.
@@ -210,9 +213,11 @@ vsock's queues share one MSI vector: 14 vsock interrupts per round trip before, 
 the 384 MiB of transfers, 21 MB peak RSS: what's left per round trip is the guest under
 translation. The SDK emulator's own adb path has no row: it doesn't start on this host (below).
 
-The SDK emulator (37.3.10) does not start on this host: it requires 7.37 GB of free disk to
-create userdata whatever the AVD's data size (2.2 GB was free), and warns that 3939 MiB is under
-its suggested 4096 MiB of RAM. Its `-accel-check` reports `/dev/kvm is not found`.
+The SDK emulator (37.3.10) does not start on this host as first set up: it requires 7.37 GB of
+free disk to create userdata whatever the AVD's data size (2.2 GB was free), and warns that
+3939 MiB is under its suggested 4096 MiB of RAM. Its `-accel-check` reports `/dev/kvm is not
+found`. With the host grown to 8 GiB and a 20 GB disk it starts, and the boot rows below compare
+against it.
 
 The renderer on the same host, no VM: the SDK's Linux `libgfxstream_backend.so` (37.3.10, from
 `emu -provision-renderer`) on lavapipe, initialized Vulkan-only as emu runs it, then a 720×1280
@@ -230,7 +235,42 @@ cargo run --release -p emu-gfxstream --example renderer_caps -- -vulkan-only <li
 | The host's Mesa lavapipe (Ubuntu 22.04, LLVM 15) | 143 ms (105, 155, 143, 140, 146) | 1.21 ms |
 
 emu uses the SDK's: the two are equal here, and the SDK's is the same on every host. Rendering
-throughput, where they could differ, needs a booted guest.
+throughput, where they could differ, needs a booted guest. Booted, the SDK's lavapipe crashed in a
+render thread on every boot, so boots render on its SwiftShader (below).
+
+### Boot to `sys.boot_completed` with emu's devices
+
+The same host, grown to 8 GiB of RAM and a 20 GB disk, 2026-11-26. The API 36 `default` x86_64
+image, 4 vCPUs and 2 GB, under QEMU 11.1.3 TCG with emu's devices
+(`crates/emu-vmm/examples/soft_devices.rs`: vsock, console, net and the GPU over vhost-user, the
+goldfish address space and pipe over vfio-user). The renderer is the SDK's gfxstream on its
+SwiftShader. Five warm boots after one uncounted first boot. Each boot's time runs from QEMU's
+start to `getprop sys.boot_completed` reading 1 on the console. Host CPU is QEMU's plus emu's,
+over 60–120 s after boot complete (the window the Mac rows use) and over 240–300 s. Peak RSS is
+each process's `VmHWM`.
+
+```bash
+scripts/tcg-bench.py <sysdir> <workdir> --qemu <qemu-system-x86_64> --emu-devices target/release/examples/soft_devices \
+  --lib64 <renderer lib64> --icd swiftshader --boots 5
+```
+
+| Run | Failed boots | Boot to `sys.boot_completed`, median (runs) | Host CPU 60–120 s after | 240–300 s after | Peak RSS, QEMU + emu |
+| --- | --- | --- | --- | --- | --- |
+| emu's devices | 0 of 5 | 168 s (165.6, 150.5, 168.0, 183.7, 181.0) | 2.14 cores | 0.75 cores | 3058 + 233 MB |
+| Before: goldfish writes posted | 2 of 5 (a guest panic, a hang) | 170 s (180.9, 170.0, 160.8) | 3.94 cores | not measured | 2992 + 173 MB |
+
+The first boot of a fresh userdata took 375.5 s. With QEMU's default posted writes on the
+goldfish devices, one boot panicked (`zap_huge_pmd`) and one never completed (SurfaceFlinger
+crashed in `init`, zygote restarted). `x-no-posted-writes` fixed both (docs/android.md, "Software
+mode"). The "before" CPU column was measured from 60 s after boot complete only; most of that
+load is the guest's post-boot work, and host CPU settles at about a third of it by 240 s.
+On one interactive boot, about 4 minutes after boot complete, `top -H` showed QEMU's four vCPU
+threads at about 16% of a core each, its main loop at 7%, and emu under 1%. The guest's own
+`top` showed it 84% idle; the rest was system_server, telephony and logd.
+
+Under emulation, apps can exceed Android's startup timeouts. One interactive boot showed "System
+UI isn't responding" after com.android.phone overran its startup (its main thread runnable, not
+blocked).
 
 ## Android farm
 

@@ -160,29 +160,64 @@ impl MmioDevice for PciHost {
 
 /// One function's config space on its own, for a transport that delivers config cycles itself
 /// (vfio-user: the frontend forwards every config read and write).
-pub struct ConfigSpace(FnState);
+pub struct ConfigSpace {
+    f: FnState,
+    /// Interrupt pin (1 = INTA; 0: none) and the line the guest writes there.
+    irq_pin: u8,
+    irq_line: u8,
+}
+
+/// Interrupt line and pin.
+const REG_INTERRUPT: usize = 0x3c;
 
 impl ConfigSpace {
     pub fn new(f: PciFunction) -> ConfigSpace {
-        ConfigSpace(FnState::new(f))
+        ConfigSpace { f: FnState::new(f), irq_pin: 0, irq_line: 0xff }
+    }
+
+    /// The same, with an interrupt on `pin` (1 = INTA).
+    pub fn with_interrupt_pin(f: PciFunction, pin: u8) -> ConfigSpace {
+        ConfigSpace { irq_pin: pin, ..ConfigSpace::new(f) }
+    }
+
+    fn word(&self, reg: usize) -> u32 {
+        if reg == REG_INTERRUPT { u32::from(self.irq_line) | (u32::from(self.irq_pin) << 8) } else { self.f.read(reg) }
     }
 
     /// Reads `data.len()` bytes at `offset`.
     pub fn read(&self, offset: usize, data: &mut [u8]) {
         for (i, b) in data.iter_mut().enumerate() {
             let at = offset + i;
-            *b = (self.0.read(at & !3) >> ((at & 3) * 8)) as u8;
+            *b = (self.word(at & !3) >> ((at & 3) * 8)) as u8;
         }
     }
 
     /// Writes 1, 2 or 4 bytes at `offset`.
     pub fn write(&mut self, offset: usize, data: &[u8]) {
-        self.0.write_bytes(offset, data);
+        if offset & !3 == REG_INTERRUPT {
+            // Only the line is writable (the guest records the IRQ it routed the pin to).
+            if offset == REG_INTERRUPT && !data.is_empty() {
+                self.irq_line = data[0];
+            }
+            return;
+        }
+        self.f.write_bytes(offset, data);
     }
 
     /// The address BAR `i` decodes now.
     pub fn bar_addr(&self, i: usize) -> u64 {
-        self.0.bar_addr(i)
+        self.f.bar_addr(i)
+    }
+
+    /// The command register (bit 1: memory decoding on).
+    pub fn command(&self) -> u16 {
+        self.f.command
+    }
+
+    /// Back to power-on state: BARs unassigned, decoding off.
+    pub fn reset(&mut self) {
+        self.f = FnState::new(self.f.f.clone());
+        self.irq_line = 0xff;
     }
 }
 
@@ -254,5 +289,21 @@ mod tests {
         assert_eq!(c.bar_addr(1), 0x8_0000_0000);
         c.write(0x10, &0xfe00_0000u32.to_le_bytes());
         assert_eq!(c.bar_addr(0), 0xfe00_0000);
+        let mut irq = [0u8; 4];
+        c.read(0x3c, &mut irq);
+        assert_eq!(irq, [0xff, 0, 0, 0], "no interrupt pin");
+    }
+
+    #[test]
+    fn an_interrupt_pin_is_reported_and_its_line_kept() {
+        let f = PciFunction { vendor: 0x607d, device: 0xf154, class: 0xff_00_00, bars: vec![] };
+        let mut c = ConfigSpace::with_interrupt_pin(f, 1);
+        let mut b = [0u8; 2];
+        c.read(0x3c, &mut b);
+        assert_eq!(b, [0xff, 1], "line unset, pin INTA");
+        c.write(0x3c, &[11]);
+        c.write(0x3d, &[4]);
+        c.read(0x3c, &mut b);
+        assert_eq!(b, [11, 1], "the line is the guest's, the pin is fixed");
     }
 }
