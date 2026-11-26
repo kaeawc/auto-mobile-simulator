@@ -1,12 +1,13 @@
-"""Per-step latency of a booted iOS simulator through `simee serve`, over one persistent connection.
+"""Per-step latency of a booted device through `simee serve`, over one persistent connection.
 
     SIMEE_SOCKET=/tmp/s.sock target/release/simee serve &
-    python3 scripts/ios-step-bench.py /tmp/s.sock <udid> [N]
+    python3 scripts/ios-step-bench.py /tmp/s.sock <udid or AVD> [N] [X Y]
 
 Prints the median and p90 of N calls (default 20, after one warm-up) each: tap, screenshot (base64
 in the reply), screenshot to a file, and a tap followed by a screenshot (one automation step). A
 tap holds 60 ms (the API's default `hold_ms`). It taps (600, 2500), the gap between the two dock
-icons of an iPhone 17's home screen, so the taps change nothing."""
+icons of an iPhone 17's home screen, so the taps change nothing; give X Y for another device (an
+Android phone's empty launcher workspace, say)."""
 import json, os, socket, statistics, sys, time
 
 sock_path, udid = sys.argv[1], sys.argv[2]
@@ -41,7 +42,7 @@ def bench(name, fn):
 
 out = os.path.join(os.path.dirname(sock_path), "stepbench.png")
 # The gap between the two dock icons (iPhone 17 home screen): taps change nothing.
-x, y = 600, 2500
+x, y = (int(sys.argv[4]), int(sys.argv[5])) if len(sys.argv) > 5 else (600, 2500)
 bench("tap", lambda: call("tap", device=udid, x=x, y=y))
 bench("screenshot (base64)", lambda: call("screenshot", device=udid))
 bench("screenshot (file)", lambda: call("screenshot", device=udid, path=out))
