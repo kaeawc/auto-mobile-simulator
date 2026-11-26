@@ -58,6 +58,57 @@ memory, several instances per AVD), `-wipe-data`, `-show-kernel`, `-verbose` (pr
 counts at shutdown), `-no-boot-anim`. The rest of the SDK emulator's flags are accepted and
 ignored for now.
 
+## Linux hosts with KVM
+
+`emu` also runs the stock board on arm64 Linux under KVM
+([#54](https://github.com/kaeawc/simee/issues/54)). The same arm64 system images, board and GIC
+model are used; only the hypervisor backend differs (`crates/emu-vmm/src/hv/kvm.rs` over
+`crates/emu-kvm`).
+
+Host requirements:
+
+- **An arm64 Linux host with KVM**: Graviton or Ampere bare metal, Asahi, or any arm64 machine
+  whose kernel booted at EL2. `emu -accel-check` reports whether KVM is usable and, if not, how
+  to fix it. The kernel needs KVM's stable API with ioeventfd, irqfd, in-kernel PSCI 0.2 and
+  `KVM_CAP_IMMEDIATE_EXIT` (any kernel since 4.13); `emu` checks these when it starts.
+- **A GICv3 interrupt controller.** The stock board is GICv3, and KVM can only offer a guest the
+  GIC generation the host has. GICv2-only hosts, such as the Raspberry Pi 5 (GIC-400), are
+  refused with that reason.
+- **Access to `/dev/kvm`, without root**: join the group that owns it (`sudo usermod -aG kvm
+  $USER`, then log in again). `emu` checks this up front and prints that fix when access is
+  denied, or how to get KVM when there is no `/dev/kvm` (module, firmware, nested
+  virtualization).
+- **No host GPU rendering yet.** Loading the Linux gfxstream renderer (`libgfxstream_backend.so`)
+  belongs to the no-KVM work ([#55](https://github.com/kaeawc/simee/issues/55)), so Linux boots
+  have no graphics until it lands.
+
+What KVM does in the kernel, where Hypervisor.framework makes `emu` do it in userspace:
+
+| | Hypervisor.framework | KVM |
+| --- | --- | --- |
+| Device interrupts | `hv_gic_set_spi`, then `emu` kicks the routed vCPU out of the guest (`wake.rs`) | `KVM_IRQ_LINE` from the device's thread; the in-kernel vGICv3 kicks the vCPU |
+| WFI and the arch timer | host-side waits for the timer deadline, polled every 1 ms while an SGI could arrive | in the kernel; the vCPU thread sleeps inside `KVM_RUN` |
+| PSCI CPU_ON/OFF/SUSPEND | `emu` (`hv/hvf.rs`) | in the kernel (`KVM_ARM_VCPU_PSCI_0_2`); only SYSTEM_OFF/RESET return, as system events |
+| virtio QueueNotify | an MMIO exit to userspace per notify | an ioeventfd per queue: the store completes in the kernel, and a dispatcher thread passes it to the device |
+| MMIO decoding | from the data abort's syndrome | decoded by the kernel |
+
+Interrupts use `KVM_IRQ_LINE` rather than irqfd because the board's SPIs are level-triggered
+(the DT says so, as stock's does). An irqfd raises an edge and needs a resample eventfd and an
+EOI round trip to emulate a level. `KVM_IRQ_LINE` sets the level directly, with the same cost (one
+syscall from the device thread) and no vCPU involved. `emu-kvm` has irqfds for device threads in
+another process (vhost-user), which only hold a file descriptor.
+
+Verified so far: `scripts/kvm-smoke.sh` boots an arm64 Linux kernel on the board under KVM. The
+guest brings up its secondary vCPUs through in-kernel PSCI and writes 2000 lines through
+virtio-console, whose QueueNotify stores all complete in the kernel. It then powers off through
+PSCI SYSTEM_OFF. With no arm64 KVM host available, the script runs KVM inside an emulated arm64
+machine with EL2 (QEMU TCG, `virt,virtualization=on,gic-version=3`). That proves the backend is
+correct, not that it is fast. GitHub's hosted arm64 runners don't expose `/dev/kvm` (their kernel
+logs `kvm: HYP mode not available`), so CI runs the emulated smoke test on x86_64. On an arm64
+KVM host, run it natively with `scripts/kvm-smoke.sh --native`, or dispatch the `kvm-arm64`
+workflow on a self-hosted runner. Not yet verified: an Android boot on arm64 KVM hardware and
+numbers against stock on the same host ([benchmarks](benchmarks.md#not-yet-measured)).
+
 ## Layout
 
 | Path | What |
