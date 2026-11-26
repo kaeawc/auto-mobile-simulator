@@ -44,7 +44,8 @@ What a new device of each kind gets unless told otherwise. Real devices report t
 | --- | --- | --- | --- | --- | --- |
 | Android phone | 720×1280 | 320 dpi | rounded | — | touch, keyboard, buttons |
 | Android tablet | 2560×1600 | 320 dpi | rounded | — | touch, keyboard, buttons |
-| Android foldable | 2208×1840 (folded 1080×2092) | 420 dpi | rectangle | hinge at 180° | touch, keyboard, buttons, hinge |
+| Android foldable (the Pixel Fold) | 2208×1840 (folded 1080×2092) | 420 dpi | rectangle | hinge at 180°, 0–180° | touch, keyboard, buttons, hinge |
+| Android dual-screen (`--device surface_duo`) | 2784×1800 (two 1350×1800 screens, an 84 px hinge) | 401 dpi | rectangle | hinge at 180°, 0–360° | touch, keyboard, buttons, hinge |
 | Wear OS watch | 454×454 | 320 dpi | round | — | touch, rotary input, buttons |
 | Android TV | 1920×1080 | 320 dpi | rectangle | — | D-pad remote, keyboard |
 | Android Automotive | 1024×768 | 160 dpi | rectangle | — | touch, head unit |
@@ -72,7 +73,7 @@ The Android XR profiles are the SDK's own device definitions (`xr_headset_device
 `ai_glasses_device`, 2 GiB; both landscape), and a new XR AVD gets their RAM and
 `hw.initialOrientation=landscape` too.
 Foldable postures follow the stock emulator's hinge ranges: closed below 30°, half-opened below
-150°, opened from 150° to 180°.
+150°, opened from 150° to 180°. A dual-screen adds tent (210–330°) and flipped (330–360°).
 
 ## How a device's form factor is found
 
@@ -100,7 +101,7 @@ Foldable postures follow the stock emulator's hinge ranges: closed below 30°, h
 | Vision Pro | `simee create V "Apple Vision Pro" "visionOS 26.0" --form-factor vision` | touch (unverified), `button home` |
 | Android phone | `simee create P --platform android --system-image "system-images;android-36;google_apis;arm64-v8a"` | touch, `button back\|home\|recents`, `type`, `rotate` |
 | Android tablet | the same image, `--form-factor tablet` | as phone, plus `stylus X Y [hover\|down\|move\|up\|leave]` or `stylus X Y --to X2 Y2` (a pen; [Tablets](#tablets)) |
-| Android foldable | the same image, `--form-factor foldable` | as phone, plus `fold <closed\|half-opened\|opened\|angle>` |
+| Android foldable | the same image, `--form-factor foldable` (a Pixel Fold) or `--device surface_duo` (a dual-screen) | as phone, plus `fold <fold\|unfold\|closed\|half-opened\|opened\|flipped\|tent\|angle>`; console `fold`, `unfold`, `posture <id>`, `fold status` |
 | Wear OS | `--system-image "system-images;android-34;android-wear;arm64-v8a"` | touch, `rotary <ticks>`, `button back\|home\|power` |
 | Android TV | `--system-image "system-images;android-34;google-tv;arm64-v8a"` | `button up\|down\|left\|right\|select\|back\|home` |
 | Automotive | `--system-image "system-images;android-34-ext9;android-automotive;arm64-v8a"` (API 34 and 35 Automotive images exist only at extension levels; `emu -provision 34 -tag android-automotive` picks `34-ext9`) | touch, `button back\|home`, `vehicle <property> [<value>]` (gear, speed, ignition, ...; unverified, see below) |
@@ -125,6 +126,67 @@ size, a foldable's hinge sensor). An image can't boot another family's form fact
 $ simee create T --platform android --system-image "system-images;android-34;android-wear;arm64-v8a" --form-factor tablet
 Error: system image `system-images;android-34;android-wear;arm64-v8a` (tag `android-wear`) boots Wear OS · Watch devices, not tablet
 ```
+
+## Foldables
+
+A new foldable AVD follows a device definition, with the `config.ini` keys avdmanager writes for
+it: `--form-factor foldable` is the SDK's Pixel Fold (`pixel_fold`: `hw.sensor.hinge.*`,
+`hw.sensor.posture_list`, the posture ranges, `hw.sensor.hinge.areas=1080-0-0-1840` and the
+1080×2092 outer screen as `hw.displayRegion.0.1.*`, checked key for key against
+`avdmanager create avd -d pixel_fold`), and `--device surface_duo` a dual-screen. The SDK has no
+dual-screen definition; that one uses Microsoft's published Surface Duo sizes (two 1350×1800
+screens either side of an 84 px hinge, 401 dpi), turns through 360° with stock's five postures,
+and shows its left screen when flipped. Both work with the SDK's `emulator` too: the keys are
+stock's own.
+
+The console takes stock's `fold` (to the AVD's fold posture,
+`hw.sensor.hinge.fold_to_displayRegion.0.1_at_posture`: a Pixel Fold shut, a dual-screen folded
+back), `unfold` (flat) and `posture <id>` (1 closed, 2 half-open, 3 open, 4 flipped, 5 tent), with
+stock's replies (`KO: Device is not foldable`, `KO: Posture 4 not supported`); `sensor set
+hinge-angle0` moves the posture too, and `fold status` (simee) reports the angle, posture, whether
+folded and the display size. `simee fold`, the API's `fold` and the desktop's Fold / Half open /
+Unfold buttons go through them.
+
+What the guest sees, as stock gives it:
+
+- **Pixel Fold images** (`DeviceStateOnBoot`, `DeviceSkinOverlay`) get the device states the
+  image ships for the AVD's device (`data/misc/pixel_fold/devicestate/`, sent at boot as
+  `androidboot.qemu.device_state`), so the guest follows the hinge sensor itself: `dumpsys
+  device_state` goes CLOSED, HALF_OPENED, OPENED with `fold`, `posture 2`, `unfold`. Once booted
+  the device's skin overlays are enabled (`com.android.internal.emulation.pixel_fold`, as stock
+  does), which give the framework the fold (`config_display_features` `fold-[1104,0,1104,1848]`)
+  and the posture of each device state, what Jetpack WindowManager's `FoldingFeature` is built
+  from. Folding shows Android's own "Swipe up to continue" over the app, as a real Pixel Fold does.
+- **Other foldables** (the dual-screen) get the `device_posture` and `display_features`
+  (`hinge-[1350,0,1434,1800]`) global settings on every posture change, as stock's
+  `sendPostureToSystem` writes them for Jetpack WindowManager's emulator support.
+
+Folded, the device shows its outer (or one) screen. Stock gives a Pixel Fold that screen as a
+second built-in display; simee's board has one display, so a folded device's display is forced to
+the folded screen's size (`wm size 1080x2092`, `1350x1800`), which the guest lays out for (an
+app's `screenWidthDp` becomes the outer screen's, `adb exec-out screencap` is 1080×2092), and
+readers of the scanout see only where the guest draws it: the display socket and `screenshot`
+stream 949×1840 for the Pixel Fold (the 1080×2092 screen at the inner screen's height) and
+1350×1800 for the dual-screen, and the desktop's view takes that shape. Touches on those frames
+(the display socket's, the desktop's) land on the folded screen. The API's `screen`, `tap`,
+`swipe` and `touch` are in the guest's layout instead (1080×2092, uiautomator's bounds): simee
+scales their points onto the frames, so a tap at an element's bounds hits it; a screenshot stays
+the 949×1840 frame. Unfolding resets the size, and so does stopping emu folded (`kill`, `adb emu
+kill`, SIGINT) before the guest goes, so the AVD boots under the stock emulator at its own size; a
+size emu couldn't reset (a crash) is recorded in `<avd>/simee/fold-wm-size` and reset at its next
+simee boot. A `wm size` simee didn't set is left alone.
+
+Checked on simee on 2026-11-26 (API 36 `google_apis` r7 image, Apple silicon host): a Pixel Fold
+AVD and a dual-screen AVD each booted, folded, half-opened, unfolded and rotated; Settings opened
+unfolded stayed in front through fold and unfold and was re-laid out for each screen; a tap on the
+folded frame opened Settings search. The AutoMobile harness passed on both (all but the audio
+tools, which reach a stock emulator's gRPC, and `deviceSnapshot`, which simee doesn't support),
+and its observe, tap, swipe, launch and button tools passed with each folded. Later the same day:
+folded, a `simee tap` at a Settings row's uiautomator bounds opened it, the harness passed folded
+(40 of 41 tools, all but `deviceSnapshot`; audio tools not run), and after `adb emu kill` or
+SIGINT folded the next boot's `wm size` had no override while a `wm size` set by hand survived a
+boot; `simee fold` folded, opened and unfolded a Pixel Fold AVD run by the stock emulator 37.2.13
+(its `dumpsys device_state` went CLOSED, OPENED).
 
 ## Tablets
 
@@ -225,6 +287,7 @@ What is modelled and labelled but not (or not verifiably) working end to end:
 | CarPlay | Implemented as above but never run: no Mac was available. Whether `simctl io enumerate` then labels the screen "CarPlay" (what auto-mobile's CarPlay observe looks for, auto-mobile #18729) is unconfirmed. Only touch: the knob, back, home and Siri head-unit inputs aren't sent (auto-mobile #19059 is finding out whether SimulatorKit takes them). The desktop doesn't show the CarPlay screen. |
 | Android Automotive | simee serves the vehicle HAL channel (`qemud:car`, driven by `vehicle` / console `car`) and the virtio-snd card the car audio HAL needs, but no car image has been booted on them yet (checked offline against 34-ext9: [android.md](android.md#automotive)); EVS, the cluster display and the rotary controller aren't modelled ([android.md](android.md#automotive)). |
 | Android TV | `android-tv` 36 boots on simee with the virtio-snd card, as stock gives it (its ranchu audio HAL plays the UI sounds through ALSA card 0, like the phone images; [android.md](android.md#automotive)); the rest of this row is unchecked on a running TV image. Checked offline against `android-tv` 34 r3 (`emu -avd TV34 -dry-run` plus its unpacked ramdisk and vendor partition): the first-stage fstab addresses the board's slots (system at `a003600`, userdata `vdc`, metadata at `a003c00`), its first-stage modules are simee's devices, the vendor partition is the generic goldfish one (no HDMI-CEC or TV-input HAL), the `.idc` files match simee's input names, and every `button` key maps to its Android key in the `qwerty.kl` the guest uses. Its AVDs say `hw.screen=no-touch` like stock's, and simee then attaches no touch device, as stock doesn't; `tap`, `swipe` and console `touch` say so. |
+| Android foldable | Folded, a Pixel Fold's outer screen is the inner display forced to 1080×2092 and drawn at 949×1840 on the host (stock: a second 1080×2092 display, as on the device), so host frames of it are scaled by 0.88 and the image's own two-display layout (`display_layout_configuration.xml`, `REAR_DISPLAY_MODE`) isn't used. A dual-screen gets no device states (stock gives other foldables a lid-switch state machine and `wm folded-area` with a lid event; simee forces the size instead), and nothing masks its hinge. Jetpack WindowManager's `FoldingFeature` is configured as stock configures it (the overlays and settings above) but no app has read it on simee yet. The stock emulator itself wasn't run beside it: its behaviour is from its binary's strings, the image's files and avdmanager's output. |
 | Android XR | Not booted on simee yet. Checked offline against `google-xr` 34 r7: its fstab, modules and input `.idc` names match the board, and its features ask for what simee gives it (`GuestAngle`, `VirtioDualModeMouse`). It enables `VirtioSndCard`, so simee gives it the virtio-snd card as stock does; its ranchu audio HAL, the phones' one, plays through it (booted on phones, Wear and TV, not yet on XR). The room renders in the guest through gfxstream (simee already defaults to ANGLE), but stock's other XR feature flags (`XrModeUI`, `XrHandAndEyePointers`, `VirtioMouse`, `MultiDisplay`, `BluetoothEmulation`) have no simee equivalent yet. The dual-mode mouse matches stock's device (name, ids, event bits, axes); how the guest maps it to its hand ray and gaze pointers, and whether head pose, options, hand and eye events over `xr_service` take effect, is unverified. auto-mobile's `xrHeadsetInput` (auto-mobile #19076) sends hand and eye events over stock's gRPC `streamInputEvent`, which simee doesn't serve yet (its gRPC `EmulatorController` is on the roadmap); `xr hand`/`xr eye` put the same messages on the guest's pipe. The display glasses' temple touchpad (`hw.touchpad0`, 1542×297, which the `ai-glasses` image configures as `virtio_input_multi_touch_touchpad_0`) is attached and driven by `touchpad`, but how the guest's UI reacts to it is unverified. Only images that enable `VirtioDualModeMouse` (the headsets, not the glasses) get the dual-mode mouse, as on stock. |
 | Apple Watch, Apple TV | The crown, gestures, Siri Remote buttons and touch surface use the messages Simulator.app sends (confirmed live by other projects on watchOS/tvOS 26.5 and 27), but not run by simee. The crown's units per tick are a calibration. From Xcode 27 the guest can switch input to `dtuhidd` (once `com.apple.coredevice.dtuhidd.active` is set, e.g. by Device Hub), after which legacy HID buttons and keys are dropped; simee doesn't detect that yet. |
 | Vision Pro | Gaze, pinch and the camera (look around, pan, orbit) go through Xcode's visionOS UI plugin in Simulator.app, whose messages aren't public; simee sends plain touches, which no source confirms visionOS honours. auto-mobile can't script visionOS input either (auto-mobile #19055). |

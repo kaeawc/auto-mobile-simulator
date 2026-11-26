@@ -166,18 +166,24 @@ fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<e
             }
             (Input::Shared, _) => wants.shared.store(true, Ordering::Relaxed),
             (Input::Socket, _) => wants.shared.store(false, Ordering::Relaxed),
-            (Input::Touch { x, y, phase }, Some(emu_vmm::Inputs { touch: Some(touch), .. })) => match phase {
-                Phase::Down | Phase::Move => {
-                    finger_down = true;
-                    touch.touch(x as i32, y as i32, true);
-                }
-                Phase::Up => {
-                    if finger_down {
-                        touch.touch(x as i32, y as i32, false);
+            (Input::Touch { x, y, phase }, Some(emu_vmm::Inputs { touch: Some(touch), .. })) => {
+                // Clients point at the frames they get: a folded foldable's view starts at its
+                // origin on the scanout.
+                let (ox, oy) = display.view_origin();
+                let (x, y) = (x as i32 + ox as i32, y as i32 + oy as i32);
+                match phase {
+                    Phase::Down | Phase::Move => {
+                        finger_down = true;
+                        touch.touch(x, y, true);
                     }
-                    finger_down = false;
+                    Phase::Up => {
+                        if finger_down {
+                            touch.touch(x, y, false);
+                        }
+                        finger_down = false;
+                    }
                 }
-            },
+            }
             // A console key name, or a raw Linux keycode (as the console's `event send` takes).
             (Input::Key(name), Some(i)) => {
                 if let Some(code) = sim_core::goldfish::keycode(&name) {

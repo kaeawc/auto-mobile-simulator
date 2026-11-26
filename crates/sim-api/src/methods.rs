@@ -28,7 +28,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("device_types", "", "List device types"),
     (
         "create",
-        "name, platform?(ios|android), form_factor?; iOS: device_type, runtime; Android: system_image",
+        "name, platform?(ios|android), form_factor?; iOS: device_type, runtime; Android: system_image, device?(pixel_fold|surface_duo)",
         "Create a device. form_factor is checked against the device type (iOS) or the system image (Android) and shapes a new AVD",
     ),
     ("delete", "device", "Delete a device"),
@@ -72,8 +72,16 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     ("shutdown", "device", "Shut down"),
     ("erase", "device", "Erase content and settings (shut down first)"),
-    ("screen", "device, display?(main|carplay)", "Screen size in pixels"),
-    ("screenshot", "device, path?, display?(main|carplay)", "PNG to path, else base64 in `png`"),
+    (
+        "screen",
+        "device, display?(main|carplay)",
+        "Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds)",
+    ),
+    (
+        "screenshot",
+        "device, path?, display?(main|carplay)",
+        "PNG to path, else base64 in `png` (a folded Android foldable: its outer screen as the scanout shows it, a Pixel Fold's 949x1840)",
+    ),
     ("tap", "device, x, y, hold_ms?, display?(main|carplay)", "Tap at pixels (display: an iPhone's CarPlay screen, iOS only)"),
     (
         "swipe",
@@ -173,7 +181,11 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "device, orientation?(portrait|landscape-right|portrait-upside-down|landscape-left; iOS)",
         "Rotate the device 90° clockwise, or to an orientation (iOS)",
     ),
-    ("fold", "device, angle(0-180) | posture(closed|half-opened|opened)", "Set a foldable's hinge"),
+    (
+        "fold",
+        "device, folded(true|false) | angle(0-180; 0-360 dual-screen) | posture(closed|half-opened|opened|flipped|tent)",
+        "Set a foldable's hinge, as the console's fold, unfold and posture do: the hinge sensor, the posture and, folded, the outer screen; returns angle, posture, folded and the size the guest lays out for",
+    ),
     (
         "xr",
         "device, action(recenter | rotate|move: x, y, z | options: environment(day|night), passthrough(0-1) | input: mode(mouse|hand|eye) | viewport: mode(pan|zoom|rotate) | pointer: x, y, phase?(move|down|up|click) | hand|eye: x, y, press?(aim|press) | gesture: gesture(left-pinch|left-grab|left-poke|right-pinch|right-grab|right-poke))",
@@ -382,7 +394,9 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             match platform {
                 Platform::Ios => crate::ios::call(&mut s.ios, method, p),
                 Platform::Android => {
-                    let info = s.android.backend().create(need_str(p, "name")?, need_str(p, "system_image")?, form_factor)?;
+                    let device = crate::params::str_param(p, "device");
+                    let info =
+                        s.android.backend().create_device(need_str(p, "name")?, need_str(p, "system_image")?, form_factor, device)?;
                     serde_json::to_value(info).map_err(|e| e.to_string())
                 }
             }
@@ -533,7 +547,7 @@ mod tests {
         assert!(err.starts_with("folding needs a device with Hinge; watch is Wear OS · Watch"), "{err}");
         assert_eq!(
             call(&mut s, "fold", &json!({"device": "fold", "posture": "ajar"})).expect_err("posture"),
-            "unknown posture `ajar` (closed, half-opened, opened)"
+            "unknown posture `ajar` (closed, half-opened, opened, flipped, tent)"
         );
         assert_eq!(call(&mut s, "rotate", &json!({"device": "fold"})).expect_err("stopped"), "fold isn't running; boot it first");
         let err = call(&mut s, "rotate", &json!({"device": "fold", "orientation": "portrait"})).expect_err("iOS-only orientation");
@@ -623,6 +637,7 @@ mod tests {
             assert!(console.iter().any(|l| l == want), "{want} not in {console:?}");
         }
         assert!(console.iter().any(|l| l.starts_with("sensor set hinge-angle0 ")), "{console:?}");
+        assert!(console.iter().any(|l| l == "posture 2") && console.iter().any(|l| l == "fold status"), "postures as stock: {console:?}");
         assert_eq!(wait_for(&fake.display, 3)[..3], ["touch 10 20 down", "touch 10 20 up", "touch 5 6 down"]);
 
         // Form-factor checks happen before anything reaches the emulator.
@@ -632,8 +647,70 @@ mod tests {
         assert!(err(&mut s, "touchpad", json!({"device": "fold", "x": 1, "y": 1})).contains("no touchpad"));
         assert_eq!(err(&mut s, "rotary", json!({"device": "fold"})), "missing number parameter `ticks`");
         assert_eq!(err(&mut s, "key", json!({"device": "fold"})), "missing number parameter `usage`");
-        assert!(err(&mut s, "fold", json!({"device": "fold"})).starts_with("give `angle`"));
+        assert!(err(&mut s, "fold", json!({"device": "fold"})).starts_with("give `folded`"));
+        assert!(err(&mut s, "fold", json!({"device": "fold", "folded": null})).starts_with("give `folded`"), "null is absent");
+        assert_eq!(err(&mut s, "fold", json!({"device": "fold", "folded": "yes"})), "`folded` must be true or false, not \"yes\"");
         assert!(err(&mut s, "rotate", json!({"device": "fold", "orientation": "portrait"})).contains("iOS-only"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// One running Pixel Fold AVD named `fold` on a fake emulator (stock's or simee's), under /tmp
+    /// (the fake display socket's path must fit a unix socket address).
+    fn running_foldable(tag: &str, stock: bool) -> (Session, sim_android::testing::FakeEmulator, std::path::PathBuf) {
+        let root = std::path::PathBuf::from("/tmp").join(format!("sa-{tag}-{}", std::process::id()));
+        let sdk = root.join("sdk/system-images/android-36/google_apis/arm64-v8a");
+        std::fs::create_dir_all(&sdk).expect("image dir");
+        std::fs::write(sdk.join("system.img"), b"s").expect("system.img");
+        std::fs::write(sdk.join("source.properties"), "AndroidVersion.ApiLevel=36\nSystemImage.TagId=google_apis\n").expect("props");
+        let env = emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") };
+        let mut android = sim_android::Android::new(env);
+        android.running_dir = Some(root.join("running"));
+        android.create_device("fold", "system-images;android-36;google_apis;arm64-v8a", None, Some("pixel_fold")).expect("create");
+        let fake = match stock {
+            true => sim_android::testing::fake_stock_emulator(&android, "fold"),
+            false => sim_android::testing::fake_emulator(&android, "fold"),
+        };
+        (Session::with_android(android), fake, root)
+    }
+
+    #[test]
+    fn a_stock_run_foldable_folds_without_simees_status() {
+        let (mut s, fake, root) = running_foldable("stockfold", true);
+        let fold = |s: &mut Session, p: Value| call(s, "fold", &p);
+        // Stock refuses simee's `fold status` (`KO: Usage: "fold"`): the answer is what was asked.
+        assert_eq!(fold(&mut s, json!({"device": "fold", "folded": true})), Ok(json!({"folded": true})));
+        assert_eq!(fold(&mut s, json!({"device": "fold", "posture": "opened"})).expect("posture")["posture"], "opened");
+        assert_eq!(fold(&mut s, json!({"device": "fold", "angle": 90})).expect("angle")["angle"], 90.0);
+        let console = sim_android::testing::wait_for(&fake.console, 3);
+        assert_eq!(console, ["fold", "posture 3", "sensor set hinge-angle0 90"], "stock's own commands only");
+        assert_eq!(call(&mut s, "screen", &json!({"device": "fold"})), Ok(json!({"width": 2208, "height": 1840})));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_folded_foldable_takes_points_in_the_guests_layout() {
+        use sim_android::testing::wait_for;
+        let (mut s, fake, root) = running_foldable("folded", false);
+        let ok = |s: &mut Session, method: &str, params: Value| call(s, method, &params).unwrap_or_else(|e| panic!("{method}: {e}"));
+        // Unfolded (simee's status: the whole screen), points pass through.
+        *fake.fold_status.lock().expect("status") = Some(
+            "angle: 180\r\nposture: opened (3)\r\nfolded: false\r\nvisible: 2208x1840+0+0\r\nsize: 2208x1840\r\npostures: 1,2,3".into(),
+        );
+        assert_eq!(ok(&mut s, "screen", json!({"device": "fold"})), json!({"width": 2208, "height": 1840}));
+        ok(&mut s, "touch", json!({"device": "fold", "x": 1000, "y": 1000, "phase": "down"}));
+        assert_eq!(wait_for(&fake.display, 1), ["touch 1000 1000 down"]);
+        // Folded, the guest lays out for the outer screen (uiautomator's bounds) while the frames
+        // and the display socket's touches are its 949x1840 region of the scanout.
+        *fake.fold_status.lock().expect("status") =
+            Some("angle: 0\r\nposture: closed (1)\r\nfolded: true\r\nvisible: 949x1840+629+0\r\nsize: 1080x2092\r\npostures: 1,2,3".into());
+        assert_eq!(ok(&mut s, "screen", json!({"device": "fold"})), json!({"width": 1080, "height": 2092}));
+        ok(&mut s, "tap", json!({"device": "fold", "x": 1080, "y": 2092, "hold_ms": 0}));
+        ok(&mut s, "touch", json!({"device": "fold", "x": 540, "y": 1046, "phase": "up"}));
+        assert_eq!(
+            wait_for(&fake.display, 4)[1..],
+            ["touch 949 1840 down", "touch 949 1840 up", "touch 474 920 up"],
+            "whole pixels on the wire"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

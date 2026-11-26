@@ -31,6 +31,8 @@ pub struct ConsoleInfo {
     /// What `network speed|delay` asked for (seeded by `-netspeed`/`-netdelay`). Reported by
     /// `network status` and shared with the guest's NAT, which shapes its traffic by it.
     pub network: Arc<std::sync::Mutex<sim_core::network::Conditions>>,
+    /// A foldable's hinge (`fold`, `unfold`, `posture`).
+    pub fold: Option<Arc<crate::fold::Foldable>>,
 }
 
 /// Stock's reply to a command group without, or with an unknown, sub-command: the group's
@@ -131,6 +133,13 @@ fn sensor(info: &ConsoleInfo, words: &[&str]) -> String {
         ["set", name, values] => {
             let parsed: Result<Vec<f32>, _> = values.split(':').map(str::parse).collect();
             match parsed {
+                // A foldable's hinge moves its posture and screen too, as stock's does.
+                Ok(v) if *name == "hinge-angle0" && v.len() == 1 && info.fold.is_some() => {
+                    match info.fold.as_deref().map(|f| f.set_angle(v[0])) {
+                        Some(Err(e)) => format!("KO: {e}"),
+                        _ => "OK".into(),
+                    }
+                }
                 Ok(v) => {
                     if info.sensors.set(name, v) {
                         "OK".into()
@@ -457,6 +466,9 @@ const HELP: &[(&str, &str)] = &[
     ("geo", "Geo-location commands"),
     ("power", "power related commands"),
     ("rotate", "rotate the screen clockwise by 90 degrees"),
+    ("fold", "fold the device"),
+    ("unfold", "unfold the device"),
+    ("posture", "change posture of foldable device"),
     ("sms", "SMS related commands"),
     ("gsm", "GSM related commands"),
     ("network", "manage network settings"),
@@ -544,6 +556,10 @@ fn session(stream: TcpStream, info: &ConsoleInfo) -> std::io::Result<()> {
             (_, false) => "KO: unknown command, try 'help'".to_string(),
             ("kill", true) => {
                 out.write_all(b"OK: killing emulator, bye bye\r\n")?;
+                // While the guest still runs: a folded foldable's forced size goes with emu.
+                if let Some(fold) = &info.fold {
+                    fold.release();
+                }
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 emu_vmm::request_stop(&info.stop);
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -584,6 +600,8 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
         "xr" => xr(info, &words[1..]),
         "car" => car(info, &words[1..]),
         "network" => network(info, &words[1..]),
+        "fold" if words.get(1) == Some(&"status") => crate::fold::status(info.fold.as_deref()),
+        "fold" | "unfold" | "posture" => crate::fold::console(info.fold.as_deref(), words),
         // Stock: rotate the device 90° clockwise. Gravity in device coordinates turns the
         // other way, and the guest's auto-rotation follows the accelerometer.
         "rotate" => match info.sensors.get("acceleration").as_deref() {
@@ -751,12 +769,15 @@ mod tests {
     /// vehicle HAL when the image has one.
     fn console(form_factor: FormFactor) -> ConsoleInfo {
         let mask = sim_core::goldfish::sensor_mask(|_| None, form_factor, Some(34));
+        let sensors = Arc::new(emu_vmm::pipe::sensors::Sensors::new(mask));
+        let fold = (form_factor == FormFactor::Foldable)
+            .then(|| Arc::new(crate::fold::Foldable::new(sim_core::fold::pixel_fold().hinge, (2208, 1840), sensors.clone(), true)));
         ConsoleInfo {
             avd_name: "Test_AVD".into(),
             stop: Arc::default(),
             display: None,
             inputs: Arc::default(),
-            sensors: Arc::new(emu_vmm::pipe::sensors::Sensors::new(mask)),
+            sensors,
             clipboard: Arc::default(),
             fingerprint: Arc::default(),
             gps: Arc::default(),
@@ -765,6 +786,7 @@ mod tests {
             xr: (form_factor == FormFactor::Vision).then(Arc::default),
             car: (form_factor == FormFactor::Auto).then(Arc::default),
             network: Arc::default(),
+            fold,
         }
     }
 
@@ -930,6 +952,26 @@ mod tests {
         assert_eq!(run(&fold, "sensor get hinge-angle0"), "hinge-angle0 = 90\r\nOK");
         assert_eq!(run(&fold, "sensor set hinge-angle0 90:1"), "KO: bad sensor 'hinge-angle0' or value count");
         assert!(!run(&console(FormFactor::Phone), "sensor status").contains("hinge"), "phones have no hinge");
+        assert_eq!(run(&fold, "sensor set hinge-angle0 270"), "KO: hinge angle 270 is outside 0-180");
+    }
+
+    #[test]
+    fn foldables_fold_unfold_and_change_posture_as_stock_does() {
+        let fold = console(FormFactor::Foldable);
+        assert_eq!(run(&fold, "fold"), "OK");
+        assert_eq!(run(&fold, "sensor get hinge-angle0"), "hinge-angle0 = 0\r\nOK");
+        assert!(run(&fold, "fold status").contains("folded: true\r\nvisible: 949x1840+629+0"));
+        assert_eq!(run(&fold, "posture 2"), "OK");
+        assert_eq!(run(&fold, "sensor get hinge-angle0"), "hinge-angle0 = 90\r\nOK");
+        assert_eq!(run(&fold, "sensor set hinge-angle0 10"), "OK");
+        assert!(run(&fold, "fold status").contains("posture: closed (1)\r\nfolded: true"), "the sensor folds it too");
+        assert_eq!(run(&fold, "unfold"), "OK");
+        assert!(run(&fold, "fold status").contains("folded: false"));
+        let phone = console(FormFactor::Phone);
+        for cmd in ["fold", "unfold", "posture 1", "fold status"] {
+            assert_eq!(run(&phone, cmd), "KO: Device is not foldable", "{cmd}");
+        }
+        assert!(run(&phone, "help").contains("posture"));
     }
 
     #[test]
