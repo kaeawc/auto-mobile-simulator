@@ -9,10 +9,12 @@ use emu_sdk::{Host, Sdk, renderer};
 
 use crate::args::Opts;
 
-/// Whether this host boots guests (and so needs the renderer).
-const BOOTS: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+/// Whether this host boots guests (and so needs the renderer): Apple silicon, and x86_64 Linux in
+/// software mode.
+const BOOTS: bool = cfg!(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")));
 const DEFAULT_TAG: &str = "google_apis";
-const DEFAULT_ABI: &str = "arm64-v8a";
+/// The images this host boots: software mode on x86_64 Linux runs x86_64 images only.
+const DEFAULT_ABI: &str = if cfg!(all(target_os = "linux", target_arch = "x86_64")) { "x86_64" } else { "arm64-v8a" };
 
 /// The SDK to provision: the resolved SDK root, else the platform default; created if missing.
 fn sdk(env: &Env) -> Result<Sdk> {
@@ -80,7 +82,9 @@ pub fn provision(env: &Env, api: &str, opts: &Opts) -> Result<()> {
         if BOOTS {
             renderer(&sdk, opts, opts.provision_renderer)?;
         } else {
-            println!("skipping the renderer: emu boots guests only on Apple silicon (-provision-renderer installs it anyway)");
+            println!(
+                "skipping the renderer: emu boots guests only on Apple silicon and x86_64 Linux (-provision-renderer installs it anyway)"
+            );
         }
     }
 

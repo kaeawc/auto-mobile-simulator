@@ -119,13 +119,13 @@ impl Mirror {
 #[test]
 fn provisions_an_image_into_an_empty_sdk_and_plans_its_avd() {
     let m = mirror("tv");
-    let listed = m.ok(&["-list-images", "-tag", "android-tv"]);
+    let listed = m.ok(&["-list-images", "-tag", "android-tv", "-abi", "arm64-v8a"]);
     assert!(listed.lines().any(|l| l.starts_with("34 ") && l.contains("android-tv")), "{listed}");
 
-    let dry = m.ok(&["-provision", "34", "-tag", "android-tv", "-no-renderer", "-dry-run"]);
+    let dry = m.ok(&["-provision", "34", "-tag", "android-tv", "-abi", "arm64-v8a", "-no-renderer", "-dry-run"]);
     assert!(dry.contains("tv-34.zip") && !m.sdk("system-images").exists(), "a dry run downloads nothing:\n{dry}");
 
-    let out = m.ok(&["-provision", "34", "-tag", "android-tv", "-no-renderer", "-create-avd", "TV"]);
+    let out = m.ok(&["-provision", "34", "-tag", "android-tv", "-abi", "arm64-v8a", "-no-renderer", "-create-avd", "TV"]);
     assert!(out.contains("created TV"), "{out}");
     assert!(m.sdk("platform-tools/adb").is_file());
     let sysdir = m.sdk("system-images/android-34/android-tv/arm64-v8a");
@@ -141,10 +141,12 @@ fn provisions_an_image_into_an_empty_sdk_and_plans_its_avd() {
     let plan = m.ok(&["-avd", "TV", "-dry-run"]);
     assert!(plan.contains("avd       TV (Android TV · TV)") && !plan.contains("multi-touch"), "{plan}");
 
-    let again = m.ok(&["-provision", "34", "-tag", "android-tv", "-no-renderer"]);
+    let again = m.ok(&["-provision", "34", "-tag", "android-tv", "-abi", "arm64-v8a", "-no-renderer"]);
     assert!(again.contains("have system-images;android-34;android-tv;arm64-v8a") && again.contains("have platform-tools"), "{again}");
-    assert!(m.err(&["-provision", "34", "-tag", "android-tv", "-create-avd", "TV"]).contains("AVD 'TV' already exists"));
-    let missing = m.err(&["-provision", "99", "-tag", "android-tv", "-no-renderer"]);
+    assert!(
+        m.err(&["-provision", "34", "-tag", "android-tv", "-abi", "arm64-v8a", "-create-avd", "TV"]).contains("AVD 'TV' already exists")
+    );
+    let missing = m.err(&["-provision", "99", "-tag", "android-tv", "-abi", "arm64-v8a", "-no-renderer"]);
     assert!(
         missing.contains("system-images;android-99;android-tv;arm64-v8a") && missing.contains("emu -list-images -tag android-tv"),
         "{missing}"
@@ -154,7 +156,7 @@ fn provisions_an_image_into_an_empty_sdk_and_plans_its_avd() {
 #[test]
 fn a_dry_run_names_what_a_boot_would_miss() {
     let m = mirror("missing");
-    m.ok(&["-provision", "34", "-tag", "android-tv", "-no-renderer", "-create-avd", "TV"]);
+    m.ok(&["-provision", "34", "-tag", "android-tv", "-abi", "arm64-v8a", "-no-renderer", "-create-avd", "TV"]);
     std::fs::remove_file(m.sdk("system-images/android-34/android-tv/arm64-v8a/vendor.img")).expect("rm");
     let out = m.emu(&["-avd", "TV", "-dry-run"]);
     assert!(!out.status.success());
