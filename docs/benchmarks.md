@@ -174,4 +174,7 @@ Claims that would belong in the README once someone runs them:
 - Time per automation step (tap, then screenshot) through the socket API against `simctl` and
   against `adb` on the SDK emulator.
 - Host CPU of an idle booted device, emu against the SDK emulator.
+- Host CPU of an idle booted device with and without the virtio-snd card (`EMU_VIRTIO_SND=0`),
+  median of 3 boots each on the same host and day (an earlier sample on API 36 showed no
+  difference, but its boots and command weren't recorded).
 - A farm of SDK emulators on the same host, to compare with the emu farm above.
