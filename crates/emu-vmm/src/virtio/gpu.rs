@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use emu_gfxstream::{Backing, Box3, Fence, Renderer, ResourceCreateArgs};
 use emu_hvf::{GuestRam, Vm};
 
+use super::legacy_asg::{self, LegacyAsg};
 use super::mmio::{F_RING_EVENT_IDX, F_RING_INDIRECT_DESC};
 use super::queue::{Chain, Queue};
 use super::{Activation, INT_USED_RING, Interrupt, VirtioDevice};
@@ -255,6 +256,7 @@ impl VirtioDevice for Gpu {
             capsets,
             resources: HashMap::new(),
             contexts: HashSet::new(),
+            legacy_asg: LegacyAsg::default(),
             scanout: None,
             pending: Vec::new(),
             fence_ids: FenceIds::after(&LAST_FENCE_ID),
@@ -290,6 +292,37 @@ struct Resource {
     format: u32,
     /// Guest physical range the blob is mapped at (unmapped on unref).
     mapped: Option<(u64, usize)>,
+    /// The context that created this blob; None for other resources.
+    blob_of: Option<u32>,
+    /// A custom buffer's guest backing (`addr`, `len`), kept since the device may write it: the
+    /// response page of address-space graphics the old way ([`legacy_asg`]). Other resources
+    /// keep none.
+    custom_backing: Option<Vec<(u64, u32)>>,
+}
+
+/// `RESOURCE_CREATE_3D` of a custom buffer (`PIPE_BUFFER`, `VIRGL_BIND_CUSTOM`): a pipe or
+/// response page.
+fn is_custom_buffer(target: u32, bind: u32) -> bool {
+    const PIPE_BUFFER: u32 = 0;
+    const VIRGL_BIND_CUSTOM: u32 = 1 << 17;
+    target == PIPE_BUFFER && bind == VIRGL_BIND_CUSTOM
+}
+
+/// Writes `words` (little-endian) at the start of guest backing `backing`, across its entries.
+fn write_words(mem: &GuestRam, backing: &[(u64, u32)], words: &[u32]) -> bool {
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut rest = &bytes[..];
+    for &(addr, len) in backing {
+        if rest.is_empty() {
+            break;
+        }
+        let n = rest.len().min(len as usize);
+        if mem.write(addr, &rest[..n]).is_err() {
+            return false;
+        }
+        rest = &rest[n..];
+    }
+    rest.is_empty()
 }
 
 #[derive(Clone, Copy)]
@@ -476,6 +509,20 @@ fn backing(mem: &GuestRam, req: &[u8], at: usize, n: u32) -> Option<Backing> {
     Some(b)
 }
 
+/// The guest memory entries of a request (`addr: u64, len: u32, pad: u32`), as they are; the
+/// caller has checked they're all in the request ([`backing`]).
+fn guest_entries(req: &[u8], at: usize, n: u32) -> Vec<(u64, u32)> {
+    req.get(at..at + n as usize * 16).map_or_else(Vec::new, |b| b.as_chunks::<16>().0.iter().map(|e| (le64(e, 0), le32(e, 8))).collect())
+}
+
+/// A two-word gfxstream command (`GFXSTREAM_CONTEXT_CREATE` / `_PING` of `resource`).
+fn asg_command(op: u32, resource: u32) -> [u8; 8] {
+    let mut c = [0u8; 8];
+    c[..4].copy_from_slice(&op.to_le_bytes());
+    c[4..].copy_from_slice(&resource.to_le_bytes());
+    c
+}
+
 fn rect(b: &[u8], o: usize) -> (u32, u32, u32, u32) {
     (le32(b, o), le32(b, o + 4), le32(b, o + 8), le32(b, o + 12))
 }
@@ -490,6 +537,8 @@ struct Worker {
     resources: HashMap<u32, Resource>,
     /// Contexts the guest created and hasn't destroyed.
     contexts: HashSet<u32>,
+    /// Contexts that set up address-space graphics the way API 31–33 guests do.
+    legacy_asg: LegacyAsg,
     scanout: Option<Scanout>,
     pending: Vec<Pending>,
     fence_ids: FenceIds,
@@ -561,6 +610,7 @@ impl Worker {
         self.scanout = None;
         let r = &self.cfg.renderer;
         let release = release_all(&mut self.resources, &mut self.contexts);
+        self.legacy_asg.clear();
         for &(id, ipa, len) in &release.unmap {
             let _ = Vm::unmap_raw(ipa, len);
             let _ = r.unmap(id);
@@ -780,6 +830,7 @@ impl Worker {
             }
             cmd::CTX_DESTROY => {
                 self.contexts.remove(&h.ctx_id);
+                self.legacy_asg.destroy(h.ctx_id);
                 r.context_destroy(h.ctx_id);
                 ok
             }
@@ -808,6 +859,7 @@ impl Worker {
             }
             cmd::RESOURCE_CREATE_3D => {
                 let v: Vec<u32> = (0..11).map(|i| le32(req, 24 + i * 4)).collect();
+                let custom = is_custom_buffer(v[1], v[3]);
                 let args = ResourceCreateArgs {
                     handle: v[0],
                     target: v[1],
@@ -821,10 +873,15 @@ impl Worker {
                     nr_samples: v[9],
                     flags: v[10],
                 };
-                self.create(v[0], args, v[4], v[5], v[2])
+                let res = self.create(v[0], args, v[4], v[5], v[2]);
+                if custom && let Some(r) = self.resources.get_mut(&v[0]) {
+                    r.custom_backing = Some(Vec::new());
+                }
+                res
             }
             cmd::RESOURCE_UNREF => {
                 let id = le32(req, 24);
+                self.legacy_asg.unref(id);
                 if let Some(res) = self.resources.remove(&id) {
                     if let Some((ipa, len)) = res.mapped {
                         let _ = Vm::unmap_raw(ipa, len);
@@ -840,7 +897,12 @@ impl Worker {
             cmd::RESOURCE_ATTACH_BACKING => {
                 let (id, n) = (le32(req, 24), le32(req, 28));
                 match self.backing(req, 32, n) {
-                    Some(b) => or(r.attach_backing(id, b), cmd::ERR_UNSPEC),
+                    Some(b) => {
+                        if let Some(keep) = self.resources.get_mut(&id).and_then(|r| r.custom_backing.as_mut()) {
+                            *keep = guest_entries(req, 32, n);
+                        }
+                        or(r.attach_backing(id, b), cmd::ERR_UNSPEC)
+                    }
                     None => cmd::ERR_INVALID_PARAMETER,
                 }
             }
@@ -872,16 +934,41 @@ impl Worker {
                 // memory, as crosvm and QEMU make, so the renderer never decodes memory the guest
                 // can still change.
                 let Some(buf) = req.get_mut(32..32 + size) else { return cmd::ERR_INVALID_PARAMETER };
-                or(r.submit(h.ctx_id, buf), cmd::ERR_UNSPEC)
+                let resources = &self.resources;
+                let ctx_blob = |id: u32| resources.get(&id).is_some_and(|res| res.blob_of == Some(h.ctx_id));
+                match self.legacy_asg.submit(h.ctx_id, buf, ctx_blob) {
+                    legacy_asg::Submit::Pass => or(r.submit(h.ctx_id, buf), cmd::ERR_UNSPEC),
+                    legacy_asg::Submit::Done => ok,
+                    legacy_asg::Submit::Respond { resource, words } => {
+                        let page = self.resources.get(&resource).and_then(|res| res.custom_backing.as_deref());
+                        if page.is_some_and(|b| write_words(&self.mem, b, &words)) { ok } else { cmd::ERR_INVALID_RESOURCE_ID }
+                    }
+                    legacy_asg::Submit::Ping { resource } => {
+                        let mut ping = asg_command(legacy_asg::OP_PING, resource);
+                        or(r.submit(h.ctx_id, &mut ping), cmd::ERR_UNSPEC)
+                    }
+                }
             }
             cmd::RESOURCE_CREATE_BLOB => {
                 let (id, blob_mem, blob_flags, n) = (le32(req, 24), le32(req, 28), le32(req, 32), le32(req, 36));
                 let (blob_id, size) = (le64(req, 40), le64(req, 48));
                 let Some(backing) = self.backing(req, 56, n) else { return cmd::ERR_INVALID_PARAMETER };
+                // An API 31–33 guest's ring, by the host memory id it was given: the renderer's
+                // ring blob (blob id 0), then the new protocol's create for it.
+                let ring = self.legacy_asg.is_ring(h.ctx_id, blob_id);
+                let blob_id = if ring { 0 } else { blob_id };
                 match r.create_blob(h.ctx_id, id, blob_mem, blob_flags, blob_id, size, backing) {
                     Ok(()) => {
                         created(id);
-                        self.resources.insert(id, Resource::default());
+                        self.resources.insert(id, Resource { blob_of: Some(h.ctx_id), ..Default::default() });
+                        if ring {
+                            let mut create = asg_command(legacy_asg::OP_CREATE, id);
+                            if let Err(e) = r.submit(h.ctx_id, &mut create) {
+                                eprintln!("emu: gpu: address-space graphics ring {id} on context {}: {e}", h.ctx_id);
+                                return cmd::ERR_UNSPEC;
+                            }
+                            self.legacy_asg.ring_created(h.ctx_id, id);
+                        }
                         ok
                     }
                     Err(e) => {
@@ -938,7 +1025,7 @@ impl Worker {
         match self.cfg.renderer.resource_create(args, &[]) {
             Ok(()) => {
                 created(id);
-                self.resources.insert(id, Resource { width, height, format, mapped: None });
+                self.resources.insert(id, Resource { width, height, format, ..Default::default() });
                 cmd::OK_NODATA
             }
             Err(e) => {
@@ -1116,7 +1203,7 @@ mod tests {
     #[test]
     fn a_reset_releases_every_mapping_context_and_resource() {
         let mut resources = HashMap::from([
-            (7, Resource { width: 720, height: 1280, format: 1, mapped: None }),
+            (7, Resource { width: 720, height: 1280, format: 1, ..Default::default() }),
             (3, Resource { mapped: Some((0x2_0000_0000, 0x4000)), ..Default::default() }),
             (9, Resource { mapped: Some((0x2_0001_0000, 0x1000)), ..Default::default() }),
             (1, Resource::default()),
@@ -1206,6 +1293,24 @@ mod tests {
         assert!(backing(&mem, &outside, 8, 2).is_none(), "an entry outside guest RAM");
         let wraps = entries(&[(u64::MAX - 10, 4096)]);
         assert!(backing(&mem, &wraps, 8, 1).is_none());
+    }
+
+    #[test]
+    fn a_response_page_gets_the_answer_across_its_entries() {
+        let mem = ram();
+        // A response page in two pieces, as ATTACH_BACKING lists them.
+        let req = entries(&[(RAM_BASE + 0x5000, 12), (RAM_BASE + 0x9000, 4096)]);
+        let page = guest_entries(&req, 8, 2);
+        assert_eq!(page, [(RAM_BASE + 0x5000, 12), (RAM_BASE + 0x9000, 4096)]);
+        let words: Vec<u32> = (1..=10).collect();
+        assert!(write_words(&mem, &page, &words));
+        let mut got = [0u8; 40];
+        mem.read(RAM_BASE + 0x5000, &mut got[..12]).expect("first");
+        mem.read(RAM_BASE + 0x9000, &mut got[12..]).expect("second");
+        assert_eq!(got.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect::<Vec<_>>(), words);
+        assert!(!write_words(&mem, &page[..1], &words), "a page too small for the answer");
+        assert!(guest_entries(&req, 8, 3).is_empty(), "more entries than the request holds");
+        assert!(is_custom_buffer(0, 1 << 17) && !is_custom_buffer(2, 1 << 17) && !is_custom_buffer(0, 2));
     }
 
     /// One control command through the queue as the worker runs it (pop, read, parse, reply,

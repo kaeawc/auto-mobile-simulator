@@ -460,6 +460,9 @@ impl NewAvd {
 impl Env {
     /// Creates an AVD the way the SDK's avdmanager lays it out (`<name>.ini` pointer and
     /// `<name>.avd/config.ini`), with no Java involved. Refuses to overwrite an existing AVD.
+    /// It writes no `fastboot.*` keys: emu has no snapshots and ignores them, and the stock
+    /// emulator then quick-boots the AVD as it would one avdmanager made (with
+    /// `fastboot.forceColdBoot=yes` its quick boots took 15 s instead of 2.8 s).
     pub fn create_avd(&self, spec: &NewAvd) -> Result<PathBuf> {
         if !valid_avd_name(&spec.name) {
             return Err(Error::Config(format!("invalid AVD name '{}' (letters, digits, . _ -)", spec.name)));
@@ -485,7 +488,7 @@ impl Env {
             "AvdId={name}\navd.ini.displayname={name}\nabi.type={abi}\nhw.cpu.arch={arch}\nhw.cpu.ncore={cores}\n\
              hw.ramSize={ram}\nhw.lcd.width={w}\nhw.lcd.height={h}\nhw.lcd.density={dpi}\nhw.gpu.enabled=yes\n\
              hw.gpu.mode=auto\nhw.keyboard=yes\nhw.mainKeys={main_keys}\nhw.dPad={dpad}\nhw.trackBall=no\n\
-             hw.sdCard=no\nimage.sysdir.1={sysdir}\ntag.id={tag}\ndisk.dataPartition.size={data}G\nfastboot.forceColdBoot=yes\n",
+             hw.sdCard=no\nimage.sysdir.1={sysdir}\ntag.id={tag}\ndisk.dataPartition.size={data}G\n",
             name = spec.name,
             cores = spec.cores,
             ram = spec.ram_mb,
@@ -1092,6 +1095,9 @@ mod tests {
         assert!(env.create_avd(&spec).is_err());
         assert!(env.create_avd(&NewAvd::new("../evil", "a/b/c")).is_err());
         assert_eq!(made.profile().kind.form_factor, FormFactor::Phone);
+        // No `fastboot.*` keys: emu has no snapshots and ignores them, and the stock emulator
+        // keeps its own default (quick boot) on an AVD emu made, as on one avdmanager made.
+        assert!(made.config.keys().all(|k| !k.starts_with("fastboot.")), "{:?}", made.config.keys().collect::<Vec<_>>());
 
         // Form factors come back from what was written: a foldable's hinge, a Wear image's tag.
         let fold = sim_core::form_factor::Kind::new(sim_core::platform::Platform::Android, FormFactor::Foldable).expect("fold").profile();
