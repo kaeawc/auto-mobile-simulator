@@ -144,6 +144,26 @@ without one fails that input with `Unavailable`, never a crash.
 - **iPhone and iPad**: `rotate` sends the GSEvent orientation message Simulator.app's Rotate
   Left/Right send, to SpringBoard's `PurpleWorkspacePort`; without `orientation` it turns 90°
   clockwise from the last orientation simee set.
+- **iPad**: `swipe --edge` (and `touch`'s `edge`) sets the edge flag Simulator.app sets on a
+  drag that starts on the bezel (`IndigoHIDMessageForMouseNSEvent`'s `IndigoHIDEdge`: top 1, left
+  2, bottom 3, right 4; SpringBoard logs them as `UIRectEdge` 1, 2, 4, 8). Without it a swipe from
+  the edge pixel is an ordinary touch: it scrolls or draws in the app and never goes home. From the
+  bottom a fast swipe goes home and a slow one (or `--settle`) opens the app switcher; from the top
+  left Notification Center, top right Control Center, top middle the iPadOS 26 menu bar. iPhones
+  take the same flag. `pointer` creates the guest's mouse service
+  (`IndigoHIDMessageToCreateMouseService`, whose message names the service's target) and sends it
+  relative motion and button events (event types `0x11` and `0x7a41`, the layout SimulatorKit's
+  `IndigoHIDMessageForPointerEventFromHIDEventRef` writes, built by `sim_core::indigo`); iPadOS
+  then shows its pointer (in screenshots too), hover effects and Trackpad & Mouse settings. Motion
+  is only relative, so each call homes the pointer against the left and bottom edges (never the top,
+  where iPadOS opens Notification or Control Center, nor a corner, which the rounded screen stops
+  short) and moves in 10 pt steps: exact on iOS 26.5, within ~20 pt on 27.2, whose pointer
+  accelerates even slow motion. `pointer --to` drags in one call; a button held by `pointer … down`
+  keeps the position for the next calls on the same server (`simee serve`), while separate CLI
+  processes home the pointer again. `pencil` sends a touch whose finger is a stylus (the guest's `SimulatorHID` copies
+  the transducer type into the `IOHIDEvent`), which apps see as `UITouch.type == .pencil` and
+  draw with. Checked on iPad Pro 13-inch (M5) clones on iOS 26.5 and 27.2 with a probe app that
+  logs every touch and hover, and with the AutoMobile harness.
 - **CarPlay**: `carplay on` writes the device's StarkConfig (`extended_display.plist`: 800×480 @2x,
   touch), sets the iPhone's TVOut screen to that mode with CarPlay properties (found through the
   framebuffer server's screen adapter; an already-on plain display is turned off first, or the
@@ -186,5 +206,7 @@ What is modelled and labelled but not (or not verifiably) working end to end:
 | Android XR | Not booted on simee yet. Checked offline against `google-xr` 34 r7: its fstab, modules and input `.idc` names match the board, and its features ask for what simee gives it (`GuestAngle`, `VirtioDualModeMouse`). It enables `VirtioSndCard`, so simee gives it the virtio-snd card as stock does; its ranchu audio HAL, the phones' one, plays through it (booted on phones, Wear and TV, not yet on XR). The room renders in the guest through gfxstream (simee already defaults to ANGLE), but stock's other XR feature flags (`XrModeUI`, `XrHandAndEyePointers`, `VirtioMouse`, `MultiDisplay`, `BluetoothEmulation`) have no simee equivalent yet. The dual-mode mouse matches stock's device (name, ids, event bits, axes); how the guest maps it to its hand ray and gaze pointers, and whether head pose, options, hand and eye events over `xr_service` take effect, is unverified. auto-mobile's `xrHeadsetInput` (auto-mobile #19076) sends hand and eye events over stock's gRPC `streamInputEvent`, which simee doesn't serve yet (its gRPC `EmulatorController` is on the roadmap); `xr hand`/`xr eye` put the same messages on the guest's pipe. The display glasses' temple touchpad (`hw.touchpad0`, 1542×297, which the `ai-glasses` image configures as `virtio_input_multi_touch_touchpad_0`) is attached and driven by `touchpad`, but how the guest's UI reacts to it is unverified. Only images that enable `VirtioDualModeMouse` (the headsets, not the glasses) get the dual-mode mouse, as on stock. |
 | Apple Watch, Apple TV | The crown, gestures, Siri Remote buttons and touch surface use the messages Simulator.app sends (confirmed live by other projects on watchOS/tvOS 26.5 and 27), but not run by simee. The crown's units per tick are a calibration. From Xcode 27 the guest can switch input to `dtuhidd` (once `com.apple.coredevice.dtuhidd.active` is set, e.g. by Device Hub), after which legacy HID buttons and keys are dropped; simee doesn't detect that yet. |
 | Vision Pro | Gaze, pinch and the camera (look around, pan, orbit) go through Xcode's visionOS UI plugin in Simulator.app, whose messages aren't public; simee sends plain touches, which no source confirms visionOS honours. auto-mobile can't script visionOS input either (auto-mobile #19055). |
+| iPad Pencil | Pressure, tilt, hover and the barrel (double-tap, squeeze) aren't reachable: the guest's `SimulatorHID` makes every touch with `IOHIDEventCreateDigitizerFingerEvent` and copies only position, the transducer type, radii and quality fields, so altitude and azimuth stay π/2 and 0; `UITouch.force` and `maximumPossibleForce` stay 0 because the screen's digitizer has no force (the iPad device types say `SupportsForceTouch` false; a pencil digitizer service, which backboardd looks for, isn't one Indigo can create), and Simulator.app's own pressure message (`IndigoHIDMessageForPressureEvent`) changes nothing on an iPad either. A contact in range but not touching makes no hover. Simulator.app has no Pencil input at all; the barrel gestures come from the Pencil's own accessory, which no HID message models. The simulator runtimes ship no Notes app, so drawing was checked in a probe app. |
+| iPad pointer | Positions are open loop (the guest takes relative motion only): ~20 pt off on iOS 27.2; turning off pointer acceleration in the guest's settings might make them exact (not tried). Pointer coordinates assume portrait. No scroll wheel or trackpad gestures yet (the guest also takes scroll and dock-swipe events). |
 | iOS rotation | Runtimes that report device motion can ignore the orientation event (idb switches to a vendor-defined HID message through `dtuhidd` there); not handled. |
 | Every Apple form factor | Needs a Mac with the runtime installed; none could be booted in the environment the combined project was built in. |

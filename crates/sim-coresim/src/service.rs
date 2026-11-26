@@ -846,7 +846,9 @@ impl Device {
     /// A HID input session. The device must be booted. Buttons and form-factor inputs follow the
     /// device's form factor (the Siri Remote on Apple TV, the crown on Apple Watch).
     pub fn hid(&self) -> Result<Hid> {
-        Hid::connect(&self.obj, self.kit, self.info().form_factor)
+        // The scale turns the pointer's pixels into the points it moves in; 0 where unknown.
+        let scale = self.device_type().map_or(0.0, |t| t.screen_scale);
+        Hid::connect(&self.obj, self.kit, self.info().form_factor, scale)
     }
 
     /// Attaches (or detaches) the CarPlay display to this iPhone and creates (or removes) the

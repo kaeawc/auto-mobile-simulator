@@ -221,6 +221,10 @@ enum Cmd {
         /// `carplay` for an iPhone's CarPlay screen.
         #[arg(long, default_value = "main")]
         display: String,
+        /// iOS: the touch comes in from this screen edge (top, bottom, left, right), as a drag from
+        /// Simulator.app's bezel: `--edge bottom` from the bottom goes home.
+        #[arg(long)]
+        edge: Option<String>,
     },
     /// Press a hardware button: home, lock (power), side, siri, apple-pay, action (iOS); back,
     /// volume-up, volume-down, recents, menu (Android); up, down, left, right, select, play-pause
@@ -302,6 +306,39 @@ enum Cmd {
     WatchGesture { device: String, gesture: String },
     /// Swipe on the Siri Remote's touch surface (Apple TV): up, down, left or right.
     RemoteSwipe { device: String, direction: String },
+    /// The iPad's pointer: move it to a point in pixels and hover, or click, press (down) or
+    /// release (up) a button there, or drag with --to X2 Y2.
+    Pointer {
+        device: String,
+        x: f64,
+        y: f64,
+        /// move (the default), click, down or up.
+        action: Option<String>,
+        /// primary (the default) or secondary.
+        #[arg(long, default_value = "primary")]
+        button: String,
+        /// How long a click holds the button, in milliseconds.
+        #[arg(long, default_value_t = 80)]
+        hold: u64,
+        /// Drag to this point instead (press at X Y, move, release).
+        #[arg(long, num_args = 2, value_names = ["X2", "Y2"])]
+        to: Option<Vec<f64>>,
+    },
+    /// Apple Pencil on an iPad's screen, in pixels: X Y [tap|down|move|up], or a stroke with
+    /// --to X2 Y2. Apps see a pencil touch (no pressure, tilt or hover in the simulator).
+    Pencil {
+        device: String,
+        x: f64,
+        y: f64,
+        /// tap (the default), down, move or up.
+        phase: Option<String>,
+        /// Draw a stroke to this point instead.
+        #[arg(long, num_args = 2, value_names = ["X2", "Y2"])]
+        to: Option<Vec<f64>>,
+        /// The stroke's duration.
+        #[arg(long, default_value_t = 300)]
+        duration_ms: u64,
+    },
     /// Attach (`on`) or detach (`off`) an iPhone's CarPlay display (iOS 26 runtimes).
     Carplay { device: String, state: String },
     /// Android Automotive's vehicle HAL: list every property, read one, or set one, e.g.
@@ -611,9 +648,9 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             call("tap", json!({"device": device, "x": x, "y": y, "hold_ms": hold, "display": display}))?;
             input = true;
         }
-        Cmd::Swipe { device, x1, y1, x2, y2, duration, settle, display } => {
+        Cmd::Swipe { device, x1, y1, x2, y2, duration, settle, display, edge } => {
             let params = json!({"device": device, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": duration, "settle": settle,
-                "display": display});
+                "display": display, "edge": edge});
             call("swipe", params)?;
             input = true;
         }
@@ -677,6 +714,23 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
         }
         Cmd::RemoteSwipe { device, direction } => {
             call("remote_swipe", json!({"device": device, "direction": direction}))?;
+            input = true;
+        }
+        Cmd::Pointer { device, x, y, action, button, hold, to } => {
+            let mut params = json!({"device": device, "x": x, "y": y, "action": action, "button": button, "hold_ms": hold});
+            if let Some([tx, ty]) = to.as_deref() {
+                params["to_x"] = json!(tx);
+                params["to_y"] = json!(ty);
+            }
+            call("pointer", params)?;
+            input = true;
+        }
+        Cmd::Pencil { device, x, y, phase, to, duration_ms } => {
+            let params = match to.as_deref() {
+                Some([tx, ty]) => json!({"device": device, "x": x, "y": y, "to_x": tx, "to_y": ty, "duration_ms": duration_ms}),
+                _ => json!({"device": device, "x": x, "y": y, "phase": phase.as_deref().unwrap_or("tap")}),
+            };
+            call("pencil", params)?;
             input = true;
         }
         Cmd::Carplay { device, state } => {

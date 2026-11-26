@@ -70,8 +70,8 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `screen` | Android, iOS | device, display?(main\|carplay) | Screen size in pixels |
 | `screenshot` | Android, iOS | device, path?, display?(main\|carplay) | PNG to path, else base64 in `png` |
 | `tap` | Android, iOS | device, x, y, hold_ms?, display?(main\|carplay) | Tap at pixels (display: an iPhone's CarPlay screen, iOS only) |
-| `swipe` | Android, iOS | device, x1, y1, x2, y2, duration_ms?, settle?, display? | Swipe between pixels |
-| `touch` | Android, iOS | device, x, y, phase(down\|move\|up), display? | One raw touch sample |
+| `swipe` | Android, iOS | device, x1, y1, x2, y2, duration_ms?, settle?, display?, edge?(top\|bottom\|left\|right; iOS) | Swipe between pixels; with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: home and the app switcher from the bottom, Notification Center and Control Center from the top (Android's edge gestures need only the start point) |
+| `touch` | Android, iOS | device, x, y, phase(down\|move\|up), display?, edge?(top\|bottom\|left\|right; iOS) | One raw touch sample |
 | `button` | Android, iOS | device, button(home\|lock\|side\|siri\|apple-pay\|action \| back\|volume-up\|volume-down\|recents\|menu\|up\|down\|left\|right\|select\|play-pause), hold_ms? | Press a hardware button, as the device's form factor has it: the Siri Remote on Apple TV (menu/back, home, select, play-pause, arrows) and the D-pad on Android TV; on Apple Watch home is the crown's press |
 | `type` | Android, iOS | device, text | Type on the hardware keyboard |
 | `key` | Android, iOS | device, usage | Press a key by HID usage |
@@ -136,4 +136,6 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `vehicle` | Android | device, property?(VHAL name or id: GEAR_SELECTION, gear, speed, 0x11600207, ...), area_id?, value? | Android Automotive's vehicle HAL: list every property's value, read one, or set one when `value` is given (typed by the property: drive, 12.5, true); through the emulator console's `car` command (simee) |
 | `watch_gesture` | iOS | device, gesture(double-tap\|wrist-flick) | An Apple Watch hand gesture |
 | `remote_swipe` | iOS | device, direction(up\|down\|left\|right), duration_ms? | Swipe on the Siri Remote's touch surface (Apple TV) |
+| `pointer` | iOS | device, x, y, action?(move\|click\|down\|up), button?(primary\|secondary), hold_ms? \| x, y, to_x, to_y, button? (a drag) | The iPad's pointer (a mouse, as Simulator.app's pointer capture connects): move it to pixels and hover there, click, press or release a button there, or drag to to_x, to_y. Exact on iOS 26.5, within ~20 pt on 27.2. A button held by `down` keeps the pointer's place for the next calls on a server (`simee serve`) |
+| `pencil` | iOS | device, x, y, phase?(tap\|down\|move\|up), hold_ms? \| x, y, to_x, to_y, duration_ms? (a stroke) | Apple Pencil on an iPad's screen at pixels (UITouch type .pencil): tap, one phase, or a stroke; no pressure, tilt or hover (the simulator's touch screen has none) |
 | `carplay` | iOS | device, on | Attach (or detach) the CarPlay display to a booted iPhone (iOS 26 runtimes); then tap/swipe/screenshot with display=carplay |
