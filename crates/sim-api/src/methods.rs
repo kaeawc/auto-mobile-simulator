@@ -75,8 +75,14 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("screen", "device, display?(main|carplay)", "Screen size in pixels"),
     ("screenshot", "device, path?, display?(main|carplay)", "PNG to path, else base64 in `png`"),
     ("tap", "device, x, y, hold_ms?, display?(main|carplay)", "Tap at pixels (display: an iPhone's CarPlay screen, iOS only)"),
-    ("swipe", "device, x1, y1, x2, y2, duration_ms?, settle?, display?", "Swipe between pixels"),
-    ("touch", "device, x, y, phase(down|move|up), display?", "One raw touch sample"),
+    (
+        "swipe",
+        "device, x1, y1, x2, y2, duration_ms?, settle?, display?, edge?(top|bottom|left|right; iOS)",
+        "Swipe between pixels; with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: \
+         home and the app switcher from the bottom, Notification Center and Control Center from the top (Android's edge \
+         gestures need only the start point)",
+    ),
+    ("touch", "device, x, y, phase(down|move|up), display?, edge?(top|bottom|left|right; iOS)", "One raw touch sample"),
     (
         "button",
         "device, button(home|lock|side|siri|apple-pay|action | back|volume-up|volume-down|recents|menu|up|down|left|right|select|play-pause), hold_ms?",
@@ -181,8 +187,10 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     (
         "stylus",
         "device, x, y, phase?(tap|hover|down|move|up|leave), pressure?(1-255), button?, eraser? | x, y, to_x, to_y, duration_ms? (a stroke)",
-        "A stylus on the touch screen at pixels, what the stock emulator's gRPC pen events send: hover over it, touch, move, \
-         lift or leave, with the barrel button or the eraser end; or draw a stroke",
+        "A stylus on the touch screen at pixels. Android: what the stock emulator's gRPC pen events send: hover over it, \
+         touch, move, lift or leave, with the barrel button or the eraser end; or draw a stroke. iPad: the Apple Pencil \
+         (UITouch type .pencil): tap, down, move, up or a stroke; hover, pressure, button and eraser are refused (the \
+         simulator's touch screen has none)",
     ),
     (
         "rotary",
@@ -197,6 +205,14 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     ("watch_gesture", "device, gesture(double-tap|wrist-flick)", "An Apple Watch hand gesture"),
     ("remote_swipe", "device, direction(up|down|left|right), duration_ms?", "Swipe on the Siri Remote's touch surface (Apple TV)"),
+    (
+        "pointer",
+        "device, x, y, action?(move|click|down|up), button?(primary|secondary), hold_ms? | x, y, to_x, to_y, button? (a drag)",
+        "The iPad's pointer (a mouse, as Simulator.app's pointer capture connects): move it to pixels and hover there, click, \
+         press or release a button there, or drag to to_x, to_y. Exact on iOS 26.5, within ~20 pt on 27.2. A button held by \
+         `down` keeps the pointer's place for the next calls on a server (`simee serve`) until a reboot; `down` without a \
+         server, `up` with nothing held, and `move`/`up` after a failed call lost the held button are refused",
+    ),
     (
         "carplay",
         "device, on",
@@ -243,9 +259,10 @@ const ALL_PLATFORMS: &[&str] = &[
     "info",
     "rotate",
     "rotary",
+    "stylus",
 ];
 /// Methods only Android devices have.
-const ANDROID_ONLY: &[&str] = &["console", "fold", "xr", "vehicle", "touchpad", "stylus"];
+const ANDROID_ONLY: &[&str] = &["console", "fold", "xr", "vehicle", "touchpad"];
 
 /// The platforms whose devices `method` works on.
 pub fn platforms(method: &str) -> &'static [Platform] {
@@ -439,6 +456,9 @@ mod tests {
         assert_eq!(find("rotate")["platforms"], json!(["android", "ios"]));
         assert_eq!(find("carplay")["platforms"], json!(["ios"]));
         assert_eq!(find("watch_gesture")["platforms"], json!(["ios"]));
+        assert_eq!(find("pointer")["platforms"], json!(["ios"]));
+        assert_eq!(find("stylus")["platforms"], json!(["android", "ios"]));
+        assert!(help.as_array().expect("array").iter().all(|m| m["method"] != "pencil"), "`stylus` is the one pen method");
         assert_eq!(find("vehicle")["platforms"], json!(["android"]));
         assert!(help.as_array().expect("array").iter().all(|m| m["platforms"].as_array().is_some_and(|p| !p.is_empty())));
     }
