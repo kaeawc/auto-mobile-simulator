@@ -79,20 +79,30 @@ impl PortBackend for Writer {
 /// blocks: when `depth` chunks are already waiting it drops the chunk and counts its bytes; the
 /// writer thread notes the loss in the stream (`[emu: N bytes dropped ...]`) before the next
 /// chunk it writes. Clones share the queue; the thread ends when every clone is gone.
+///
+/// A [`Tap`] ([`Spool::with_tap`], [`Spool::tap_only`]) reads every chunk on the sender's thread
+/// before it's queued, so it never misses one however far the writer falls behind: for a reader
+/// that must see each line (emu's watch for the guest's rotation) and is cheap enough to run
+/// inline.
 #[derive(Clone)]
 pub struct Spool {
-    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    /// None with only a tap.
+    tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     /// Bytes dropped so far.
     dropped: Arc<std::sync::atomic::AtomicU64>,
     /// Dropped but not yet noted in the stream.
     unreported: Arc<std::sync::atomic::AtomicU64>,
+    tap: Option<Arc<std::sync::Mutex<Tap>>>,
 }
+
+/// Reads a [`Spool`]'s chunks inline, as they're sent.
+pub type Tap = Box<dyn FnMut(&[u8]) + Send>;
 
 impl Spool {
     pub fn new(name: &str, mut out: Box<dyn std::io::Write + Send>, depth: usize) -> std::io::Result<Spool> {
         use std::sync::atomic::Ordering::Relaxed;
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(depth);
-        let spool = Spool { tx, dropped: Default::default(), unreported: Default::default() };
+        let spool = Spool { tx: Some(tx), dropped: Default::default(), unreported: Default::default(), tap: None };
         let unreported = spool.unreported.clone();
         std::thread::Builder::new().name(name.into()).spawn(move || {
             // Writes logcat to a file: nothing in the guest waits on it.
@@ -109,13 +119,29 @@ impl Spool {
         Ok(spool)
     }
 
-    /// Queues `data`, or drops it when the queue is full or the writer has gone.
+    /// `tap` reads every chunk too, before it's queued.
+    pub fn with_tap(mut self, tap: Tap) -> Spool {
+        self.tap = Some(Arc::new(std::sync::Mutex::new(tap)));
+        self
+    }
+
+    /// A spool with no writer: `tap` reads every chunk, and nothing is queued or dropped.
+    pub fn tap_only(tap: Tap) -> Spool {
+        Spool { tx: None, dropped: Default::default(), unreported: Default::default(), tap: None }.with_tap(tap)
+    }
+
+    /// Hands `data` to the tap, then queues it, or drops it when the queue is full or the writer
+    /// has gone.
     pub fn send(&self, data: &[u8]) {
         use std::sync::atomic::Ordering::Relaxed;
         if data.is_empty() {
             return;
         }
-        if self.tx.try_send(data.to_vec()).is_err() {
+        if let Some(tap) = &self.tap {
+            (tap.lock().unwrap_or_else(|e| e.into_inner()))(data);
+        }
+        let Some(tx) = &self.tx else { return };
+        if tx.try_send(data.to_vec()).is_err() {
             self.dropped.fetch_add(data.len() as u64, Relaxed);
             self.unreported.fetch_add(data.len() as u64, Relaxed);
         }
@@ -877,6 +903,34 @@ mod tests {
             text.split("[emu: ").skip(1).map(|s| s.split(' ').next().and_then(|n| n.parse::<u64>().ok()).expect("count")).sum();
         assert_eq!(noted, dropped, "{text}");
         assert_eq!(kept(text.as_bytes()), 1000 - dropped);
+    }
+
+    /// A tap reads every chunk as it's sent, while the writer is stuck and its queue drops them,
+    /// and with no writer at all.
+    #[test]
+    fn a_tap_reads_every_chunk_however_far_the_writer_falls_behind() {
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let seen = Shared::default();
+        let mut tapped = seen.clone();
+        let tap: Tap = Box::new(move |b| tapped.write_all(b).expect("tap"));
+        let spool = Spool::new("test-tap", Box::new(Gated(gate.clone(), Shared::default())), 2).expect("spool").with_tap(tap);
+        let mut port = Writer(spool);
+        for i in 0..50u8 {
+            port.guest_data(&[i]);
+            assert_eq!(seen.0.lock().expect("seen").len(), usize::from(i) + 1, "read before send returns");
+        }
+        assert!(port.0.dropped() >= 40, "the queue dropped: {}", port.0.dropped());
+        assert_eq!(*seen.0.lock().expect("seen"), (0..50).collect::<Vec<u8>>());
+        *gate.0.lock().expect("gate") = true;
+        gate.1.notify_all();
+
+        let only = Shared::default();
+        let mut tapped = only.clone();
+        let spool = Spool::tap_only(Box::new(move |b| tapped.write_all(b).expect("tap")));
+        spool.clone().send(b"one ");
+        spool.send(b"two");
+        assert_eq!(*only.0.lock().expect("only"), b"one two");
+        assert_eq!(spool.dropped(), 0);
     }
 
     #[test]

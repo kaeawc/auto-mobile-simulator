@@ -7,6 +7,7 @@ use rune::{Color, Cx, Drag, El, Icon, KeyEvent, Phase, PointerEvent, ScrollSpec,
 use sim_core::device::{DeviceInfo, DeviceState};
 use sim_core::form_factor::Shape;
 use sim_core::platform::Platform;
+use sim_core::rotation::Rotation;
 
 use crate::{Action, Input, State, icons};
 
@@ -204,10 +205,14 @@ fn placeholder(s: &State, t: Theme) -> El {
 fn screen(s: &State) -> El {
     let (w, h) = s.screen_size();
     let ratio = w as f32 / h.max(1) as f32;
-    let device = el().key("device-screen").aspect_fit(ratio).radius(screen_radius(s.shape, 10_000.0));
+    let corners = screen_radius(s.shape, 10_000.0);
+    let device = el().key("device-screen").aspect_fit(ratio).radius(corners);
+    let turn = s.screen_rotation();
     let device = match (&s.live, &s.screen) {
         (Some(_), _) => device.native_surface(&s.native, SurfaceFit::Fill),
+        (None, Some(sc)) if turn != Rotation::Deg0 => turned(device, &sc.pixels, turn, ratio, corners),
         (None, Some(sc)) => device.pixels_fit(&sc.pixels, SurfaceFit::Fill),
+        (None, None) if turn != Rotation::Deg0 => turned(device, &s.pixels, turn, ratio, corners),
         (None, None) => device.pixels(&s.pixels),
     };
     let device = device
@@ -259,6 +264,28 @@ fn screen(s: &State) -> El {
         None => stage,
     };
     stage.child(device)
+}
+
+/// `pixels` as a turned device's panel lies, drawn turned clockwise by `turn` to fill `device`,
+/// whose box has the upright screen's shape (`ratio`, width over height): Rune turns it as it
+/// draws (on the GPU), so no frame is turned on the CPU. The picture is sized as fractions of
+/// the box (sideways, its width is the box's height and its height the box's width), centred,
+/// so it fills the box from the first frame and follows it as the window resizes. It takes no
+/// input: `device` keeps its upright box, so pointer positions in it are the upright screen's.
+fn turned(device: El, pixels: &rune::Pixels, turn: Rotation, ratio: f32, corners: f32) -> El {
+    let (w, h) = if turn.is_sideways() { (1.0 / ratio.max(f32::EPSILON), ratio) } else { (1.0, 1.0) };
+    let picture = el()
+        .key("device-pixels")
+        .w_frac(w)
+        .h_frac(h)
+        .radius(corners)
+        .pixels_fit(pixels, SurfaceFit::Fill)
+        .rotate((turn.degrees() as f32).to_radians())
+        // The device turned: the picture shows the new way at once, as stock's window does,
+        // and follows the box as the window resizes rather than springing after it.
+        .instant_changes()
+        .enter_in_instant();
+    device.center().child(picture)
 }
 
 /// Corner radius, in points, for a screen of `width` points with this outline: a round watch is

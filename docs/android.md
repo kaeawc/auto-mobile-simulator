@@ -23,7 +23,7 @@ to use fewer resources.
 | Storage | virtio-blk with indirect descriptors, event-idx, and discard/write-zeroes (hole punching). System and vendor are copy-on-write in memory; userdata, cache and metadata persist per AVD. Userdata is created by a native ext4 formatter (no `mkfs.ext4`) |
 | Boot | Full Android boot to `sys.boot_completed`: 9.5 s cold, 3.5 s warm (stock: 22.9 s and 17.1 s; [benchmarks](benchmarks.md)); first boot formats and encrypts `/data`. System images from API 29 on; emu refuses older ones up front with the reason (`EMU_ALLOW_OLD_IMAGES=1` boots them anyway, to work on them). API 29 and 30 draw with the GLES encoder over the goldfish `opengles` pipe: each pipe gets a render channel of its own in the renderer, as stock gives it ([performance notes](#performance-notes)); the board has no virtio-gpu for them (their kernels oops on it, and stock gives them none). They also get adb over `qemud:adb` (a client that connects first waits for adbd's `accept`), the reference RIL's `qemud:gsm` modem, and `logcat -Q`'s `logcat` stream from stock's `qemu.cmdline` and `qemu.logcat` properties. API 29 `default` warm-boots in 4.8 s (stock 6.4 s), but its first boot hangs in the host renderer (a known gap: ANGLE on Metal faults, [performance notes](#performance-notes)); API 29 `default` and API 30 `google_apis` pass the AutoMobile harness (40 of 41 on API 30, 35 of 41 on API 29; device snapshots fail on every image, video recording as on API 31, and rotation and dark theme on API 29 fail on stock too; since the touch screen became stock's `virtio_input_multi_touch_1` (#69), AutoMobile's injected taps, multi-touch and pinch are cancelled on API 30, 2026-11-26). API 31 to 33 guests set up address-space graphics with the protocol before the renderer's; the GPU translates it (`virtio/legacy_asg.rs`, [#39](https://github.com/kaeawc/simee/issues/39)), and their GLES is the encoder on a renderer with GL, as stock runs them, since their ANGLE finds SurfaceFlinger no EGL config. Images without `AndroidbootProps2` (API 30 and older, kernels without bootconfig) get stock's legacy kernel command line (`qemu.*` names) instead of bootconfig |
 | adb | virtio-vsock with a host bridge on `console port + 1`, announced to the adb server. `adb shell`/`root`/`push` work, and the device shows up about 8 s after launch on a warm boot |
-| Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot`, `network speed|delay|status` (stock's presets, numbers and report, seeded by `-netspeed`/`-netdelay`; applied live in the NAT, `crates/emu-vmm/src/net/shape.rs`: a token bucket per direction, 0 = unlimited, each direction holds about a second of its rate and drops past that, as a bottleneck does (except small control frames, ARP replies and payload-free TCP segments, which take a bounded reserve of 16 frames past it), with TCP held back by the download queue's room; unshaped devices take the plain path with no shaper; inbound frames are delayed by a latency between min and max, in order. Verified in unit tests over loopback only: not yet measured in a guest under `network speed edge`, and `network speed` doesn't change the radio's reported data type), `avd snapshot` (answers as stock does without snapshot support: `save`/`load` are a `KO`, `list` is empty, `del` succeeds), plus simee's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
+| Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot` turned upright as the guest rotated its display (as `adb screencap` is), `network speed|delay|status` (stock's presets, numbers and report, seeded by `-netspeed`/`-netdelay`; applied live in the NAT, `crates/emu-vmm/src/net/shape.rs`: a token bucket per direction, 0 = unlimited, each direction holds about a second of its rate and drops past that, as a bottleneck does (except small control frames, ARP replies and payload-free TCP segments, which take a bounded reserve of 16 frames past it), with TCP held back by the download queue's room; unshaped devices take the plain path with no shaper; inbound frames are delayed by a latency between min and max, in order. Verified in unit tests over loopback only: not yet measured in a guest under `network speed edge`, and `network speed` doesn't change the radio's reported data type), `avd snapshot` (answers as stock does without snapshot support: `save`/`load` are a `KO`, `list` is empty, `del` succeeds), plus simee's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
 | Discovery | `-list-avds`, `pid_<pid>.ini` running-instance file, `emulator-<port>` serial on stdout |
 | Graphics | Home screen and apps render. virtio-gpu with gfxstream contexts on the host GPU: the guest's GLES through ANGLE on its Vulkan and, on images that map it (API 36 and newer, `VulkanVirtualQueue`), its UI and SurfaceFlinger drawn with Skia on that Vulkan, as stock's `GuestAngle` mode does, so the renderer runs without a GL backend (see "Vulkan-only renderer" below); Vulkan on MoltenVK (lavapipe fallback), Vulkan composition. Host-visible memory via blob mapping; goldfish address space (PCIe, shared-slot allocator) and goldfish pipe (refcounted color buffers) for the ranchu gralloc; guest `screencap` and host screenshots both work |
 | Input & sensors | virtio-input touchscreen, keyboard and rotary, plus stock's dual-mode mouse on XR images. The keyboard is stock's `qwerty2` (0627:0001, stock's key set), so goldfish's `qwerty2.kl` applies: HOME, D-pad centre (`KEY_CENTER`), Recents (580), media and stem keys arrive. The console takes every stock `KEY_*` name and numeric codes. `qemud:sensors` lists the AVD's sensors by stock's rules (`hw.sensor*` flags; heart rate and wrist tilt on Wear OS API 28+; the hinge on foldables) with live values; GNSS over `qemud:gps`; goldfish battery; fingerprint; clipboard |
@@ -581,6 +581,50 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   keep GL. Host screenshots matched the guest's `screencap` on every form factor, the stream ran
   40 fps at full tablet size during swipes (GL: 24–33), and the AutoMobile harness gave the same
   results under both on phone, tablet, foldable, watch, TV, car, XR headset and glasses.
+- **A turned device: frames and touches follow the guest's display rotation, turned where it's
+  cheapest, never when upright.** The panel never turns; a guest that rotates draws its turned
+  layout sideways into the same scanout. Whether it rotates is the guest's call: with
+  auto-rotate off, with a portrait-locked app (a phone's launcher) and when a phone is turned
+  upside down (it refuses 180°, staying in landscape) the accelerometer turns and the display
+  doesn't, and a device lying flat turns nothing. So emu turns frames and touches by the
+  rotation the guest reports, not by the accelerometer: each rotation is logged at info, as
+  `WindowManager: Display id=0 rotation changed to N` (API 36 and later) and as
+  `ActivityTaskManager: Config changes=... mDisplayRotation=ROTATION_N` (API 33 and later), or
+  `mRotation=ROTATION_N` in the same line where `mDisplayRotation` isn't (API 31 and 32; checked
+  under simee on API 31, 34 and 36, 2026-11-26), and emu asks the guest's `goldfish-logcat` for
+  those two tags at info (`androidboot.logcat`, beside whatever `-logcat` asks for, which still
+  sees only its own lines) and reads them off the logcat console as they arrive
+  (`sim_core::rotation::guest_rotation`, only under those two tags, so an app logging the same
+  words turns nothing; no polling and no adb). The reader runs inline on the console worker,
+  before the spool that feeds `-logcat`'s output (a utility-priority thread that drops chunks
+  when it falls behind), so a slow or verbose `-logcat` never loses a rotation line. It is
+  still a log: a rotation reaches emu a few milliseconds after the guest relayouts, so a tap at
+  bounds read from the turned layout and sent in that window maps with the old turn; a caller
+  that rotates then taps should read `rotation` (the console, or `simee screen`) until it shows
+  the new turn. The two tags add little log: on an API 36 phone (720x1280, 2026-11-26, this Mac at load 19 to 62), 4.3 KB in 17 lines from boot to boot complete, nothing in 2 minutes idle, and 11.4 KB in 50 lines over four rotations and five Settings launches (2 rotation lines each), against 1.9 MB in 10,385 lines that the guest logged under all tags in the same window (`adb logcat -d -s WindowManager:I ActivityTaskManager:I`; one run, not a benchmark). API 29 and 30 aren't followed: their filter
+  goes through `qemu.cmdline`, at most 91 bytes, which the two tags would overflow, so emu
+  leaves it as the user's and `rotation` says `unknown` there (frames and touches stay as the
+  panel lies). Phones, tablets and foldables follow it; TVs, cars, watches and XR headsets and
+  glasses never turn (`sim_core::rotation::turns`). A guest reset starts upright again. Screenshots,
+  frames, the API's `screen`, `tap`, `swipe`, `touch`, `stylus` and the console's `touch` and
+  `pen` are then all in one space, the guest's layout: what `adb screencap` and uiautomator's
+  bounds are in, in every case above (the console's `rotation` says how far it is turned).
+  Stock differs here: its window and its gRPC and `screenrecord` screenshots follow the
+  accelerometer's coarse orientation, so with auto-rotate off or after a phone's 180° they show
+  the guest's layout sideways while `adb screencap` doesn't (checked on 37.2.13). The readback is a renderer copy into host memory with no turn of its
+  own, so the turn happens after it, once per frame, and only for readers that need it: the
+  desktop sends `rotates` and gets frames as the panel lies with an `EMUO` record saying how far
+  to turn them, and Rune turns the picture as it draws (a GPU transform; no CPU turn anywhere);
+  screenshots and other stream clients get the frame turned upright, from a turned copy the
+  store makes once per frame and shares (1.2–1.4 ms for 1080×2400, 1.6–1.9 ms for 2560×1600 on
+  this Mac, 32-pixel tiles: `cargo test --release -p sim-core rotate_cost -- --ignored
+  --nocapture`), which goes with the other buffers when nobody reads. Upright, readers get the
+  capture itself and a full-size ring stream still reads straight into its slot; a unit test
+  pins that no turned buffer is made. Touches on the display socket and the console's `touch`
+  and `pen` are in the upright screen's (the guest layout's) pixels; emu maps each onto the panel pixel shown there
+  (and a folded foldable's view origin), which is what the touch screen, fixed to the panel,
+  reports. Stock's gRPC touches, by contrast, stay in panel pixels when turned (checked on
+  37.2.13: a `sendTouch` at 300,900 on a turned phone reached the guest as panel 300,900).
 - **Gboard's blank keyboard: the UI draws with Skia on Vulkan, as stock's does.** On MoltenVK
   Gboard's keyboard was one flat panel: its buffer came out fully transparent (guest `screencap`
   and host frame alike), on 3 of 3 boots; on KosmicKrisp it drew. emu ran every app's HWUI as

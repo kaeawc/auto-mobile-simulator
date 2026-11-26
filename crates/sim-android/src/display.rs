@@ -9,6 +9,7 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+use sim_core::rotation::Rotation;
 use sim_core::stream::{FrameHeader, HEADER_LEN, Input, Record, ring};
 
 /// The display socket of the AVD in `avd_dir`.
@@ -39,6 +40,13 @@ impl Display {
     /// an emulator that predates the ring ignores it and keeps sending frames on the socket.
     pub fn request_shared(&mut self) -> Result<(), String> {
         self.send(&Input::Shared)
+    }
+
+    /// Asks for a turned device's frames as the panel lies, with how to turn them
+    /// ([`Frames::rotation`]), for a client that turns them as it draws. Send it before `hello`;
+    /// an emulator that predates it ignores it, and its frames are never turned.
+    pub fn request_rotation(&mut self) -> Result<(), String> {
+        self.send(&Input::Rotates)
     }
 
     /// A second handle on the same connection (for a reader thread).
@@ -95,11 +103,22 @@ pub struct Frames<R> {
     pub superseded: u64,
     /// Frames passed over unread because nobody wanted them ([`Frames::next_frame_when`]).
     pub skipped: u64,
+    /// How far to turn the frame just read, clockwise, to show it upright (after
+    /// [`Display::request_rotation`]; always upright without it).
+    pub rotation: Rotation,
 }
 
 impl<R: Read> Frames<R> {
     pub fn new(reader: R) -> Frames<R> {
-        Frames { reader: BufReader::with_capacity(READ_AHEAD, reader), ring: None, fallback: None, torn: 0, superseded: 0, skipped: 0 }
+        Frames {
+            reader: BufReader::with_capacity(READ_AHEAD, reader),
+            ring: None,
+            fallback: None,
+            torn: 0,
+            superseded: 0,
+            skipped: 0,
+            rotation: Rotation::Deg0,
+        }
     }
 
     /// The ring notice already read ahead behind the current record, if the next record is one.
@@ -190,6 +209,8 @@ impl<R: Read> Frames<R> {
                         w.write_all(format!("{}\n", Input::Socket.to_line()).as_bytes())?;
                     }
                 }
+                // Before the frames it applies to; a frame ahead of it keeps the turn it had.
+                Record::Rotation(r) => self.rotation = r,
                 Record::Shared { .. } if !wanted() => self.skipped += 1,
                 Record::Shared { mut header, mut slot } => {
                     // A client that fell behind reads only the newest of the frames announced

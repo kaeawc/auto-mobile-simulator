@@ -6,7 +6,10 @@
 //! - `hello <max_width>`: start streaming, downscaled by a whole factor to at most that width;
 //! - `shm`: send frames through a shared-memory ring instead of the socket (see below);
 //! - `socket`: send frames on the socket again (a client that couldn't open the ring);
-//! - `touch <x> <y> down|move|up` in device pixels;
+//! - `rotates`: send frames as the panel lies and say how to turn them (`EMUO`), for a client
+//!   that turns them as it draws; without it a turned device's frames come turned upright;
+//! - `touch <x> <y> down|move|up` in pixels of the screen as the guest rotated its display (the
+//!   frames' pixels, turned upright when the stream says to turn them);
 //! - `key <name>`: press and release a key by its console name (`HOME`, `BACK`, `POWER`, `A`, ...);
 //! - `wheel <ticks>` on the rotary / scroll device.
 //!
@@ -15,13 +18,17 @@
 //!   u32 byte count), then the frame's RGBA rows on the socket;
 //! - `EMUR`: a shared frame ring was created; its path (the u32 byte count of UTF-8) follows;
 //! - `EMUS`: a frame whose RGBA rows are in a slot of the last announced ring (the header's last
-//!   u32 is the slot), so only these 32 bytes cross the socket.
+//!   u32 is the slot), so only these 32 bytes cross the socket;
+//! - `EMUO`: the frames after it are to be turned clockwise by the last u32's quarter turns
+//!   ([`Rotation`]) to show upright, as the guest rotated its display. Only to clients that sent
+//!   `rotates`, before their first frame and whenever it changes.
 //!
 //! `EMUR` and `EMUS` go only to clients that sent `shm`; a server that predates it ignores the
 //! line and keeps sending `EMUF`, so clients read whichever arrives. The ring ([`ring`]) is a
 //! file the server maps and writes; clients read it with `pread`, so they need no mapping.
 
 use crate::gesture::Phase;
+use crate::rotation::Rotation;
 
 /// The bytes every frame header starts with.
 pub const MAGIC: &[u8; 4] = b"EMUF";
@@ -29,6 +36,8 @@ pub const MAGIC: &[u8; 4] = b"EMUF";
 pub const SHARED_MAGIC: &[u8; 4] = b"EMUS";
 /// A shared ring's announcement.
 pub const RING_MAGIC: &[u8; 4] = b"EMUR";
+/// How the frames after it are turned.
+pub const ROTATION_MAGIC: &[u8; 4] = b"EMUO";
 /// Size of a frame header in bytes.
 pub const HEADER_LEN: usize = 32;
 
@@ -95,6 +104,8 @@ pub enum Record {
     Shared { header: FrameHeader, slot: u32 },
     /// `EMUR`: a ring was created; its path, `path_len` bytes of UTF-8, follows.
     Ring { path_len: u32 },
+    /// `EMUO`: the frames after it show upright turned clockwise by this much.
+    Rotation(Rotation),
 }
 
 impl Record {
@@ -106,6 +117,12 @@ impl Record {
                 let mut out = [0u8; HEADER_LEN];
                 out[0..4].copy_from_slice(RING_MAGIC);
                 out[28..32].copy_from_slice(&path_len.to_le_bytes());
+                out
+            }
+            Record::Rotation(r) => {
+                let mut out = [0u8; HEADER_LEN];
+                out[0..4].copy_from_slice(ROTATION_MAGIC);
+                out[28..32].copy_from_slice(&r.quarters().to_le_bytes());
                 out
             }
         }
@@ -128,6 +145,10 @@ impl Record {
             m if m == RING_MAGIC => match last {
                 1..=4096 => Ok(Record::Ring { path_len: last }),
                 _ => Err("bad ring path length".into()),
+            },
+            m if m == ROTATION_MAGIC => match last {
+                0..=3 => Ok(Record::Rotation(Rotation::from_quarters(last))),
+                _ => Err("bad rotation".into()),
             },
             _ => Err("bad frame header".into()),
         }
@@ -293,6 +314,9 @@ pub enum Input {
     Shared,
     /// Frames on the socket (after [`Input::Shared`], when the client can't open the ring).
     Socket,
+    /// Frames as the panel lies, with [`Record::Rotation`] saying how to turn them: the client
+    /// turns them as it draws (on the GPU), so the server never does.
+    Rotates,
     Touch {
         x: f32,
         y: f32,
@@ -309,6 +333,7 @@ impl Input {
             Self::Hello { max_width } => format!("hello {max_width}"),
             Self::Shared => "shm".into(),
             Self::Socket => "socket".into(),
+            Self::Rotates => "rotates".into(),
             Self::Touch { x, y, phase } => {
                 let phase = match phase {
                     Phase::Down => "down",
@@ -329,6 +354,7 @@ impl Input {
             ["hello", mw] => Self::Hello { max_width: mw.parse().unwrap_or(0) },
             ["shm"] => Self::Shared,
             ["socket"] => Self::Socket,
+            ["rotates"] => Self::Rotates,
             ["touch", x, y, phase] => Self::Touch {
                 x: x.parse().ok()?,
                 y: y.parse().ok()?,
@@ -368,7 +394,13 @@ mod tests {
     fn records_round_trip_and_are_checked() {
         let header = FrameHeader::new(360, 640, 720, 1280, 9).expect("size");
         assert_eq!(header.len, 360 * 640 * 4);
-        let records = [Record::Frame(header), Record::Shared { header, slot: 2 }, Record::Ring { path_len: 40 }];
+        let records = [
+            Record::Frame(header),
+            Record::Shared { header, slot: 2 },
+            Record::Ring { path_len: 40 },
+            Record::Rotation(Rotation::Deg270),
+            Record::Rotation(Rotation::Deg0),
+        ];
         for r in records {
             assert_eq!(Record::decode(&r.encode()), Ok(r), "{r:?}");
         }
@@ -384,6 +416,15 @@ mod tests {
         for bad_len in [0, 4097] {
             assert_eq!(Record::decode(&Record::Ring { path_len: bad_len }.encode()), Err("bad ring path length".into()));
         }
+        let mut turned = Record::Rotation(Rotation::Deg90).encode();
+        assert_eq!(&turned[0..4], b"EMUO");
+        turned[28] = 4;
+        assert_eq!(Record::decode(&turned), Err("bad rotation".into()));
+        assert_eq!(
+            FrameHeader::decode(&Record::Rotation(Rotation::Deg90).encode()),
+            Err("bad frame header".into()),
+            "an old client's decoder takes only frames"
+        );
     }
 
     #[test]
@@ -428,6 +469,7 @@ mod tests {
             Input::Hello { max_width: 720 },
             Input::Shared,
             Input::Socket,
+            Input::Rotates,
             Input::Touch { x: 10.0, y: 20.0, phase: Phase::Down },
             Input::Touch { x: 11.0, y: 21.0, phase: Phase::Move },
             Input::Touch { x: 12.0, y: 22.0, phase: Phase::Up },

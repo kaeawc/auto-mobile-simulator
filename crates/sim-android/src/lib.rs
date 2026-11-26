@@ -28,6 +28,7 @@ use sim_core::frame::Frame;
 use sim_core::gesture::{Phase, Sample, pace, pace_samples};
 use sim_core::hid::{Button, Direction, KEY_LEFT_SHIFT, KeyStroke, keystroke, linux_keycode};
 use sim_core::platform::{AndroidOs, Platform, SubPlatform};
+use sim_core::rotation::Rotation;
 use sim_core::stream::Input;
 use sim_core::vhal;
 use sim_core::xr::XrCommand;
@@ -592,30 +593,46 @@ impl Device {
     }
 
     /// The size the guest lays out for, which [`play`](Self::play) and [`touch`](Self::touch)
-    /// points are in: the LCD, except on a folded foldable under simee, whose guest lays out for
-    /// its outer screen (a Pixel Fold's 1080x2092, as uiautomator's bounds are).
+    /// points are in, turned as the guest rotated its display (a phone in landscape: 2400x1080,
+    /// as screenshots, `adb screencap` and uiautomator's bounds are then): the LCD, except on a
+    /// folded foldable under simee, whose guest lays out for its outer screen (a Pixel Fold's
+    /// 1080x2092, as uiautomator's bounds are).
     pub fn layout_size(&self) -> Result<(u32, u32), String> {
         match self.folded_view()? {
-            Some(s) => Ok((s.width, s.height)),
-            None => self.screen_size(),
+            Some((s, turn)) => Ok(turn.turned((s.width, s.height))),
+            None => Ok(self.rotation()?.turned(self.screen_size()?)),
         }
+    }
+
+    /// How far the running device's guest rotated its display (emu's `rotation`, from what the
+    /// guest logs as it rotates, not the accelerometer it may not follow): simee's screenshots,
+    /// frames and touches are turned by this much, as `adb screencap` and uiautomator's bounds
+    /// are. Upright unless it runs under simee (or under an emu that predates it).
+    pub fn rotation(&self) -> Result<Rotation, String> {
+        if !self.running.as_ref().is_some_and(|r| r.simee) {
+            return Ok(Rotation::Deg0);
+        }
+        Ok(display_rotation(&self.console(&["rotation".into()])?))
     }
 
     /// A folded foldable's hinge under simee, whose frames (the display socket, screenshots) show
     /// only the outer screen's region of the scanout (949x1840 of a Pixel Fold's 2208x1840) while
-    /// the guest lays out for the outer screen's own size: None for every other device, and
-    /// without asking the emulator unless the device is a foldable.
-    fn folded_view(&self) -> Result<Option<sim_core::fold::FoldState>, String> {
+    /// the guest lays out for the outer screen's own size, and how far its display is turned (in
+    /// the same console session): None for every other device, and without asking the emulator
+    /// unless the device is a foldable.
+    fn folded_view(&self) -> Result<Option<(sim_core::fold::FoldState, Rotation)>, String> {
         let foldable = self.info.kind().is_some_and(|k| k.accepts(InputMethod::Hinge));
         if !foldable || !self.running.as_ref().is_some_and(|r| r.simee) {
             return Ok(None);
         }
-        Ok(self.fold_state()?.filter(|s| s.folded))
+        let lines = self.console(&["fold status".into(), "rotation".into()])?;
+        Ok(sim_core::fold::FoldState::parse(&lines).filter(|s| s.folded).map(|s| (s, display_rotation(&lines))))
     }
 
-    /// `point` in the guest's layout on the display socket's frames (see [`Device::layout_size`]).
-    fn to_view(view: Option<&sim_core::fold::FoldState>, x: f64, y: f64) -> (f32, f32) {
-        let (x, y) = view.map_or((x, y), |s| s.guest_to_view((x, y)));
+    /// `point` in the guest's layout on the display socket's frames (see [`Device::layout_size`]),
+    /// which emu turns onto the panel itself.
+    fn to_view(view: Option<&(sim_core::fold::FoldState, Rotation)>, x: f64, y: f64) -> (f32, f32) {
+        let (x, y) = view.map_or((x, y), |(s, turn)| s.guest_to_turned_view((x, y), *turn));
         (x as f32, y as f32)
     }
 
@@ -827,10 +844,11 @@ impl Device {
         pace(&delays, || start.elapsed(), sleep, |i| session.command(&lines[i]).map(drop))
     }
 
-    /// Stylus samples on the touch screen at device pixels, what stock's gRPC `PenEvent` sends,
-    /// spread over `duration` in one console session (simee's `pen` command).
+    /// Stylus samples on the touch screen at pixels of the screen as screenshots show it (turned
+    /// with the device), with the codes stock's gRPC `PenEvent` sends, spread over `duration` in
+    /// one console session (simee's `pen` command).
     pub fn stylus(&self, samples: &[sim_core::stylus::PenSample], duration: Duration) -> Result<(), String> {
-        let (w, h) = self.screen_size()?;
+        let (w, h) = self.rotation()?.turned(self.screen_size()?);
         if let Some(s) = samples.iter().find(|s| s.x as u32 >= w || s.y as u32 >= h) {
             return Err(format!("({}, {}) is off the {w}x{h} screen", s.x, s.y));
         }
@@ -1163,6 +1181,14 @@ fn file_tail(path: &Path, n: usize) -> Vec<String> {
     lines[lines.len().saturating_sub(n)..].iter().map(|l| (*l).to_owned()).collect()
 }
 
+/// How far a display is turned whose emulator's console answered `rotation` with `lines`
+/// (`rotation: 90`); upright when the reply has no such line (an emu that predates it) or says
+/// `rotation: unknown` (an image whose rotation emu doesn't read, API 29 and 30: its frames and
+/// touches stay in panel space, as they are upright).
+fn display_rotation(lines: &[String]) -> Rotation {
+    lines.iter().find_map(|l| Rotation::from_degrees(l.strip_prefix("rotation: ")?.trim().parse().ok()?)).unwrap_or_default()
+}
+
 /// Decodes an 8-bit RGBA PNG (what the emulator's `screenshot` writes).
 fn decode_png(bytes: &[u8]) -> Result<Frame, String> {
     let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().map_err(|e| e.to_string())?;
@@ -1178,7 +1204,7 @@ fn decode_png(bytes: &[u8]) -> Result<Frame, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{fake_emulator, wait_for};
+    use crate::testing::{fake_emulator, fake_stock_emulator, wait_for};
 
     struct Fixture {
         root: PathBuf,
@@ -1755,10 +1781,57 @@ mod tests {
             Some("angle: 0\r\nposture: closed (1)\r\nfolded: true\r\nvisible: 949x1840+629+0\r\nsize: 1080x2092\r\npostures: 1,2,3".into());
         let d = f.android.device("phone").expect("running");
         assert_eq!(d.layout_size(), d.screen_size());
+        assert_eq!(std::mem::take(&mut *fake.console.lock().expect("console")), ["rotation"], "how it's turned");
         d.touch(1000.0, 2000.0, Phase::Down).expect("touch");
         d.play(&sim_core::gesture::tap(sim_core::geometry::Point::new(7.0, 9.0), Duration::ZERO)).expect("tap");
         assert_eq!(wait_for(&fake.display, 3), ["touch 1000 2000 down", "touch 7 9 down", "touch 7 9 up"]);
         assert!(fake.console.lock().expect("console").is_empty(), "no console round trip for a phone's touch");
+    }
+
+    /// The layout and touches follow the guest's display rotation as emu reports it (`rotation`),
+    /// not the accelerometer: a turned phone whose guest stayed upright (auto-rotate off, a
+    /// portrait-locked app) keeps its portrait layout.
+    #[test]
+    fn a_turned_devices_layout_and_folded_touches_are_turned() {
+        let f = fixture("turned");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let fake = fake_emulator(&f.android, "phone");
+        let d = f.android.device("phone").expect("running");
+        let panel = d.screen_size().expect("lcd");
+        assert_eq!(d.layout_size(), Ok(panel), "the guest hasn't rotated");
+        for (degrees, turn) in [(90, Rotation::Deg90), (180, Rotation::Deg180), (270, Rotation::Deg270), (0, Rotation::Deg0)] {
+            *fake.rotation.lock().expect("rotation") = degrees;
+            assert_eq!(d.rotation(), Ok(turn));
+            assert_eq!(d.layout_size(), Ok(turn.turned(panel)), "{turn:?}");
+        }
+        // A phone's touches go as they are: emu turns them onto the panel.
+        *fake.rotation.lock().expect("rotation") = 90;
+        d.touch(2000.0, 100.0, Phase::Down).expect("touch");
+        assert_eq!(wait_for(&fake.display, 1), ["touch 2000 100 down"]);
+        // A folded Pixel Fold whose guest turned a quarter: its layout is 2092x1080, its frames
+        // 1840x949.
+        let f = fixture("turnedfold");
+        f.android.create("fold", "system-images;android-36;google_apis;arm64-v8a", Some(FormFactor::Foldable)).expect("fold");
+        let fake = fake_emulator(&f.android, "fold");
+        *fake.fold_status.lock().expect("status") =
+            Some("angle: 0\r\nposture: closed (1)\r\nfolded: true\r\nvisible: 949x1840+629+0\r\nsize: 1080x2092\r\npostures: 1,2,3".into());
+        *fake.rotation.lock().expect("rotation") = 90;
+        let d = f.android.device("fold").expect("running");
+        assert_eq!(d.layout_size(), Ok((2092, 1080)));
+        d.touch(2092.0, 1080.0, Phase::Down).expect("touch");
+        assert_eq!(wait_for(&fake.display, 1), ["touch 1840 949 down"], "the layout's corner on the frames' corner");
+        // An emu that predates `rotation`, or a reply without it: upright.
+        assert_eq!(display_rotation(&["KO: unknown command".into()]), Rotation::Deg0);
+        assert_eq!(display_rotation(&["rotation: 45".into()]), Rotation::Deg0);
+        assert_eq!(display_rotation(&["rotation: unknown".into(), "OK".into()]), Rotation::Deg0, "panel space");
+        assert_eq!(display_rotation(&["rotation: 270".into()]), Rotation::Deg270);
+        // The stock emulator: never asked.
+        let f = fixture("turnedstock");
+        f.android.create("stock", "system-images;android-36;google_apis;arm64-v8a", None).expect("stock");
+        let fake = fake_stock_emulator(&f.android, "stock");
+        let d = f.android.device("stock").expect("running");
+        assert_eq!(d.rotation(), Ok(Rotation::Deg0));
+        assert!(fake.console.lock().expect("console").is_empty());
     }
 
     #[test]

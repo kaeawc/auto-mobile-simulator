@@ -17,8 +17,8 @@
 //!
 //! `cargo run` opens the window (`SIMEE_DEVICE=<udid|name|booted>` preselects a device);
 //! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
-//! folded, tablet, ipad, watch, tv, apple-watch, apple-tv, empty); a release build needs
-//! `--features tooling` for it.
+//! folded, tablet, ipad, watch, tv, apple-watch, apple-tv, turned, turned-tablet, empty); a
+//! release build needs `--features tooling` for it.
 
 mod android;
 mod bezel;
@@ -47,6 +47,7 @@ use sim_core::form_factor::{FormFactor, Kind, Posture, Shape};
 use sim_core::gesture::Phase;
 use sim_core::hid::{Button, Direction};
 use sim_core::platform::Platform;
+use sim_core::rotation::Rotation;
 
 use device::{Context, Live};
 use keys::KeyAction;
@@ -121,6 +122,8 @@ pub struct State {
     /// Headless scenes show the screen without a live device.
     pub offline_screen: bool,
     offline_size: (u32, u32),
+    /// How far a headless scene's screen is turned (a live Android screen says itself).
+    offline_turn: Rotation,
     /// The UI thread's simulator service connection, made when an iOS device is first shown
     /// (the scanner has its own).
     ctx: Option<Result<Context, String>>,
@@ -173,6 +176,12 @@ impl State {
     pub fn screen_size(&self) -> (u32, u32) {
         let live = self.live.as_ref().and_then(|l| l.shared.size());
         live.or_else(|| self.screen.as_ref().and_then(android::Screen::device_size)).unwrap_or(self.offline_size)
+    }
+
+    /// How far to turn the screen's pixels (as a turned Android device's panel lies) clockwise
+    /// to show them upright.
+    pub fn screen_rotation(&self) -> Rotation {
+        self.screen.as_ref().map_or(self.offline_turn, android::Screen::rotation)
     }
 
     /// Whether a device screen is shown (live, or a headless scene's).
@@ -384,6 +393,7 @@ fn init() -> State {
         offline: false,
         offline_screen: false,
         offline_size: (1206, 2622),
+        offline_turn: Rotation::Deg0,
         ctx: None,
         android_backend: None,
         scanner: None,
@@ -531,6 +541,19 @@ fn select_running(s: &mut State, udid: &str, (w, h): (u32, u32), shape: Shape) {
 
 fn android_scene(s: &mut State) {
     select_running(s, "pixel_9", (360, 800), Shape::Rounded);
+}
+
+/// A phone turned a quarter clockwise: its frames lie as the panel does (360x800) and the view
+/// turns them as it draws, so the screen shows 800x360, upright.
+fn turned_scene(s: &mut State) {
+    select_running(s, "pixel_9", (360, 800), Shape::Rounded);
+    (s.offline_size, s.offline_turn) = ((800, 360), Rotation::Deg90);
+}
+
+/// A Pixel Tablet (landscape panel, at half size) turned a quarter clockwise: portrait.
+fn turned_tablet_scene(s: &mut State) {
+    select_running(s, "pixel_tablet", (1280, 800), Shape::Rounded);
+    (s.offline_size, s.offline_turn) = ((800, 1280), Rotation::Deg90);
 }
 
 fn foldable_scene(s: &mut State) {
@@ -967,6 +990,8 @@ fn main() {
             ("tv", tv_scene),
             ("apple-watch", apple_watch_scene),
             ("apple-tv", apple_tv_scene),
+            ("turned", turned_scene),
+            ("turned-tablet", turned_tablet_scene),
             ("empty", empty),
         ],
         setup: Some(setup),
@@ -1115,6 +1140,40 @@ mod tests {
         );
     }
 
+    /// A turned phone's screen is upright: the view's box has the turned shape, the panel's
+    /// picture is turned into it, and a drag lands at the upright screen's pixels (emu maps
+    /// those onto the panel).
+    #[test]
+    fn a_turned_screen_is_drawn_upright_and_takes_upright_touches() {
+        for (scene, upright) in [(turned_scene as fn(&mut State), (800, 360)), (turned_tablet_scene, (800, 1280))] {
+            // The picture takes the box's size from its layout, so it fills the box the frame
+            // after: at once, not springing there.
+            let mut rt = runtime(scene);
+            rt.frame(1.0 / 60.0);
+            assert_eq!(rt.state.screen_size(), upright);
+            let ([x, y, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+            let ratio = upright.0 as f32 / upright.1 as f32;
+            assert!((w / h - ratio).abs() < 0.02, "{upright:?}: the box is {w}x{h}");
+            let ([px, py, pw, ph], _) = rt.presented("device-pixels").expect("the turned picture");
+            // Its upright bounding box: the screen's own.
+            assert!((px - x).abs() < 1.0 && (py - y).abs() < 1.0 && (pw - w).abs() < 1.0 && (ph - h).abs() < 1.0, "{:?}", [px, py, pw, ph]);
+            rt.pointer_down(x + w * 0.75, y + h * 0.25);
+            rt.frame(1.0 / 60.0);
+            rt.pointer_up(x + w * 0.75, y + h * 0.25);
+            rt.frame(1.0 / 60.0);
+            let near = |a: f32, b: f32| (a - b).abs() < 2.0;
+            let (ux, uy) = (upright.0 as f32 * 0.75, upright.1 as f32 * 0.25);
+            assert!(
+                matches!(rt.state.inputs.first(), Some(Input::Down(dx, dy)) if near(*dx, ux) && near(*dy, uy)),
+                "{upright:?}: {:?}",
+                rt.state.inputs
+            );
+        }
+        // Unturned, nothing is drawn turned.
+        let rt = runtime(android_scene);
+        assert!(rt.find("device-pixels").is_none());
+    }
+
     /// A drag that starts just below an iPad's screen is a touch from its bottom edge, from the
     /// edge pixel up to where the pointer goes; one on the screen stays an ordinary touch.
     #[test]
@@ -1219,6 +1278,22 @@ mod tests {
         rt.frame(1.0 / 60.0);
         assert!(
             matches!(rt.state.inputs.first(), Some(Input::Edge(px, _, Phase::Down, ScreenEdge::Left)) if *px == 0.0),
+            "{:?}",
+            rt.state.inputs
+        );
+        // Turned a quarter, the edge pixels are the upright screen's (800x360), which emu maps
+        // onto the panel as it does any touch: the bottom edge is y 359, not the panel's 799.
+        let mut rt = runtime(turned_scene);
+        rt.frame(1.0 / 60.0);
+        let ([x, y, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+        assert_eq!(rt.state.screen_size(), (800, 360));
+        rt.pointer_down(x + w * 0.5, y + h + bezel::BAND * 0.5);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_up(x + w * 0.5, y + h * 0.5);
+        rt.frame(1.0 / 60.0);
+        let near = |a: f32, b: f32| (a - b).abs() < 2.0;
+        assert!(
+            matches!(rt.state.inputs.first(), Some(Input::Edge(px, py, Phase::Down, ScreenEdge::Bottom)) if near(*px, 400.0) && *py == 359.0),
             "{:?}",
             rt.state.inputs
         );
@@ -1547,12 +1622,16 @@ mod tests {
             assert_eq!(sc.pixels.signature(), shown, "the same buffer and frame, not a new one");
             assert_eq!(sc.pixels.rgba(), [9; 8]);
             let start = std::time::Instant::now();
-            while lines.lock().expect("lines").len() < 4 {
+            while lines.lock().expect("lines").len() < 5 {
                 assert!(start.elapsed() < Duration::from_secs(5), "{:?}", lines.lock().expect("lines"));
                 std::thread::sleep(Duration::from_millis(2));
             }
             let back = if visible { "hello 1080" } else { "hello 0" };
-            assert_eq!(*lines.lock().expect("lines"), ["shm", "hello 1080", "hello 0", back], "paused, then resumed (visible: {visible})");
+            assert_eq!(
+                *lines.lock().expect("lines"),
+                ["shm", "rotates", "hello 1080", "hello 0", back],
+                "paused, then resumed (visible: {visible})"
+            );
             let _ = std::fs::remove_dir_all(dir);
         }
     }
