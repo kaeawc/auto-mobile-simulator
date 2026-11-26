@@ -37,6 +37,25 @@ scripts/android-bench.sh <label> <avd> emu|stock [-no-snapshot-load]   # one boo
 These replace the 2026-11-22 run, whose 1.67 GB peak memory for emu (against 5.09 GB) did not
 hold up when remeasured.
 
+### API 29 (GLES over the goldfish pipe)
+
+One API 29 `default` arm64 AVD (2 GB, 720x1280), same host (Apple silicon Mac, 16 CPUs, macOS
+26.6), 2026-11-26, SDK emulator 37.2.13.0. Warm boots (the AVD had booted before under both),
+medians of 3, emu and stock alternating; host load average 21–30 during the runs.
+
+```bash
+PORT=5610 scripts/android-bench.sh a29-emu-N <avd> emu
+PORT=5612 scripts/android-bench.sh a29-stock-N <avd> stock
+```
+
+| Measure | emu | SDK emulator | Ratio |
+| --- | --- | --- | --- |
+| Warm: launch until `sys.boot_completed` | 4.8 s | 6.4 s | 1.3× faster |
+| Warm: launch until `adb` lists the device | 2.4 s | 3.5 s | 1.5× faster |
+| Warm: peak RSS, process tree | 1596 MB | 1692 MB | 6% less |
+| Guest CPU, 100k shell loop, warm | 0.29 s | 0.59 s | |
+| Guest CPU, 4× md5, warm | 0.43 s | 0.94 s | |
+
 ### Idle host CPU
 
 The same API 36 AVD, warm-booted under emu built without and with its network device (#29),
@@ -408,6 +427,9 @@ Claims that would belong in the README once someone runs them:
   interval only so far: homing 85 reports, 5 more per move; not timed, since the host's load was
   198 on 2026-11-26.
 - Host CPU of an idle booted device, emu against the SDK emulator.
+- API 29 and 30 cold boots (a new AVD's first), API 30 warm boots, and their idle host CPU: an
+  API 29 or 30 device under emu sat at 150–170% of a core after the AutoMobile harness, with
+  `com.android.phone`, `system_server` and `logd` busy in the guest; not yet compared with stock.
 - Network throughput and latency through emu's NAT against the SDK emulator's slirp.
 - Host CPU of an idle booted device with and without the virtio-snd card (`EMU_VIRTIO_SND=0`),
   median of 3 boots each on the same host and day (an earlier sample on API 36 showed no
