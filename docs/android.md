@@ -295,7 +295,9 @@ EMU_QEMU=/path/to/qemu-system-x86_64 emu -avd phone   # QEMU 11.1 or newer; with
 - **Boots to `sys.boot_completed`.** With all of the above, the API 36 image boots under QEMU
   TCG on emu's devices with no KVM and no GPU
   ([benchmarks](benchmarks.md#boot-to-sysboot_completed-with-emus-devices)): 168 s warm, 0 of 5
-  boots failed. Open: the launcher's workspace composes black (the navigation bar and
+  boots failed. The SDK emulator's own software mode (`-accel off`, refused without
+  `ANDROID_I_WANT_MY_TCG=yes`) runs all vCPUs on one translator thread and took 2302 s (median
+  of 3, one of which didn't finish in 40 minutes) on the same host. Open: the launcher's workspace composes black (the navigation bar and
   FallbackHome draw); the launcher once failed to make a bitmap at unlock (`DotRenderer`, null
   `Bitmap`); and under emulation apps can overrun Android's startup timeouts and show "isn't
   responding" dialogs.
