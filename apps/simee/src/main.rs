@@ -288,6 +288,30 @@ enum Cmd {
         #[arg(long, default_value_t = 300)]
         duration_ms: u64,
     },
+    /// Android: a stylus on the touch screen, in pixels: X Y [tap|hover|down|move|up|leave], or a
+    /// stroke with --to X2 Y2; --button holds the barrel button, --eraser uses the eraser end.
+    Stylus {
+        device: String,
+        x: u32,
+        y: u32,
+        /// tap (the default), hover, down, move, up or leave.
+        phase: Option<String>,
+        /// Draw a stroke to this point instead.
+        #[arg(long, num_args = 2, value_names = ["X2", "Y2"])]
+        to: Option<Vec<u32>>,
+        /// Pressure while touching, 1-255.
+        #[arg(long)]
+        pressure: Option<u8>,
+        /// Hold the barrel button.
+        #[arg(long)]
+        button: bool,
+        /// The eraser end.
+        #[arg(long)]
+        eraser: bool,
+        /// The stroke's duration.
+        #[arg(long, default_value_t = 300)]
+        duration_ms: u64,
+    },
     /// Turn a watch's crown (Wear OS rotary input, Apple Watch Digital Crown) by some ticks
     /// (negative turns back).
     #[command(allow_negative_numbers = true)]
@@ -677,6 +701,18 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             };
             call("touchpad", params)?;
         }
+        Cmd::Stylus { device, x, y, phase, to, pressure, button, eraser, duration_ms } => {
+            let mut params = json!({"device": device, "x": x, "y": y, "pressure": pressure, "button": button, "eraser": eraser});
+            match to.as_deref() {
+                Some([tx, ty]) => {
+                    params["to_x"] = json!(tx);
+                    params["to_y"] = json!(ty);
+                    params["duration_ms"] = json!(duration_ms);
+                }
+                _ => params["phase"] = json!(phase.as_deref().unwrap_or("tap")),
+            }
+            call("stylus", params)?;
+        }
         Cmd::Rotary { device, ticks, delta } => {
             call("rotary", json!({"device": device, "ticks": ticks, "delta": delta}))?;
             input = true;
@@ -918,6 +954,7 @@ mod tests {
             "xr",
             "vehicle",
             "touchpad",
+            "stylus",
             "boot_many",
             "settle",
             "profile",

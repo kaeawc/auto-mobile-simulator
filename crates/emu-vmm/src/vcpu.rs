@@ -121,7 +121,7 @@ pub struct Cpus {
     pub bus: Bus,
     slots: Vec<CpuSlot>,
     wakers: Arc<Wakers>,
-    pub stats: Vec<ExitStats>,
+    pub stats: Arc<[ExitStats]>,
     vtimer_offset: u64,
     stopping: AtomicBool,
     stop: Mutex<Option<StopReason>>,

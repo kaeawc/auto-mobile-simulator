@@ -220,8 +220,8 @@ impl Instance {
             verbose: opts.verbose,
             display: display.clone(),
             // Images without bootconfig have no ANGLE: their GLES is the encoder, on the host's GL.
-            vulkan_only: guest_egl() == "angle" && takes_bootconfig(&self.avd),
-            virtual_queue: virtual_queue(&guest_egl(), AngleImage::of(&self.avd)),
+            vulkan_only: guest_egl(&self.avd) == "angle" && takes_bootconfig(&self.avd),
+            virtual_queue: virtual_queue(&guest_egl(&self.avd), AngleImage::of(&self.avd)),
         })
     }
 
@@ -277,10 +277,17 @@ impl Instance {
             }),
             on_guest_event: {
                 let started = std::time::Instant::now();
+                let verbose = opts.verbose;
                 Some(std::sync::Arc::new(move |event: &str| {
                     if event == "bootcomplete" {
                         // On stdout, like the launch line: tools can watch for it.
                         println!("emu: boot completed in {:.1}s", started.elapsed().as_secs_f64());
+                        // What the boot cost the vCPUs (scripts/android-bench.sh reads vcpu0's).
+                        if let Some(exits) = emu_vmm::exit_counts().filter(|_| verbose) {
+                            for line in crate::exit_lines(&exits) {
+                                eprintln!("emu: at boot completed:{line}");
+                            }
+                        }
                     }
                 }))
             },
@@ -643,11 +650,13 @@ fn bootconfig(avd: &Avd, opts: &Opts, graphics: bool) -> BootConfig {
         // gfxstream over virtio-gpu: GLES through the pipe stream, Vulkan and ANGLE through
         // address-space graphics, both on the host renderer.
         bc.set("androidboot.hardware.gltransport", "virtio-gpu-asg").set("androidboot.hardware.vulkan", "ranchu");
-        // Guest GLES through ANGLE on the guest's Vulkan, so every context uses
+        // API 34+: guest GLES through ANGLE on the guest's Vulkan, so every context uses
         // address-space graphics: with `emulation` GLES rides the virtio-gpu pipe stream,
-        // whose blocking reads serialize all processes on one queue (boots took 14–28 s with
-        // ANRs, against 5–8 s on ANGLE). EMU_GUEST_EGL=emulation restores it.
-        for (k, v) in guest_graphics(&guest_egl(), AngleImage::of(avd)) {
+        // whose blocking reads serialize all processes on one queue (API 34+ boots took
+        // 14–28 s with ANRs, against 5–8 s on ANGLE). Below API 34 the images' ANGLE aborts
+        // SurfaceFlinger, so they get the GLES encoder (`emulation`), as stock runs them; their
+        // boot times aren't measured yet. EMU_GUEST_EGL overrides either default.
+        for (k, v) in guest_graphics(&guest_egl(avd), AngleImage::of(avd)) {
             bc.set(k, v);
         }
     }
@@ -677,22 +686,21 @@ fn takes_bootconfig(avd: &Avd) -> bool {
     avd.image_feature("AndroidbootProps2") == Some(true) || avd.api_level().is_none_or(|api| api >= 31)
 }
 
-/// Why emu can't run this AVD's image yet, if it can't: system images below API 34 boot their
+/// Why emu can't run this AVD's image yet, if it can't: system images below API 31 boot their
 /// kernel and init but never get graphics, so a boot would only loop. emu refuses them up front
-/// with the reason; `EMU_ALLOW_OLD_IMAGES=1` boots them anyway, for work on the issues named.
+/// with the reason; `EMU_ALLOW_OLD_IMAGES=1` boots them anyway, for work on the issue named.
+/// (API 31–33 guests set up address-space graphics the old way; the GPU translates it,
+/// `virtio/legacy_asg.rs`.)
 pub fn unsupported(avd: &Avd) -> Option<String> {
     let api = avd.api_level()?;
     let why = match api {
         ..=30 => {
             "its GLES goes over the `opengles` goldfish pipe, which emu doesn't bridge to the renderer yet (https://github.com/kaeawc/simee/issues/38)"
         }
-        31..=33 => {
-            "its address-space graphics ring is a guest-backed 3D resource the renderer can't map yet (https://github.com/kaeawc/simee/issues/39)"
-        }
         _ => return None,
     };
     Some(format!(
-        "{}: API {api} images don't run on emu yet: {why}. emu runs API 34 and newer; create the AVD from a newer image (`emu -provision 36`), or boot this one with the SDK's emulator",
+        "{}: API {api} images don't run on emu yet: {why}. emu runs API 31 and newer; create the AVD from a newer image (`emu -provision 36`), or boot this one with the SDK's emulator",
         avd.name
     ))
 }
@@ -747,11 +755,19 @@ fn logcat_pipe_cmdline(filter: &str) -> String {
     format!("androidboot.logcat={} androidboot.consolepipe=qemu_pipe,pipe:logcat", filter.join(","))
 }
 
-/// The guest's GLES driver: ANGLE on the guest's Vulkan, or `EMU_GUEST_EGL` (`emulation`, the
-/// GLES encoder). Under ANGLE no guest process uses the host's GL, so the renderer runs without
-/// it ([`emu_vmm::GpuSpec::vulkan_only`]).
-fn guest_egl() -> String {
-    std::env::var("EMU_GUEST_EGL").unwrap_or_else(|_| "angle".into())
+/// The guest's GLES driver: `EMU_GUEST_EGL` if set, else [`default_egl`]. Under ANGLE no guest
+/// process uses the host's GL, so the renderer runs without it
+/// ([`emu_vmm::GpuSpec::vulkan_only`]).
+fn guest_egl(avd: &Avd) -> String {
+    std::env::var("EMU_GUEST_EGL").unwrap_or_else(|_| default_egl(avd.api_level()).into())
+}
+
+/// ANGLE on the guest's Vulkan, except on images below API 34: their ANGLE finds no EGL config
+/// for SurfaceFlinger on the renderer's Vulkan (API 33 aborts "no suitable EGLConfig found" and
+/// restarts forever), so they get the GLES encoder (`emulation`) and a renderer with GL, as stock
+/// runs them.
+fn default_egl(api: Option<u32>) -> &'static str {
+    if api.is_some_and(|api| api < 34) { "emulation" } else { "angle" }
 }
 
 /// What an image's `advancedFeatures.ini` says about drawing its UI when its GLES is ANGLE.
@@ -994,6 +1010,17 @@ mod tests {
     }
 
     #[test]
+    fn images_below_api_34_get_the_gles_encoder() {
+        // API 31–33's ANGLE gives SurfaceFlinger no EGL config on the renderer's Vulkan.
+        for api in [31, 32, 33] {
+            assert_eq!(default_egl(Some(api)), "emulation", "API {api}");
+        }
+        for api in [Some(34), Some(36), None] {
+            assert_eq!(default_egl(api), "angle", "{api:?}");
+        }
+    }
+
+    #[test]
     fn a_plan_with_a_renderer_tells_the_guest_its_graphics() {
         let s = sdk("graphics");
         add_image(&s, "v", 35, "AndroidbootProps2 = on\n");
@@ -1003,7 +1030,7 @@ mod tests {
         let phone = with("phone");
         assert_eq!(phone.bootconfig.get("androidboot.hardware.gltransport"), Some("virtio-gpu-asg"));
         assert!(phone.bootconfig.get("androidboot.hardwareegl").is_some());
-        if guest_egl() == "angle" {
+        if guest_egl(&s.env.load("phone").expect("load")) == "angle" {
             // API 36 (VulkanVirtualQueue): Skia on Vulkan.
             assert_eq!(phone.bootconfig.get(hwui), Some("skiavk"));
             assert_eq!(phone.bootconfig.get(renderengine), Some("skiavkthreaded"));
@@ -1025,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn images_below_api_34_are_refused_with_the_reason() {
+    fn images_below_api_31_are_refused_with_the_reason() {
         let s = sdk("old");
         add_image(&s, "q", 29, "");
         add_image(&s, "r", 30, "");
@@ -1033,11 +1060,12 @@ mod tests {
         add_image(&s, "t", 33, "AndroidbootProps2 = on\n");
         add_image(&s, "u", 34, "AndroidbootProps2 = on\n");
         let why = |n: &str| unsupported(&s.env.load(n).expect("load"));
-        for (n, api, issue) in [("q", 29, "issues/38"), ("r", 30, "issues/38"), ("s", 31, "issues/39"), ("t", 33, "issues/39")] {
+        for (n, api, issue) in [("q", 29, "issues/38"), ("r", 30, "issues/38")] {
             let w = why(n).unwrap_or_default();
-            assert!(w.starts_with(&format!("{n}: API {api} images")) && w.contains(issue) && w.contains("API 34 and newer"), "{w}");
+            assert!(w.starts_with(&format!("{n}: API {api} images")) && w.contains(issue) && w.contains("API 31 and newer"), "{w}");
         }
-        assert_eq!(why("u"), None);
+        // API 31–33 set up address-space graphics the old way, which the GPU translates (#39).
+        assert_eq!((why("s"), why("t"), why("u")), (None, None, None));
         assert_eq!(why("phone"), None, "no API level: not refused");
     }
 

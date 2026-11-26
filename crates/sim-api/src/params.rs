@@ -12,7 +12,7 @@ use sim_core::geometry::Point;
 use sim_core::gesture::{self, Phase, Sample};
 use sim_core::hid::{Button, CROWN_UNITS_PER_TICK, Orientation};
 use sim_core::platform::Platform;
-use sim_core::vhal;
+use sim_core::{stylus, vhal};
 
 pub fn str_param<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
     p.get(key).and_then(Value::as_str)
@@ -197,6 +197,44 @@ pub fn vehicle_value(p: &Value) -> Result<Option<String>, String> {
     }
 }
 
+/// `stylus`'s samples and how long to spread them over: a stroke with `to_x`/`to_y` (300 ms by
+/// default), else one phase at a point, `tap` (down, up, out of range) by default.
+pub fn stylus_samples(p: &Value) -> Result<(Vec<stylus::PenSample>, Duration), String> {
+    let coord = |k: &str| -> Result<Option<i32>, String> {
+        p.get(k)
+            .map(|v| v.as_u64().and_then(|n| i32::try_from(n).ok()).ok_or(format!("`{k}` must be a whole number of pixels")))
+            .transpose()
+    };
+    let at = |k: &str| coord(k)?.ok_or(format!("missing number parameter `{k}`"));
+    let (x, y) = (at("x")?, at("y")?);
+    let (button, eraser) = (opt_bool(p, "button")?.unwrap_or(false), opt_bool(p, "eraser")?.unwrap_or(false));
+    let pressure = match p.get("pressure") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_u64().and_then(|n| u8::try_from(n).ok()).filter(|n| *n > 0).ok_or("`pressure` must be 1-255")?),
+    };
+    match (coord("to_x")?, coord("to_y")?) {
+        (Some(tx), Some(ty)) => {
+            let ms = opt_u64(p, "duration_ms").unwrap_or(300);
+            let mut samples = stylus::stroke((x, y), (tx, ty), 10, button, eraser);
+            samples.iter_mut().filter(|s| s.phase != stylus::PenPhase::Leave).for_each(|s| s.pressure = pressure);
+            Ok((samples, Duration::from_millis(ms)))
+        }
+        (None, None) => {
+            let mut samples = match str_param(p, "phase").unwrap_or("tap") {
+                "tap" => stylus::tap(x, y, button, eraser),
+                name => {
+                    let phase = stylus::PenPhase::parse(name)
+                        .ok_or_else(|| format!("unknown phase `{name}` (tap, {})", stylus::PenPhase::NAMES))?;
+                    vec![stylus::PenSample { x, y, phase, pressure: None, button, eraser }]
+                }
+            };
+            samples.iter_mut().for_each(|s| s.pressure = pressure);
+            Ok((samples, Duration::ZERO))
+        }
+        _ => Err("a stroke needs both `to_x` and `to_y`".into()),
+    }
+}
+
 /// A vehicle property reading as JSON, its value typed by the property (booleans, numbers,
 /// arrays of numbers; strings and bytes stay text).
 pub fn reading_json(r: &vhal::Reading) -> Value {
@@ -247,6 +285,21 @@ mod tests {
         assert_eq!(crown_delta(&json!({"ticks": -3})), Ok(-3.0 * CROWN_UNITS_PER_TICK));
         assert_eq!(crown_delta(&json!({"delta": 12.5, "ticks": 1})), Ok(12.5));
         assert!(crown_delta(&json!({})).is_err());
+    }
+
+    #[test]
+    fn stylus_parameters() {
+        use stylus::PenPhase::*;
+        let phases = |p: Value| stylus_samples(&p).map(|(s, d)| (s.iter().map(|s| s.phase).collect::<Vec<_>>(), d));
+        assert_eq!(phases(json!({"x": 1, "y": 2})), Ok((vec![Down, Up, Leave], Duration::ZERO)), "a tap by default");
+        assert_eq!(phases(json!({"x": 1, "y": 2, "phase": "hover"})), Ok((vec![Hover], Duration::ZERO)));
+        let (stroke, d) = stylus_samples(&json!({"x": 0, "y": 0, "to_x": 100, "to_y": 0, "pressure": 90, "button": true})).expect("stroke");
+        assert_eq!((stroke.len(), d), (13, Duration::from_millis(300)));
+        assert!(stroke[..12].iter().all(|s| s.pressure == Some(90) && s.button) && stroke[12].phase == Leave);
+        assert!(stylus_samples(&json!({"x": 1, "y": 2, "phase": "press"})).expect_err("phase").contains("tap, hover, down"));
+        assert_eq!(stylus_samples(&json!({"x": 1, "y": 2, "pressure": 0})), Err("`pressure` must be 1-255".into()));
+        assert_eq!(stylus_samples(&json!({"x": 1, "y": 2, "to_x": 3})), Err("a stroke needs both `to_x` and `to_y`".into()));
+        assert_eq!(stylus_samples(&json!({"x": -1, "y": 2})), Err("`x` must be a whole number of pixels".into()));
     }
 
     #[test]

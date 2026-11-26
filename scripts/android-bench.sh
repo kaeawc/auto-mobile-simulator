@@ -6,6 +6,14 @@
 # Metrics: seconds to `adb device` and to sys.boot_completed; median-of-3 latency of common adb
 # shell calls; guest CPU microbenchmarks; the emulator process's peak RSS. Runs with a stripped
 # environment (no Java on PATH). Stops the instance it started, by PID.
+#
+# Telling a starved run from a slow emulator: `cpu_s` is the emulator's CPU-seconds (user + sys,
+# whole process tree) at boot, `vcpu0_runs` (emu only, from its -verbose line at boot) how many
+# times vCPU0 entered the guest by then, and `load1_start`/`load1_boot` the host's 1-minute load
+# at launch and at boot. A host with more runnable threads than CPUs starves the guest's vCPU
+# threads: `starved=yes` when either load is above the CPU count. Keep those runs out of medians.
+# `stop_s` is seconds from the console's `kill` to the process exiting (`stop_overran=yes` when
+# emu printed that its shutdown overran and it exited anyway).
 set -uo pipefail
 label=${1:?usage: scripts/android-bench.sh <label> <avd> [emu|stock] [args...]}
 avd=${2:?avd}; kind=${3:-emu}; shift $(( $# >= 3 ? 3 : $# ))
@@ -14,9 +22,10 @@ sdk=${ANDROID_HOME:-$HOME/Library/Android/sdk}
 adb="$sdk/platform-tools/adb"
 out="$repo/bench"; mkdir -p "$out"
 port=${PORT:-5600}; serial="emulator-$port"
+own=()
 case "$kind" in
   emu) (cd "$repo" && cargo build -q --release -p emu) && codesign -s - -f --entitlements "$repo/scripts/hypervisor.entitlements" "$repo/target/release/emu" 2>/dev/null
-       bin="$repo/target/release/emu" ;;
+       bin="$repo/target/release/emu"; own=(-verbose) ;;
   stock) bin="$sdk/emulator/emulator" ;;
   *) echo "kind must be emu or stock" >&2; exit 2 ;;
 esac
@@ -24,13 +33,18 @@ esac
 # and readings are taken only at events (start, adb up, boot), never once per poll.
 now() { perl -MTime::HiRes=time -e 'printf "%.3f\n", time'; }
 since() { awk -v a="$(now)" -v b="$1" -v d="${2:-1}" 'BEGIN { printf "%.*f\n", d, a - b }'; }
+load1() { sysctl -n vm.loadavg | awk '{print $2}'; }
+ncpu=$(sysctl -n hw.ncpu)
+l0=$(load1)
 t0=$(now)
 # emu's own switches (EMU_RENDERER_GL=1, EMU_GUEST_EGL=...) pass through, for A/B runs.
 emu_env=()
 while IFS= read -r kv; do emu_env+=("$kv"); done < <(env | grep '^EMU_' || true)
 env -i HOME="$HOME" USER="$USER" TMPDIR="$TMPDIR" PATH="/usr/bin:/bin:/usr/sbin:/sbin" ANDROID_HOME="$sdk" ANDROID_SDK_ROOT="$sdk" ${emu_env[@]+"${emu_env[@]}"} \
-  "$bin" -avd "$avd" -port "$port" -no-window -no-audio -no-boot-anim -no-snapshot-save "$@" > "$out/$label.log" 2>&1 &
+  "$bin" -avd "$avd" -port "$port" -no-window -no-audio -no-boot-anim -no-snapshot-save ${own[@]+"${own[@]}"} "$@" > "$out/$label.log" 2>&1 &
 pid=$!
+# CPU-seconds of the emulator's process tree (the stock launcher execs a qemu child).
+cpu_s() { ps -o time= -p "$pid" $(pgrep -P "$pid") 2>/dev/null | awk -F: '{ s += (NF == 3) ? $1*3600 + $2*60 + $3 : $1*60 + $2 } END { printf "%.1f", s }'; }
 deadline=$(( SECONDS + ${BOOT_TIMEOUT:-600} )); state=timeout; t_adb=""; t_line=""; rss=0; tick=0
 # Poll every POLL seconds (default 0.15), so a sub-second win shows. Per poll: a builtin liveness
 # check and a grep of emu's log for its own `emu: boot completed in X s` line (emu only); adb is
@@ -41,7 +55,6 @@ while [ "$SECONDS" -lt "$deadline" ]; do
   kill -0 $pid 2>/dev/null || { state=exited; break; }
   tick=$((tick + 1))
   if [ $((tick % 7)) -eq 1 ]; then
-    # The stock launcher execs a qemu child; count the whole process tree.
     r=$(ps -o rss= -p $pid $(pgrep -P $pid) 2>/dev/null | awk '{s+=$1} END{print s+0}'); [ "$r" -gt "$rss" ] && rss=$r
   fi
   [ -z "$t_adb" ] && "$adb" -s "$serial" get-state 2>/dev/null | grep -q device && t_adb=$(since "$t0")
@@ -51,8 +64,12 @@ while [ "$SECONDS" -lt "$deadline" ]; do
   sleep "${POLL:-0.15}"
 done
 t_boot=$(since "$t0")
+cpu_boot=$(cpu_s); l1=$(load1)
 # emu's own figure (seconds from its start to the guest's boot event), when it printed one.
 emu_s=$(sed -n 's/^emu: boot completed in \([0-9.]*\)s.*/\1/p' "$out/$label.log" 2>/dev/null | head -1)
+# vCPU0's guest entries at boot: the sum of its exit counters on emu's -verbose line.
+runs0=$(sed -n 's/^emu: at boot completed: *vcpu0: //p' "$out/$label.log" 2>/dev/null | head -1 | tr ' ' '\n' | awk -F= 'NF == 2 { s += $2; n++ } END { if (n) print s }')
+starved=$(awk -v a="$l0" -v b="$l1" -v n="$ncpu" 'BEGIN { print (a > n || b > n) ? "yes" : "no" }')
 lat() { local s; s=$(now); "$adb" -s "$serial" shell "$@" >/dev/null 2>&1; since "$s" 2; }
 med3() { printf '%s\n%s\n%s\n' "$(lat "$@")" "$(lat "$@")" "$(lat "$@")" | sort -n | sed -n 2p; }
 m=""
@@ -62,7 +79,14 @@ if [ -n "$t_adb" ]; then
   m+=" md5x4=$(lat 'for j in 1 2 3 4; do (dd if=/dev/zero bs=1048576 count=64 2>/dev/null | md5sum >/dev/null) & done; wait')"
   [ "$state" = booted ] && m+=" pm_list=$(med3 pm list packages) am_start_W=$(med3 am start -W -n com.android.settings/.Settings)"
 fi
-line="label=$label kind=$kind state=$state adb_s=${t_adb:-} boot_s=$t_boot emu_boot_s=${emu_s:-} log_line_s=${t_line:-} peak_rss_mb=$((rss / 1024)) $m"
+# Stop: the console's kill, then SIGTERM by PID if it is still up after STOP_WAIT seconds (15).
+ts=$(now); "$adb" -s "$serial" emu kill >/dev/null 2>&1
+stop_by=$(( SECONDS + ${STOP_WAIT:-15} ))
+while kill -0 $pid 2>/dev/null && [ "$SECONDS" -lt "$stop_by" ]; do sleep 0.1; done
+t_stop=$(since "$ts")
+kill $pid 2>/dev/null; wait $pid 2>/dev/null
+overran=no; grep -q '^emu: shutdown took over' "$out/$label.log" 2>/dev/null && overran=yes
+line="label=$label kind=$kind state=$state adb_s=${t_adb:-} boot_s=$t_boot emu_boot_s=${emu_s:-} log_line_s=${t_line:-} peak_rss_mb=$((rss / 1024))"
+line+=" cpu_s=$cpu_boot vcpu0_runs=${runs0:-} load1_start=$l0 load1_boot=$l1 starved=$starved $m stop_s=$t_stop stop_overran=$overran"
 echo "$line" | tee "$out/$label.result"
-"$adb" -s "$serial" emu kill >/dev/null 2>&1; sleep 3; kill $pid 2>/dev/null; wait $pid 2>/dev/null
 exit 0

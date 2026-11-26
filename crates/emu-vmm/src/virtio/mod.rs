@@ -4,6 +4,7 @@ pub mod console;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod gpu;
 pub mod input;
+pub mod legacy_asg;
 pub mod mmio;
 pub mod net;
 pub mod queue;

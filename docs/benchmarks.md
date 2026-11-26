@@ -177,7 +177,14 @@ in [android.md](android.md#performance-notes).
 
 | Change | Before | After | Measured on |
 | --- | --- | --- | --- |
-| Kick the target vCPU on an interrupt: first-boot `/data` encryption | 22 s | 8 s | M-series Mac |
+| Kick the target vCPU on an interrupt: first-boot `/data` encryption | 22 s | 8 s | M-series Mac, an earlier macOS |
+| No kicks on an interrupt (`EMU_VCPU_WAKE` default `targeted` → `none` on macOS 26 and later): first boot (`-wipe-data`) of a 720×1280 API 36 phone, median (runs). A tie: the arms differ by less than the run-to-run spread | 11.4 s (11.4, 11.5, 11.4) | 11.6 s (11.8, 11.4; a third low-load run is owed) | M3 Max, macOS 26.6.2, 2026-11-26, runs at 1-minute load 7.7 to 8.1 (16 CPUs), arms interleaved, `EMU_VCPU_WAKE=targeted\|none scripts/android-bench.sh <label> <avd> emu -wipe-data` |
+| Same runs, vCPU0 guest entries / emu CPU-seconds to `sys.boot_completed`, first boot, median | 348k / 21.7 | 257k / 22.1 | same runs (`vcpu0_runs`, `cpu_s`) |
+| Same change, warm boot, median of 6 | 4.2 s (3.5 to 4.7) | 3.7 s (3.7 to 5.2) | same AVD and hour, host load 9.6 to 13.2 |
+| Same change, vCPU0 guest entries to `sys.boot_completed`, first / warm boot, median | 338k / 59.7k | 249k / 41.4k | same runs (`vcpu0_runs`) |
+| Same change, emu CPU-seconds to `sys.boot_completed`, first / warm boot, median | 25.0 / 9.3 | 23.4 / 8.7 | same runs (`cpu_s`) |
+| Same change, launcher swipes a minute after boot: janky frames, median of 6 (2 boots × 3 runs) / emu CPU | 0.40% / 28% of a core | 0.20% / 25% | same AVD, host load 5 to 11, `scripts/android-jank.sh emulator-5600 <pid>` |
+| Renderer init with Metal's shader cache cold / warm (gfxstream's compositor pipelines through MoltenVK) | 4.5 and 5.1 s (2 of 20 launches) | 0.33 s (median of the other 18) | M3 Max, 2026-11-26, `emu -verbose` (`renderer initialized in`) |
 | Plain `fsync` for guest flushes: first-boot APEX decompression | over 270 s | about 70 s | M-series Mac |
 | Screenshot of a 2480×1740 screen (convert and encode) | 86 ms | 19 ms | `cargo run --release -p sim-core --example frame_bench` |
 | Display stream: emulator CPU per frame besides the readback, tablet / phone | 12.8 / 7.1 ms | 2.0 / 0 ms | 4-core Linux VM |
@@ -278,6 +285,7 @@ are what a fresh checkout, a CI cache miss or a Rune bump pays.
 
 Claims that would belong in the README once someone runs them:
 
+- First boot with and without interrupt kicks at a 1-minute load under 8: three more runs per arm (two `none` runs and three `targeted` runs are published), and the `targeted` default below macOS 26 has no measurement on that macOS.
 - `simee screenshot` against `xcrun simctl io screenshot` on a quiet host (the run above had load
   13-69).
 - iOS boot and settle on a quiet host (the runs above had other load).

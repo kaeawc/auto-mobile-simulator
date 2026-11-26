@@ -153,7 +153,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `host` (hole punching) build on any unix host; the hypervisor (`hv.rs`) is Apple silicon only.
 - `crates/emu-vmm` — `machine.rs` (`run`), `layout.rs`, `board.rs` (DT), `vcpu.rs` (exits, PSCI,
   wakers), `bus.rs`, `devices/` (PL011, PL031, goldfish), `virtio/` (mmio transport, queue, blk,
-  rng, vsock, gpu, input incl. XR's dual-mode mouse, console, snd), `pipe/` (adb bridge, qemud
+  rng, vsock, gpu with `legacy_asg.rs` (API 31–33's address-space graphics on the renderer's
+  protocol), input incl. XR's dual-mode mouse, console, snd), `pipe/` (adb bridge, qemud
   services incl. `car.rs`, the vehicle HAL, and `xr.rs`, Android XR's `xr_service`), `modem/`,
   `disk.rs`, `boot.rs`, `display.rs` (`FrameStore`). Everything but `machine.rs`, `vcpu.rs` and
   `virtio/gpu.rs` builds and tests on Linux: put device logic there, not behind the hypervisor.
