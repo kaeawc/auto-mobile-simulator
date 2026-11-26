@@ -964,4 +964,274 @@ mod tests {
         let err = call(&mut s, "create", &json!({"name": "x", "device_type": "y", "runtime": "z", "form_factor": "foldable"}));
         assert!(err.expect_err("no foldable iPhone").starts_with("foldable is not supported on iOS"));
     }
+
+    /// The parameters a dispatcher's "missing" error names: "missing number parameter `x`",
+    /// "xr: missing field `action`", "give `angle` (0-180) or `posture`". Empty for any other error.
+    fn missing_names(error: &str) -> Vec<String> {
+        let tail = if let Some(at) = error.find("missing ") {
+            &error[at..]
+        } else if error.starts_with("give `") {
+            error
+        } else {
+            return Vec::new();
+        };
+        let mut ticks = tail.split('`').skip(1).step_by(2).map(str::to_owned);
+        if tail.starts_with("give") { ticks.collect() } else { ticks.next().into_iter().collect() }
+    }
+
+    /// A value of the type the schema gives a parameter, to get past its "missing" error.
+    fn dummy(schema: &Value) -> Value {
+        if let Some(first) = schema["enum"].get(0) {
+            return first.clone();
+        }
+        match schema["type"].as_str() {
+            Some("number" | "integer") => json!(1),
+            Some("boolean") => json!(true),
+            Some("array") => json!(["a"]),
+            Some("object") => json!({}),
+            _ => json!("a"),
+        }
+    }
+
+    /// What probing one method on one dispatcher found.
+    #[derive(Debug, PartialEq)]
+    enum Probe {
+        /// The dispatcher checked this method's parameters: every parameter it reported missing is
+        /// required or a member of a group of alternatives, a call with the schema's required
+        /// fields (and one member of each group it asked for) wasn't refused for a missing one,
+        /// and dropping any required field made it say that field was missing (or the call worked).
+        Probed,
+        /// The dispatcher refused before it read parameters (no such hardware, a platform or form
+        /// factor it doesn't serve, a state): nothing is known.
+        Unprobed(String),
+    }
+
+    /// Drives `method` on the Android dispatcher, on the running fake device `device`, from the
+    /// schema's required fields.
+    fn probe_android(s: &mut Session, method: &str, device: &str) -> Probe {
+        let schema = crate::input_schema(method).expect("schema");
+        let members: Vec<String> = crate::schema::one_of(method).into_iter().flatten().collect();
+        let required: Vec<String> =
+            schema["required"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_owned)).collect();
+        let mut params = json!({});
+        if schema["properties"].get("device").is_some() {
+            params["device"] = json!(device);
+        }
+        for name in required.iter().filter(|n| *n != "device") {
+            params[name] = dummy(&schema["properties"][name]);
+        }
+        // Give the parameters the dispatcher asks for beyond the required ones: each must be a member of
+        // a group of alternatives, or the schema leaves out something every call needs.
+        let mut added: Vec<String> = Vec::new();
+        let mut last = call(s, method, &params);
+        for _ in 0..8 {
+            let Err(error) = &last else { break };
+            let names = missing_names(error);
+            let fresh: Vec<&String> = names.iter().filter(|n| params.get(n.as_str()).is_none()).collect();
+            let Some(&first) = fresh.first() else { break };
+            for name in &names {
+                assert!(
+                    required.contains(name) || members.contains(name),
+                    "`{method}` refuses a call with its required fields {required:?} for a missing `{name}` ({error}): the schema must require it or group it"
+                );
+            }
+            params[first] = dummy(&schema["properties"][first]);
+            added.push(first.clone());
+            last = call(s, method, &params);
+        }
+        for group in crate::schema::one_of(method) {
+            let given = added.iter().filter(|n| group.contains(n)).count();
+            assert!(given <= 1, "`{method}` needed more than one of {group:?}: they are not alternatives");
+        }
+        assert!(added.iter().all(|n| members.contains(n)), "`{method}`: {added:?}");
+        let refused = last
+            .as_ref()
+            .err()
+            .is_some_and(|e| !missing_names(e).is_empty() && missing_names(e).iter().all(|n| params.get(n.as_str()).is_none()));
+        assert!(!refused, "`{method}` still refuses {params} for a missing parameter: {last:?}");
+        // Drop each required field in turn: the dispatcher must say it is missing, or (when the whole
+        // call was refused before parameters) tell nothing.
+        let mut confirmed = 0;
+        let others: Vec<&String> = required.iter().filter(|n| *n != "device").collect();
+        for name in &others {
+            let mut without = params.clone();
+            without.as_object_mut().map(|o| o.remove(name.as_str()));
+            match call(s, method, &without) {
+                Ok(_) => panic!("`{method}` works without `{name}`, but its schema requires it"),
+                Err(error) if missing_names(&error).contains(name) => confirmed += 1,
+                Err(_) => {}
+            }
+        }
+        if last.is_ok() || (!others.is_empty() && confirmed == others.len()) {
+            Probe::Probed
+        } else {
+            Probe::Unprobed(format!("{:?}", last.err()))
+        }
+    }
+
+    /// Methods the Android dispatcher serves that this test must not run, and why.
+    const NOT_RUN_ON_ANDROID: &[(&str, &str)] = &[
+        ("boot", "starts or stops emulators: the fake's advertisement names this process"),
+        ("boot_many", "starts emulators"),
+        ("shutdown", "signals the advertised process, which is this one"),
+        ("delete", "refuses a running device before it reads parameters"),
+        ("create", "its required parameters depend on `platform`, and it creates a device"),
+        ("clone", "creates a device from a golden that has booted"),
+    ];
+
+    /// The parameters an iOS dispatcher arm reads with `need_*` or reports missing, found in its
+    /// source: the iOS backend only builds on macOS, so on other hosts this is the nearest thing to
+    /// running it. Arms that hand `p` to a helper (`tap_samples(p)`) read nothing here; the Android
+    /// probe covers the helpers the platforms share.
+    fn ios_arm_reads(source: &str, method: &str) -> Vec<String> {
+        let quoted = format!("\"{method}\"");
+        let starts_arm = |line: &str| line.starts_with("        \"") && line.contains("=>") && !line.starts_with("         ");
+        let mut reads = Vec::new();
+        let mut in_arm = false;
+        for line in source.lines() {
+            if starts_arm(line) {
+                in_arm = line.split("=>").next().is_some_and(|names| names.split('|').any(|n| n.trim() == quoted));
+            } else if line.starts_with("        _ =>") || line.starts_with("        other =>") || line == "    }" {
+                in_arm = false;
+            }
+            if !in_arm {
+                continue;
+            }
+            for marker in ["need_str(p, \"", "need_f64(p, \"", "need_bool(p, \"", "parameter `", "missing parameter `"] {
+                let mut rest = line;
+                while let Some(at) = rest.find(marker) {
+                    rest = &rest[at + marker.len()..];
+                    let end = rest.find(['"', '`']).unwrap_or(rest.len());
+                    let name = rest[..end].to_owned();
+                    if !name.is_empty() && !reads.contains(&name) {
+                        reads.push(name);
+                    }
+                }
+            }
+        }
+        reads
+    }
+
+    /// Every method's schema agrees with its dispatchers about what is required:
+    ///
+    /// - Android: each method its dispatcher serves is driven on a running fake device, in both
+    ///   directions ([`Probe::Probed`]). A method the dispatcher refuses before reading parameters
+    ///   isn't counted as probed; each such one is listed here with why, and a method that stops
+    ///   needing to be listed fails until it is taken off.
+    /// - iOS: its dispatcher only builds on macOS, and the Linux stub refuses every device method
+    ///   before reading parameters, so the iOS arms' own `need_*` reads are scanned from the source:
+    ///   each must be required or in a group of alternatives in the schema.
+    #[test]
+    fn the_schema_requires_what_the_dispatchers_require() {
+        use sim_android::testing::fake_emulator;
+        use sim_core::form_factor::FormFactor;
+        let root = std::path::PathBuf::from("/tmp").join(format!("sa-schema-{}", std::process::id()));
+        let sdk = root.join("sdk/system-images/android-36/google_apis/arm64-v8a");
+        std::fs::create_dir_all(&sdk).expect("image dir");
+        std::fs::write(sdk.join("system.img"), b"s").expect("system.img");
+        std::fs::write(sdk.join("source.properties"), "AndroidVersion.ApiLevel=36\nSystemImage.TagId=google_apis\n").expect("props");
+        // A watch and a car: the methods that need their hardware are refused on a foldable before
+        // their parameters are read.
+        for (dir, tag, build_prop) in [
+            ("android-34/android-wear/arm64-v8a", "android-wear", ""),
+            ("android-34-ext9/android-automotive/arm64-v8a", "android-automotive", "ro.product.name=sdk_car_arm64\n"),
+        ] {
+            let d = root.join("sdk/system-images").join(dir);
+            std::fs::create_dir_all(&d).expect("image dir");
+            std::fs::write(d.join("system.img"), b"s").expect("system.img");
+            std::fs::write(d.join("source.properties"), format!("AndroidVersion.ApiLevel=34\nSystemImage.TagId={tag}\n")).expect("props");
+            if !build_prop.is_empty() {
+                std::fs::write(d.join("build.prop"), build_prop).expect("build.prop");
+            }
+        }
+        let env = emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") };
+        let mut android = sim_android::Android::new(env);
+        android.running_dir = Some(root.join("running"));
+        android.create("fold", "system-images;android-36;google_apis;arm64-v8a", Some(FormFactor::Foldable)).expect("create");
+        android.create("watch", "system-images;android-34;android-wear;arm64-v8a", None).expect("watch");
+        android.create("car", "system-images;android-34-ext9;android-automotive;arm64-v8a", None).expect("car");
+        // One fake emulator is advertised at a time (its advertisement is named for this process).
+        let mut fakes = vec![fake_emulator(&android, "fold")];
+        let mut advertised = "fold";
+        let backend = android.clone();
+        let mut s = Session::with_android(android);
+
+        let (mut probed, mut unprobed) = (Vec::new(), Vec::new());
+        for (method, ..) in METHODS {
+            if !platforms(method).contains(&Platform::Android) || NOT_RUN_ON_ANDROID.iter().any(|(m, _)| m == method) {
+                continue;
+            }
+            let device = match *method {
+                "rotary" => "watch",
+                "vehicle" => "car",
+                _ => "fold",
+            };
+            if device != advertised {
+                fakes.push(fake_emulator(&backend, device));
+                advertised = device;
+            }
+            match probe_android(&mut s, method, device) {
+                Probe::Probed => probed.push(*method),
+                Probe::Unprobed(why) => unprobed.push((*method, why)),
+            }
+        }
+        assert!(
+            unprobed.is_empty(),
+            "the Android dispatcher refused these before reading their parameters, so nothing is known: {unprobed:?}"
+        );
+        // The probe reaches parameter checks (a method it didn't would be in `unprobed`).
+        for method in [
+            "tap",
+            "swipe",
+            "touch",
+            "button",
+            "type",
+            "key",
+            "location",
+            "rotate",
+            "rotary",
+            "fold",
+            "console",
+            "touchpad",
+            "stylus",
+            "xr",
+            "vehicle",
+            "screen",
+            "screenshot",
+            "info",
+            "devices",
+        ] {
+            assert!(probed.contains(&method), "{method} should be probed: {probed:?}");
+        }
+        for (method, _) in NOT_RUN_ON_ANDROID {
+            assert!(METHODS.iter().any(|(m, ..)| m == method), "{method} is not a method");
+        }
+
+        // The iOS dispatcher's reads, from its source.
+        let source = include_str!("ios.rs");
+        let mut scanned = 0;
+        for (method, ..) in METHODS {
+            if !platforms(method).contains(&Platform::Ios) {
+                continue;
+            }
+            let schema = crate::input_schema(method).expect("schema");
+            let members: Vec<String> = crate::schema::one_of(method).into_iter().flatten().collect();
+            let reads = ios_arm_reads(source, method);
+            scanned += usize::from(!reads.is_empty());
+            for name in reads.iter().filter(|n| *n != "device") {
+                let required = schema["required"].as_array().is_some_and(|r| r.iter().any(|v| v == name.as_str()));
+                // A parameter only iOS reads (`create`'s `device_type`) is optional in the schema and says so.
+                let ios_only = schema["properties"][name]["description"].as_str().is_some_and(|d| d.contains("iOS only"));
+                assert!(
+                    required || members.contains(name) || ios_only,
+                    "the iOS `{method}` arm reads `{name}` as required, but its schema doesn't ({reads:?})"
+                );
+            }
+        }
+        // The scan finds real reads: `launch`'s bundle id, `defaults_write`'s key.
+        assert!(ios_arm_reads(source, "launch").contains(&"bundle_id".to_owned()));
+        assert!(ios_arm_reads(source, "defaults_write").contains(&"domain".to_owned()));
+        assert!(scanned >= 20, "{scanned} methods with reads");
+        std::fs::remove_dir_all(root).ok();
+    }
 }

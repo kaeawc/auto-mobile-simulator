@@ -10,12 +10,20 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use crate::{Error, Revision};
+use crate::{Error, Host, Revision};
 
 /// The repository package that carries the renderer.
 pub const PACKAGE: &str = "emulator";
-/// The renderer library; a `lib64` without it isn't a renderer.
-pub const BACKEND: &str = "libgfxstream_backend.dylib";
+/// The renderer library; a `lib64` without it isn't a renderer. The macOS package carries a
+/// `.dylib`, the Linux one a `.so`.
+pub const BACKEND: &str = if cfg!(target_os = "macos") { "libgfxstream_backend.dylib" } else { "libgfxstream_backend.so" };
+
+/// The host whose `emulator` package carries a renderer this one can load: Apple silicon's on
+/// macOS, the host's own elsewhere. Google publishes the package for macOS (arm64, x64), Linux x64
+/// and Windows x64 (37.x), so on arm64 Linux this resolves to nothing and provisioning says so.
+pub fn host() -> Host {
+    if cfg!(target_os = "macos") { Host::MACOS_ARM64 } else { Host::current() }
+}
 /// Archive members unpacked: the renderer's `lib64` (backend, its `@rpath` dependencies, the
 /// shader translator it `dlopen`s by name, `gles_angle`/`gles_swiftshader` and the Vulkan
 /// loader, ICDs and layers it finds relative to the launcher directory), plus the license files.

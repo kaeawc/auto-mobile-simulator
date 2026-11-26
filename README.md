@@ -104,6 +104,7 @@ Unsupported combinations are refused with the reason. The matrix and its gaps:
 | [Comparison](docs/comparison.md) | what differs from the stock tools, and why |
 | [Benchmarks](docs/benchmarks.md) | every published number and the command behind it |
 | [CLI](docs/cli.md) and [API](docs/api.md) | commands and methods for both platforms |
+| [MCP server](docs/mcp.md) | `simee mcp`: every method as a tool for an agent, with resources, tasks and a device view |
 | [Debugging](docs/debugging.md) | the iOS debug surface, network shaping, audio, Android counters |
 | [Desktop window](docs/desktop.md) | the window, its shortcuts and per-device controls |
 | [Android backend](docs/android.md) | emu status, provisioning, performance notes |

@@ -21,6 +21,7 @@ sim-core = { path = "crates/sim-core" }
 sim-coresim = { path = "crates/sim-coresim" }
 sim-debug = { path = "crates/sim-debug" }
 sim-api = { path = "crates/sim-api" }
+sim-mcp = { path = "crates/sim-mcp" }
 sim-netshape = { path = "crates/sim-netshape" }
 sim-audio = { path = "crates/sim-audio" }
 sim-android = { path = "crates/sim-android" }

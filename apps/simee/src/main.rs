@@ -394,6 +394,10 @@ enum Cmd {
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
     },
+    /// Serve MCP on stdin and stdout, so an agent can do everything simee can: every API method as
+    /// a tool, devices as resources, long operations as tasks, a device view as an app. Configure
+    /// it in the agent's MCP settings as the command `simee mcp` (see docs/mcp.md).
+    Mcp,
     /// Run a program inside the device (e.g. `defaults`, `log`, `launchctl`, `notifyutil`, `heap`).
     #[command(disable_help_flag = true)]
     Exec {
@@ -414,6 +418,12 @@ fn main() -> Result<()> {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
             eprintln!("simee API on {}", path.display());
             sim_api::serve(&path)?;
+            return Ok(());
+        }
+        Cmd::Mcp => {
+            // Methods run in this process, on the server's own threads: nothing but protocol
+            // messages may reach stdout.
+            sim_mcp::serve_stdio(std::sync::Arc::new(sim_mcp::ApiBackend::new()))?;
             return Ok(());
         }
         Cmd::Call { method, params, socket } => {
@@ -782,7 +792,7 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             }
         }
         Cmd::Console { device, command } => lines(out, &call("console", json!({"device": device, "command": command.join(" ")}))?)?,
-        Cmd::Serve { .. } | Cmd::Call { .. } => anyhow::bail!("`serve` and `call` don't run through a transport"),
+        Cmd::Serve { .. } | Cmd::Call { .. } | Cmd::Mcp => anyhow::bail!("`serve`, `call` and `mcp` don't run through a transport"),
         Cmd::Exec { device, env, program, args } => {
             let env: serde_json::Map<String, Value> =
                 env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), Value::from(v))).collect();
@@ -1179,6 +1189,16 @@ mod tests {
         failed["failed"] = json!(1);
         let e = print_boot_many(&failed, 2, true, &mut Vec::new(), &mut Vec::new()).expect_err("a failed boot fails");
         assert_eq!(e.to_string(), "1 of 2 devices failed to boot");
+    }
+
+    #[test]
+    fn mcp_is_a_subcommand_that_runs_no_device_command() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        assert!(matches!(parse(&["mcp"]), Ok(Cmd::Mcp)));
+        assert!(parse(&["mcp", "--http"]).is_err(), "stdio only");
+        let mut transport = Transport::local();
+        let e = run(Cmd::Mcp, &mut transport, &mut Vec::new(), &mut Vec::new()).expect_err("served by main, not run");
+        assert!(e.to_string().contains("`mcp` don't run through a transport"));
     }
 
     #[test]
