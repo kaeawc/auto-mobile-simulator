@@ -1,0 +1,22 @@
+[package]
+name = "sim-mcp"
+description = "simee's MCP server: every API method as a tool, devices as resources, long operations as tasks, and a device view as an MCP App, over stdio."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+serde_json.workspace = true
+sim-api.workspace = true
+
+[dev-dependencies]
+emu-avd.workspace = true
+sim-android = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true
