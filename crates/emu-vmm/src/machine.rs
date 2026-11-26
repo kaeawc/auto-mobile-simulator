@@ -43,19 +43,25 @@ pub struct GpuSpec {
     pub pipe_gles: bool,
 }
 
+#[cfg(target_os = "macos")]
 static RENDERER: std::sync::OnceLock<Arc<emu_gfxstream::Renderer>> = std::sync::OnceLock::new();
 
 /// A Vulkan-only renderer's post notices (see `init_renderer`).
+#[cfg(target_os = "macos")]
 static TICKER: std::sync::OnceLock<Arc<crate::display::PostTicker>> = std::sync::OnceLock::new();
 
 /// Post notices of a Vulkan-only renderer ([`crate::display::PostTicker`]): at most one per
 /// display frame (60 Hz) while the renderer signals fences, and for 50 ms (three frames) after.
+#[cfg(target_os = "macos")]
 const POST_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+#[cfg(target_os = "macos")]
 const POST_NOTICE_TAIL: std::time::Duration = std::time::Duration::from_millis(50);
 
+#[cfg(target_os = "macos")]
 type RendererInit = std::sync::mpsc::Receiver<Result<Arc<emu_gfxstream::Renderer>>>;
 
 /// An initialization [`start_renderer`] began, not yet claimed by [`run`].
+#[cfg(target_os = "macos")]
 static PENDING: std::sync::Mutex<Option<RendererInit>> = std::sync::Mutex::new(None);
 
 /// Loads and initializes the renderer on its own thread, so the dlopen chain and EGL/GLES/Vulkan
@@ -64,6 +70,7 @@ static PENDING: std::sync::Mutex<Option<RendererInit>> = std::sync::Mutex::new(N
 /// environment is configured (`emu_gfxstream::configure_environment`). The thread stays parked
 /// after init, like the main thread that initialized it before: thread-local EGL state made
 /// during init never sees its thread exit.
+#[cfg(target_os = "macos")]
 pub fn start_renderer(spec: GpuSpec) {
     let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     if RENDERER.get().is_some() || pending.is_some() {
@@ -88,6 +95,7 @@ pub fn start_renderer(spec: GpuSpec) {
 
 /// The renderer is process-wide: loaded and initialized once, reused across guest reboots.
 /// Claims an init [`start_renderer`] began, or initializes it here.
+#[cfg(target_os = "macos")]
 fn renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     if let Some(r) = RENDERER.get() {
         return Ok(r.clone());
@@ -105,6 +113,7 @@ fn renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
 /// compositor's pipelines) lands in Metal's shader cache, so the next process's init finds it
 /// there (`emu -provision-renderer` warms it this way, in a child per kind). Once per process,
 /// like any renderer init; call after `emu_gfxstream::configure_environment`.
+#[cfg(target_os = "macos")]
 pub fn warm_renderer(lib64: PathBuf, vulkan_only: bool, virtual_queue: bool) -> Result<Duration> {
     let t = Instant::now();
     let spec = GpuSpec {
@@ -125,6 +134,7 @@ pub fn warm_renderer(lib64: PathBuf, vulkan_only: bool, virtual_queue: bool) -> 
 /// Waits out an init [`start_renderer`] began that no boot claimed (a launch that fails before
 /// it reaches the GPU), so the process never exits while the renderer is inside dlopen or EGL
 /// init. The result is dropped: the launch is failing anyway.
+#[cfg(target_os = "macos")]
 fn settle_renderer() {
     let pending = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(rx) = pending {
@@ -132,9 +142,20 @@ fn settle_renderer() {
     }
 }
 
+/// No renderer exists on this host yet (Linux renderer loading is #55's): nothing to start, so
+/// nothing is ever pending.
+#[cfg(not(target_os = "macos"))]
+pub fn start_renderer(spec: GpuSpec) {
+    drop(spec);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn settle_renderer() {}
+
 /// The renderer features emu turns on (see [`init_renderer`]), with VulkanVirtualQueue when
 /// `virtual_queue` ([`GpuSpec::virtual_queue`]), without the virtio-gpu extensions for a
 /// [`GpuSpec::pipe_gles`] guest, then `extra` overrides.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn renderer_features(virtual_queue: bool, pipe_gles: bool, extra: Option<&str>) -> String {
     let mut features = String::from("RefCountPipe:enabled,GlDirectMem:enabled");
     if virtual_queue {
@@ -159,6 +180,7 @@ fn renderer_features(virtual_queue: bool, pipe_gles: bool, extra: Option<&str>) 
     features
 }
 
+#[cfg(target_os = "macos")]
 fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     let r = emu_gfxstream::Renderer::load(&spec.lib64).context("loading the gfxstream renderer")?;
     let gl_composition = std::env::var_os("EMU_GL_COMPOSITION").is_some();
@@ -567,37 +589,11 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     if let Some(opts) = cfg.sound {
         slots[slots::SOUND as usize] = Some(Box::new(virtio::snd::Snd::new(opts)));
     }
-    let mut dma_renderer = None;
-    let mut gpu_renderer = None;
-    if let Some(spec) = &cfg.gpu {
-        let t = Instant::now();
-        let r = renderer(spec)?;
-        if cfg.launched.is_some() {
-            eprintln!("emu: renderer ready (boot waited {} ms)", t.elapsed().as_millis());
-        }
-        gpu_renderer = Some(r.clone());
-        // Guest-physical → host for the renderer's DMA paths (gralloc CPU reads land in the
-        // goldfish address-space area; direct-mapped buffers may be anywhere in RAM).
-        let (ram, area) = (mem.clone(), as_area.clone());
-        let translate: emu_gfxstream::DmaTranslator = Box::new(move |gpa| {
-            ram.host_range(gpa, 1).or_else(|| area.as_ref().and_then(|a| a.host_range(gpa, 1))).map_or(std::ptr::null_mut(), |h| h.as_ptr())
-        });
-        match r.set_dma_translator(Some(translate)) {
-            Ok(()) => dma_renderer = Some(r.clone()),
-            Err(e) => eprintln!("emu: renderer DMA hooks unavailable ({e}); guest CPU reads of color buffers will fail"),
-        }
-        if !spec.pipe_gles {
-            let gpu = virtio::gpu::Gpu::new(virtio::gpu::GpuConfig {
-                width: spec.width,
-                height: spec.height,
-                renderer: r,
-                shm: (GPU_SHM_BASE, GPU_SHM_SIZE),
-                window: Arc::new(virtio::gpu::HvWindow { base: GPU_SHM_BASE }),
-                display: spec.display.clone(),
-                verbose: spec.verbose,
-            });
-            slots[slots::GPU as usize] = Some(Box::new(gpu));
-        }
+    #[cfg(target_os = "macos")]
+    let (dma_renderer, gpu_renderer) = attach_gpu(cfg.gpu.as_ref(), cfg.launched.is_some(), &mem, as_area.as_ref(), &mut slots)?;
+    #[cfg(not(target_os = "macos"))]
+    if cfg.gpu.is_some() {
+        bail!("host GPU rendering isn't available on this host yet (the Linux gfxstream renderer is #55); boot with -gpu off");
     }
     if let Some((w, h)) = cfg.input {
         use virtio::input::{Input, Kind};
@@ -630,11 +626,14 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         let mut registry = pipe::PipeRegistry::default();
         registry.register("qemud:adb", Box::new(svc));
         registry.register("qemud:boot-properties", Box::new(pipe::qemud::BootProperties { props: cfg.boot_props.clone() }));
+        #[cfg(target_os = "macos")]
         let on_last_ref = gpu_renderer.clone().map(|r| -> devices::goldfish_pipe::OnLastRef {
             Arc::new(move |handle| {
                 let _ = r.release_color_buffer(handle);
             })
         });
+        #[cfg(not(target_os = "macos"))]
+        let on_last_ref = None;
         registry.register("refcount", Box::new(devices::goldfish_pipe::RefCount { on_last_ref }));
         registry.register("QemuMiscPipe", Box::new(pipe::misc::MiscService { on_event: cfg.on_guest_event.clone() }));
         registry.register("qemud:sensors", Box::new(pipe::sensors::SensorService { sensors: cfg.sensors.clone() }));
@@ -651,12 +650,15 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         registry.register("multidisplay", Box::new(pipe::misc::Silent("multidisplay")));
         registry.register("qemud:camera", Box::new(pipe::fingerprint::CameraService));
         // The GLES encoder's pipes on API 29–30 images, each to a render channel of its own.
+        #[cfg(target_os = "macos")]
         let gl_backend = cfg
             .gpu
             .as_ref()
             .filter(|s| s.pipe_gles)
             .and(gpu_renderer.clone())
             .map(|r| Arc::new(GlPipes::new(r)) as Arc<dyn pipe::opengles::GlBackend>);
+        #[cfg(not(target_os = "macos"))]
+        let gl_backend: Option<Arc<dyn pipe::opengles::GlBackend>> = None;
         if let Some(backend) = &gl_backend {
             registry.register("opengles", Box::new(pipe::opengles::OpenglesService { backend: backend.clone() }));
         }
@@ -674,11 +676,15 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         slots[slots::VSOCK as usize] = Some(Box::new(virtio::vsock::Vsock::new(3, registry, events, rx)));
         pipe::adb::AdbService::announce_port(port);
     }
+    let mut notifies = Vec::new();
     for (i, dev) in slots.into_iter().enumerate() {
         let n = i as u32;
         let irq = Arc::new(Interrupt::new(spi(VIRTIO_MMIO_SPI_BASE + n)));
-        bus.insert(virtio_slot_addr(n), VIRTIO_MMIO_STRIDE, Arc::new(MmioTransport::new(dev, irq, mem.clone())));
+        let transport = Arc::new(MmioTransport::new(dev, irq, mem.clone()));
+        notifies.extend(queue_notifies(&transport, virtio_slot_addr(n)));
+        bus.insert(virtio_slot_addr(n), VIRTIO_MMIO_STRIDE, transport);
     }
+    vm.serve_notifies(notifies)?;
 
     let cpus = Arc::new(Cpus::new(bus, cfg.cpus as usize, vm.clone()));
     *EXIT_STATS.lock().unwrap_or_else(PoisonError::into_inner) = Some(cpus.stats.clone());
@@ -708,6 +714,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     }
     teardown_step(Some("releasing the vCPUs"), verbose);
     drop(cpus);
+    #[cfg(target_os = "macos")]
     if let Some(r) = dma_renderer {
         let _ = r.set_dma_translator(None);
     }
@@ -721,6 +728,81 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         blank_until_next_post(&*spec.display, spec.verbose);
     }
     Ok(Outcome { reason, uptime: started.elapsed(), exits })
+}
+
+#[cfg(target_os = "macos")]
+type Renderers = (Option<Arc<emu_gfxstream::Renderer>>, Option<Arc<emu_gfxstream::Renderer>>);
+
+/// The renderer, when the boot has a GPU, and its virtio-gpu device unless the guest draws through
+/// the pipe ([`GpuSpec::pipe_gles`]): returns the renderer with its
+/// DMA translator installed (to remove at teardown) and the renderer itself.
+#[cfg(target_os = "macos")]
+fn attach_gpu(
+    spec: Option<&GpuSpec>,
+    timings: bool,
+    mem: &Arc<GuestRam>,
+    as_area: Option<&Arc<GuestRam>>,
+    slots: &mut [Option<Box<dyn virtio::VirtioDevice>>],
+) -> Result<Renderers> {
+    let Some(spec) = spec else { return Ok((None, None)) };
+    let t = Instant::now();
+    let r = renderer(spec)?;
+    if timings {
+        eprintln!("emu: renderer ready (boot waited {} ms)", t.elapsed().as_millis());
+    }
+    let gpu_renderer = Some(r.clone());
+    // Guest-physical → host for the renderer's DMA paths (gralloc CPU reads land in the
+    // goldfish address-space area; direct-mapped buffers may be anywhere in RAM).
+    let (ram, area) = (mem.clone(), as_area.cloned());
+    let translate: emu_gfxstream::DmaTranslator = Box::new(move |gpa| {
+        ram.host_range(gpa, 1).or_else(|| area.as_ref().and_then(|a| a.host_range(gpa, 1))).map_or(std::ptr::null_mut(), |h| h.as_ptr())
+    });
+    let dma_renderer = match r.set_dma_translator(Some(translate)) {
+        Ok(()) => Some(r.clone()),
+        Err(e) => {
+            eprintln!("emu: renderer DMA hooks unavailable ({e}); guest CPU reads of color buffers will fail");
+            None
+        }
+    };
+    if !spec.pipe_gles {
+        let gpu = virtio::gpu::Gpu::new(virtio::gpu::GpuConfig {
+            width: spec.width,
+            height: spec.height,
+            renderer: r,
+            shm: (GPU_SHM_BASE, GPU_SHM_SIZE),
+            window: Arc::new(virtio::gpu::HvWindow { base: GPU_SHM_BASE }),
+            display: spec.display.clone(),
+            verbose: spec.verbose,
+        });
+        slots[slots::GPU as usize] = Some(Box::new(gpu));
+    }
+    Ok((dma_renderer, gpu_renderer))
+}
+
+/// QueueNotify for each of `transport`'s queues, at its slot `base`, for the hypervisor to
+/// complete in the kernel where it can ([`Hypervisor::serve_notifies`]). The notifier holds the
+/// transport weakly: devices still go first at teardown.
+fn queue_notifies(transport: &Arc<MmioTransport>, base: u64) -> Vec<crate::hv::QueueNotify> {
+    (0..transport.queue_count() as u32)
+        .map(|q| {
+            let t = Arc::downgrade(transport);
+            crate::hv::QueueNotify {
+                addr: base + crate::virtio::mmio::QUEUE_NOTIFY,
+                value: q,
+                on: Arc::new(move || {
+                    if let Some(t) = t.upgrade() {
+                        t.queue_notify(q);
+                    }
+                }),
+            }
+        })
+        .collect()
+}
+
+/// No renderer, no post notices to hold.
+#[cfg(not(target_os = "macos"))]
+fn next_post_hold(_verbose: bool) -> Option<(Arc<crate::display::PostTicker>, crate::display::Hold)> {
+    None
 }
 
 /// After a guest reset, the screen is black until the next boot posts, not the last boot's final
@@ -737,6 +819,7 @@ fn blank_until_next_post(display: &dyn crate::display::DisplaySink, verbose: boo
 
 /// The Vulkan-only renderer's ticker and a hold met once the next boot posts (none for another
 /// renderer).
+#[cfg(target_os = "macos")]
 fn next_post_hold(verbose: bool) -> Option<(Arc<crate::display::PostTicker>, crate::display::Hold)> {
     let (ticker, r) = (TICKER.get()?, RENDERER.get()?);
     let stale = r.last_posted_color_buffer().ok()?;
@@ -758,19 +841,23 @@ fn next_post_hold(verbose: bool) -> Option<(Arc<crate::display::PostTicker>, cra
 /// The renderer as the `opengles` and `GLProcessPipe` pipes use it. Process cleanups run on a
 /// thread of their own (they free a dead process's GL objects, and may wait on its render
 /// threads), never on the pipe device's.
+#[cfg(target_os = "macos")]
 struct GlPipes {
     renderer: Arc<emu_gfxstream::Renderer>,
     dead: Mutex<Option<std::sync::mpsc::Sender<u64>>>,
 }
 
+#[cfg(target_os = "macos")]
 impl GlPipes {
     fn new(renderer: Arc<emu_gfxstream::Renderer>) -> GlPipes {
         GlPipes { renderer, dead: Mutex::new(None) }
     }
 }
 
+#[cfg(target_os = "macos")]
 struct Channel(emu_gfxstream::RenderChannel);
 
+#[cfg(target_os = "macos")]
 impl pipe::opengles::GlChannel for Channel {
     fn try_write(&self, data: &[u8]) -> pipe::opengles::GlWrite {
         match self.0.try_write(data) {
@@ -794,6 +881,7 @@ impl pipe::opengles::GlChannel for Channel {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl pipe::opengles::GlBackend for GlPipes {
     fn open(&self) -> Option<Arc<dyn pipe::opengles::GlChannel>> {
         match self.renderer.open_channel() {
@@ -851,6 +939,7 @@ mod tests {
         assert!(teardown_status().is_none());
     }
 
+    #[cfg(target_os = "macos")]
     fn spec(lib64: PathBuf) -> GpuSpec {
         GpuSpec {
             lib64,
@@ -996,10 +1085,12 @@ mod tests {
     }
 
     /// Serializes the tests that use the process-wide `PENDING` slot.
+    #[cfg(target_os = "macos")]
     static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A launch that fails before it claims the renderer returns only after the init thread is
     /// done: exiting mid-dlopen or mid-EGL-init could crash or hang the process.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_failed_launch_waits_out_the_pending_renderer_init() {
         let _slot = SLOT.lock().unwrap_or_else(|e| e.into_inner());
@@ -1025,6 +1116,7 @@ mod tests {
     }
 
     /// An init started early that fails reports its error where the boot claims it.
+    #[cfg(target_os = "macos")]
     #[test]
     fn early_renderer_failure_surfaces_at_claim() {
         let _slot = SLOT.lock().unwrap_or_else(|e| e.into_inner());
@@ -1043,6 +1135,7 @@ mod tests {
     /// bare-name dlopen of ANGLE needs a fallback path (without it, init crashes in the renderer):
     ///     L=~/Library/Android/sdk/emulator/lib64; DYLD_FALLBACK_LIBRARY_PATH=$L:$L/gles_angle:/usr/lib \
     ///       cargo test --release -p emu-vmm renderer_init_off_thread -- --ignored --nocapture
+    #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "needs a gfxstream renderer and a host GPU"]
     fn renderer_init_off_thread() {

@@ -1,9 +1,9 @@
 //! The simee virtual machine: an arm64 board that boots unmodified Android emulator system
-//! images on Hypervisor.framework.
+//! images on Hypervisor.framework (Apple silicon) or KVM (arm64 Linux).
 //!
 //! The device models and the vCPU threads' shared half ([`vcpu`]) build and test on any unix host;
 //! the machine that runs them needs a hypervisor backend ([`hv`]: Hypervisor.framework on Apple
-//! silicon) and the GPU renderer.
+//! silicon, KVM on arm64 Linux) and the GPU renderer.
 #![cfg(unix)]
 
 pub mod acpi;
@@ -15,11 +15,11 @@ pub mod bus;
 pub mod devices;
 pub mod disk;
 pub mod display;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(hv)]
 pub mod hv;
 pub mod irq;
 pub mod layout;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(hv)]
 mod machine;
 pub mod modem;
 pub mod net;
@@ -34,7 +34,7 @@ pub mod virtio;
 pub mod wake;
 
 pub use disk::{DiskMode, DiskSpec};
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(hv)]
 pub use machine::*;
 pub use virtio::input::Inputs;
 

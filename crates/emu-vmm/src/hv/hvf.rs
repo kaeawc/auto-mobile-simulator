@@ -124,9 +124,16 @@ impl Hypervisor {
         Arc::new(GicSpi { intid, wakers: self.wakers.clone() })
     }
 
+    /// Nothing to do: Hypervisor.framework has no ioeventfd, so QueueNotify stores exit as MMIO
+    /// and reach the transport that way.
+    pub fn serve_notifies(&self, notifies: Vec<super::QueueNotify>) -> anyhow::Result<()> {
+        drop(notifies);
+        Ok(())
+    }
+
     /// Starts one thread per vCPU: the boot CPU at `entry` with x0 = `dtb`, the rest waiting for
     /// PSCI CPU_ON. The guest counter starts near zero, identical on every vCPU.
-    pub fn start_vcpus(self: &Arc<Self>, cpus: &Arc<Cpus>, entry: u64, dtb: u64) -> std::io::Result<Vec<JoinHandle<()>>> {
+    pub fn start_vcpus(self: &Arc<Self>, cpus: &Arc<Cpus>, entry: u64, dtb: u64) -> anyhow::Result<Vec<JoinHandle<()>>> {
         let vtimer_offset = emu_hvf::host_ticks();
         (0..cpus.count())
             .map(|idx| {
@@ -137,7 +144,8 @@ impl Hypervisor {
                     cpus.finish(idx, t.main(boot));
                 })
             })
-            .collect()
+            .collect::<std::io::Result<_>>()
+            .map_err(Into::into)
     }
 }
 

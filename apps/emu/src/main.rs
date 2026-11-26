@@ -5,17 +5,18 @@
 //! reported once with `-verbose`.
 
 mod args;
-// The VMM, the renderer and everything that drives them exist only on Apple silicon Macs (the
-// Hypervisor.framework); elsewhere `emu` still lists, creates and provisions AVDs.
+// The VMM and everything that drives it exist only where a hypervisor backend does (`build.rs`:
+// Hypervisor.framework on Apple silicon, KVM on arm64 Linux); elsewhere `emu` still lists,
+// creates and provisions AVDs. The renderer is Apple silicon only so far.
 mod console;
-// Builds and tests everywhere; only an Apple silicon boot serves it.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+// Builds and tests everywhere; only a boot serves it.
+#[cfg_attr(not(hv), allow(dead_code))]
 mod display_server;
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(not(hv), allow(dead_code))]
 mod fold;
 mod instance;
 mod provision;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(hv_hvf)]
 mod vkprobe;
 
 use std::process::ExitCode;
@@ -109,20 +110,20 @@ fn raise_nofile() -> u64 {
 }
 
 /// How often a running instance tells the adb server about itself again.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(hv)]
 const ADB_REANNOUNCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long a stop may take before the stop watcher exits the process anyway.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(not(hv), allow(dead_code))]
 const SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The teardown step once the machine is down (`emu_vmm::teardown_step`).
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(not(hv), allow(dead_code))]
 const EXITING: &str = "exiting after the machine stopped";
 
 /// What the stop watcher prints when a stop overran [`SHUTDOWN_LIMIT`]: the teardown step it was
 /// waiting for (as `emu_vmm::teardown_status` gives it) and for how long.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(not(hv), allow(dead_code))]
 fn overrun_line(step: Option<(String, std::time::Duration)>) -> String {
     let limit = SHUTDOWN_LIMIT.as_secs();
     match step {
@@ -132,7 +133,7 @@ fn overrun_line(step: Option<(String, std::time::Duration)>) -> String {
 }
 
 /// `-verbose`'s exit-count lines, one per vCPU, without the zero counters.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(not(hv), allow(dead_code))]
 fn exit_lines(exits: &[Vec<(&'static str, u64)>]) -> Vec<String> {
     exits
         .iter()
@@ -183,7 +184,7 @@ fn real_main() -> Result<ExitCode> {
     // Before the NAT sizes its flow caps from it.
     raise_nofile();
     // Internal: `emu -probe-vulkan <lib64>` and `emu -warm-renderer <lib64>` (see vkprobe.rs).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(hv_hvf)]
     {
         let raw: Vec<String> = std::env::args().collect();
         let child: Option<fn(&std::path::Path) -> bool> = match raw.get(1).map(String::as_str) {
@@ -242,12 +243,9 @@ fn real_main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if opts.accel_check {
-        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            println!("accel:\n0\nHypervisor.framework (arm64) is usable\naccel");
-            return Ok(ExitCode::SUCCESS);
-        }
-        println!("accel:\n1\nsimee needs Hypervisor.framework on an Apple silicon Mac\naccel");
-        return Ok(ExitCode::FAILURE);
+        let (ok, what) = accel_check();
+        println!("accel:\n{}\n{what}\naccel", if ok { 0 } else { 1 });
+        return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
     }
     let name = opts.avd.clone().context("no AVD given (use -avd NAME, or -list-avds)")?;
     if opts.dry_run {
@@ -256,11 +254,25 @@ fn real_main() -> Result<ExitCode> {
     boot(&env, &name, &opts, signals, launched)
 }
 
+/// `-accel-check`: whether this host can boot a guest, and if not, how to fix it (stock prints the
+/// same `accel:` block).
+fn accel_check() -> (bool, String) {
+    #[cfg(hv_hvf)]
+    return (true, "Hypervisor.framework (arm64) is usable".into());
+    #[cfg(hv_kvm)]
+    return match emu_kvm::open() {
+        Ok(_) => (true, "KVM (version 12) is installed and usable.".into()),
+        Err(e) => (false, e.to_string()),
+    };
+    #[cfg(not(hv))]
+    (false, "simee needs Hypervisor.framework on an Apple silicon Mac or KVM on arm64 Linux".into())
+}
+
 /// `-avd NAME -dry-run`: prints the boot plan without booting (on any host), and fails if the
 /// image is missing files the boot reads.
 fn dry_run(env: &emu_avd::Env, name: &str, opts: &args::Opts) -> Result<ExitCode> {
     let avd = env.load(name)?;
-    let renderer = if cfg!(all(target_os = "macos", target_arch = "aarch64")) { instance::renderer(&avd, opts) } else { None };
+    let renderer = if cfg!(hv_hvf) { instance::renderer(&avd, opts) } else { None };
     let plan = instance::BootPlan::new(&avd, opts, renderer);
     print!("{plan}");
     let missing = plan.missing();
@@ -274,13 +286,13 @@ fn dry_run(env: &emu_avd::Env, name: &str, opts: &args::Opts) -> Result<ExitCode
     Ok(if missing.is_empty() && unsupported.is_none() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(not(hv))]
 fn boot(_: &emu_avd::Env, name: &str, _: &args::Opts, _: std::sync::mpsc::Receiver<i32>, _: std::time::Instant) -> Result<ExitCode> {
-    anyhow::bail!("cannot boot {name}: simee needs Hypervisor.framework on an Apple silicon Mac")
+    anyhow::bail!("cannot boot {name}: simee needs Hypervisor.framework on an Apple silicon Mac or KVM on arm64 Linux")
 }
 
 /// Once the guest has booted, a foldable tells it its posture (stock sends it after boot).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(hv)]
 fn announce_fold_at_boot(cfg: &mut emu_vmm::MachineConfig, fold: Option<std::sync::Arc<fold::Foldable>>) {
     let Some(fold) = fold else { return };
     let before = cfg.on_guest_event.take();
@@ -295,7 +307,7 @@ fn announce_fold_at_boot(cfg: &mut emu_vmm::MachineConfig, fold: Option<std::syn
 }
 
 /// Boots the AVD and runs it until the guest powers off or a signal arrives.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(hv)]
 fn boot(
     env: &emu_avd::Env,
     name: &str,

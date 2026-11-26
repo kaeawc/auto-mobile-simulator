@@ -1,3 +1,7 @@
+// Which hypervisor backend `emu-vmm` builds for this target (its `build.rs` decides the same):
+// `hv_hvf` (Hypervisor.framework on Apple silicon), `hv_kvm` (KVM on arm64 Linux), and `hv` for
+// either, the targets `emu` can boot a guest on.
+//
 // Lets the binary find the gfxstream renderer's libraries at runtime: next to the binary (an SDK
 // overlay installs emu as emulator/emulator; a target/ build gets a lib64 symlink at startup),
 // then in the build machine's SDK, either its emulator package or the renderer that
@@ -5,6 +9,7 @@
 // dependencies are preloaded by emu-gfxstream and don't need these; libraries gfxstream
 // dlopens by bare name (libshadertranslator.dylib) do.
 fn main() {
+    backend_cfg();
     println!("cargo:rerun-if-env-changed=ANDROID_HOME");
     println!("cargo:rerun-if-env-changed=ANDROID_SDK_ROOT");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
@@ -53,5 +58,21 @@ fn info_plist() {
     let path = std::path::Path::new(&out).join("Info.plist");
     if std::fs::write(&path, plist).is_ok() {
         println!("cargo:rustc-link-arg-bins=-Wl,-sectcreate,__TEXT,__info_plist,{}", path.display());
+    }
+}
+
+/// Sets `hv` and the backend's own cfg (`hv_hvf`, `hv_kvm`) on the targets that can boot a guest.
+fn backend_cfg() {
+    println!("cargo::rustc-check-cfg=cfg(hv, hv_hvf, hv_kvm)");
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let backend = match (os.as_str(), arch.as_str()) {
+        ("macos", "aarch64") => Some("hv_hvf"),
+        ("linux", "aarch64") => Some("hv_kvm"),
+        _ => None,
+    };
+    if let Some(b) = backend {
+        println!("cargo::rustc-cfg=hv");
+        println!("cargo::rustc-cfg={b}");
     }
 }
