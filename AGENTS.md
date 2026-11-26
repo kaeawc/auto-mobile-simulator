@@ -157,7 +157,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   (`for_profile`), running-instance advertisements (`Running`), `BootConfig`, ini parsing.
 - `crates/emu-sdk` — Java-free provisioning: repository manifests, verified downloads, the
   on-demand gfxstream renderer.
-- `crates/emu-gfxstream` — `stream_renderer_*` FFI; `examples/renderer_caps.rs` checks a renderer.
+- `crates/emu-gfxstream` — `stream_renderer_*` FFI (macOS `.dylib`, Linux `.so`; `macho.rs` and
+  `elf.rs` list what to preload); `examples/renderer_caps.rs` checks a renderer.
 - `crates/emu-ext4` — the native ext4 formatter for first-boot userdata. `crates/emu-fdt` — the
   device tree writer.
 - `crates/sim-api` — the JSON-lines unix socket API: `METHODS` table and dispatcher
