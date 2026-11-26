@@ -139,9 +139,58 @@ pub fn tap(x: i32, y: i32, button: bool, eraser: bool) -> Vec<PenSample> {
         .collect()
 }
 
+/// Queues `sample` behind `queue`, the samples waiting for a device that is slower than the pen
+/// (a console session at a time): a hover or move replaces the hover or move just before it with
+/// the same button and end, since only its newest position matters, while downs, ups and leaves
+/// are always kept, in order. A queue of moves stays one sample long however long the device
+/// stalls, and the pen never stays down or in range for want of a dropped up or leave.
+pub fn enqueue(queue: &mut Vec<PenSample>, sample: PenSample) {
+    if matches!(sample.phase, PenPhase::Hover | PenPhase::Move)
+        && queue.last().is_some_and(|l| l.phase == sample.phase && l.button == sample.button && l.eraser == sample.eraser)
+    {
+        queue.pop();
+    }
+    queue.push(sample);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_moves_coalesce_and_downs_ups_and_leaves_stay() {
+        use PenPhase::*;
+        let mut q = Vec::new();
+        let mut samples = vec![PenSample::new(0, 0, Hover), PenSample::new(1, 0, Hover), PenSample::new(1, 1, Down)];
+        samples.extend((2..50).map(|x| PenSample::new(x, 1, Move)));
+        samples.push(PenSample { button: true, ..PenSample::new(50, 1, Move) });
+        samples.extend([
+            PenSample::new(50, 1, Up),
+            PenSample::new(51, 1, Hover),
+            PenSample::new(52, 1, Hover),
+            PenSample::new(52, 1, Leave),
+        ]);
+        for s in samples {
+            enqueue(&mut q, s);
+        }
+        let got: Vec<(i32, PenPhase, bool)> = q.iter().map(|s| (s.x, s.phase, s.button)).collect();
+        assert_eq!(
+            got,
+            [
+                (1, Hover, false),
+                (1, Down, false),
+                (49, Move, false),
+                (50, Move, true),
+                (50, Up, false),
+                (52, Hover, false),
+                (52, Leave, false)
+            ]
+        );
+        // Repeated ups and leaves are kept too: the device drops what changes nothing.
+        let mut q = vec![PenSample::new(0, 0, Leave)];
+        enqueue(&mut q, PenSample::new(0, 0, Leave));
+        assert_eq!(q.len(), 2);
+    }
 
     #[test]
     fn console_lines_round_trip() {

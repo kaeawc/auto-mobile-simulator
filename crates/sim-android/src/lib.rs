@@ -768,12 +768,18 @@ impl Device {
             return Ok(());
         }
         let lines: Vec<String> = samples.iter().map(sim_core::stylus::PenSample::console).collect();
-        let mut session = console::Session::open(self.running_simee("the pen console command")?.console_port)?;
+        let mut session = self.pen_session()?;
         let steps = u32::try_from(lines.len()).unwrap_or(u32::MAX);
         let mut delays = vec![duration / steps; lines.len()];
         delays[0] = Duration::ZERO;
         let start = Instant::now();
         pace(&delays, || start.elapsed(), sleep, |i| session.command(&lines[i]).map(drop))
+    }
+
+    /// A console session for `pen` lines (`PenSample::console`), for a caller that sends samples
+    /// as they come (the desktop's stylus) and keeps the session open across them.
+    pub fn pen_session(&self) -> Result<console::Session, String> {
+        console::Session::open(self.running_simee("the pen console command")?.console_port)
     }
 
     /// The touchpad's size, if the AVD has one.

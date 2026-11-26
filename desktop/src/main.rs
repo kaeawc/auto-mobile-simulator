@@ -29,6 +29,7 @@ mod icons;
 mod ios;
 mod keys;
 mod scan;
+mod stylus;
 #[cfg(target_os = "macos")]
 mod surface;
 mod view;
@@ -139,6 +140,9 @@ pub struct State {
     visible: bool,
     /// Android tablets: the pointer is a stylus (drags draw, moving over the screen hovers).
     pub stylus: bool,
+    /// The stylus's own line to the device while it's on (one console session, samples
+    /// coalesced; see [`stylus::Pen`]).
+    pen: Option<stylus::Pen>,
     /// The screen element's size in points (pointer moves come in its own points).
     pub screen_view: (f32, f32),
 }
@@ -388,6 +392,7 @@ fn init() -> State {
         sized_for: None,
         visible: true,
         stylus: false,
+        pen: None,
         screen_view: (0.0, 0.0),
     }
 }
@@ -665,7 +670,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
                 if s.selected.as_ref() != Some(&udid) {
                     // The scan of the new selection brings its log.
                     s.console_log.clear();
-                    s.stylus = false;
+                    stylus_off(s);
                 }
                 s.selected = Some(udid);
                 if let Some(sc) = &s.scanner {
@@ -778,7 +783,8 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
         && s.sized_for != Some(size)
     {
         s.sized_for = Some(size);
-        tx.resize_window(fit_window(size));
+        let form_factor = s.selected_info().and_then(|i| i.form_factor);
+        tx.resize_window(fit_window(size, form_factor));
         changed = true;
     }
     changed
@@ -788,20 +794,32 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
 /// pen events send, through simee's `pen` console command); turning it off takes the pen out
 /// of range.
 fn toggle_stylus(s: &mut State) {
-    if s.screen.is_none() {
-        s.status = Some("The stylus needs a running Android device".into());
+    if s.stylus {
+        stylus_off(s);
+        s.status = Some("Stylus off".into());
         return;
     }
-    s.stylus = !s.stylus;
-    if !s.stylus {
-        let leave = sim_core::stylus::PenSample::new(0, 0, sim_core::stylus::PenPhase::Leave);
-        android_action(s, move |d| d.stylus(&[leave], Duration::ZERO));
-    }
-    s.status = Some(if s.stylus { "Stylus on: drag to draw, move over the screen to hover" } else { "Stylus off" }.into());
+    let Some(udid) = s.screen.as_ref().map(|sc| sc.udid.clone()) else {
+        s.status = Some("The stylus needs a running Android device".into());
+        return;
+    };
+    let find = android::lookup(s.android_backend.clone().unwrap_or_default(), udid);
+    s.pen = Some(stylus::Pen::for_device(find, s.outbox.clone()));
+    s.stylus = true;
+    s.status = Some("Stylus on: drag to draw, move over the screen to hover".into());
 }
 
-/// Pointer input while the stylus is on: one pen sample per input, through the console worker
-/// (in order with the device's other console work). Anything else goes on as usual.
+/// Turns the stylus off, taking the pen out of range first: its thread sends the leave after
+/// whatever is still queued, then ends.
+fn stylus_off(s: &mut State) {
+    if let Some(pen) = s.pen.take() {
+        pen.send(sim_core::stylus::PenSample::new(0, 0, sim_core::stylus::PenPhase::Leave));
+    }
+    s.stylus = false;
+}
+
+/// Pointer input while the stylus is on: one pen sample per input, on the pen's own line to the
+/// device. Anything else goes on as usual.
 fn stylus_input(s: &State, input: Input) {
     use sim_core::stylus::{PenPhase, PenSample};
     let (phase, x, y) = match input {
@@ -815,7 +833,9 @@ fn stylus_input(s: &State, input: Input) {
     let (w, h) = s.screen_size();
     let at = |v: f32, max: u32| (v.round().max(0.0) as i32).min(max.max(1) as i32 - 1);
     let sample = PenSample::new(at(x, w), at(y, h), phase);
-    android_action(s, move |d| d.stylus(&[sample], Duration::ZERO));
+    if let Some(pen) = &s.pen {
+        pen.send(sample);
+    }
 }
 
 /// The widest window the fit asks for, in points: a 13-inch laptop's display (1440 points)
@@ -826,11 +846,13 @@ const MAX_WINDOW_W: f32 = 1440.0;
 /// the screen at [`android::SCREEN_POINTS`] tall (at least 420 wide, for the toolbar) and the
 /// Android panel (340); 110 points of toolbar and status around it. A landscape tablet's screen
 /// (2560x1600 is 1216 points wide at that height) would make the window wider than a laptop's
-/// display, so a wide screen is shown shorter instead, as far as fits [`MAX_WINDOW_W`].
-fn fit_window(size: (u32, u32)) -> (f32, f32) {
+/// display, so a tablet's wide screen is shown shorter instead, as far as fits [`MAX_WINDOW_W`].
+/// Other form factors (an unfolded foldable, automotive, TV) keep the full-height screen.
+fn fit_window(size: (u32, u32), form_factor: Option<FormFactor>) -> (f32, f32) {
     const CHROME_W: f32 = 240.0 + 32.0 + 340.0;
     let aspect = size.0 as f32 / size.1.max(1) as f32;
-    let screen_w = (android::SCREEN_POINTS * aspect).min(MAX_WINDOW_W - CHROME_W);
+    let full_w = android::SCREEN_POINTS * aspect;
+    let screen_w = if form_factor == Some(FormFactor::Tablet) { full_w.min(MAX_WINDOW_W - CHROME_W) } else { full_w };
     let screen_h = screen_w / aspect;
     (CHROME_W + screen_w.max(420.0), screen_h + 110.0)
 }
@@ -1390,16 +1412,70 @@ mod tests {
         assert!(!rt.state.stylus && rt.state.status.as_deref() == Some("The stylus needs a running Android device"));
     }
 
+    /// Switching to another device with the stylus on takes the pen out of range on the device
+    /// switched away from, rather than leaving it hovering (or touching) there.
+    #[test]
+    fn switching_devices_takes_the_pen_out_of_range_first() {
+        use sim_core::stylus::{PenPhase, PenSample};
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let s2 = sent.clone();
+        let pen = stylus::Pen::start(
+            Box::new(move || {
+                let s = s2.clone();
+                Ok(Box::new(move |p: &PenSample| {
+                    s.lock().expect("sent").push(p.phase);
+                    Ok(())
+                }) as stylus::Sink)
+            }),
+            work::Outbox::default(),
+        );
+        pen.send(PenSample::new(5, 5, PenPhase::Hover));
+        let mut rt = runtime(android_scene);
+        rt.update(|s, tx| {
+            s.offline = false;
+            (s.stylus, s.pen) = (true, Some(pen));
+            s.actions.push(Action::Select("pixel_fold".into()));
+            poll(s, 0.0, tx);
+        });
+        assert!(!rt.state.stylus && rt.state.pen.is_none(), "the stylus is off for the next device");
+        let start = std::time::Instant::now();
+        while sent.lock().expect("sent").len() < 2 && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(*sent.lock().expect("sent"), [PenPhase::Hover, PenPhase::Leave]);
+    }
+
     #[test]
     fn landscape_tablets_fit_a_laptop_display() {
         // Phones and portrait tablets keep the full-height screen.
-        let phone = fit_window((720, 1280));
+        let tablet = Some(FormFactor::Tablet);
+        let phone = fit_window((720, 1280), Some(FormFactor::Phone));
         assert_eq!(phone.1, android::SCREEN_POINTS + 110.0);
-        assert!(fit_window((1600, 2560)).1 == phone.1 && fit_window((1600, 2560)).0 < MAX_WINDOW_W);
+        assert!(fit_window((1600, 2560), tablet).1 == phone.1 && fit_window((1600, 2560), tablet).0 < MAX_WINDOW_W);
         // A Pixel Tablet in landscape would be 1828 points wide at full height: it is shorter.
-        let (w, h) = fit_window((2560, 1600));
+        let (w, h) = fit_window((2560, 1600), tablet);
         assert_eq!(w, MAX_WINDOW_W);
         let screen = (w - 612.0, h - 110.0);
         assert!((screen.0 / screen.1 - 1.6).abs() < 1e-3, "the screen keeps its aspect: {screen:?}");
+    }
+
+    /// The cap is for tablets: an unfolded Pixel Fold (1.2:1), a landscape automotive screen and
+    /// a TV keep the full-height screen and the window they had before it.
+    #[test]
+    fn only_tablets_are_shown_shorter_to_fit_a_laptop() {
+        let full = |(w, h): (u32, u32)| {
+            let screen_w = android::SCREEN_POINTS * w as f32 / h as f32;
+            (240.0 + 32.0 + screen_w.max(420.0) + 340.0, android::SCREEN_POINTS + 110.0)
+        };
+        for (size, ff) in [
+            ((2208, 1840), FormFactor::Foldable),
+            ((1920, 1080), FormFactor::Auto),
+            ((1920, 1080), FormFactor::Tv),
+            ((720, 1280), FormFactor::Phone),
+        ] {
+            assert_eq!(fit_window(size, Some(ff)), full(size), "{ff:?} {size:?}");
+        }
+        assert_eq!(fit_window((2208, 1840), None), full((2208, 1840)), "an unknown form factor keeps its size");
+        assert_eq!(fit_window((2560, 1600), Some(FormFactor::Tablet)).0, MAX_WINDOW_W);
     }
 }

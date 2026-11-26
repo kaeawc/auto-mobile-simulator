@@ -154,6 +154,9 @@ enum Msg {
 /// the eraser, the barrel button as `BTN_STYLUS`, and the changed axes on a move. simee's screens
 /// also advertise `BTN_TOUCH`, so contact is `BTN_TOUCH` (and pressure): a pen in range that
 /// isn't touching is hovering, which Android reports as hover events from a stylus.
+/// `BTN_TOUCH` is one key for the whole screen, so the pen clears it only while no finger is down
+/// (and the finger only while the pen isn't touching): the contact still down keeps reading as
+/// touching, and a pen lifted beside a finger hovers by its zero pressure.
 #[derive(Default)]
 struct PenState {
     in_range: bool,
@@ -167,13 +170,13 @@ struct PenState {
 
 impl PenState {
     /// The batch for a sample; `None` when nothing changes (a leave while out of range, a
-    /// repeated sample).
-    fn batch(&mut self, s: &PenSample) -> Option<Batch> {
+    /// repeated sample). `finger_down`: a finger touches the screen too.
+    fn batch(&mut self, s: &PenSample, finger_down: bool) -> Option<Batch> {
         let mut ev = vec![InputEvent::new(EV_ABS, ABS_MT_SLOT, PEN_SLOT)];
         // A leave, or the other end of the pen: the contact ends.
         if self.in_range && (s.phase == PenPhase::Leave || s.eraser != self.eraser) {
             ev.push(InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 0));
-            if self.touching {
+            if self.touching && !finger_down {
                 ev.push(InputEvent::new(EV_KEY, BTN_TOUCH, 0));
             }
             if self.eraser {
@@ -231,7 +234,7 @@ impl PenState {
             if s.button != self.button {
                 ev.push(InputEvent::new(EV_KEY, BTN_STYLUS, i32::from(s.button)));
             }
-            if touching != self.touching {
+            if touching != self.touching && (touching || !finger_down) {
                 ev.push(InputEvent::new(EV_KEY, BTN_TOUCH, i32::from(touching)));
             }
         }
@@ -269,15 +272,20 @@ struct TouchState {
 
 impl TouchState {
     /// The batch for a touch: the full set on a down (or when the state isn't known), the axes
-    /// that changed on a move (none when nothing did), the lift on an up.
-    fn batch(&mut self, x: i32, y: i32, down: bool) -> Option<Batch> {
+    /// that changed on a move (none when nothing did), the lift on an up, which leaves
+    /// `BTN_TOUCH` set while `pen_touching` (see [`PenState`]).
+    fn batch(&mut self, x: i32, y: i32, down: bool, pen_touching: bool) -> Option<Batch> {
         let batch = |events: Vec<InputEvent>, move_from| Some(Batch { events, sent: 0, move_from });
         if !down {
             let mut ev = Vec::with_capacity(4);
             if !self.known {
                 ev.push(InputEvent::new(EV_ABS, ABS_MT_SLOT, 0));
             }
-            ev.extend([InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, -1), InputEvent::new(EV_KEY, BTN_TOUCH, 0), InputEvent::syn()]);
+            ev.push(InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, -1));
+            if !pen_touching {
+                ev.push(InputEvent::new(EV_KEY, BTN_TOUCH, 0));
+            }
+            ev.push(InputEvent::syn());
             self.down = false;
             return batch(ev, None);
         }
@@ -406,8 +414,8 @@ impl Input {
                     touch.raw(&e);
                     Some(e)
                 }
-                Msg::Touch { x, y, down } => touch.batch(x, y, down).map(|b| b.events),
-                Msg::Pen(s) => pen.batch(&s).map(|b| {
+                Msg::Touch { x, y, down } => touch.batch(x, y, down, pen.touching).map(|b| b.events),
+                Msg::Pen(s) => pen.batch(&s, touch.down).map(|b| {
                     touch.raw(&b.events);
                     b.events
                 }),
@@ -629,12 +637,12 @@ impl Worker {
                 self.push(Batch { events, sent: 0, move_from: None });
             }
             Msg::Touch { x, y, down } => {
-                if let Some(b) = self.touch.batch(x, y, down) {
+                if let Some(b) = self.touch.batch(x, y, down, self.pen.touching) {
                     self.push(b);
                 }
             }
             Msg::Pen(s) => {
-                if let Some(b) = self.pen.batch(&s) {
+                if let Some(b) = self.pen.batch(&s, self.touch.down) {
                     // The pen selects its own slot: the finger's next batch selects slot 0 again.
                     self.touch.raw(&b.events);
                     self.push(b);
@@ -831,6 +839,37 @@ mod tests {
         assert!(b[2].contains(&InputEvent::new(EV_KEY, BTN_TOOL_RUBBER, 0)));
         // The finger after the pen selects slot 0 again.
         assert_eq!(b[3][0], InputEvent::new(EV_ABS, ABS_MT_SLOT, 0));
+    }
+
+    /// `BTN_TOUCH` is one bit for the whole screen: a pen lifting (or leaving) while a finger is
+    /// down, or a finger lifting under a touching pen, leaves it set, or the contact still down
+    /// would read as hovering.
+    #[test]
+    fn btn_touch_clears_only_when_neither_pen_nor_finger_touches() {
+        use sim_core::stylus::{PenPhase::*, PenSample};
+        let lifts = |b: &[InputEvent]| b.contains(&InputEvent::new(EV_KEY, BTN_TOUCH, 0));
+        // A finger held while the pen taps and leaves.
+        let (dev, h) = Input::new(Kind::Touch { width: 2560, height: 1600, pen: true }, "t");
+        h.touch(100, 100, true);
+        h.pen(PenSample::new(500, 500, Down));
+        h.pen(PenSample::new(500, 500, Up));
+        h.pen(PenSample::new(500, 500, Down));
+        h.pen(PenSample::new(500, 500, Leave));
+        h.touch(100, 100, false);
+        let b = dev.take_queued();
+        assert_eq!(b.len(), 6, "{b:?}");
+        assert!(!lifts(&b[2]) && !lifts(&b[4]), "the finger still touches: {:?} {:?}", b[2], b[4]);
+        assert!(b[2].contains(&InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 0)), "the pen hovers by its pressure");
+        assert!(lifts(&b[5]), "the last contact lifts: {:?}", b[5]);
+        // A pen held while a finger taps.
+        let (dev, h) = Input::new(Kind::Touch { width: 2560, height: 1600, pen: true }, "t");
+        h.pen(PenSample::new(500, 500, Down));
+        h.touch(100, 100, true);
+        h.touch(100, 100, false);
+        h.pen(PenSample::new(500, 500, Up));
+        let b = dev.take_queued();
+        assert!(!lifts(&b[2]), "the pen still touches: {:?}", b[2]);
+        assert!(lifts(&b[3]), "the pen's lift clears it: {:?}", b[3]);
     }
 
     #[test]
