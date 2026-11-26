@@ -81,6 +81,31 @@ fn signal_guard_interval(since_start: std::time::Duration) -> std::time::Duratio
     if since_start < SIGNAL_GUARD_FAST { std::time::Duration::from_millis(200) } else { std::time::Duration::from_secs(5) }
 }
 
+/// macOS's `OPEN_MAX`: the most open files `setrlimit` grants a process there whatever its hard
+/// limit says, and room for the NAT's flow caps and the rest of emu.
+const NOFILE_WANT: u64 = 10240;
+
+/// Raises the soft open-file limit (256 by default on macOS) toward the hard one, up to
+/// [`NOFILE_WANT`]: each of the guest's network flows is a host socket of this process, and
+/// running out also fails the console's and the adb bridge's `accept`. Never lowers it. Returns
+/// the soft limit in force.
+fn raise_nofile() -> u64 {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let cur = getrlimit(Resource::Nofile);
+    let soft = cur.current.unwrap_or(u64::MAX);
+    let want = cur.maximum.unwrap_or(u64::MAX).min(NOFILE_WANT);
+    if soft >= want {
+        return soft;
+    }
+    match setrlimit(Resource::Nofile, Rlimit { current: Some(want), maximum: cur.maximum }) {
+        Ok(()) => want,
+        Err(e) => {
+            eprintln!("emu: warning: the open-file limit stays {soft} ({e}): the guest gets fewer network flows");
+            soft
+        }
+    }
+}
+
 /// How often a running instance tells the adb server about itself again.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const ADB_REANNOUNCE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -121,6 +146,8 @@ fn real_main() -> Result<ExitCode> {
     let launched = std::time::Instant::now();
     // First, before any thread exists.
     let signals = shutdown_signals();
+    // Before the NAT sizes its flow caps from it.
+    raise_nofile();
     // Internal: `emu -probe-vulkan <lib64>` (see vkprobe.rs).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
@@ -339,6 +366,27 @@ mod tests {
             t += signal_guard_interval(t);
         }
         n
+    }
+
+    #[test]
+    fn the_open_file_limit_is_raised_toward_the_hard_limit_and_never_lowered() {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        let was = getrlimit(Resource::Nofile);
+        let hard = was.maximum.unwrap_or(u64::MAX);
+        let want = hard.min(NOFILE_WANT);
+        // From a low soft limit (macOS's default is 256; 1024 leaves the other tests room).
+        let low = want.min(1024);
+        setrlimit(Resource::Nofile, Rlimit { current: Some(low), maximum: was.maximum }).expect("lower");
+        let raised = raise_nofile();
+        let now = getrlimit(Resource::Nofile).current.unwrap_or(u64::MAX);
+        setrlimit(Resource::Nofile, was).expect("restore");
+        assert_eq!(raised, want);
+        assert_eq!(now, want, "the process's limit, not only the return value");
+        // Already higher (a shell's `ulimit -n`): left alone.
+        let soft = was.current.unwrap_or(u64::MAX);
+        if soft >= want {
+            assert_eq!(raise_nofile(), soft);
+        }
     }
 
     #[test]
