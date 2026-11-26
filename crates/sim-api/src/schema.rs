@@ -35,10 +35,12 @@ enum Ty {
     Strings,
 }
 
-/// The type of the parameter `name`, where every method that takes it agrees on one.
-fn param_type(name: &str) -> Option<Ty> {
+/// The type of the parameter `name` of `method`: the same for every method that takes it, bar the
+/// few listed first (`stylus`'s `button` is the barrel button, `button`'s a name).
+fn param_type(method: &str, name: &str) -> Option<Ty> {
     use Ty::*;
     Some(match name {
+        "button" if method == "stylus" => Bool,
         "devices" | "args" | "commands" => Strings,
         "device" | "platform" | "form_factor" | "name" | "device_type" | "runtime" | "system_image" | "path" | "url" | "bundle_id"
         | "text" | "base64" | "domain" | "key" | "language" | "uid" | "capture_id" | "program" | "command" | "predicate" | "last"
@@ -48,9 +50,9 @@ fn param_type(name: &str) -> Option<Ty> {
         "x" | "y" | "z" | "x1" | "y1" | "x2" | "y2" | "to_x" | "to_y" | "latitude" | "longitude" | "delta" | "angle" | "passthrough"
         | "settle_cpu_pct" | "settle_window_s" | "cpu_pct" | "window_s" | "latency_ms" | "down_kbps" | "up_kbps" | "loss_pct" => Num,
         "hold_ms" | "duration_ms" | "timeout_s" | "settle_timeout_s" | "concurrency" | "first_port" | "usage" | "pid" | "signal"
-        | "ticks" | "level" | "wifi_bars" | "cellular_bars" | "battery_level" | "state" | "port_base" | "port_count" => Int,
+        | "ticks" | "pressure" | "level" | "wifi_bars" | "cellular_bars" | "battery_level" | "state" | "port_base" | "port_count" => Int,
         "booted" | "on" | "suppressed" | "undo" | "shaped" | "settle" | "settle_foreground" | "audio" | "mute" | "sizes" | "offline"
-        | "proxy" | "face" | "foreground" => Bool,
+        | "proxy" | "face" | "foreground" | "eraser" => Bool,
         "env" => StrMap,
         "payload" => Obj,
         "rules" => Objects,
@@ -179,6 +181,13 @@ fn parse(spec: &str) -> Vec<(Param, bool)> {
 /// read different ones).
 const IRREGULAR: &[(&str, &[&str])] = &[("xr", &["x", "y", "z", "environment", "passthrough", "mode", "phase", "press", "gesture"])];
 
+/// Methods whose grammar writes alternative forms with shared names (`touchpad`: a touch is `x, y`,
+/// a swipe adds `to_x, to_y`), which a per-name reading can't tell apart: the parameters every
+/// form needs. (`rotary`: an Apple Watch also takes `delta` instead of `ticks`, but `ticks` works on
+/// both.)
+const REQUIRED: &[(&str, &[&str])] =
+    &[("touchpad", &["device", "x", "y"]), ("stylus", &["device", "x", "y"]), ("rotary", &["device", "ticks"])];
+
 /// The JSON Schema (an object schema) of `method`'s parameters, or `None` for a name that isn't in
 /// [`METHODS`]. Choices, ranges and defaults become `enum`, `minimum`/`maximum` and `default`;
 /// parameters only one platform reads say so in their `description`.
@@ -194,11 +203,15 @@ pub fn input_schema(method: &str) -> Option<Value> {
             params.push((param, false));
         }
     }
-    for (param, is_required) in params {
+    let fixed = REQUIRED.iter().find(|(m, _)| *m == method).map(|(_, names)| *names);
+    for (param, mut is_required) in params {
+        if let Some(names) = fixed {
+            is_required = names.contains(&param.name.as_str());
+        }
         if is_required {
             required.push(Value::String(param.name.clone()));
         }
-        properties.insert(param.name.clone(), property(&param));
+        properties.insert(param.name.clone(), property(method, &param));
     }
     let mut schema = json!({"type": "object", "properties": properties});
     if !required.is_empty() {
@@ -215,8 +228,8 @@ fn object(v: Value) -> Map<String, Value> {
 }
 
 /// The schema of one parameter.
-fn property(param: &Param) -> Value {
-    let ty = param_type(&param.name);
+fn property(method: &str, param: &Param) -> Value {
+    let ty = param_type(method, &param.name);
     let mut prop = object(match ty {
         Some(Ty::Str) => json!({"type": "string"}),
         Some(Ty::Num) => json!({"type": "number"}),
@@ -314,7 +327,7 @@ mod tests {
         // `audio_route`'s `uid | "default"` is the uid alone: the quoted word is a value, not a name.
         assert_eq!(schema("audio_route")["properties"].as_object().map(|p| p.len()), Some(3));
         let rotary = schema("rotary");
-        assert_eq!(rotary["required"], json!(["device"]));
+        assert_eq!(rotary["required"], json!(["device", "ticks"]), "Android needs ticks; an Apple Watch may give delta instead");
         assert_eq!(rotary["properties"]["delta"]["description"], "Digital Crown units; iOS");
     }
 
@@ -343,6 +356,16 @@ mod tests {
             assert!(xr["properties"][name].is_object(), "{name}");
         }
         assert_eq!(schema("touchpad")["properties"]["to_x"]["type"], "number");
+        // A touch is `x, y`; only a swipe adds `to_x, to_y`.
+        assert_eq!(schema("touchpad")["required"], json!(["device", "x", "y"]));
+        assert_eq!(schema("rotary")["required"], json!(["device", "ticks"]));
+        let stylus = schema("stylus");
+        assert_eq!(stylus["required"], json!(["device", "x", "y"]));
+        assert_eq!(
+            (stylus["properties"]["button"]["type"].clone(), stylus["properties"]["pressure"]["type"].clone()),
+            (json!("boolean"), json!("integer"))
+        );
+        assert_eq!(schema("button")["properties"]["button"]["type"], "string");
     }
 
     #[test]

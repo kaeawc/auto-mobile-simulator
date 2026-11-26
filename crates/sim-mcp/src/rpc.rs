@@ -26,6 +26,8 @@ pub const INTERNAL_ERROR: i64 = -32603;
 /// Reserved for the specification: the request needs an extension the client didn't declare.
 pub const MISSING_CAPABILITY: i64 = -32021;
 pub const UNSUPPORTED_VERSION: i64 = -32022;
+/// What revisions before 2026-07-28 call "resource not found" (the current one uses -32602).
+pub const RESOURCE_NOT_FOUND_LEGACY: i64 = -32002;
 
 /// A JSON-RPC error.
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +127,15 @@ pub fn requested_version(params: &Value) -> Option<&str> {
     meta(params).get(META_VERSION).and_then(Value::as_str)
 }
 
+/// An error as the client's revision spells it: "resource not found" is -32602 for the current
+/// revision and -32002 for the ones before it; everything else is the same in both.
+pub fn for_era(mut error: RpcError, era: Era) -> RpcError {
+    if era == Era::Legacy && error.code == INVALID_PARAMS && error.message == "Resource not found" {
+        error.code = RESOURCE_NOT_FOUND_LEGACY;
+    }
+    error
+}
+
 /// The error for a version this server doesn't speak.
 pub fn unsupported_version(requested: &str) -> RpcError {
     let supported: Vec<&str> = std::iter::once(MODERN).chain(LEGACY.iter().copied()).collect();
@@ -182,6 +193,11 @@ mod tests {
         assert_eq!(e["data"]["requested"], "1900-01-01");
         let e = missing_extension(EXT_TASKS).to_json();
         assert_eq!((e["code"].as_i64(), &e["data"]["requiredCapabilities"]["extensions"][EXT_TASKS]), (Some(-32021), &json!({})));
+        let not_found = RpcError::invalid_params("Resource not found");
+        assert_eq!(for_era(not_found.clone(), Era::Modern).code, INVALID_PARAMS);
+        assert_eq!(for_era(not_found, Era::Legacy).code, RESOURCE_NOT_FOUND_LEGACY);
+        let other = RpcError::invalid_params("`uri` is required");
+        assert_eq!(for_era(other, Era::Legacy).code, INVALID_PARAMS, "only not-found changes");
         assert_eq!(id_key(&json!("1")), "\"1\"");
         assert_ne!(id_key(&json!(1)), id_key(&json!("1")));
     }

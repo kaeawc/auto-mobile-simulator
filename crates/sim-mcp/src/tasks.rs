@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,7 +19,8 @@ use crate::rpc::{INTERNAL_ERROR, META_SUBSCRIPTION, RpcError};
 const TTL: Duration = Duration::from_secs(3600);
 /// How often a client should poll.
 const POLL_MS: u64 = 1000;
-/// How many tasks may be working at once.
+/// How many tasks' calls may be running at once. A cancelled task's call keeps running (the API
+/// can't interrupt it), so it counts until it ends.
 pub const MAX_RUNNING: usize = 8;
 
 /// Writes one outgoing JSON-RPC line.
@@ -57,7 +59,18 @@ struct Table {
 #[derive(Clone)]
 pub struct Tasks {
     table: Arc<Mutex<Table>>,
+    /// Calls running now, cancelled tasks' included.
+    running: Arc<AtomicUsize>,
     ttl: Duration,
+}
+
+/// One running call, counted until it ends (or its thread can't start).
+struct Running(Arc<AtomicUsize>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Default for Tasks {
@@ -101,7 +114,7 @@ fn new_id() -> String {
 
 impl Tasks {
     pub fn with_ttl(ttl: Duration) -> Tasks {
-        Tasks { table: Arc::default(), ttl }
+        Tasks { table: Arc::default(), running: Arc::default(), ttl }
     }
 
     fn lock(&self) -> MutexGuard<'_, Table> {
@@ -154,17 +167,20 @@ impl Tasks {
 
     /// Starts `work` on its own thread as a task for `method`. Its return value is the task's
     /// result (a `CallToolResult`). The handle (a `CreateTaskResult`'s fields) is returned at once;
-    /// at [`MAX_RUNNING`] tasks working, it fails instead.
+    /// with [`MAX_RUNNING`] calls running (cancelled tasks' too), it fails instead.
     pub fn create(&self, method: &str, work: impl FnOnce() -> Value + Send + 'static) -> Result<Value, String> {
         let id = new_id();
         let now = SystemTime::now();
-        let handle = {
+        let (handle, running) = {
             let mut table = self.lock();
             self.sweep(&mut table);
-            let running = table.entries.values().filter(|e| matches!(e.state, State::Working)).count();
+            let running = self.running.load(Ordering::SeqCst);
             if running >= MAX_RUNNING {
-                return Err(format!("{running} tasks are already running; wait for one to finish or cancel it"));
+                return Err(format!(
+                    "{running} calls are already running (a cancelled task's call counts until it ends); wait for one to finish"
+                ));
             }
+            self.running.fetch_add(1, Ordering::SeqCst);
             let entry = Entry {
                 method: method.to_owned(),
                 created: now,
@@ -175,10 +191,11 @@ impl Tasks {
             };
             let handle = self.detail(&id, &entry);
             table.entries.insert(id.clone(), entry);
-            handle
+            (handle, Running(self.running.clone()))
         };
         let (tasks, task_id) = (self.clone(), id.clone());
         let spawned = std::thread::Builder::new().name(format!("simee-task-{}", &id[..8])).spawn(move || {
+            let _running = running;
             let outcome = catch_unwind(AssertUnwindSafe(work));
             tasks.finish(&task_id, outcome.map_err(|_| RpcError::new(INTERNAL_ERROR, "the task's thread panicked").to_json()));
         });
@@ -338,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn at_most_eight_tasks_work_at_once() {
+    fn at_most_eight_calls_run_at_once_even_if_their_tasks_are_cancelled() {
         let tasks = Tasks::default();
         let mut releases = Vec::new();
         for _ in 0..MAX_RUNNING {
@@ -347,8 +364,26 @@ mod tests {
             releases.push(release);
         }
         let (extra, work) = gated();
-        assert!(tasks.create("boot", work).expect_err("full").contains("8 tasks are already running"));
+        assert!(tasks.create("boot", work).expect_err("full").contains("8 calls are already running"));
         drop(extra);
+        // Cancelling doesn't stop the calls, so it doesn't make room: create and cancel in a loop
+        // can't start more boots than the limit.
+        let ids: Vec<String> = tasks.lock().entries.keys().cloned().collect();
+        for id in &ids {
+            assert!(tasks.cancel(id));
+        }
+        for _ in 0..3 {
+            assert!(tasks.create("boot", || json!({"content": []})).is_err(), "still 8 calls running");
+        }
+        // When a call ends there is room again.
+        releases.remove(0).send(()).expect("release");
+        for _ in 0..500 {
+            if tasks.create("boot", || json!({"content": []})).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tasks.running.load(Ordering::SeqCst) <= MAX_RUNNING);
         for r in releases {
             r.send(()).ok();
         }

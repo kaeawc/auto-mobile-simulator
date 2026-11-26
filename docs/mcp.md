@@ -96,13 +96,19 @@ crate:
   (`settle_foreground?(true)`), and which platform reads a parameter (`iOS: device_type`). A
   parameter's type comes from its name, in `crates/sim-api/src/schema.rs`; a test lists any name
   that doesn't have one yet.
-- Annotations follow what the method does: read-only for listings and reads, destructive for
-  `delete`, `erase`, `rm`, `uninstall`, `kill` and the like, idempotent for settings. A method not
-  classified in `crates/sim-mcp/src/tools.rs` gets the specification's defaults (writes, may
-  destroy), which is the safe side.
+- Annotations follow what the method does, from one table in `crates/sim-mcp/src/tools.rs` that
+  classifies every method (a test fails for one that isn't listed). Read-only means it changes
+  nothing on the device or the host: listings, reads, `screenshot`. Settings are idempotent;
+  `exec`, `launch`, `push`, `network_shape`, `console`, `kill` and `audio_capture_start` are marked
+  destructive (they run code, reboot or restart things, or write a file), and so are `delete`,
+  `erase`, `shutdown`, `rm`, `uninstall`, `terminate`, `write` and the other overwrites. A method
+  nobody has classified gets the specification's defaults (writes, may destroy), not a claim of
+  safety.
 - A failing method is a tool result with `isError: true` and its message, so the agent can correct
   itself; protocol errors are for unknown tools and malformed requests.
-- `screenshot` returns an image block (and the size); other results are JSON as text and as
+- `screenshot` returns an image block (and the size). It doesn't take the API's `path`: writing a
+  file anywhere on the host isn't something a read-only tool may do, so the schema leaves it out
+  and a call that passes it gets a tool error. Other results are JSON as text and as
   `structuredContent`.
 
 `device_view` is the one tool that is not an API method (see [the app](#the-device-view-app)).
@@ -117,7 +123,7 @@ reverse):
 | Tools | Platforms |
 | --- | --- |
 | `help`, `identity`, `form_factors`, `devices`, `runtimes`, `create`, `delete`, `boot`, `boot_many`, `clone`, `shutdown`, `screen`, `screenshot`, `tap`, `swipe`, `touch`, `button`, `type`, `key`, `location`, `info`, `rotate`, `rotary`, `device_view` | Android, iOS |
-| `console`, `fold`, `xr`, `vehicle`, `touchpad` | Android |
+| `console`, `fold`, `xr`, `vehicle`, `touchpad`, `stylus` | Android |
 | `device_types`, `settle`, `profile`, `erase`, `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `appearance`, `privacy`, `push`, `status_bar`, `clear_status_bar`, `content_size`, `increase_contrast`, `dynamic_island`, `backlight`, `keyboard_language`, `hardware_keyboard`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `memory_warning`, `notify`, `biometric`, `exec`, `logs`, `processes`, `kill`, `connections`, `traffic`, `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container`, `defaults_read`, `defaults_write`, `crash_reports`, `network_shape`, `network_state`, `network_flows`, `network_clear`, `network_env`, `audio_state`, `audio_volume`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `audio_mute`, `watch_gesture`, `remote_swipe`, `carplay` | iOS |
 
 A test keeps this page honest: it fails if a tool isn't named here.
@@ -139,8 +145,9 @@ A test keeps this page honest: it fails if a tool isn't named here.
 `{device}` is a UDID or an AVD name. `resources/list` includes each device's resources that apply
 to it (a screenshot for a booted device, logs and apps for an iOS one), and
 `resources/templates/list` the four templates. Android has no log resource: its console is the
-`console` tool. A device that doesn't exist is the specification's "resource not found"
-(`-32602`); one that isn't running is an internal error that says so.
+`console` tool. A device that doesn't exist is the specification's "resource not found" (`-32602`
+for the current revision, `-32002` for the earlier ones); one that isn't running is an internal
+error that says so.
 
 **Subscriptions.** The API has nothing to subscribe to, so a subscription re-reads: while a client
 is subscribed (`subscriptions/listen` with `resourceSubscriptions`, or `resources/subscribe` for an
@@ -168,8 +175,9 @@ a list in `crates/sim-mcp/src/tools.rs`; every other tool answers inline.
   result is discarded, but the API can't interrupt a device call that is already running, so a
   cancelled `boot` still finishes booting the device in the background. The status message says
   so.
-- At most 8 tasks work at once; a ninth is refused with a tool error until one finishes or is
-  cancelled. Finished tasks are kept for an hour.
+- At most 8 task calls run at once; a ninth is refused with a tool error until one ends. A
+  cancelled task's call keeps running, so it still counts: cancelling doesn't make room. Finished
+  tasks are kept for an hour.
 - `tasks/update` only acknowledges: nothing a simee task does needs the client's input.
 
 `provision` (SDK downloads) and recording are not API methods, so they are not tools or tasks yet;

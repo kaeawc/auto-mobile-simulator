@@ -867,4 +867,84 @@ mod tests {
         let err = call(&mut s, "create", &json!({"name": "x", "device_type": "y", "runtime": "z", "form_factor": "foldable"}));
         assert!(err.expect_err("no foldable iPhone").starts_with("foldable is not supported on iOS"));
     }
+
+    /// The parameter a dispatcher's "missing ..." error names.
+    fn missing_param(error: &str) -> Option<&str> {
+        let rest = error.strip_prefix("missing ")?;
+        let rest = &rest[rest.find("parameter `")? + "parameter `".len()..];
+        rest.split('`').next()
+    }
+
+    /// A value of the type the schema gives a parameter, to get past its "missing" error.
+    fn dummy(schema: &Value) -> Value {
+        if let Some(first) = schema["enum"].get(0) {
+            return first.clone();
+        }
+        match schema["type"].as_str() {
+            Some("number" | "integer") => json!(1),
+            Some("boolean") => json!(true),
+            Some("array") => json!(["a"]),
+            Some("object") => json!({}),
+            _ => json!("a"),
+        }
+    }
+
+    /// What a method's schema requires has to cover what its dispatcher requires: every parameter
+    /// the dispatcher reports missing is `required` in the schema (an agent that follows the schema
+    /// never meets that error). Run on a running Android device, so it covers every method the
+    /// Android backend dispatches; the iOS backend's methods can't be reached from this host.
+    #[test]
+    fn the_schema_requires_what_the_dispatcher_requires() {
+        use sim_android::testing::fake_emulator;
+        use sim_core::form_factor::FormFactor;
+        let root = std::path::PathBuf::from("/tmp").join(format!("sa-schema-{}", std::process::id()));
+        let sdk = root.join("sdk/system-images/android-36/google_apis/arm64-v8a");
+        std::fs::create_dir_all(&sdk).expect("image dir");
+        std::fs::write(sdk.join("system.img"), b"s").expect("system.img");
+        std::fs::write(sdk.join("source.properties"), "AndroidVersion.ApiLevel=36\nSystemImage.TagId=google_apis\n").expect("props");
+        let env = emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") };
+        let mut android = sim_android::Android::new(env);
+        android.running_dir = Some(root.join("running"));
+        android.create("fold", "system-images;android-36;google_apis;arm64-v8a", Some(FormFactor::Foldable)).expect("create");
+        let _fake = fake_emulator(&android, "fold");
+        let mut s = Session::with_android(android);
+        // These would act on the fake emulator's advertisement, which names this process, or
+        // create devices: their parameters are covered by the other tests.
+        let skip = ["boot", "boot_many", "shutdown", "delete", "clone", "create", "help", "identity"];
+        let mut probed = Vec::new();
+        for (method, ..) in METHODS {
+            let schema = crate::input_schema(method).expect("schema");
+            if skip.contains(method) || !platforms(method).contains(&Platform::Android) {
+                continue;
+            }
+            let required: Vec<&str> = schema["required"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            let mut params = if schema["properties"].get("device").is_some() { json!({"device": "fold"}) } else { json!({}) };
+            let mut named = Vec::new();
+            for _ in 0..12 {
+                let Err(error) = call(&mut s, method, &params) else { break };
+                let Some(name) = missing_param(&error).map(str::to_owned) else { break };
+                assert!(
+                    required.contains(&name.as_str()),
+                    "`{method}` reports `{name}` missing, but its schema doesn't require it: {required:?}"
+                );
+                params[&name] = dummy(&schema["properties"][&name]);
+                named.push(name);
+            }
+            probed.push((*method, named));
+        }
+        let find = |m: &str| {
+            probed.iter().find(|(name, _)| *name == m).map(|(_, named)| named.clone()).unwrap_or_else(|| panic!("{m} wasn't probed"))
+        };
+        // The test does reach parameter checks: a touch's coordinates, a button's name.
+        assert_eq!(find("tap"), ["x", "y"]);
+        assert_eq!(find("touchpad"), ["x", "y"]);
+        assert_eq!(find("stylus"), ["x", "y"]);
+        assert_eq!(find("button"), ["button"]);
+        assert_eq!(find("type"), ["text"]);
+        assert_eq!(find("key"), ["usage"]);
+        assert_eq!(find("rotary"), ["ticks"]);
+        assert_eq!(find("location"), ["latitude", "longitude"]);
+        assert!(probed.len() >= 15, "{probed:?}");
+        std::fs::remove_dir_all(root).ok();
+    }
 }

@@ -16,80 +16,72 @@ pub const VIEW_TOOL: &str = "device_view";
 /// listed runs inline. (`provision` and `record` aren't API methods, so they aren't tools.)
 pub const LONG_RUNNING: &[&str] = &["boot", "boot_many", "create", "clone", "install", "settle", "erase", "shutdown"];
 
-/// Methods that change nothing.
-const READ_ONLY: &[&str] = &[
-    "help",
-    "identity",
-    "form_factors",
-    "devices",
-    "runtimes",
-    "device_types",
-    "screen",
-    "screenshot",
-    "apps",
-    "ca_debug_state",
-    "logs",
-    "processes",
-    "connections",
-    "traffic",
-    "containers",
-    "ls",
-    "read",
-    "du",
-    "crash_reports",
-    "info",
-    "defaults_read",
-    "network_state",
-    "network_flows",
-    "network_env",
-    "audio_state",
-    "audio_capture_stop",
-];
+/// What a method does to a device or the host, for the annotations a client's approval prompts
+/// read. Every method in the table is classified here on purpose (a test fails for one that isn't),
+/// since a client may auto-approve what is marked read-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Effect {
+    /// Changes nothing, on the device or the host.
+    Read,
+    /// Sets something to a value; repeating it changes nothing more.
+    Set,
+    /// Does something each time it is called (input, a boot) without destroying anything.
+    Act,
+    /// May lose data, run code or change what's running; repeating it can differ.
+    Danger,
+    /// Destroys or overwrites something; repeating it changes nothing more.
+    Destroy,
+}
 
-/// Methods that lose data or stop something running.
-const DESTRUCTIVE: &[&str] = &["delete", "erase", "rm", "uninstall", "reset_keychain", "clear_container", "kill"];
+/// The effect of `method`, or `None` for one nobody has classified (it then gets the specification's
+/// defaults: it writes, and may destroy).
+fn effect(method: &str) -> Option<Effect> {
+    use Effect::*;
+    Some(match method {
+        "help" | "identity" | "form_factors" | "devices" | "runtimes" | "device_types" | "screen" | "screenshot" | "apps"
+        | "ca_debug_state" | "logs" | "processes" | "connections" | "traffic" | "containers" | "ls" | "read" | "du" | "crash_reports"
+        | "info" | "defaults_read" | "network_state" | "network_flows" | "network_env" | "audio_state" | "settle" | VIEW_TOOL => Read,
+        "appearance" | "location" | "status_bar" | "clear_status_bar" | "content_size" | "increase_contrast" | "dynamic_island"
+        | "backlight" | "keyboard_language" | "hardware_keyboard" | "ca_debug" | "network_clear" | "audio_volume" | "audio_route"
+        | "audio_mute" | "fold" | "carplay" | "profile" | "privacy" => Set,
+        "create" | "boot" | "boot_many" | "clone" | "tap" | "swipe" | "touch" | "button" | "type" | "key" | "open_url" | "install"
+        | "memory_warning" | "notify" | "biometric" | "rotate" | "rotary" | "watch_gesture" | "remote_swipe" | "xr" | "touchpad"
+        | "stylus" | "vehicle" | "audio_capture_stop" => Act,
+        // Runs programs, starts apps with an environment, replaces a network profile (inject "boot"
+        // reboots the device), delivers a payload, writes a recording to a path, drives the console.
+        "exec" | "launch" | "push" | "network_shape" | "console" | "audio_capture_start" | "kill" => Danger,
+        "delete" | "erase" | "shutdown" | "rm" | "uninstall" | "terminate" | "reset_keychain" | "clear_container" | "write"
+        | "defaults_write" => Destroy,
+        _ => return None,
+    })
+}
 
-/// Methods whose repeating changes nothing more.
-const IDEMPOTENT: &[&str] = &[
-    "delete",
-    "shutdown",
-    "appearance",
-    "location",
-    "status_bar",
-    "clear_status_bar",
-    "content_size",
-    "increase_contrast",
-    "dynamic_island",
-    "backlight",
-    "keyboard_language",
-    "hardware_keyboard",
-    "ca_debug",
-    "network_shape",
-    "network_clear",
-    "audio_volume",
-    "audio_route",
-    "audio_mute",
-    "fold",
-    "carplay",
-    "terminate",
-    "uninstall",
-    "rm",
-    "profile",
-];
+/// Parameters the API takes but a tool doesn't: `screenshot`'s `path` writes a file anywhere on the
+/// host, which a client that auto-approves read-only tools must not be able to ask for. The image
+/// comes back in the result instead.
+const WITHHELD: &[(&str, &str, &str)] = &[("screenshot", "path", "The device's screen as a PNG image, returned in the result")];
+
+fn withheld(method: &str) -> Option<&'static str> {
+    WITHHELD.iter().find(|(m, ..)| *m == method).map(|(_, p, _)| *p)
+}
 
 /// Whether `name` is a tool.
 pub fn exists(name: &str) -> bool {
     name == VIEW_TOOL || METHODS.iter().any(|(m, ..)| *m == name)
 }
 
-/// The annotations the MCP spec defines, for an API method. A method that isn't classified is
-/// treated as the spec's default: it writes and may destroy.
+/// The annotations the MCP spec defines. An unclassified method gets only `readOnlyHint: false`, so
+/// a client applies the specification's defaults (it may destroy, and isn't idempotent).
 fn annotations(method: &str) -> Value {
-    let read_only = READ_ONLY.contains(&method);
-    let mut a = json!({"title": method, "readOnlyHint": read_only, "openWorldHint": false});
-    if !read_only {
-        a["destructiveHint"] = DESTRUCTIVE.contains(&method).into();
-        a["idempotentHint"] = IDEMPOTENT.contains(&method).into();
+    let mut a = json!({"title": method, "openWorldHint": false});
+    match effect(method) {
+        Some(Effect::Read) => a["readOnlyHint"] = true.into(),
+        Some(effect) => {
+            a["readOnlyHint"] = false.into();
+            a["destructiveHint"] = matches!(effect, Effect::Danger | Effect::Destroy).into();
+            a["idempotentHint"] = matches!(effect, Effect::Set | Effect::Destroy).into();
+        }
+        None => a["readOnlyHint"] = false.into(),
     }
     a
 }
@@ -111,11 +103,20 @@ pub fn list() -> Vec<Value> {
     let mut tools: Vec<Value> = METHODS
         .iter()
         .map(|(method, params, doc)| {
+            let mut schema = input_schema(method).unwrap_or_else(|| json!({"type": "object"}));
+            let (mut params, mut doc) = (params.to_string(), doc.to_string());
+            if let Some((_, name, text)) = WITHHELD.iter().find(|(m, ..)| m == method) {
+                doc = (*text).to_owned();
+                if let Some(properties) = schema["properties"].as_object_mut() {
+                    properties.remove(*name);
+                }
+                params = params.split(", ").filter(|t| t != name && !t.starts_with(&format!("{name}?"))).collect::<Vec<_>>().join(", ");
+            }
             json!({
                 "name": method,
                 "title": method,
-                "description": describe(method, params, doc),
-                "inputSchema": input_schema(method).unwrap_or_else(|| json!({"type": "object"})),
+                "description": describe(method, &params, &doc),
+                "inputSchema": schema,
                 "annotations": annotations(method),
             })
         })
@@ -145,6 +146,9 @@ pub fn arguments(params: &Value) -> Result<Value, RpcError> {
 
 /// Runs one tool: the method's outcome (a failure is a tool error, not a protocol error).
 pub fn run(backend: &dyn Backend, name: &str, args: &Value) -> Result<Value, String> {
+    if let Some(param) = withheld(name).filter(|p| args.get(*p).is_some_and(|v| !v.is_null())) {
+        return Err(format!("`{param}` isn't available through MCP: `{name}` returns the image in its result"));
+    }
     if name == VIEW_TOOL {
         let device = args.get("device").and_then(Value::as_str).unwrap_or("booted");
         let screen = backend.call("screen", &json!({"device": device}))?;
@@ -207,8 +211,10 @@ mod tests {
         for (method, params, doc) in METHODS {
             let tool = tools.iter().find(|t| t["name"] == *method).unwrap_or_else(|| panic!("no tool for {method}"));
             let description = tool["description"].as_str().expect("description");
-            assert!(description.starts_with(doc), "{method}");
-            assert!(params.is_empty() || description.contains(params), "{method} lists its parameters");
+            if withheld(method).is_none() {
+                assert!(description.starts_with(doc), "{method}");
+                assert!(params.is_empty() || description.contains(params), "{method} lists its parameters");
+            }
             assert!(description.contains("Platforms: "), "{method} says where it works");
             assert_eq!(tool["inputSchema"]["type"], "object", "{method}");
         }
@@ -235,6 +241,17 @@ mod tests {
     }
 
     #[test]
+    fn every_method_is_classified_on_purpose() {
+        // A method that isn't in `effect` would get the specification's defaults: add it there.
+        let unclassified: Vec<&str> = METHODS.iter().map(|(m, ..)| *m).filter(|m| effect(m).is_none()).collect();
+        assert!(unclassified.is_empty(), "classify these in `effect` in tools.rs: {unclassified:?}");
+        assert!(effect(VIEW_TOOL).is_some());
+        for name in LONG_RUNNING {
+            assert!(METHODS.iter().any(|(m, ..)| m == name), "{name} is not a method");
+        }
+    }
+
+    #[test]
     fn annotations_follow_what_a_method_does() {
         let tools = list();
         let ann = |m: &str| tools.iter().find(|t| t["name"] == m).map(|t| t["annotations"].clone()).expect(m);
@@ -244,11 +261,38 @@ mod tests {
         assert_eq!((ann("tap")["readOnlyHint"].clone(), ann("tap")["destructiveHint"].clone()), (json!(false), json!(false)));
         assert_eq!(ann("appearance")["idempotentHint"], true);
         assert_eq!(ann("tap")["openWorldHint"], false);
-        // Every name in the lists is a real method, so a rename can't leave a stale entry.
-        for name in READ_ONLY.iter().chain(DESTRUCTIVE).chain(IDEMPOTENT).chain(LONG_RUNNING) {
-            assert!(METHODS.iter().any(|(m, ..)| m == name), "{name} is not a method");
+        // What runs code, replaces state or overwrites files is marked destructive, not harmless.
+        for risky in ["exec", "write", "defaults_write", "network_shape", "push", "launch", "console", "kill", "audio_capture_start"] {
+            assert_eq!((ann(risky)["readOnlyHint"].clone(), ann(risky)["destructiveHint"].clone()), (json!(false), json!(true)), "{risky}");
         }
-        assert!(DESTRUCTIVE.iter().all(|m| !READ_ONLY.contains(m)));
+        // Read-only means it changes nothing: not a capture that stops and writes a recording.
+        assert_eq!(ann("audio_capture_stop")["readOnlyHint"], false);
+        assert_eq!(ann("screenshot")["readOnlyHint"], true);
+        // A method nobody classified gets the specification's defaults, not a claim of safety.
+        let unknown = annotations("a_new_method");
+        assert_eq!(unknown["readOnlyHint"], false);
+        assert_eq!((unknown.get("destructiveHint"), unknown.get("idempotentHint")), (None, None));
+        // Every read-only tool is one of the listings and reads, by name.
+        let read_only: Vec<&str> = METHODS.iter().map(|(m, ..)| *m).filter(|m| effect(m) == Some(Effect::Read)).collect();
+        assert!(read_only.iter().all(|m| !m.starts_with("audio_capture") && !["write", "rm", "exec", "kill"].contains(m)), "{read_only:?}");
+    }
+
+    #[test]
+    fn screenshot_does_not_take_a_host_path() {
+        let tools = list();
+        let shot = tools.iter().find(|t| t["name"] == "screenshot").expect("screenshot");
+        assert_eq!(shot["inputSchema"]["properties"].get("path"), None);
+        assert!(!shot["description"].as_str().expect("description").contains("path"));
+        assert!(shot["inputSchema"]["properties"]["device"].is_object());
+        let fake = Fake::default();
+        let err = run(&fake, "screenshot", &json!({"device": "d", "path": "/home/me/.zshrc"})).expect_err("refused");
+        assert!(err.contains("`path` isn't available through MCP"), "{err}");
+        assert!(fake.called("screenshot").is_empty(), "never reaches the API");
+        assert!(run(&fake, "screenshot", &json!({"device": "d", "path": null})).is_ok());
+        // Other methods keep their parameters.
+        assert!(
+            tools.iter().find(|t| t["name"] == "audio_capture_start").is_some_and(|t| t["inputSchema"]["properties"].get("path").is_some())
+        );
     }
 
     #[test]

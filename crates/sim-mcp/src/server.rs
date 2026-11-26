@@ -295,8 +295,11 @@ impl Inner {
             "resources/read" => match params.get("uri").and_then(Value::as_str) {
                 Some(uri) => {
                     let uri = uri.to_owned();
+                    let era = ctx.era;
                     self.offload(id.clone(), ctx.clone(), move |i| {
-                        resources::read(&*i.backend, &uri).map(|contents| cacheable(json!({"contents": contents}), 0, "private"))
+                        resources::read(&*i.backend, &uri)
+                            .map(|contents| cacheable(json!({"contents": contents}), 0, "private"))
+                            .map_err(|error| rpc::for_era(error, era))
                     });
                 }
                 None => reply(Err(RpcError::invalid_params("`uri` is required"))),
@@ -429,7 +432,7 @@ impl Inner {
     fn legacy_subscription(self: &Arc<Self>, method: &str, params: &Value) -> Result<Value, RpcError> {
         let uri = params.get("uri").and_then(Value::as_str).ok_or_else(|| RpcError::invalid_params("`uri` is required"))?;
         if resources::parse(uri).is_none() {
-            return Err(RpcError::invalid_params("Resource not found").with_data(json!({"uri": uri})));
+            return Err(rpc::for_era(RpcError::invalid_params("Resource not found").with_data(json!({"uri": uri})), Era::Legacy));
         }
         let uris: Vec<String> = {
             let mut set = lock(&self.legacy_uris);

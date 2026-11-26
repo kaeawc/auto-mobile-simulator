@@ -432,6 +432,25 @@ fn an_older_client_opens_with_initialize_and_is_served_in_its_shape() {
 }
 
 #[test]
+fn resource_not_found_has_the_code_of_the_clients_revision() {
+    let rig = Rig::new();
+    rig.fake.answer("info", Err("no device matches `ghost`".into()));
+    let missing = rig.modern("resources/read", json!({"uri": "simee://devices/ghost"}));
+    assert_eq!(missing["error"]["code"], -32602, "the current revision");
+    let id = rig.send_raw("initialize", json!({"protocolVersion": "2025-11-25", "capabilities": {}}));
+    rig.response(id);
+    for uri in ["simee://devices/ghost", "simee://nope"] {
+        let id = rig.send_raw("resources/read", json!({"uri": uri}));
+        let error = rig.response(id)["error"].clone();
+        assert_eq!((error["code"].clone(), error["message"].clone()), (json!(-32002), json!("Resource not found")), "{uri}");
+        assert_eq!(error["data"]["uri"], uri);
+    }
+    // Other errors keep their codes.
+    let id = rig.send_raw("resources/read", json!({}));
+    assert_eq!(rig.response(id)["error"]["code"], rpc::INVALID_PARAMS);
+}
+
+#[test]
 fn an_older_client_subscribes_to_resources_the_old_way() {
     let rig = Rig::new();
     let id = rig.send_raw("initialize", json!({"protocolVersion": "2025-11-25", "capabilities": {}}));
@@ -443,8 +462,9 @@ fn an_older_client_subscribes_to_resources_the_old_way() {
     rig.fake.answer("info", Ok(json!({"state": "Booted"})));
     let note = rig.notification("notifications/resources/updated");
     assert_eq!(note["params"], json!({"uri": "simee://devices/phone"}));
+    // An older revision's "resource not found" is -32002.
     let id = rig.send_raw("resources/subscribe", json!({"uri": "file:///x"}));
-    assert_eq!(rig.response(id)["error"]["code"], rpc::INVALID_PARAMS);
+    assert_eq!(rig.response(id)["error"]["code"], rpc::RESOURCE_NOT_FOUND_LEGACY);
     let id = rig.send_raw("resources/subscribe", json!({}));
     assert_eq!(rig.response(id)["error"]["code"], rpc::INVALID_PARAMS);
     let id = rig.send_raw("resources/unsubscribe", json!({"uri": "simee://devices/phone"}));
