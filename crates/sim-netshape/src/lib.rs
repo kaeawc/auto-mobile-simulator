@@ -330,6 +330,14 @@ pub fn scproxy_tool(sdk: Sdk) -> Result<PathBuf, String> {
     build(sdk, "scproxy", "", SCPROXY_SOURCE, &["-fobjc-arc", "-framework", "Foundation", "-framework", "CFNetwork"])
 }
 
+/// Builds (or reuses) another of simee's in-device Objective-C programs for `sdk`'s simulator,
+/// cached beside the shaper (once per `source`: put anything else the build depends on in it), and
+/// returns its path. `flags` are clang's: frameworks and linker options.
+pub fn objc_tool(sdk: Sdk, name: &str, source: &str, flags: &[&str]) -> Result<PathBuf, String> {
+    let flags: Vec<&str> = std::iter::once("-fobjc-arc").chain(flags.iter().copied()).collect();
+    build(sdk, name, "", source, &flags)
+}
+
 fn run(cmd: &mut Command) -> Result<(), String> {
     let out = cmd.output().map_err(|e| format!("{cmd:?}: {e}"))?;
     if out.status.success() { Ok(()) } else { Err(format!("{cmd:?} failed: {}", String::from_utf8_lossy(&out.stderr).trim())) }

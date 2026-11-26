@@ -13,6 +13,8 @@
 //! macOS hosts; elsewhere they fail with a clear reason.
 
 mod android;
+#[cfg(target_os = "macos")]
+mod duo;
 mod forward;
 #[cfg(target_os = "macos")]
 mod ios;

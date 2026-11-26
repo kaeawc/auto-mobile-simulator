@@ -137,14 +137,10 @@ pub fn opt_orientation(p: &Value) -> Result<Option<Orientation>, String> {
         .transpose()
 }
 
-/// Whether the optional `display` parameter picks the CarPlay screen (`carplay`) rather than the
-/// device's own (`main`, the default).
-pub fn on_carplay(p: &Value) -> Result<bool, String> {
-    match str_param(p, "display").unwrap_or("main") {
-        "main" => Ok(false),
-        "carplay" | "car" => Ok(true),
-        other => Err(format!("unknown display `{other}` (main or carplay)")),
-    }
+/// The screen the optional `display` parameter names: the one in use (`main`, the default), an
+/// iPhone Duo's `outer` or `inner` screen, or an iPhone's CarPlay screen (`carplay`).
+pub fn display(p: &Value) -> Result<sim_core::duo::Display, String> {
+    sim_core::duo::Display::parse(str_param(p, "display"))
 }
 
 /// `remote_swipe` (iOS only, so unused where the iOS backend isn't built): a swipe across the Siri Remote's touch surface in `direction`, as samples
@@ -359,9 +355,12 @@ mod tests {
         assert_eq!(opt_orientation(&json!({})), Ok(None));
         assert_eq!(opt_orientation(&json!({"orientation": "landscape-left"})), Ok(Some(Orientation::LandscapeLeft)));
         assert!(opt_orientation(&json!({"orientation": "diagonal"})).expect_err("bad").contains("portrait, landscape-right"));
-        assert_eq!(on_carplay(&json!({})), Ok(false));
-        assert_eq!(on_carplay(&json!({"display": "carplay"})), Ok(true));
-        assert!(on_carplay(&json!({"display": "hud"})).is_err());
+        use sim_core::duo::{Display, Screen};
+        assert_eq!(display(&json!({})), Ok(Display::Active));
+        assert_eq!(display(&json!({"display": "main"})), Ok(Display::Active));
+        assert_eq!(display(&json!({"display": "carplay"})), Ok(Display::CarPlay));
+        assert_eq!(display(&json!({"display": "inner"})), Ok(Display::Builtin(Screen::Inner)));
+        assert!(display(&json!({"display": "hud"})).is_err());
         assert_eq!(crown_delta(&json!({"ticks": -3})), Ok(-3.0 * CROWN_UNITS_PER_TICK));
         assert_eq!(crown_delta(&json!({"delta": 12.5, "ticks": 1})), Ok(12.5));
         assert!(crown_delta(&json!({})).is_err());

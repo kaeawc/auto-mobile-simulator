@@ -10,6 +10,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use sim_core::debug;
 use sim_core::device::{DeviceState, privacy_service};
+use sim_core::duo;
 use sim_core::form_factor::FormFactor;
 use sim_core::geometry::{Point, Size};
 use sim_core::gesture::{Sample, ScreenEdge};
@@ -21,9 +22,9 @@ use sim_core::worker::Workers;
 use sim_coresim::{Appearance, Context, Device, Direction, Display, Hid, Orientation, StateWatch, StatusBar, WatchGesture};
 
 use crate::params::{
-    PointerRequest, button, crown_delta, err, need_bool, need_f64, need_str, on_carplay, opt_bool, opt_edge, opt_form_factor,
-    opt_orientation, opt_u64, pairs, pencil_samples, pointer_request, remote_swipe_samples, screenshot_result, str_param, strings,
-    swipe_samples, tap_samples, touch_sample,
+    PointerRequest, button, crown_delta, display, err, need_bool, need_f64, need_str, opt_bool, opt_edge, opt_form_factor, opt_orientation,
+    opt_u64, pairs, pencil_samples, pointer_request, remote_swipe_samples, screenshot_result, str_param, strings, swipe_samples,
+    tap_samples, touch_sample,
 };
 
 /// Shaping proxies, one per device, owned by this (long-running) process.
@@ -276,17 +277,75 @@ struct Input {
     changes: Arc<AtomicU64>,
     watch: Option<StateWatch>,
     hid: Reuse<BootKey, Hid>,
-    display: Reuse<BootKey, Display>,
+    screens: Reuse<BootKey, Screens>,
     /// The buttons `pointer` holds (and where the pointer is while it holds one) in this boot: the
     /// moves of a drag start there instead of being homed.
     pointer: HeldPointer,
 }
 
+/// A device's built-in displays, kept by its input worker: the main one and an iPhone Duo's inner
+/// one.
+struct Screens {
+    main: Display,
+    inner: Option<Display>,
+}
+
+/// A screen a touch lands on: its size, and the screen ID whose digitizer takes it (`None`: the
+/// main digitizer, as before).
+type Touched = (Size, Option<u32>);
+
+/// A second built-in screen counts as an iPhone Duo's inner screen only on that device type (as
+/// the desktop decides), so no other device's touches change path.
+fn inner_for<T>(device_type_id: &str, second: Option<T>) -> Option<T> {
+    second.filter(|_| duo::folds(device_type_id))
+}
+
+impl Screens {
+    fn open(device: &Device) -> Result<Self, String> {
+        let (main, inner) = device.builtin_displays().map_err(err)?;
+        Ok(Self { main, inner: inner_for(&device.info().device_type_id, inner) })
+    }
+
+    /// The display `which` names and, on a device with two built-in screens, the screen ID of its
+    /// digitizer: the main digitizer follows SpringBoard's primary screen there, so an iPhone Duo's
+    /// touches name their screen. The screen in use is the main one unless the device has a second
+    /// (the iPhone Duo's inner screen) and only that one is lit ([`duo::active`]).
+    fn pick(&self, which: duo::Display) -> Result<(&Display, Option<u32>), String> {
+        fn addressed(d: &Display) -> Result<(&Display, Option<u32>), String> {
+            d.screen_id().map(|id| (d, Some(id))).ok_or_else(|| "the simulator service doesn't say the screen's ID".into())
+        }
+        let screen = match (which, &self.inner) {
+            (duo::Display::CarPlay, _) => return Err("the CarPlay screen isn't a built-in one".into()),
+            (_, None) if which == duo::Display::Builtin(duo::Screen::Inner) => {
+                return Err("display=inner is an iPhone Duo's inner screen; this device has one built-in screen".into());
+            }
+            (_, None) => return Ok((&self.main, None)),
+            (duo::Display::Builtin(screen), Some(_)) => screen,
+            (duo::Display::Active, Some(inner)) => duo::active(self.main.lit(), inner.lit()),
+        };
+        match (screen, &self.inner) {
+            (duo::Screen::Inner, Some(inner)) => addressed(inner),
+            _ => addressed(&self.main),
+        }
+    }
+}
+
 impl Input {
-    /// Runs `send` with the device's HID client and, when `screen` is set, its screen size. Both
-    /// are reused until the device's state changes (a reboot) and dropped, with the device, on any
-    /// failure; a device whose boots can't be told apart connects on every call, as before.
+    /// Runs `send` with the device's HID client and, when `screen` is set, its main screen's size.
+    /// Both are reused until the device's state changes (a reboot) and dropped, with the device, on
+    /// any failure; a device whose boots can't be told apart connects on every call, as before.
     fn run<R>(&mut self, udid: &str, screen: bool, send: impl FnOnce(&Hid, Option<Size>) -> Result<R, String>) -> Result<R, String> {
+        let main = screen.then_some(duo::Display::Builtin(duo::Screen::Outer));
+        self.run_on(udid, main, |hid, at| send(hid, at.map(|(size, _)| size)))
+    }
+
+    /// [`Input::run`] on the built-in screen `screen` names: `send` gets its size and digitizer.
+    fn run_on<R>(
+        &mut self,
+        udid: &str,
+        screen: Option<duo::Display>,
+        send: impl FnOnce(&Hid, Option<Touched>) -> Result<R, String>,
+    ) -> Result<R, String> {
         let result = self.try_run(udid, screen, send);
         if result.is_err() {
             self.device = None;
@@ -307,10 +366,10 @@ impl Input {
         result
     }
 
-    /// Runs `with` on the device's main display, reused like the HID client (and dropped, with the
-    /// device, on any failure).
-    fn display<R>(&mut self, udid: &str, with: impl FnOnce(&Display) -> Result<R, String>) -> Result<R, String> {
-        let result = self.try_display(udid, with);
+    /// Runs `with` on the built-in display `which` names, reused like the HID client (and dropped,
+    /// with the device, on any failure).
+    fn display<R>(&mut self, udid: &str, which: duo::Display, with: impl FnOnce(&Display) -> Result<R, String>) -> Result<R, String> {
+        let result = self.try_display(udid, which, with);
         if result.is_err() {
             self.device = None;
             self.watch = None;
@@ -318,22 +377,33 @@ impl Input {
         result
     }
 
-    fn try_display<R>(&mut self, udid: &str, with: impl FnOnce(&Display) -> Result<R, String>) -> Result<R, String> {
-        let Self { ctx, device, changes, watch, display, .. } = self;
+    fn try_display<R>(&mut self, udid: &str, which: duo::Display, with: impl FnOnce(&Display) -> Result<R, String>) -> Result<R, String> {
+        let Self { ctx, device, changes, watch, screens, .. } = self;
         let (device, key) = connect(ctx, device, changes, watch, udid)?;
-        display.with(key, || device.display().map_err(err), with)
+        screens.with(key, || Screens::open(device), |s| with(s.pick(which)?.0))
     }
 
-    fn try_run<R>(&mut self, udid: &str, screen: bool, send: impl FnOnce(&Hid, Option<Size>) -> Result<R, String>) -> Result<R, String> {
-        let Self { ctx, device, changes, watch, hid, display, .. } = self;
+    fn try_run<R>(
+        &mut self,
+        udid: &str,
+        screen: Option<duo::Display>,
+        send: impl FnOnce(&Hid, Option<Touched>) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let Self { ctx, device, changes, watch, hid, screens, .. } = self;
         let (device, key) = connect(ctx, device, changes, watch, udid)?;
-        let size = if screen {
-            let (w, h) = display.with(key, || device.display().map_err(err), |d| d.size().map_err(err))?;
-            Some(Size::new(f64::from(w), f64::from(h)))
-        } else {
-            None
+        let at = match screen {
+            Some(which) => Some(screens.with(
+                key,
+                || Screens::open(device),
+                |s| {
+                    let (display, id) = s.pick(which)?;
+                    let (w, h) = display.size().map_err(err)?;
+                    Ok((Size::new(f64::from(w), f64::from(h)), id))
+                },
+            )?),
+            None => None,
         };
-        hid.with(key, || device.hid().map_err(err), |hid| send(hid, size))
+        hid.with(key, || device.hid().map_err(err), |hid| send(hid, at))
     }
 }
 
@@ -368,15 +438,16 @@ fn connect<'a>(
     Ok((device, key))
 }
 
-/// Runs `with` on the device's main display on its input worker, which keeps the display between
-/// calls (and orders a capture after the input sent before it).
-fn on_main_display<R: Send + 'static>(
+/// Runs `with` on the built-in display `which` names on the device's input worker, which keeps the
+/// displays between calls (and orders a capture after the input sent before it).
+fn on_display<R: Send + 'static>(
     s: &mut Session,
     p: &Value,
+    which: duo::Display,
     with: impl FnOnce(&Display) -> Result<R, String> + Send + 'static,
 ) -> Result<R, String> {
     let udid = s.udid(p)?;
-    let result = INPUT.run(&udid.clone(), move |input| sim_coresim::autoreleasepool(|| input.display(&udid, with)))?;
+    let result = INPUT.run(&udid.clone(), move |input| sim_coresim::autoreleasepool(|| input.display(&udid, which, with)))?;
     result.map_err(|e| as_typed(e, p))
 }
 
@@ -391,20 +462,20 @@ fn as_typed(error: String, p: &Value) -> String {
     }
 }
 
-/// The `display` a method names: its size, or a capture. The main display goes through the
+/// The `display` a method names: its size, or a capture. Built-in displays go through the
 /// device's worker; the CarPlay screen is looked up per call (attaching it isn't a new boot).
 fn screen_size(s: &mut Session, p: &Value) -> Result<(u32, u32), String> {
-    if on_carplay(p)? {
-        return display_of(&s.device(p)?, p)?.size().map_err(err);
+    match display(p)? {
+        duo::Display::CarPlay => s.device(p)?.external_display().and_then(|d| d.size()).map_err(err),
+        which => on_display(s, p, which, |d| d.size().map_err(err)),
     }
-    on_main_display(s, p, |d| d.size().map_err(err))
 }
 
 fn capture(s: &mut Session, p: &Value) -> Result<sim_core::frame::Frame, String> {
-    if on_carplay(p)? {
-        return display_of(&s.device(p)?, p)?.capture().map_err(err);
+    match display(p)? {
+        duo::Display::CarPlay => s.device(p)?.external_display().and_then(|d| d.capture()).map_err(err),
+        which => on_display(s, p, which, |d| d.capture().map_err(err)),
     }
-    on_main_display(s, p, |d| d.capture().map_err(err))
 }
 
 /// The simulators to resolve a `device` across platforms with: what selection reads of each.
@@ -480,37 +551,37 @@ fn input_method(input: &mut Input, udid: &str, method: &str, p: &Value) -> Resul
     }
 }
 
-/// The display a method's `display` parameter picks: the device's own, or its CarPlay screen.
-fn display_of(device: &Device, p: &Value) -> Result<sim_coresim::Display, String> {
-    if on_carplay(p)? { device.external_display() } else { device.display() }.map_err(err)
-}
-
 /// The CarPlay screen's size: the car display simee attaches.
 fn carplay_screen() -> Size {
     Size::new(f64::from(sim_core::carplay::WIDTH), f64::from(sim_core::carplay::HEIGHT))
 }
 
-fn play(hid: &Hid, screen: Size, samples: &[Sample], edge: Option<ScreenEdge>) -> Result<(), String> {
+/// Plays samples on a built-in screen: the main digitizer, or the screen `screen_id` names (an
+/// iPhone Duo's inner screen).
+fn play(hid: &Hid, (screen, screen_id): Touched, samples: &[Sample], edge: Option<ScreenEdge>) -> Result<(), String> {
     for s in samples {
         sleep(s.delay);
         let at = screen.normalize(s.point);
-        match edge {
-            Some(edge) => hid.edge_touch(at, s.phase, edge),
-            None => hid.touch(at, s.phase),
+        match (screen_id, edge) {
+            (Some(id), edge) => hid.screen_touch(id, at, s.phase, edge),
+            (None, Some(edge)) => hid.edge_touch(at, s.phase, edge),
+            (None, None) => hid.touch(at, s.phase),
         }
         .map_err(err)?;
     }
     Ok(())
 }
 
-/// Plays touch samples on the device's screen, or its CarPlay screen (`display: "carplay"`); with
-/// an `edge`, as a touch that comes in from that edge of the device's screen.
+/// Plays touch samples on the screen the `display` parameter names: the one in use (an iPhone
+/// Duo's inner screen when it is unfolded), an iPhone Duo's `outer` or `inner` one, or the CarPlay
+/// screen; with an `edge`, as a touch that comes in from that edge of the device's screen.
 fn play_on(input: &mut Input, udid: &str, p: &Value, samples: &[Sample], edge: Option<ScreenEdge>) -> Result<Value, String> {
-    let carplay = on_carplay(p)?;
+    let which = display(p)?;
+    let carplay = which == duo::Display::CarPlay;
     if carplay && edge.is_some() {
         return Err("`edge` is for the device's own screen, not CarPlay's".into());
     }
-    let played = input.run(udid, !carplay, |hid, screen| match screen {
+    let played = input.run_on(udid, (!carplay).then_some(which), |hid, screen| match screen {
         Some(screen) => play(hid, screen, samples, edge),
         None => {
             for s in samples {
@@ -1309,6 +1380,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "screenshot" => screenshot_result(&capture(s, p)?, p),
         m if INPUT_METHODS.contains(&m) => input(s, m, p),
         "rotate" => rotate(&s.device(p)?, opt_orientation(p)?),
+        "fold" => crate::duo::fold(&s.device(p)?, p),
         "carplay" => {
             let on = need_bool(p, "on")?;
             s.device(p)?.set_carplay(on).map_err(err)?;
@@ -1643,6 +1715,15 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_second_built_in_screen_is_an_inner_screen_only_on_the_duo() {
+        let duo = "com.apple.CoreSimulator.SimDeviceType.iPhone-Duo";
+        assert_eq!(super::inner_for(duo, Some(3)), Some(3));
+        assert_eq!(super::inner_for(duo, None::<u32>), None);
+        assert_eq!(super::inner_for("com.apple.CoreSimulator.SimDeviceType.iPad-Pro", Some(3)), None);
+        assert_eq!(super::inner_for("", Some(3)), None);
+    }
+
     use super::*;
 
     #[test]

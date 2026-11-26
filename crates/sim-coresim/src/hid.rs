@@ -191,6 +191,13 @@ impl Hid {
         self.touch_target(TARGET_TOUCH, at, phase, Some(edge))
     }
 
+    /// One touch sample (normalized like [`Hid::touch`]) on the digitizer of the screen whose
+    /// screen ID is `screen_id` ([`crate::Display::screen_id`]), from `edge` if given: the iPhone
+    /// Duo's inner screen, which the main digitizer doesn't reach.
+    pub fn screen_touch(&self, screen_id: u32, at: Point, phase: Phase, edge: Option<ScreenEdge>) -> Result<()> {
+        self.touch_target(sim_core::duo::digitizer_target(screen_id), at, phase, edge)
+    }
+
     /// One Apple Pencil sample on the screen (normalized like [`Hid::touch`]): a touch whose
     /// transducer is a stylus, which apps see as a `UITouch` of type `.pencil`. The simulator's
     /// touch screen reports no force, tilt or hover for it (`docs/form-factors.md`). iPad only.

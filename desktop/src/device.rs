@@ -16,6 +16,9 @@ pub struct Shared {
     /// Device framebuffer size in pixels, packed `w << 16 | h`; 0 until the first frame.
     pub size: AtomicU32,
     pub frames: AtomicU32,
+    /// On a device with two built-in screens (the iPhone Duo), the screen ID of the one shown (the
+    /// one in use), whose digitizer touches go to; 0 for the main digitizer.
+    pub screen_id: AtomicU32,
 }
 
 impl Shared {

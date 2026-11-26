@@ -32,7 +32,8 @@ device type of the iOS 27.1 and `iOS-27-2-iPhone19-4` runtimes), `simee boot`, w
 | network shaping: injected (`inject: true`) | pass | pass | pass | pass | pass | pass | pass |
 | audio: state, volume, mute, capture start/stop | pass | pass | pass | pass | pass | pass | pass |
 | CarPlay attach/detach | pass² | pass² | pass² | unsupported³ | unsupported³ | unsupported³ | unsupported³ |
-| AutoMobile harness (getApple, observe, pressButton) | pass | — | — | — | — | pass | — |
+| AutoMobile harness (getApple, observe, pressButton) | pass | — | — | — | — | pass | pass (folded and unfolded) |
+| `fold`, the inner screen (`display=inner`) | — | — | — | — | not run | — (one screen) | pass |
 
 1. In the first minute after boot `push` fails with "Simulator device failed to complete the
    requested operation" while the device's `apsd` is still starting; the same call passes once it
@@ -41,6 +42,40 @@ device type of the iOS 27.1 and `iOS-27-2-iPhone19-4` runtimes), `simee boot`, w
    screenshots reach it, but on this host it stays black on every runtime. Not yet compared with
    Simulator.app's CarPlay window on the same host.
 3. `carplay` refuses iOS 27 runtimes: Apple renders CarPlay black there.
+
+## iPhone Duo
+
+The iPhone Duo (`iPhone19,4`) has two built-in screens: the outer one (`LCD`, 1398×2034, the
+device type's main screen) and the inner one (`LCD-1`, 2007×2853, a landscape panel its
+framebuffer holds a quarter turn from upright). SpringBoard shows the device on one at a time and
+leaves the other black. Neither Xcode 26.6's Simulator.app nor Xcode 27.2 (whose DeviceHub replaces
+it) has a fold control, and the simulator has no hinge sensor: the guest boots closed, on the outer
+screen.
+
+- **Fold and unfold.** SpringBoard's display tool service (`SBSDisplayToolService`, which its
+  internal `suiatool display swap` drives) sweeps a synthetic hinge to a position and moves the
+  device to the other screen when the sweep crosses its swap boundary (85°, opening from closed).
+  `fold` runs a small in-device program (`crates/sim-api/native/displaytool.m`, built on first use
+  with the simulator SDK and cached like the network shaper) that asks it to; SpringBoard serves
+  clients with the `com.apple.springboard.sbdisplay.service` entitlement, which the program carries
+  in `__TEXT,__entitlements`, where the simulator reads a program's entitlements. `simee fold <duo>
+  unfold|fold|half-opened|<angle>`; the answer names the screen in use. The hinge keeps its
+  hysteresis: opening to the book posture (100°) from closed moves to the inner screen, closing to
+  it from open stays there.
+- **Which screen.** `screen`, `screenshot`, `tap`, `swipe` and `touch` take
+  `display=main|outer|inner`; `main`, the default, is the screen in use, the one of the two that
+  isn't black (the outer one when both are, so pass `inner` for a full-screen black app unfolded).
+  The inner screen's pixels are its framebuffer's (2007×2853, the content on its side), and edges
+  (`--edge`) are that framebuffer's too: home from the upright bottom is `--edge right`.
+- **Touch.** Each screen has its own digitizer, addressed by its screen ID with the screen bit
+  (`IndigoHIDTargetForScreen`). The main digitizer follows SpringBoard's primary screen, so after a
+  fold it lands on the inner screen: on a device with two screens every touch names its screen.
+  Other iPhones and iPads keep the main digitizer, unchanged.
+- **The desktop** shows the screen in use and switches when the device folds; an iPhone Duo's
+  toolbar gets Fold, Half open and Unfold.
+- **Not yet:** the inner screen isn't turned upright (in screenshots or the desktop); `rotate` was
+  not checked unfolded; powering a built-in screen off and on through the service
+  (`setPowerState`) leaves it black until the device reboots, so simee never does.
 
 ## Apple TV
 
@@ -75,7 +110,8 @@ device type of the iOS 27.1 and `iOS-27-2-iPhone19-4` runtimes), `simee boot`, w
 - **The iPhone Duo's main screen.** It has two built-in framebuffers, and the inner one (black when
   folded) comes first; simee captured and touched that one. The main display is now the built-in
   framebuffer the size of the device type's main screen (`sim_core::framebuffer::main_port`).
-  The inner screen isn't reachable yet. `parity.sh` asks `simctl` for the `primary` display.
+  `parity.sh` asks `simctl` for the `primary` display. The inner screen and the hinge: see
+  [iPhone Duo](#iphone-duo).
 - **Network shaping on Apple TV.** The shaper and the proxy tool were built for the iOS simulator
   only, and dyld refused them in a tvOS device. They are built per platform now
   (`sim_netshape::Sdk`). watchOS and visionOS devices get a clear error.
