@@ -54,12 +54,18 @@ const CB_PTRS: u64 = 24;
 const CB_SIZES: u64 = CB_PTRS + 8 * MAX_BUFFERS as u64;
 
 struct Pipe {
+    /// The id the guest named it by, and which open of that id this is (the driver reuses
+    /// freed ids): host threads address it by this, so a closed pipe's late messages find no
+    /// pipe instead of the next one with its id.
+    conn: u64,
     command: u64,
     /// Collecting `pipe:<name>\0` until the handler exists.
     name: Option<Vec<u8>>,
     handler: Option<Box<dyn PipeHandler>>,
     inbound: VecDeque<u8>,
     wants_read: bool,
+    /// Asked to be woken when its handler, full, can take guest bytes again.
+    wants_write: bool,
     closed_by_host: bool,
 }
 
@@ -70,6 +76,8 @@ struct State {
     open_buffer: u64,
     regs: HashMap<u64, u32>,
     pipes: HashMap<u32, Pipe>,
+    /// Opens so far, the high half of each pipe's `conn`.
+    opens: u32,
     /// (pipe id, wake flags) waiting for GET_SIGNALLED.
     signalled: VecDeque<(u32, u32)>,
     /// The level last driven on the line (it starts low): the controller hears changes only.
@@ -153,14 +161,18 @@ impl GoldfishPipe {
         let cmd = self.rd32(cb + CB_CMD) as i32;
         let (status, consumed) = match cmd {
             CMD_OPEN => {
+                s.opens = s.opens.wrapping_add(1);
+                let conn = u64::from(s.opens) << 32 | u64::from(id);
                 s.pipes.insert(
                     id,
                     Pipe {
+                        conn,
                         command: cb,
                         name: Some(Vec::new()),
                         handler: None,
                         inbound: VecDeque::new(),
                         wants_read: false,
+                        wants_write: false,
                         closed_by_host: false,
                     },
                 );
@@ -190,11 +202,17 @@ impl GoldfishPipe {
             },
             CMD_WRITE => self.pipe_write(s, id, cb),
             CMD_READ => self.pipe_read(s, id, cb),
-            CMD_WAKE_ON_WRITE => {
-                // Writes never block: wake the writer right away.
-                self.signal(s, id, WAKE_WRITE);
-                (0, 0)
-            }
+            CMD_WAKE_ON_WRITE => match s.pipes.get_mut(&id) {
+                // Woken by the handler's `drained` once it has room.
+                Some(p) if p.handler.as_ref().is_some_and(|h| h.write_blocked()) => {
+                    p.wants_write = true;
+                    (0, 0)
+                }
+                _ => {
+                    self.signal(s, id, WAKE_WRITE);
+                    (0, 0)
+                }
+            },
             CMD_WAKE_ON_READ => match s.pipes.get_mut(&id) {
                 Some(p) if !p.inbound.is_empty() || p.closed_by_host => {
                     let flags = if p.closed_by_host { WAKE_CLOSED } else { WAKE_READ };
@@ -239,7 +257,7 @@ impl GoldfishPipe {
                     let raw = p.name.take().unwrap_or_default();
                     let full = String::from_utf8_lossy(&raw).into_owned();
                     let name = full.strip_prefix("pipe:").unwrap_or(&full).to_string();
-                    match self.registry.open(&name, PipeCtx { conn: u64::from(id), events: self.events.clone() }) {
+                    match self.registry.open(&name, PipeCtx { conn: p.conn, events: self.events.clone() }) {
                         Some(h) => p.handler = Some(h),
                         None => {
                             eprintln!("emu: guest opened unknown goldfish pipe '{name}'");
@@ -252,6 +270,12 @@ impl GoldfishPipe {
         if !rest.is_empty()
             && let Some(h) = p.handler.as_mut()
         {
+            // Full (a render thread far behind): "try again", never a wait under the device's
+            // lock. The guest asks to be woken (WAKE_ON_WRITE) and writes the rest then.
+            if h.write_blocked() {
+                let taken = (data.len() - rest.len()) as i32;
+                return if taken > 0 { (taken, taken) } else { (ERR_AGAIN, 0) };
+            }
             let mut out = Vec::new();
             let keep = h.guest_data(rest, &mut out);
             p.inbound.extend(out);
@@ -298,11 +322,24 @@ impl GoldfishPipe {
 fn host_loop(dev: &std::sync::Weak<GoldfishPipe>, rx: &Receiver<WorkerEvent>) {
     while let Ok(ev) = rx.recv() {
         let Some(dev) = dev.upgrade() else { return };
-        let WorkerEvent::Host { conn, msg } = ev else { continue };
+        let (conn, msg) = match ev {
+            WorkerEvent::Host { conn, msg } => (conn, Some(msg)),
+            WorkerEvent::Drained { conn } => (conn, None),
+            _ => continue,
+        };
         let id = conn as u32;
         let mut s = dev.lock();
-        let Some(p) = s.pipes.get_mut(&id) else { continue };
+        // Gone, or closed and its id given to a newer pipe.
+        let Some(p) = s.pipes.get_mut(&id).filter(|p| p.conn == conn) else { continue };
         let Some(h) = p.handler.as_mut() else { continue };
+        let Some(msg) = msg else {
+            // Room again for a full handler's writer.
+            if p.wants_write && !h.write_blocked() {
+                p.wants_write = false;
+                dev.signal(&mut s, id, WAKE_WRITE);
+            }
+            continue;
+        };
         let mut out = Vec::new();
         let keep = h.host_msg(msg, &mut out);
         p.inbound.extend(out);
@@ -411,9 +448,13 @@ impl PipeHandler for RefPipe {
 /// the renderer hears of each process when its pipe opens and again when it closes (the process
 /// exited), to set up and free that process's GL state, as the stock emulator's pipe does.
 pub struct GlProcess {
-    next: std::sync::atomic::AtomicU64,
+    next: &'static std::sync::atomic::AtomicU64,
     backend: Option<Arc<dyn crate::pipe::opengles::GlBackend>>,
 }
+
+/// Process ids for the whole emu process, as stock's are: the renderer keeps each process's GL
+/// state (and may still be cleaning one up) across guest resets, which rebuild the pipes.
+static PROCESS_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Default for GlProcess {
     fn default() -> Self {
@@ -423,7 +464,13 @@ impl Default for GlProcess {
 
 impl GlProcess {
     pub fn with_backend(backend: Option<Arc<dyn crate::pipe::opengles::GlBackend>>) -> GlProcess {
-        GlProcess { next: std::sync::atomic::AtomicU64::new(1), backend }
+        GlProcess { next: &PROCESS_IDS, backend }
+    }
+
+    /// Ids from 1, of its own (tests that check the numbers).
+    #[cfg(test)]
+    fn numbered_from_one(backend: Option<Arc<dyn crate::pipe::opengles::GlBackend>>) -> GlProcess {
+        GlProcess { next: Box::leak(Box::new(std::sync::atomic::AtomicU64::new(1))), backend }
     }
 }
 
@@ -505,7 +552,7 @@ mod tests {
         let mem = Arc::new(GuestRam::new(RAM, 0x10_0000).expect("ram"));
         let line = Arc::new(TestLine::default());
         let mut reg = PipeRegistry::default();
-        reg.register("GLProcessPipe", Box::new(GlProcess::default()));
+        reg.register("GLProcessPipe", Box::new(GlProcess::numbered_from_one(None)));
         reg.register("refcount", Box::new(RefCount::default()));
         let d = GoldfishPipe::new(mem.clone(), Arc::new(reg), line.clone());
         assert_eq!(
@@ -591,7 +638,7 @@ mod tests {
     fn commands_span_several_buffers() {
         let mem = Arc::new(GuestRam::new(RAM, 0x10_0000).expect("ram"));
         let mut reg = PipeRegistry::default();
-        reg.register("GLProcessPipe", Box::new(GlProcess::default()));
+        reg.register("GLProcessPipe", Box::new(GlProcess::numbered_from_one(None)));
         let d = GoldfishPipe::new(mem.clone(), Arc::new(reg), Arc::new(TestLine::default()));
         wr(&d, REG_VERSION, 4);
         let (open_buf, cb) = (RAM + 0x1000, RAM + 0x3000);
@@ -668,19 +715,129 @@ mod tests {
         assert_eq!(&reply, b"cba");
         assert_eq!(run(&d, &mem, 9, cb, CMD_CLOSE, None).0, 0);
         let c = backend.channels.lock().expect("lock")[0].clone();
-        assert!(!crate::pipe::opengles::GlChannel::write(&*c, b"x"), "the guest's close stopped the channel");
+        assert_eq!(
+            crate::pipe::opengles::GlChannel::try_write(&*c, b"x"),
+            crate::pipe::opengles::GlWrite::Stopped,
+            "the guest's close stopped the channel"
+        );
     }
 
     #[test]
     fn gl_processes_are_announced_to_the_renderer_when_they_come_and_go() {
         let backend = Arc::new(crate::pipe::opengles::tests::Backend::default());
         let mut reg = PipeRegistry::default();
-        reg.register("GLProcessPipe", Box::new(GlProcess::with_backend(Some(backend.clone()))));
+        reg.register("GLProcessPipe", Box::new(GlProcess::numbered_from_one(Some(backend.clone()))));
         let (mem, _line, d) = device(reg);
         for (id, cb) in [(3, RAM + 0x3000), (4, RAM + 0x4000)] {
             assert_eq!(open_named(&d, &mem, id, cb, b"pipe:GLProcessPipe\0").0, 19);
         }
         assert_eq!(run(&d, &mem, 3, RAM + 0x3000, CMD_CLOSE, None).0, 0);
         assert_eq!(*backend.processes.lock().expect("lock"), [(1, true), (2, true), (1, false)]);
+    }
+
+    fn wait_for_line(line: &TestLine) {
+        let t = std::time::Instant::now();
+        while !line.level() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(5), "never woken");
+            std::thread::yield_now();
+        }
+    }
+
+    /// The guest closes a GL pipe whose render thread still has a reply and a close on the way,
+    /// and the driver hands the same id to the next pipe: that pipe gets neither.
+    #[test]
+    fn a_closed_gl_pipes_late_replies_never_reach_the_pipe_that_reuses_its_id() {
+        let backend = Arc::new(crate::pipe::opengles::tests::Backend::default());
+        let mut reg = PipeRegistry::default();
+        reg.register("opengles", Box::new(crate::pipe::opengles::OpenglesService { backend: backend.clone() }));
+        let (mem, line, d) = device(reg);
+        let (cb, data) = (RAM + 0x3000, RAM + 0x8000);
+        assert_eq!(open_named(&d, &mem, 9, cb, b"pipe:opengles\0"), (14, 14));
+        let old = backend.channels.lock().expect("lock")[0].clone();
+        old.set_held(true);
+        mem.write(data, b"abc").expect("w");
+        assert_eq!(run(&d, &mem, 9, cb, CMD_WRITE, Some((data, 3))), (3, 3));
+        assert_eq!(run(&d, &mem, 9, cb, CMD_CLOSE, None).0, 0);
+        assert_eq!(open_named(&d, &mem, 9, cb, b"pipe:opengles\0"), (14, 14), "the id, reused");
+        // The old render thread's reply ("cba") and its close go out now, after the reuse.
+        old.set_held(false);
+        let t = std::time::Instant::now();
+        // The backend and this test hold the rest.
+        while Arc::strong_count(&old) > 2 {
+            assert!(t.elapsed() < std::time::Duration::from_secs(5), "the old reader never ended");
+            std::thread::yield_now();
+        }
+        // The new pipe's own round trip, queued behind them.
+        mem.write(data, b"xyz").expect("w");
+        assert_eq!(run(&d, &mem, 9, cb, CMD_WRITE, Some((data, 3))), (3, 3), "the new pipe is open");
+        if run(&d, &mem, 9, cb, CMD_READ, Some((data + 0x100, 16))).0 == ERR_AGAIN {
+            assert_eq!(run(&d, &mem, 9, cb, CMD_WAKE_ON_READ, None).0, 0);
+            wait_for_line(&line);
+            assert_eq!(rd(&d, REG_GET_SIGNALLED), 1);
+            assert_eq!(mem.read_u32(RAM + 0x2000 + 4).expect("flags"), WAKE_READ, "woken to read, not closed");
+            assert_eq!(run(&d, &mem, 9, cb, CMD_READ, Some((data + 0x100, 16))), (3, 3), "only its own reply");
+        }
+        let mut reply = [0u8; 3];
+        mem.read(data + 0x100, &mut reply).expect("r");
+        assert_eq!(&reply, b"zyx");
+        assert_eq!(run(&d, &mem, 9, cb, CMD_POLL, None).0, POLL_OUT, "no stale bytes, no hang-up");
+    }
+
+    /// A render thread that fell 1024 writes behind: the vCPU gets "try again" and returns (the
+    /// device lock with it), and the guest is woken to write once there's room.
+    #[test]
+    fn a_full_render_queue_answers_try_again_and_wakes_the_writer_later() {
+        let backend = Arc::new(crate::pipe::opengles::tests::Backend::default());
+        let mut reg = PipeRegistry::default();
+        reg.register("opengles", Box::new(crate::pipe::opengles::OpenglesService { backend: backend.clone() }));
+        reg.register("GLProcessPipe", Box::new(GlProcess::default()));
+        let (mem, line, d) = device(reg);
+        let (gl, other) = (RAM + 0x3000, RAM + 0x4000);
+        assert_eq!(open_named(&d, &mem, 9, gl, b"pipe:opengles\0"), (14, 14));
+        assert_eq!(open_named(&d, &mem, 3, other, b"pipe:GLProcessPipe\0").0, 19);
+        let c = backend.channels.lock().expect("lock")[0].clone();
+        c.set_full(true);
+        let (tx, rx) = channel();
+        let (vcpu, vmem) = (d.clone(), mem.clone());
+        std::thread::spawn(move || {
+            let data = RAM + 0x9000;
+            vmem.write(data, b"abc").expect("w");
+            let first = run(&vcpu, &vmem, 9, gl, CMD_WRITE, Some((data, 3)));
+            vmem.write(data, b"def").expect("w");
+            let second = run(&vcpu, &vmem, 9, gl, CMD_WRITE, Some((data, 3)));
+            let _ = tx.send((first, second));
+        });
+        let (first, second) = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("the vCPU stalled on a full render queue");
+        assert_eq!(first, (3, 3), "taken and held for the render thread");
+        assert_eq!(second.0, ERR_AGAIN, "nothing more until it catches up");
+        assert_eq!(run(&d, &mem, 3, other, CMD_POLL, None).0, POLL_OUT, "other pipes are still served");
+        assert_eq!(run(&d, &mem, 9, gl, CMD_WAKE_ON_WRITE, None).0, 0);
+        assert!(!line.level(), "no wake while the queue is full");
+        c.set_full(false);
+        wait_for_line(&line);
+        assert_eq!(rd(&d, REG_GET_SIGNALLED), 1);
+        assert_eq!(mem.read_u32(RAM + 0x2000).expect("id"), 9);
+        assert_eq!(mem.read_u32(RAM + 0x2000 + 4).expect("flags"), WAKE_WRITE);
+        let data = RAM + 0xa000;
+        mem.write(data, b"def").expect("w");
+        assert_eq!(run(&d, &mem, 9, gl, CMD_WRITE, Some((data, 3))), (3, 3));
+        assert_eq!(&*c.written.lock().expect("lock"), b"abcdef", "in order, once each");
+    }
+
+    /// `boot_and_run` builds the pipe services again on a guest reset, but the renderer (and the
+    /// GL state it keeps per process id) lives as long as emu: ids never repeat.
+    #[test]
+    fn gl_process_ids_keep_counting_across_a_guest_reset() {
+        let first_boot = Arc::new(crate::pipe::opengles::tests::Backend::default());
+        let second_boot = Arc::new(crate::pipe::opengles::tests::Backend::default());
+        let mut puids = Vec::new();
+        for backend in [&first_boot, &second_boot] {
+            let mut reg = PipeRegistry::default();
+            reg.register("GLProcessPipe", Box::new(GlProcess::with_backend(Some(backend.clone()))));
+            let (mem, _line, d) = device(reg);
+            assert_eq!(open_named(&d, &mem, 3, RAM + 0x3000, b"pipe:GLProcessPipe\0").0, 19);
+            puids.push(backend.processes.lock().expect("lock")[0].0);
+        }
+        assert!(puids[1] > puids[0], "the second boot's process reused id {} of the first", puids[0]);
     }
 }

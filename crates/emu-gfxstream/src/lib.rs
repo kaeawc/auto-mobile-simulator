@@ -11,7 +11,7 @@
 mod channel;
 mod macho;
 
-pub use channel::{ChannelRead, RenderChannel};
+pub use channel::{ChannelRead, ChannelWrite, RenderChannel};
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, c_char, c_int, c_void};

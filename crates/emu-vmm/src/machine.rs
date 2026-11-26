@@ -757,8 +757,15 @@ impl GlPipes {
 struct Channel(emu_gfxstream::RenderChannel);
 
 impl pipe::opengles::GlChannel for Channel {
-    fn write(&self, data: &[u8]) -> bool {
-        self.0.write(data)
+    fn try_write(&self, data: &[u8]) -> pipe::opengles::GlWrite {
+        match self.0.try_write(data) {
+            emu_gfxstream::ChannelWrite::Done => pipe::opengles::GlWrite::Done,
+            emu_gfxstream::ChannelWrite::Full => pipe::opengles::GlWrite::Full,
+            emu_gfxstream::ChannelWrite::Stopped => pipe::opengles::GlWrite::Stopped,
+        }
+    }
+    fn wait_writable(&self) {
+        self.0.wait_writable();
     }
     fn read(&self, timeout: Duration, out: &mut Vec<u8>) -> pipe::opengles::GlRead {
         match self.0.read(timeout, out) {

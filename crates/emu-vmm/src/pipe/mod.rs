@@ -88,6 +88,12 @@ pub trait PipeHandler: Send {
     /// The guest took `n` more of the bytes this pipe queued for it (a host producer can bound
     /// what it has in flight by this).
     fn guest_took(&mut self, _n: usize) {}
+    /// True while the host side can take no more guest bytes (a full render queue). The
+    /// goldfish pipe then answers writes with "try again" and wakes the guest's writer on the
+    /// handler's next [`PipeCtx::drained`] that finds it unblocked.
+    fn write_blocked(&self) -> bool {
+        false
+    }
 }
 
 pub trait PipeService: Send + Sync {

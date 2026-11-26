@@ -189,6 +189,17 @@ pub enum ChannelRead {
     Closed,
 }
 
+/// What [`RenderChannel::try_write`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChannelWrite {
+    /// The render thread has the bytes.
+    Done,
+    /// Its queue is full; nothing was taken.
+    Full,
+    /// The channel is stopped (or the bytes couldn't be copied).
+    Stopped,
+}
+
 /// One guest GLES connection and its render thread on the host. Calls may come from any
 /// thread. Dropping it stops the connection; the render thread is joined on a thread of its
 /// own, so a drop never waits for it.
@@ -203,25 +214,28 @@ unsafe impl Send for RenderChannel {}
 unsafe impl Sync for RenderChannel {}
 
 impl RenderChannel {
-    /// Sends guest bytes to the render thread. Waits while its queue is full (1024 writes deep);
-    /// false once the channel is stopped.
-    pub fn write(&self, data: &[u8]) -> bool {
+    /// Sends guest bytes to the render thread if its queue (1024 writes deep) has room. Never
+    /// waits: a full queue is [`ChannelWrite::Full`], as stock's pipe answers "try again".
+    pub fn try_write(&self, data: &[u8]) -> ChannelWrite {
         let mut b = ChannelBuffer::EMPTY;
         if !b.fill(data) {
-            return false;
+            return ChannelWrite::Stopped;
         }
-        let ok = loop {
-            // SAFETY: a live channel and a valid buffer; on success the channel moves it out
-            // (taking its heap block), otherwise it's left as it was.
-            match unsafe { (self.api.try_write)(self.obj, &mut b) } {
-                IO_OK => break true,
-                // SAFETY: a live channel; returns when there's room or the channel stops.
-                IO_TRY_AGAIN => unsafe { (self.api.wait_writable)(self.obj) },
-                _ => break false,
-            }
+        // SAFETY: a live channel and a valid buffer; on success the channel moves it out
+        // (taking its heap block), otherwise it's left as it was.
+        let r = match unsafe { (self.api.try_write)(self.obj, &mut b) } {
+            IO_OK => ChannelWrite::Done,
+            IO_TRY_AGAIN => ChannelWrite::Full,
+            _ => ChannelWrite::Stopped,
         };
         b.release();
-        ok
+        r
+    }
+
+    /// Waits until the queue has room or the channel stops.
+    pub fn wait_writable(&self) {
+        // SAFETY: a live channel; returns when there's room or the channel stops.
+        unsafe { (self.api.wait_writable)(self.obj) }
     }
 
     /// Appends what the render thread sent the guest next to `out`, waiting up to `timeout`.
