@@ -91,6 +91,13 @@ fn message(kinds: &[u32], now_ns: u64) -> Vec<u8> {
     m
 }
 
+/// How long a message is by its header: the header and the events it counts, when they have
+/// [`EVENT_SIZE`] bytes each; `None` for a header shorter than [`HEADER_SIZE`] or another stride.
+pub fn message_len(header: &[u8]) -> Option<usize> {
+    let header = header.get(..HEADER_SIZE)?;
+    (get_u32(header, STRIDE_OFFSET) == Some(EVENT_SIZE as u32)).then(|| HEADER_SIZE + usize::from(header[COUNT_OFFSET]) * EVENT_SIZE)
+}
+
 /// The pointer moving by `(dx, dy)` points with `buttons` (a mask of [`PointerButton::mask`])
 /// held, sent to the pointer service `target`: the guest makes a relative pointer event of it.
 pub fn pointer_motion(dx: f64, dy: f64, buttons: u32, target: u32, now_ns: u64) -> Vec<u8> {
@@ -226,6 +233,16 @@ mod tests {
         assert!(!make_pencil(&mut two_fingers));
         assert_eq!(get_u32(&two_fingers, 0x114), Some(2), "left unchanged");
         assert!(!make_pencil(&mut touch()[..0x100].to_vec()));
+    }
+
+    #[test]
+    fn a_message_is_as_long_as_its_header_says() {
+        assert_eq!(message_len(&touch()), Some(0x160));
+        assert_eq!(message_len(&mouse_service()[..HEADER_SIZE]), Some(0xc0), "the header alone tells");
+        assert_eq!(message_len(&touch()[..0x1c]), None, "shorter than a header");
+        let mut stride = touch();
+        put_u32(&mut stride, 0x18, 0xb0);
+        assert_eq!(message_len(&stride), None);
     }
 
     #[test]

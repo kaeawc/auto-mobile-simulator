@@ -200,9 +200,7 @@ impl Hid {
         if message.is_null() {
             return if phase == Phase::Move { Ok(()) } else { self.send(message) };
         }
-        // SAFETY: `message` is a live malloc'd block of `malloc_size` bytes, ours until sent.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(message.cast::<u8>(), malloc_size(message)) };
-        if !indigo::make_pencil(bytes) {
+        if !message_bytes(message).is_some_and(indigo::make_pencil) {
             // SAFETY: the message is malloc'd and wasn't handed to the client.
             unsafe { libc_free(message) };
             return Err(Error::Unavailable("IndigoHIDMessageForMouseNSEvent builds a touch this version doesn't know".into()));
@@ -224,9 +222,7 @@ impl Hid {
         if message.is_null() {
             return Err(Error::Service { op: "HID", message: "pointer service builder returned nothing".into() });
         }
-        // SAFETY: `message` is a live malloc'd block of `malloc_size` bytes.
-        let bytes = unsafe { std::slice::from_raw_parts(message.cast::<u8>(), malloc_size(message)) };
-        let Some(target) = indigo::service_target(bytes) else {
+        let Some(target) = message_bytes(message).and_then(|bytes| indigo::service_target(bytes)) else {
             // SAFETY: the message is malloc'd and wasn't handed to the client.
             unsafe { libc_free(message) };
             return Err(Error::Unavailable("IndigoHIDMessageToCreateMouseService builds a message this version doesn't know".into()));
@@ -358,6 +354,30 @@ impl Hid {
 
 /// Turns the builder's "moved" contact into the phase wanted, after checking the message has the
 /// layout the fields are patched for (else [`Error::Unavailable`], never a blind write).
+/// The bytes a SimulatorKit builder wrote in `message`: its header and the events the header
+/// counts, never the block's slack past them (which malloc leaves uninitialized). `None` for a
+/// block too short for its header, or one whose header has a layout [`indigo::message_len`]
+/// doesn't know. The slice is valid until the message is sent or freed.
+fn message_bytes<'a>(message: Message) -> Option<&'a mut [u8]> {
+    let base = message.cast::<u8>();
+    // SAFETY: `message` is a live block from malloc (a builder's `calloc`); `malloc_size` reports
+    // its usable size.
+    let size = unsafe { malloc_size(message) };
+    if size < indigo::HEADER_SIZE {
+        return None;
+    }
+    let mut header = [0u8; indigo::HEADER_SIZE];
+    // SAFETY: the block has at least HEADER_SIZE bytes (checked above), and they're initialized:
+    // the builders `calloc` the header and their events together (0xc0 bytes for one event, 0x160
+    // for two, 0x200 for three, in Xcode 26.6's SimulatorKit). `header` is a separate local array.
+    unsafe { ptr::copy_nonoverlapping(base, header.as_mut_ptr(), indigo::HEADER_SIZE) };
+    let len = indigo::message_len(&header).filter(|&len| len <= size)?;
+    // SAFETY: `len` bytes lie inside the block (`len <= size`) and are the header and the events it
+    // counts, all of them zeroed by `calloc` and then written by the builder; the block is ours until
+    // sent, and nothing else reads or writes it while the slice lives.
+    Some(unsafe { std::slice::from_raw_parts_mut(base, len) })
+}
+
 fn patch_trackpad(message: Message, phase: Phase) -> Result<()> {
     use trackpad::*;
     let base = message.cast::<u8>();

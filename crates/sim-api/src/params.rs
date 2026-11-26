@@ -168,10 +168,21 @@ pub fn opt_edge(p: &Value) -> Result<Option<ScreenEdge>, String> {
     str_param(p, "edge").map(|v| ScreenEdge::parse(v).ok_or_else(|| format!("unknown edge `{v}` ({})", ScreenEdge::NAMES))).transpose()
 }
 
-/// `pencil`'s samples in pixels: a stroke from x, y to to_x, to_y over duration_ms (300 by
-/// default), else one phase at x, y (`tap` by default: down, then up 60 ms later).
+/// `stylus`'s samples on an iPad (the Apple Pencil), in pixels: a stroke from x, y to to_x, to_y
+/// over duration_ms (300 by default), else one phase at x, y (`tap` by default: down, then up
+/// 60 ms later). Hover, pressure, the barrel button and the eraser, which Android's stylus takes,
+/// are refused with the reason: the simulator's touch screen has none of them.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn pencil_samples(p: &Value) -> Result<Vec<Sample>, String> {
+    const NONE: &str = "the simulator's touch screen reports only the Apple Pencil's position (docs/form-factors.md)";
+    if p.get("pressure").is_some_and(|v| !v.is_null()) {
+        return Err(format!("an iPad's stylus has no `pressure`: {NONE}"));
+    }
+    for key in ["button", "eraser"] {
+        if opt_bool(p, key)? == Some(true) {
+            return Err(format!("an iPad's stylus has no `{key}`: {NONE}"));
+        }
+    }
     let at = Point::new(need_f64(p, "x")?, need_f64(p, "y")?);
     let to = (p.get("to_x").and_then(Value::as_f64), p.get("to_y").and_then(Value::as_f64));
     match to {
@@ -185,6 +196,9 @@ pub fn pencil_samples(p: &Value) -> Result<Vec<Sample>, String> {
                 "down" => Phase::Down,
                 "move" => Phase::Move,
                 "up" => Phase::Up,
+                phase @ ("hover" | "leave") => {
+                    return Err(format!("an iPad's stylus can't `{phase}` (it takes tap, down, move, up): {NONE}"));
+                }
                 other => return Err(format!("unknown phase `{other}` (tap, down, move, up)")),
             };
             Ok(vec![Sample { point: at, phase, delay: Duration::ZERO }])
@@ -365,7 +379,19 @@ mod tests {
         let stroke = pencil_samples(&json!({"x": 0, "y": 0, "to_x": 100, "to_y": 50, "duration_ms": 170})).expect("stroke");
         assert_eq!(stroke.first().map(|s| s.phase), Some(Phase::Down));
         assert_eq!(stroke.last().map(|s| (s.phase, s.point)), Some((Phase::Up, Point::new(100.0, 50.0))));
-        assert!(pencil_samples(&json!({"x": 1, "y": 2, "phase": "hover"})).expect_err("hover").contains("tap, down, move, up"));
+        for phase in ["hover", "leave"] {
+            let e = pencil_samples(&json!({"x": 1, "y": 2, "phase": phase})).expect_err(phase);
+            assert!(e.contains("tap, down, move, up") && e.contains("only the Apple Pencil's position"), "{e}");
+        }
+        for (key, value) in [("pressure", json!(90)), ("button", json!(true)), ("eraser", json!(true))] {
+            let e = pencil_samples(&json!({"x": 1, "y": 2, key: value})).expect_err(key);
+            assert!(e.contains(&format!("no `{key}`")) && e.contains("simulator"), "{e}");
+        }
+        // What the CLI sends when none of them is asked for.
+        let cli = json!({"x": 1, "y": 2, "phase": "tap", "pressure": null, "button": false, "eraser": false});
+        assert_eq!(phases(cli), Ok(vec![Phase::Down, Phase::Up]));
+        assert!(pencil_samples(&json!({"x": 1, "y": 2, "button": "yes"})).is_err());
+        assert!(pencil_samples(&json!({"x": 1, "y": 2, "phase": "press"})).expect_err("unknown").contains("unknown phase"));
         assert_eq!(pencil_samples(&json!({"x": 1, "y": 2, "to_x": 3})), Err("a stroke needs both `to_x` and `to_y`".into()));
 
         let r = pointer_request(&json!({"x": 10, "y": 20})).expect("defaults");

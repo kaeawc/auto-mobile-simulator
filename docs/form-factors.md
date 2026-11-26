@@ -93,7 +93,7 @@ Foldable postures follow the stock emulator's hinge ranges: closed below 30°, h
 | Kind | Create | Drive |
 | --- | --- | --- |
 | iPhone | `simee create P "iPhone 17" "iOS 26.5"` | touch, `button home\|lock\|side\|action`, `type`, `rotate [--orientation …]` |
-| iPad | `simee create T "iPad Pro 11-inch (M4)" "iOS 26.5" --form-factor tablet` | as iPhone |
+| iPad | `simee create T "iPad Pro 11-inch (M4)" "iOS 26.5" --form-factor tablet` | as iPhone, plus `swipe --edge bottom\|top`, `pointer X Y [click\|down\|up]` or `pointer X Y --to X2 Y2`, and `stylus X Y [tap\|down\|move\|up]` or `stylus X Y --to X2 Y2` (the Apple Pencil) |
 | CarPlay | an iPhone on an iOS 26 runtime, booted: `simee carplay P on` | `tap\|swipe\|screenshot … --display carplay`; `carplay P off` |
 | Apple Watch | `simee create W "Apple Watch Series 10 (46mm)" "watchOS 26.0" --form-factor watch` | touch, `rotary <ticks> [--delta <crown units>]`, `button home` (the crown's press) `\|side\|action`, `watch-gesture double-tap\|wrist-flick` |
 | Apple TV | `simee create TV "Apple TV 4K (3rd generation)" "tvOS 26.0" --form-factor tv` | `button select\|menu\|back\|home\|play-pause\|up\|down\|left\|right` (the Siri Remote), `remote-swipe up\|down\|left\|right` (its touch surface) |
@@ -179,8 +179,10 @@ without one fails that input with `Unavailable`, never a crash.
   where iPadOS opens Notification or Control Center, nor a corner, which the rounded screen stops
   short) and moves in 10 pt steps: exact on iOS 26.5, within ~20 pt on 27.2, whose pointer
   accelerates even slow motion. `pointer --to` drags in one call; a button held by `pointer … down`
-  keeps the position for the next calls on the same server (`simee serve`), while separate CLI
-  processes home the pointer again. `stylus` on an iPad sends a touch whose finger is a stylus (the guest's `SimulatorHID` copies
+  keeps the position for the next calls on the same server (`simee serve`) in the same boot. A
+  `down` that runs in its own process (no server) is refused, since nothing would release it, as
+  are an `up` with nothing held and a `move` or `up` after a failed call lost the held button
+  (`click`, `down` or a drag first lets go of both buttons and homes). `stylus` on an iPad sends a touch whose finger is a stylus (the guest's `SimulatorHID` copies
   the transducer type into the `IOHIDEvent`), which apps see as `UITouch.type == .pencil` and
   draw with. Checked on iPad Pro 13-inch (M5) clones on iOS 26.5 and 27.2 with a probe app that
   logs every touch and hover, and with the AutoMobile harness.

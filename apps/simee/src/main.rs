@@ -292,18 +292,21 @@ enum Cmd {
         #[arg(long, default_value_t = 300)]
         duration_ms: u64,
     },
-    /// Android: a stylus on the touch screen, in pixels: X Y [tap|hover|down|move|up|leave], or a
-    /// stroke with --to X2 Y2; --button holds the barrel button, --eraser uses the eraser end.
+    /// A stylus on the touch screen, in pixels: X Y [tap|hover|down|move|up|leave], or a stroke
+    /// with --to X2 Y2; --button holds the barrel button, --eraser uses the eraser end. On an iPad
+    /// it is the Apple Pencil: tap, down, move, up and strokes only (no hover, pressure, button or
+    /// eraser in the simulator).
+    #[command(alias = "pencil")]
     Stylus {
         device: String,
         x: u32,
         y: u32,
-        /// tap (the default), hover, down, move, up or leave.
+        /// tap (the default), hover, down, move, up or leave (Android).
         phase: Option<String>,
         /// Draw a stroke to this point instead.
         #[arg(long, num_args = 2, value_names = ["X2", "Y2"])]
         to: Option<Vec<u32>>,
-        /// Pressure while touching, 1-255.
+        /// Pressure while touching, 1-255 (Android).
         #[arg(long)]
         pressure: Option<u8>,
         /// Hold the barrel button.
@@ -347,21 +350,6 @@ enum Cmd {
         /// Drag to this point instead (press at X Y, move, release).
         #[arg(long, num_args = 2, value_names = ["X2", "Y2"])]
         to: Option<Vec<f64>>,
-    },
-    /// Apple Pencil on an iPad's screen, in pixels: X Y [tap|down|move|up], or a stroke with
-    /// --to X2 Y2. Apps see a pencil touch (no pressure, tilt or hover in the simulator).
-    Pencil {
-        device: String,
-        x: f64,
-        y: f64,
-        /// tap (the default), down, move or up.
-        phase: Option<String>,
-        /// Draw a stroke to this point instead.
-        #[arg(long, num_args = 2, value_names = ["X2", "Y2"])]
-        to: Option<Vec<f64>>,
-        /// The stroke's duration.
-        #[arg(long, default_value_t = 300)]
-        duration_ms: u64,
     },
     /// Attach (`on`) or detach (`off`) an iPhone's CarPlay display (iOS 26 runtimes).
     Carplay { device: String, state: String },
@@ -739,6 +727,7 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
                 _ => params["phase"] = json!(phase.as_deref().unwrap_or("tap")),
             }
             call("stylus", params)?;
+            input = true;
         }
         Cmd::Rotary { device, ticks, delta } => {
             call("rotary", json!({"device": device, "ticks": ticks, "delta": delta}))?;
@@ -759,14 +748,6 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
                 params["to_y"] = json!(ty);
             }
             call("pointer", params)?;
-            input = true;
-        }
-        Cmd::Pencil { device, x, y, phase, to, duration_ms } => {
-            let params = match to.as_deref() {
-                Some([tx, ty]) => json!({"device": device, "x": x, "y": y, "to_x": tx, "to_y": ty, "duration_ms": duration_ms}),
-                _ => json!({"device": device, "x": x, "y": y, "phase": phase.as_deref().unwrap_or("tap")}),
-            };
-            call("pencil", params)?;
             input = true;
         }
         Cmd::Carplay { device, state } => {
@@ -1189,6 +1170,13 @@ mod tests {
         // Android devices boot silent unless `--audio`.
         assert!(matches!(parse(&["boot", "a"]), Ok(Cmd::Boot { audio: false, .. })));
         assert!(matches!(parse(&["boot", "a", "--audio"]), Ok(Cmd::Boot { audio: true, .. })));
+    }
+
+    #[test]
+    fn pencil_is_the_stylus_command() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        assert!(matches!(parse(&["pencil", "iPad", "1", "2", "--to", "3", "4"]), Ok(Cmd::Stylus { to: Some(_), .. })));
+        assert!(matches!(parse(&["stylus", "iPad", "1", "2", "down"]), Ok(Cmd::Stylus { button: false, pressure: None, .. })));
     }
 
     /// A fake server's reply to a method: its result or its error.

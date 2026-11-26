@@ -14,7 +14,8 @@ use sim_core::form_factor::FormFactor;
 use sim_core::geometry::{Point, Size};
 use sim_core::gesture::{Sample, ScreenEdge};
 use sim_core::hid::{KEY_LEFT_SHIFT, keystroke};
-use sim_core::pointer::{self, PointerAction};
+use sim_core::indigo::PointerButton;
+use sim_core::pointer::{self, Held, HeldPointer, PointerAction};
 use sim_core::reuse::{BootKey, Reuse};
 use sim_core::worker::Workers;
 use sim_coresim::{Appearance, Context, Device, Direction, Display, Hid, Orientation, StateWatch, StatusBar, WatchGesture};
@@ -257,7 +258,7 @@ impl Session {
 
 /// The methods that send input, each run on its device's input worker.
 const INPUT_METHODS: &[&str] =
-    &["tap", "swipe", "touch", "rotary", "watch_gesture", "remote_swipe", "button", "type", "key", "pointer", "pencil"];
+    &["tap", "swipe", "touch", "rotary", "watch_gesture", "remote_swipe", "button", "type", "key", "pointer", "stylus"];
 
 /// One input worker per device (by UDID), shared by every API connection. A worker keeps its
 /// device's HID client and display between calls (the service's objects stay on the thread that
@@ -276,9 +277,9 @@ struct Input {
     watch: Option<StateWatch>,
     hid: Reuse<BootKey, Hid>,
     display: Reuse<BootKey, Display>,
-    /// Where the pointer is (in points) and the buttons held, while `pointer` holds one down: the
-    /// moves of a drag start there instead of from the corner.
-    pointer_held: Option<(Point, u32)>,
+    /// The buttons `pointer` holds (and where the pointer is while it holds one) in this boot: the
+    /// moves of a drag start there instead of being homed.
+    pointer: HeldPointer,
 }
 
 impl Input {
@@ -287,6 +288,18 @@ impl Input {
     /// failure; a device whose boots can't be told apart connects on every call, as before.
     fn run<R>(&mut self, udid: &str, screen: bool, send: impl FnOnce(&Hid, Option<Size>) -> Result<R, String>) -> Result<R, String> {
         let result = self.try_run(udid, screen, send);
+        if result.is_err() {
+            self.device = None;
+            self.watch = None;
+        }
+        result
+    }
+
+    /// The key of the device's current boot (none when its boots can't be told apart); the device
+    /// is dropped on failure, as in [`Input::run`].
+    fn boot(&mut self, udid: &str) -> Result<Option<BootKey>, String> {
+        let Self { ctx, device, changes, watch, .. } = self;
+        let result = connect(ctx, device, changes, watch, udid).map(|(_, key)| key);
         if result.is_err() {
             self.device = None;
             self.watch = None;
@@ -416,7 +429,7 @@ fn input_method(input: &mut Input, udid: &str, method: &str, p: &Value) -> Resul
             let (at, phase) = touch_sample(p)?;
             play_on(input, udid, p, &[Sample { point: at, phase, delay: Duration::ZERO }], opt_edge(p)?)
         }
-        "pencil" => {
+        "stylus" => {
             let samples = pencil_samples(p)?;
             null(input.run(udid, true, |hid, screen| {
                 let screen = screen.ok_or("no screen size")?;
@@ -513,19 +526,46 @@ fn play_on(input: &mut Input, udid: &str, p: &Value, samples: &[Sample], edge: O
 /// `pointer`: brings the iPad's pointer to a point (pixels) and hovers, clicks, presses or releases
 /// a button there, or drags from it to another. The pointer only moves relatively, so it is homed
 /// against the screen's edges first (`sim_core::pointer`), unless a button is held from an earlier
-/// call on this worker (`down`), which moves on from there.
+/// call on this server in this boot (`down`), which moves on from there. A `down` that no later
+/// call could see (an in-process run), an `up` with nothing held, and a `move` or `up` after a
+/// failed call lost what was held are refused ([`pointer::check`]).
 fn pointer_on(input: &mut Input, udid: &str, p: &Value) -> Result<Value, String> {
     let PointerRequest { at, action, button, hold, drag_to } = pointer_request(p)?;
-    let held = input.pointer_held.take();
-    let moved = input.run(udid, true, |hid, screen| {
+    let boot = input.boot(udid)?;
+    let held = input.pointer.get(boot);
+    pointer::check(action, drag_to.is_some(), held, crate::serving())?;
+    let result = input.run(udid, true, |hid, screen| {
         let screen = screen.ok_or("no screen size")?;
         let scale = if hid.scale() > 0.0 { hid.scale() } else { 1.0 };
         let points = Size::new(screen.width / scale, screen.height / scale);
         let in_points = |p: Point| Point::new(p.x.clamp(0.0, screen.width) / scale, p.y.clamp(0.0, screen.height) / scale);
         let to = in_points(at);
-        let (from, mut buttons) = held.map_or((None, 0), |(at, buttons)| (Some(at), buttons));
+        let (from, mut buttons) = match held {
+            Held::Down { at, buttons } => (Some(at), buttons),
+            Held::Nothing => (None, 0),
+            Held::Lost => {
+                // Let go of whatever the guest may hold, where the pointer is, before homing: a
+                // held button would drag along the edges.
+                for b in [PointerButton::Primary, PointerButton::Secondary] {
+                    hid.pointer_button(b, false, 0).map_err(err)?;
+                }
+                (None, 0)
+            }
+        };
         let glide = |from: Option<Point>, to: Point, buttons: u32| -> Result<(), String> {
-            for (dx, dy) in pointer::path(from, to, points) {
+            let from = match from {
+                Some(from) => from,
+                None => {
+                    // Home, then let the Dock the push into the bottom showed hide again.
+                    for (dx, dy) in pointer::home() {
+                        hid.pointer_motion(dx, dy, buttons).map_err(err)?;
+                        sleep(pointer::INTERVAL);
+                    }
+                    sleep(pointer::SETTLE);
+                    pointer::homed(points)
+                }
+            };
+            for (dx, dy) in pointer::path(Some(from), to, points) {
                 hid.pointer_motion(dx, dy, buttons).map_err(err)?;
                 sleep(pointer::INTERVAL);
             }
@@ -533,13 +573,14 @@ fn pointer_on(input: &mut Input, udid: &str, p: &Value) -> Result<Value, String>
         };
         glide(from, to, buttons)?;
         let mask = button.mask();
+        let left = |at: Point, buttons: u32| if buttons == 0 { Held::Nothing } else { Held::Down { at, buttons } };
         if let Some(end) = drag_to.map(in_points) {
             sleep(pointer::INTERVAL * 3);
             hid.pointer_button(button, true, buttons | mask).map_err(err)?;
             glide(Some(to), end, buttons | mask)?;
             sleep(pointer::INTERVAL * 3);
             hid.pointer_button(button, false, buttons).map_err(err)?;
-            return Ok((buttons != 0).then_some((end, buttons)));
+            return Ok(left(end, buttons));
         }
         match action {
             PointerAction::Move => {}
@@ -559,9 +600,15 @@ fn pointer_on(input: &mut Input, udid: &str, p: &Value) -> Result<Value, String>
                 hid.pointer_button(button, false, buttons).map_err(err)?;
             }
         }
-        Ok((buttons != 0).then_some((to, buttons)))
-    })?;
-    input.pointer_held = moved;
+        Ok(left(to, buttons))
+    });
+    match result {
+        Ok(next) => input.pointer.set(boot, next),
+        Err(e) => {
+            input.pointer.failed(boot, held, drag_to.is_some() || matches!(action, PointerAction::Click | PointerAction::Down));
+            return Err(e);
+        }
+    }
     Ok(Value::Null)
 }
 
