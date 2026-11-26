@@ -29,6 +29,11 @@ simee rotary Watch 3                         # the Digital Crown (--delta for ra
 simee watch-gesture Watch double-tap         # or wrist-flick
 simee button TV select                       # the Siri Remote: select, menu, home, play-pause, arrows
 simee remote-swipe TV left                   # its touch surface
+simee swipe iPad 1032 2748 1032 1600 --duration 150 --edge bottom   # home (slower: the app switcher)
+simee swipe iPad 1960 4 1960 1200 --edge top # Control Center (top right), Notification Center (top left)
+simee pointer iPad 500 520                   # the iPad's pointer: hover there (pixels)
+simee pointer iPad 500 520 click             # or click; --to X2 Y2 drags
+simee stylus iPad 400 1300 --to 1400 1700    # an Apple Pencil stroke (or X Y [tap|down|move|up])
 ```
 
 `--form-factor` is checked against the device type (an iPhone is not a tablet). CarPlay is an
@@ -45,13 +50,14 @@ emu -list-images -tag android-wear            # other image families: android-tv
 simee create Pixel   --platform android --system-image "system-images;android-36;google_apis;arm64-v8a"
 simee create Tablet  --platform android --system-image "system-images;android-36;google_apis;arm64-v8a" --form-factor tablet
 simee create Fold    --platform android --system-image "system-images;android-36;google_apis;arm64-v8a" --form-factor foldable
+simee create Duo     --platform android --system-image "system-images;android-36;google_apis;arm64-v8a" --device surface_duo
 simee create Wear    --platform android --system-image "system-images;android-34;android-wear;arm64-v8a"
 simee create TV      --platform android --system-image "system-images;android-34;google-tv;arm64-v8a"
 simee create Car     --platform android --system-image "system-images;android-34-ext9;android-automotive;arm64-v8a"
 simee create XR      --platform android --system-image "system-images;android-34;google-xr;arm64-v8a"
 simee boot Pixel                             # starts emu; waits for sys.boot_completed
 adb -s emulator-5554 shell                    # it is an ordinary emulator to every tool
-simee fold Fold half-opened                  # the hinge (foldables only)
+simee fold Fold fold                         # the outer screen; `unfold`, a posture or an angle
 simee rotary Wear 3                          # the rotary input (watches only)
 simee xr XR recenter                         # Android XR head pose, options, pointer
 simee vehicle Car gear drive                 # a vehicle HAL property (Automotive only)
@@ -84,10 +90,13 @@ simee shutdown|delete <device>
 
 `<device>` is a UDID (an Android device's is its AVD name), an exact name, or `booted`.
 iOS-only commands: `install|uninstall|launch|terminate|apps`, `open-url`, `appearance`, `privacy`,
-`memory-warning`, `erase`, `exec`, `carplay`, `watch-gesture`, `remote-swipe`; Android-only:
-`fold`, `console`, `xr`, `touchpad`, `vehicle`, `stylus` (a pen on the touch screen:
-`simee stylus <device> 400 300 hover`, `... down --pressure 200 --button`, `... 100 100 --to 900 600`
-for a stroke, `--eraser` for the eraser end). Using one
+`memory-warning`, `erase`, `exec`, `carplay`, `watch-gesture`, `remote-swipe`, `pointer`
+(and `swipe --edge`); Android-only:
+`fold`, `console`, `xr`, `touchpad`, `vehicle`. `stylus` works on both: a pen on the touch screen
+(`simee stylus <device> 400 300 hover`, `... down --pressure 200 --button`, `... 100 100 --to 900 600`
+for a stroke, `--eraser` for the eraser end); on an iPad it is the Apple Pencil, which takes taps,
+`down`/`move`/`up` and strokes but no hover, pressure, button or eraser (the simulator's touch
+screen has none). Using one
 on the other platform's device fails with the platforms it works on.
 
 

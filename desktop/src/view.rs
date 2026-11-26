@@ -224,7 +224,10 @@ fn screen(s: &State) -> El {
             });
         })
         // With the stylus on (Android tablets), the pointer over the screen is the pen hovering.
-        .on_layout(|s: &mut State, r: [f32; 4]| s.screen_view = (r[2], r[3]))
+        .on_layout(|s: &mut State, r: [f32; 4]| {
+            s.screen_view = (r[2], r[3]);
+            s.bezel.screen = r;
+        })
         .on_pointer_move_local(|s: &mut State, p: PointerEvent, _: &mut Tx| {
             if s.stylus && !p.pressing {
                 let (w, h) = s.screen_size();
@@ -245,7 +248,17 @@ fn screen(s: &State) -> El {
             }
             handled
         });
-    col().w_full().grow(1.0).min_h(0.0).center().child(device)
+    let stage = col().w_full().grow(1.0).min_h(0.0).center();
+    // A drag from just outside the screen comes in from its edge (`crate::bezel`).
+    let stage = match s.selected_info().and_then(crate::controls::bezel) {
+        Some(_) => stage
+            .key("device-bezel")
+            .padding(crate::bezel::BAND)
+            .on_layout(|s: &mut State, r: [f32; 4]| s.bezel.stage = r)
+            .on_drag(|s: &mut State, d: &mut Drag, _: &mut Tx| crate::bezel::on_drag(s, d)),
+        None => stage,
+    };
+    stage.child(device)
 }
 
 /// Corner radius, in points, for a screen of `width` points with this outline: a round watch is

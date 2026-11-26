@@ -9,9 +9,11 @@ use sim_core::form_factor::FormFactor;
 #[cfg(target_os = "macos")]
 use sim_core::frame::{Frame, encode_png};
 use sim_core::geometry::Point;
-use sim_core::gesture::{self, Phase, Sample};
+use sim_core::gesture::{self, Phase, Sample, ScreenEdge};
 use sim_core::hid::{Button, CROWN_UNITS_PER_TICK, Orientation};
+use sim_core::indigo::PointerButton;
 use sim_core::platform::Platform;
+use sim_core::pointer::PointerAction;
 use sim_core::{stylus, vhal};
 
 pub fn str_param<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
@@ -160,6 +162,84 @@ pub fn remote_swipe_samples(p: &Value) -> Result<Vec<Sample>, String> {
     Ok(gesture::swipe(from, to, duration, Duration::from_millis(17), false))
 }
 
+/// `swipe`'s and `touch`'s optional `edge` (iOS): the screen edge the touch comes in from.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn opt_edge(p: &Value) -> Result<Option<ScreenEdge>, String> {
+    str_param(p, "edge").map(|v| ScreenEdge::parse(v).ok_or_else(|| format!("unknown edge `{v}` ({})", ScreenEdge::NAMES))).transpose()
+}
+
+/// `stylus`'s samples on an iPad (the Apple Pencil), in pixels: a stroke from x, y to to_x, to_y
+/// over duration_ms (300 by default), else one phase at x, y (`tap` by default: down, then up
+/// 60 ms later). Hover, pressure, the barrel button and the eraser, which Android's stylus takes,
+/// are refused with the reason: the simulator's touch screen has none of them.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn pencil_samples(p: &Value) -> Result<Vec<Sample>, String> {
+    const NONE: &str = "the simulator's touch screen reports only the Apple Pencil's position (docs/form-factors.md)";
+    if p.get("pressure").is_some_and(|v| !v.is_null()) {
+        return Err(format!("an iPad's stylus has no `pressure`: {NONE}"));
+    }
+    for key in ["button", "eraser"] {
+        if opt_bool(p, key)? == Some(true) {
+            return Err(format!("an iPad's stylus has no `{key}`: {NONE}"));
+        }
+    }
+    let at = Point::new(need_f64(p, "x")?, need_f64(p, "y")?);
+    let to = (p.get("to_x").and_then(Value::as_f64), p.get("to_y").and_then(Value::as_f64));
+    match to {
+        (Some(tx), Some(ty)) => {
+            let duration = Duration::from_millis(opt_u64(p, "duration_ms").unwrap_or(300));
+            Ok(gesture::swipe(at, Point::new(tx, ty), duration, Duration::from_millis(17), false))
+        }
+        (None, None) => {
+            let phase = match str_param(p, "phase").unwrap_or("tap") {
+                "tap" => return Ok(gesture::tap(at, Duration::from_millis(opt_u64(p, "hold_ms").unwrap_or(60)))),
+                "down" => Phase::Down,
+                "move" => Phase::Move,
+                "up" => Phase::Up,
+                phase @ ("hover" | "leave") => {
+                    return Err(format!("an iPad's stylus can't `{phase}` (it takes tap, down, move, up): {NONE}"));
+                }
+                other => return Err(format!("unknown phase `{other}` (tap, down, move, up)")),
+            };
+            Ok(vec![Sample { point: at, phase, delay: Duration::ZERO }])
+        }
+        _ => Err("a stroke needs both `to_x` and `to_y`".into()),
+    }
+}
+
+/// What a `pointer` call asks for, in pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointerRequest {
+    pub at: Point,
+    /// What to do at `at` (`move` by default).
+    pub action: PointerAction,
+    pub button: PointerButton,
+    /// How long a click holds the button.
+    pub hold: Duration,
+    /// A drag: press at `at`, move here holding the button, release.
+    pub drag_to: Option<Point>,
+}
+
+/// `pointer`'s request: x, y, then an `action` there (`move` by default) or a drag to to_x, to_y;
+/// the button (`primary` by default) and how long a click holds it (80 ms by default).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn pointer_request(p: &Value) -> Result<PointerRequest, String> {
+    let at = Point::new(need_f64(p, "x")?, need_f64(p, "y")?);
+    let drag_to = match (p.get("to_x").and_then(Value::as_f64), p.get("to_y").and_then(Value::as_f64)) {
+        (Some(x), Some(y)) => Some(Point::new(x, y)),
+        (None, None) => None,
+        _ => return Err("a drag needs both `to_x` and `to_y`".into()),
+    };
+    let action = match (str_param(p, "action"), drag_to) {
+        (Some(a), Some(_)) => return Err(format!("a drag (`to_x`, `to_y`) takes no `action` (got `{a}`)")),
+        (a, _) => a.unwrap_or("move"),
+    };
+    let action = PointerAction::parse(action).ok_or_else(|| format!("unknown action `{action}` ({})", PointerAction::NAMES))?;
+    let button = str_param(p, "button").unwrap_or("primary");
+    let button = PointerButton::parse(button).ok_or_else(|| format!("unknown button `{button}` ({})", PointerButton::NAMES))?;
+    Ok(PointerRequest { at, action, button, hold: Duration::from_millis(opt_u64(p, "hold_ms").unwrap_or(80)), drag_to })
+}
+
 /// `rotary`'s turn on an Apple Watch, in Digital Crown units: `delta` as given, else `ticks` detents.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn crown_delta(p: &Value) -> Result<f64, String> {
@@ -285,6 +365,57 @@ mod tests {
         assert_eq!(crown_delta(&json!({"ticks": -3})), Ok(-3.0 * CROWN_UNITS_PER_TICK));
         assert_eq!(crown_delta(&json!({"delta": 12.5, "ticks": 1})), Ok(12.5));
         assert!(crown_delta(&json!({})).is_err());
+    }
+
+    #[test]
+    fn ipad_input_parameters() {
+        assert_eq!(opt_edge(&json!({})), Ok(None));
+        assert_eq!(opt_edge(&json!({"edge": "bottom"})), Ok(Some(ScreenEdge::Bottom)));
+        assert!(opt_edge(&json!({"edge": "bezel"})).expect_err("bad").contains("top, bottom, left, right"));
+
+        let phases = |p: Value| pencil_samples(&p).map(|s| s.iter().map(|s| s.phase).collect::<Vec<_>>());
+        assert_eq!(phases(json!({"x": 1, "y": 2})), Ok(vec![Phase::Down, Phase::Up]), "a tap by default");
+        assert_eq!(phases(json!({"x": 1, "y": 2, "phase": "move"})), Ok(vec![Phase::Move]));
+        let stroke = pencil_samples(&json!({"x": 0, "y": 0, "to_x": 100, "to_y": 50, "duration_ms": 170})).expect("stroke");
+        assert_eq!(stroke.first().map(|s| s.phase), Some(Phase::Down));
+        assert_eq!(stroke.last().map(|s| (s.phase, s.point)), Some((Phase::Up, Point::new(100.0, 50.0))));
+        for phase in ["hover", "leave"] {
+            let e = pencil_samples(&json!({"x": 1, "y": 2, "phase": phase})).expect_err(phase);
+            assert!(e.contains("tap, down, move, up") && e.contains("only the Apple Pencil's position"), "{e}");
+        }
+        for (key, value) in [("pressure", json!(90)), ("button", json!(true)), ("eraser", json!(true))] {
+            let e = pencil_samples(&json!({"x": 1, "y": 2, key: value})).expect_err(key);
+            assert!(e.contains(&format!("no `{key}`")) && e.contains("simulator"), "{e}");
+        }
+        // What the CLI sends when none of them is asked for.
+        let cli = json!({"x": 1, "y": 2, "phase": "tap", "pressure": null, "button": false, "eraser": false});
+        assert_eq!(phases(cli), Ok(vec![Phase::Down, Phase::Up]));
+        assert!(pencil_samples(&json!({"x": 1, "y": 2, "button": "yes"})).is_err());
+        assert!(pencil_samples(&json!({"x": 1, "y": 2, "phase": "press"})).expect_err("unknown").contains("unknown phase"));
+        assert_eq!(pencil_samples(&json!({"x": 1, "y": 2, "to_x": 3})), Err("a stroke needs both `to_x` and `to_y`".into()));
+
+        let r = pointer_request(&json!({"x": 10, "y": 20})).expect("defaults");
+        assert_eq!(
+            r,
+            PointerRequest {
+                at: Point::new(10.0, 20.0),
+                action: PointerAction::Move,
+                button: PointerButton::Primary,
+                hold: Duration::from_millis(80),
+                drag_to: None
+            }
+        );
+        let r = pointer_request(&json!({"x": 1, "y": 2, "action": "click", "button": "secondary"})).expect("click");
+        assert_eq!((r.action, r.button), (PointerAction::Click, PointerButton::Secondary));
+        let drag = pointer_request(&json!({"x": 1, "y": 2, "to_x": 30, "to_y": 40})).expect("drag");
+        assert_eq!(drag.drag_to, Some(Point::new(30.0, 40.0)));
+        assert!(pointer_request(&json!({"x": 1, "y": 2, "to_x": 30})).expect_err("half").contains("both `to_x` and `to_y`"));
+        assert!(
+            pointer_request(&json!({"x": 1, "y": 2, "to_x": 3, "to_y": 4, "action": "click"})).expect_err("both").contains("no `action`")
+        );
+        assert!(pointer_request(&json!({"x": 1, "y": 2, "action": "drag"})).expect_err("drag").contains("move, click, down, up"));
+        assert!(pointer_request(&json!({"x": 1, "y": 2, "button": "middle"})).expect_err("middle").contains("primary, secondary"));
+        assert!(pointer_request(&json!({"x": 1})).is_err());
     }
 
     #[test]

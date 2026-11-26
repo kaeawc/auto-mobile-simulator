@@ -1,6 +1,8 @@
 //! HID input: touches, hardware buttons, keyboard keys, and each form factor's own inputs (the
-//! Siri Remote and its touch surface, the Digital Crown, watch gestures, the CarPlay screen).
+//! Siri Remote and its touch surface, the Digital Crown, watch gestures, the CarPlay screen, the
+//! iPad's pointer and Apple Pencil).
 
+use std::cell::Cell;
 use std::ffi::{CStr, c_void};
 use std::ptr;
 
@@ -10,8 +12,9 @@ use objc2::{msg_send, sel};
 use objc2_foundation::NSError;
 use sim_core::form_factor::FormFactor;
 use sim_core::geometry::Point;
-use sim_core::gesture::Phase;
+use sim_core::gesture::{Phase, ScreenEdge};
 use sim_core::hid::{Button, Direction, WatchGesture, crown_steps};
+use sim_core::indigo::{self, PointerButton};
 
 use crate::error::{Error, Result};
 use crate::rt::{self, CGPoint, Library, Obj};
@@ -35,6 +38,7 @@ type GestureFn = unsafe extern "C" fn(u32) -> Message;
 type TrackpadFn = unsafe extern "C" fn(CGPoint, u32) -> Message;
 type CreateCarPlayFn = unsafe extern "C" fn(bool) -> Message;
 type RemoveCarPlayFn = unsafe extern "C" fn() -> Message;
+type ServiceFn = unsafe extern "C" fn() -> Message;
 type SendFn = unsafe extern "C" fn(*const AnyObject, Sel, Message, bool, *const AnyObject, *const c_void);
 
 /// Touch digitizer target.
@@ -64,22 +68,32 @@ mod trackpad {
 
 unsafe extern "C" {
     fn malloc_size(ptr: *const c_void) -> usize;
+    #[link_name = "malloc"]
+    fn libc_malloc(size: usize) -> *mut c_void;
     #[link_name = "free"]
     fn libc_free(ptr: *mut c_void);
+    fn clock_gettime_nsec_np(clock: u32) -> u64;
 }
+
+/// `CLOCK_UPTIME_RAW`: the clock SimulatorKit stamps its messages with, in nanoseconds.
+const CLOCK_UPTIME_RAW: u32 = 8;
 
 /// A HID session with one booted device.
 pub struct Hid {
     client: Obj,
     kit: Library,
     form_factor: Option<FormFactor>,
+    /// The main screen's pixels per point (2 on an iPad): pointer motion is in points.
+    scale: f64,
     mouse: MouseFn,
     button: ButtonFn,
     keyboard: KeyboardFn,
+    /// The pointer (mouse) service's target, once this session has created it.
+    pointer: Cell<Option<u32>>,
 }
 
 impl Hid {
-    pub(crate) fn connect(device: &AnyObject, kit: Library, form_factor: Option<FormFactor>) -> Result<Self> {
+    pub(crate) fn connect(device: &AnyObject, kit: Library, form_factor: Option<FormFactor>, scale: f64) -> Result<Self> {
         let cls = rt::class(c"SimulatorKit.SimDeviceLegacyHIDClient")?;
         if cls.instance_method(sel!(initWithDevice:error:)).is_none()
             || cls.instance_method(sel!(sendWithMessage:freeWhenDone:completionQueue:completion:)).is_none()
@@ -100,7 +114,7 @@ impl Hid {
         // SAFETY: see above.
         let keyboard =
             unsafe { std::mem::transmute::<*mut c_void, KeyboardFn>(kit.symbol(c"IndigoHIDMessageForKeyboardArbitrary")?.as_ptr()) };
-        Ok(Self { client, kit, form_factor, mouse, button, keyboard })
+        Ok(Self { client, kit, form_factor, scale, mouse, button, keyboard, pointer: Cell::new(None) })
     }
 
     /// An optional message builder, looked up when first needed: a runtime without it fails that
@@ -124,7 +138,33 @@ impl Hid {
         Ok(())
     }
 
-    fn touch_target(&self, target: u32, at: Point, phase: Phase) -> Result<()> {
+    /// The main screen's pixels per point.
+    pub fn scale(&self) -> f64 {
+        self.scale
+    }
+
+    /// Sends a message simee wrote itself: copied into a malloc'd block the client frees.
+    fn send_bytes(&self, bytes: &[u8]) -> Result<()> {
+        // SAFETY: malloc has no preconditions; a null result is checked.
+        let block = unsafe { libc_malloc(bytes.len()) };
+        if block.is_null() {
+            return Err(Error::Service { op: "HID", message: "out of memory".into() });
+        }
+        // SAFETY: `block` holds `bytes.len()` writable bytes and doesn't overlap `bytes`.
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), block.cast::<u8>(), bytes.len()) };
+        self.send(block)
+    }
+
+    fn touch_target(&self, target: u32, at: Point, phase: Phase, edge: Option<ScreenEdge>) -> Result<()> {
+        let message = self.touch_message(target, at, phase, edge);
+        if message.is_null() && phase == Phase::Move {
+            return Ok(());
+        }
+        self.send(message)
+    }
+
+    /// The builder's one-finger touch message (null for a move it coalesced).
+    fn touch_message(&self, target: u32, at: Point, phase: Phase, edge: Option<ScreenEdge>) -> Message {
         // NSEventType: left mouse down / up / dragged.
         let event_type = match phase {
             Phase::Down => 1,
@@ -132,25 +172,88 @@ impl Hid {
             Phase::Move => 6,
         };
         let point = CGPoint { x: at.x.clamp(0.0, 1.0), y: at.y.clamp(0.0, 1.0) };
+        let edge = edge.map_or(0, ScreenEdge::apple_edge);
         // SAFETY: `point` outlives the call; a null second point means a single touch; size (1, 1)
-        // makes the builder treat the point as already normalized.
-        let message = unsafe { (self.mouse)(&point, ptr::null(), target, event_type, 0, 1.0, 1.0) };
-        if message.is_null() && phase == Phase::Move {
-            return Ok(());
-        }
-        self.send(message)
+        // makes the builder treat the point as already normalized; the edge is 0 (none) or 1-4.
+        unsafe { (self.mouse)(&point, ptr::null(), target, event_type, u64::from(edge), 1.0, 1.0) }
     }
 
     /// Sends one touch sample. `at` is normalized to `0..=1` on both axes, origin top-left.
     /// Moves sent less than ~16 ms apart are coalesced by the service and silently dropped.
     pub fn touch(&self, at: Point, phase: Phase) -> Result<()> {
-        self.touch_target(TARGET_TOUCH, at, phase)
+        self.touch_target(TARGET_TOUCH, at, phase, None)
+    }
+
+    /// One sample of a touch that comes in from a screen edge, as Simulator.app sends a drag that
+    /// starts on the bezel: what the system's edge gestures (home, Control Center, Notification
+    /// Center, the iPad's menu bar) take. Every sample of the contact carries the edge.
+    pub fn edge_touch(&self, at: Point, phase: Phase, edge: ScreenEdge) -> Result<()> {
+        self.touch_target(TARGET_TOUCH, at, phase, Some(edge))
+    }
+
+    /// One Apple Pencil sample on the screen (normalized like [`Hid::touch`]): a touch whose
+    /// transducer is a stylus, which apps see as a `UITouch` of type `.pencil`. The simulator's
+    /// touch screen reports no force, tilt or hover for it (`docs/form-factors.md`). iPad only.
+    pub fn pencil(&self, at: Point, phase: Phase) -> Result<()> {
+        self.require(FormFactor::Tablet, "Apple Pencil")?;
+        let message = self.touch_message(TARGET_TOUCH, at, phase, None);
+        if message.is_null() {
+            return if phase == Phase::Move { Ok(()) } else { self.send(message) };
+        }
+        if !message_bytes(message).is_some_and(indigo::make_pencil) {
+            // SAFETY: the message is malloc'd and wasn't handed to the client.
+            unsafe { libc_free(message) };
+            return Err(Error::Unavailable("IndigoHIDMessageForMouseNSEvent builds a touch this version doesn't know".into()));
+        }
+        self.send(message)
+    }
+
+    /// The pointer service's target, creating the service (a mouse) the first time: iPadOS then
+    /// shows its pointer and the Trackpad & Mouse settings. iPad only.
+    fn pointer_target(&self) -> Result<u32> {
+        if let Some(target) = self.pointer.get() {
+            return Ok(target);
+        }
+        self.require(FormFactor::Tablet, "the pointer")?;
+        // SAFETY: the builder takes nothing and returns a malloc'd message.
+        let create = unsafe { std::mem::transmute::<*mut c_void, ServiceFn>(self.builder(c"IndigoHIDMessageToCreateMouseService")?) };
+        // SAFETY: no arguments; returns a message or null.
+        let message = unsafe { create() };
+        if message.is_null() {
+            return Err(Error::Service { op: "HID", message: "pointer service builder returned nothing".into() });
+        }
+        let Some(target) = message_bytes(message).and_then(|bytes| indigo::service_target(bytes)) else {
+            // SAFETY: the message is malloc'd and wasn't handed to the client.
+            unsafe { libc_free(message) };
+            return Err(Error::Unavailable("IndigoHIDMessageToCreateMouseService builds a message this version doesn't know".into()));
+        };
+        self.send(message)?;
+        self.pointer.set(Some(target));
+        Ok(target)
+    }
+
+    /// Moves the pointer by `(dx, dy)` points with `buttons` (a mask of [`PointerButton::mask`])
+    /// held: relative motion, as a mouse reports it. iPad only.
+    pub fn pointer_motion(&self, dx: f64, dy: f64, buttons: u32) -> Result<()> {
+        let target = self.pointer_target()?;
+        // SAFETY: plain argument; the clock always exists.
+        let now = unsafe { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) };
+        self.send_bytes(&indigo::pointer_motion(dx, dy, buttons, target, now))
+    }
+
+    /// Presses or releases a pointer button where the pointer is; `buttons` is the mask of the
+    /// buttons held after the change. iPad only.
+    pub fn pointer_button(&self, button: PointerButton, pressed: bool, buttons: u32) -> Result<()> {
+        let target = self.pointer_target()?;
+        // SAFETY: plain argument; the clock always exists.
+        let now = unsafe { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) };
+        self.send_bytes(&indigo::pointer_button(button, pressed, buttons, target, now))
     }
 
     /// One touch sample on the CarPlay screen (normalized like [`Hid::touch`]). The CarPlay HID
     /// service must exist first ([`Hid::carplay_service`]).
     pub fn carplay_touch(&self, at: Point, phase: Phase) -> Result<()> {
-        self.touch_target(TARGET_CARPLAY, at, phase)
+        self.touch_target(TARGET_CARPLAY, at, phase, None)
     }
 
     /// Creates (or removes) the guest's CarPlay HID service, which the CarPlay screen's touches go
@@ -251,6 +354,30 @@ impl Hid {
 
 /// Turns the builder's "moved" contact into the phase wanted, after checking the message has the
 /// layout the fields are patched for (else [`Error::Unavailable`], never a blind write).
+/// The bytes a SimulatorKit builder wrote in `message`: its header and the events the header
+/// counts, never the block's slack past them (which malloc leaves uninitialized). `None` for a
+/// block too short for its header, or one whose header has a layout [`indigo::message_len`]
+/// doesn't know. The slice is valid until the message is sent or freed.
+fn message_bytes<'a>(message: Message) -> Option<&'a mut [u8]> {
+    let base = message.cast::<u8>();
+    // SAFETY: `message` is a live block from malloc (a builder's `calloc`); `malloc_size` reports
+    // its usable size.
+    let size = unsafe { malloc_size(message) };
+    if size < indigo::HEADER_SIZE {
+        return None;
+    }
+    let mut header = [0u8; indigo::HEADER_SIZE];
+    // SAFETY: the block has at least HEADER_SIZE bytes (checked above), and they're initialized:
+    // the builders `calloc` the header and their events together (0xc0 bytes for one event, 0x160
+    // for two, 0x200 for three, in Xcode 26.6's SimulatorKit). `header` is a separate local array.
+    unsafe { ptr::copy_nonoverlapping(base, header.as_mut_ptr(), indigo::HEADER_SIZE) };
+    let len = indigo::message_len(&header).filter(|&len| len <= size)?;
+    // SAFETY: `len` bytes lie inside the block (`len <= size`) and are the header and the events it
+    // counts, all of them zeroed by `calloc` and then written by the builder; the block is ours until
+    // sent, and nothing else reads or writes it while the slice lives.
+    Some(unsafe { std::slice::from_raw_parts_mut(base, len) })
+}
+
 fn patch_trackpad(message: Message, phase: Phase) -> Result<()> {
     use trackpad::*;
     let base = message.cast::<u8>();

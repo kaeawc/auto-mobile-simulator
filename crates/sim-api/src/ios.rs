@@ -11,16 +11,19 @@ use serde_json::{Value, json};
 use sim_core::debug;
 use sim_core::device::{DeviceState, privacy_service};
 use sim_core::form_factor::FormFactor;
-use sim_core::geometry::Size;
-use sim_core::gesture::Sample;
+use sim_core::geometry::{Point, Size};
+use sim_core::gesture::{Sample, ScreenEdge};
 use sim_core::hid::{KEY_LEFT_SHIFT, keystroke};
+use sim_core::indigo::PointerButton;
+use sim_core::pointer::{self, Held, HeldPointer, PointerAction};
 use sim_core::reuse::{BootKey, Reuse};
 use sim_core::worker::Workers;
 use sim_coresim::{Appearance, Context, Device, Direction, Display, Hid, Orientation, StateWatch, StatusBar, WatchGesture};
 
 use crate::params::{
-    button, crown_delta, err, need_bool, need_f64, need_str, on_carplay, opt_bool, opt_form_factor, opt_orientation, opt_u64, pairs,
-    remote_swipe_samples, screenshot_result, str_param, strings, swipe_samples, tap_samples, touch_sample,
+    PointerRequest, button, crown_delta, err, need_bool, need_f64, need_str, on_carplay, opt_bool, opt_edge, opt_form_factor,
+    opt_orientation, opt_u64, pairs, pencil_samples, pointer_request, remote_swipe_samples, screenshot_result, str_param, strings,
+    swipe_samples, tap_samples, touch_sample,
 };
 
 /// Shaping proxies, one per device, owned by this (long-running) process.
@@ -254,7 +257,8 @@ impl Session {
 }
 
 /// The methods that send input, each run on its device's input worker.
-const INPUT_METHODS: &[&str] = &["tap", "swipe", "touch", "rotary", "watch_gesture", "remote_swipe", "button", "type", "key"];
+const INPUT_METHODS: &[&str] =
+    &["tap", "swipe", "touch", "rotary", "watch_gesture", "remote_swipe", "button", "type", "key", "pointer", "stylus"];
 
 /// One input worker per device (by UDID), shared by every API connection. A worker keeps its
 /// device's HID client and display between calls (the service's objects stay on the thread that
@@ -273,6 +277,9 @@ struct Input {
     watch: Option<StateWatch>,
     hid: Reuse<BootKey, Hid>,
     display: Reuse<BootKey, Display>,
+    /// The buttons `pointer` holds (and where the pointer is while it holds one) in this boot: the
+    /// moves of a drag start there instead of being homed.
+    pointer: HeldPointer,
 }
 
 impl Input {
@@ -281,6 +288,18 @@ impl Input {
     /// failure; a device whose boots can't be told apart connects on every call, as before.
     fn run<R>(&mut self, udid: &str, screen: bool, send: impl FnOnce(&Hid, Option<Size>) -> Result<R, String>) -> Result<R, String> {
         let result = self.try_run(udid, screen, send);
+        if result.is_err() {
+            self.device = None;
+            self.watch = None;
+        }
+        result
+    }
+
+    /// The key of the device's current boot (none when its boots can't be told apart); the device
+    /// is dropped on failure, as in [`Input::run`].
+    fn boot(&mut self, udid: &str) -> Result<Option<BootKey>, String> {
+        let Self { ctx, device, changes, watch, .. } = self;
+        let result = connect(ctx, device, changes, watch, udid).map(|(_, key)| key);
         if result.is_err() {
             self.device = None;
             self.watch = None;
@@ -306,7 +325,7 @@ impl Input {
     }
 
     fn try_run<R>(&mut self, udid: &str, screen: bool, send: impl FnOnce(&Hid, Option<Size>) -> Result<R, String>) -> Result<R, String> {
-        let Self { ctx, device, changes, watch, hid, display } = self;
+        let Self { ctx, device, changes, watch, hid, display, .. } = self;
         let (device, key) = connect(ctx, device, changes, watch, udid)?;
         let size = if screen {
             let (w, h) = display.with(key, || device.display().map_err(err), |d| d.size().map_err(err))?;
@@ -404,12 +423,24 @@ fn input(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
 fn input_method(input: &mut Input, udid: &str, method: &str, p: &Value) -> Result<Value, String> {
     let null = |r: Result<(), String>| r.map(|()| Value::Null);
     match method {
-        "tap" => play_on(input, udid, p, &tap_samples(p)?),
-        "swipe" => play_on(input, udid, p, &swipe_samples(p)?),
+        "tap" => play_on(input, udid, p, &tap_samples(p)?, None),
+        "swipe" => play_on(input, udid, p, &swipe_samples(p)?, opt_edge(p)?),
         "touch" => {
             let (at, phase) = touch_sample(p)?;
-            play_on(input, udid, p, &[Sample { point: at, phase, delay: Duration::ZERO }])
+            play_on(input, udid, p, &[Sample { point: at, phase, delay: Duration::ZERO }], opt_edge(p)?)
         }
+        "stylus" => {
+            let samples = pencil_samples(p)?;
+            null(input.run(udid, true, |hid, screen| {
+                let screen = screen.ok_or("no screen size")?;
+                for s in &samples {
+                    sleep(s.delay);
+                    hid.pencil(screen.normalize(s.point), s.phase).map_err(err)?;
+                }
+                Ok(())
+            }))
+        }
+        "pointer" => pointer_on(input, udid, p),
         "rotary" => {
             let delta = crown_delta(p)?;
             input.run(udid, false, |hid, _| hid.crown(delta).map_err(err)).map(|()| json!({"delta": delta}))
@@ -459,19 +490,28 @@ fn carplay_screen() -> Size {
     Size::new(f64::from(sim_core::carplay::WIDTH), f64::from(sim_core::carplay::HEIGHT))
 }
 
-fn play(hid: &Hid, screen: Size, samples: &[Sample]) -> Result<(), String> {
+fn play(hid: &Hid, screen: Size, samples: &[Sample], edge: Option<ScreenEdge>) -> Result<(), String> {
     for s in samples {
         sleep(s.delay);
-        hid.touch(screen.normalize(s.point), s.phase).map_err(err)?;
+        let at = screen.normalize(s.point);
+        match edge {
+            Some(edge) => hid.edge_touch(at, s.phase, edge),
+            None => hid.touch(at, s.phase),
+        }
+        .map_err(err)?;
     }
     Ok(())
 }
 
-/// Plays touch samples on the device's screen, or its CarPlay screen (`display: "carplay"`).
-fn play_on(input: &mut Input, udid: &str, p: &Value, samples: &[Sample]) -> Result<Value, String> {
+/// Plays touch samples on the device's screen, or its CarPlay screen (`display: "carplay"`); with
+/// an `edge`, as a touch that comes in from that edge of the device's screen.
+fn play_on(input: &mut Input, udid: &str, p: &Value, samples: &[Sample], edge: Option<ScreenEdge>) -> Result<Value, String> {
     let carplay = on_carplay(p)?;
+    if carplay && edge.is_some() {
+        return Err("`edge` is for the device's own screen, not CarPlay's".into());
+    }
     let played = input.run(udid, !carplay, |hid, screen| match screen {
-        Some(screen) => play(hid, screen, samples),
+        Some(screen) => play(hid, screen, samples, edge),
         None => {
             for s in samples {
                 sleep(s.delay);
@@ -481,6 +521,95 @@ fn play_on(input: &mut Input, udid: &str, p: &Value, samples: &[Sample]) -> Resu
         }
     });
     played.map(|()| Value::Null)
+}
+
+/// `pointer`: brings the iPad's pointer to a point (pixels) and hovers, clicks, presses or releases
+/// a button there, or drags from it to another. The pointer only moves relatively, so it is homed
+/// against the screen's edges first (`sim_core::pointer`), unless a button is held from an earlier
+/// call on this server in this boot (`down`), which moves on from there. A `down` that no later
+/// call could see (an in-process run), an `up` with nothing held, and a `move` or `up` after a
+/// failed call lost what was held are refused ([`pointer::check`]).
+fn pointer_on(input: &mut Input, udid: &str, p: &Value) -> Result<Value, String> {
+    let PointerRequest { at, action, button, hold, drag_to } = pointer_request(p)?;
+    let boot = input.boot(udid)?;
+    let held = input.pointer.get(boot);
+    pointer::check(action, drag_to.is_some(), held, crate::serving())?;
+    let result = input.run(udid, true, |hid, screen| {
+        let screen = screen.ok_or("no screen size")?;
+        let scale = if hid.scale() > 0.0 { hid.scale() } else { 1.0 };
+        let points = Size::new(screen.width / scale, screen.height / scale);
+        let in_points = |p: Point| Point::new(p.x.clamp(0.0, screen.width) / scale, p.y.clamp(0.0, screen.height) / scale);
+        let to = in_points(at);
+        let (from, mut buttons) = match held {
+            Held::Down { at, buttons } => (Some(at), buttons),
+            Held::Nothing => (None, 0),
+            Held::Lost => {
+                // Let go of whatever the guest may hold, where the pointer is, before homing: a
+                // held button would drag along the edges.
+                for b in [PointerButton::Primary, PointerButton::Secondary] {
+                    hid.pointer_button(b, false, 0).map_err(err)?;
+                }
+                (None, 0)
+            }
+        };
+        let glide = |from: Option<Point>, to: Point, buttons: u32| -> Result<(), String> {
+            let from = match from {
+                Some(from) => from,
+                None => {
+                    // Home, then let the Dock the push into the bottom showed hide again.
+                    for (dx, dy) in pointer::home() {
+                        hid.pointer_motion(dx, dy, buttons).map_err(err)?;
+                        sleep(pointer::INTERVAL);
+                    }
+                    sleep(pointer::SETTLE);
+                    pointer::homed(points)
+                }
+            };
+            for (dx, dy) in pointer::path(Some(from), to, points) {
+                hid.pointer_motion(dx, dy, buttons).map_err(err)?;
+                sleep(pointer::INTERVAL);
+            }
+            Ok(())
+        };
+        glide(from, to, buttons)?;
+        let mask = button.mask();
+        let left = |at: Point, buttons: u32| if buttons == 0 { Held::Nothing } else { Held::Down { at, buttons } };
+        if let Some(end) = drag_to.map(in_points) {
+            sleep(pointer::INTERVAL * 3);
+            hid.pointer_button(button, true, buttons | mask).map_err(err)?;
+            glide(Some(to), end, buttons | mask)?;
+            sleep(pointer::INTERVAL * 3);
+            hid.pointer_button(button, false, buttons).map_err(err)?;
+            return Ok(left(end, buttons));
+        }
+        match action {
+            PointerAction::Move => {}
+            PointerAction::Click | PointerAction::Down => {
+                // Let the last move land: a press in the same frame can be lost.
+                sleep(pointer::INTERVAL * 3);
+                buttons |= mask;
+                hid.pointer_button(button, true, buttons).map_err(err)?;
+                if action == PointerAction::Click {
+                    sleep(hold);
+                    buttons &= !mask;
+                    hid.pointer_button(button, false, buttons).map_err(err)?;
+                }
+            }
+            PointerAction::Up => {
+                buttons &= !mask;
+                hid.pointer_button(button, false, buttons).map_err(err)?;
+            }
+        }
+        Ok(left(to, buttons))
+    });
+    match result {
+        Ok(next) => input.pointer.set(boot, next),
+        Err(e) => {
+            input.pointer.failed(boot, held, drag_to.is_some() || matches!(action, PointerAction::Click | PointerAction::Down));
+            return Err(e);
+        }
+    }
+    Ok(Value::Null)
 }
 
 /// The orientation simee last set per device (UDID), so `rotate` without one turns 90° from there.

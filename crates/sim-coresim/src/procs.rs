@@ -161,11 +161,16 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    fn busy(ms: u64) {
-        let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    /// Spins until this process has used `secs` more CPU, so a loaded host (where wall time
+    /// buys less CPU) can't starve the measurement; gives up after 30 s of wall time.
+    fn busy_cpu(secs: f64) {
+        let target = cpu_s(libc::RUSAGE_SELF) + secs;
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut x = 0u64;
-        while std::time::Instant::now() < end {
-            x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(7));
+        while cpu_s(libc::RUSAGE_SELF) < target && std::time::Instant::now() < give_up {
+            for _ in 0..10_000 {
+                x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(7));
+            }
         }
     }
 
@@ -181,11 +186,11 @@ mod tests {
 
     #[test]
     fn own_usage_matches_getrusage() {
-        busy(200);
+        busy_cpu(0.2);
         let u = usage(std::process::id() as i32).expect("own usage");
         let rusage_s = cpu_s(libc::RUSAGE_SELF);
         let ours = u.cpu_ns as f64 / 1e9;
-        assert!(ours >= 0.15, "{ours} s after 200 ms busy");
+        assert!(ours >= 0.15, "{ours} s after 0.2 s of busy CPU");
         // Both count the same CPU in different units: within 20 % (other test threads run too).
         assert!((ours - rusage_s).abs() <= 0.2 * rusage_s.max(0.2), "libproc {ours} s, getrusage {rusage_s} s");
         assert!(u.background_ns <= u.cpu_ns);

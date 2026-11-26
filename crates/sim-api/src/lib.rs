@@ -145,9 +145,19 @@ pub fn serve_in_background_with(path: PathBuf, make: impl Fn() -> methods::Sessi
     Ok(())
 }
 
+/// Whether this process serves the API, and so outlives each call: state one call leaves for the
+/// next (a pointer button held by `pointer`'s `down`) only means something then.
+static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn serving() -> bool {
+    SERVING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn bind(path: &Path) -> std::io::Result<UnixListener> {
     // Fix this server's identity now, before its executable can be rebuilt under it.
     identity();
+    SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
     if path.exists() && UnixStream::connect(path).is_err() {
         std::fs::remove_file(path)?;
     }

@@ -79,9 +79,9 @@ pub fn for_device(d: &DeviceInfo) -> Vec<Control> {
                 }
                 FormFactor::Foldable => {
                     out.push(control("rotate-button", &icons::ROTATE, "Rotate", Action::Rotate));
-                    out.push(control("fold-closed", &icons::FOLD_CLOSED, "Fold closed", Action::Fold(Posture::Closed)));
+                    out.push(control("fold-closed", &icons::FOLD_CLOSED, "Fold", Action::Fold(Posture::Closed)));
                     out.push(control("fold-half", &icons::FOLD_HALF, "Half open", Action::Fold(Posture::HalfOpened)));
-                    out.push(control("fold-opened", &icons::FOLD_OPEN, "Open flat", Action::Fold(Posture::Opened)));
+                    out.push(control("fold-opened", &icons::FOLD_OPEN, "Unfold", Action::Fold(Posture::Opened)));
                 }
                 FormFactor::Watch => {
                     out.push(control("crown-up", &icons::CROWN_UP, "Rotary up", Action::Rotary(-1)));
@@ -108,6 +108,21 @@ pub fn for_device(d: &DeviceInfo) -> Vec<Control> {
     out.push(control("screenshot-button", &icons::CAMERA, "Screenshot", Action::Screenshot));
     out.push(control("shutdown-button", &icons::POWER, "Shut Down", Action::Shutdown));
     out
+}
+
+/// How a running device takes drags that start on its bezel (`crate::bezel`): an iPhone, iPad or
+/// Apple Watch as touches from that edge (home, the app switcher, Notification and Control
+/// Center); an Android phone, tablet, foldable or watch as touches that start on the edge (gesture
+/// navigation's back and home, a watch's dismiss). TVs, Vision Pro, XR headsets and cars have no
+/// edge gestures, so no bezel.
+pub fn bezel(d: &DeviceInfo) -> Option<crate::bezel::Mode> {
+    let form_factor = d.form_factor.unwrap_or(FormFactor::Phone);
+    let edges = matches!(form_factor, FormFactor::Phone | FormFactor::Tablet | FormFactor::Watch | FormFactor::Foldable);
+    match d.platform {
+        Platform::Ios if edges && form_factor != FormFactor::Foldable => Some(crate::bezel::Mode::Ios),
+        Platform::Android if edges => Some(crate::bezel::Mode::Android),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -204,5 +219,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn devices_with_edge_gestures_get_a_bezel() {
+        use crate::bezel::Mode;
+        let bezel = |p, f| bezel(&device(p, f));
+        for f in [FormFactor::Phone, FormFactor::Tablet, FormFactor::Watch] {
+            assert_eq!(bezel(Platform::Ios, f), Some(Mode::Ios), "{f:?}");
+        }
+        for f in [FormFactor::Phone, FormFactor::Tablet, FormFactor::Foldable, FormFactor::Watch] {
+            assert_eq!(bezel(Platform::Android, f), Some(Mode::Android), "{f:?}");
+        }
+        for (p, f) in [(Platform::Ios, FormFactor::Tv), (Platform::Ios, FormFactor::Vision), (Platform::Android, FormFactor::Tv)] {
+            assert_eq!(bezel(p, f), None, "{p:?} {f:?}");
+        }
+        assert_eq!(bezel(Platform::Android, FormFactor::Auto), None);
+        assert_eq!(bezel(Platform::Android, FormFactor::Vision), None);
     }
 }

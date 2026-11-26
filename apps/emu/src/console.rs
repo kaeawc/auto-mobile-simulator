@@ -29,8 +29,10 @@ pub struct ConsoleInfo {
     pub xr: Option<Arc<emu_vmm::pipe::xr::Xr>>,
     pub car: Option<Arc<emu_vmm::pipe::car::Car>>,
     /// What `network speed|delay` asked for (seeded by `-netspeed`/`-netdelay`). Reported by
-    /// `network status`; the guest's traffic isn't shaped by it yet.
+    /// `network status` and shared with the guest's NAT, which shapes its traffic by it.
     pub network: Arc<std::sync::Mutex<sim_core::network::Conditions>>,
+    /// A foldable's hinge (`fold`, `unfold`, `posture`).
+    pub fold: Option<Arc<crate::fold::Foldable>>,
 }
 
 /// Stock's reply to a command group without, or with an unknown, sub-command: the group's
@@ -131,6 +133,13 @@ fn sensor(info: &ConsoleInfo, words: &[&str]) -> String {
         ["set", name, values] => {
             let parsed: Result<Vec<f32>, _> = values.split(':').map(str::parse).collect();
             match parsed {
+                // A foldable's hinge moves its posture and screen too, as stock's does.
+                Ok(v) if *name == "hinge-angle0" && v.len() == 1 && info.fold.is_some() => {
+                    match info.fold.as_deref().map(|f| f.set_angle(v[0])) {
+                        Some(Err(e)) => format!("KO: {e}"),
+                        _ => "OK".into(),
+                    }
+                }
                 Ok(v) => {
                     if info.sensors.set(name, v) {
                         "OK".into()
@@ -457,6 +466,9 @@ const HELP: &[(&str, &str)] = &[
     ("geo", "Geo-location commands"),
     ("power", "power related commands"),
     ("rotate", "rotate the screen clockwise by 90 degrees"),
+    ("fold", "fold the device"),
+    ("unfold", "unfold the device"),
+    ("posture", "change posture of foldable device"),
     ("sms", "SMS related commands"),
     ("gsm", "GSM related commands"),
     ("network", "manage network settings"),
@@ -544,6 +556,10 @@ fn session(stream: TcpStream, info: &ConsoleInfo) -> std::io::Result<()> {
             (_, false) => "KO: unknown command, try 'help'".to_string(),
             ("kill", true) => {
                 out.write_all(b"OK: killing emulator, bye bye\r\n")?;
+                // While the guest still runs: a folded foldable's forced size goes with emu.
+                if let Some(fold) = &info.fold {
+                    fold.release();
+                }
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 emu_vmm::request_stop(&info.stop);
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -584,6 +600,8 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
         "xr" => xr(info, &words[1..]),
         "car" => car(info, &words[1..]),
         "network" => network(info, &words[1..]),
+        "fold" if words.get(1) == Some(&"status") => crate::fold::status(info.fold.as_deref()),
+        "fold" | "unfold" | "posture" => crate::fold::console(info.fold.as_deref(), words),
         // Stock: rotate the device 90° clockwise. Gravity in device coordinates turns the
         // other way, and the guest's auto-rotation follows the accelerometer.
         "rotate" => match info.sensors.get("acceleration").as_deref() {
@@ -751,12 +769,15 @@ mod tests {
     /// vehicle HAL when the image has one.
     fn console(form_factor: FormFactor) -> ConsoleInfo {
         let mask = sim_core::goldfish::sensor_mask(|_| None, form_factor, Some(34));
+        let sensors = Arc::new(emu_vmm::pipe::sensors::Sensors::new(mask));
+        let fold = (form_factor == FormFactor::Foldable)
+            .then(|| Arc::new(crate::fold::Foldable::new(sim_core::fold::pixel_fold().hinge, (2208, 1840), sensors.clone(), true)));
         ConsoleInfo {
             avd_name: "Test_AVD".into(),
             stop: Arc::default(),
             display: None,
             inputs: Arc::default(),
-            sensors: Arc::new(emu_vmm::pipe::sensors::Sensors::new(mask)),
+            sensors,
             clipboard: Arc::default(),
             fingerprint: Arc::default(),
             gps: Arc::default(),
@@ -765,6 +786,7 @@ mod tests {
             xr: (form_factor == FormFactor::Vision).then(Arc::default),
             car: (form_factor == FormFactor::Auto).then(Arc::default),
             network: Arc::default(),
+            fold,
         }
     }
 
@@ -783,7 +805,7 @@ mod tests {
 
     fn attach(info: &ConsoleInfo, with_mouse: bool, touch_screen: bool) -> Devices {
         let (touch, th) = if touch_screen {
-            let (t, h) = Input::new(Kind::Touch { width: 720, height: 1280, pen: true }, "touch");
+            let (t, h) = Input::new(Kind::Touch { width: 720, height: 1280, screen: true }, "touch");
             (Some(t), Some(h))
         } else {
             (None, None)
@@ -930,6 +952,26 @@ mod tests {
         assert_eq!(run(&fold, "sensor get hinge-angle0"), "hinge-angle0 = 90\r\nOK");
         assert_eq!(run(&fold, "sensor set hinge-angle0 90:1"), "KO: bad sensor 'hinge-angle0' or value count");
         assert!(!run(&console(FormFactor::Phone), "sensor status").contains("hinge"), "phones have no hinge");
+        assert_eq!(run(&fold, "sensor set hinge-angle0 270"), "KO: hinge angle 270 is outside 0-180");
+    }
+
+    #[test]
+    fn foldables_fold_unfold_and_change_posture_as_stock_does() {
+        let fold = console(FormFactor::Foldable);
+        assert_eq!(run(&fold, "fold"), "OK");
+        assert_eq!(run(&fold, "sensor get hinge-angle0"), "hinge-angle0 = 0\r\nOK");
+        assert!(run(&fold, "fold status").contains("folded: true\r\nvisible: 949x1840+629+0"));
+        assert_eq!(run(&fold, "posture 2"), "OK");
+        assert_eq!(run(&fold, "sensor get hinge-angle0"), "hinge-angle0 = 90\r\nOK");
+        assert_eq!(run(&fold, "sensor set hinge-angle0 10"), "OK");
+        assert!(run(&fold, "fold status").contains("posture: closed (1)\r\nfolded: true"), "the sensor folds it too");
+        assert_eq!(run(&fold, "unfold"), "OK");
+        assert!(run(&fold, "fold status").contains("folded: false"));
+        let phone = console(FormFactor::Phone);
+        for cmd in ["fold", "unfold", "posture 1", "fold status"] {
+            assert_eq!(run(&phone, cmd), "KO: Device is not foldable", "{cmd}");
+        }
+        assert!(run(&phone, "help").contains("posture"));
     }
 
     #[test]
@@ -963,7 +1005,9 @@ mod tests {
 
     #[test]
     fn pens_hover_touch_and_leave_on_the_screen() {
-        use emu_vmm::virtio::input::{ABS_MT_PRESSURE, ABS_MT_SLOT, ABS_MT_TOOL_TYPE, BTN_STYLUS, BTN_TOUCH, EV_ABS, EV_KEY, PEN_SLOT};
+        use emu_vmm::virtio::input::{
+            ABS_MT_POSITION_X, ABS_MT_PRESSURE, ABS_MT_SLOT, ABS_MT_TOOL_TYPE, BTN_STYLUS, BTN_TOUCH, EV_ABS, EV_KEY, PEN_SLOT,
+        };
         let info = console(FormFactor::Tablet);
         let devices = attach_inputs(&info, false);
         for line in ["pen 100 200", "pen 100 200 down pressure 200 button", "pen 120 200 move", "pen 120 200 up", "pen 120 200 leave"] {
@@ -972,13 +1016,15 @@ mod tests {
         let batches = devices.touch.expect("touch").take_queued();
         assert_eq!(batches.len(), 5);
         assert!(batches.iter().all(|b| b[0] == InputEvent::new(EV_ABS, ABS_MT_SLOT, PEN_SLOT)), "the pen's own slot");
-        assert!(batches[0].contains(&InputEvent::new(EV_ABS, ABS_MT_TOOL_TYPE, 1)) && !batches[0].iter().any(|e| e.code == BTN_TOUCH));
+        assert!(batches[0].contains(&InputEvent::new(EV_ABS, ABS_MT_TOOL_TYPE, 1)));
+        // Pixels and the console's pressure (of 255) on stock's axes (0..=32767, 0..=1024).
+        assert!(batches[0].contains(&InputEvent::new(EV_ABS, ABS_MT_POSITION_X, 4552)), "100 of 720: {:?}", batches[0]);
         assert!(
-            batches[1].contains(&InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 200))
+            batches[1].contains(&InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 803))
                 && batches[1].contains(&InputEvent::new(EV_KEY, BTN_STYLUS, 1))
         );
-        assert!(batches[1].contains(&InputEvent::new(EV_KEY, BTN_TOUCH, 1)));
-        assert!(batches[3].contains(&InputEvent::new(EV_KEY, BTN_TOUCH, 0)), "up lifts to hovering");
+        assert!(batches[3].contains(&InputEvent::new(EV_ABS, ABS_MT_PRESSURE, 0)), "up lifts to hovering");
+        assert!(batches.iter().flatten().all(|e| e.typ != EV_KEY || e.code != BTN_TOUCH), "contact is pressure alone");
         assert_eq!(run(&info, "pen 720 10"), "KO: (720, 10) is off the 720x1280 screen");
         assert_eq!(run(&info, "pen 1 2 press"), format!("KO: unknown word 'press' ({})", sim_core::stylus::USAGE));
     }
@@ -988,7 +1034,7 @@ mod tests {
         let info = console(FormFactor::Vision);
         let _devices = attach_inputs(&info, true);
         assert_eq!(run(&info, "touchpad 10 10"), "KO: this device has no touchpad (hw.touchpad0)");
-        let (pad, handle) = Input::new(Kind::Touch { width: 1542, height: 297, pen: false }, emu_vmm::virtio::input::TOUCHPAD_NAME);
+        let (pad, handle) = Input::new(Kind::Touch { width: 1542, height: 297, screen: false }, emu_vmm::virtio::input::TOUCHPAD_NAME);
         info.inputs.lock().expect("inputs").as_mut().expect("inputs").touchpad = Some(handle);
         for line in ["touchpad 100 150 down", "touchpad 900 150 move", "touchpad 900 150 up"] {
             assert_eq!(run(&info, line), "OK");
@@ -1018,8 +1064,11 @@ mod tests {
         assert_eq!(run(&info, "touch 10 20"), "OK");
         let batches = devices.touch.expect("touch").take_queued();
         assert_eq!(batches.len(), 2, "down then up");
-        assert!(batches[0].contains(&InputEvent::new(EV_KEY, emu_vmm::virtio::input::BTN_TOUCH, 1)));
-        assert!(batches[1].contains(&InputEvent::new(EV_KEY, emu_vmm::virtio::input::BTN_TOUCH, 0)));
+        use emu_vmm::virtio::input::{ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID, EV_ABS};
+        // Device pixels on stock's 0..=32767 axes: 10 of 720 and 20 of 1280.
+        assert!(batches[0].contains(&InputEvent::new(EV_ABS, ABS_MT_POSITION_X, 456)), "{:?}", batches[0]);
+        assert!(batches[0].contains(&InputEvent::new(EV_ABS, ABS_MT_POSITION_Y, 512)), "{:?}", batches[0]);
+        assert!(batches[1].contains(&InputEvent::new(EV_ABS, ABS_MT_TRACKING_ID, -1)));
     }
 
     /// Opens the guest end of a qemud pipe the way the guest's service does.
