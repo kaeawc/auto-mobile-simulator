@@ -170,15 +170,25 @@ without one fails that input with `Unavailable`, never a crash.
   the edge pixel is an ordinary touch: it scrolls or draws in the app and never goes home. From the
   bottom a fast swipe goes home and a slow one (or `--settle`) opens the app switcher; from the top
   left Notification Center, top right Control Center, top middle the iPadOS 26 menu bar. iPhones
-  take the same flag. `pointer` creates the guest's mouse service
+  take the same flag. In the desktop window a drag that starts in the 24 pt band just outside the
+  screen (the bezel) is sent the same way, through the API's `touch` with `edge`, so home, the app
+  switcher, Notification Center and Control Center open from the window as in Simulator.app;
+  on an Android phone, tablet, foldable or watch it is an ordinary touch that starts on the edge
+  pixel (gesture navigation's back and home, a watch's dismiss), since Android's edge gestures have
+  no flag. TVs, Vision Pro, XR headsets and cars have no bezel. `pointer` creates the guest's mouse service
   (`IndigoHIDMessageToCreateMouseService`, whose message names the service's target) and sends it
   relative motion and button events (event types `0x11` and `0x7a41`, the layout SimulatorKit's
   `IndigoHIDMessageForPointerEventFromHIDEventRef` writes, built by `sim_core::indigo`); iPadOS
   then shows its pointer (in screenshots too), hover effects and Trackpad & Mouse settings. Motion
   is only relative, so each call homes the pointer against the left and bottom edges (never the top,
   where iPadOS opens Notification or Control Center, nor a corner, which the rounded screen stops
-  short) and moves in 10 pt steps: exact on iOS 26.5, within ~20 pt on 27.2, whose pointer
-  accelerates even slow motion. `pointer --to` drags in one call; a button held by `pointer … down`
+  short) and moves in 10 pt steps that slow to a stop, halving over the last 10 pt. iOS 27.2 carries
+  the pointer on past a run of reports by half its last report (10 pt steps landed 5–11 pt long,
+  median 7.9 pt over 12 targets), and pushes into an edge carry on into the next move; neither
+  `HIDMouseAcceleration` (1.0 on both) nor backboardd's pointer acceleration preference changes
+  that. Ending each run slowing down and pausing after the push into the bottom edge makes it
+  exact on both (median and maximum error 0.0 pt over the same 12 targets on 26.5 and 27.2, read
+  back by the probe app, 2026-11-26). `pointer --to` drags in one call; a button held by `pointer … down`
   keeps the position for the next calls on the same server (`simee serve`) in the same boot. A
   `down` that runs in its own process (no server) is refused, since nothing would release it, as
   are an `up` with nothing held and a `move` or `up` after a failed call lost the held button
@@ -229,7 +239,7 @@ What is modelled and labelled but not (or not verifiably) working end to end:
 | Apple Watch, Apple TV | The crown, gestures, Siri Remote buttons and touch surface use the messages Simulator.app sends (confirmed live by other projects on watchOS/tvOS 26.5 and 27), but not run by simee. The crown's units per tick are a calibration. From Xcode 27 the guest can switch input to `dtuhidd` (once `com.apple.coredevice.dtuhidd.active` is set, e.g. by Device Hub), after which legacy HID buttons and keys are dropped; simee doesn't detect that yet. |
 | Vision Pro | Gaze, pinch and the camera (look around, pan, orbit) go through Xcode's visionOS UI plugin in Simulator.app, whose messages aren't public; simee sends plain touches, which no source confirms visionOS honours. auto-mobile can't script visionOS input either (auto-mobile #19055). |
 | iPad stylus (Apple Pencil) | Pressure, tilt, hover and the barrel (double-tap, squeeze) aren't reachable: the guest's `SimulatorHID` makes every touch with `IOHIDEventCreateDigitizerFingerEvent` and copies only position, the transducer type, radii and quality fields, so altitude and azimuth stay π/2 and 0; `UITouch.force` and `maximumPossibleForce` stay 0 because the screen's digitizer has no force (the iPad device types say `SupportsForceTouch` false; a pencil digitizer service, which backboardd looks for, isn't one Indigo can create), and Simulator.app's own pressure message (`IndigoHIDMessageForPressureEvent`) changes nothing on an iPad either. A contact in range but not touching makes no hover. Simulator.app has no Pencil input at all; the barrel gestures come from the Pencil's own accessory, which no HID message models. The simulator runtimes ship no Notes app, so drawing was checked in a probe app. |
-| iPad pointer | Positions are open loop (the guest takes relative motion only): ~20 pt off on iOS 27.2; turning off pointer acceleration in the guest's settings might make them exact (not tried). Pointer coordinates assume portrait. No scroll wheel or trackpad gestures yet (the guest also takes scroll and dock-swipe events). |
+| iPad pointer | Positions are open loop (the guest takes relative motion only): exact on iOS 26.5 and 27.2, but a future release that moves the pointer differently again would put them off without simee noticing (simee doesn't read back where the pointer is). Pointer coordinates assume portrait. No scroll wheel or trackpad gestures yet (the guest also takes scroll and dock-swipe events). |
 | Android rotation (tablets, phones) | The guest rotates, but frames come from the panel as it lies, so after `rotate` simee's `screenshot`, the display stream and the desktop show the content turned 90° (`adb screencap` is upright); stock's window and screenshots follow its rotation. `tap`/`swipe` take panel pixels. A tablet's natural orientation is landscape, so it starts upright. |
 | Android tablet pointer | No mouse or trackpad is attached (stock attaches none to google_apis tablets either); hover and right-click aren't available except as the stylus's hover and barrel button. |
 | iOS rotation | Runtimes that report device motion can ignore the orientation event (idb switches to a vendor-defined HID message through `dtuhidd` there); not handled. |
