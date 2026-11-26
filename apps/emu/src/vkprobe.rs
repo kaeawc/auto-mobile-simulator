@@ -24,15 +24,48 @@ pub fn moltenvk_works(lib64: &Path) -> bool {
     {
         return v.trim() == "ok";
     }
-    let ok = std::env::current_exe()
+    probe_and_record(lib64, cache)
+}
+
+/// Runs `emu <flag> <lib64>` and reports whether it succeeded.
+fn child(flag: &str, lib64: &Path) -> bool {
+    std::env::current_exe()
         .ok()
-        .and_then(|exe| std::process::Command::new(exe).arg("-probe-vulkan").arg(lib64).stderr(std::process::Stdio::null()).output().ok())
-        .is_some_and(|o| o.status.success());
+        .and_then(|exe| std::process::Command::new(exe).arg(flag).arg(lib64).stderr(std::process::Stdio::null()).output().ok())
+        .is_some_and(|o| o.status.success())
+}
+
+/// Runs the probe child and records its verdict.
+fn probe_and_record(lib64: &Path, cache: Option<PathBuf>) -> bool {
+    let ok = child("-probe-vulkan", lib64);
     if let Some(c) = cache {
         let _ = c.parent().map(std::fs::create_dir_all);
         let _ = std::fs::write(c, if ok { "ok" } else { "fail" });
     }
     ok
+}
+
+/// Initializes the renderer in children the way boots do (`-provision-renderer` runs it), so the
+/// Metal shaders a boot's renderer init compiles (about 4 s cold, ANGLE's shader library most of
+/// it) are in emu's shader cache before the first boot: the probe's init (a GL backend, as API 31
+/// to 35 guests get), then, when MoltenVK works, an API 36 guest's (no GL, Vulkan composition),
+/// which compiles about another 0.9 s the probe's doesn't. Records the MoltenVK verdict too.
+/// Returns whether Vulkan came up and how long the children took.
+pub fn warm(lib64: &Path) -> (bool, std::time::Duration) {
+    let t = std::time::Instant::now();
+    let ok = probe_and_record(lib64, cache_file(lib64));
+    if ok {
+        child("-warm-renderer", lib64);
+    }
+    (ok, t.elapsed())
+}
+
+/// Child side of [`warm`]: the renderer's init exactly as an API 36 boot on MoltenVK makes it.
+pub fn warm_child(lib64: &Path) -> bool {
+    let Some(emulator_dir) = lib64.parent() else { return false };
+    emu_gfxstream::link_beside_exe(lib64);
+    emu_gfxstream::configure_environment(emulator_dir, emu_gfxstream::Icd::MoltenVk);
+    emu_vmm::warm_renderer(lib64.to_path_buf(), true, true).is_ok()
 }
 
 /// Child side: init the renderer on MoltenVK and report whether Vulkan came up.

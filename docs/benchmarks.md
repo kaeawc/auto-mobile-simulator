@@ -184,7 +184,11 @@ in [android.md](android.md#performance-notes).
 | Same change, vCPU0 guest entries to `sys.boot_completed`, first / warm boot, median | 338k / 59.7k | 249k / 41.4k | same runs (`vcpu0_runs`) |
 | Same change, emu CPU-seconds to `sys.boot_completed`, first / warm boot, median | 25.0 / 9.3 | 23.4 / 8.7 | same runs (`cpu_s`) |
 | Same change, launcher swipes a minute after boot: janky frames, median of 6 (2 boots × 3 runs) / emu CPU | 0.40% / 28% of a core | 0.20% / 25% | same AVD, host load 5 to 11, `scripts/android-jank.sh emulator-5600 <pid>` |
-| Renderer init with Metal's shader cache cold / warm (gfxstream's compositor pipelines through MoltenVK) | 4.5 and 5.1 s (2 of 20 launches) | 0.33 s (median of the other 18) | M3 Max, 2026-11-26, `emu -verbose` (`renderer initialized in`) |
+| Renderer init with Metal's shader cache cold / warm (mostly ANGLE's Metal shader library) | 4.5 and 5.1 s (2 of 20 launches) | 0.33 s (median of the other 18) | M3 Max, 2026-11-26, `emu -verbose` (`renderer initialized in`) |
+| Same init without a guest, as an API 36 boot makes it: cold (an empty cache) / warm, median of 3 | 4.36 s (4.31, 4.36, 4.39) | 0.08 s (70 to 96 ms, 6 runs) | M3 Max, 2026-11-26, host load 23 to 27, `cargo run --release -p emu-gfxstream --example renderer_caps -- -emu <lib64>`, each cold run under a new bundle id |
+| emu with its own Metal cache (bundle `dev.simee.emu`): repeat boots of one binary at one path, renderer init / launch to `sys.boot_completed`, median (runs) | 1.01 s (4.69, 1.01, 0.35) / 11.7 s (20.0, 11.7, 8.3): the shared cache missed in 2 of 3 boots | 0.34 s (0.33 to 0.36) / 7.8 s (7.8, 7.8, 7.8, 9.8), 4 boots (2 with the ring-yield experiment of android.md "Ring polling", since dropped) | API 36 phone 720×1280, 4 vCPUs, M3 Max, 2026-11-26, arms interleaved, both binaries warmed first; host load 8 to 33 (before) and 9 to 22 (after); `emu -verbose` (`renderer initialized in`), `adb shell getprop sys.boot_completed` polled every 0.25 s from launch |
+| Same boots, launcher swipes 30 s after `sys.boot_completed`: janky frames / emu CPU, median (runs). Not a difference: both arms swung run to run on a host other work was loading (the 1-minute load reached 114 during the run) | 3.1% (3.1, 1.1, 27.0) / 30% (28, 30, 55) | 1.1% (0, 20.4, 0, 2.3) / 34% (28, 38, 30, 38) | same runs, `scripts/android-jank.sh emulator-5600 <pid>` |
+| A fresh install path: the boot-shaped renderer init (`emu -warm-renderer <lib64>`, timed) without / after `emu -provision-renderer` from that path, 3 interleaved rounds | 5.42, 0.83, 0.73 s (cold once: later fresh copies were warm) | 0.78, 1.00, 0.78 s | M3 Max, 2026-11-26, host load 180 to 210 (every number slow), a new copy of one emu build per run |
 | Plain `fsync` for guest flushes: first-boot APEX decompression | over 270 s | about 70 s | M-series Mac |
 | Screenshot of a 2480×1740 screen (convert and encode) | 86 ms | 19 ms | `cargo run --release -p sim-core --example frame_bench` |
 | Display stream: emulator CPU per frame besides the readback, tablet / phone | 12.8 / 7.1 ms | 2.0 / 0 ms | 4-core Linux VM |
@@ -268,6 +272,10 @@ are what a fresh checkout, a CI cache miss or a Rune bump pays.
 ## Not yet measured
 
 Claims that would belong in the README once someone runs them:
+
+- First boot of a fresh install with and without `emu -provision-renderer`'s renderer warm-up,
+  launch to `sys.boot_completed` on a quiet host (only the renderer init itself is measured,
+  at load 180 to 210), and a third round of the repeat-boot A/B's after arm.
 
 - First boot with and without interrupt kicks at a 1-minute load under 8: three more runs per arm (two `none` runs and three `targeted` runs are published), and the `targeted` default below macOS 26 has no measurement on that macOS.
 - `simee screenshot` against `xcrun simctl io screenshot` on a quiet host (the run above had load

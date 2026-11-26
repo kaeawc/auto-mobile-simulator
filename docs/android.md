@@ -329,13 +329,14 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   `scripts/android-jank.sh`, 2026-11-26). Nearly all of emu's CPU is the guest running inside
   `hv_trap`; VMM code (MMIO handlers, `preadv`/`pwritev`, the wake bookkeeping) was under 2% of
   the samples. Ranked by what a user waits for:
-  1. *The renderer's Metal shader compiles.* gfxstream's compositor builds its Vulkan pipelines
-     at init, and MoltenVK compiles each through the Metal compiler service. With Metal's cache
-     warm the init takes 0.33 s; cold it took 4.5 and 5.1 s (2 of 20 launches that day: the
-     first launch of a new `emu` build, and one later), and the boot waits for it.
+  1. *The renderer's Metal shader compiles.* With Metal's cache warm the init takes 0.33 s;
+     cold it took 4.5 and 5.1 s (2 of 20 launches that day), and the boot waits for it. Mostly
+     ANGLE's own Metal shader library, and why it went cold: "Renderer init and Metal's shader
+     cache" below.
   2. *The renderer's ring polling.* gfxstream's render threads yield-spin on the
-     address-space-graphics ring (`RingStream::readRaw` → `cthread_yield`) for about a fifth of a
-     core while the guest draws.
+     address-space-graphics ring (`RingStream::readRaw` → `cthread_yield`) while the guest
+     draws. Measured again after the Vulkan-only renderer: about 1% of a core; see "Ring
+     polling" below.
   3. *Interrupt round trips on vCPU0*, now without the kicks (above): three exits per block
      request, 0.15 s of handler time per 20 s.
   4. *Teardown.* A stop takes 0.2–0.6 s; releasing the userdata disk took 0.3 s once (its
@@ -474,6 +475,52 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   `vsock_throughput_to_host` 5.9 → 6.4 GiB/s (its guest now honours credit),
   `adb_throughput_to_guest` (TCP client → guest, end to end) 498 → 870 MiB/s,
   `adb_throughput_to_host` 1382 → 1433 MiB/s.
+- **Renderer init and Metal's shader cache.** A cold renderer init is about 4.3 s of Metal shader
+  compiles and a warm one under 0.1 s (`cargo run --release -p emu-gfxstream --example
+  renderer_caps -- -emu <lib64>`, which inits as an API 36 boot does: cold 4.31, 4.36, 4.39 s,
+  warm 70 to 96 ms, M3 Max, 2026-11-26). `sample` of a cold init: the time is ANGLE's Metal
+  backend compiling its built-in shader library (`DisplayMtl::getDefaultShadersLib`, waited on
+  by the first context's `ProvokingVertexHelper`), which gfxstream sets up even without a GL
+  backend (`EmulationGl::initDispatchers` → the EGL display ANGLE provides); the compositor's
+  Vulkan pipelines through MoltenVK are the remaining ~0.9 s. Why it goes cold: Metal keeps its
+  cache per bundle identifier, in `$DARWIN_USER_CACHE_DIR/<bundle id>/com.apple.metal/`, and a
+  process without one (emu was one) uses the single cache under
+  `$DARWIN_USER_CACHE_DIR/com.apple.metal/` that every unbundled process of the user shares:
+  CLI tools, test binaries, every lane's emu. On this host that cache held 460 MB in 8 rotating
+  shards and rotated several times a day; a fixed `emu` binary that had initialized warm went
+  cold again within minutes (4.69 s and 1.01 s inits in 2 of 3 repeat boots of one binary that
+  had just initialized warm, and 2 of 3 launches of the probe binary in another 10-minute
+  window; [benchmarks](benchmarks.md#emulator-internals)). With its own cache, 4 of 4 such
+  boots initialized in 0.33 to 0.36 s and reached `sys.boot_completed` in a median 7.8 s instead
+  of 11.7 s. Entries also seem tied to the executable's location: the first launch of the same
+  binary copied or moved to a new directory was cold in 4 of 6 tries (3.86 to 5.42 s, then
+  warm), while touching, re-signing, symlinking or another cwd kept it warm; what else keys
+  them wasn't established. So `emu` now carries an `Info.plist`
+  (`__TEXT,__info_plist`, `apps/emu/build.rs`) naming bundle `dev.simee.emu`: its shaders sit in
+  a cache only emu writes (the renderer's init, guest shaders), every emu build and instance at
+  one path shares it, and other processes can't rotate it out. And `emu -provision-renderer`
+  (and `-provision`) end by initializing the renderer in two children, the probe's GL-backed
+  init and an API 36 boot's own (`emu_vmm::warm_renderer`), so the first boot of a fresh install
+  finds the cache warm (0.9 s for both when warm): a fresh copy's boot-shaped init took 0.78,
+  1.00 and 0.78 s after `-provision-renderer` from its path, against 5.42 s for the first fresh
+  copy without (`-warm-renderer` timed, host load 180 to 210, so slow throughout). Still cold
+  once, sometimes: the first launch from a new path without provisioning there, and, not yet seen, likely the first after a macOS update
+  (the cache's subdirectories look keyed by compiler and GPU: `32024`, `16777235_419`).
+  KosmicKrisp wasn't measured.
+- **Ring polling.** When its address-space-graphics ring is empty, `RingStream::readRaw` polls
+  it with `ring_buffer_yield()` (`sched_yield`) 30 times per round for 8 rounds, then marks the
+  ring as needing a notification and blocks until the guest pings (disassembly of the SDK's
+  37.2.13 renderer; the counts are immediates). No renderer flag, feature, `stream_renderer_init`
+  parameter or environment variable selects another wait. With the Vulkan-only renderer the
+  polling is small: in `sample` of the API 36 phone during launcher swipes, 43 and 51 of about
+  4,400 samples per thread were in `swtch_pri` (about 1% of a core) out of 30 to 45% for the
+  whole process. The renderer links with a flat namespace, so an executable can supply its own
+  `ring_buffer_yield()`; emu tried one that skips the system call for the first 256 calls of a
+  streak, and it changed neither emu's CPU during `scripts/android-jank.sh` swipes (30 and 38%
+  of a core with it, 28 and 38% without, one run on each of two boots per arm, host load 9 to
+  22) nor what `sample` showed (51 samples in `swtch_pri`, now under emu's function), since
+  most polling streaks run past the first episode's 240 calls. It was dropped: the renderer's internals would change for no
+  measured gain.
 - **Launch to first guest instruction.** Most images ship a gzip `kernel-ranchu` (an API 37
   kernel is 16 MiB that inflates to about 40 MiB). It used to be read whole, inflated into a
   `Vec` with miniz_oxide and copied into guest RAM on every launch. QEMU, and so the stock
