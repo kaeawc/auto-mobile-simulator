@@ -216,6 +216,7 @@ impl Instance {
             verbose: opts.verbose,
             display: display.clone(),
             vulkan_only: guest_egl() == "angle",
+            virtual_queue: virtual_queue(&guest_egl(), AngleImage::of(&self.avd)),
         })
     }
 
@@ -636,7 +637,7 @@ fn bootconfig(avd: &Avd, opts: &Opts, graphics: bool) -> BootConfig {
         // address-space graphics: with `emulation` GLES rides the virtio-gpu pipe stream,
         // whose blocking reads serialize all processes on one queue (boots took 14–28 s with
         // ANRs, against 5–8 s on ANGLE). EMU_GUEST_EGL=emulation restores it.
-        for (k, v) in guest_graphics(&guest_egl()) {
+        for (k, v) in guest_graphics(&guest_egl(), AngleImage::of(avd)) {
             bc.set(k, v);
         }
     }
@@ -703,7 +704,7 @@ fn legacy_cmdline(bc: &BootConfig, graphics: bool) -> String {
         out.push("qemu.gles=1".to_string());
     }
     for (k, v) in bc.entries() {
-        if v.contains(char::is_whitespace) || k == "androidboot.hardwareegl" {
+        if v.contains(char::is_whitespace) || k == "androidboot.hardwareegl" || ANGLE_UI_KEYS.contains(&k.as_str()) {
             continue;
         }
         let key = match k.as_str() {
@@ -728,23 +729,72 @@ fn guest_egl() -> String {
     std::env::var("EMU_GUEST_EGL").unwrap_or_else(|_| "angle".into())
 }
 
-/// The bootconfig entries for a guest GLES driver `egl`. Under ANGLE they are what stock 37.2
-/// gives a `GuestAngle` guest: the UI toolkit (HWUI) and SurfaceFlinger draw with Skia on the
-/// guest's Vulkan (`skiavk`, which needs the renderer's `VulkanVirtualQueue`), not Skia GL on
-/// ANGLE on that Vulkan, and ANGLE hides its non-conformant `exposeN*` extensions. Skia GL on
-/// ANGLE on MoltenVK leaves some apps' buffers fully transparent: Gboard's keyboard was a blank
-/// panel (docs/android.md, "Gboard's blank keyboard").
-fn guest_graphics(egl: &str) -> Vec<(&'static str, String)> {
-    let mut out = vec![("androidboot.hardwareegl", egl.to_string())];
-    if egl == "angle" {
-        out.extend([
-            ("androidboot.debug.hwui.renderer", "skiavk".to_string()),
-            ("androidboot.debug.renderengine.backend", "skiavkthreaded".to_string()),
-            ("androidboot.hardware.angle_feature_overrides_disabled", "exposeN*".to_string()),
-            ("androidboot.hardware.angle_feature_overrides_enabled", String::new()),
-        ]);
+/// What an image's `advancedFeatures.ini` says about drawing its UI when its GLES is ANGLE.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AngleImage {
+    /// `VulkanVirtualQueue` (the API 36 and newer images): its Vulkan driver takes a graphics
+    /// queue family with two queues, which HWUI on Vulkan asserts, and the image maps
+    /// RenderEngine's backend from bootconfig (API 35 hard-codes `skiaglthreaded`).
+    virtual_queue: bool,
+    /// `GuestAngle` (google-xr 34): the image asks for ANGLE itself.
+    guest_angle: bool,
+}
+
+impl AngleImage {
+    fn of(avd: &Avd) -> Self {
+        AngleImage {
+            virtual_queue: avd.image_feature("VulkanVirtualQueue") == Some(true),
+            guest_angle: avd.image_feature("GuestAngle") == Some(true),
+        }
     }
+}
+
+/// The bootconfig keys [`guest_graphics`] adds for ANGLE guests: what the UI draws with and the
+/// ANGLE features it hides. Images without bootconfig (the legacy command line) have no ANGLE.
+const ANGLE_UI_KEYS: [&str; 4] = [
+    "androidboot.debug.hwui.renderer",
+    "androidboot.debug.renderengine.backend",
+    "androidboot.hardware.angle_feature_overrides_disabled",
+    "androidboot.hardware.angle_feature_overrides_enabled",
+];
+
+/// The bootconfig entries for a guest GLES driver `egl` on `image`. Under ANGLE they are what
+/// stock 37.2 gives a `GuestAngle` guest on such an image (its `/proc/bootconfig` with
+/// `-feature GuestAngle` on API 36, and on google-xr 34, which enables it):
+/// - with `VulkanVirtualQueue`, the UI toolkit (HWUI) and SurfaceFlinger draw with Skia on the
+///   guest's Vulkan (`skiavk`, `skiavkthreaded`), not Skia GL on ANGLE on that Vulkan: Skia GL
+///   on ANGLE on MoltenVK leaves some apps' buffers fully transparent (Gboard's keyboard was a
+///   blank panel; docs/android.md, "Gboard's blank keyboard");
+/// - with `GuestAngle` alone, HWUI stays Skia GL (`skiagl`) and RenderEngine is the image's;
+/// - with either, ANGLE hides its non-conformant `exposeN*` extensions.
+///
+/// Images with neither (API 34 and 35 phones, Automotive) keep their own choice: emu runs them
+/// on ANGLE where stock wouldn't, and stock gives them no `GuestAngle` keys to copy. The GLES
+/// encoder (`EMU_GUEST_EGL=emulation`) gets none, as stock without `GuestAngle`.
+fn guest_graphics(egl: &str, image: AngleImage) -> Vec<(&'static str, String)> {
+    let mut out = vec![("androidboot.hardwareegl", egl.to_string())];
+    if egl != "angle" {
+        return out;
+    }
+    let [hwui, renderengine, overrides_disabled, overrides_enabled] = ANGLE_UI_KEYS;
+    if image.virtual_queue {
+        out.extend([(hwui, "skiavk".to_string()), (renderengine, "skiavkthreaded".to_string())]);
+    } else if image.guest_angle {
+        out.push((hwui, "skiagl".to_string()));
+    } else {
+        return out;
+    }
+    out.extend([(overrides_disabled, "exposeN*".to_string()), (overrides_enabled, String::new())]);
     out
+}
+
+/// Whether the renderer offers a graphics queue family with more than one queue
+/// (`VulkanVirtualQueue`, [`emu_vmm::GpuSpec::virtual_queue`]), which HWUI on Vulkan needs: only
+/// when the guest is on ANGLE (so [`guest_graphics`] gives it `skiavk`) and its image
+/// advertises the feature.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn virtual_queue(egl: &str, image: AngleImage) -> bool {
+    egl == "angle" && image.virtual_queue
 }
 
 /// What the stock host hands `qemu-props` at boot.
@@ -781,12 +831,12 @@ mod tests {
         let root = std::env::temp_dir().join(format!("emu-plan-{tag}-{}", std::process::id()));
         let sdk = root.join("sdk");
         let images: [(&str, &str, &str); 6] = [
-            ("android-36/google_apis/arm64-v8a", "ro.product.name=sdk_gphone64_arm64\n", "VirtioSndCard = on\n"),
+            ("android-36/google_apis/arm64-v8a", "ro.product.name=sdk_gphone64_arm64\n", "VirtioSndCard = on\nVulkanVirtualQueue = on\n"),
             ("android-36/android-wear-signed/arm64-v8a", "", "VirtioSndCard = on\n"),
             ("android-34/android-tv/arm64-v8a", "", "VirtioSndCard = on\n"),
             ("android-34-ext9/android-automotive/arm64-v8a", "ro.product.name=sdk_car_arm64\n", "VirtioSndCard = on\n"),
             ("android-34/google-xr/arm64-v8a", "", "GuestAngle = on\nVirtioDualModeMouse = on\n"),
-            ("android-36/ai-glasses/arm64-v8a", "", "VirtioSndCard = on\nXrStatusLed = on\n"),
+            ("android-36/ai-glasses/arm64-v8a", "", "VirtioSndCard = on\nXrStatusLed = on\nVulkanVirtualQueue = on\n"),
         ];
         for (dir, build_prop, features) in images {
             let d = sdk.join("system-images").join(dir);
@@ -870,32 +920,73 @@ mod tests {
             .set("androidboot.hardwareegl", "angle")
             .set("androidboot.qemu.adb.pubkey", "QAAAAB== user@host")
             .set("androidboot.vbmeta.size", "4352");
+        for (k, v) in guest_graphics("angle", AngleImage { virtual_queue: true, guest_angle: true }) {
+            bc.set(k, v);
+        }
         let line = legacy_cmdline(&bc, true);
+        // No ANGLE on these images: neither its driver nor what the UI draws with under it.
         assert_eq!(line, "android.qemud=1 qemu.encrypt=1 qemu.gles=1 qemu.gltransport=virtio-gpu-asg androidboot.vbmeta.size=4352");
         assert!(!legacy_cmdline(&bc, false).contains("qemu.gles"));
     }
 
     #[test]
-    fn guest_angle_draws_the_ui_with_vulkan_as_stock_does() {
-        let get = |egl: &str, k: &str| guest_graphics(egl).into_iter().find(|(key, _)| *key == k).map(|(_, v)| v);
-        assert_eq!(get("angle", "androidboot.hardwareegl").as_deref(), Some("angle"));
-        assert_eq!(get("angle", "androidboot.debug.hwui.renderer").as_deref(), Some("skiavk"));
-        assert_eq!(get("angle", "androidboot.debug.renderengine.backend").as_deref(), Some("skiavkthreaded"));
-        assert_eq!(get("angle", "androidboot.hardware.angle_feature_overrides_disabled").as_deref(), Some("exposeN*"));
-        // The GLES encoder (EMU_GUEST_EGL=emulation) keeps the image's own choice, as stock
-        // without GuestAngle does.
-        assert_eq!(guest_graphics("emulation"), vec![("androidboot.hardwareegl", "emulation".to_string())]);
+    fn guest_angle_draws_the_ui_with_vulkan_where_the_image_maps_it_as_stock_does() {
+        let vvq = AngleImage { virtual_queue: true, guest_angle: false };
+        let xr = AngleImage { virtual_queue: false, guest_angle: true };
+        let get = |egl: &str, image: AngleImage, k: &str| guest_graphics(egl, image).into_iter().find(|(key, _)| *key == k).map(|(_, v)| v);
+        // An API 36 image (VulkanVirtualQueue): stock's GuestAngle bootconfig on the same image.
+        assert_eq!(get("angle", vvq, "androidboot.hardwareegl").as_deref(), Some("angle"));
+        assert_eq!(get("angle", vvq, "androidboot.debug.hwui.renderer").as_deref(), Some("skiavk"));
+        assert_eq!(get("angle", vvq, "androidboot.debug.renderengine.backend").as_deref(), Some("skiavkthreaded"));
+        assert_eq!(get("angle", vvq, "androidboot.hardware.angle_feature_overrides_disabled").as_deref(), Some("exposeN*"));
+        assert_eq!(get("angle", vvq, "androidboot.hardware.angle_feature_overrides_enabled").as_deref(), Some(""));
+        assert!(virtual_queue("angle", vvq));
+        // google-xr 34 (GuestAngle, no VulkanVirtualQueue): stock keeps HWUI on Skia GL and
+        // leaves RenderEngine to the image.
+        assert_eq!(get("angle", xr, "androidboot.debug.hwui.renderer").as_deref(), Some("skiagl"));
+        assert_eq!(get("angle", xr, "androidboot.debug.renderengine.backend"), None);
+        assert_eq!(get("angle", xr, "androidboot.hardware.angle_feature_overrides_disabled").as_deref(), Some("exposeN*"));
+        assert!(!virtual_queue("angle", xr));
+        // API 34 and 35 phones and Automotive advertise neither: the image's own choice.
+        assert_eq!(guest_graphics("angle", AngleImage::default()), vec![("androidboot.hardwareegl", "angle".to_string())]);
+        assert!(!virtual_queue("angle", AngleImage::default()));
+        // The GLES encoder (EMU_GUEST_EGL=emulation) keeps the image's own choice and one
+        // queue, as stock without GuestAngle does.
+        for image in [vvq, xr, AngleImage::default()] {
+            assert_eq!(guest_graphics("emulation", image), vec![("androidboot.hardwareegl", "emulation".to_string())]);
+            assert!(!virtual_queue("emulation", image));
+        }
     }
 
     #[test]
     fn a_plan_with_a_renderer_tells_the_guest_its_graphics() {
         let s = sdk("graphics");
-        let avd = s.env.load("phone").expect("load");
-        let with = BootPlan::new(&avd, &Opts::default(), Some(PathBuf::from("/nonexistent/lib64")));
-        assert_eq!(with.bootconfig.get("androidboot.hardware.gltransport"), Some("virtio-gpu-asg"));
-        assert!(with.bootconfig.get("androidboot.hardwareegl").is_some());
+        add_image(&s, "v", 35, "AndroidbootProps2 = on\n");
+        let with =
+            |name: &str| BootPlan::new(&s.env.load(name).expect("load"), &Opts::default(), Some(PathBuf::from("/nonexistent/lib64")));
+        let (hwui, renderengine) = ("androidboot.debug.hwui.renderer", "androidboot.debug.renderengine.backend");
+        let phone = with("phone");
+        assert_eq!(phone.bootconfig.get("androidboot.hardware.gltransport"), Some("virtio-gpu-asg"));
+        assert!(phone.bootconfig.get("androidboot.hardwareegl").is_some());
+        if guest_egl() == "angle" {
+            // API 36 (VulkanVirtualQueue): Skia on Vulkan.
+            assert_eq!(phone.bootconfig.get(hwui), Some("skiavk"));
+            assert_eq!(phone.bootconfig.get(renderengine), Some("skiavkthreaded"));
+            assert_eq!(phone.bootconfig.get("androidboot.hardware.angle_feature_overrides_disabled"), Some("exposeN*"));
+            // google-xr 34 (GuestAngle): Skia GL, as stock gives it.
+            let headset = with("headset");
+            assert_eq!(headset.bootconfig.get(hwui), Some("skiagl"));
+            assert_eq!(headset.bootconfig.get(renderengine), None);
+        }
+        // API 34 and 35 images and Automotive advertise neither: none of the keys.
+        for name in ["v", "tv", "car"] {
+            let p = with(name);
+            for k in ANGLE_UI_KEYS {
+                assert_eq!(p.bootconfig.get(k), None, "{name}: {k}");
+            }
+        }
         let without = plan(&s, "phone");
-        assert_eq!(without.bootconfig.get("androidboot.debug.hwui.renderer"), None, "no renderer: the image's default");
+        assert_eq!(without.bootconfig.get(hwui), None, "no renderer: the image's default");
     }
 
     #[test]
