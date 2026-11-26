@@ -53,9 +53,21 @@ fn user_logcat_filter(opts: &Opts) -> &str {
 }
 
 /// Whether emu follows the guest's display rotation: on the form factors whose displays turn
-/// ([`sim_core::rotation::turns`]), from the lines the guest logs when it rotates.
+/// ([`sim_core::rotation::turns`]), from the lines the guest logs when it rotates, on images with
+/// a logcat console (bootconfig, API 31 and later). Images without one (API 29 and 30) aren't
+/// followed, and their logcat filter stays the user's: it goes through `qemu.cmdline`, which holds
+/// [`PROP_VALUE_MAX`] bytes, and the rotation tags would take the default past it (logcat then
+/// shows every tag). There `rotation` says it doesn't know ([`rotation_unknown`]).
 fn follows_rotation(avd: &Avd) -> bool {
-    sim_core::rotation::turns(avd.profile().kind.form_factor)
+    sim_core::rotation::turns(avd.profile().kind.form_factor) && takes_bootconfig(avd)
+}
+
+/// Whether the guest may turn its display without emu knowing: a display that turns on an image
+/// whose rotation emu doesn't follow ([`follows_rotation`]). Frames and touches stay in panel
+/// space there, and the console's `rotation` answers `unknown` rather than a turn it never read.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub fn rotation_unknown(avd: &Avd) -> bool {
+    sim_core::rotation::turns(avd.profile().kind.form_factor) && !follows_rotation(avd)
 }
 
 /// The guest's logcat filter for `goldfish-logcat` (`logcat -f /dev/hvc1 ${ro.boot.logcat}`):
@@ -398,72 +410,92 @@ const LOGCAT_SPOOL_DEPTH: usize = 1024;
 
 /// Where logcat's stream goes for this process: `-logcat-output`'s file (rotated), stdout with
 /// `-logcat` alone, and `watch`, the display that turns as the guest's log says it rotated
-/// ([`LogcatWatch`]); nowhere without either. Behind a spool either way.
+/// ([`rotation_watch`]); nowhere without either. The user's output is behind a spool, which
+/// drops output when its writer falls behind; the watch reads every chunk inline, before the
+/// spool's queue, on the thread that hands it the guest's log (the console worker), so it never
+/// misses a rotation line.
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 pub fn logcat_sink(
     opts: &Opts,
     watch: Option<std::sync::Arc<emu_vmm::display::FrameStore>>,
 ) -> std::io::Result<Option<emu_vmm::virtio::console::Spool>> {
+    use emu_vmm::virtio::console::Spool;
     let out: Option<Box<dyn std::io::Write + Send>> = match (&opts.logcat_output, &opts.logcat) {
         (Some(path), _) => Some(Box::new(RotatingFile::create(Path::new(path), LOGCAT_ROTATE_BYTES)?)),
         (None, Some(_)) => Some(Box::new(std::io::stdout())),
         (None, None) => None,
     };
-    let out: Box<dyn std::io::Write + Send> = match (out, watch) {
-        (None, None) => return Ok(None),
+    Ok(match (out, watch) {
+        (None, None) => None,
+        (None, Some(display)) => Some(Spool::tap_only(rotation_watch(display))),
         // Nothing but the user's: as they asked, untouched.
-        (Some(out), None) => out,
-        (out, Some(display)) => {
+        (Some(out), None) => Some(Spool::new("logcat-out", out, LOGCAT_SPOOL_DEPTH)?),
+        // The guest also logs the tags emu reads for itself; the user's output drops them.
+        (Some(out), Some(display)) => {
             let filter = sim_core::logcat::Filter::parse(user_logcat_filter(opts));
-            Box::new(LogcatWatch { display, out: out.map(|o| (o, filter)), line: Vec::new() })
+            let out = Box::new(UserLines { out, filter, lines: Lines::default() });
+            Some(Spool::new("logcat-out", out, LOGCAT_SPOOL_DEPTH)?.with_tap(rotation_watch(display)))
         }
-    };
-    emu_vmm::virtio::console::Spool::new("logcat-out", out, LOGCAT_SPOOL_DEPTH).map(Some)
+    })
 }
 
-/// The guest's logcat stream as emu reads it, a line at a time: a line that reports the
-/// display's rotation ([`sim_core::rotation::guest_rotation`]) turns `display`'s frames and
-/// touches to match, and the lines the user's filter shows go on to `out` (the tags emu added
-/// for itself don't, unless the user's filter shows them too).
-struct LogcatWatch {
-    display: std::sync::Arc<emu_vmm::display::FrameStore>,
-    out: Option<(Box<dyn std::io::Write + Send>, sim_core::logcat::Filter)>,
-    /// The line so far.
-    line: Vec<u8>,
+/// Reads the guest's logcat stream a line at a time: a line that reports the display's rotation
+/// ([`sim_core::rotation::guest_rotation`]) turns `display`'s frames and touches to match. Cheap
+/// enough to run inline: a line is copied once and its tag compared.
+fn rotation_watch(display: std::sync::Arc<emu_vmm::display::FrameStore>) -> emu_vmm::virtio::console::Tap {
+    let mut lines = Lines::default();
+    Box::new(move |buf| {
+        lines
+            .feed(buf, |line| {
+                if let Some(r) = sim_core::rotation::guest_rotation(&String::from_utf8_lossy(line)) {
+                    display.set_rotation(r);
+                }
+                Ok(())
+            })
+            .unwrap_or(())
+    })
 }
 
-/// A line longer than this is taken as it is (logcat's own limit is about 4 KB a message).
-const LOGCAT_LINE_MAX: usize = 16 << 10;
-
-impl LogcatWatch {
-    fn end_line(&mut self) -> std::io::Result<()> {
-        let text = String::from_utf8_lossy(&self.line);
-        if let Some(r) = sim_core::rotation::guest_rotation(&text) {
-            self.display.set_rotation(r);
-        }
-        let written = match &mut self.out {
-            Some((out, filter)) if filter.passes(text.trim_end()) => out.write_all(&self.line),
-            _ => Ok(()),
-        };
-        // The line is done with even when its write failed (a full disk loses it, nothing more).
-        self.line.clear();
-        written
-    }
+/// The lines of the guest's log the user's filter shows, passed on to `out` (the tags emu added
+/// for itself aren't, unless the user's filter shows them too).
+struct UserLines {
+    out: Box<dyn std::io::Write + Send>,
+    filter: sim_core::logcat::Filter,
+    lines: Lines,
 }
 
-impl std::io::Write for LogcatWatch {
+impl std::io::Write for UserLines {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        for piece in buf.split_inclusive(|b| *b == b'\n') {
-            self.line.extend_from_slice(piece);
-            if piece.ends_with(b"\n") || self.line.len() >= LOGCAT_LINE_MAX {
-                self.end_line()?;
-            }
-        }
+        let (out, filter) = (&mut self.out, &self.filter);
+        self.lines.feed(buf, |line| if filter.passes(String::from_utf8_lossy(line).trim_end()) { out.write_all(line) } else { Ok(()) })?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.out.as_mut().map_or(Ok(()), |(out, _)| out.flush())
+        self.out.flush()
+    }
+}
+
+/// A byte stream cut into lines.
+#[derive(Default)]
+struct Lines(Vec<u8>);
+
+/// A line longer than this is taken as it is (logcat's own limit is about 4 KB a message).
+const LOGCAT_LINE_MAX: usize = 16 << 10;
+
+impl Lines {
+    /// Hands each line `buf` completes to `line`, with its end. A line is done with even when
+    /// `line` fails (a full disk loses it, nothing more); the first failure is returned.
+    fn feed(&mut self, buf: &[u8], mut line: impl FnMut(&[u8]) -> std::io::Result<()>) -> std::io::Result<()> {
+        for piece in buf.split_inclusive(|b| *b == b'\n') {
+            self.0.extend_from_slice(piece);
+            if piece.ends_with(b"\n") || self.0.len() >= LOGCAT_LINE_MAX {
+                let done = line(&self.0);
+                self.0.clear();
+                done?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1056,20 +1088,14 @@ mod tests {
             assert!(words.contains(&w), "{w} missing from {}", q.cmdline);
         }
         assert!(!q.cmdline.contains("androidboot.qemu"), "{}", q.cmdline);
-        // logcat -Q's filter and pipe (#38), silent without -logcat but for the lines that say
-        // the display rotated.
+        // logcat -Q's filter and pipe (#38), silent without -logcat.
         let cmdline_prop = |p: &BootPlan| p.boot_props.iter().find(|(k, _)| k == "qemu.cmdline").map(|(_, v)| v.clone());
-        assert_eq!(
-            cmdline_prop(&q).as_deref(),
-            Some("androidboot.logcat=WindowManager:I,ActivityTaskManager:I,*:S androidboot.consolepipe=qemu_pipe,pipe:logcat")
-        );
+        assert_eq!(cmdline_prop(&q).as_deref(), Some("androidboot.logcat=*:S androidboot.consolepipe=qemu_pipe,pipe:logcat"));
         let tags = Opts { logcat: Some("ActivityManager:I  *:S".into()), ..Opts::default() };
         let q_tags = BootPlan::new(&s.env.load("q").expect("load"), &tags, None);
         assert_eq!(
             cmdline_prop(&q_tags).as_deref(),
-            Some(
-                "androidboot.logcat=ActivityManager:I,WindowManager:I,ActivityTaskManager:I,*:S androidboot.consolepipe=qemu_pipe,pipe:logcat"
-            )
+            Some("androidboot.logcat=ActivityManager:I,*:S androidboot.consolepipe=qemu_pipe,pipe:logcat")
         );
 
         let first: Vec<&str> = q.boot_props.iter().take(2).map(|(k, _)| k.as_str()).collect();
@@ -1396,6 +1422,62 @@ mod tests {
         assert!(logcat_sink(&Opts::default(), None).expect("sink").is_none());
     }
 
+    /// API 29 and 30 take their logcat filter through `qemu.cmdline`, at most `PROP_VALUE_MAX`
+    /// bytes (a longer value isn't set, and logcat -Q logs nothing): emu adds nothing to it there
+    /// and doesn't follow their rotation, so the property is main's, the default and a typical
+    /// `-logcat` fit, and `rotation` says it doesn't know. API 31 and later read it from the log.
+    #[test]
+    fn images_whose_log_goes_through_qemu_cmdline_keep_the_users_filter() {
+        let s = sdk("cmdline-rotation");
+        add_image(&s, "q", 29, "");
+        add_image(&s, "r", 30, "");
+        add_image(&s, "s", 31, "AndroidbootProps2 = on\n");
+        let prop = |name: &str, opts: &Opts| {
+            let p = BootPlan::new(&s.env.load(name).expect("load"), opts, None);
+            p.boot_props.iter().find(|(k, _)| k == "qemu.cmdline").map(|(_, v)| v.clone())
+        };
+        let typical = Opts { logcat: Some("ActivityManager:I *:S".into()), ..Opts::default() };
+        let to_file = Opts { logcat_output: Some("/tmp/l".into()), ..Opts::default() };
+        for name in ["q", "r"] {
+            let avd = s.env.load(name).expect("load");
+            assert!(sim_core::rotation::turns(avd.profile().kind.form_factor), "{name}: a phone");
+            assert!(!follows_rotation(&avd) && rotation_unknown(&avd), "{name}");
+            for (opts, filter) in [(&Opts::default(), "*:S"), (&typical, "ActivityManager:I,*:S"), (&to_file, "*:V")] {
+                let line = prop(name, opts).expect("qemu.cmdline");
+                assert!(line.len() <= PROP_VALUE_MAX, "{name}: {} bytes: {line}", line.len());
+                assert_eq!(line, format!("androidboot.logcat={filter} androidboot.consolepipe=qemu_pipe,pipe:logcat"), "{name}");
+            }
+        }
+        let s31 = s.env.load("s").expect("load");
+        assert!(follows_rotation(&s31) && !rotation_unknown(&s31));
+        assert_eq!(prop("s", &Opts::default()), None);
+        assert_eq!(
+            BootPlan::new(&s31, &typical, None).bootconfig.get("androidboot.logcat"),
+            Some("ActivityManager:I WindowManager:I ActivityTaskManager:I *:S")
+        );
+        // A display that never turns is upright, not unknown.
+        assert!(!rotation_unknown(&s.env.load("tv").expect("load")));
+    }
+
+    /// The rotation watch reads the guest's log as it's sent, not behind the spool's queue (whose
+    /// writer thread runs at utility priority and drops chunks when it falls behind): the turn
+    /// has happened by the time `send` returns.
+    #[test]
+    fn the_rotation_watch_reads_each_line_as_it_is_sent() {
+        use sim_core::rotation::Rotation;
+        let display = std::sync::Arc::new(emu_vmm::display::FrameStore::default());
+        let spool = logcat_sink(&Opts::default(), Some(display.clone())).expect("sink").expect("a stream to watch");
+        for (line, want) in [
+            ("11-26 09:58:57.210   642   680 I WindowManager: Display id=0 rotation changed to 1 from 0\n", Rotation::Deg270),
+            ("11-26 09:58:58.210   642   680 I WindowManager: Display id=0 rotation changed to 0 from 1\n", Rotation::Deg0),
+            ("11-26 09:58:59.210   642   680 I WindowManager: Display id=0 rotation changed to 3 from 0\n", Rotation::Deg90),
+        ] {
+            spool.send(line.as_bytes());
+            assert_eq!(display.rotation(), want, "{line}");
+        }
+        assert_eq!(spool.dropped(), 0);
+    }
+
     /// The guest's log turns the display as each rotation line arrives (split across writes or
     /// not), and the user's output keeps only what their filter shows.
     #[test]
@@ -1416,27 +1498,27 @@ mod tests {
         let display = std::sync::Arc::new(emu_vmm::display::FrameStore::default());
         let out = Shared::default();
         let user = sim_core::logcat::Filter::parse("MyApp:D *:S");
-        let mut w = LogcatWatch { display: display.clone(), out: Some((Box::new(out.clone()), user)), line: Vec::new() };
+        let mut watch = rotation_watch(display.clone());
+        let mut shown = UserLines { out: Box::new(out.clone()), filter: user, lines: Lines::default() };
+        let mut send = |b: &[u8]| {
+            watch(b);
+            shown.write_all(b).expect("write");
+        };
         let turn = "11-26 09:58:57.210   642   680 I WindowManager: Display id=0 rotation changed to 3 from 0, lastOrientation=-1\n";
         let (a, b) = turn.split_at(60);
-        w.write_all(a.as_bytes()).expect("write");
+        send(a.as_bytes());
         assert_eq!(display.rotation(), Rotation::Deg0, "half a line");
-        w.write_all(
-            format!("{b}11-26 09:58:57.300  4242  4242 D MyApp: hello\n11-26 09:58:57.301  4242  4242 V MyApp: quiet\n").as_bytes(),
-        )
-        .expect("write");
+        send(format!("{b}11-26 09:58:57.300  4242  4242 D MyApp: hello\n11-26 09:58:57.301  4242  4242 V MyApp: quiet\n").as_bytes());
         assert_eq!(display.rotation(), Rotation::Deg90);
         assert_eq!(String::from_utf8_lossy(&out.0.lock().expect("out")), "11-26 09:58:57.300  4242  4242 D MyApp: hello\n");
         // API 34's line, back upright.
-        w.write_all(
+        send(
             b"11-26 10:07:09.487   540  1888 I ActivityTaskManager: Config changes=20000580 {winConfig={ mDisplayRotation=ROTATION_0 }}\n",
-        )
-        .expect("write");
+        );
         assert_eq!(display.rotation(), Rotation::Deg0);
-        // With no user output, only the display hears it.
-        let mut quiet = LogcatWatch { display: display.clone(), out: None, line: Vec::new() };
-        quiet.write_all(b"x I WindowManager: Display id=0 rotation changed to 1 from 0\n").expect("write");
-        assert_eq!(display.rotation(), Rotation::Deg270);
+        // An app that logs the same words under its own tag turns nothing.
+        send(b"11-26 10:07:10.000  4242  4242 I MyApp: Display id=0 rotation changed to 1 from 0\n");
+        assert_eq!(display.rotation(), Rotation::Deg0);
     }
 
     #[test]

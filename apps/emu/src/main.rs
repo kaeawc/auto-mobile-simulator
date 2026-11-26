@@ -381,6 +381,7 @@ fn boot(
             car: inst.car.clone(),
             network: inst.network.clone(),
             fold: fold.clone(),
+            rotation_unknown: instance::rotation_unknown(&avd),
         },
     )?;
     let _advert = console::Advertisement::write(&avd.name, &avd.dir, inst.console_port);

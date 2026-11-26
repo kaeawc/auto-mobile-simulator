@@ -538,13 +538,23 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   doesn't, and a device lying flat turns nothing. So emu turns frames and touches by the
   rotation the guest reports, not by the accelerometer: each rotation is logged at info, as
   `WindowManager: Display id=0 rotation changed to N` (API 36 and later) and as
-  `ActivityTaskManager: Config changes=... mDisplayRotation=ROTATION_N` (API 34 and later; both
-  checked under simee on API 34 and 36, 2026-11-26), and emu asks the guest's `goldfish-logcat`
-  for those two tags at info (`androidboot.logcat`, beside whatever `-logcat` asks for, which
-  still sees only its own lines) and reads them off the logcat console as they arrive
-  (`sim_core::rotation::guest_rotation`; a few lines per rotation or app start, no polling and no
-  adb). Phones, tablets and foldables follow it; TVs, cars, watches and XR headsets and glasses
-  never turn (`sim_core::rotation::turns`). A guest reset starts upright again. Screenshots,
+  `ActivityTaskManager: Config changes=... mDisplayRotation=ROTATION_N` (API 33 and later), or
+  `mRotation=ROTATION_N` in the same line where `mDisplayRotation` isn't (API 31 and 32; checked
+  under simee on API 31, 34 and 36, 2026-11-26), and emu asks the guest's `goldfish-logcat` for
+  those two tags at info (`androidboot.logcat`, beside whatever `-logcat` asks for, which still
+  sees only its own lines) and reads them off the logcat console as they arrive
+  (`sim_core::rotation::guest_rotation`, only under those two tags, so an app logging the same
+  words turns nothing; no polling and no adb). The reader runs inline on the console worker,
+  before the spool that feeds `-logcat`'s output (a utility-priority thread that drops chunks
+  when it falls behind), so a slow or verbose `-logcat` never loses a rotation line. It is
+  still a log: a rotation reaches emu a few milliseconds after the guest relayouts, so a tap at
+  bounds read from the turned layout and sent in that window maps with the old turn; a caller
+  that rotates then taps should read `rotation` (the console, or `simee screen`) until it shows
+  the new turn. The two tags add little log: on an API 36 phone (720x1280, 2026-11-26, this Mac at load 19 to 62), 4.3 KB in 17 lines from boot to boot complete, nothing in 2 minutes idle, and 11.4 KB in 50 lines over four rotations and five Settings launches (2 rotation lines each), against 1.9 MB in 10,385 lines that the guest logged under all tags in the same window (`adb logcat -d -s WindowManager:I ActivityTaskManager:I`; one run, not a benchmark). API 29 and 30 aren't followed: their filter
+  goes through `qemu.cmdline`, at most 91 bytes, which the two tags would overflow, so emu
+  leaves it as the user's and `rotation` says `unknown` there (frames and touches stay as the
+  panel lies). Phones, tablets and foldables follow it; TVs, cars, watches and XR headsets and
+  glasses never turn (`sim_core::rotation::turns`). A guest reset starts upright again. Screenshots,
   frames, the API's `screen`, `tap`, `swipe`, `touch`, `stylus` and the console's `touch` and
   `pen` are then all in one space, the guest's layout: what `adb screencap` and uiautomator's
   bounds are in, in every case above (the console's `rotation` says how far it is turned).

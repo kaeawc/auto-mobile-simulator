@@ -109,23 +109,36 @@ pub fn turns(form_factor: FormFactor) -> bool {
 /// priority they're logged at.
 pub const ROTATION_TAGS: [(&str, char); 2] = [("WindowManager", 'I'), ("ActivityTaskManager", 'I')];
 
-/// The default display's new rotation, if logcat `line` reports one. The guest's window manager
-/// logs it two ways, both at info: `Display id=0 rotation changed to 3 from 0, ...`
+/// The default display's new rotation, if logcat `line` (`threadtime`) reports one. The guest's
+/// window manager logs it two ways, both at info: `Display id=0 rotation changed to 3 from 0, ...`
 /// (`WindowManager`, API 36 and later) and the global configuration it then applies, `Config
-/// changes=... winConfig={ ... mDisplayRotation=ROTATION_270 ...}` (`ActivityTaskManager`, which
-/// API 34 and 35 log too). Other displays' lines and anything else are None.
+/// changes=... winConfig={ ... mDisplayRotation=ROTATION_270 ... mRotation=ROTATION_270}`
+/// (`ActivityTaskManager`, API 31 and later: `mDisplayRotation` from API 33, the configuration's
+/// own `mRotation`, the same turn, before it). Only lines under those tags
+/// ([`ROTATION_TAGS`]) count, so an app logging the same words under its own tag turns nothing.
+/// Other displays' lines and anything else are None.
 pub fn guest_rotation(line: &str) -> Option<Rotation> {
     const CHANGED: &str = "Display id=0 rotation changed to ";
-    if let Some(at) = line.find(CHANGED) {
-        let n = line[at + CHANGED.len()..].chars().next()?.to_digit(10)?;
-        return Rotation::from_surface(n);
-    }
     // Capitalised: WindowManager's per-display `Override config changes=` is the same change.
     const CONFIG: &str = "Config changes=";
-    const DISPLAY: &str = "mDisplayRotation=ROTATION_";
-    let config = &line[line.find(CONFIG)?..];
-    let at = config.find(DISPLAY)? + DISPLAY.len();
-    let degrees: String = config[at..].chars().take_while(char::is_ascii_digit).collect();
+    let (_, tag, message) = crate::logcat::parse_line(line)?;
+    match tag {
+        "WindowManager" => {
+            let n = message.strip_prefix(CHANGED)?.chars().next()?.to_digit(10)?;
+            Rotation::from_surface(n)
+        }
+        "ActivityTaskManager" => {
+            let config = message.strip_prefix(CONFIG)?;
+            surface_rotation(config, " mDisplayRotation=").or_else(|| surface_rotation(config, " mRotation="))
+        }
+        _ => None,
+    }
+}
+
+/// The turn `field` gives as `ROTATION_<degrees>` in `config`, if it's there.
+fn surface_rotation(config: &str, field: &str) -> Option<Rotation> {
+    let at = config.find(field)? + field.len();
+    let degrees: String = config[at..].strip_prefix("ROTATION_")?.chars().take_while(char::is_ascii_digit).collect();
     Rotation::from_surface(degrees.parse::<u32>().ok().filter(|d| d % 90 == 0)? / 90)
 }
 
@@ -201,7 +214,7 @@ mod tests {
         assert_eq!(Rotation::Deg180.turned((1080, 2400)), (1080, 2400));
     }
 
-    /// The lines the guest logs when it rotates, as API 36 and API 34 images log them (captured
+    /// The lines the guest logs when it rotates, as API 36, 34 and 31 images log them (captured
     /// under simee, 2026-11-26), and lines that must not count.
     #[test]
     fn the_guests_rotation_is_read_from_its_log() {
@@ -212,19 +225,37 @@ mod tests {
         let api34 = "11-26 10:07:09.487   540  1888 I ActivityTaskManager: Config changes=20000580 {1.0 310mcc260mnc [en_US] ldltr sw360dp w640dp h312dp 320dpi nrml long land finger qwerty/v/v dpad/v winConfig={ mBounds=Rect(0, 0 - 1280, 720) mAppBounds=Rect(0, 0 - 1280, 672) mMaxBounds=Rect(0, 0 - 1280, 720) mDisplayRotation=ROTATION_270 mWindowingMode=fullscreen mActivityType=undefined mAlwaysOnTop=undefined mRotation=ROTATION_270} s.6 fontWeightAdjustment=0}";
         assert_eq!(guest_rotation(api34), Some(Rotation::Deg90));
         assert_eq!(guest_rotation(&api34.replace("ROTATION_270", "ROTATION_90")), Some(Rotation::Deg270));
+        // API 31 and 32 have no mDisplayRotation: the configuration's mRotation says the same.
+        assert_eq!(guest_rotation(API31_CONFIG), Some(Rotation::Deg90));
+        assert_eq!(guest_rotation(&API31_CONFIG.replace("mRotation=ROTATION_270", "mRotation=ROTATION_0")), Some(Rotation::Deg0));
+        // Where both are there, mDisplayRotation wins.
+        let both = api34.replace("mRotation=ROTATION_270}", "mRotation=ROTATION_0}");
+        assert_eq!(guest_rotation(&both), Some(Rotation::Deg90));
         for not in [
             // Another display, the per-display override (the same change again), a config change
             // that says nothing of rotation, and noise.
-            "I WindowManager: Display id=2 rotation changed to 1 from 0",
-            "I WindowManager: Override config changes=20000480 {... mDisplayRotation=ROTATION_90 ...} for displayId=3",
-            "I ActivityTaskManager: Config changes=4 {1.0 ... }",
-            "I ActivityTaskManager: Config changes=20000480 {... mDisplayRotation=ROTATION_45 ...}",
-            "I WindowManager: Display id=0 rotation changed to x from 0",
+            "11-26 09:58:57.210   642   680 I WindowManager: Display id=2 rotation changed to 1 from 0",
+            "11-26 09:58:57.210   642   680 I WindowManager: Override config changes=20000480 {... mDisplayRotation=ROTATION_90 ...} for displayId=3",
+            "11-26 09:58:57.210   642   680 I ActivityTaskManager: Config changes=4 {1.0 ... }",
+            "11-26 09:58:57.210   642   680 I ActivityTaskManager: Config changes=20000480 {... mDisplayRotation=ROTATION_45 ...}",
+            "11-26 09:58:57.210   642   680 I ActivityTaskManager: Config changes=20000480 {... mRotation=undefined}",
+            "11-26 09:58:57.210   642   680 I WindowManager: Display id=0 rotation changed to x from 0",
+            // The right words under the wrong tag (an app's own log), or each under the other's.
+            "11-26 09:58:57.210  4242  4242 I MyApp   : Display id=0 rotation changed to 1 from 0",
+            "11-26 09:58:57.210  4242  4242 I MyApp   : Config changes=20000480 {... mDisplayRotation=ROTATION_90 ...}",
+            "11-26 09:58:57.210   642   680 I ActivityTaskManager: Display id=0 rotation changed to 1 from 0",
+            "11-26 09:58:57.210   642   680 I WindowManager: Config changes=20000480 {... mDisplayRotation=ROTATION_90 ...}",
+            // Not a threadtime line.
+            "I WindowManager: Display id=0 rotation changed to 1 from 0",
             "",
         ] {
             assert_eq!(guest_rotation(not), None, "{not}");
         }
     }
+
+    /// API 31's line as its `ActivityTaskManager` logs it after one `rotate`: no
+    /// `mDisplayRotation` (captured under simee, 2026-11-26).
+    const API31_CONFIG: &str = "11-26 11:15:32.456   524   564 I ActivityTaskManager: Config changes=20000480 {1.0 310mcc260mnc [en_US] ldltr sw360dp w592dp h336dp 320dpi nrml land -touch qwerty/v/v dpad/v winConfig={ mBounds=Rect(0, 0 - 1280, 720) mAppBounds=Rect(96, 0 - 1280, 720) mMaxBounds=Rect(0, 0 - 1280, 720) mWindowingMode=fullscreen mDisplayWindowingMode=fullscreen mActivityType=undefined mAlwaysOnTop=undefined mRotation=ROTATION_270} s.27 fontWeightAdjustment=0}";
 
     /// Phones, tablets and foldables turn; XR (headsets and glasses), TVs, cars and watches
     /// never do.

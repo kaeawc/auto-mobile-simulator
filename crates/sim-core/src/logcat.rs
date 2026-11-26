@@ -55,7 +55,7 @@ impl Filter {
     /// a line in any other shape does (it's passed on as it came).
     pub fn passes(&self, line: &str) -> bool {
         match parse_line(line) {
-            Some((priority, tag)) => self.shows(tag, priority),
+            Some((priority, tag, _)) => self.shows(tag, priority),
             None => true,
         }
     }
@@ -81,8 +81,8 @@ pub fn with_tags(user: &Filter, tags: &[(&str, char)]) -> Filter {
     f
 }
 
-/// A `threadtime` line's priority and tag.
-fn parse_line(line: &str) -> Option<(char, &str)> {
+/// A `threadtime` line's priority, tag and message (without the line's end).
+pub fn parse_line(line: &str) -> Option<(char, &str, &str)> {
     let mut rest = line.trim_start();
     // Date, time, pid, tid.
     for _ in 0..4 {
@@ -95,8 +95,9 @@ fn parse_line(line: &str) -> Option<(char, &str)> {
         return None;
     }
     let rest = chars.as_str().trim_start();
-    let tag = rest[..rest.find(':')?].trim_end();
-    Some((priority, tag))
+    let colon = rest.find(':')?;
+    let message = rest[colon + 1..].strip_prefix(' ').unwrap_or(&rest[colon + 1..]).trim_end_matches(['\r', '\n']);
+    Some((priority, rest[..colon].trim_end(), message))
 }
 
 #[cfg(test)]
@@ -144,8 +145,9 @@ mod tests {
     #[test]
     fn lines_in_other_shapes_pass() {
         let f = Filter::parse("*:S");
-        assert_eq!(parse_line(WM), Some(('I', "WindowManager")));
-        assert_eq!(parse_line(APP), Some(('D', "MyApp")));
+        assert_eq!(parse_line(WM), Some(('I', "WindowManager", "Display id=0 rotation changed to 3 from 0")));
+        assert_eq!(parse_line(APP), Some(('D', "MyApp", "hello: world")));
+        assert_eq!(parse_line(&format!("{WM}\r\n")).map(|l| l.2), Some("Display id=0 rotation changed to 3 from 0"));
         for odd in ["--------- beginning of main", "", "W/Tag( 12): brief format", "1 2 3 4 Q Tag: x"] {
             assert!(f.passes(odd), "{odd}");
         }

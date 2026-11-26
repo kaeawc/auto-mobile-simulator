@@ -33,6 +33,9 @@ pub struct ConsoleInfo {
     pub network: Arc<std::sync::Mutex<sim_core::network::Conditions>>,
     /// A foldable's hinge (`fold`, `unfold`, `posture`).
     pub fold: Option<Arc<crate::fold::Foldable>>,
+    /// The guest may turn its display without emu knowing (`crate::instance::rotation_unknown`):
+    /// `rotation` says `unknown`.
+    pub rotation_unknown: bool,
 }
 
 /// Stock's reply to a command group without, or with an unknown, sub-command: the group's
@@ -656,7 +659,10 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
         // simee extension: how far the frames are turned clockwise to show the guest's display
         // upright, in degrees (the guest's own rotation): what `touch`, `pen` and screenshots
         // are turned by.
+        // `unknown` where emu doesn't read the guest's rotation (API 29 and 30): frames and
+        // touches stay in panel space there, whichever way the guest turned.
         "rotation" => match &info.display {
+            _ if info.rotation_unknown => "rotation: unknown\r\nOK".into(),
             Some(d) => format!("rotation: {}\r\nOK", d.rotation().degrees()),
             None => "rotation: 0\r\nOK".into(),
         },
@@ -817,6 +823,7 @@ mod tests {
             car: (form_factor == FormFactor::Auto).then(Arc::default),
             network: Arc::default(),
             fold,
+            rotation_unknown: false,
         }
     }
 
@@ -1041,6 +1048,9 @@ mod tests {
         assert_eq!(run(&info, "rotation"), "rotation: 0\r\nOK");
         store.set_rotation(sim_core::rotation::Rotation::Deg90);
         assert_eq!(run(&info, "rotation"), "rotation: 90\r\nOK");
+        // An image whose rotation emu doesn't read says so rather than a turn it never saw.
+        let unread = ConsoleInfo { rotation_unknown: true, ..console(FormFactor::Tablet) };
+        assert_eq!(run(&unread, "rotation"), "rotation: unknown\r\nOK");
         let path = std::env::temp_dir().join(format!("emu-console-turned-{}.png", std::process::id()));
         let reply = run(&info, &format!("screenshot {}", path.display()));
         let png = std::fs::read(&path).expect("written");

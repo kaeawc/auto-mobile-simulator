@@ -1182,7 +1182,9 @@ fn file_tail(path: &Path, n: usize) -> Vec<String> {
 }
 
 /// How far a display is turned whose emulator's console answered `rotation` with `lines`
-/// (`rotation: 90`); upright when the reply has no such line (an emu that predates it).
+/// (`rotation: 90`); upright when the reply has no such line (an emu that predates it) or says
+/// `rotation: unknown` (an image whose rotation emu doesn't read, API 29 and 30: its frames and
+/// touches stay in panel space, as they are upright).
 fn display_rotation(lines: &[String]) -> Rotation {
     lines.iter().find_map(|l| Rotation::from_degrees(l.strip_prefix("rotation: ")?.trim().parse().ok()?)).unwrap_or_default()
 }
@@ -1821,6 +1823,7 @@ mod tests {
         // An emu that predates `rotation`, or a reply without it: upright.
         assert_eq!(display_rotation(&["KO: unknown command".into()]), Rotation::Deg0);
         assert_eq!(display_rotation(&["rotation: 45".into()]), Rotation::Deg0);
+        assert_eq!(display_rotation(&["rotation: unknown".into(), "OK".into()]), Rotation::Deg0, "panel space");
         assert_eq!(display_rotation(&["rotation: 270".into()]), Rotation::Deg270);
         // The stock emulator: never asked.
         let f = fixture("turnedstock");
