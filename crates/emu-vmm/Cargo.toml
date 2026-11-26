@@ -20,5 +20,8 @@ libc.workspace = true
 rustix.workspace = true
 sim-core.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal.workspace = true
+
 [lints]
 workspace = true

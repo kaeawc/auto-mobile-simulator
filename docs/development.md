@@ -5,6 +5,12 @@
 - macOS on Apple silicon to run devices: Xcode (`xcode-select -p`, or `DEVELOPER_DIR`) with at
   least one simulator runtime for iOS; for Android, an SDK system image (`emu -provision` fetches
   one, no Java needed).
+  Xcode 26 and 27 both work, and several can be installed side by side: `DEVELOPER_DIR` picks one
+  per run. CoreSimulator is the system's (`/Library/Developer/PrivateFrameworks`) whichever Xcode
+  is selected; SimulatorKit is the selected Xcode's, in `Contents/SharedFrameworks` from Xcode 27
+  and `Contents/Developer/Library/PrivateFrameworks` before it (tried in that order). Xcode 27.2's
+  SimulatorKit keeps every HID builder, the HID client class and selectors simee uses, and builds
+  byte-identical messages to Xcode 26.6's apart from timestamps.
 - Rust 1.99.1 (pinned in `rust-toolchain.toml`).
 - On Linux the shared core, the API, the CLI and the desktop window build and test (CI runs them
   there); there are no devices to run, since both runtimes need macOS.

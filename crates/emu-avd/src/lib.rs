@@ -639,11 +639,17 @@ pub struct Running {
     pub console_port: u16,
     pub adb_port: u16,
     pub avd_dir: Option<PathBuf>,
-    /// simee wrote it (the stock emulator writes the same file without `emulator=simee`).
+    /// simee's `emu` runs it (it advertised itself with `emulator=simee`); `false` for the stock
+    /// emulator, found by [`Env::stock_instances`].
     pub simee: bool,
 }
 
 impl Running {
+    /// Which emulator runs it: `simee` or `stock`.
+    pub fn emulator(&self) -> &'static str {
+        if self.simee { "simee" } else { "stock" }
+    }
+
     /// The adb serial, `emulator-<console port>`.
     pub fn serial(&self) -> String {
         format!("emulator-{}", self.console_port)
@@ -667,6 +673,176 @@ impl Running {
     /// Whether its process still exists.
     pub fn alive(&self) -> bool {
         rustix::process::Pid::from_raw(self.pid).is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
+    }
+}
+
+/// What the host says about a process, for [`Env::stock_instances_with`].
+pub struct Probe<'a> {
+    /// The process's command line (`ps -o args=`); `None` when it has gone.
+    pub args: &'a dyn Fn(i32) -> Option<String>,
+    /// The TCP ports the process listens on (`lsof`).
+    pub listening: &'a dyn Fn(i32) -> Vec<u16>,
+}
+
+/// The console and adb ports a stock emulator was started with: `-port N` (adb is `N + 1`) or
+/// `-ports N,M` (console, adb) in its command line (the launcher execs the qemu binary with the
+/// same arguments).
+pub fn ports_from_args(args: &str) -> Option<(u16, u16)> {
+    let words: Vec<&str> = args.split_whitespace().collect();
+    words.windows(2).find_map(|w| match w[0] {
+        "-port" => w[1].parse::<u16>().ok().and_then(|c| Some((c, c.checked_add(1)?))),
+        "-ports" => {
+            let (c, a) = w[1].split_once(',')?;
+            Some((c.parse().ok()?, a.parse().ok()?))
+        }
+        _ => None,
+    })
+}
+
+/// Whether `args` is a qemu command line started for AVD `name`: the exact pair `-avd <name>`
+/// (adjacent words), not just any word equal to the name.
+pub fn qemu_args_run_avd(args: &str, name: &str) -> bool {
+    args.contains("qemu") && args.split_whitespace().collect::<Vec<_>>().windows(2).any(|w| w[0] == "-avd" && w[1] == name)
+}
+
+/// Whether process `pid` is, right now, a qemu running AVD `name` (asks `ps`).
+pub fn process_runs_avd(pid: i32, name: &str) -> bool {
+    host_probe_args(pid).is_some_and(|a| qemu_args_run_avd(&a, name))
+}
+
+/// The console port among the listening `ports` of an emulator started without `-port`: the
+/// lowest even port in the emulator range (5554..=5682) whose adb port (next) listens too.
+pub fn console_port_from_listening(ports: &[u16]) -> Option<u16> {
+    ports.iter().copied().filter(|p| (5554..=5682).contains(p) && p % 2 == 0 && ports.contains(&(p + 1))).min()
+}
+
+/// The ports a process listens on, from `lsof -nP -a -iTCP -sTCP:LISTEN -p <pid>`: each line
+/// ends with `TCP 127.0.0.1:5750 (LISTEN)`.
+pub fn parse_lsof_listening(out: &str) -> Vec<u16> {
+    out.lines()
+        .filter(|l| l.contains("(LISTEN)"))
+        .filter_map(|l| l.split_whitespace().rev().nth(1)?.rsplit(':').next()?.parse().ok())
+        .collect()
+}
+
+fn host_probe_args(pid: i32) -> Option<String> {
+    let out = std::process::Command::new("ps").args(["-o", "args=", "-p", &pid.to_string()]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (out.status.success() && !text.is_empty()).then_some(text)
+}
+
+fn host_probe_listening(pid: i32) -> Vec<u16> {
+    std::process::Command::new("lsof")
+        .args(["-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-p", &pid.to_string()])
+        .output()
+        .map(|o| parse_lsof_listening(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+/// Every process's command line from one `ps -axo pid=,args=`.
+pub fn parse_ps_all(out: &str) -> BTreeMap<i32, String> {
+    out.lines()
+        .filter_map(|l| {
+            let (pid, args) = l.trim_start().split_once(char::is_whitespace)?;
+            Some((pid.parse().ok()?, args.trim().to_owned()))
+        })
+        .collect()
+}
+
+/// Every process's listening TCP ports from one `lsof -nP -iTCP -sTCP:LISTEN -Fpn`: `p<pid>`
+/// lines, each followed by that process's `n<address>:<port>` lines.
+pub fn parse_lsof_by_pid(out: &str) -> BTreeMap<i32, Vec<u16>> {
+    let mut map: BTreeMap<i32, Vec<u16>> = BTreeMap::new();
+    let mut pid = None;
+    for l in out.lines() {
+        if let Some(p) = l.strip_prefix('p') {
+            pid = p.parse().ok();
+        } else if let (Some(n), Some(pid)) = (l.strip_prefix('n'), pid)
+            && !n.contains("->")
+            && let Some(port) = n.rsplit(':').next().and_then(|p| p.parse().ok())
+        {
+            map.entry(pid).or_default().push(port);
+        }
+    }
+    map
+}
+
+impl Env {
+    /// AVDs the stock emulator is running. This emulator doesn't write the `pid_<pid>.ini` that
+    /// [`running_instances_in`] reads (checked on emulator 36.x, macOS: `<tmp>/avd/running` stays
+    /// empty); it holds `<avd>/multiinstance.lock` and writes the qemu PID into
+    /// `<avd>/hardware-qemu.ini.lock`. The PID's command line has `-avd <name>` and usually
+    /// `-port N`; without it the console port is the emulator-range port the process listens on.
+    /// Instances in `skip` (by AVD name) are left out, so a simee `emu` is never listed twice.
+    ///
+    /// The host is asked once per listing: one `ps` for every live lock's command line and, only
+    /// if some emulator lacks `-port`, one `lsof` for every listening socket.
+    pub fn stock_instances(&self, skip: &[Running]) -> Vec<Running> {
+        let names = self.list_avds();
+        self.stock_instances_among(&names, skip, true)
+    }
+
+    /// [`Env::stock_instances`] for the one AVD `name` alone: its lock only, one `ps` at most.
+    pub fn stock_instance(&self, name: &str, skip: &[Running]) -> Option<Running> {
+        self.stock_instances_among(&[name.to_owned()], skip, false).pop()
+    }
+
+    fn stock_instances_among(&self, names: &[String], skip: &[Running], batch: bool) -> Vec<Running> {
+        let ps = std::cell::OnceCell::new();
+        let lsof = std::cell::OnceCell::new();
+        let run = |argv: &[&str]| {
+            std::process::Command::new(argv[0])
+                .args(&argv[1..])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        let args = |pid: i32| {
+            if batch {
+                ps.get_or_init(|| parse_ps_all(&run(&["ps", "-axo", "pid=,args="]))).get(&pid).cloned()
+            } else {
+                host_probe_args(pid)
+            }
+        };
+        let listening = |pid: i32| {
+            if batch {
+                let all = lsof.get_or_init(|| parse_lsof_by_pid(&run(&["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"])));
+                all.get(&pid).cloned().unwrap_or_default()
+            } else {
+                host_probe_listening(pid)
+            }
+        };
+        self.stock_instances_among_with(names, skip, &Probe { args: &args, listening: &listening })
+    }
+
+    /// [`Env::stock_instances`] asking `probe` about processes.
+    pub fn stock_instances_with(&self, skip: &[Running], probe: &Probe) -> Vec<Running> {
+        self.stock_instances_among_with(&self.list_avds(), skip, probe)
+    }
+
+    fn stock_instances_among_with(&self, names: &[String], skip: &[Running], probe: &Probe) -> Vec<Running> {
+        names
+            .iter()
+            .filter(|name| !skip.iter().any(|r| r.avd_name == **name))
+            .filter_map(|name| {
+                let dir = self.content_dir(name).ok()?;
+                let bytes = std::fs::read(dir.join("hardware-qemu.ini.lock")).ok()?;
+                let digits: String = bytes.iter().take_while(|c| c.is_ascii_digit()).map(|&c| c as char).collect();
+                let pid: i32 = digits.parse().ok()?;
+                let r = Running { pid, avd_name: name.clone(), console_port: 0, adb_port: 0, avd_dir: Some(dir), simee: false };
+                if !r.alive() {
+                    return None;
+                }
+                // A reused PID is some other program: it must be a qemu started for this AVD.
+                let args = (probe.args)(pid)?;
+                if !qemu_args_run_avd(&args, &r.avd_name) {
+                    return None;
+                }
+                let (console_port, adb_port) =
+                    ports_from_args(&args).or_else(|| console_port_from_listening(&(probe.listening)(pid)).map(|c| (c, c + 1)))?;
+                Some(Running { console_port, adb_port, ..r })
+            })
+            .collect()
     }
 }
 
@@ -739,6 +915,104 @@ pub fn is_car_build(props: &BTreeMap<String, String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stock_ports_come_from_args_then_listening_sockets() {
+        let args = "/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64-headless -avd lane -port 5750 -no-window";
+        assert_eq!(ports_from_args(args), Some((5750, 5751)));
+        assert_eq!(ports_from_args("qemu -avd lane -ports 5600,5601"), Some((5600, 5601)));
+        assert_eq!(ports_from_args("qemu -avd lane -ports 5600,5700"), Some((5600, 5700)), "the adb port is the second value");
+        assert_eq!(ports_from_args("qemu -avd lane -ports 5600"), None);
+        assert_eq!(ports_from_args("qemu -avd lane -no-window"), None);
+        // The AVD name must follow `-avd`, not merely appear.
+        assert!(qemu_args_run_avd(args, "lane"));
+        assert!(!qemu_args_run_avd("qemu -avd other -writable-system lane", "lane"));
+        assert!(!qemu_args_run_avd("qemu -avd lane2 -no-window", "lane"));
+        assert!(!qemu_args_run_avd("vim -avd lane", "lane"), "not a qemu");
+        let ps = "  1 /sbin/launchd\n 4242 /sdk/qemu-system-aarch64 -avd lane -ports 5600,5700\nnoise\n";
+        assert_eq!(parse_ps_all(ps).get(&4242).map(String::as_str), Some("/sdk/qemu-system-aarch64 -avd lane -ports 5600,5700"));
+        let by_pid = parse_lsof_by_pid("p10\nf3\nn127.0.0.1:5751\nn[::1]:5750\nn127.0.0.1:5751->127.0.0.1:9\np11\nn*:80\n");
+        assert_eq!((by_pid.get(&10), by_pid.get(&11)), (Some(&vec![5751, 5750]), Some(&vec![80])));
+        assert_eq!(console_port_from_listening(&[51686, 5555, 5554, 5555, 8080]), Some(5554));
+        assert_eq!(console_port_from_listening(&[5554]), None, "an adb port must listen too");
+        let lsof = "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n\
+            qemu-syst 44692 jason 35u IPv4 0xa 0t0 TCP 127.0.0.1:5751 (LISTEN)\n\
+            qemu-syst 44692 jason 36u IPv6 0xb 0t0 TCP [::1]:5750 (LISTEN)\n\
+            qemu-syst 44692 jason 67u IPv4 0xc 0t0 TCP 127.0.0.1:5751->127.0.0.1:51699 (ESTABLISHED)\n";
+        assert_eq!(parse_lsof_listening(lsof), [5751, 5750]);
+    }
+
+    #[test]
+    fn stock_instances_are_read_from_lock_files_and_checked_for_life() {
+        let tmp = std::env::temp_dir().join(format!("emu-avd-stock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let env = Env { sdk_root: None, avd_home: tmp.clone() };
+        let me = std::process::id();
+        // Fixtures as stock writes them: the PID, then a NUL, in `hardware-qemu.ini.lock`.
+        for (name, lock) in [
+            ("live", Some(format!("{me}\0"))),
+            ("noport", Some(format!("{me}\0"))),
+            ("dead", Some("999999999\0".to_owned())),
+            ("reused", Some(format!("{me}\0"))),
+            ("idle", None),
+            ("simee", Some(format!("{me}\0"))),
+        ] {
+            let dir = tmp.join(format!("{name}.avd"));
+            std::fs::create_dir_all(&dir).expect("avd dir");
+            std::fs::write(tmp.join(format!("{name}.ini")), format!("path={}\n", dir.display())).expect("pointer");
+            if let Some(lock) = lock {
+                std::fs::write(dir.join("hardware-qemu.ini.lock"), lock).expect("lock");
+            }
+        }
+        let args = |_pid: i32| Some("/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64-headless -avd X -port 5750".to_owned());
+        let probe = Probe { args: &|pid| args(pid).map(|a| a.replace(" X ", " live ")), listening: &|_| vec![] };
+        let skip = [Running { pid: 1, avd_name: "simee".into(), console_port: 5600, adb_port: 5601, avd_dir: None, simee: true }];
+        let found = env.stock_instances_with(&skip, &probe);
+        let names: Vec<&str> = found.iter().map(|r| r.avd_name.as_str()).collect();
+        // `noport`/`reused` lack `-avd <their name>` in the fixture args; `dead` has no process;
+        // `idle` has no lock; `simee` is already listed by its advertisement.
+        assert_eq!(names, ["live"]);
+        let r = &found[0];
+        assert_eq!((r.console_port, r.adb_port, r.pid, r.simee, r.emulator()), (5750, 5751, me as i32, false, "stock"));
+        assert_eq!(r.serial(), "emulator-5750");
+        // Started without `-port`: the listening sockets say.
+        let probe = Probe {
+            args: &|_| Some("qemu-system-aarch64-headless -avd noport -no-window".to_owned()),
+            listening: &|_| vec![5557, 5556, 51686],
+        };
+        let found = env.stock_instances_with(&skip, &probe);
+        let noport = found.iter().find(|r| r.avd_name == "noport").expect("noport");
+        assert_eq!(noport.console_port, 5556);
+        // A PID that now belongs to another program is not an emulator.
+        let probe = Probe { args: &|_| Some("/usr/bin/vim notes.txt".to_owned()), listening: &|_| vec![] };
+        assert!(env.stock_instances_with(&skip, &probe).is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn one_avd_is_probed_alone_and_ports_flags_give_the_adb_port() {
+        let tmp = std::env::temp_dir().join(format!("emu-avd-one-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let env = Env { sdk_root: None, avd_home: tmp.clone() };
+        for name in ["a", "b"] {
+            let dir = tmp.join(format!("{name}.avd"));
+            std::fs::create_dir_all(&dir).expect("dir");
+            std::fs::write(tmp.join(format!("{name}.ini")), format!("path={}\n", dir.display())).expect("ini");
+            std::fs::write(dir.join("hardware-qemu.ini.lock"), format!("{}\0", std::process::id())).expect("lock");
+        }
+        let asked = std::cell::Cell::new(0);
+        let probe = Probe {
+            args: &|_| {
+                asked.set(asked.get() + 1);
+                Some("qemu-system-aarch64 -avd a -ports 5600,5700".to_owned())
+            },
+            listening: &|_| panic!("ports are in the args: no lsof"),
+        };
+        let found = env.stock_instances_among_with(&["a".to_owned()], &[], &probe);
+        assert_eq!(asked.get(), 1, "only the named AVD's process is asked about");
+        assert_eq!((found[0].console_port, found[0].adb_port), (5600, 5700));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn car_images_are_found_from_build_prop() {
