@@ -3,7 +3,7 @@
 //! (`OK` / `KO: <reason>`, CRLF line endings, token auth from `~/.emulator_console_auth_token`).
 //!
 //! It builds everywhere so its commands are tested on any host; only Apple silicon serves it.
-#![cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#![cfg_attr(not(hv), allow(dead_code))]
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -583,9 +583,9 @@ fn session(stream: TcpStream, info: &ConsoleInfo) -> std::io::Result<()> {
                 if let Some(fold) = &info.fold {
                     fold.release();
                 }
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                #[cfg(hv)]
                 emu_vmm::request_stop(&info.stop);
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                #[cfg(not(hv))]
                 info.stop.store(true, std::sync::atomic::Ordering::SeqCst);
                 return Ok(());
             }

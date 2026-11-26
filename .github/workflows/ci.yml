@@ -57,6 +57,14 @@ jobs:
       # fails when line coverage drops under the floor: raise it as coverage grows, never lower it
       # to get green.
       - run: cargo llvm-cov nextest --locked --workspace --cargo-profile ci --no-report --hide-progress-bar
+      # x86_64 runners expose /dev/kvm (root:kvm 0660): open it to the runner user, then run
+      # emu-kvm's tests that drive real KVM guests (ignored where there is no KVM).
+      - name: Give the runner /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - run: cargo llvm-cov nextest --locked -p emu-kvm --cargo-profile ci --no-report --hide-progress-bar --run-ignored only -E 'not test(notify_cost)'
       - run: |
           {
             echo '### Coverage (Linux)'
@@ -69,6 +77,57 @@ jobs:
         with:
           name: coverage-linux
           path: lcov.info
+
+  # What the KVM fast paths save, on real KVM (x86_64; GitHub's arm64 runners have no /dev/kvm,
+  # see #54): a virtio-style doorbell store that exits to userspace against one completed in the
+  # kernel by an ioeventfd. The numbers go to the job summary.
+  kvm-x86:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: kvm-x86
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Give the runner /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - run: |
+          cargo test --locked --release -p emu-kvm notify_cost -- --ignored --nocapture | tee bench.txt
+          { echo '### KVM notify cost (x86_64 runner)'; echo '```text'; grep notify_cost: bench.txt; nproc; grep -m1 'model name' /proc/cpuinfo; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  # The arm64 KVM backend boots a Linux guest on the stock board (scripts/kvm-smoke.sh): KVM runs
+  # inside an emulated arm64 machine with EL2, since no hosted arm64 runner exposes /dev/kvm. It
+  # checks that the backend works, not how fast it is.
+  kvm-arm64-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-arm gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup target add aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: kvm-arm64-smoke
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --locked --target aarch64-unknown-linux-gnu --all-targets --profile ci -- -D warnings
+      - run: scripts/kvm-smoke.sh
+      - if: always()
+        run: |
+          log=~/.cache/simee/kvm-smoke/last.log
+          [ -f "$log" ] || exit 0
+          { echo '### KVM smoke (arm64 KVM in an emulated EL2 machine)'; echo '```text'; grep -E 'kvm-smoke|boot_kernel' "$log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   # The simulator service and Hypervisor.framework only exist on macOS, so the iOS and Android
   # backends are linted and tested there (unit tests don't need the hypervisor).

@@ -85,7 +85,11 @@ Unsupported combinations are refused with the reason. The matrix and its gaps:
 
 ## Not yet
 
-- Apple silicon Macs only. Linux builds and tests everything but cannot run devices.
+- Android devices run on Apple silicon Macs. arm64 Linux with KVM boots the board (a Linux guest,
+  under KVM inside an emulated machine in CI), but no Android image has been booted on arm64 KVM
+  hardware yet, and Linux has no host graphics yet
+  ([#54](https://github.com/kaeawc/simee/issues/54), [#55](https://github.com/kaeawc/simee/issues/55)).
+  iOS devices need a Mac.
 - No Android snapshots, so every boot is a full boot.
 - AutoMobile's Android harness: 38 of 41 tools pass (2026-11-24). Open: network shaping and VM
   snapshots.

@@ -9,8 +9,8 @@ use emu_sdk::{Host, Sdk, renderer};
 
 use crate::args::Opts;
 
-/// Whether this host boots guests (and so needs the renderer).
-const BOOTS: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+/// Whether this host boots guests with the renderer (Apple silicon so far; the Linux renderer is #55).
+const BOOTS: bool = cfg!(hv_hvf);
 const DEFAULT_TAG: &str = "google_apis";
 const DEFAULT_ABI: &str = "arm64-v8a";
 
@@ -140,7 +140,7 @@ fn renderer(sdk: &Sdk, opts: &Opts, update: bool) -> Result<()> {
 /// Initializes the renderer boots will use once, in a child process: its init compiles ANGLE's
 /// Metal shader library (about 4 s), which then sits in emu's own shader cache, so the first
 /// boot doesn't wait for it.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(hv_hvf)]
 fn warm_renderer(root: &std::path::Path) {
     let Some(lib64) = renderer::find_lib64(root) else { return };
     let (ok, warmed, took) = crate::vkprobe::warm(&lib64);
@@ -153,7 +153,7 @@ fn warm_renderer(root: &std::path::Path) {
     }
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(not(hv_hvf))]
 fn warm_renderer(_: &std::path::Path) {}
 
 /// Installs the gfxstream renderer out of the `emulator` package. With `update` the newest

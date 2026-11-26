@@ -16,6 +16,9 @@ const STATUS_DRIVER_OK: u32 = 4;
 const STATUS_FEATURES_OK: u32 = 8;
 const STATUS_FAILED: u32 = 0x80;
 
+/// QueueNotify: the driver writes a queue index here when it adds buffers.
+pub const QUEUE_NOTIFY: u64 = 0x050;
+
 pub const F_VERSION_1: u64 = 1 << 32;
 pub const F_RING_INDIRECT_DESC: u64 = 1 << 28;
 pub const F_RING_EVENT_IDX: u64 = 1 << 29;
@@ -68,6 +71,26 @@ impl MmioTransport {
             }),
             irq,
             mem,
+        }
+    }
+
+    /// How many queues the device has (0 for an empty slot): the QueueNotify values that mean
+    /// something.
+    pub fn queue_count(&self) -> usize {
+        self.lock().queues.len()
+    }
+
+    /// The driver's QueueNotify of `queue`, arriving some other way than an MMIO store (an
+    /// ioeventfd the hypervisor completed in the kernel): the same as the store.
+    pub fn queue_notify(&self, queue: u32) {
+        Self::notify_locked(&mut self.lock(), queue);
+    }
+
+    fn notify_locked(s: &mut State, queue: u32) {
+        if s.activated
+            && let Some(d) = s.dev.as_mut()
+        {
+            d.notify(queue as u16);
         }
     }
 
@@ -204,13 +227,7 @@ impl MmioDevice for MmioTransport {
                     q.ready = v == 1 && q.num != 0;
                 }
             }
-            0x050 => {
-                if s.activated
-                    && let Some(d) = s.dev.as_mut()
-                {
-                    d.notify(v as u16);
-                }
-            }
+            QUEUE_NOTIFY => Self::notify_locked(&mut s, v),
             0x070 => {
                 if v == 0 {
                     let irq = self.irq.clone();
@@ -406,6 +423,29 @@ mod tests {
         assert_eq!(s.seen.lock().expect("seen").activations.len(), 1, "activates once");
         s.w(0x050, 1);
         assert_eq!(s.seen.lock().expect("seen").notified, [1]);
+    }
+
+    /// An ioeventfd delivers QueueNotify off the MMIO path: it must mean exactly what the store
+    /// does (ignored before DRIVER_OK and after a reset).
+    #[test]
+    fn a_notify_from_an_ioeventfd_is_the_same_as_the_store() {
+        let s = slot(false);
+        assert_eq!(s.t.queue_count(), 2);
+        s.t.queue_notify(0);
+        assert!(s.seen.lock().expect("seen").notified.is_empty(), "nothing before DRIVER_OK");
+        s.negotiate(F_VERSION_1);
+        s.queue(0, 16, 0x4000_4000);
+        s.w(0x070, 0xf);
+        s.t.queue_notify(1);
+        s.w(QUEUE_NOTIFY, 0);
+        assert_eq!(s.seen.lock().expect("seen").notified, [1, 0], "both paths, in order");
+        s.w(0x070, 0);
+        s.t.queue_notify(0);
+        assert_eq!(s.seen.lock().expect("seen").notified, [1, 0], "nothing after a reset");
+        let mem = Arc::new(GuestRam::new(0x4000_0000, 0x4000).expect("ram"));
+        let empty = MmioTransport::new(None, Arc::new(Interrupt::new(Arc::new(TestLine::default()))), mem);
+        assert_eq!(empty.queue_count(), 0, "an empty slot gets no notifiers");
+        empty.queue_notify(0);
     }
 
     #[test]

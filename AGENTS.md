@@ -11,7 +11,7 @@ for both is to match the stock tools exactly and then exceed them.
 - New dependencies go in root `[workspace.dependencies]` with `default-features = false` and only
   the features used; crates reference them with `{ workspace = true }`.
 - `unsafe` lives only in `crates/sim-coresim` (the Objective-C / IOSurface boundary),
-  `crates/emu-hvf` (Hypervisor.framework and guest RAM), `crates/emu-gfxstream` (the renderer),
+  `crates/emu-hvf` (Hypervisor.framework and guest RAM), `crates/emu-kvm` (Linux KVM), `crates/emu-gfxstream` (the renderer),
   `apps/emu`'s `shutdown_signals` (signal masks) and `desktop/src/surface.rs` (the zero-copy
   bridge). Every `unsafe` block carries a `// SAFETY:` comment
   (`clippy::undocumented_unsafe_blocks` is denied or warned there). Everything else forbids it.
@@ -151,16 +151,22 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
 - `crates/emu-hvf` — `Vm` (GIC, RAM mapping, SPIs), `Vcpu` (run/regs/vtimer), `GuestRam`,
   `SharedMap` (a file mapped shared: the display server's frame ring). `GuestRam`, `SharedMap` and
   `host` (hole punching) build on any unix host; the hypervisor (`hv.rs`) is Apple silicon only.
-- `crates/emu-vmm` — `machine.rs` (`run`), `layout.rs`, `board.rs` (DT), `vcpu.rs` (exits, PSCI,
-  wakers), `bus.rs`, `devices/` (PL011, PL031, goldfish), `virtio/` (mmio transport, queue, blk,
-  rng, vsock, gpu with `legacy_asg.rs` (API 31–33's address-space graphics on the renderer's
-  protocol), input incl. XR's dual-mode mouse, console, snd), `pipe/` (adb bridge, qemud
+- `crates/emu-kvm` — Linux KVM on `kvm-ioctls`: `open` (checks `/dev/kvm` and says how to get
+  access), `Vm` (memory slots, `KVM_IRQ_LINE`, ioeventfd, irqfd, the arm64 vGICv3), `Vcpu` and its
+  decoded exits, `Kicks` (signals that force vCPU threads out of `KVM_RUN`). Linux only;
+  `x86_tests.rs` drives real-mode guests on a host with `/dev/kvm` (CI's Linux job).
+- `crates/emu-vmm` — `machine.rs` (`run`), `layout.rs`, `board.rs` (DT), `hv/` (the hypervisor
+  seam: one backend per host, each owning its vCPU run loop; `hvf.rs` has HVF's PSCI, WFI and
+  wakers), `vcpu.rs` (what every backend shares: stop protocol, exit counters, MMIO dispatch,
+  syndrome decoding), `wake.rs`, `bus.rs`, `devices/` (PL011, PL031, goldfish), `virtio/` (mmio
+  transport, queue, blk, rng, vsock, gpu with `legacy_asg.rs` (API 31–33's address-space graphics
+  on the renderer's protocol), input incl. XR's dual-mode mouse, console, snd), `pipe/` (adb bridge, qemud
   services incl. `car.rs`, the vehicle HAL, and `xr.rs`, Android XR's `xr_service`), `modem/`,
   `disk.rs`, `boot.rs`, `display.rs` (`FrameStore`), `vhost_user.rs` (serves a device to QEMU
   over vhost-user, for software mode on Linux; `examples/vhost_user_vsock.rs`), `vfio_user.rs`
   (serves a PCI function over vfio-user: the goldfish address space, and the goldfish pipe's
   carrier), `acpi.rs` (the SSDT that describes the pipe to x86 guests); `examples/soft_devices.rs`
-  serves the whole software-mode device set. Everything but `machine.rs`, `vcpu.rs` and
+  serves the whole software-mode device set. Everything but `machine.rs`, `hv/` and
   `virtio/gpu.rs` builds and tests on Linux: put device logic there, not behind the hypervisor.
 - `crates/emu-avd` — `Env` (SDK/AVD paths), `Avd` (config, `profile()`), `NewAvd`
   (`for_profile`), running-instance advertisements (`Running`), `BootConfig`, ini parsing.
