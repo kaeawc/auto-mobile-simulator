@@ -91,8 +91,8 @@ Unsupported combinations are refused with the reason. The matrix and its gaps:
   snapshots.
 - Automotive and Android XR images have their devices implemented but have not been booted.
 - iOS microphone injection still needs a loopback audio device.
-- Android system images below API 31 are refused with the reason: API 29 and 30 need goldfish
-  pipes emu doesn't serve ([#38](https://github.com/kaeawc/simee/issues/38)).
+- Android system images below API 29 are refused with the reason; emu hasn't been brought up on
+  them.
 - Android guests reach the internet over IPv4 only (TCP, UDP, ping); no IPv6 or inbound port
   forwarding yet. IP fragments the guest sends are dropped, and DNS goes to the host's first
   resolver, not to a VPN's scoped one.
@@ -104,6 +104,7 @@ Unsupported combinations are refused with the reason. The matrix and its gaps:
 | [Comparison](docs/comparison.md) | what differs from the stock tools, and why |
 | [Benchmarks](docs/benchmarks.md) | every published number and the command behind it |
 | [CLI](docs/cli.md) and [API](docs/api.md) | commands and methods for both platforms |
+| [MCP server](docs/mcp.md) | `simee mcp`: every method as a tool for an agent, with resources, tasks and a device view |
 | [Debugging](docs/debugging.md) | the iOS debug surface, network shaping, audio, Android counters |
 | [Desktop window](docs/desktop.md) | the window, its shortcuts and per-device controls |
 | [Android backend](docs/android.md) | emu status, provisioning, performance notes |

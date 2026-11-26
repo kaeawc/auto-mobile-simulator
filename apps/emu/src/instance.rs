@@ -246,6 +246,8 @@ impl Instance {
             // Images without bootconfig have no ANGLE: their GLES is the encoder, on the host's GL.
             vulkan_only: guest_egl(&self.avd) == "angle" && takes_bootconfig(&self.avd),
             virtual_queue: virtual_queue(&guest_egl(&self.avd), AngleImage::of(&self.avd)),
+            // Their GLES encoder's transport (see `legacy_cmdline`).
+            pipe_gles: !takes_bootconfig(&self.avd),
         })
     }
 
@@ -553,6 +555,9 @@ pub struct BootPlan {
     /// The dual-mode mouse: XR images that enable `VirtioDualModeMouse` (the headsets, not the
     /// display glasses), as stock adds it.
     pub dual_mode_mouse: bool,
+    /// The GLES encoder goes over the goldfish `opengles` pipe and the board has no virtio-gpu
+    /// (images without bootconfig: API 30 and older).
+    pub pipe_gles: bool,
 }
 
 impl BootPlan {
@@ -597,6 +602,7 @@ impl BootPlan {
             touch_screen: avd.touch_screen(),
             touchpad: avd.touchpad(),
             dual_mode_mouse: xr && avd.image_feature("VirtioDualModeMouse").unwrap_or(true),
+            pipe_gles: !takes_bootconfig(avd),
         };
         let bc = bootconfig(avd, opts, plan.renderer.is_some());
         if takes_bootconfig(avd) {
@@ -609,7 +615,16 @@ impl BootPlan {
             plan.cmdline = plan.cmdline.replace(" bootconfig", "");
             plan.cmdline.push(' ');
             plan.cmdline.push_str(&legacy_cmdline(&bc, plan.renderer.is_some()));
-            plan.boot_props.push(("qemu.cmdline".to_string(), logcat_pipe_cmdline(&logcat_filter(avd, opts))));
+            let filter = logcat_filter(avd, opts);
+            let line = logcat_pipe_cmdline(&filter);
+            if !line.contains(&filter.split_whitespace().collect::<Vec<_>>().join(",")) {
+                eprintln!("emu: -logcat '{filter}' is too long for these images' qemu.cmdline property; logcat shows every tag (*:V)");
+            }
+            // First, then `qemu.logcat=start`, as stock sends them: qemu-props sets the second
+            // as `vendor.qemu.logcat`, which starts `goldfish-logcat`, and `logcat -Q` reads
+            // the first once and exits quietly if it isn't set yet.
+            plan.boot_props.insert(0, ("qemu.cmdline".to_string(), line));
+            plan.boot_props.insert(1, ("qemu.logcat".to_string(), "start".to_string()));
         }
         plan
     }
@@ -649,8 +664,10 @@ impl BootPlan {
         if self.touchpad.is_some() {
             out.push("virtio-input: touchpad");
         }
-        if self.renderer.is_some() {
-            out.push("virtio-gpu (gfxstream), goldfish address space");
+        match (self.renderer.is_some(), self.pipe_gles) {
+            (true, false) => out.push("virtio-gpu (gfxstream), goldfish address space"),
+            (true, true) => out.push("goldfish pipe (opengles, GLProcessPipe; gfxstream), goldfish address space"),
+            (false, _) => {}
         }
         if self.sound {
             out.push("virtio-snd");
@@ -774,21 +791,19 @@ fn takes_bootconfig(avd: &Avd) -> bool {
     avd.image_feature("AndroidbootProps2") == Some(true) || avd.api_level().is_none_or(|api| api >= 31)
 }
 
-/// Why emu can't run this AVD's image yet, if it can't: system images below API 31 boot their
-/// kernel and init but never get graphics, so a boot would only loop. emu refuses them up front
-/// with the reason; `EMU_ALLOW_OLD_IMAGES=1` boots them anyway, for work on the issue named.
-/// (API 31–33 guests set up address-space graphics the old way; the GPU translates it,
-/// `virtio/legacy_asg.rs`.)
+/// Why emu can't run this AVD's image yet, if it can't: images below API 29, which emu has never
+/// been brought up on. emu refuses them up front with the reason; `EMU_ALLOW_OLD_IMAGES=1` boots
+/// them anyway, to work on them. (API 29–30 guests draw through the goldfish `opengles` pipe,
+/// `emu_vmm::pipe::opengles`; API 31–33 guests set up address-space graphics the old way, which
+/// the GPU translates, `virtio/legacy_asg.rs`.)
 pub fn unsupported(avd: &Avd) -> Option<String> {
     let api = avd.api_level()?;
     let why = match api {
-        ..=30 => {
-            "its GLES goes over the `opengles` goldfish pipe, which emu doesn't bridge to the renderer yet (https://github.com/kaeawc/simee/issues/38)"
-        }
+        ..=28 => "emu was brought up on API 29 and newer, and older boards differ (goldfish devices where newer ones have virtio)",
         _ => return None,
     };
     Some(format!(
-        "{}: API {api} images don't run on emu yet: {why}. emu runs API 31 and newer; create the AVD from a newer image (`emu -provision 36`), or boot this one with the SDK's emulator",
+        "{}: API {api} images don't run on emu yet: {why}. emu runs API 29 and newer; create the AVD from a newer image (`emu -provision 36`), or boot this one with the SDK's emulator",
         avd.name
     ))
 }
@@ -837,11 +852,18 @@ fn legacy_cmdline(bc: &BootConfig, graphics: bool) -> String {
 /// `goldfish-logcat` runs `logcat -Q`, which takes its filter and destination from this property
 /// (SELinux keeps it from `/proc/cmdline`), as stock sets it: `androidboot.logcat=<filter>` and
 /// `androidboot.consolepipe=qemu_pipe,pipe:logcat`. logcat stops the filter at the first space
-/// and splits it on commas, so the filter's spaces become commas.
+/// and splits it on commas, so the filter's spaces become commas. The property isn't read-only,
+/// so its value is at most [`PROP_VALUE_MAX`] bytes and a longer one isn't set at all (logcat -Q
+/// then exits quietly): a filter that doesn't fit becomes `*:V`, every tag, which does.
 fn logcat_pipe_cmdline(filter: &str) -> String {
-    let filter: Vec<&str> = filter.split_whitespace().collect();
-    format!("androidboot.logcat={} androidboot.consolepipe=qemu_pipe,pipe:logcat", filter.join(","))
+    let line = |f: &str| format!("androidboot.logcat={f} androidboot.consolepipe=qemu_pipe,pipe:logcat");
+    let full = line(&filter.split_whitespace().collect::<Vec<_>>().join(","));
+    if full.len() <= PROP_VALUE_MAX { full } else { line("*:V") }
 }
+
+/// The longest value bionic stores for a property that isn't `ro.` (`PROP_VALUE_MAX` less the
+/// NUL).
+const PROP_VALUE_MAX: usize = 91;
 
 /// The guest's GLES driver: `EMU_GUEST_EGL` if set, else [`default_egl`]. Under ANGLE no guest
 /// process uses the host's GL, so the renderer runs without it
@@ -1050,6 +1072,9 @@ mod tests {
             )
         );
 
+        let first: Vec<&str> = q.boot_props.iter().take(2).map(|(k, _)| k.as_str()).collect();
+        assert_eq!(first, ["qemu.cmdline", "qemu.logcat"], "logcat -Q's property before the start that runs it");
+
         let new = plan(&s, "s");
         assert_eq!(cmdline_prop(&new), None, "bootconfig images have a logcat console");
         assert_eq!(new.bootconfig.get("androidboot.qemu.avd_name"), Some("s"));
@@ -1146,21 +1171,44 @@ mod tests {
     }
 
     #[test]
-    fn images_below_api_31_are_refused_with_the_reason() {
+    fn images_below_api_29_are_refused_with_the_reason() {
         let s = sdk("old");
+        add_image(&s, "p", 28, "");
         add_image(&s, "q", 29, "");
         add_image(&s, "r", 30, "");
         add_image(&s, "s", 31, "AndroidbootProps2 = on\n");
-        add_image(&s, "t", 33, "AndroidbootProps2 = on\n");
         add_image(&s, "u", 34, "AndroidbootProps2 = on\n");
         let why = |n: &str| unsupported(&s.env.load(n).expect("load"));
-        for (n, api, issue) in [("q", 29, "issues/38"), ("r", 30, "issues/38")] {
-            let w = why(n).unwrap_or_default();
-            assert!(w.starts_with(&format!("{n}: API {api} images")) && w.contains(issue) && w.contains("API 31 and newer"), "{w}");
-        }
-        // API 31–33 set up address-space graphics the old way, which the GPU translates (#39).
-        assert_eq!((why("s"), why("t"), why("u")), (None, None, None));
+        let w = why("p").unwrap_or_default();
+        assert!(w.starts_with("p: API 28 images") && w.contains("API 29 and newer"), "{w}");
+        // API 29–30 draw through the opengles pipe (#38); API 31–33 through translated ASG (#39).
+        assert_eq!((why("q"), why("r"), why("s"), why("u")), (None, None, None, None));
         assert_eq!(why("phone"), None, "no API level: not refused");
+    }
+
+    #[test]
+    fn pipe_images_get_no_virtio_gpu() {
+        let s = sdk("pipe-gles");
+        add_image(&s, "q", 29, "");
+        add_image(&s, "s", 31, "AndroidbootProps2 = on\n");
+        let gpu = Some(PathBuf::from("/renderer/lib64"));
+        let q = BootPlan::new(&s.env.load("q").expect("load"), &Opts::default(), gpu.clone());
+        let s31 = BootPlan::new(&s.env.load("s").expect("load"), &Opts::default(), gpu);
+        assert!(q.pipe_gles && !s31.pipe_gles);
+        assert!(q.devices().iter().any(|d| d.starts_with("goldfish pipe (opengles")), "{:?}", q.devices());
+        assert!(!q.devices().iter().any(|d| d.contains("virtio-gpu")), "{:?}", q.devices());
+        assert!(s31.devices().iter().any(|d| d.starts_with("virtio-gpu")), "{:?}", s31.devices());
+    }
+
+    #[test]
+    fn a_logcat_filter_too_long_for_the_property_shows_every_tag() {
+        let fits = logcat_pipe_cmdline("ActivityManager:I *:S");
+        assert!(fits.len() <= PROP_VALUE_MAX && fits.contains("ActivityManager:I,*:S"), "{fits}");
+        // 65 bytes around the filter: 26 fit, 27 don't.
+        let at_cap = "A".repeat(24) + ":I";
+        assert_eq!(logcat_pipe_cmdline(&at_cap).len(), PROP_VALUE_MAX);
+        let long = logcat_pipe_cmdline(&("A".repeat(25) + ":I"));
+        assert_eq!(long, "androidboot.logcat=*:V androidboot.consolepipe=qemu_pipe,pipe:logcat");
     }
 
     fn plan(s: &Sdk, name: &str) -> BootPlan {
