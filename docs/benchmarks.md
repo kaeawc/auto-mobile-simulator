@@ -151,7 +151,7 @@ judged on all CPU (`--settle-cpu all`), as until this change; the mechanism is i
 | --- | --- | --- |
 | 1 clone: booted until settled, median (runs) | 95.0 s (97.2, 95.0, 52.7) | 33.3 s (44.2, 33.3, 28.3) |
 | 4 clones at once (K=4): all settled, median (runs) | 229 s (229, 170, 238) | 43 s (35, 43, 71) |
-| 4 clones at once: CPU-s each device used until settled, median | 167 | 76 |
+| 4 clones at once: CPU-s each device used until settled, median (not like for like: "before" waited on all CPU, "after" on foreground CPU only, so its wait ends earlier and background work keeps running after it; docs/farm.md) | 167 | 76 |
 | The slim profile's own time in that, 4 at once, median of 12 | 42.9 s | 5.4 s |
 
 Time per automation step on one booted iPhone 17 (iOS 27.2) through `simee serve`, one persistent

@@ -166,6 +166,9 @@ enum Cmd {
         device: String,
         #[arg(long, default_value_t = 600)]
         timeout: u64,
+        /// Which CPU to judge: `all`, or `foreground` (background-QoS work doesn't count). Default: foreground.
+        #[arg(long, value_enum)]
+        settle_cpu: Option<SettleCpu>,
     },
     /// iOS: turn a named set of daemons off on a booted simulator (`slim`), or back on with --undo.
     Profile {
@@ -573,8 +576,12 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             let r = call("boot_many", params)?;
             print_boot_many(&r, devices.len(), json, out, err)?;
         }
-        Cmd::Settle { device, timeout } => {
-            let r = call("settle", json!({"device": device, "timeout_s": timeout}))?;
+        Cmd::Settle { device, timeout, settle_cpu } => {
+            let mut params = json!({"device": device, "timeout_s": timeout});
+            if let Some(c) = settle_cpu {
+                params["foreground"] = json!(c == SettleCpu::Foreground);
+            }
+            let r = call("settle", params)?;
             let mut line = format!("settle_s={} procs={} cpu_pct={}", r["settle_s"], r["procs"], r["cpu_pct"]);
             for key in ["foreground_cpu_pct", "background_cpu_pct"] {
                 if let Some(v) = r.get(key) {
@@ -1083,6 +1090,9 @@ mod tests {
             Ok(Cmd::Boot { settle_cpu: Some(SettleCpu::Foreground), .. })
         ));
         assert!(parse(&["boot", "a", "--settle-cpu", "background"]).is_err());
+        assert!(matches!(parse(&["settle", "a"]), Ok(Cmd::Settle { settle_cpu: None, .. })), "the API's default");
+        assert!(matches!(parse(&["settle", "a", "--settle-cpu", "all"]), Ok(Cmd::Settle { settle_cpu: Some(SettleCpu::All), .. })));
+        assert!(parse(&["settle", "a", "--settle-cpu", "background"]).is_err());
         assert!(parse(&["boot-many", "a", "--settle", "--no-settle"]).is_err());
         assert!(matches!(parse(&["boot-many", "a", "--first-port", "5600"]), Ok(Cmd::BootMany { first_port: Some(5600), .. })));
         // Android devices boot silent unless `--audio`.

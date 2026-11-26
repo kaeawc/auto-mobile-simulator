@@ -858,10 +858,37 @@ fn preset_disables(path: &Path, labels: &[&str]) -> Result<usize, String> {
     let dir = path.parent().ok_or("no directory")?;
     // launchd_sim makes it 0700 when it doesn't exist.
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let tmp = dir.join("disabled.plist.simee");
-    std::fs::write(&tmp, sim_core::launchd::render(&entries, labels, true)).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // The directory is under world-writable /private/var/tmp: a unique name, created exclusively.
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let tmp = dir.join(format!("disabled.plist.simee.{}.{nanos}", std::process::id()));
+    write_new(&tmp, dir, sim_core::launchd::render(&entries, labels, true).as_bytes())?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })?;
     Ok(new)
+}
+
+/// Writes `bytes` to a file that must not exist yet in `dir` (`create_new` is `O_CREAT|O_EXCL`,
+/// which never follows a symlink planted at the name), and refuses a `dir` owned by another user:
+/// the file just made is ours, so its owner is this process's uid (no libc needed).
+fn write_new(path: &Path, dir: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|e| fail(&e))?;
+    let checked = file.metadata().and_then(|m| Ok((m.uid(), std::fs::symlink_metadata(dir)?))).map_err(|e| fail(&e));
+    let result = checked.and_then(|(uid, d)| {
+        if d.file_type().is_symlink() || d.uid() != uid {
+            Err(format!("{} isn't a directory owned by the current user; refusing to write the launchd overrides there", dir.display()))
+        } else {
+            file.write_all(bytes).map_err(|e| fail(&e))
+        }
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
 }
 
 /// A device's processes read through libproc (see [`crate::settle::Procs`]).
@@ -1617,6 +1644,55 @@ mod tests {
         assert!(preset_disables(&path, &["a"]).is_err());
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "bplist00");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_temp_file_for_the_disables_is_never_a_planted_symlink() {
+        let dir = std::env::temp_dir().join(format!("simee-write-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep").expect("victim");
+        let tmp = dir.join("disabled.plist.simee");
+        std::os::unix::fs::symlink(&victim, &tmp).expect("plant");
+        assert!(write_new(&tmp, &dir, b"x").is_err(), "an existing name, symlink or not, is refused");
+        assert_eq!(std::fs::read_to_string(&victim).expect("read"), "keep", "not written through the link");
+        // A dangling link too (O_EXCL fails on the link itself).
+        std::fs::remove_file(&tmp).expect("rm");
+        std::os::unix::fs::symlink(dir.join("missing"), &tmp).expect("plant dangling");
+        assert!(write_new(&tmp, &dir, b"x").is_err());
+        assert!(!dir.join("missing").exists());
+        std::fs::remove_file(&tmp).expect("rm");
+        // A free name works and has the bytes.
+        write_new(&tmp, &dir, b"ok").expect("free name");
+        assert_eq!(std::fs::read_to_string(&tmp).expect("read"), "ok");
+        // A directory that is itself a symlink is refused, and leaves no file behind.
+        let link = std::env::temp_dir().join(format!("simee-write-new-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&dir, &link).expect("dir link");
+        let via = link.join("new");
+        assert!(write_new(&via, &link, b"x").is_err());
+        assert!(!dir.join("new").exists());
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_disables_are_not_written_into_another_users_directory() {
+        // The sticky, world-writable /private/tmp (macOS) or /tmp is root's: anyone can create a
+        // file in it, which is what a hostile directory looks like. Skipped as root (the owner).
+        let dir = std::path::Path::new(if std::path::Path::new("/private/tmp").is_dir() { "/private/tmp" } else { "/tmp" });
+        let tmp = dir.join(format!("simee-foreign-dir-{}", std::process::id()));
+        match write_new(&tmp, dir, b"x") {
+            Err(e) => {
+                assert!(e.contains("isn't a directory owned by the current user"), "{e}");
+                assert!(!tmp.exists(), "nothing left behind");
+            }
+            Ok(()) => {
+                eprintln!("skipped: running as the directory's owner (root), no other uid to test with");
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
     }
 
     #[test]

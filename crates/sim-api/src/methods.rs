@@ -39,7 +39,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; settle also waits \
          up to settle_timeout_s (600) until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s \
          (settle_foreground, the default: counting only foreground-QoS CPU) and returns the timings with cpu_pct, foreground_cpu_pct, \
-         background_cpu_pct and cpu_s (CPU-seconds since the boot), settled false if it ran out of time; profile turns off a named set \
+         background_cpu_pct and cpu_s (CPU-seconds the tree used since the boot; for a device already booted, since the first sample), settled false if it ran out of time; profile turns off a named set \
          of daemons (written before the boot of a shut-down device, so they never start); Android: starts emu and \
          waits for sys.boot_completed, silent unless audio, which plays the device on the host's default output)",
     ),
@@ -55,7 +55,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "settle",
         "device, cpu_pct?, window_s?, foreground?(true), timeout_s?(600)",
         "Wait until a booted simulator is quiet: its processes under cpu_pct (10) % of a core for window_s (10) s (foreground, the default: \
-         only foreground-QoS CPU counts), SpringBoard running; returns settle_s, cpu_pct, foreground_cpu_pct and background_cpu_pct",
+         only foreground-QoS CPU counts), SpringBoard running; returns settle_s, cpu_pct, foreground_cpu_pct and background_cpu_pct, and cpu_s and background_cpu_s (CPU-seconds used since the first sample)",
     ),
     (
         "profile",
@@ -284,6 +284,17 @@ fn resolve(s: &mut Session, p: &Value) -> Result<(Platform, String), String> {
     }
 }
 
+/// Fails with the "no device matches" error when `query` was routed to iOS only by its UDID shape
+/// and no such simulator exists. [`resolve`] doesn't look the simulator up (that listing costs more
+/// than the call it routes), so a platform error that would be about a mistyped UDID checks first.
+fn ios_device_exists(s: &mut Session, platform: Platform, query: &str) -> Result<(), String> {
+    if platform != Platform::Ios || !sim_core::device::is_udid(query) {
+        return Ok(());
+    }
+    let found = crate::ios::selection_infos(&mut s.ios)?.iter().any(|d| d.udid.eq_ignore_ascii_case(query));
+    if found { Ok(()) } else { Err(format!("no device matches `{query}`")) }
+}
+
 /// A listing from the iOS backend (empty where there is none).
 fn ios_list<T: serde::de::DeserializeOwned>(s: &mut Session, method: &str) -> Result<Vec<T>, String> {
     serde_json::from_value(crate::ios::call(&mut s.ios, method, &json!({}))?).map_err(|e| e.to_string())
@@ -364,6 +375,8 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
                 match &first {
                     None => first = Some((platform, q.clone())),
                     Some((other, q0)) if *other != platform => {
+                        ios_device_exists(s, platform, &q)?;
+                        ios_device_exists(s, *other, q0)?;
                         return Err(format!(
                             "`boot_many` boots one platform's devices per call: `{q0}` is an {} device and `{q}` an {} one",
                             other.label(),
@@ -386,6 +399,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         m if METHODS.iter().any(|(name, ..)| *name == m) => {
             let (platform, udid) = resolve(s, p)?;
             if !platforms(m).contains(&platform) {
+                ios_device_exists(s, platform, str_param(p, "device").unwrap_or("booted"))?;
                 let on: Vec<&str> = platforms(m).iter().map(|p| p.label()).collect();
                 return Err(format!("`{m}` isn't available on {} devices (it works on {})", platform.label(), on.join(", ")));
             }
@@ -524,6 +538,14 @@ mod tests {
         call(&mut s, "create", &json!({"platform": "android", "name": avd, "system_image": mobile})).expect("uuid-named avd");
         assert_eq!(resolve(&mut s, &json!({"device": avd})), Ok((Platform::Android, avd.to_owned())));
         assert!(resolve(&mut s, &json!({"device": udid, "platform": "android"})).is_err(), "no such AVD");
+        // A mistyped UDID with AVDs around says "no device matches", not a platform mismatch.
+        let missing = format!("no device matches `{udid}`");
+        let err = call(&mut s, "boot_many", &json!({"devices": ["phone", udid]})).expect_err("mixed");
+        assert_eq!(err, missing);
+        let err = call(&mut s, "boot_many", &json!({"devices": [udid, "phone"]})).expect_err("mixed");
+        assert_eq!(err, missing);
+        assert_eq!(call(&mut s, "fold", &json!({"device": udid, "posture": "closed"})).expect_err("no such device"), missing);
+        assert_eq!(call(&mut s, "console", &json!({"device": udid})).expect_err("no such device"), missing);
         std::fs::remove_dir_all(root).ok();
     }
 
