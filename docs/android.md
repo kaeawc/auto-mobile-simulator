@@ -399,18 +399,25 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   its resources and contexts when the device next activates, on the GPU worker before the
   guest's first command. Released at the reset instead, a shutdown destroyed contexts just
   before exit: the renderer's cleanup thread was then still destroying their Vulkan instances
-  while `exit` ran its static destructors, and one stop in four ended in SIGSEGV. A reset first
-  gives the fences the guest still waits on up to 100 ms to signal, and fences signalled after the
-  device stopped reach no one. The renderer gets the device's fence ids, from a counter that
-  never restarts, not the guest's, which start again at 1 each boot: a fence of the last boot
-  that the renderer signals after the next one started (fence 4000 on context 1, ring 0) is
-  known by its id and completes nothing, where with the guest's ids it would have completed the
-  new boot's requests up to 4000 before their work was done. Between a reset and the next boot's first post, host screenshots
-  and streams show black instead of the last boot's final frame; a Vulkan-only renderer's post
-  notices are held until the renderer posts a buffer of the new boot (a color buffer's handle
-  can be the guest's resource id, which every boot allocates alike, so creation of that id
-  counts too). Before, once the new boot signalled fences, screenshots failed (`Failed to read
-  from ColorBuffer:3, not found`) until its first post. Numbers in
+  while `exit` ran its static destructors, and one stop in four ended in SIGSEGV. The deferred
+  release costs nothing measurable (`-verbose` prints it): a hard reset of a 720×1280 phone
+  leaves 50 resources and 14 contexts, released in under 1 ms, and after an `adb reboot` the
+  guest has already given back everything (0 and 0). A reset first gives the fences the guest
+  still waits on up to 100 ms to signal (none were pending in either kind of reset), and fences
+  signalled after the device stopped reach no one. The renderer gets the device's fence ids, from
+  a counter that never restarts, not the guest's, which start again at 1 each boot: a fence of
+  the last boot that the renderer signals after the next one started (fence 4000 on context 1,
+  ring 0) is known by its id and completes nothing, where with the guest's ids it would have
+  completed the new boot's requests up to 4000 before their work was done. Between a reset and
+  the next boot's first post, host screenshots and streams show black instead of the last boot's
+  final frame; a Vulkan-only renderer's post notices are held until the renderer posts a buffer
+  of the new boot (a color buffer's handle can be the guest's resource id, which every boot
+  allocates alike, so creation of that id counts too), and a notice already under way when the
+  hold is set finishes before the screen goes black. Before, once the new boot signalled fences,
+  screenshots failed (`Failed to read from ColorBuffer:3, not found`) until its first post. An
+  earlier measurement had `adb reboot` 0.3 s slower with this change; that was the benchmark: its
+  all-black test (0.3 s a screenshot) ran on every poll of the black screen, and it timed
+  `sys.boot_completed` only after the first frame. Numbers in
   [benchmarks](benchmarks.md#emulator-internals).
 
 ## Development

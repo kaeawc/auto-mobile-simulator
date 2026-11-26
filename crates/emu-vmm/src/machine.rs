@@ -476,6 +476,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
             renderer: r,
             shm: (GPU_SHM_BASE, GPU_SHM_SIZE),
             display: spec.display.clone(),
+            verbose: spec.verbose,
         });
         slots[slots::GPU as usize] = Some(Box::new(gpu));
     }

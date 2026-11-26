@@ -80,6 +80,9 @@ pub struct GpuConfig {
     /// Guest physical base and size of the host-visible region.
     pub shm: (u64, u64),
     pub display: Arc<dyn DisplaySink>,
+    /// Timing of each activation on stderr (`-verbose`): the last boot's release, the first
+    /// command and the first fence.
+    pub verbose: bool,
 }
 
 enum Event {
@@ -255,6 +258,7 @@ impl VirtioDevice for Gpu {
             scanout: None,
             pending: Vec::new(),
             fence_ids: FenceIds::after(&LAST_FENCE_ID),
+            timing: Timing::new(),
             req: Vec::new(),
             body: Vec::new(),
         };
@@ -489,10 +493,30 @@ struct Worker {
     scanout: Option<Scanout>,
     pending: Vec<Pending>,
     fence_ids: FenceIds,
+    timing: Timing,
     /// The current control request, reused across requests (command streams are KBs to MBs).
     req: Vec<u8>,
     /// The current reply's payload after its header, reused likewise (most replies have none).
     body: Vec<u8>,
+}
+
+/// When this activation's first command came and its first fence signalled (`-verbose`).
+struct Timing {
+    activated: Instant,
+    first_command: bool,
+    /// The first fence made: its id and when.
+    first_fence: Option<(u64, Instant)>,
+    fence_reported: bool,
+}
+
+impl Timing {
+    fn new() -> Timing {
+        Timing { activated: Instant::now(), first_command: false, first_fence: None, fence_reported: false }
+    }
+
+    fn ms(&self, t: Instant) -> u128 {
+        t.saturating_duration_since(self.activated).as_millis()
+    }
 }
 
 impl Worker {
@@ -541,7 +565,7 @@ impl Worker {
             let _ = Vm::unmap_raw(ipa, len);
             let _ = r.unmap(id);
         }
-        if trace() || unsignalled > 0 {
+        if self.cfg.verbose || trace() || unsignalled > 0 {
             eprintln!(
                 "emu: gpu reset: {} mappings removed in {} ms, {} contexts and {} resources left for the next boot; {unsignalled} of {waited} fences never signalled",
                 release.unmap.len(),
@@ -558,14 +582,22 @@ impl Worker {
     fn release_leftovers(&self) {
         let left = std::mem::take(&mut *leftovers());
         let r = &self.cfg.renderer;
+        let t = Instant::now();
         for &id in &left.resources {
             r.resource_unref(id);
         }
+        let unref = t.elapsed();
         for &ctx in &left.contexts {
             r.context_destroy(ctx);
         }
-        if trace() {
-            eprintln!("gpu: released {} resources and {} contexts of the last boot", left.resources.len(), left.contexts.len());
+        if self.cfg.verbose || trace() {
+            eprintln!(
+                "emu: gpu: released {} resources in {} ms and {} contexts in {} ms of the last boot",
+                left.resources.len(),
+                unref.as_millis(),
+                left.contexts.len(),
+                (t.elapsed() - unref).as_millis()
+            );
         }
     }
 
@@ -650,6 +682,7 @@ impl Worker {
                     eprintln!("gpu: fence {} for the guest's {}", f.fence_id, hdr.fence_id);
                 }
                 if self.cfg.renderer.create_fence(f).is_ok() {
+                    self.timing.first_fence.get_or_insert((f.fence_id, Instant::now()));
                     self.pending.push(Pending { timeline, fence_id: f.fence_id, head: chain.head, len });
                     continue;
                 }
@@ -673,6 +706,18 @@ impl Worker {
             );
         }
         let done = complete(&mut self.pending, &self.fence_ids, &f);
+        if let (false, true, Some((id, made))) = (self.timing.fence_reported, self.cfg.verbose, self.timing.first_fence)
+            && !self.fence_ids.stale(&f)
+            && f.fence_id >= id
+        {
+            self.timing.fence_reported = true;
+            let now = Instant::now();
+            eprintln!(
+                "emu: gpu: first fence signalled {} ms after it was made ({} ms after activation)",
+                now.saturating_duration_since(made).as_millis(),
+                self.timing.ms(now)
+            );
+        }
         for p in &done {
             let _ = self.ctrl.add_used(&self.mem, p.head, p.len);
         }
@@ -688,6 +733,12 @@ impl Worker {
     /// Runs one control request; returns the response type. A response payload (after the
     /// header the caller writes) goes into `body`, which arrives empty.
     fn handle(&mut self, h: &Hdr, req: &mut [u8], body: &mut Vec<u8>) -> u32 {
+        if !self.timing.first_command {
+            self.timing.first_command = true;
+            if self.cfg.verbose {
+                eprintln!("emu: gpu: first command {:#06x} {} ms after activation", h.typ, self.timing.ms(Instant::now()));
+            }
+        }
         let r = &self.cfg.renderer;
         let ok = cmd::OK_NODATA;
         let or = |res: Result<(), emu_gfxstream::Error>, err: u32| if res.is_ok() { ok } else { err };
