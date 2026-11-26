@@ -885,6 +885,21 @@ impl Renderer {
         self.gl.load(Ordering::Relaxed)
     }
 
+    /// The handle of the color buffer the renderer posted last (0 before any post). A different
+    /// handle means a new post; a new post of the same buffer keeps it.
+    pub fn last_posted_color_buffer(&self) -> Result<u32> {
+        let f = self.fb_api()?;
+        // SAFETY: getFB returns the renderer's singleton or null; getLastPostedColorBuffer is a
+        // member function taking `this` first (Itanium ABI).
+        unsafe {
+            let fb = (f.get_fb)();
+            if fb.is_null() {
+                return Err(Error::Call("FrameBuffer::getFB", 0));
+            }
+            Ok((f.last)(fb))
+        }
+    }
+
     /// The last color buffer the renderer posted (host composition's output), read back as
     /// RGBA, `width` x `height`, top row first.
     pub fn read_last_posted(&self, width: u32, height: u32) -> Result<Vec<u8>> {

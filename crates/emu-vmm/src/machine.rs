@@ -40,6 +40,9 @@ pub struct GpuSpec {
 
 static RENDERER: std::sync::OnceLock<Arc<emu_gfxstream::Renderer>> = std::sync::OnceLock::new();
 
+/// A Vulkan-only renderer's post notices (see `init_renderer`).
+static TICKER: std::sync::OnceLock<Arc<crate::display::PostTicker>> = std::sync::OnceLock::new();
+
 /// Post notices of a Vulkan-only renderer ([`crate::display::PostTicker`]): at most one per
 /// display frame (60 Hz) while the renderer signals fences, and for 50 ms (three frames) after.
 const POST_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
@@ -149,6 +152,9 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     let ticker = vulkan_only
         .then(|| crate::display::PostTicker::start(spec.display.clone(), spec.width, spec.height, POST_NOTICE_INTERVAL, POST_NOTICE_TAIL));
     let fences = virtio::gpu::fence_handler();
+    if let Some(t) = &ticker {
+        let _ = TICKER.set(t.clone());
+    }
     let fences: Arc<dyn Fn(emu_gfxstream::Fence) + Send + Sync> = match ticker {
         Some(t) => Arc::new(move |f| {
             fences(f);
@@ -508,6 +514,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
             renderer: r,
             shm: (GPU_SHM_BASE, GPU_SHM_SIZE),
             display: spec.display.clone(),
+            verbose: spec.verbose,
         });
         slots[slots::GPU as usize] = Some(Box::new(gpu));
     }
@@ -608,7 +615,49 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     drop(vm);
     drop(as_area);
     drop(mem);
+    if let (StopReason::Reset, Some(spec)) = (&reason, &cfg.gpu) {
+        blank_until_next_post(&*spec.display, spec.verbose);
+    }
     Ok(Outcome { reason, uptime: started.elapsed(), exits })
+}
+
+/// After a guest reset, the screen is black until the next boot posts, not the last boot's final
+/// frame. A Vulkan-only renderer's post notices are held until then too: they come with fences,
+/// which the next boot signals well before its first post, and would have readers read back the
+/// last boot's final post, which the reset freed. The next boot has posted once the last post is
+/// another color buffer, or the same handle on a buffer it created (handles can be resource ids,
+/// which every boot allocates alike); in the second case a reader may see that buffer before its
+/// first post.
+fn blank_until_next_post(display: &dyn crate::display::DisplaySink, verbose: bool) {
+    let hold = next_post_hold(verbose);
+    hold_then_blank(display, hold.as_ref().map(|(t, h)| (&**t, h.clone())));
+}
+
+/// The Vulkan-only renderer's ticker and a hold met once the next boot posts (none for another
+/// renderer).
+fn next_post_hold(verbose: bool) -> Option<(Arc<crate::display::PostTicker>, crate::display::Hold)> {
+    let (ticker, r) = (TICKER.get()?, RENDERER.get()?);
+    let stale = r.last_posted_color_buffer().ok()?;
+    virtio::gpu::watch_for_resource(stale);
+    let r = r.clone();
+    let hold: crate::display::Hold = Arc::new(move || {
+        let Ok(cb) = r.last_posted_color_buffer() else { return false };
+        let posted = cb != 0 && (cb != stale || virtio::gpu::resource_created(stale));
+        if posted && verbose {
+            eprintln!("emu: host frames resume: color buffer {cb} posted (the last boot's last was {stale})");
+        }
+        posted
+    });
+    Some((ticker.clone(), hold))
+}
+
+/// Holds the ticker's notices, then blanks: in the other order a notice between the two would
+/// have readers read the last boot's post back over the black frame.
+fn hold_then_blank(display: &dyn crate::display::DisplaySink, hold: Option<(&crate::display::PostTicker, crate::display::Hold)>) {
+    if let Some((ticker, until)) = hold {
+        ticker.hold_until(until);
+    }
+    display.blank();
 }
 
 #[cfg(test)]
@@ -630,6 +679,35 @@ mod tests {
     fn idle_cpus() -> Arc<Cpus> {
         let wakers = Arc::new(Wakers::new(1, HvVcpus::new(1), WakeMode::from_env()));
         Arc::new(Cpus::new(Bus::new(), wakers, 0))
+    }
+
+    /// A display that notes, when it is blanked, whether the ticker was already holding.
+    #[derive(Default)]
+    struct Blanks {
+        ticker: std::sync::OnceLock<Arc<crate::display::PostTicker>>,
+        held_at_blank: Mutex<Vec<bool>>,
+    }
+
+    impl crate::display::DisplaySink for Blanks {
+        fn present(&self, _: u32, _: u32, _: u32, _: u32, _: &[u8]) {}
+        fn blank(&self) {
+            let held = self.ticker.get().is_some_and(|t| t.holding());
+            self.held_at_blank.lock().unwrap_or_else(PoisonError::into_inner).push(held);
+        }
+    }
+
+    #[test]
+    fn a_reset_holds_post_notices_before_it_blanks() {
+        let display = Arc::new(Blanks::default());
+        let ticker = crate::display::PostTicker::start(display.clone(), 720, 1280, Duration::from_millis(1), Duration::from_millis(20));
+        let _ = display.ticker.set(ticker.clone());
+        hold_then_blank(&*display, Some((&ticker, Arc::new(|| false))));
+        assert_eq!(*display.held_at_blank.lock().unwrap_or_else(PoisonError::into_inner), [true]);
+        ticker.stop();
+        // Without a Vulkan-only renderer there is nothing to hold; the screen still goes black.
+        let other = Blanks::default();
+        hold_then_blank(&other, None);
+        assert_eq!(*other.held_at_blank.lock().unwrap_or_else(PoisonError::into_inner), [false]);
     }
 
     #[test]

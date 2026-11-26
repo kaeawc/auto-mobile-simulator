@@ -156,6 +156,29 @@ in [android.md](android.md#performance-notes).
 | Whole-disk FITRIM | | 90 ms | M-series Mac |
 | Vulkan-only renderer: warm boot of a 1080×2400 phone, median (runs) | 3.7 s (3.7, 3.5, 3.7) | 3.3 s (3.3, 3.3, 3.3) | M3 Max, 2026-11-25, `EMU_RENDERER_GL=1 scripts/android-bench.sh` against without |
 | Vulkan-only renderer: peak RSS of that boot | 3262 MB (3279, 1939, 3262) | 2014 MB (2044, 2014, 1945) | same runs |
+| GPU state released on reset: hard guest reset of a 720×1280 API 36 phone, trigger to the next boot's first host frame, median (runs) | never (boot not complete in 120 s) | 3.26 s (3.36, 3.12, 3.26) | M3 Max, 2026-11-25, host load 7 to 9, `scripts/android-reset-bench.sh <avd> hard 3` |
+| Same, trigger to `sys.boot_completed` | never | 2.96 s (3.13, 2.96, 2.94) | same runs |
+| Same change, `adb reboot`: trigger to first host frame / to `sys.boot_completed`, median of 8 (two processes, 4 reboots each) | 3.92 / 3.74 s (3.72 to 4.12 / 3.61 to 3.99) | 4.06 / 3.88 s (3.65 to 4.18 / 3.61 to 4.08) | same AVD and hour, builds interleaved, host load 6 to 10, `scripts/android-reset-bench.sh <avd> reboot 4` |
+| Same, a second interleaved set at host load 13 to 66 | 4.07 / 3.97 s (3.78 to 4.74 / 3.78 to 4.58) | 4.07 / 3.91 s (3.84 to 4.23 / 3.78 to 4.06) | same AVD and hour |
+| Same change, `kill -INT` to process exit (exit status) | 0.13 s (0.14, 0.12, 0.13; all 0) | 0.13 s (0.13, 0.14, 0.13; all 0) | same AVD and hour, host load 6 to 8, `scripts/android-reset-bench.sh <avd> exit 3` |
+
+The reset rows come from `scripts/android-reset-bench.sh` with `EMU` set to each build (the
+change's parent and the change, release builds, 16 cores). A hard reset is
+`echo b > /proc/sysrq-trigger` under `adb root`. Every time is from the trigger, so it includes
+what emu does between the old boot's last instruction and the new boot's first (with this change,
+the GPU teardown and the black frame); for `adb reboot` it also includes the guest's orderly
+shutdown, about 1.0 s on both builds. The first host frame is the first `adb emu screenshot`
+after emu's `-verbose` log prints `stopped after …: Reset` (polled every 0.1 s) that is neither
+the frame taken just before the trigger nor all black: the next boot's first content, by the
+same test on both builds (before the change the screen kept the last boot's final frame until
+then, after it black). `sys.boot_completed` is polled beside it. Before the change a hard reset
+never booted; a frame that differed did show (0.60 s), but not the next boot's. For
+`adb reboot` the two sets disagree in sign (+0.14 / +0.13 s, then 0.00 / -0.06 s), within
+the spread between rounds of one build (0.18 s): no cost is measured. These rows replace runs
+that timed from the Reset line, which this change prints after its own teardown, ran the
+0.3 s all-black test on every poll of a black screen (so only the build that shows black
+polled slowly), and timed `sys.boot_completed` only after the first frame; those runs had
+`adb reboot` about 0.3 s slower with the change.
 
 The `--ignored` benches run on any host:
 

@@ -59,6 +59,10 @@ pub trait DisplaySink: Send + Sync {
     fn set_readback(&self, readback: Readback) {
         let _ = readback;
     }
+
+    /// The guest reset: the screen goes black until the next boot shows a frame, rather than
+    /// keep the last boot's final frame (or a posted frame the renderer has since freed).
+    fn blank(&self) {}
 }
 
 /// How long a store goes unread before it frees its frame-sized buffers.
@@ -393,6 +397,20 @@ impl DisplaySink for FrameStore {
     fn set_readback(&self, readback: Readback) {
         let _ = self.readback.set(readback);
     }
+
+    /// An opaque black frame of the current size, presented as pixels (nothing before the first
+    /// frame).
+    fn blank(&self) {
+        let (width, height, frames) = self.geometry();
+        if frames == 0 || width == 0 || height == 0 {
+            return;
+        }
+        self.update(width, height, width * 4, PixelFormat::RGBA_VIRTIO, false, |kept| {
+            kept.clear();
+            kept.extend(std::iter::repeat_n([0, 0, 0, 0xff], width as usize * height as usize).flatten());
+            true
+        });
+    }
 }
 
 /// Post notices for a renderer that can't make them: a Vulkan-only renderer, whose post callback
@@ -406,7 +424,13 @@ impl DisplaySink for FrameStore {
 pub struct PostTicker {
     state: Mutex<TickState>,
     wake: Condvar,
+    /// Signalled when a notice given outside the lock ends ([`TickState::noticing`]).
+    noticed: Condvar,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
+
+/// See [`PostTicker::hold_until`].
+pub type Hold = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[derive(Default)]
 struct TickState {
@@ -415,18 +439,46 @@ struct TickState {
     /// The thread is waiting for a poke (a poke then has to wake it).
     idle: bool,
     stop: bool,
+    hold: Option<Hold>,
+    /// The thread is giving a notice ([`DisplaySink::posted`], outside the lock).
+    noticing: bool,
 }
 
 impl PostTicker {
     /// Starts the notice thread for a `width` x `height` display.
     pub fn start(sink: Arc<dyn DisplaySink>, width: u32, height: u32, interval: Duration, tail: Duration) -> Arc<PostTicker> {
-        let ticker = Arc::new(PostTicker { state: Mutex::new(TickState::default()), wake: Condvar::new() });
+        let ticker = Arc::new(PostTicker {
+            state: Mutex::new(TickState::default()),
+            wake: Condvar::new(),
+            noticed: Condvar::new(),
+            thread: Mutex::new(None),
+        });
         let t = ticker.clone();
         let spawned = std::thread::Builder::new().name("post-ticker".into()).spawn(move || t.run(&*sink, width, height, interval, tail));
-        if let Err(e) = spawned {
-            eprintln!("emu: post-ticker: {e}; host frames won't update");
+        match spawned {
+            Ok(h) => *ticker.thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(h),
+            Err(e) => eprintln!("emu: post-ticker: {e}; host frames won't update"),
         }
         ticker
+    }
+
+    /// Holds notices back until `until` returns true (asked before each one, until it does).
+    /// After a guest reset the renderer's last post is the old boot's, maybe freed: a notice then
+    /// would have readers read it back, until the new boot posts. Returns once no notice is
+    /// being given, so none reaches the sink after this returns until `until` is met (not from
+    /// the sink's `posted`, which would wait for itself).
+    pub fn hold_until(&self, until: Hold) {
+        let mut s = self.lock();
+        s.hold = Some(until);
+        while s.noticing {
+            s = self.noticed.wait(s).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Whether notices are held ([`PostTicker::hold_until`]), for the machine's tests.
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn holding(&self) -> bool {
+        self.lock().hold.is_some()
     }
 
     fn lock(&self) -> MutexGuard<'_, TickState> {
@@ -444,15 +496,19 @@ impl PostTicker {
         }
     }
 
-    /// Ends the thread (after its current notice).
+    /// Ends the thread after its current notice and waits for it (not from the thread itself).
     pub fn stop(&self) {
         self.lock().stop = true;
         self.wake.notify_one();
+        let thread = self.thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some(h) = thread {
+            let _ = h.join();
+        }
     }
 
     fn run(&self, sink: &dyn DisplaySink, width: u32, height: u32, interval: Duration, tail: Duration) {
         loop {
-            {
+            let hold = {
                 let mut s = self.lock();
                 loop {
                     if s.stop {
@@ -467,8 +523,38 @@ impl PostTicker {
                         }
                     }
                 }
+                s.hold.clone()
+            };
+            // The hold is asked unlocked: it may call into the renderer, whose fences poke.
+            let met = hold.as_ref().is_none_or(|h| h());
+            let notice = {
+                let mut s = self.lock();
+                // Checked again under the lock: a hold set since it was read holds this notice
+                // too, or the notice could land after the reset's black frame.
+                let notice = met
+                    && match (&s.hold, &hold) {
+                        (None, _) => true,
+                        (Some(cur), Some(h)) => Arc::ptr_eq(cur, h),
+                        (Some(_), None) => false,
+                    };
+                if notice {
+                    s.hold = None;
+                    s.noticing = true;
+                }
+                notice
+            };
+            if notice {
+                // Ends the notice even if the sink panics, so a hold never waits for it forever.
+                struct Noticed<'a>(&'a PostTicker);
+                impl Drop for Noticed<'_> {
+                    fn drop(&mut self) {
+                        self.0.lock().noticing = false;
+                        self.0.noticed.notify_all();
+                    }
+                }
+                let _end = Noticed(self);
+                sink.posted(width, height);
             }
-            sink.posted(width, height);
             std::thread::sleep(interval);
         }
     }
@@ -524,6 +610,125 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         assert!(posts.0.load(Ordering::Relaxed) > after);
         ticker.stop();
+    }
+
+    #[test]
+    fn a_held_ticker_gives_no_notice_until_its_hold_is_met() {
+        let posts = Arc::new(Posts::default());
+        let ticker = PostTicker::start(posts.clone(), 2560, 1600, Duration::from_millis(2), Duration::from_millis(20));
+        // After a reset: fences of the new boot, but no new post yet.
+        let posted_new = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let asked = Arc::new(AtomicUsize::new(0));
+        ticker.hold_until({
+            let (posted_new, asked) = (posted_new.clone(), asked.clone());
+            Arc::new(move || {
+                asked.fetch_add(1, Ordering::Relaxed);
+                posted_new.load(Ordering::Relaxed)
+            })
+        });
+        let fences = |ms| {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                ticker.poke();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        fences(40);
+        assert_eq!(posts.0.load(Ordering::Relaxed), 0, "held: no notice");
+        assert!(asked.load(Ordering::Relaxed) > 0, "the hold was asked");
+        // The new boot posted: notices resume, and the hold is dropped (asked no more).
+        posted_new.store(true, Ordering::Relaxed);
+        fences(40);
+        assert!(posts.0.load(Ordering::Relaxed) > 0, "released");
+        let asked_then = asked.load(Ordering::Relaxed);
+        posted_new.store(false, Ordering::Relaxed);
+        fences(20);
+        assert_eq!(asked.load(Ordering::Relaxed), asked_then, "a met hold is gone");
+        ticker.stop();
+    }
+
+    /// A sink whose notices wait at a gate until it opens.
+    #[derive(Default)]
+    struct Gated {
+        posts: AtomicUsize,
+        open: Mutex<bool>,
+        opened: Condvar,
+    }
+
+    impl DisplaySink for Gated {
+        fn present(&self, _: u32, _: u32, _: u32, _: u32, _: &[u8]) {}
+        fn posted(&self, _: u32, _: u32) {
+            self.posts.fetch_add(1, Ordering::SeqCst);
+            let mut open = self.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*open {
+                open = self.opened.wait(open).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+    }
+
+    #[test]
+    fn a_hold_waits_out_a_notice_already_under_way() {
+        let sink = Arc::new(Gated::default());
+        let ticker = PostTicker::start(sink.clone(), 2560, 1600, Duration::from_millis(1), Duration::from_secs(60));
+        ticker.poke();
+        let start = Instant::now();
+        while sink.posts.load(Ordering::SeqCst) == 0 {
+            assert!(start.elapsed() < Duration::from_secs(5), "no notice");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // A reset holds notices while one is being given (it read no hold).
+        let returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder = std::thread::spawn({
+            let (ticker, returned) = (ticker.clone(), returned.clone());
+            move || {
+                ticker.hold_until(Arc::new(|| false));
+                returned.store(true, Ordering::SeqCst);
+            }
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!returned.load(Ordering::SeqCst), "the hold returned while a notice was under way");
+        *sink.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        sink.opened.notify_all();
+        holder.join().expect("holder");
+        let n = sink.posts.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(sink.posts.load(Ordering::SeqCst), n, "a notice after the hold returned");
+        ticker.stop();
+    }
+
+    #[test]
+    fn stopping_a_ticker_ends_its_thread() {
+        let posts = Arc::new(Posts::default());
+        let ticker = PostTicker::start(posts.clone(), 2560, 1600, Duration::from_millis(1), Duration::from_secs(60));
+        ticker.poke(); // busy: noticing every millisecond for a minute
+        std::thread::sleep(Duration::from_millis(10));
+        let t = Instant::now();
+        ticker.stop();
+        assert!(t.elapsed() < Duration::from_secs(1), "stop took {:?}", t.elapsed());
+        let n = posts.0.load(Ordering::Relaxed);
+        assert!(n > 0);
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(posts.0.load(Ordering::Relaxed), n, "no notice after stop returned");
+        ticker.stop(); // twice is fine
+    }
+
+    #[test]
+    fn blanking_replaces_the_last_boots_frame_with_black() {
+        let store = FrameStore::default();
+        store.blank();
+        assert_eq!(store.frames(), 0, "nothing shown yet: nothing to blank");
+        // The last boot's final frame was posted (its pixels the renderer's, maybe freed by now).
+        store.set_readback(Box::new(|_, _, buf| {
+            buf.fill(0x7f);
+            true
+        }));
+        store.posted(4, 2);
+        assert_eq!(store.latest(|c| c.rgba[0]), Some(0x7f));
+        store.blank();
+        let s = store.snapshot();
+        assert!(!s.posted && (s.width, s.height, s.frames) == (4, 2, 2));
+        let rgba = store.latest(|c| c.rgba.clone()).expect("a frame");
+        assert_eq!(rgba, [0, 0, 0, 0xff].repeat(8), "opaque black, not the readback");
     }
 
     #[test]

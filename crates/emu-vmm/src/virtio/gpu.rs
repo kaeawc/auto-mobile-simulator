@@ -3,10 +3,18 @@
 //!
 //! Requests run on one worker thread. A request carrying a fence is answered only after the
 //! renderer signals that fence (its callback posts to the worker), per (context, ring) timeline.
-use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+//! The renderer gets the device's own fence ids, not the guest's ([`FenceIds`]).
+//!
+//! The renderer is process-wide and outlives the device: a reset (the driver's, or the machine's
+//! when the guest reboots) gives back everything the guest made in it ([`Worker::teardown`],
+//! [`Leftovers`]), so the next boot starts from a clean renderer whatever the last one left
+//! behind.
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use emu_gfxstream::{Backing, Box3, Fence, Renderer, ResourceCreateArgs};
 use emu_hvf::{GuestRam, Vm};
@@ -72,6 +80,9 @@ pub struct GpuConfig {
     /// Guest physical base and size of the host-visible region.
     pub shm: (u64, u64),
     pub display: Arc<dyn DisplaySink>,
+    /// Timing of each activation on stderr (`-verbose`): the last boot's release, the first
+    /// command and the first fence.
+    pub verbose: bool,
 }
 
 enum Event {
@@ -80,21 +91,93 @@ enum Event {
     Stop,
 }
 
-/// Where the renderer's fence callback posts; replaced when the device (re)activates.
-static FENCE_SINK: Mutex<Option<Sender<Event>>> = Mutex::new(None);
+/// Where the renderer's fence callback posts: the active device's worker, tagged with that
+/// device's generation. Set when the device activates and cleared when its worker stops, so a
+/// fence the renderer signals for a torn-down device reaches no one.
+static FENCE_SINK: Mutex<Option<(u64, Sender<Event>)>> = Mutex::new(None);
+
+/// Generations of [`Gpu`] devices (one per machine run), for [`FENCE_SINK`].
+static GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn fence_sink() -> MutexGuard<'static, Option<(u64, Sender<Event>)>> {
+    FENCE_SINK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Sends the renderer's fences to `tx`, the worker of device generation `generation`.
+fn route_fences(generation: u64, tx: Sender<Event>) {
+    *fence_sink() = Some((generation, tx));
+}
+
+/// Stops sending fences to generation `generation`; a newer device's route stays.
+fn unroute_fences(generation: u64) {
+    let mut sink = fence_sink();
+    if sink.as_ref().is_some_and(|(g, _)| *g == generation) {
+        *sink = None;
+    }
+}
 
 /// Routes renderer fences to the active GPU worker. Pass to `Renderer::init`.
 pub fn fence_handler() -> Arc<dyn Fn(Fence) + Send + Sync> {
     Arc::new(|f| {
-        if let Some(tx) = FENCE_SINK.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some((_, tx)) = fence_sink().as_ref() {
             let _ = tx.send(Event::Fence(f));
         }
     })
 }
 
+/// Longest a reset waits for the renderer to signal the fences the guest still waits on, so the
+/// work they stand for is done before the guest's mappings go and its contexts are released. They
+/// normally signal within a frame; a renderer stuck on one costs a reset (or a shutdown) this
+/// long, no more. One signalled later completes nothing ([`FenceIds`]).
+const FENCE_SETTLE: Duration = Duration::from_millis(100);
+
+/// The last fence id any GPU device gave the renderer (see [`FenceIds`]).
+static LAST_FENCE_ID: AtomicU64 = AtomicU64::new(0);
+
+/// The fence ids one activation of the device gives the renderer: one more than the last, from a
+/// process-wide counter, instead of the guest's own ids. A fence the renderer still holds from
+/// before a reset (stopping waits [`FENCE_SETTLE`] for them, no longer) can signal at any time
+/// after, and a `Fence` says nothing of which boot made it; the guest's ids start again at 1 each
+/// boot, so with them a late fence (ctx 1, ring 0, id 4000) would complete the next boot's
+/// requests up to 4000 on that timeline before their work was done. Every id of this activation
+/// is above `base`, the last id given out before it, so an earlier boot's fence is known
+/// ([`FenceIds::stale`]) and retires nothing. On a timeline the ids keep the order the requests
+/// arrived in, which is the order the renderer signals them; the guest's id goes back in the
+/// reply, which is written before the fence is made.
+#[derive(Clone, Copy)]
+struct FenceIds {
+    counter: &'static AtomicU64,
+    base: u64,
+}
+
+impl FenceIds {
+    /// Ids for an activation starting now: every one above those `counter` gave out before.
+    fn after(counter: &'static AtomicU64) -> FenceIds {
+        FenceIds { counter, base: counter.load(Ordering::Acquire) }
+    }
+
+    fn next(&self) -> u64 {
+        self.counter.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Whether `f` is an earlier activation's fence (one the renderer signalled after its reset).
+    fn stale(&self, f: &Fence) -> bool {
+        f.fence_id <= self.base
+    }
+}
+
+/// The renderer fence for request `h`, with id `id`, and the timeline it signals on.
+fn fence_for(h: &Hdr, id: u64) -> ((u32, u8), Fence) {
+    let ringed = h.flags & FLAG_RING_IDX != 0;
+    let timeline = if ringed { (h.ctx_id, h.ring_idx) } else { (0, 0) };
+    let flags = emu_gfxstream::FENCE_FLAG | if ringed { emu_gfxstream::FENCE_FLAG_RING_IDX } else { 0 };
+    (timeline, Fence { flags, fence_id: id, ctx_id: timeline.0, ring_idx: timeline.1 })
+}
+
 pub struct Gpu {
     cfg: Arc<GpuConfig>,
     num_capsets: u32,
+    generation: u64,
     events: Sender<Event>,
     rx: Option<Receiver<Event>>,
     worker: Option<JoinHandle<Receiver<Event>>>,
@@ -104,9 +187,12 @@ impl Gpu {
     pub fn new(cfg: GpuConfig) -> Gpu {
         let num_capsets = emu_gfxstream::capset::ALL.iter().filter(|&&c| cfg.renderer.capset_info(c).is_some()).count() as u32;
         let (events, rx) = channel();
-        Gpu { cfg: Arc::new(cfg), num_capsets, events, rx: Some(rx), worker: None }
+        let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+        Gpu { cfg: Arc::new(cfg), num_capsets, generation, events, rx: Some(rx), worker: None }
     }
 
+    /// Stops the worker once it has given the guest's renderer state back, then stops routing
+    /// fences to it.
     fn stop_worker(&mut self) {
         if let Some(h) = self.worker.take() {
             let _ = self.events.send(Event::Stop);
@@ -115,6 +201,7 @@ impl Gpu {
                 self.rx = Some(rx);
             }
         }
+        unroute_fences(self.generation);
     }
 }
 
@@ -155,7 +242,7 @@ impl VirtioDevice for Gpu {
         let cursor = act.queues.get(1).copied().flatten();
         self.stop_worker();
         let rx = self.rx.take().ok_or("gpu worker receiver missing")?;
-        *FENCE_SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(self.events.clone());
+        route_fences(self.generation, self.events.clone());
         let capsets: Vec<u32> =
             emu_gfxstream::capset::ALL.iter().copied().filter(|&c| self.cfg.renderer.capset_info(c).is_some()).collect();
         let event_idx = act.features & F_RING_EVENT_IDX != 0;
@@ -167,8 +254,11 @@ impl VirtioDevice for Gpu {
             cfg: self.cfg.clone(),
             capsets,
             resources: HashMap::new(),
+            contexts: HashSet::new(),
             scanout: None,
             pending: Vec::new(),
+            fence_ids: FenceIds::after(&LAST_FENCE_ID),
+            timing: Timing::new(),
             req: Vec::new(),
             body: Vec::new(),
         };
@@ -176,8 +266,9 @@ impl VirtioDevice for Gpu {
             .name("gpu".into())
             .spawn(move || {
                 crate::device_thread();
+                w.release_leftovers();
                 w.run(&rx);
-                w.teardown();
+                w.teardown(&rx);
                 rx
             })
             .map_err(|e| e.to_string())?;
@@ -213,9 +304,107 @@ struct Scanout {
 struct Pending {
     /// (ctx, ring) for ring-indexed fences; (0, 0) for the global timeline.
     timeline: (u32, u8),
+    /// The renderer's id for the fence ([`FenceIds`]), not the guest's.
     fence_id: u64,
     head: u16,
     len: u32,
+}
+
+/// Takes the requests signalled fence `f` completes out of `pending`: those on its timeline with
+/// a fence id up to its own.
+fn retire(pending: &mut Vec<Pending>, f: &Fence) -> Vec<Pending> {
+    let ringed = f.flags & emu_gfxstream::FENCE_FLAG_RING_IDX != 0;
+    let timeline = if ringed { (f.ctx_id, f.ring_idx) } else { (0, 0) };
+    let (done, rest) = std::mem::take(pending).into_iter().partition(|p| p.timeline == timeline && p.fence_id <= f.fence_id);
+    *pending = rest;
+    done
+}
+
+/// [`retire`] for a fence of this activation; an earlier one's ([`FenceIds::stale`]) retires
+/// nothing.
+fn complete(pending: &mut Vec<Pending>, ids: &FenceIds, f: &Fence) -> Vec<Pending> {
+    if ids.stale(f) { Vec::new() } else { retire(pending, f) }
+}
+
+/// What a reset gives back to the renderer, in the order it does. The guest's mappings of blobs
+/// (resource, guest physical address, length) go at once, so the guest never reaches memory the
+/// renderer frees. The rest waits for the device's next activation ([`Leftovers`]): the
+/// resources, whose iovecs point into guest RAM a machine reset frees, before the contexts, since
+/// an unref detaches the resource from the contexts it is attached to; then the contexts, whose
+/// ids and per-process renderer state (render threads, Vulkan instances) would otherwise outlive
+/// the boot, and make the next boot's contexts of the same ids fail ("Failed to create process
+/// resource"), leaving it without graphics. Each list is sorted.
+#[derive(Debug, Default, PartialEq)]
+struct Release {
+    unmap: Vec<(u32, u64, usize)>,
+    resources: Vec<u32>,
+    contexts: Vec<u32>,
+}
+
+/// Resources and contexts a reset left in the renderer, released when a GPU device next
+/// activates (on its worker, before the guest's first command), not at the reset. Destroying a
+/// context hands its Vulkan instances to the renderer's cleanup thread; at a shutdown the process
+/// then exits while that thread is still destroying them, racing the renderer's static
+/// destructors (a SIGSEGV at exit, in one of four stops). A reset is followed by an activation; a
+/// shutdown never is.
+static LEFTOVERS: Mutex<Leftovers> = Mutex::new(Leftovers { resources: Vec::new(), contexts: Vec::new() });
+
+#[derive(Debug, Default, PartialEq)]
+struct Leftovers {
+    resources: Vec<u32>,
+    contexts: Vec<u32>,
+}
+
+impl Leftovers {
+    /// Keeps `r`'s resources and contexts (its mappings are gone already) for the next release.
+    fn keep(&mut self, r: Release) {
+        self.resources.extend(r.resources);
+        self.contexts.extend(r.contexts);
+        for v in [&mut self.resources, &mut self.contexts] {
+            v.sort_unstable();
+            v.dedup();
+        }
+    }
+}
+
+fn leftovers() -> MutexGuard<'static, Leftovers> {
+    LEFTOVERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The resource id [`watch_for_resource`] watches for; 0 once created (or when watching none).
+static WATCHED: AtomicU32 = AtomicU32::new(0);
+
+/// After a reset: notes when the next boot creates resource `id`. The renderer's color buffers
+/// can take the guest's resource ids as their handles, and a boot allocates those the same way
+/// every time, so the next boot's buffer may get the handle of the last boot's final post: a
+/// different handle can't be the only sign of a new post.
+pub fn watch_for_resource(id: u32) {
+    WATCHED.store(id, Ordering::Relaxed);
+}
+
+/// Whether resource `id`, watched for with [`watch_for_resource`], has been created since.
+pub fn resource_created(id: u32) -> bool {
+    id != 0 && WATCHED.load(Ordering::Relaxed) != id
+}
+
+fn created(id: u32) {
+    let _ = WATCHED.compare_exchange(id, 0, Ordering::Relaxed, Ordering::Relaxed);
+}
+
+/// Empties the device's resource and context tables into a [`Release`].
+fn release_all(resources: &mut HashMap<u32, Resource>, contexts: &mut HashSet<u32>) -> Release {
+    let mut r = Release::default();
+    for (id, res) in resources.drain() {
+        if let Some((ipa, len)) = res.mapped {
+            r.unmap.push((id, ipa, len));
+        }
+        r.resources.push(id);
+    }
+    r.contexts.extend(contexts.drain());
+    r.unmap.sort_unstable();
+    r.contexts.sort_unstable();
+    r.resources.sort_unstable();
+    r
 }
 
 #[derive(Clone, Copy, Default)]
@@ -299,12 +488,35 @@ struct Worker {
     cfg: Arc<GpuConfig>,
     capsets: Vec<u32>,
     resources: HashMap<u32, Resource>,
+    /// Contexts the guest created and hasn't destroyed.
+    contexts: HashSet<u32>,
     scanout: Option<Scanout>,
     pending: Vec<Pending>,
+    fence_ids: FenceIds,
+    timing: Timing,
     /// The current control request, reused across requests (command streams are KBs to MBs).
     req: Vec<u8>,
     /// The current reply's payload after its header, reused likewise (most replies have none).
     body: Vec<u8>,
+}
+
+/// When this activation's first command came and its first fence signalled (`-verbose`).
+struct Timing {
+    activated: Instant,
+    first_command: bool,
+    /// The first fence made: its id and when.
+    first_fence: Option<(u64, Instant)>,
+    fence_reported: bool,
+}
+
+impl Timing {
+    fn new() -> Timing {
+        Timing { activated: Instant::now(), first_command: false, first_fence: None, fence_reported: false }
+    }
+
+    fn ms(&self, t: Instant) -> u128 {
+        t.saturating_duration_since(self.activated).as_millis()
+    }
 }
 
 impl Worker {
@@ -329,12 +541,63 @@ impl Worker {
         }
     }
 
-    fn teardown(&mut self) {
-        for (id, r) in self.resources.drain() {
-            if let Some((ipa, len)) = r.mapped {
-                let _ = Vm::unmap_raw(ipa, len);
-                let _ = self.cfg.renderer.unmap(id);
+    /// Empties the device once the fences the guest still waits on have signalled or
+    /// [`FENCE_SETTLE`] has passed: removes the guest's blob mappings and leaves its resources and
+    /// contexts for the next activation ([`Release`]). Writes nothing to guest memory: after a
+    /// reset the rings are no longer the device's.
+    fn teardown(&mut self, rx: &Receiver<Event>) {
+        let t = Instant::now();
+        let waited = self.pending.len();
+        let deadline = t + FENCE_SETTLE;
+        while !self.pending.is_empty() {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Event::Fence(f)) => drop(complete(&mut self.pending, &self.fence_ids, &f)),
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
+        }
+        let unsignalled = self.pending.len();
+        self.pending.clear();
+        self.scanout = None;
+        let r = &self.cfg.renderer;
+        let release = release_all(&mut self.resources, &mut self.contexts);
+        for &(id, ipa, len) in &release.unmap {
+            let _ = Vm::unmap_raw(ipa, len);
+            let _ = r.unmap(id);
+        }
+        if self.cfg.verbose || trace() || unsignalled > 0 {
+            eprintln!(
+                "emu: gpu reset: {} mappings removed in {} ms, {} contexts and {} resources left for the next boot; {unsignalled} of {waited} fences never signalled",
+                release.unmap.len(),
+                t.elapsed().as_millis(),
+                release.contexts.len(),
+                release.resources.len(),
+            );
+        }
+        leftovers().keep(release);
+    }
+
+    /// Releases what the last reset left in the renderer ([`Leftovers`]), before the guest's
+    /// first command.
+    fn release_leftovers(&self) {
+        let left = std::mem::take(&mut *leftovers());
+        let r = &self.cfg.renderer;
+        let t = Instant::now();
+        for &id in &left.resources {
+            r.resource_unref(id);
+        }
+        let unref = t.elapsed();
+        for &ctx in &left.contexts {
+            r.context_destroy(ctx);
+        }
+        if self.cfg.verbose || trace() {
+            eprintln!(
+                "emu: gpu: released {} resources in {} ms and {} contexts in {} ms of the last boot",
+                left.resources.len(),
+                unref.as_millis(),
+                left.contexts.len(),
+                (t.elapsed() - unref).as_millis()
+            );
         }
     }
 
@@ -414,16 +677,13 @@ impl Worker {
             }
             self.req = req;
             if hdr.flags & FLAG_FENCE != 0 {
-                let ringed = hdr.flags & FLAG_RING_IDX != 0;
-                let timeline = if ringed { (hdr.ctx_id, hdr.ring_idx) } else { (0, 0) };
-                let f = Fence {
-                    flags: emu_gfxstream::FENCE_FLAG | if ringed { emu_gfxstream::FENCE_FLAG_RING_IDX } else { 0 },
-                    fence_id: hdr.fence_id,
-                    ctx_id: if ringed { hdr.ctx_id } else { 0 },
-                    ring_idx: if ringed { hdr.ring_idx } else { 0 },
-                };
+                let (timeline, f) = fence_for(&hdr, self.fence_ids.next());
+                if trace() {
+                    eprintln!("gpu: fence {} for the guest's {}", f.fence_id, hdr.fence_id);
+                }
                 if self.cfg.renderer.create_fence(f).is_ok() {
-                    self.pending.push(Pending { timeline, fence_id: hdr.fence_id, head: chain.head, len });
+                    self.timing.first_fence.get_or_insert((f.fence_id, Instant::now()));
+                    self.pending.push(Pending { timeline, fence_id: f.fence_id, head: chain.head, len });
                     continue;
                 }
             }
@@ -436,29 +696,32 @@ impl Worker {
     fn complete_fences(&mut self, f: Fence) -> bool {
         if trace() {
             eprintln!(
-                "gpu: fence signaled id {} ctx {} ring {} flags {:#x} (pending {})",
+                "gpu: fence signaled id {} ctx {} ring {} flags {:#x} (pending {}){}",
                 f.fence_id,
                 f.ctx_id,
                 f.ring_idx,
                 f.flags,
-                self.pending.len()
+                self.pending.len(),
+                if self.fence_ids.stale(&f) { ", from before the reset" } else { "" }
             );
         }
-        let ringed = f.flags & emu_gfxstream::FENCE_FLAG_RING_IDX != 0;
-        let timeline = if ringed { (f.ctx_id, f.ring_idx) } else { (0, 0) };
-        let mut used = false;
-        let mut i = 0;
-        while i < self.pending.len() {
-            let p = &self.pending[i];
-            if p.timeline == timeline && p.fence_id <= f.fence_id {
-                let p = self.pending.remove(i);
-                let _ = self.ctrl.add_used(&self.mem, p.head, p.len);
-                used = true;
-            } else {
-                i += 1;
-            }
+        let done = complete(&mut self.pending, &self.fence_ids, &f);
+        if let (false, true, Some((id, made))) = (self.timing.fence_reported, self.cfg.verbose, self.timing.first_fence)
+            && !self.fence_ids.stale(&f)
+            && f.fence_id >= id
+        {
+            self.timing.fence_reported = true;
+            let now = Instant::now();
+            eprintln!(
+                "emu: gpu: first fence signalled {} ms after it was made ({} ms after activation)",
+                now.saturating_duration_since(made).as_millis(),
+                self.timing.ms(now)
+            );
         }
-        used
+        for p in &done {
+            let _ = self.ctrl.add_used(&self.mem, p.head, p.len);
+        }
+        !done.is_empty()
     }
 
     /// Guest memory entries (`addr: u64, len: u32, pad: u32`) → the renderer's iovecs, built in
@@ -470,6 +733,12 @@ impl Worker {
     /// Runs one control request; returns the response type. A response payload (after the
     /// header the caller writes) goes into `body`, which arrives empty.
     fn handle(&mut self, h: &Hdr, req: &mut [u8], body: &mut Vec<u8>) -> u32 {
+        if !self.timing.first_command {
+            self.timing.first_command = true;
+            if self.cfg.verbose {
+                eprintln!("emu: gpu: first command {:#06x} {} ms after activation", h.typ, self.timing.ms(Instant::now()));
+            }
+        }
         let r = &self.cfg.renderer;
         let ok = cmd::OK_NODATA;
         let or = |res: Result<(), emu_gfxstream::Error>, err: u32| if res.is_ok() { ok } else { err };
@@ -503,9 +772,14 @@ impl Worker {
                 let nlen = (le32(req, 24) as usize).min(64);
                 let init = le32(req, 28);
                 let name = req.get(32..32 + nlen).unwrap_or(&[]);
-                or(r.context_create(h.ctx_id, name, init), cmd::ERR_UNSPEC)
+                let res = r.context_create(h.ctx_id, name, init);
+                if res.is_ok() {
+                    self.contexts.insert(h.ctx_id);
+                }
+                or(res, cmd::ERR_UNSPEC)
             }
             cmd::CTX_DESTROY => {
+                self.contexts.remove(&h.ctx_id);
                 r.context_destroy(h.ctx_id);
                 ok
             }
@@ -606,6 +880,7 @@ impl Worker {
                 let Some(backing) = self.backing(req, 56, n) else { return cmd::ERR_INVALID_PARAMETER };
                 match r.create_blob(h.ctx_id, id, blob_mem, blob_flags, blob_id, size, backing) {
                     Ok(()) => {
+                        created(id);
                         self.resources.insert(id, Resource::default());
                         ok
                     }
@@ -662,6 +937,7 @@ impl Worker {
     fn create(&mut self, id: u32, args: ResourceCreateArgs, width: u32, height: u32, format: u32) -> u32 {
         match self.cfg.renderer.resource_create(args, &[]) {
             Ok(()) => {
+                created(id);
                 self.resources.insert(id, Resource { width, height, format, mapped: None });
                 cmd::OK_NODATA
             }
@@ -748,6 +1024,164 @@ mod tests {
         assert!(!wants_interrupt(&mem, &mut [(true, Some(&mut ctrl)), (true, Some(&mut cursor))]), "both suppressed");
         mem.write_u16(cd.cfg.avail, 0).expect("flags");
         assert!(wants_interrupt(&mem, &mut [(true, Some(&mut ctrl)), (true, None)]), "re-enabled");
+    }
+
+    fn pending(timeline: (u32, u8), fence_id: u64) -> Pending {
+        Pending { timeline, fence_id, head: fence_id as u16, len: 24 }
+    }
+
+    fn fence(ring: Option<(u32, u8)>, fence_id: u64) -> Fence {
+        let (ctx_id, ring_idx) = ring.unwrap_or((0, 0));
+        let flags = emu_gfxstream::FENCE_FLAG | if ring.is_some() { emu_gfxstream::FENCE_FLAG_RING_IDX } else { 0 };
+        Fence { flags, fence_id, ctx_id, ring_idx }
+    }
+
+    #[test]
+    fn a_fence_retires_its_own_timeline_up_to_its_id() {
+        let mut p = vec![pending((0, 0), 1), pending((0, 0), 3), pending((5, 1), 2), pending((5, 0), 2), pending((0, 0), 4)];
+        let ids = |v: &[Pending]| v.iter().map(|p| (p.timeline, p.fence_id)).collect::<Vec<_>>();
+        assert_eq!(ids(&retire(&mut p, &fence(None, 3))), [((0, 0), 1), ((0, 0), 3)]);
+        assert_eq!(ids(&retire(&mut p, &fence(Some((5, 1)), 9))), [((5, 1), 2)], "another ring of the context stays");
+        assert!(retire(&mut p, &fence(Some((6, 0)), 9)).is_empty(), "no requests on that timeline");
+        assert_eq!(ids(&p), [((5, 0), 2), ((0, 0), 4)]);
+    }
+
+    /// The renderer as far as fences go: it holds the fences it was given until told to signal.
+    #[derive(Default)]
+    struct FakeRenderer {
+        held: Vec<Fence>,
+    }
+
+    impl FakeRenderer {
+        /// What the worker does with a fenced request: a fence made with the activation's next id.
+        fn fenced(&mut self, ids: &FenceIds, pending: &mut Vec<Pending>, ctx: u32, ring: u8, guest_id: u64) {
+            let h = Hdr { typ: cmd::SUBMIT_3D, flags: FLAG_FENCE | FLAG_RING_IDX, fence_id: guest_id, ctx_id: ctx, ring_idx: ring };
+            let (timeline, f) = fence_for(&h, ids.next());
+            self.held.push(f);
+            pending.push(Pending { timeline, fence_id: f.fence_id, head: guest_id as u16, len: 24 });
+        }
+
+        /// Signals the fence it was given `nth` (0 first).
+        fn signal(&self, nth: usize) -> Fence {
+            self.held[nth]
+        }
+    }
+
+    #[test]
+    fn a_fence_from_before_a_reset_completes_nothing_of_the_next_boot() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let mut renderer = FakeRenderer::default();
+        let guest_ids = |v: &[Pending]| v.iter().map(|p| p.head).collect::<Vec<_>>();
+        // The last boot: fences up to the guest's 4000 on (ctx 1, ring 0); the last hasn't
+        // signalled when the reset drops what was pending.
+        let old = FenceIds::after(&COUNTER);
+        let mut pending = Vec::new();
+        for id in [3998, 3999, 4000] {
+            renderer.fenced(&old, &mut pending, 1, 0, id);
+        }
+        assert_eq!(guest_ids(&complete(&mut pending, &old, &renderer.signal(1))), [3998, 3999]);
+        pending.clear();
+        // The next boot, its fence ids from 1 again on the same timeline.
+        let new = FenceIds::after(&COUNTER);
+        for id in 1..=5 {
+            renderer.fenced(&new, &mut pending, 1, 0, id);
+        }
+        // The renderer signals the last boot's fence 4000 late: nothing of the new boot is done.
+        let late = renderer.signal(2);
+        assert!(new.stale(&late));
+        assert!(complete(&mut pending, &new, &late).is_empty(), "a late fence retired the next boot's requests");
+        assert_eq!(pending.len(), 5);
+        // The new boot's own fences retire its requests up to theirs, on their timeline.
+        assert_eq!(guest_ids(&complete(&mut pending, &new, &renderer.signal(5))), [1, 2, 3]);
+        assert!(!new.stale(&renderer.signal(3)));
+        renderer.fenced(&new, &mut pending, 2, 0, 6);
+        assert_eq!(guest_ids(&complete(&mut pending, &new, &renderer.signal(8))), [6], "another context's timeline");
+        assert_eq!(guest_ids(&complete(&mut pending, &new, &renderer.signal(7))), [4, 5]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_fence_keeps_its_timeline_and_the_guest_id_stays_in_the_reply() {
+        let ring = Hdr { typ: cmd::SUBMIT_3D, flags: FLAG_FENCE | FLAG_RING_IDX, fence_id: 77, ctx_id: 3, ring_idx: 1 };
+        let (timeline, f) = fence_for(&ring, 9001);
+        assert_eq!(timeline, (3, 1));
+        assert_eq!(f, fence(Some((3, 1)), 9001));
+        assert_eq!(le64(&ring.reply(cmd::OK_NODATA), 8), 77, "the guest signals its own id");
+        let global = Hdr { flags: FLAG_FENCE, ..ring };
+        let (timeline, f) = fence_for(&global, 9002);
+        assert_eq!(timeline, (0, 0));
+        assert_eq!(f, fence(None, 9002), "the global timeline names no context");
+    }
+
+    #[test]
+    fn a_reset_releases_every_mapping_context_and_resource() {
+        let mut resources = HashMap::from([
+            (7, Resource { width: 720, height: 1280, format: 1, mapped: None }),
+            (3, Resource { mapped: Some((0x2_0000_0000, 0x4000)), ..Default::default() }),
+            (9, Resource { mapped: Some((0x2_0001_0000, 0x1000)), ..Default::default() }),
+            (1, Resource::default()),
+        ]);
+        let mut contexts = HashSet::from([4, 2]);
+        let r = release_all(&mut resources, &mut contexts);
+        assert_eq!(
+            r,
+            Release {
+                unmap: vec![(3, 0x2_0000_0000, 0x4000), (9, 0x2_0001_0000, 0x1000)],
+                resources: vec![1, 3, 7, 9],
+                contexts: vec![2, 4],
+            }
+        );
+        assert!(resources.is_empty() && contexts.is_empty(), "the next boot starts empty");
+        assert_eq!(release_all(&mut resources, &mut contexts), Release::default(), "a second reset has nothing to give back");
+    }
+
+    #[test]
+    fn a_watched_resource_is_seen_when_the_next_boot_creates_it() {
+        watch_for_resource(3);
+        assert!(!resource_created(3), "not yet");
+        created(5);
+        assert!(!resource_created(3), "another resource");
+        created(3);
+        assert!(resource_created(3));
+        created(3);
+        assert!(resource_created(3), "and stays seen");
+        assert!(!resource_created(0), "id 0 is never a resource");
+    }
+
+    #[test]
+    fn leftovers_wait_for_the_next_activation_and_are_released_once() {
+        let mut left = Leftovers::default();
+        left.keep(Release { unmap: vec![(3, 0x2_0000_0000, 0x4000)], resources: vec![1, 3], contexts: vec![2] });
+        // A second reset before any activation (a driver reset, then the machine's): kept too,
+        // each id once.
+        left.keep(Release { unmap: vec![], resources: vec![3, 5], contexts: vec![4, 2] });
+        assert_eq!(left, Leftovers { resources: vec![1, 3, 5], contexts: vec![2, 4] });
+        // The activation takes them all; the one after has nothing to release.
+        assert_eq!(std::mem::take(&mut left).contexts, [2, 4]);
+        assert_eq!(left, Leftovers::default());
+    }
+
+    #[test]
+    fn fences_reach_only_the_active_device() {
+        let handler = fence_handler();
+        let (old_tx, old_rx) = channel();
+        let (new_tx, new_rx) = channel();
+        let (old, new) = (GENERATION.fetch_add(1, Ordering::Relaxed), GENERATION.fetch_add(1, Ordering::Relaxed));
+        route_fences(old, old_tx);
+        handler(fence(None, 1));
+        assert!(matches!(old_rx.try_recv(), Ok(Event::Fence(f)) if f.fence_id == 1));
+        // The device reset: its worker stopped, and a fence signalled late reaches no one.
+        unroute_fences(old);
+        handler(fence(None, 2));
+        assert!(old_rx.try_recv().is_err());
+        // The next boot's device; the old one going away late doesn't take its route.
+        route_fences(new, new_tx);
+        unroute_fences(old);
+        handler(fence(None, 3));
+        assert!(matches!(new_rx.try_recv(), Ok(Event::Fence(f)) if f.fence_id == 3));
+        assert!(old_rx.try_recv().is_err());
+        unroute_fences(new);
+        assert!(fence_sink().is_none());
     }
 
     fn entries(list: &[(u64, u32)]) -> Vec<u8> {
