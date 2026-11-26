@@ -20,6 +20,7 @@
 mod engine;
 mod host;
 mod packet;
+mod shape;
 #[cfg(test)]
 mod tests;
 
@@ -55,6 +56,8 @@ pub struct Config {
     pub dns: Dns,
     /// How many flows (each a host socket) the guest may hold open.
     pub limits: Limits,
+    /// The console's `network speed|delay`: read live, so a change applies to the next frame.
+    pub network: Arc<Mutex<sim_core::network::Conditions>>,
 }
 
 /// Caps on the guest's flows. The guest is untrusted and every flow is a host file descriptor
@@ -105,6 +108,7 @@ impl Default for Config {
             loopback: IpAddr::V4(Ipv4Addr::LOCALHOST),
             dns: Dns::System,
             limits: Limits::from_rlimit(),
+            network: Arc::default(),
         }
     }
 }
@@ -113,6 +117,13 @@ impl Default for Config {
 struct Shared {
     to_host: Mutex<VecDeque<Vec<u8>>>,
     to_guest: Mutex<VecDeque<Vec<u8>>>,
+    /// While the upload is shaped: the most bytes the guest's frames may wait for the net
+    /// thread (about a second of the rate; `usize::MAX` otherwise), and how many wait now, in
+    /// `to_host` and in the thread's hands. Past the cap frames drop, as at a full link.
+    up_cap: AtomicUsize,
+    up_held: AtomicUsize,
+    /// Whether the thread holds a shaper (for tests: unshaped, none exists).
+    shaped: AtomicBool,
     ready: Mutex<Option<RxReady>>,
     /// The net thread stopped taking smoltcp's frames because `to_guest` was full: the worker
     /// wakes it once the guest has taken half.
@@ -133,6 +144,20 @@ impl Shared {
     fn wake(&self) {
         // A full socket buffer means a wakeup is already pending.
         let _ = (&self.wake).write(&[1]);
+    }
+
+    /// Sets the upload's cap (`held`: the bytes the thread holds already). Under the queue's
+    /// lock, so frames the device adds are counted once.
+    fn set_up_cap(&self, cap: Option<usize>, held: usize) {
+        let q = lock(&self.to_host);
+        let queued: usize = q.iter().map(Vec::len).sum();
+        self.up_held.store(queued + held, Ordering::Relaxed);
+        self.up_cap.store(cap.unwrap_or(usize::MAX), Ordering::Relaxed);
+    }
+
+    /// The net thread took a frame of `bytes` off the upload's queue (shaped only).
+    fn up_released(&self, bytes: usize) {
+        let _ = self.up_held.try_update(Ordering::Relaxed, Ordering::Relaxed, |h| Some(h.saturating_sub(bytes)));
     }
 
     fn ring_guest(&self) {
@@ -159,6 +184,9 @@ impl Nat {
         let shared = Arc::new(Shared {
             to_host: Mutex::new(VecDeque::new()),
             to_guest: Mutex::new(VecDeque::new()),
+            up_cap: AtomicUsize::new(usize::MAX),
+            up_held: AtomicUsize::new(0),
+            shaped: AtomicBool::new(false),
             ready: Mutex::new(None),
             guest_full: AtomicBool::new(false),
             stop: AtomicBool::new(false),
@@ -176,6 +204,11 @@ impl Nat {
     }
 
     #[cfg(test)]
+    fn shaped(&self) -> bool {
+        self.shared.shaped.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     fn flows(&self) -> usize {
         self.shared.flows.load(Ordering::Relaxed)
     }
@@ -186,6 +219,7 @@ impl Backend for Nat {
         *lock(&self.shared.ready) = Some(ready);
         lock(&self.shared.to_guest).clear();
         lock(&self.shared.to_host).clear();
+        self.shared.up_held.store(0, Ordering::Relaxed);
         if let Some((wait, cfg)) = self.start.take() {
             let shared = self.shared.clone();
             let spawned = std::thread::Builder::new().name("virtio-net-nat".into()).spawn(move || {
@@ -209,6 +243,15 @@ impl Backend for Nat {
         let mut q = lock(&self.shared.to_host);
         if q.len() >= TO_HOST {
             return;
+        }
+        // Counted only while shaped (the cap is finite): the unshaped path adds nothing.
+        let cap = self.shared.up_cap.load(Ordering::Relaxed);
+        if cap != usize::MAX {
+            let held = self.shared.up_held.load(Ordering::Relaxed);
+            if held + frame.len() > cap && held > 0 {
+                return;
+            }
+            self.shared.up_held.fetch_add(frame.len(), Ordering::Relaxed);
         }
         q.push_back(frame.to_vec());
         let first = q.len() == 1;

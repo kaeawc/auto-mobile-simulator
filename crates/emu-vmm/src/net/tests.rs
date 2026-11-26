@@ -611,3 +611,210 @@ fn what_the_guest_sent_before_its_fin_reaches_a_slow_host() {
         deadline("the drained flow is reaped", start);
     }
 }
+
+// Shaping: the console's `network speed|delay`, applied live to the NAT.
+
+fn shaped(c: sim_core::network::Conditions) -> (Arc<std::sync::Mutex<sim_core::network::Conditions>>, Nat) {
+    let shared = Arc::new(std::sync::Mutex::new(c));
+    (shared.clone(), nat(Config { network: shared, ..Config::default() }))
+}
+
+fn cond(up: f64, down: f64, min: i32, max: i32) -> sim_core::network::Conditions {
+    sim_core::network::Conditions { upload_bps: up, download_bps: down, min_latency_ms: min, max_latency_ms: max }
+}
+
+/// A host server that answers its first datagram with `count` datagrams of `size` bytes.
+fn burst_server(count: usize, size: usize) -> (u16, std::thread::JoinHandle<()>) {
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let port = server.local_addr().expect("addr").port();
+    let h = std::thread::spawn(move || {
+        let mut b = [0u8; 64];
+        let (_, from) = server.recv_from(&mut b).expect("recv");
+        for i in 0..count {
+            server.send_to(&vec![i as u8; size], from).expect("send");
+        }
+    });
+    (port, h)
+}
+
+/// Receives `count` datagrams, returning when each arrived since `start`.
+fn arrivals(n: &mut Nat, count: usize, start: Instant, mut each: impl FnMut(&mut Nat, usize)) -> Vec<Duration> {
+    let mut at = Vec::new();
+    while at.len() < count {
+        let f = next_frame(n, Duration::from_secs(10), |f| matches!(packet::parse(f), Frame::Udp { .. })).expect("datagram");
+        assert!(matches!(packet::parse(&f), Frame::Udp { .. }));
+        at.push(start.elapsed());
+        each(n, at.len());
+    }
+    at
+}
+
+#[test]
+fn download_is_throttled_to_the_rate_and_unlimited_is_unchanged() {
+    // 20 datagrams of 1000 bytes at 200 kbit/s: about 0.8 s.
+    let (port, server) = burst_server(20, 1000);
+    let (_, mut n) = shaped(cond(0.0, 200_000.0, 0, 0));
+    let t0 = Instant::now();
+    n.transmit(&udp_frame(SocketAddrV4::new(GUEST, 40001), SocketAddrV4::new(GW, port), b"go"));
+    let at = arrivals(&mut n, 20, t0, |_, _| {});
+    server.join().expect("server");
+    assert!(at[19] >= Duration::from_millis(500), "throttled: {:?}", at[19]);
+    assert!(at[19] <= Duration::from_secs(5), "{:?}", at[19]);
+
+    // Pin: 0 = unlimited delivers the same burst whole, with nothing held back.
+    let (port, server) = burst_server(20, 1000);
+    let (_, mut n) = shaped(cond(0.0, 0.0, 0, 0));
+    let t0 = Instant::now();
+    n.transmit(&udp_frame(SocketAddrV4::new(GUEST, 40002), SocketAddrV4::new(GW, port), b"go"));
+    let at = arrivals(&mut n, 20, t0, |_, _| {});
+    server.join().expect("server");
+    assert!(at[19] < Duration::from_millis(400), "unshaped: {:?}", at[19]);
+}
+
+#[test]
+fn lifting_the_throttle_mid_stream_frees_what_is_held() {
+    // At 100 kbit/s the burst would take 1.7 s; `network speed full` after 3 datagrams ends it.
+    let (port, server) = burst_server(20, 1000);
+    let (shared, mut n) = shaped(cond(0.0, 100_000.0, 0, 0));
+    let t0 = Instant::now();
+    n.transmit(&udp_frame(SocketAddrV4::new(GUEST, 40003), SocketAddrV4::new(GW, port), b"go"));
+    let at = arrivals(&mut n, 20, t0, |_, got| {
+        if got == 3 {
+            shared.lock().expect("conditions").download_bps = 0.0;
+        }
+    });
+    server.join().expect("server");
+    assert!(at[19] < Duration::from_millis(1300), "{:?}", at[19]);
+}
+
+#[test]
+fn upload_is_throttled_and_drops_nothing() {
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let port = server.local_addr().expect("addr").port();
+    server.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    let (_, mut n) = shaped(cond(200_000.0, 0.0, 0, 0));
+    let t0 = Instant::now();
+    let (src, dst) = (SocketAddrV4::new(GUEST, 40004), SocketAddrV4::new(GW, port));
+    for _ in 0..20 {
+        n.transmit(&udp_frame(src, dst, &[7; 1000]));
+    }
+    let mut b = [0u8; 2000];
+    for _ in 0..20 {
+        server.recv_from(&mut b).expect("datagram");
+    }
+    let took = t0.elapsed();
+    assert!(took >= Duration::from_millis(500), "throttled: {took:?}");
+    assert!(took <= Duration::from_secs(5), "{took:?}");
+}
+
+#[test]
+fn inbound_latency_lies_between_min_and_max_and_none_removes_it() {
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let port = server.local_addr().expect("addr").port();
+    let echo = std::thread::spawn(move || {
+        let mut b = [0u8; 64];
+        for _ in 0..2 {
+            let (len, from) = server.recv_from(&mut b).expect("recv");
+            server.send_to(&b[..len], from).expect("send");
+        }
+    });
+    let (shared, mut n) = shaped(cond(0.0, 0.0, 150, 250));
+    let (src, dst) = (SocketAddrV4::new(GUEST, 40005), SocketAddrV4::new(GW, port));
+    let t0 = Instant::now();
+    n.transmit(&udp_frame(src, dst, b"a"));
+    next_frame(&mut n, Duration::from_secs(5), |f| matches!(packet::parse(f), Frame::Udp { .. })).expect("reply");
+    let held = t0.elapsed();
+    assert!(held >= Duration::from_millis(150), "delayed: {held:?}");
+    assert!(held <= Duration::from_secs(2), "{held:?}");
+
+    *shared.lock().expect("conditions") = cond(0.0, 0.0, 0, 0);
+    // The delay is gone for what follows, on the same flow.
+    let t1 = Instant::now();
+    n.transmit(&udp_frame(src, dst, b"b"));
+    next_frame(&mut n, Duration::from_secs(5), |f| matches!(packet::parse(f), Frame::Udp { .. })).expect("reply");
+    assert!(t1.elapsed() < Duration::from_millis(150), "undelayed: {:?}", t1.elapsed());
+    echo.join().expect("echo");
+}
+
+/// One datagram out to a host echo and back through `n`.
+fn echo_once(n: &mut Nat, sport: u16, payload: &[u8]) {
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let port = server.local_addr().expect("addr").port();
+    server.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    let echo = std::thread::spawn(move || {
+        let mut b = [0u8; 2048];
+        let (len, from) = server.recv_from(&mut b).expect("recv");
+        server.send_to(&b[..len], from).expect("send");
+    });
+    n.transmit(&udp_frame(SocketAddrV4::new(GUEST, sport), SocketAddrV4::new(GW, port), payload));
+    next_frame(n, Duration::from_secs(5), |f| matches!(packet::parse(f), Frame::Udp { .. })).expect("reply");
+    echo.join().expect("echo");
+}
+
+#[test]
+fn an_unshaped_nat_never_builds_the_shaper_and_drops_it_when_the_conditions_set_none() {
+    // Pin: with both rates 0 and no latency (the default), traffic takes the plain path.
+    let (shared, mut n) = shaped(cond(0.0, 0.0, 0, 0));
+    echo_once(&mut n, 40010, b"plain");
+    assert!(!n.shaped(), "no shaper for unshaped conditions");
+    // Shaping on builds it; the same traffic still flows. (An unshaped engine reads the
+    // conditions every 50 ms, not every pass.)
+    *shared.lock().expect("conditions") = cond(0.0, 0.0, 30, 30);
+    std::thread::sleep(Duration::from_millis(120));
+    echo_once(&mut n, 40011, b"delayed");
+    assert!(n.shaped());
+    // Off again: the shaper is gone.
+    *shared.lock().expect("conditions") = cond(0.0, 0.0, 0, 0);
+    echo_once(&mut n, 40012, b"plain again");
+    assert!(!n.shaped(), "the shaper is dropped when the conditions set none");
+}
+
+#[test]
+fn tcp_through_the_shaper_finishes_at_the_set_rates() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let download: Vec<u8> = (0..50_000u32).map(|i| (i * 13) as u8).collect();
+    let reply = download.clone();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().expect("accept");
+        let mut got = Vec::new();
+        s.read_to_end(&mut got).expect("read to the guest's FIN");
+        s.write_all(&reply).expect("write");
+        got.len()
+    });
+    // 50 kB down at 400 kbit/s is 1 s; 12.5 kB up at 400 kbit/s is 0.25 s.
+    let network = Arc::new(std::sync::Mutex::new(cond(400_000.0, 400_000.0, 0, 0)));
+    let mut g = Guest::new(Config { network, ..Config::default() });
+    let t0 = Instant::now();
+    let h = g.connect(port, 49170);
+    g.until("established", |g| g.sock(h).state() == tcp::State::Established);
+    let up = vec![5u8; 12_500];
+    let mut sent = 0;
+    g.until("upload", |g| {
+        let s = g.sock(h);
+        if s.can_send() {
+            sent += s.send_slice(&up[sent..]).expect("send");
+        }
+        sent == up.len()
+    });
+    g.sock(h).close();
+    let mut got = Vec::new();
+    g.until("download", |g| {
+        let s = g.sock(h);
+        while s.can_recv() {
+            s.recv(|b| {
+                got.extend_from_slice(b);
+                (b.len(), ())
+            })
+            .expect("recv");
+        }
+        matches!(s.state(), tcp::State::TimeWait | tcp::State::Closed)
+    });
+    let took = t0.elapsed();
+    assert_eq!(server.join().expect("server"), up.len(), "the upload arrived whole");
+    assert!(got == download, "the download is intact");
+    // The rates are a floor (1.25 s of data in all); retransmits past the queue's cap and
+    // timer granularity stretch it, but not without bound.
+    assert!(took >= Duration::from_millis(900), "throttled: {took:?}");
+    assert!(took <= Duration::from_secs(9), "{took:?}");
+}
