@@ -5,6 +5,7 @@ pub mod debug;
 pub mod device;
 pub mod form_factor;
 pub mod frame;
+pub mod framebuffer;
 pub mod geometry;
 pub mod gesture;
 pub mod goldfish;

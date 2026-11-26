@@ -1142,9 +1142,11 @@ DYLD_INTERPOSE(my_SCNetworkReachabilityGetFlags, SCNetworkReachabilityGetFlags)
 
 // dnssd_getaddrinfo (libdns_services), the resolver Network.framework and URLSession use. Every
 // address handed to the client passes through this getter, so the name is learned before connect.
+// iOS 18 runtimes have no libdns_services: the library is weakly linked, both getters are then
+// NULL, and dyld skips an interpose whose replacee is NULL.
 typedef void *dnssd_getaddrinfo_result_t;
-extern const struct sockaddr *dnssd_getaddrinfo_result_get_address(dnssd_getaddrinfo_result_t);
-extern const char *dnssd_getaddrinfo_result_get_hostname(dnssd_getaddrinfo_result_t);
+extern const struct sockaddr *dnssd_getaddrinfo_result_get_address(dnssd_getaddrinfo_result_t) __attribute__((weak_import));
+extern const char *dnssd_getaddrinfo_result_get_hostname(dnssd_getaddrinfo_result_t) __attribute__((weak_import));
 static const struct sockaddr *my_dnssd_get_address(dnssd_getaddrinfo_result_t result) {
     const struct sockaddr *addr = dnssd_getaddrinfo_result_get_address(result);
     if (addr) learn(dnssd_getaddrinfo_result_get_hostname(result), addr);

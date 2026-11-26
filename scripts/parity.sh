@@ -18,7 +18,9 @@ for rt,ds in json.load(sys.stdin)['devices'].items():
 check identity "$ours" "$theirs"
 
 "$sim" screenshot "$udid" "$tmp/ours.png"
-xcrun simctl io "$udid" screenshot --type=png "$tmp/theirs.png" >/dev/null 2>&1
+# A device with two built-in screens (the iPhone Duo) needs one named: its main one is `primary`.
+xcrun simctl io "$udid" screenshot --type=png "$tmp/theirs.png" >/dev/null 2>&1 ||
+  xcrun simctl io "$udid" screenshot --type=png --display=primary "$tmp/theirs.png" >/dev/null 2>&1
 size() { sips -g pixelWidth -g pixelHeight "$1" | awk '/pixel/{printf "%s ", $2}'; }
 check "screenshot size" "$(size "$tmp/ours.png")" "$(size "$tmp/theirs.png")"
 # Pixel difference: fraction of bytes that differ by more than 8 (the clock or a cursor may tick).

@@ -47,7 +47,7 @@ type ErrorBlock = Block<dyn Fn(*mut NSError)>;
 
 /// A completion handler that reports its error (or `None`) on `tx`.
 fn error_block(tx: mpsc::Sender<Option<String>>) -> RcBlock<dyn Fn(*mut NSError)> {
-    RcBlock::new(move |error: *mut NSError| {
+    RcBlock::with_encoding::<_, _, _, rt::ErrorBlock>(move |error: *mut NSError| {
         // SAFETY: the service passes nil or a valid NSError for the duration of the call.
         let message = unsafe { error.as_ref() }.map(|e| e.localizedDescription().to_string());
         let _ = tx.send(message);
@@ -72,7 +72,7 @@ struct Screen {
 fn screens_of(adapter: &AnyObject) -> Result<Vec<Obj>> {
     let enumerate = sel!(enumerateScreensWithCompletionQueue:completionHandler:);
     let (tx, rx) = mpsc::channel::<std::result::Result<Vec<usize>, String>>();
-    let block = RcBlock::new(move |screens: *mut AnyObject, error: *mut NSError| {
+    let block = RcBlock::with_encoding::<_, _, _, rt::ObjErrorBlock>(move |screens: *mut AnyObject, error: *mut NSError| {
         // SAFETY: the service passes nil or valid objects for the duration of the call.
         let result = match unsafe { error.as_ref() } {
             Some(e) => Err(e.localizedDescription().to_string()),
