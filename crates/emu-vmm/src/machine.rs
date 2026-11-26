@@ -447,6 +447,15 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
             PortSpec { name: String::new(), backend: Box::new(Sink) },
             PortSpec { name: "modem".into(), backend: cfg.telephony.backend() },
             PortSpec { name: String::new(), backend: logcat },
+            // A named console port, so the guest's third console (hvc2), where the UWB HAL looks.
+            PortSpec { name: "uwb".into(), backend: Box::new(crate::bt::UwbPort::default()) },
+            // Stable per AVD: its disks' paths.
+            PortSpec {
+                name: "bluetooth".into(),
+                backend: Box::new(crate::bt::BluetoothPort::new(crate::bt::address_for(
+                    cfg.disks.iter().map(|d| d.path.as_os_str().as_encoded_bytes()).collect::<Vec<_>>().concat().as_slice(),
+                ))),
+            },
         ]);
         if let Some(h) = handles.get(1) {
             cfg.telephony.attach(h.clone());
@@ -456,9 +465,21 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     if cfg.rng {
         slots[slots::RNG as usize] = Some(Box::new(virtio::rng::Rng::new()));
     }
-    // eth0, which the radio HAL configures from the modem's data-call reply. Link only for now:
-    // the frames the guest sends are dropped.
-    slots[slots::NET as usize] = Some(Box::new(virtio::net::Net::new(Box::new(virtio::net::LinkOnly))));
+    // eth0, which the radio HAL configures from the modem's data-call reply, behind the
+    // user-mode NAT (10.0.2.2 the host's loopback, 10.0.2.3 its resolver). `EMU_NET=link`: the
+    // link alone, to measure what the NAT costs (scripts/net-bench.sh).
+    let net: Box<dyn virtio::net::Backend> = if std::env::var("EMU_NET").is_ok_and(|v| v == "link") {
+        Box::new(virtio::net::LinkOnly)
+    } else {
+        match crate::net::Nat::new(crate::net::Config::default()) {
+            Ok(n) => Box::new(n),
+            Err(e) => {
+                eprintln!("emu: net: no NAT ({e}); the network is link only");
+                Box::new(virtio::net::LinkOnly)
+            }
+        }
+    };
+    slots[slots::NET as usize] = Some(Box::new(virtio::net::Net::new(net)));
     if let Some(opts) = cfg.sound {
         slots[slots::SOUND as usize] = Some(Box::new(virtio::snd::Snd::new(opts)));
     }

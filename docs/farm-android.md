@@ -113,13 +113,13 @@ the guest logcat's formatting, not vCPU exits per byte; sim-android launches wit
 
 ## UWB (system_server asks for IUwb every second)
 
-`init.ranchu.rc` starts the UWB HAL only `on property:vendor.qemu.vport.uwb=*`, linking that
-virtio-console port to `/dev/hvc2` (stock serves it from netsim). simee has no `uwb` port, so the
-HAL never starts and system_server's UWB service retries the lazy AIDL service every second
-(servicemanager → init `ctl.interface_start` → "Could not find"), ~3 kmsg lines/s (56 in dmesg 40 s
-after boot). Not changed: the fix stock makes is a working UWB device behind the port (a `uwb`
-port with nothing answering the HAL's UCI protocol would trade the lookups for a HAL that times
-out). With the console quiet these lines no longer print; the lookup itself is cheap.
+`init.ranchu.rc` starts the UWB HAL only `on property:vendor.qemu.vport.uwb=*`, and the HAL opens
+`/dev/hvc2` (stock serves it from netsim). simee had no `uwb` port, so the HAL never started and
+system_server's UWB service retried the lazy AIDL service every second (servicemanager → init
+`ctl.interface_start` → "Could not find"), ~3 kmsg lines/s. Now the virtio-console has stock's
+`uwb` port, a named console port (the guest's hvc2), answered by a UCI responder with no peers
+(`crates/emu-vmm/src/bt/uwb.rs`): the HAL starts, UWB reports READY, and `IUwb` is looked up once
+per boot, as on stock (docs/research/bluetooth.md).
 
 ## Port and adb scaling
 
