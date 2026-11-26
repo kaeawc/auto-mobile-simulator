@@ -34,27 +34,28 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("delete", "device", "Delete a device"),
     (
         "boot",
-        "device, timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, settle_foreground?, settle_timeout_s?, profile?(slim); \
+        "device, timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, settle_foreground?(true), settle_timeout_s?, profile?(slim); \
          Android: audio?(false)",
         "Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; settle also waits \
          up to settle_timeout_s (600) until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s \
-         (settle_foreground: counting only foreground-QoS CPU) and returns the timings with cpu_pct, foreground_cpu_pct and \
-         background_cpu_pct, settled false if it ran out of time; profile turns off a named set of daemons; Android: starts emu and \
+         (settle_foreground, the default: counting only foreground-QoS CPU) and returns the timings with cpu_pct, foreground_cpu_pct, \
+         background_cpu_pct and cpu_s (CPU-seconds since the boot), settled false if it ran out of time; profile turns off a named set \
+         of daemons (written before the boot of a shut-down device, so they never start); Android: starts emu and \
          waits for sys.boot_completed, silent unless audio, which plays the device on the host's default output)",
     ),
     (
         "boot_many",
         "devices, concurrency?, timeout_s?; iOS: env?, shaped?, settle?(default true), settle_cpu_pct?, settle_window_s?, \
-         settle_foreground?, settle_timeout_s?, profile?; Android: first_port?(5554)",
+         settle_foreground?(true), settle_timeout_s?, profile?; Android: first_port?(5554)",
         "Boot several devices of one platform, at most `concurrency` at once (default: a quarter of the host's CPUs, at least 2), each as \
          `boot` does (iOS: a slot is held until the device settles, unless settle is false); returns each device's timings or error, \
          failed and unsettled counts, and the time until all were done. Android: each on its own console port from first_port up",
     ),
     (
         "settle",
-        "device, cpu_pct?, window_s?, foreground?, timeout_s?(600)",
-        "Wait until a booted simulator is quiet: its processes under cpu_pct (10) % of a core for window_s (10) s (foreground: only \
-         foreground-QoS CPU counts), SpringBoard running; returns settle_s, cpu_pct, foreground_cpu_pct and background_cpu_pct",
+        "device, cpu_pct?, window_s?, foreground?(true), timeout_s?(600)",
+        "Wait until a booted simulator is quiet: its processes under cpu_pct (10) % of a core for window_s (10) s (foreground, the default: \
+         only foreground-QoS CPU counts), SpringBoard running; returns settle_s, cpu_pct, foreground_cpu_pct and background_cpu_pct",
     ),
     (
         "profile",
@@ -261,6 +262,12 @@ fn resolve(s: &mut Session, p: &Value) -> Result<(Platform, String), String> {
     // (AVD names have no spaces, simulator names usually do; `platform` decides otherwise).
     if only != Some(Platform::Ios) && s.android.backend().has_avd(query) {
         return Ok((Platform::Android, query.to_owned()));
+    }
+    // A simulator's UDID that isn't an AVD's name: the iOS backend looks it up itself. Listing
+    // both platforms here (every AVD's config, every simulator's state) cost ~70 ms per call on
+    // a host with 48 AVDs and 100 simulators, more than the tap or screenshot it routed.
+    if only != Some(Platform::Android) && sim_core::device::is_udid(query) {
+        return Ok((Platform::Ios, query.to_owned()));
     }
     let android = if only == Some(Platform::Ios) { Vec::new() } else { s.android.devices() };
     if android.is_empty() && only != Some(Platform::Android) {
@@ -500,6 +507,23 @@ mod tests {
         );
         call(&mut s, "delete", &json!({"device": "watch"})).expect("delete");
         assert_eq!(call(&mut s, "devices", &json!({"platform": "android"})).expect("devices").as_array().map(Vec::len), Some(1));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_simulator_udid_is_routed_without_listing_either_platform() {
+        let (mut s, root) = android_session("udid");
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        call(&mut s, "create", &json!({"platform": "android", "name": "phone", "system_image": mobile})).expect("phone");
+        // With an AVD around, a name is resolved across both platforms; a UDID goes straight to
+        // the iOS backend, which looks it up (here it would find none: the routing is the test).
+        let udid = "0000AAAA-BBBB-CCCC-DDDD-EEEEFFFF0000";
+        assert_eq!(resolve(&mut s, &json!({"device": udid})), Ok((Platform::Ios, udid.to_owned())));
+        // An AVD whose name has a UDID's shape is still that AVD, and `platform` still decides.
+        let avd = "1111aaaa-bbbb-cccc-dddd-eeeeffff1111";
+        call(&mut s, "create", &json!({"platform": "android", "name": avd, "system_image": mobile})).expect("uuid-named avd");
+        assert_eq!(resolve(&mut s, &json!({"device": avd})), Ok((Platform::Android, avd.to_owned())));
+        assert!(resolve(&mut s, &json!({"device": udid, "platform": "android"})).is_err(), "no such AVD");
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -13,7 +13,8 @@
 //! The tree is read through [`Procs`] (libproc on macOS: the host's process table, then the CPU
 //! time of the device's processes only), not from a host-wide `ps` listing. Each process's
 //! CPU is split into background (maintenance and background QoS: darwinbg work, which runs on the
-//! efficiency cores) and the rest; [`Rule::foreground`] judges a tree on the rest only.
+//! efficiency cores) and the rest; [`Rule::foreground`] (the default) judges a tree on the rest
+//! only.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -98,11 +99,14 @@ pub struct Rule {
 }
 
 impl Default for Rule {
-    /// 10 % of one core over 10 s, all CPU. A booted iPhone 17 (iOS 27.2) idles at 1-6 % with no
-    /// client attached; its first boot runs at 100-500 % for a minute or more, a later boot for
-    /// 10-20 s.
+    /// 10 % of one core over 10 s, foreground CPU. A booted iPhone 17 (iOS 27.2) idles at 1-6 %
+    /// with no client attached; its first boot runs at 100-500 % for a minute or more, a later
+    /// boot for 10-20 s. After the storm what a device still runs is mostly background-QoS work
+    /// on the efficiency cores, which doesn't hold up the next device's boot on the performance
+    /// cores: judged on foreground CPU, four clones booted at once settled in 35 s instead of 90 s
+    /// (docs/farm.md).
     fn default() -> Self {
-        Rule { cpu_pct: 10.0, window: Duration::from_secs(10), foreground: false }
+        Rule { cpu_pct: 10.0, window: Duration::from_secs(10), foreground: true }
     }
 }
 
@@ -136,11 +140,22 @@ pub struct Settler {
     last: Option<(f64, Tree)>,
     /// (seconds, CPU used) per interval between samples, newest last, spanning at most the window.
     intervals: VecDeque<(f64, Cpu)>,
+    /// CPU the tree used over the whole wait (see [`Settler::used`]).
+    used: Cpu,
+    /// Count the first sample's accumulated CPU as used: every process in it started with this
+    /// boot.
+    since_boot: bool,
 }
 
 impl Settler {
     pub fn new(rule: Rule) -> Settler {
-        Settler { rule, last: None, intervals: VecDeque::new() }
+        Settler { rule, last: None, intervals: VecDeque::new(), used: Cpu::default(), since_boot: false }
+    }
+
+    /// A settler for a device this boot just started: [`Settler::used`] then counts the CPU
+    /// its processes used before the first sample too.
+    pub fn since_boot(rule: Rule) -> Settler {
+        Settler { since_boot: true, ..Settler::new(rule) }
     }
 
     /// Adds a sample taken at `t` seconds (any monotonic origin); true once the device is settled.
@@ -157,7 +172,14 @@ impl Settler {
                     used.total_s += (now.total_s - before.total_s).max(0.0);
                     used.background_s += (now.background_s - before.background_s).max(0.0);
                 }
+                self.used.total_s += used.total_s;
+                self.used.background_s += used.background_s;
                 self.intervals.push_back((dt, used));
+            }
+        } else if self.since_boot {
+            for c in tree.cpu.values() {
+                self.used.total_s += c.total_s;
+                self.used.background_s += c.background_s;
             }
         }
         self.last = Some((t, tree));
@@ -185,6 +207,13 @@ impl Settler {
     /// The tree's CPU use over the window so far, percent of one core (all of it).
     pub fn cpu_pct(&self) -> Option<f64> {
         self.load().map(|l| l.total_pct)
+    }
+
+    /// CPU seconds the tree used over the whole wait (from the boot for [`Settler::since_boot`]),
+    /// all of it and the background part: what the device cost the host until it settled. A
+    /// process that started and exited between two samples is missed, so this is a floor.
+    pub fn used(&self) -> Cpu {
+        self.used
     }
 
     /// Processes in the last sample.
@@ -363,7 +392,7 @@ mod tests {
     fn background_cpu_is_reported_apart_and_judged_only_when_asked() {
         let window = Duration::from_secs(3);
         let (all, s) = background_heavy(Rule { cpu_pct: 10.0, window, foreground: false });
-        assert_eq!(all, None, "by default background work keeps the device unsettled");
+        assert_eq!(all, None, "judged on all CPU, background work keeps the device unsettled");
         let load = s.load().expect("load");
         assert!((load.total_pct - 45.0).abs() < 0.01, "{load:?}");
         assert!((load.background_pct - 40.0).abs() < 0.01, "{load:?}");
@@ -393,14 +422,31 @@ mod tests {
     #[test]
     fn a_load_is_judged_by_the_rule() {
         let load = Load { total_pct: 30.0, background_pct: 25.0 };
-        let all = Rule::default();
-        let fg = Rule { foreground: true, ..Rule::default() };
+        let all = Rule { foreground: false, ..Rule::default() };
+        let fg = Rule::default();
         assert_eq!(load.judged_pct(&all), 30.0);
         assert_eq!(load.judged_pct(&fg), 5.0);
         assert!(!load.quiet(&all) && load.quiet(&fg));
         // Background never exceeds the total: a foreground figure is never negative.
         assert_eq!(Load { total_pct: 1.0, background_pct: 2.0 }.foreground_pct(), 0.0);
-        assert!(!Rule::default().foreground, "the default judges all CPU");
+        assert!(Rule::default().foreground, "the default judges foreground CPU");
+    }
+
+    #[test]
+    fn a_wait_reports_the_cpu_seconds_used_since_the_boot_or_its_first_sample() {
+        // The tree has used 3.5 s by the first sample (launchd_sim 1, SpringBoard 2, child 0.5),
+        // then SpringBoard 1 s a second for 4 s, half of it at background QoS.
+        let feed = |mut s: Settler| {
+            for t in 0..5 {
+                let mut tree = sample(2.0 + f64::from(t));
+                tree.cpu.insert(110, Cpu { total_s: 2.0 + f64::from(t), background_s: 0.5 * f64::from(t) });
+                s.push(f64::from(t), tree);
+            }
+            s.used()
+        };
+        let rule = Rule { cpu_pct: 10.0, window: Duration::from_secs(2), ..Rule::default() };
+        assert_eq!(feed(Settler::new(rule)), Cpu { total_s: 4.0, background_s: 2.0 }, "from the first sample");
+        assert_eq!(feed(Settler::since_boot(rule)), Cpu { total_s: 7.5, background_s: 2.0 }, "the boot's CPU before it too");
     }
 
     #[test]
