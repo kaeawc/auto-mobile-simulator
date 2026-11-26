@@ -641,14 +641,7 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
                 (_, Ok(angle)) => json!({"device": device, "angle": angle}),
                 (_, Err(_)) => json!({"device": device, "posture": posture}),
             };
-            let r = call("fold", params)?;
-            match (r["folded"].as_bool(), r["width"].as_u64(), r["height"].as_u64()) {
-                (Some(folded), Some(w), Some(h)) => {
-                    let screen = if folded { "folded" } else { "unfolded" };
-                    writeln!(out, "{} ({}°), {screen}, {w}x{h}", text(&r["posture"]), r["angle"])?
-                }
-                _ => writeln!(out, "{} ({}°)", text(&r["posture"]), r["angle"])?,
-            }
+            writeln!(out, "{}", fold_line(&call("fold", params)?))?;
         }
         Cmd::Xr { device, command } => lines(out, &call("xr", xr_params(&device, &command)?)?)?,
         Cmd::Touchpad { device, x, y, phase, to, duration_ms } => {
@@ -828,6 +821,19 @@ fn form_factors_text(rows: &Value) -> String {
     out
 }
 
+/// `simee fold`'s line for the `fold` method's answer: the posture and angle, and the screen and
+/// its size when simee's emulator says them; the stock emulator's answer to a fold or unfold is
+/// only which was asked.
+fn fold_line(r: &Value) -> String {
+    let screen = |folded: bool| if folded { "folded" } else { "unfolded" };
+    match (r["posture"].as_str(), r["folded"].as_bool(), r["width"].as_u64(), r["height"].as_u64()) {
+        (Some(posture), Some(folded), Some(w), Some(h)) => format!("{posture} ({}°), {}, {w}x{h}", r["angle"], screen(folded)),
+        (Some(posture), ..) => format!("{posture} ({}°)", r["angle"]),
+        (None, Some(folded), ..) => screen(folded).to_owned(),
+        (None, None, ..) => r.to_string(),
+    }
+}
+
 /// The `xr` method's parameters for `simee xr DEVICE WORDS...` (the console's `xr` syntax).
 fn xr_params(device: &str, words: &[String]) -> Result<Value> {
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
@@ -904,6 +910,16 @@ mod tests {
         ] {
             assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
         }
+    }
+
+    #[test]
+    fn fold_answers_print_what_the_emulator_said() {
+        let simee = json!({"angle": 0.0, "posture": "closed", "folded": true, "width": 1080, "height": 2092});
+        assert_eq!(fold_line(&simee), "closed (0.0°), folded, 1080x2092");
+        // The stock emulator doesn't report the hinge: what was asked.
+        assert_eq!(fold_line(&json!({"folded": true})), "folded", "not `null (null°)`");
+        assert_eq!(fold_line(&json!({"folded": false})), "unfolded");
+        assert_eq!(fold_line(&json!({"angle": 180.0, "posture": "opened"})), "opened (180.0°)");
     }
 
     #[test]

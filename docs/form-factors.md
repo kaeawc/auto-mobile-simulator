@@ -168,14 +168,25 @@ app's `screenWidthDp` becomes the outer screen's, `adb exec-out screencap` is 10
 readers of the scanout see only where the guest draws it: the display socket and `screenshot`
 stream 949×1840 for the Pixel Fold (the 1080×2092 screen at the inner screen's height) and
 1350×1800 for the dual-screen, and the desktop's view takes that shape. Touches on those frames
-land on the folded screen. Unfolding resets the size.
+(the display socket's, the desktop's) land on the folded screen. The API's `screen`, `tap`,
+`swipe` and `touch` are in the guest's layout instead (1080×2092, uiautomator's bounds): simee
+scales their points onto the frames, so a tap at an element's bounds hits it; a screenshot stays
+the 949×1840 frame. Unfolding resets the size, and so does stopping emu folded (`kill`, `adb emu
+kill`, SIGINT) before the guest goes, so the AVD boots under the stock emulator at its own size; a
+size emu couldn't reset (a crash) is recorded in `<avd>/simee/fold-wm-size` and reset at its next
+simee boot. A `wm size` simee didn't set is left alone.
 
 Checked on simee on 2026-11-26 (API 36 `google_apis` r7 image, Apple silicon host): a Pixel Fold
 AVD and a dual-screen AVD each booted, folded, half-opened, unfolded and rotated; Settings opened
 unfolded stayed in front through fold and unfold and was re-laid out for each screen; a tap on the
 folded frame opened Settings search. The AutoMobile harness passed on both (all but the audio
 tools, which reach a stock emulator's gRPC, and `deviceSnapshot`, which simee doesn't support),
-and its observe, tap, swipe, launch and button tools passed with each folded.
+and its observe, tap, swipe, launch and button tools passed with each folded. Later the same day:
+folded, a `simee tap` at a Settings row's uiautomator bounds opened it, the harness passed folded
+(40 of 41 tools, all but `deviceSnapshot`; audio tools not run), and after `adb emu kill` or
+SIGINT folded the next boot's `wm size` had no override while a `wm size` set by hand survived a
+boot; `simee fold` folded, opened and unfolded a Pixel Fold AVD run by the stock emulator 37.2.13
+(its `dumpsys device_state` went CLOSED, OPENED).
 
 ## Apple inputs and CarPlay
 

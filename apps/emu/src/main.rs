@@ -281,11 +281,17 @@ fn boot(
     }
 
     let stop = Arc::new(AtomicBool::new(false));
+    // A foldable, once there is one: it resets a size it forced before the guest stops.
+    let foldable: Arc<std::sync::OnceLock<Arc<fold::Foldable>>> = Arc::default();
     {
         let stop = stop.clone();
+        let foldable = foldable.clone();
         // Without it a SIGINT/SIGTERM would never stop the machine: fail the launch instead.
         std::thread::Builder::new().name("stop-watch".into()).spawn(move || {
             if signals.recv().is_ok() {
+                if let Some(f) = foldable.get() {
+                    f.release();
+                }
                 emu_vmm::request_stop(&stop);
                 // Device threads blocked in native code (e.g. a wedged renderer) can stall an
                 // orderly teardown; don't let that keep the process alive.
@@ -314,6 +320,9 @@ fn boot(
         });
     }
     let fold = fold::for_avd(&avd, inst.sensors.clone(), inst.display.clone(), inst.console_port).map(Arc::new);
+    if let Some(f) = &fold {
+        let _ = foldable.set(f.clone());
+    }
     console::serve(
         inst.console_port,
         console::ConsoleInfo {

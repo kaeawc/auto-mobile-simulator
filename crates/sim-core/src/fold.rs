@@ -323,6 +323,23 @@ impl FoldState {
             postures: field("postures")?.split(',').filter_map(|p| p.trim().parse::<u8>().ok().and_then(StockPosture::from_id)).collect(),
         })
     }
+
+    /// A point in the guest's layout (what the API's `screen` reports and `tap` takes: a folded
+    /// Pixel Fold's 1080x2092, as uiautomator's bounds are) on the frames readers get (the visible
+    /// region, 949x1840, origin at its corner). The same point when the two agree (unfolded).
+    pub fn guest_to_view(&self, (x, y): (f64, f64)) -> (f64, f64) {
+        (rescale(x, self.visible.width, self.width), rescale(y, self.visible.height, self.height))
+    }
+
+    /// [`FoldState::guest_to_view`] the other way: a point on the frames in the guest's layout.
+    pub fn view_to_guest(&self, (x, y): (f64, f64)) -> (f64, f64) {
+        (rescale(x, self.width, self.visible.width), rescale(y, self.height, self.visible.height))
+    }
+}
+
+/// `v` on an axis `from` long, on one `to` long.
+fn rescale(v: f64, to: u32, from: u32) -> f64 {
+    if from == 0 || to == from { v } else { v * f64::from(to) / f64::from(from) }
 }
 
 /// A foldable device definition a new AVD can follow.
@@ -563,6 +580,30 @@ mod tests {
         assert_eq!(s.postures.len(), 3);
         assert_eq!(FoldState::parse(&[]), None, "an emulator that doesn't report it");
         assert_eq!(FoldState::parse(&lines[..4]), None);
+    }
+
+    #[test]
+    fn folded_points_map_between_the_guests_layout_and_the_frames() {
+        let lines: Vec<String> =
+            ["angle: 0", "posture: closed (1)", "folded: true", "visible: 949x1840+629+0", "size: 1080x2092", "postures: 1,2,3"]
+                .map(String::from)
+                .to_vec();
+        let folded = FoldState::parse(&lines).expect("state");
+        // The outer screen's bottom-right corner in uiautomator's bounds is the frame's.
+        assert_eq!(folded.guest_to_view((1080.0, 2092.0)), (949.0, 1840.0));
+        let (x, y) = folded.guest_to_view((1000.0, 2000.0));
+        assert!((x - 878.7).abs() < 0.1 && (y - 1759.1).abs() < 0.1, "({x}, {y})");
+        let (gx, gy) = folded.view_to_guest((x, y));
+        assert!((gx - 1000.0).abs() < 1e-9 && (gy - 2000.0).abs() < 1e-9, "round trip: ({gx}, {gy})");
+        // Unfolded, the guest lays out for the whole screen it shows: points don't move.
+        let open = FoldState {
+            folded: false,
+            visible: Rect { x: 0, y: 0, width: 2208, height: 1840 },
+            width: 2208,
+            height: 1840,
+            ..folded.clone()
+        };
+        assert_eq!((open.guest_to_view((1000.0, 2000.0)), open.view_to_guest((7.5, 9.0))), ((1000.0, 2000.0), (7.5, 9.0)));
     }
 
     #[test]

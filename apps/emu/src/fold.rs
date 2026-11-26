@@ -7,7 +7,14 @@
 //! Stock gives a Pixel Fold its outer screen as a second display; simee's board has one, so a
 //! folded device's display is forced to the folded screen's size (`wm size`), and readers of the
 //! scanout (the display socket, screenshots) see only where the guest then draws it
-//! ([`FrameStore::set_view`]; touches on it land there too).
+//! ([`FrameStore::set_view`]; touches on it land there too). Those frames are that region at the
+//! scanout's scale (a Pixel Fold's 949x1840), not the 1080x2092 the guest lays out for: the API
+//! maps its points (`tap`, uiautomator's bounds) from the one to the other.
+//!
+//! The forced size is the guest's (`/data`), so it would outlive the emulator: emu resets it
+//! before it stops ([`Foldable::release`]), and a size it couldn't reset (a crash, a guest powered
+//! off) is recorded in `<avd>/simee/` ([`OVERRIDE_MARKER`]) and reset at the next boot. A size
+//! simee didn't set (a user's, a test harness's `wm size`) is never reset.
 //!
 //! What the guest is told besides, as stock tells it: an image that follows the hinge with its
 //! own device states (a Pixel Fold's `data/misc/pixel_fold`, sent at boot as
@@ -16,13 +23,31 @@
 //! support reads, over adb, as stock sends them.
 //!
 //! Builds and tests on any host; only an Apple silicon boot serves it.
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use emu_vmm::display::FrameStore;
 use sim_core::fold::{Hinge, Rect, StockPosture};
 
-/// Runs shell commands in the guest, in order (stock's `AdbInterface`); fire and forget.
-pub type GuestShell = Box<dyn Fn(Vec<String>) + Send + Sync>;
+/// Runs shell commands in the guest, in order (stock's `AdbInterface`), without waiting: the
+/// receiver says, once they have run, whether every one succeeded.
+pub type GuestShell = Box<dyn Fn(Vec<String>) -> Receiver<bool> + Send + Sync>;
+
+/// The file in `<avd>/simee/` that says the guest's display size is forced by simee (it holds the
+/// `wm size` sent): present from a fold until the size is reset.
+pub const OVERRIDE_MARKER: &str = "fold-wm-size";
+
+/// What [`Foldable::release`] runs in the guest: the reset, then, once SettingsProvider has
+/// written `display_size_forced` (200 ms after a change), a `sync`. Without it the stop loses both
+/// files' renames to the guest's journal (measured on a Pixel Fold, API 36: the size was back at
+/// the next boot), and WindowManager reads either at boot.
+pub const RELEASE_COMMAND: &str = "wm size reset && sleep 1 && sync";
+
+/// How long [`Foldable::release`] waits for [`RELEASE_COMMAND`] before the emulator stops.
+const RELEASE_WAIT: Duration = Duration::from_secs(4);
 
 pub struct Foldable {
     hinge: Hinge,
@@ -37,6 +62,10 @@ pub struct Foldable {
     display: Option<Arc<FrameStore>>,
     /// Sent once the guest has booted, before its posture: the device's skin overlays.
     boot_commands: Vec<String>,
+    /// Whether the guest's display size is forced by us (`wm size`), mirrored in `marker`.
+    overridden: AtomicBool,
+    /// [`OVERRIDE_MARKER`] in the AVD's state dir, so a boot after a crash knows to reset it.
+    marker: Option<PathBuf>,
 }
 
 impl Foldable {
@@ -53,6 +82,31 @@ impl Foldable {
             shell: None,
             display: None,
             boot_commands: Vec::new(),
+            overridden: AtomicBool::new(false),
+            marker: None,
+        }
+    }
+
+    /// Records the forced size in `marker` ([`OVERRIDE_MARKER`]); one already there is a size a
+    /// previous run left forced, which the next boot resets.
+    pub fn with_override_marker(mut self, marker: PathBuf) -> Foldable {
+        self.overridden = AtomicBool::new(marker.is_file());
+        self.marker = Some(marker);
+        self
+    }
+
+    /// Whether the guest's display size is forced by us now.
+    pub fn overridden(&self) -> bool {
+        self.overridden.load(Ordering::SeqCst)
+    }
+
+    fn set_overridden(&self, size: Option<&str>) {
+        self.overridden.store(size.is_some(), Ordering::SeqCst);
+        if let Some(marker) = &self.marker {
+            let _ = match size {
+                Some(size) => marker.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(marker, size)),
+                None => std::fs::remove_file(marker).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }),
+            };
         }
     }
 
@@ -141,19 +195,22 @@ impl Foldable {
         self.set_posture(StockPosture::Open)
     }
 
-    /// What the guest is told at `angle`: the display size when the fold changed it (`resize`),
-    /// and, for an image that doesn't follow the hinge itself, the settings stock's
-    /// `sendPostureToSystem` writes (the posture, and where the fold or hinge is).
+    /// What the guest is told at `angle`: the display size when the fold changed it (`resize`):
+    /// forced while folded, else reset if we forced it; and, for an image that doesn't follow the
+    /// hinge itself, the settings stock's `sendPostureToSystem` writes (the posture, and where the
+    /// fold or hinge is). Records the size as forced or not.
     pub fn guest_commands(&self, angle: f32, resize: bool) -> Vec<String> {
         let mut out = Vec::new();
         if resize {
-            out.push(match self.hinge.folded_at(angle) {
-                true => {
-                    let (w, h) = self.hinge.logical_size(angle, self.screen);
-                    format!("wm size {w}x{h}")
-                }
-                false => "wm size reset".to_owned(),
-            });
+            if self.hinge.folded_at(angle) {
+                let (w, h) = self.hinge.logical_size(angle, self.screen);
+                let size = format!("{w}x{h}");
+                out.push(format!("wm size {size}"));
+                self.set_overridden(Some(&size));
+            } else if self.overridden() {
+                out.push("wm size reset".to_owned());
+                self.set_overridden(None);
+            }
         }
         if !self.guest_device_states {
             out.push(format!("settings put global device_posture {}", self.hinge.posture_at(angle).id()));
@@ -164,13 +221,25 @@ impl Foldable {
         out
     }
 
-    /// Tells the guest the current state once it has booted (a boot keeps a forced size of ours
-    /// from before: the size is set again), after the boot commands.
+    /// Tells the guest the current state once it has booted, after the boot commands: folded, its
+    /// size is forced again; unfolded, a size we left forced (a reboot, a crash) is reset, and any
+    /// other is left alone.
     pub fn announce(&self) {
         let a = self.angle.lock().unwrap_or_else(|e| e.into_inner());
         let mut commands = self.boot_commands.clone();
         commands.extend(self.guest_commands(*a, true));
         self.send(commands);
+    }
+
+    /// Before the emulator stops, while the guest still runs: resets a display size we forced, so
+    /// the AVD's next boot (under any emulator) lays out for its own screen. Waits for it, up to
+    /// [`RELEASE_WAIT`]; a reset that didn't happen stays recorded for the next boot.
+    pub fn release(&self) {
+        let _a = self.angle.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(shell) = self.shell.as_ref().filter(|_| self.overridden()) else { return };
+        if shell(vec![RELEASE_COMMAND.to_owned()]).recv_timeout(RELEASE_WAIT) == Ok(true) {
+            self.set_overridden(None);
+        }
     }
 
     fn apply_view(&self) {
@@ -187,7 +256,7 @@ impl Foldable {
 
     fn send(&self, commands: Vec<String>) {
         if let (Some(shell), false) = (&self.shell, commands.is_empty()) {
-            shell(commands);
+            drop(shell(commands));
         }
     }
 }
@@ -255,26 +324,31 @@ pub fn for_avd(
         .filter(|p| p.is_file())
         .unwrap_or_else(|| std::path::PathBuf::from("adb"));
     let serial = format!("emulator-{console_port}");
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
+    let (tx, rx) = std::sync::mpsc::channel::<(Vec<String>, std::sync::mpsc::Sender<bool>)>();
     // One thread, so a fold and the unfold after it reach the guest in that order.
     let _ = std::thread::Builder::new().name("fold-guest".into()).spawn(move || {
-        for commands in rx {
-            for c in commands {
-                let _ = std::process::Command::new(&adb)
-                    .args(["-s", &serial, "shell", &c])
+        for (commands, done) in rx {
+            let ok = commands.iter().fold(true, |ok, c| {
+                let status = std::process::Command::new(&adb)
+                    .args(["-s", &serial, "shell", c])
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();
-            }
+                ok & status.is_ok_and(|s| s.success())
+            });
+            let _ = done.send(ok);
         }
     });
     let tx = Mutex::new(tx);
     let shell: GuestShell = Box::new(move |commands| {
-        let _ = tx.lock().unwrap_or_else(|e| e.into_inner()).send(commands);
+        let (done, ran) = std::sync::mpsc::channel();
+        let _ = tx.lock().unwrap_or_else(|e| e.into_inner()).send((commands, done));
+        ran
     });
     Some(
         Foldable::new(hinge, (w, h), sensors, guest_device_states(avd).is_some())
+            .with_override_marker(emu_avd::state_dir(&avd.dir).join(OVERRIDE_MARKER))
             .with_shell(shell)
             .with_display(display)
             .with_boot_commands(skin_overlays(avd)),
@@ -327,9 +401,20 @@ mod tests {
     }
 
     fn recording(fold: Foldable) -> (Foldable, Arc<Mutex<Vec<String>>>) {
+        recording_as(fold, true)
+    }
+
+    /// A shell that records what it's told and says it ran (`ok`) or failed.
+    fn recording_as(fold: Foldable, ok: bool) -> (Foldable, Arc<Mutex<Vec<String>>>) {
         let seen: Arc<Mutex<Vec<String>>> = Arc::default();
         let s = seen.clone();
-        (fold.with_shell(Box::new(move |c| s.lock().expect("lock").extend(c))), seen)
+        let shell: GuestShell = Box::new(move |c| {
+            s.lock().expect("lock").extend(c);
+            let (done, ran) = std::sync::mpsc::channel();
+            let _ = done.send(ok);
+            ran
+        });
+        (fold.with_shell(shell), seen)
     }
 
     #[test]
@@ -399,7 +484,47 @@ mod tests {
         pixel.unfold().expect("open");
         assert!(take(&seen).is_empty());
         pixel.announce();
-        assert_eq!(take(&seen), ["wm size reset"], "a boot gets the size again");
+        assert!(take(&seen).is_empty(), "a boot unfolded leaves a size simee didn't force alone");
+        pixel.fold().expect("fold");
+        take(&seen);
+        pixel.announce();
+        assert_eq!(take(&seen), ["wm size 1080x2092"], "a guest rebooted folded gets the size again");
+    }
+
+    #[test]
+    fn a_forced_size_is_reset_before_the_emulator_stops_and_after_a_crash() {
+        let dir = std::env::temp_dir().join(format!("emu-fold-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let marker = dir.join("simee").join(OVERRIDE_MARKER);
+        let take = |seen: &Arc<Mutex<Vec<String>>>| std::mem::take(&mut *seen.lock().expect("lock"));
+        let pixel = || Foldable::new(pixel_fold().hinge, (2208, 1840), sensors(), true).with_override_marker(marker.clone());
+        // Unfolded, stopping sends nothing: a user's own `wm size` survives.
+        let (fold, seen) = recording(pixel());
+        fold.release();
+        assert!(take(&seen).is_empty());
+        // Folded, the size is recorded, and reset before the stop.
+        fold.fold().expect("fold");
+        assert_eq!(take(&seen), ["wm size 1080x2092"]);
+        assert_eq!(std::fs::read_to_string(&marker).ok().as_deref(), Some("1080x2092"));
+        fold.release();
+        assert_eq!(take(&seen), [RELEASE_COMMAND]);
+        assert!(!marker.exists() && !fold.overridden(), "reset: nothing left for the next boot");
+        // A reset that fails (adb gone) stays recorded...
+        let (fold, seen) = recording_as(pixel(), false);
+        fold.fold().expect("fold");
+        fold.release();
+        assert_eq!(take(&seen), ["wm size 1080x2092", RELEASE_COMMAND]);
+        assert!(marker.exists());
+        // ...as does a crash while folded: the next boot (unfolded) resets it once.
+        let (next, seen) = recording(pixel());
+        assert!(next.overridden(), "found the marker");
+        next.announce();
+        assert_eq!(take(&seen), ["wm size reset"]);
+        assert!(!marker.exists());
+        let (after, seen) = recording(pixel());
+        after.announce();
+        assert!(take(&seen).is_empty(), "and only once");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -67,8 +67,8 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `clone` | Android, iOS | device, name | Create a device as a copy of a shut-down one. iOS: a simulator (data, settings, apps; APFS clones of its files); Android: an AVD from a golden that has booted under simee (copy-on-write clones of its disks). A booted-once template's copies skip the first-boot work |
 | `shutdown` | Android, iOS | device | Shut down |
 | `erase` | iOS | device | Erase content and settings (shut down first) |
-| `screen` | Android, iOS | device, display?(main\|carplay) | Screen size in pixels |
-| `screenshot` | Android, iOS | device, path?, display?(main\|carplay) | PNG to path, else base64 in `png` |
+| `screen` | Android, iOS | device, display?(main\|carplay) | Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds) |
+| `screenshot` | Android, iOS | device, path?, display?(main\|carplay) | PNG to path, else base64 in `png` (a folded Android foldable: its outer screen as the scanout shows it, a Pixel Fold's 949x1840) |
 | `tap` | Android, iOS | device, x, y, hold_ms?, display?(main\|carplay) | Tap at pixels (display: an iPhone's CarPlay screen, iOS only) |
 | `swipe` | Android, iOS | device, x1, y1, x2, y2, duration_ms?, settle?, display? | Swipe between pixels |
 | `touch` | Android, iOS | device, x, y, phase(down\|move\|up), display? | One raw touch sample |

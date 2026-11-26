@@ -600,8 +600,6 @@ fn press_button(s: &mut State, button: Button, t: f64, tx: &mut Tx) {
     tx.wake_after(Duration::from_millis(60));
 }
 
-/// Queues a console action for the selected Android device on its console worker; failures go
-/// to the status line when it finishes.
 /// A foldable toolbar button, as stock's fold controls: fold shows the folded screen (a fold-in
 /// shut, a dual-screen folded back), unfold lays it flat, half open stands it like a book. The
 /// screen then streams at the folded screen's size, so the view resizes with it.
@@ -613,6 +611,8 @@ fn fold_to(d: &sim_android::Device, posture: Posture) -> Result<(), String> {
     }
 }
 
+/// Queues a console action for the selected Android device on its console worker; failures go
+/// to the status line when it finishes.
 fn android_action(s: &State, f: impl FnOnce(&sim_android::Device) -> Result<(), String> + Send + 'static) {
     if let Some(sc) = &s.screen {
         sc.console(move |d| f(d).map(|()| None));

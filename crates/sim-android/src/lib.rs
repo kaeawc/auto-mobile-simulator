@@ -591,6 +591,34 @@ impl Device {
         Ok((w, h))
     }
 
+    /// The size the guest lays out for, which [`play`](Self::play) and [`touch`](Self::touch)
+    /// points are in: the LCD, except on a folded foldable under simee, whose guest lays out for
+    /// its outer screen (a Pixel Fold's 1080x2092, as uiautomator's bounds are).
+    pub fn layout_size(&self) -> Result<(u32, u32), String> {
+        match self.folded_view()? {
+            Some(s) => Ok((s.width, s.height)),
+            None => self.screen_size(),
+        }
+    }
+
+    /// A folded foldable's hinge under simee, whose frames (the display socket, screenshots) show
+    /// only the outer screen's region of the scanout (949x1840 of a Pixel Fold's 2208x1840) while
+    /// the guest lays out for the outer screen's own size: None for every other device, and
+    /// without asking the emulator unless the device is a foldable.
+    fn folded_view(&self) -> Result<Option<sim_core::fold::FoldState>, String> {
+        let foldable = self.info.kind().is_some_and(|k| k.accepts(InputMethod::Hinge));
+        if !foldable || !self.running.as_ref().is_some_and(|r| r.simee) {
+            return Ok(None);
+        }
+        Ok(self.fold_state()?.filter(|s| s.folded))
+    }
+
+    /// `point` in the guest's layout on the display socket's frames (see [`Device::layout_size`]).
+    fn to_view(view: Option<&sim_core::fold::FoldState>, x: f64, y: f64) -> (f32, f32) {
+        let (x, y) = view.map_or((x, y), |s| s.guest_to_view((x, y)));
+        (x as f32, y as f32)
+    }
+
     /// Starts `emu` for this AVD (unless it's running) and waits until it has booted: until
     /// `sys.boot_completed` is 1 when adb is available, else until the display has a frame.
     /// The emulator's own output goes to `<avd>/simee/emu.log`. With `audio` the device plays
@@ -745,23 +773,31 @@ impl Device {
         sim_core::frame::png_size(&header).ok_or_else(|| format!("{} isn't a PNG", path.display()))
     }
 
-    /// Plays touch samples (device pixels) over one display connection.
+    /// Plays touch samples (pixels of the guest's layout, [`Device::layout_size`]) over one
+    /// display connection.
     pub fn play(&self, samples: &[Sample]) -> Result<(), String> {
-        self.with_display(self.touch_screen()?, |display| {
+        let avd = self.touch_screen()?;
+        let view = self.folded_view()?;
+        self.with_display(avd, |display| {
             // Against deadlines from the first sample, so send costs and oversleeps don't stretch it.
             let start = Instant::now();
             pace_samples(
                 samples,
                 || start.elapsed(),
                 sleep,
-                |s| display.send(&Input::Touch { x: s.point.x as f32, y: s.point.y as f32, phase: s.phase }),
+                |s| {
+                    let (x, y) = Self::to_view(view.as_ref(), s.point.x, s.point.y);
+                    display.send(&Input::Touch { x, y, phase: s.phase })
+                },
             )
         })
     }
 
-    /// One touch sample at device pixels.
+    /// One touch sample at pixels of the guest's layout ([`Device::layout_size`]).
     pub fn touch(&self, x: f64, y: f64, phase: Phase) -> Result<(), String> {
-        self.with_display(self.touch_screen()?, |d| d.send(&Input::Touch { x: x as f32, y: y as f32, phase }))
+        let avd = self.touch_screen()?;
+        let (x, y) = Self::to_view(self.folded_view()?.as_ref(), x, y);
+        self.with_display(avd, |d| d.send(&Input::Touch { x, y, phase }))
     }
 
     /// A touch on the touchpad beside the screen (`hw.touchpad0`: Android XR display glasses), in
@@ -950,9 +986,12 @@ impl Device {
     }
 
     /// A foldable's hinge as the emulator has it (simee's `fold status`); None from an emulator
-    /// that doesn't say.
+    /// that doesn't say, the stock one among them (it isn't asked: it refuses the command).
     pub fn fold_state(&self) -> Result<Option<sim_core::fold::FoldState>, String> {
         self.require(InputMethod::Hinge, "folding")?;
+        if !self.running()?.simee {
+            return Ok(None);
+        }
         Ok(sim_core::fold::FoldState::parse(&self.console(&["fold status".into()])?))
     }
 
@@ -1677,6 +1716,22 @@ mod tests {
         assert_eq!((d.info.udid.as_str(), d.info.state, d.avd.is_some()), ("b", DeviceState::Booted, true));
         assert_eq!(f.android.device("c").map(|d| d.info.state), Ok(DeviceState::Shutdown));
         assert!(f.android.device("nope").is_err());
+    }
+
+    #[test]
+    fn only_foldables_ask_for_their_hinge_before_a_touch() {
+        let f = fixture("phonepts");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let fake = fake_emulator(&f.android, "phone");
+        // Even an emulator that would say "folded" isn't asked about a phone.
+        *fake.fold_status.lock().expect("status") =
+            Some("angle: 0\r\nposture: closed (1)\r\nfolded: true\r\nvisible: 949x1840+629+0\r\nsize: 1080x2092\r\npostures: 1,2,3".into());
+        let d = f.android.device("phone").expect("running");
+        assert_eq!(d.layout_size(), d.screen_size());
+        d.touch(1000.0, 2000.0, Phase::Down).expect("touch");
+        d.play(&sim_core::gesture::tap(sim_core::geometry::Point::new(7.0, 9.0), Duration::ZERO)).expect("tap");
+        assert_eq!(wait_for(&fake.display, 3), ["touch 1000 2000 down", "touch 7 9 down", "touch 7 9 up"]);
+        assert!(fake.console.lock().expect("console").is_empty(), "no console round trip for a phone's touch");
     }
 
     #[test]

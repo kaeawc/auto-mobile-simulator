@@ -50,42 +50,6 @@ const IOS_BOOT_PARAMS: &[(&str, &str)] = &[
 
 /// Rejects iOS-only boot parameters that ask for something (a `false`, `null`, empty or absent
 /// one asks for nothing), naming the platform that has them.
-/// `fold`: a hinge `angle`, or a `posture` (stock's names or ids: closed, half-opened, opened,
-/// flipped, tent). Answers with the hinge as the emulator then has it (angle, posture, whether
-/// folded, the display size the guest lays out for), or, from an emulator that doesn't say, what
-/// was asked.
-fn fold(d: &sim_android::Device, p: &Value) -> Result<Value, String> {
-    const POSTURES: &str = "closed, half-opened, opened, flipped, tent";
-    let asked = match (p.get("angle").and_then(Value::as_f64), str_param(p, "posture")) {
-        _ if p.get("folded").is_some() => {
-            let folded = opt_bool(p, "folded")?.unwrap_or(true);
-            d.fold_display(folded)?;
-            json!({"folded": folded})
-        }
-        (Some(a), _) => {
-            d.fold(a as f32)?;
-            json!({"angle": a as f32, "posture": Posture::from_angle(a as f32)})
-        }
-        (None, Some(name)) => {
-            let posture = StockPosture::parse(name).ok_or_else(|| format!("unknown posture `{name}` ({POSTURES})"))?;
-            d.posture(posture)?;
-            json!({"angle": Posture::parse(name).map(Posture::angle), "posture": posture.name()})
-        }
-        (None, None) => return Err(format!("give `angle` (0-180; 0-360 on a dual-screen) or `posture` ({POSTURES})")),
-    };
-    Ok(match d.fold_state()? {
-        Some(s) => json!({
-            "angle": s.angle,
-            "posture": s.posture.name(),
-            "folded": s.folded,
-            "width": s.width,
-            "height": s.height,
-            "postures": s.postures.iter().map(|p| p.name()).collect::<Vec<_>>(),
-        }),
-        None => asked,
-    })
-}
-
 fn reject_ios_boot_params(method: &str, p: &Value) -> Result<(), String> {
     for (key, why) in IOS_BOOT_PARAMS {
         let asks = match p.get(*key) {
@@ -99,6 +63,44 @@ fn reject_ios_boot_params(method: &str, p: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// `fold`: `folded` (the console's `fold` or `unfold`), a hinge `angle`, or a `posture` (stock's
+/// names or ids: closed, half-opened, opened, flipped, tent); a `null` one is absent. Answers
+/// with the hinge as simee's emulator then has it (angle, posture, whether folded, the display
+/// size the guest lays out for), or, from one that doesn't say (the stock emulator), what was
+/// asked.
+fn fold(d: &sim_android::Device, p: &Value) -> Result<Value, String> {
+    const POSTURES: &str = "closed, half-opened, opened, flipped, tent";
+    let asked = match (opt_bool(p, "folded")?, p.get("angle").and_then(Value::as_f64), str_param(p, "posture")) {
+        (Some(folded), ..) => {
+            d.fold_display(folded)?;
+            json!({"folded": folded})
+        }
+        (None, Some(a), _) => {
+            d.fold(a as f32)?;
+            json!({"angle": a as f32, "posture": Posture::from_angle(a as f32)})
+        }
+        (None, None, Some(name)) => {
+            let posture = StockPosture::parse(name).ok_or_else(|| format!("unknown posture `{name}` ({POSTURES})"))?;
+            d.posture(posture)?;
+            json!({"angle": Posture::parse(name).map(Posture::angle), "posture": posture.name()})
+        }
+        (None, None, None) => {
+            return Err(format!("give `folded` (true|false), `angle` (0-180; 0-360 on a dual-screen) or `posture` ({POSTURES})"));
+        }
+    };
+    Ok(match d.fold_state()? {
+        Some(s) => json!({
+            "angle": s.angle,
+            "posture": s.posture.name(),
+            "folded": s.folded,
+            "width": s.width,
+            "height": s.height,
+            "postures": s.postures.iter().map(|p| p.name()).collect::<Vec<_>>(),
+        }),
+        None => asked,
+    })
 }
 
 /// The first console port `boot_many` hands out: `first_port` (default 5554), even and in the
@@ -168,7 +170,8 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             serde_json::to_value(info).map_err(|e| e.to_string())
         }
         "shutdown" => null(d.shutdown()),
-        "screen" => d.screen_size().map(|(w, h)| json!({"width": w, "height": h})),
+        // The guest's layout, which tap, swipe and touch take (a folded foldable's outer screen).
+        "screen" => d.layout_size().map(|(w, h)| json!({"width": w, "height": h})),
         // The emulator's own PNG, passed through: with `path` it writes the file itself.
         "screenshot" => match str_param(p, "path") {
             Some(path) => d.screenshot_png_to(std::path::Path::new(path)).map(|(w, h)| json!({"path": path, "width": w, "height": h})),

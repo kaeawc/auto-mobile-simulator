@@ -555,6 +555,10 @@ fn session(stream: TcpStream, info: &ConsoleInfo) -> std::io::Result<()> {
             (_, false) => "KO: unknown command, try 'help'".to_string(),
             ("kill", true) => {
                 out.write_all(b"OK: killing emulator, bye bye\r\n")?;
+                // While the guest still runs: a folded foldable's forced size goes with emu.
+                if let Some(fold) = &info.fold {
+                    fold.release();
+                }
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 emu_vmm::request_stop(&info.stop);
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
