@@ -29,7 +29,16 @@ const BASE_CMDLINE: &str = "8250.nr_uarts=1 no_timer_check console=ttyAMA0,38400
 /// Kernel arguments stock's x86 board passes (software mode, #55), with the console on the first
 /// 8250 UART instead of stock's `console=0`, as on arm64. The image's own `kernel_cmdline.txt`
 /// adds the rest (`clocksource=pit` on x86_64).
-const X86_CMDLINE: &str = "8250.nr_uarts=1 no_timer_check console=ttyS0,38400 keep_bootcon ndns=2 loop.max_part=7 printk.devkmsg=on bootconfig mac80211_hwsim.radios=0";
+///
+/// Plus `kfence.sample_interval=0`. These kernels build KFENCE with static keys
+/// (`CONFIG_KFENCE_STATIC_KEYS`), so every 500 ms its sampling flips a branch inside every slab
+/// allocation, live-patching kernel text through an `int3`. Under QEMU's multi-threaded TCG
+/// another vCPU can execute the breakpoint after the patch has finished. Guests panicked with
+/// `int3` in `__kmem_cache_alloc_node`, three CPUs at once, and each flip also invalidates
+/// QEMU's translations of that code. With hardware virtualization the CPU keeps that coherent,
+/// so other boards keep KFENCE.
+const X86_CMDLINE: &str = "8250.nr_uarts=1 no_timer_check console=ttyS0,38400 keep_bootcon ndns=2 loop.max_part=7 printk.devkmsg=on \
+                           bootconfig mac80211_hwsim.radios=0 kfence.sample_interval=0";
 
 /// Without `-show-kernel`, only messages below KERN_ERR reach the console (emergencies, alerts,
 /// criticals, so init's FATAL lines). The PL011 traps twice per byte, and booting printed 230 KB
@@ -1683,12 +1692,16 @@ mod tests {
         let boot_devices =
             |p: &BootPlan| p.bootconfig.entries().iter().find(|(k, _)| k == "androidboot.boot_devices").map(|(_, v)| v.clone());
         let x86 = BootPlan::new(&s.env.load("x86").expect("load"), &Opts::default(), Some(PathBuf::from("/r/lib64")));
+        let arm = BootPlan::new(&s.env.load("phone").expect("load"), &Opts::default(), None);
         assert!(x86.cmdline.starts_with("8250.nr_uarts=1 no_timer_check console=ttyS0,38400 "), "{}", x86.cmdline);
         assert!(!x86.cmdline.contains("ttyAMA0"), "{}", x86.cmdline);
+        // KFENCE's sampling flips a static key twice a second, patching kernel text that TCG's
+        // other vCPUs may be running.
+        assert!(x86.cmdline.contains(" kfence.sample_interval=0"), "{}", x86.cmdline);
+        assert!(!arm.cmdline.contains("kfence"), "only software mode needs it: {}", arm.cmdline);
         assert_eq!(boot_devices(&x86).as_deref(), Some(emu_vmm::layout::x86::BOOT_DEVICES));
         assert!(x86.devices().iter().any(|d| d.contains("QEMU")), "{:?}", x86.devices());
         assert!(x86.to_string().contains("userdata  pci 00:05.0 "), "{x86}");
-        let arm = BootPlan::new(&s.env.load("phone").expect("load"), &Opts::default(), None);
         assert_eq!(boot_devices(&arm).as_deref(), Some("a003600.virtio_mmio"));
         assert!(arm.cmdline.contains("console=ttyAMA0"));
         let _ = std::fs::remove_dir_all(&s.root);
