@@ -105,13 +105,16 @@ impl PipeService for SensorService {
             crate::device_thread();
             // Every enabled sensor goes out each tick, changed or not, as stock's
             // `_hwSensorClient_tick` does (the HAL reports continuous sensors at their rate).
-            // With none enabled the thread sleeps until one is.
+            // With none enabled the thread sleeps until one is. Events go out under the protocol
+            // name even where the HAL enables a sensor by another one: it enables
+            // `magnetic-field[-uncalibrated]` but parses `magnetic[-uncalibrated]:` events, and
+            // logs "don't know how to parse" (~90 times per rotate) for the echoed spelling.
             while let Some(enabled) = s.next_tick() {
                 let mut out = Vec::new();
                 for name in enabled {
                     if let Some(vals) = sensors.get(&name) {
                         let joined: Vec<String> = vals.iter().map(|v| format!("{v}")).collect();
-                        frame(&mut out, format!("{name}:{}", joined.join(":")).as_bytes());
+                        frame(&mut out, format!("{}:{}", Sensors::protocol_name(&name), joined.join(":")).as_bytes());
                     }
                 }
                 frame(&mut out, format!("sync:{}", start.elapsed().as_micros()).as_bytes());
@@ -295,6 +298,55 @@ mod tests {
         pipe.closed();
         assert!(sent.join().expect("stream") as u64 >= ticks);
         assert!(closed.elapsed() < Duration::from_millis(100), "a close wakes it: {:?}", closed.elapsed());
+    }
+
+    /// One batch of event lines after the guest enables `enable` (a name as the HAL spells it).
+    fn lines_after_enabling(sensors: Arc<Sensors>, enable: &[&str]) -> Vec<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut pipe = SensorService { sensors }.open("qemud:sensors", PipeCtx { conn: 1, events: tx }).expect("open");
+        let mut req = Vec::new();
+        frame(&mut req, b"set-delay:10");
+        for name in enable {
+            frame(&mut req, format!("set:{name}:1").as_bytes());
+        }
+        assert!(pipe.guest_data(&req, &mut Vec::new()));
+        let ev = rx.recv_timeout(Duration::from_secs(2)).expect("event");
+        let crate::pipe::WorkerEvent::Host { msg: HostMsg::Data(mut d), .. } = ev else { panic!("data") };
+        pipe.closed();
+        let mut lines: Vec<String> = take_frames(&mut d).into_iter().map(|l| String::from_utf8(l).expect("utf8")).collect();
+        assert!(lines.pop().is_some_and(|l| l.starts_with("sync:")));
+        lines.sort();
+        lines
+    }
+
+    #[test]
+    fn the_hal_enables_magnetic_field_and_gets_events_named_magnetic() {
+        // The HAL's `set:` names (traced on API 36) differ from the names its parser takes for
+        // events: it logged "don't know how to parse 'magnetic-field:0:5.9:-48.4'".
+        let lines = lines_after_enabling(Arc::new(Sensors::phone()), &["magnetic-field", "magnetic-field-uncalibrated"]);
+        assert_eq!(lines, ["magnetic-uncalibrated:0:5.9:-48.4", "magnetic:0:5.9:-48.4"]);
+    }
+
+    #[test]
+    fn every_sensor_event_line_is_its_protocol_name_and_values() {
+        // Every sensor, enabled by the name the HAL sends (stock's console spelling for the two
+        // magnetic ones): a line per sensor, `<protocol name>:<v>[:<v>...]`, one value per axis.
+        let sensors = Arc::new(Sensors::new((1 << NAMES.len()) - 1));
+        let enable: Vec<&str> = NAMES
+            .iter()
+            .map(|n| match *n {
+                "magnetic" => "magnetic-field",
+                "magnetic-uncalibrated" => "magnetic-field-uncalibrated",
+                other => other,
+            })
+            .collect();
+        let lines = lines_after_enabling(sensors.clone(), &enable);
+        assert_eq!(lines.len(), NAMES.len());
+        for name in NAMES {
+            let want = format!("{name}:{}", sensors.get(name).expect("value").iter().map(|v| v.to_string()).collect::<Vec<_>>().join(":"));
+            assert!(lines.contains(&want), "{want} in {lines:?}");
+        }
+        assert!(lines.iter().all(|l| !l.contains("field")), "no `-field` spelling on the wire: {lines:?}");
     }
 
     #[test]
