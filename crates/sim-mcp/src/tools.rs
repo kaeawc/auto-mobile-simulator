@@ -233,8 +233,9 @@ mod tests {
         let tools = list();
         let find = |m: &str| tools.iter().find(|t| t["name"] == m).and_then(|t| t["description"].as_str()).expect(m).to_owned();
         assert!(find("tap").contains("Platforms: Android, iOS."));
-        assert!(find("fold").contains("Platforms: Android."));
-        assert!(!find("fold").contains("iOS."));
+        assert!(find("xr").contains("Platforms: Android."));
+        assert!(!find("xr").contains("iOS."));
+        assert!(find("fold").contains("Platforms: Android, iOS."), "the iPhone Duo folds too");
         assert!(find("status_bar").contains("Platforms: iOS."));
         assert!(find("boot").contains("task"));
         assert!(!find("tap").contains("task"));

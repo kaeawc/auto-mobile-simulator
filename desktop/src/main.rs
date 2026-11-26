@@ -670,6 +670,15 @@ fn fold_to(d: &sim_android::Device, posture: Posture) -> Result<(), String> {
     }
 }
 
+/// Folds an iPhone Duo through the API's `fold` (SpringBoard sweeps its hinge: a second or two),
+/// off the UI thread; the capture thread then shows the screen in use.
+fn apple_fold(s: &mut State, udid: String, posture: Posture) {
+    s.run_async("Folding…", move || {
+        let params = serde_json::json!({"device": udid, "posture": posture});
+        sim_api::call_method(&mut sim_api::Session::default(), "fold", &params).map(drop)
+    });
+}
+
 /// Queues a console action for the selected Android device on its console worker; failures go
 /// to the status line when it finishes.
 fn android_action(s: &State, f: impl FnOnce(&sim_android::Device) -> Result<(), String> + Send + 'static) {
@@ -771,7 +780,10 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
                 Some(live) => live.rotate(),
                 None => android_action(s, sim_android::Device::rotate),
             },
-            Action::Fold(posture) => android_action(s, move |d| fold_to(d, posture)),
+            Action::Fold(posture) => match s.live.as_ref().map(|l| l.udid.clone()) {
+                Some(udid) => apple_fold(s, udid, posture),
+                None => android_action(s, move |d| fold_to(d, posture)),
+            },
             Action::Rotary(ticks) => {
                 s.live.iter().for_each(|l| l.crown(ticks));
                 s.screen.iter().for_each(|sc| sc.wheel(ticks));

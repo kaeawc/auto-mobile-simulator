@@ -322,7 +322,7 @@ mod tests {
         assert_eq!(tap["required"], json!(["device", "x", "y"]));
         assert_eq!(tap["properties"]["x"]["type"], "number");
         assert_eq!(tap["properties"]["hold_ms"]["type"], "integer");
-        assert_eq!(tap["properties"]["display"]["enum"], json!(["main", "carplay"]));
+        assert_eq!(tap["properties"]["display"]["enum"], json!(["main", "outer", "inner", "carplay"]));
         assert_eq!(tap["properties"]["device"]["description"], "A device's UDID, name or `booted`");
         assert_eq!(schema("devices").get("required"), None, "every parameter is optional");
         assert_eq!(schema("help"), json!({"type": "object", "properties": {}}));

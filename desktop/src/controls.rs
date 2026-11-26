@@ -59,6 +59,7 @@ pub fn for_device(d: &DeviceInfo) -> Vec<Control> {
                 out.push(button("lock-button", &icons::LOCK, "Lock", Button::Lock));
                 out.push(control("rotate-button", &icons::ROTATE, "Rotate", Action::Rotate));
                 out.push(control("appearance-button", &icons::MOON, "Appearance", Action::ToggleAppearance));
+                out.extend(apple_fold(d));
             }
         },
         Platform::Android => {
@@ -108,6 +109,19 @@ pub fn for_device(d: &DeviceInfo) -> Vec<Control> {
     out.push(control("screenshot-button", &icons::CAMERA, "Screenshot", Action::Screenshot));
     out.push(control("shutdown-button", &icons::POWER, "Shut Down", Action::Shutdown));
     out
+}
+
+/// An iPhone Duo's hinge: folded (the outer screen), the book posture and open flat (the inner
+/// screen). The view follows the screen in use.
+fn apple_fold(d: &DeviceInfo) -> Vec<Control> {
+    if !sim_core::duo::folds(&d.device_type_id) {
+        return Vec::new();
+    }
+    vec![
+        control("fold-closed", &icons::FOLD_CLOSED, "Fold", Action::Fold(Posture::Closed)),
+        control("fold-half", &icons::FOLD_HALF, "Half open", Action::Fold(Posture::HalfOpened)),
+        control("fold-opened", &icons::FOLD_OPEN, "Unfold", Action::Fold(Posture::Opened)),
+    ]
 }
 
 /// How a running device takes drags that start on its bezel (`crate::bezel`): an iPhone, iPad or
@@ -219,6 +233,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_iphone_duo_gets_its_hinge() {
+        let mut duo = device(Platform::Ios, FormFactor::Phone);
+        duo.device_type_id = "com.apple.CoreSimulator.SimDeviceType.iPhone-Duo".into();
+        let keys: Vec<&str> = for_device(&duo).iter().map(|c| c.key).collect();
+        assert!(keys.ends_with(&["fold-closed", "fold-half", "fold-opened", "screenshot-button", "shutdown-button"]), "{keys:?}");
+        assert!(!self::keys(Platform::Ios, FormFactor::Phone).contains(&"fold-closed"), "other iPhones don't fold");
     }
 
     #[test]

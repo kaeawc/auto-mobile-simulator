@@ -74,23 +74,33 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("erase", "device", "Erase content and settings (shut down first)"),
     (
         "screen",
-        "device, display?(main|carplay)",
-        "Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds)",
+        "device, display?(main|outer|inner|carplay)",
+        "Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds). \
+         display (iOS): main is the screen in use (an unfolded iPhone Duo's inner one), outer and inner an iPhone Duo's two, carplay an iPhone's CarPlay screen",
     ),
     (
         "screenshot",
-        "device, path?, display?(main|carplay)",
-        "PNG to path, else base64 in `png` (a folded Android foldable: its outer screen as the scanout shows it, a Pixel Fold's 949x1840)",
+        "device, path?, display?(main|outer|inner|carplay)",
+        "PNG to path, else base64 in `png` (a folded Android foldable: its outer screen as the scanout shows it, a Pixel Fold's 949x1840; \
+         an iPhone Duo's inner screen as its framebuffer holds it, 2007x2853)",
     ),
-    ("tap", "device, x, y, hold_ms?, display?(main|carplay)", "Tap at pixels (display: an iPhone's CarPlay screen, iOS only)"),
+    (
+        "tap",
+        "device, x, y, hold_ms?, display?(main|outer|inner|carplay)",
+        "Tap at pixels (display, iOS only: an iPhone Duo's outer or inner screen, an iPhone's CarPlay screen)",
+    ),
     (
         "swipe",
-        "device, x1, y1, x2, y2, duration_ms?, settle?, display?, edge?(top|bottom|left|right; iOS)",
+        "device, x1, y1, x2, y2, duration_ms?, settle?, display?(main|outer|inner|carplay), edge?(top|bottom|left|right; iOS)",
         "Swipe between pixels; with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: \
          home and the app switcher from the bottom, Notification Center and Control Center from the top (Android's edge \
          gestures need only the start point)",
     ),
-    ("touch", "device, x, y, phase(down|move|up), display?, edge?(top|bottom|left|right; iOS)", "One raw touch sample"),
+    (
+        "touch",
+        "device, x, y, phase(down|move|up), display?(main|outer|inner|carplay), edge?(top|bottom|left|right; iOS)",
+        "One raw touch sample",
+    ),
     (
         "button",
         "device, button(home|lock|side|siri|apple-pay|action | back|volume-up|volume-down|recents|menu|up|down|left|right|select|play-pause), hold_ms?",
@@ -184,7 +194,10 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     (
         "fold",
         "device, folded(true|false) | angle(0-180; 0-360 dual-screen) | posture(closed|half-opened|opened|flipped|tent)",
-        "Set a foldable's hinge, as the console's fold, unfold and posture do: the hinge sensor, the posture and, folded, the outer screen; returns angle, posture, folded and the size the guest lays out for",
+        "Set a foldable's hinge. Android: as the console's fold, unfold and posture do (the hinge sensor, the posture and, folded, \
+         the outer screen). iOS: an iPhone Duo's (closed, half-opened is the 100° book posture, opened), which SpringBoard sweeps \
+         to, moving the content to the inner screen when it opens past its swap boundary. Returns angle, posture, folded and the \
+         size the guest lays out for (iOS: of the screen in use, named in display)",
     ),
     (
         "xr",
@@ -270,11 +283,12 @@ const ALL_PLATFORMS: &[&str] = &[
     "location",
     "info",
     "rotate",
+    "fold",
     "rotary",
     "stylus",
 ];
 /// Methods only Android devices have.
-const ANDROID_ONLY: &[&str] = &["console", "fold", "xr", "vehicle", "touchpad"];
+const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad"];
 
 /// The platforms whose devices `method` works on.
 pub fn platforms(method: &str) -> &'static [Platform] {
@@ -464,7 +478,7 @@ mod tests {
         assert_eq!(find("devices")["platforms"], json!(["android", "ios"]));
         assert_eq!(find("status_bar")["platforms"], json!(["ios"]));
         assert_eq!(find("tap")["platforms"], json!(["android", "ios"]));
-        assert_eq!(find("fold")["platforms"], json!(["android"]));
+        assert_eq!(find("fold")["platforms"], json!(["android", "ios"]));
         assert_eq!(find("xr")["platforms"], json!(["android"]));
         assert_eq!(find("rotary")["platforms"], json!(["android", "ios"]));
         assert_eq!(find("rotate")["platforms"], json!(["android", "ios"]));

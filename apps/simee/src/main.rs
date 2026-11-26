@@ -193,7 +193,7 @@ enum Cmd {
     Screenshot {
         device: String,
         path: String,
-        /// `carplay` for an iPhone's CarPlay screen.
+        /// iOS: `outer` or `inner` for an iPhone Duo's screen (`main` is the one in use), `carplay` for an iPhone's CarPlay screen.
         #[arg(long, default_value = "main")]
         display: String,
     },
@@ -205,7 +205,7 @@ enum Cmd {
         /// Hold time in milliseconds.
         #[arg(long, default_value_t = 60)]
         hold: u64,
-        /// `carplay` for an iPhone's CarPlay screen.
+        /// iOS: `outer` or `inner` for an iPhone Duo's screen (`main` is the one in use), `carplay` for an iPhone's CarPlay screen.
         #[arg(long, default_value = "main")]
         display: String,
     },
@@ -222,7 +222,7 @@ enum Cmd {
         /// Pause at the end before lifting (a drag rather than a flick).
         #[arg(long)]
         settle: bool,
-        /// `carplay` for an iPhone's CarPlay screen.
+        /// iOS: `outer` or `inner` for an iPhone Duo's screen (`main` is the one in use), `carplay` for an iPhone's CarPlay screen.
         #[arg(long, default_value = "main")]
         display: String,
         /// iOS: the touch comes in from this screen edge (top, bottom, left, right), as a drag from
@@ -272,8 +272,8 @@ enum Cmd {
         #[arg(long)]
         orientation: Option<String>,
     },
-    /// Set an Android foldable's hinge: fold, unfold, a posture (closed, half-opened, opened, flipped, tent) or an
-    /// angle (0-180; 0-360 on a dual-screen).
+    /// Set a foldable's hinge: fold, unfold, a posture (closed, half-opened, opened, flipped, tent) or an angle (0-180;
+    /// 0-360 on a dual-screen). Android foldables, and the iPhone Duo (iOS: closed, half-opened, opened, 0-180).
     Fold { device: String, posture: String },
     /// Android XR: recenter, rotate X Y Z (radians), move DX DY DZ (metres), options day|night
     /// PASSTHROUGH (0-1), input mouse|hand|eye, viewport pan|zoom|rotate, pointer X Y [PHASE].
@@ -930,12 +930,15 @@ fn form_factors_text(rows: &Value) -> String {
 }
 
 /// `simee fold`'s line for the `fold` method's answer: the posture and angle, and the screen and
-/// its size when simee's emulator says them; the stock emulator's answer to a fold or unfold is
-/// only which was asked.
+/// its size when simee's emulator (or an iPhone Duo, naming its screen in use) says them; the
+/// stock emulator's answer to a fold or unfold is only which was asked.
 fn fold_line(r: &Value) -> String {
     let screen = |folded: bool| if folded { "folded" } else { "unfolded" };
     match (r["posture"].as_str(), r["folded"].as_bool(), r["width"].as_u64(), r["height"].as_u64()) {
-        (Some(posture), Some(folded), Some(w), Some(h)) => format!("{posture} ({}°), {}, {w}x{h}", r["angle"], screen(folded)),
+        (Some(posture), Some(folded), Some(w), Some(h)) => match r["display"].as_str() {
+            Some(display) => format!("{posture} ({}°), {}, {display} {w}x{h}", r["angle"], screen(folded)),
+            None => format!("{posture} ({}°), {}, {w}x{h}", r["angle"], screen(folded)),
+        },
         (Some(posture), ..) => format!("{posture} ({}°)", r["angle"]),
         (None, Some(folded), ..) => screen(folded).to_owned(),
         (None, None, ..) => r.to_string(),
@@ -1029,6 +1032,9 @@ mod tests {
         assert_eq!(fold_line(&json!({"folded": true})), "folded", "not `null (null°)`");
         assert_eq!(fold_line(&json!({"folded": false})), "unfolded");
         assert_eq!(fold_line(&json!({"angle": 180.0, "posture": "opened"})), "opened (180.0°)");
+        // An iPhone Duo names the screen in use.
+        let duo = json!({"angle": 180.0, "posture": "opened", "folded": false, "display": "inner", "width": 2007, "height": 2853});
+        assert_eq!(fold_line(&duo), "opened (180.0°), unfolded, inner 2007x2853");
     }
 
     #[test]

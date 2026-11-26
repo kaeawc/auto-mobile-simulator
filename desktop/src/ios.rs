@@ -11,13 +11,14 @@ use std::time::Instant;
 use rune::NativeSurface;
 use rune::native_surface::macos::PixelBuffer;
 use sim_core::device::{DeviceInfo, DeviceState};
+use sim_core::duo::Screen;
 use sim_core::geometry::{Point, Size};
 use sim_core::gesture::Phase;
 use sim_core::hid::Direction;
 use sim_core::hid::{Button, CROWN_UNITS_PER_TICK, KEY_LEFT_SHIFT, KeyStroke, Orientation};
 use sim_core::pacing::{Pacer, Pacing};
 pub use sim_coresim::Context;
-use sim_coresim::{Appearance, Device, Frame, Hid, Surface};
+use sim_coresim::{Appearance, Device, Display, Frame, Hid, Surface};
 
 use crate::device::Shared;
 
@@ -66,10 +67,16 @@ impl Live {
         }
     }
 
-    /// Sends a touch at a point given in device pixels.
+    /// Sends a touch at a point given in device pixels, on the screen shown (an iPhone Duo's inner
+    /// screen while it is unfolded).
     pub fn touch(&self, x: f32, y: f32, phase: Phase) {
         let (Some(hid), Some(screen)) = (&self.hid, self.screen()) else { return };
-        if let Err(e) = hid.touch(screen.normalize(Point::new(f64::from(x), f64::from(y))), phase) {
+        let at = screen.normalize(Point::new(f64::from(x), f64::from(y)));
+        let sent = match self.shared.screen_id.load(Ordering::Relaxed) {
+            0 => hid.touch(at, phase),
+            id => hid.screen_touch(id, at, phase, None),
+        };
+        if let Err(e) = sent {
             eprintln!("touch: {e}");
         }
         self.kick();
@@ -108,9 +115,12 @@ impl Live {
         self.device.data_path()
     }
 
-    /// Copies the current frame (for saving screenshots).
+    /// Copies the current frame of the screen shown (for saving screenshots).
     pub fn capture(&self) -> Result<Frame, String> {
-        self.device.display().and_then(|d| d.capture()).map_err(|e| e.to_string())
+        let (main, inner) = self.device.builtin_displays().map_err(|e| e.to_string())?;
+        let shown = self.shared.screen_id.load(Ordering::Relaxed);
+        let display = inner.filter(|d| shown != 0 && d.screen_id() == Some(shown)).unwrap_or(main);
+        display.capture().map_err(|e| e.to_string())
     }
 
     pub fn strokes(&self, strokes: &[KeyStroke]) {
@@ -176,18 +186,22 @@ fn spawn_capture(
     std::thread::Builder::new()
         .name("simee-capture".into())
         .spawn(move || {
-            let display = match Context::new().and_then(|c| c.device(&udid)).and_then(|d| d.display()) {
+            let (main, inner) = match Context::new().and_then(|c| c.device(&udid)).and_then(|d| d.builtin_displays()) {
                 Ok(d) => d,
                 Err(e) => return eprintln!("capture: {e}"),
             };
             let announced = Arc::new(AtomicBool::new(false));
-            let watch = {
+            let watch_frames = |display: &Display| {
                 let (announced, this) = (announced.clone(), std::thread::current());
                 display.watch_frames(move || {
                     announced.store(true, Ordering::Release);
                     this.unpark();
                 })
             };
+            let watch = watch_frames(&main);
+            // An iPhone Duo's inner screen announces its frames too; without, the safety look finds them.
+            let _inner_watch = inner.as_ref().and_then(|d| watch_frames(d).ok());
+            let mut shown = Screen::Outer;
             let mut pacer = Pacer::new(Pacing::FRAMEBUFFER, Instant::now());
             match &watch {
                 Ok(_) => pacer = pacer.announcing(),
@@ -205,6 +219,17 @@ fn spawn_capture(
                 if current.is_none() || Instant::now() >= next_check {
                     next_check = Instant::now() + Duration::from_millis(250);
                     sim_coresim::autoreleasepool(|| {
+                        let display = match &inner {
+                            Some(inner) => {
+                                let next = follow_fold(&main, inner, shown, &shared);
+                                if next != shown {
+                                    shown = next;
+                                    current = None;
+                                }
+                                if shown == Screen::Inner { inner } else { &main }
+                            }
+                            None => &main,
+                        };
                         if let Some(surface) = display.surface_handle()
                             && current.as_ref().is_none_or(|(s, _)| s.as_raw() != surface.as_raw())
                         {
@@ -247,6 +272,15 @@ fn spawn_capture(
             native.clear();
         })
         .map_err(|e| e.to_string())
+}
+
+/// The screen an iPhone Duo's view shows next ([`sim_core::duo::follow`]: the one in use), with its
+/// screen ID published for touches.
+fn follow_fold(main: &Display, inner: &Display, shown: Screen, shared: &Shared) -> Screen {
+    let next = sim_core::duo::follow(shown, main.lit(), inner.lit());
+    let id = if next == Screen::Inner { inner.screen_id() } else { main.screen_id() };
+    shared.screen_id.store(id.unwrap_or(0), Ordering::Relaxed);
+    next
 }
 
 /// Lists devices for the picker. Errors become an empty list plus a message.

@@ -17,7 +17,9 @@ print it. Which iOS and tvOS runtime versions each feature works on: [ios-versio
 | `vision` | Android XR | visionOS |
 
 A foldable iPhone is the only unsupported pair. Unsupported pairs are rejected wherever they
-appear, with the reason:
+appear, with the reason (the matrix predates the iPhone Duo of the iOS 27.1 and
+`iOS-27-2-iPhone19-4` runtimes: simee labels it a phone, and `fold` and `display=outer|inner`
+drive its hinge and its two screens, see [ios-versions.md](ios-versions.md#iphone-duo)):
 
 ```text
 $ simee create x "iPhone 17" "iOS 26.5" --form-factor foldable

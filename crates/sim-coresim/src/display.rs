@@ -62,6 +62,12 @@ impl Display {
     /// as on the iPhone Duo, the one the size of the device type's main `screen`), else the first
     /// one (Apple TV renders only to its TVOut port). See [`sim_core::framebuffer::main_port`].
     pub(crate) fn main(device: &AnyObject, screen: Option<(u32, u32)>) -> Result<Self> {
+        Self::builtins(device, screen).map(|(main, _)| main)
+    }
+
+    /// The main display and, on a device with two built-in screens (the iPhone Duo), the other
+    /// one: [`sim_core::framebuffer::inner_port`].
+    pub(crate) fn builtins(device: &AnyObject, screen: Option<(u32, u32)>) -> Result<(Self, Option<Self>)> {
         let ports = framebuffer_ports(device)?;
         let classes: Vec<Option<u16>> = ports.iter().map(|d| display_class(d)).collect();
         let sizes = framebuffer::needs_sizes(&classes);
@@ -73,10 +79,45 @@ impl Display {
                 size: if sizes && class == Some(0) { Self { descriptor: d.clone() }.size().ok() } else { None },
             })
             .collect();
-        framebuffer::main_port(&described, screen)
-            .and_then(|main| ports.into_iter().nth(main))
-            .map(|descriptor| Self { descriptor })
-            .ok_or_else(|| Error::NoDisplay("no framebuffer port; is the device booted?".into()))
+        let at = |i: Option<usize>| i.and_then(|i| ports.get(i)).map(|d| Self { descriptor: d.clone() });
+        let main = at(framebuffer::main_port(&described, screen))
+            .ok_or_else(|| Error::NoDisplay("no framebuffer port; is the device booted?".into()))?;
+        Ok((main, at(framebuffer::inner_port(&described, screen))))
+    }
+
+    /// The screen's ID (`screenProperties.screenID`, 1 for the main screen), where the descriptor
+    /// is a screen (CoreSimulator 1051 on): what its digitizer is addressed by.
+    pub fn screen_id(&self) -> Option<u32> {
+        if !rt::responds(&self.descriptor, sel!(screenProperties)) {
+            return None;
+        }
+        let props = rt::object_prop(&self.descriptor, sel!(screenProperties)).ok()?;
+        // SAFETY: `screenID` returns an unsigned 32-bit integer.
+        unsafe { rt::send_scalar(&props, sel!(screenID)) }
+    }
+
+    /// Whether the screen shows anything ([`sim_core::duo::lit`] on a sparse grid): a built-in
+    /// screen not in use is exactly black. `false` without a surface.
+    pub fn lit(&self) -> bool {
+        /// One pixel in this many, each way: 1/256 of a screen, a few thousand reads.
+        const STEP: usize = 16;
+        let Some(surface) = self.surface() else { return false };
+        let s: *const AnyObject = &*surface;
+        // SAFETY: `s` is a live IOSurface (retained by `surface`) for all calls below.
+        if unsafe { IOSurfaceGetPixelFormat(s) } != FORMAT_BGRA || unsafe { IOSurfaceLock(s, LOCK_READ_ONLY, std::ptr::null_mut()) } != 0 {
+            return false;
+        }
+        // SAFETY: the surface is locked, so its geometry and base address are stable.
+        let (width, height, stride, len, base) = unsafe {
+            (IOSurfaceGetWidth(s), IOSurfaceGetHeight(s), IOSurfaceGetBytesPerRow(s), IOSurfaceGetAllocSize(s), IOSurfaceGetBaseAddress(s))
+        };
+        // SAFETY: while locked, `base` points to `len` readable bytes owned by the surface; the
+        // slice does not outlive the lock.
+        let lit = !base.is_null()
+            && sim_core::duo::lit(unsafe { std::slice::from_raw_parts(base.cast::<u8>(), len) }, width, height, stride, STEP);
+        // SAFETY: balances the successful lock above.
+        unsafe { IOSurfaceUnlock(s, LOCK_READ_ONLY, std::ptr::null_mut()) };
+        lit
     }
 
     /// Finds an external display (an iPhone's TVOut screen, the CarPlay display once attached):

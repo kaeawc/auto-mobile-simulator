@@ -838,6 +838,12 @@ impl Device {
         Display::main(&self.obj, self.main_screen())
     }
 
+    /// The device's built-in displays: the main one and, on a device with two built-in screens
+    /// (the iPhone Duo), the other (inner) one. The device must be booted.
+    pub fn builtin_displays(&self) -> Result<(Display, Option<Display>)> {
+        Display::builtins(&self.obj, self.main_screen())
+    }
+
     /// The device type's main screen in pixels, when the service says.
     fn main_screen(&self) -> Option<(u32, u32)> {
         let ty = rt::optional_prop(&self.obj, sel!(deviceType))?;

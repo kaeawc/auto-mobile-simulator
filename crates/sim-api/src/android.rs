@@ -150,8 +150,14 @@ pub fn boot_many(s: &mut Session, p: &Value, udids: &[String]) -> Result<Value, 
 pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Value, String> {
     let android = s.backend().clone();
     let d = android.device(udid)?;
-    if crate::params::on_carplay(p)? {
-        return Err("display=carplay is an iPhone's CarPlay screen; Android devices have one display".into());
+    match crate::params::display(p)? {
+        sim_core::duo::Display::Active => {}
+        sim_core::duo::Display::CarPlay => {
+            return Err("display=carplay is an iPhone's CarPlay screen; Android devices have one display".into());
+        }
+        sim_core::duo::Display::Builtin(s) => {
+            return Err(format!("display={} is an iPhone Duo's screen; an Android foldable shows the screen `fold` sets", s.as_str()));
+        }
     }
     let null = |r: Result<(), String>| r.map(|()| Value::Null);
     match method {

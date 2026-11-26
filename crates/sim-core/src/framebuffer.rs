@@ -29,6 +29,13 @@ pub fn main_port(ports: &[Port], screen: Option<(u32, u32)>) -> Option<usize> {
     builtin.first().copied().or(if ports.is_empty() { None } else { Some(0) })
 }
 
+/// The second built-in screen's index (the iPhone Duo's inner screen): the built-in port that
+/// isn't [`main_port`]. `None` for a device with one built-in screen.
+pub fn inner_port(ports: &[Port], screen: Option<(u32, u32)>) -> Option<usize> {
+    let main = main_port(ports, screen)?;
+    (0..ports.len()).find(|&i| i != main && ports[i].class == Some(0))
+}
+
 /// Whether the main display can only be chosen by its size: more than one built-in port.
 pub fn needs_sizes(classes: &[Option<u16>]) -> bool {
     classes.iter().filter(|c| **c == Some(0)).count() > 1
@@ -62,6 +69,18 @@ mod tests {
         assert_eq!(main_port(&ports, Some((100, 100))), Some(2));
         let unrendered = [port(0, None), port(0, None)];
         assert_eq!(main_port(&unrendered, Some((1398, 2034))), Some(0));
+    }
+
+    #[test]
+    fn the_iphone_duo_s_inner_screen_is_the_other_built_in_port() {
+        let ports = [port(1, None), port(1, None), port(0, Some((2007, 2853))), port(1, None), port(0, Some((1398, 2034)))];
+        assert_eq!(inner_port(&ports, Some((1398, 2034))), Some(2));
+        // Unrendered or unmatched, the main port is the first built-in one and the inner the next.
+        assert_eq!(inner_port(&ports, None), Some(4));
+        // One built-in screen (an iPhone 17 Pro, an iPad, Apple TV's TVOut): no inner screen.
+        assert_eq!(inner_port(&[port(1, None), port(0, Some((1206, 2622))), port(1, None)], Some((1206, 2622))), None);
+        assert_eq!(inner_port(&[port(1, Some((3840, 2160)))], None), None);
+        assert_eq!(inner_port(&[], None), None);
     }
 
     #[test]
