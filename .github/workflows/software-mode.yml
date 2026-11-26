@@ -1,0 +1,140 @@
+name: Software mode
+
+# Boots an API 36 x86_64 image in emu's software mode (QEMU's TCG with emu's devices, #55) on a
+# hosted runner, and checks it the way a user would: `sys.boot_completed`, a screenshot of the
+# launcher over display.sock, a tap, and a clean stop through the console. Software mode doesn't
+# use the runner's /dev/kvm. QEMU 11.1 (Ubuntu's is older) is built once and cached, as are the
+# system image and the SDK's Linux renderer.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/emu/**"
+      - "apps/simee/**"
+      - "crates/emu-*/**"
+      - "crates/sim-android/**"
+      - "crates/sim-api/**"
+      - "crates/sim-core/**"
+      - "Cargo.lock"
+      - ".github/workflows/software-mode.yml"
+  pull_request:
+    paths:
+      - "apps/emu/**"
+      - "apps/simee/**"
+      - "crates/emu-*/**"
+      - "crates/sim-android/**"
+      - "crates/sim-api/**"
+      - "crates/sim-core/**"
+      - "Cargo.lock"
+      - ".github/workflows/software-mode.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: software-mode-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  QEMU_VERSION: 11.1.3
+  # sha256 of download.qemu.org's qemu-11.1.3.tar.xz.
+  QEMU_SHA256: 5a8289c7940dc77d3873c81a6c29ba3afe1446fc9d36e77fa1658cdbecb84b22
+
+jobs:
+  boot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      # Everything outside the checkout lives under the runner's temp dir. The runner exports
+      # ANDROID_SDK_ROOT for its preinstalled SDK, and emu prefers it, so both point at the
+      # cached one.
+      - name: Paths
+        run: |
+          {
+            echo "ANDROID_HOME=$RUNNER_TEMP/sdk"
+            echo "ANDROID_SDK_ROOT=$RUNNER_TEMP/sdk"
+            echo "ANDROID_AVD_HOME=$RUNNER_TEMP/avd"
+            echo "QEMU_PREFIX=$RUNNER_TEMP/qemu"
+            echo "EMU_QEMU=$RUNNER_TEMP/qemu/bin/qemu-system-x86_64"
+          } >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: software-mode
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # QEMU's build dependencies also bring the libraries it runs on; the renderer needs X11's.
+      - name: Packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends ninja-build libglib2.0-dev libpixman-1-dev libslirp-dev \
+            libfdt-dev flex bison python3-venv libx11-6 libxcb1
+      - id: qemu-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/qemu
+          key: qemu-${{ env.QEMU_VERSION }}-x86_64-${{ runner.os }}-v1
+      - name: Build QEMU
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -sSfLo qemu.tar.xz "https://download.qemu.org/qemu-$QEMU_VERSION.tar.xz"
+          echo "$QEMU_SHA256  qemu.tar.xz" | sha256sum -c
+          tar xf qemu.tar.xz
+          cd "qemu-$QEMU_VERSION"
+          ./configure --prefix="$QEMU_PREFIX" --target-list=x86_64-softmmu --disable-docs --disable-werror \
+            --enable-slirp --enable-fdt=system --disable-gtk --disable-sdl --disable-opengl --disable-spice --disable-vnc \
+            --disable-xen --disable-debug-info
+          make -j"$(nproc)"
+          make install
+      - run: $EMU_QEMU -version
+      - run: cargo build --locked --release -p emu -p simee
+      - id: sdk-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/sdk
+          key: sdk-android-36-default-x86_64-${{ runner.os }}-v1
+      # emu's own provisioning: verified downloads, no Java.
+      - name: Provision
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          target/release/emu -provision 36 -tag default -abi x86_64
+      - run: target/release/emu -create-avd ci -sysdir system-images/android-36/default/x86_64
+      - run: target/release/emu -avd ci -dry-run
+      - name: Boot, screenshot, tap, stop
+        run: |
+          adb="$ANDROID_HOME/platform-tools/adb"
+          "$adb" start-server
+          target/release/emu -avd ci -verbose > emu.log 2>&1 &
+          pid=$!
+          # A fresh userdata's first boot: 375 s on a 4-vCPU Xeon; allow 30 minutes.
+          for _ in $(seq 1 180); do
+            grep -q "boot completed" emu.log && break
+            kill -0 "$pid" || { echo "emu exited before boot completed"; exit 1; }
+            sleep 10
+          done
+          grep "boot completed" emu.log
+          test "$("$adb" -s emulator-5554 shell getprop sys.boot_completed | tr -d '\r')" = 1
+          sleep 30
+          target/release/simee screenshot ci shot.png
+          python3 -c "import struct,sys; d=open('shot.png','rb').read(); w,h=struct.unpack('>II',d[16:24]); print(w,h,len(d)); sys.exit(0 if (w,h)==(720,1280) and len(d)>20000 else 1)"
+          target/release/simee tap ci 360 600
+          "$adb" -s emulator-5554 emu kill
+          for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+          ! kill -0 "$pid" 2>/dev/null
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: software-mode
+          path: |
+            emu.log
+            shot.png
+            ${{ runner.temp }}/avd/ci.avd/simee/console.log
+          if-no-files-found: ignore
