@@ -184,6 +184,16 @@ impl Avd {
         matches!(self.get(key), Some("yes" | "true"))
     }
 
+    /// Whether the guest is x86_64: `abi.type` or `hw.cpu.arch` in `config.ini`, else the system
+    /// image's directory (`.../x86_64`). x86_64 guests run only in software mode (#55), on stock's
+    /// x86 board; everything else is arm64.
+    pub fn is_x86_64(&self) -> bool {
+        match self.get("abi.type").or_else(|| self.get("hw.cpu.arch")) {
+            Some(abi) => abi == "x86_64",
+            None => self.sysdir.file_name().is_some_and(|n| n == "x86_64"),
+        }
+    }
+
     pub fn cpus(&self) -> u32 {
         self.get("hw.cpu.ncore").and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 16)
     }
@@ -1084,6 +1094,13 @@ mod tests {
         small.config.insert("hw.ramSize".into(), "512".into());
         assert_eq!(small.ram_bytes(), 1 << 30, "stock pads small devices by 512 MB");
         assert_eq!(avd.api_level(), Some(36));
+        assert!(!avd.is_x86_64());
+        let mut x86 = avd.clone();
+        x86.config.insert("abi.type".into(), "x86_64".into());
+        assert!(x86.is_x86_64(), "abi.type says so");
+        x86.config.clear();
+        x86.sysdir = sdk.join("system-images/android-36/default/x86_64");
+        assert!(x86.is_x86_64(), "an AVD with neither key takes its image's ABI");
         assert!(env.load("nope").is_err());
 
         // A created AVD loads back with the requested hardware, and can't be created twice.

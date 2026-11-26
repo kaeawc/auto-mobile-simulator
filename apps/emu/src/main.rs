@@ -15,6 +15,8 @@ mod display_server;
 mod fold;
 mod instance;
 mod provision;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod software;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vkprobe;
 
@@ -109,7 +111,7 @@ fn raise_nofile() -> u64 {
 }
 
 /// How often a running instance tells the adb server about itself again.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 const ADB_REANNOUNCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long a stop may take before the stop watcher exits the process anyway.
@@ -260,7 +262,11 @@ fn real_main() -> Result<ExitCode> {
 /// image is missing files the boot reads.
 fn dry_run(env: &emu_avd::Env, name: &str, opts: &args::Opts) -> Result<ExitCode> {
     let avd = env.load(name)?;
-    let renderer = if cfg!(all(target_os = "macos", target_arch = "aarch64")) { instance::renderer(&avd, opts) } else { None };
+    let renderer = if cfg!(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))) {
+        instance::renderer(&avd, opts)
+    } else {
+        None
+    };
     let plan = instance::BootPlan::new(&avd, opts, renderer);
     print!("{plan}");
     let missing = plan.missing();
@@ -274,9 +280,9 @@ fn dry_run(env: &emu_avd::Env, name: &str, opts: &args::Opts) -> Result<ExitCode
     Ok(if missing.is_empty() && unsupported.is_none() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))))]
 fn boot(_: &emu_avd::Env, name: &str, _: &args::Opts, _: std::sync::mpsc::Receiver<i32>, _: std::time::Instant) -> Result<ExitCode> {
-    anyhow::bail!("cannot boot {name}: simee needs Hypervisor.framework on an Apple silicon Mac")
+    anyhow::bail!("cannot boot {name}: simee needs Hypervisor.framework on an Apple silicon Mac, or an x86_64 Linux host for software mode")
 }
 
 /// Once the guest has booted, a foldable tells it its posture (stock sends it after boot).
@@ -292,6 +298,18 @@ fn announce_fold_at_boot(cfg: &mut emu_vmm::MachineConfig, fold: Option<std::syn
             fold.announce();
         }
     }));
+}
+
+/// Software mode (#55): x86_64 AVDs on QEMU's TCG with emu's devices.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn boot(
+    env: &emu_avd::Env,
+    name: &str,
+    opts: &args::Opts,
+    signals: std::sync::mpsc::Receiver<i32>,
+    launched: std::time::Instant,
+) -> Result<ExitCode> {
+    software::boot(env, name, opts, signals, launched)
 }
 
 /// Boots the AVD and runs it until the guest powers off or a signal arrives.
