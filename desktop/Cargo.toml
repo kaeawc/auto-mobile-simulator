@@ -59,6 +59,12 @@ debug = "line-tables-only"
 debug = false
 opt-level = 2
 
+# `cargo test` and `cargo clippy` render nothing at speed (the view tests finish in ~0.1 s even at
+# opt-level 0), so their dependencies, Rune's GPU stack above all, are built unoptimized: a clean
+# build takes ~4x less CPU (614 s to ~146 s, docs/benchmarks.md). `cargo build`/`run` keep opt-level 2.
+[profile.test.package."*"]
+opt-level = 0
+
 [profile.release]
 codegen-units = 16
 incremental = true
