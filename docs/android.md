@@ -492,7 +492,8 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   had just initialized warm, and 2 of 3 launches of the probe binary in another 10-minute
   window; [benchmarks](benchmarks.md#emulator-internals)). With its own cache, 4 of 4 such
   boots initialized in 0.33 to 0.36 s and reached `sys.boot_completed` in a median 7.8 s instead
-  of 11.7 s. Entries also seem tied to the executable's location: the first launch of the same
+  of 11.7 s (7 boots in all; a third interleaved round had the shared cache warm in its 3 before
+  boots too, 7.8 s median, so the gain is the misses, which come and go with what else runs). Entries also seem tied to the executable's location: the first launch of the same
   binary copied or moved to a new directory was cold in 4 of 6 tries (3.86 to 5.42 s, then
   warm), while touching, re-signing, symlinking or another cwd kept it warm; what else keys
   them wasn't established. So `emu` now carries an `Info.plist`
