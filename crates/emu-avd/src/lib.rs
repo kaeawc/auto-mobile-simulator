@@ -220,6 +220,13 @@ impl Avd {
         (n("hw.lcd.width", 1080), n("hw.lcd.height", 2400), n("hw.lcd.density", 420))
     }
 
+    /// The display's refresh rate in Hz (`hw.lcd.vsync`, as stock reads it), 60 when unset or
+    /// outside 1..=240. The guest's composer paces vsync by it. Under software mode's TCG, every
+    /// vsync callback is translated work: 30 Hz settled 0.12 cores lower than 60 (docs/benchmarks.md).
+    pub fn vsync_hz(&self) -> u32 {
+        self.get("hw.lcd.vsync").and_then(|v| v.parse().ok()).filter(|hz| (1..=240).contains(hz)).unwrap_or(60)
+    }
+
     pub fn has_sdcard(&self) -> bool {
         self.flag("hw.sdCard")
     }
@@ -1095,6 +1102,14 @@ mod tests {
         assert_eq!(small.ram_bytes(), 1 << 30, "stock pads small devices by 512 MB");
         assert_eq!(avd.api_level(), Some(36));
         assert!(!avd.is_x86_64());
+        assert_eq!(avd.vsync_hz(), 60, "stock's default refresh rate");
+        let mut slow = avd.clone();
+        slow.config.insert("hw.lcd.vsync".into(), "30".into());
+        assert_eq!(slow.vsync_hz(), 30);
+        for bad in ["0", "1000", "sixty"] {
+            slow.config.insert("hw.lcd.vsync".into(), bad.into());
+            assert_eq!(slow.vsync_hz(), 60, "{bad} falls back to 60");
+        }
         let mut x86 = avd.clone();
         x86.config.insert("abi.type".into(), "x86_64".into());
         assert!(x86.is_x86_64(), "abi.type says so");

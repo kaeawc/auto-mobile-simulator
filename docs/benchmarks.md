@@ -360,6 +360,22 @@ rate, which these 8 boots are too few to show. A warm `emu -avd` boot had panick
 in `__kmem_cache_alloc_node` 101 s in, on three CPUs at once. Lowest-priority builds of emu ran
 on 2 cores during the 184.6 s run.
 
+The guest display's refresh rate, 30 Hz against 60 (`androidboot.qemu.vsync`, which emu takes
+from the AVD's `hw.lcd.vsync`), through `scripts/tcg-bench.py --emu-devices ... --vsync N`, three
+alternating rounds, one boot of each per round. The ranchu composer marks its present fences
+unreliable, so SurfaceFlinger keeps hardware vsync on even when nothing draws. On an idle
+software-mode guest, Perfetto showed 60 composer callbacks a second, each a binder call that
+SurfaceFlinger handles: 3.2 s of guest CPU per 14.5 s.
+
+| Refresh rate | Boot, median (runs) | Host CPU 60–120 s after | 240–300 s after |
+| --- | --- | --- | --- |
+| 30 Hz | 169.0 s (154.4, 175.8, 169.0) | 1.94 cores | 0.61 cores (0.61, 0.69, 0.61) |
+| 60 Hz (the default) | 175.7 s (169.2, 175.7, 177.6) | 2.12 cores | 0.73 cores (0.72, 0.74, 0.73) |
+
+30 Hz settles 0.12 cores lower, and it was lower in every round. Software mode draws about 7
+frames a second, so a 30 Hz display costs no frames. But apps see a 30 Hz display, so 60 stays the
+default, and an AVD opts in with `hw.lcd.vsync=30`.
+
 On GitHub's `ubuntu-latest` (4 vCPUs, `.github/workflows/software-mode.yml`), the first boot of
 a fresh userdata reached `sys.boot_completed` in 243.9 s (one run). This host's first boot took
 381.4 s.
