@@ -2,8 +2,8 @@
 //!
 //! The ranchu radio HAL configures `eth0` itself from the modem's `+CGCONTRDP` reply (address,
 //! gateway, DNS; no DHCP) and fails every data call while the interface is missing. The device
-//! moves Ethernet frames between the guest and a [`Backend`]; [`LinkOnly`] (the link comes up,
-//! nothing gets through) is the only one so far, a user-mode NAT is the next.
+//! moves Ethernet frames between the guest and a [`Backend`]: the user-mode NAT (`crate::net`),
+//! or [`LinkOnly`] (the link comes up, nothing gets through) when the NAT can't start.
 //!
 //! Features are the minimum Linux's driver binds with: a MAC, the link status, event-idx. No
 //! mergeable rx buffers, checksum offload or GSO, so every rx buffer holds one whole frame and
@@ -42,6 +42,10 @@ const TXQ: usize = 1;
 pub struct RxReady(Arc<Doorbell>);
 
 impl RxReady {
+    pub fn new(bell: Arc<Doorbell>) -> RxReady {
+        RxReady(bell)
+    }
+
     pub fn ring(&self) {
         self.0.ring();
     }
@@ -177,16 +181,28 @@ struct Worker {
 }
 
 impl Worker {
-    /// One wakeup: everything the guest sent, then everything for it that fits.
+    /// One wakeup: everything the guest sent, then everything for it that fits. Frames are
+    /// taken from the backend only while there is room to hold them, so a backend that bounds
+    /// its own queue (the NAT) sees the guest's pace instead of losing frames here.
     fn pass(&mut self) {
         self.drain_tx();
-        while let Some(f) = self.backend.receive() {
-            if self.pending.len() == RX_BACKLOG {
-                self.pending.pop_front();
+        loop {
+            let mut drained = false;
+            while self.pending.len() < RX_BACKLOG {
+                match self.backend.receive() {
+                    Some(f) => self.pending.push_back(f),
+                    None => {
+                        drained = true;
+                        break;
+                    }
+                }
             }
-            self.pending.push_back(f);
+            self.fill_rx();
+            // Out of rx buffers (the guest's refill kick comes back here) or out of frames.
+            if !self.pending.is_empty() || drained {
+                break;
+            }
         }
-        self.fill_rx();
         if std::mem::take(&mut self.irq_due) {
             self.irq.raise(INT_USED_RING);
         }
@@ -481,6 +497,30 @@ mod tests {
         g.send(&frame(3));
         wait_for("tx after re-activation", || g.tx.used_idx(&g.mem) == 1);
         assert_eq!(g.wire.lock().expect("wire").sent, [frame(3)]);
+    }
+
+    #[test]
+    fn frames_past_the_backlog_wait_in_the_backend_instead_of_dropping() {
+        let mut g = guest();
+        let n = RX_BACKLOG as u16 + 40;
+        {
+            let mut w = g.wire.lock().expect("wire");
+            for i in 0..n {
+                w.inbound.push_back(frame(i as u8));
+            }
+        }
+        g.wire.lock().expect("wire").ready.clone().expect("attached").ring();
+        let mut got = 0;
+        while got < n {
+            for _ in 0..RING {
+                g.post_rx(0x800);
+            }
+            wait_for("a ring of frames", || g.rx.used_idx(&g.mem) == got + RING.min(n - got));
+            for i in got..g.rx.used_idx(&g.mem) {
+                assert_eq!(g.received(i).1, frame(i as u8), "frame {i} in order, none dropped");
+            }
+            got = g.rx.used_idx(&g.mem);
+        }
     }
 
     #[test]
