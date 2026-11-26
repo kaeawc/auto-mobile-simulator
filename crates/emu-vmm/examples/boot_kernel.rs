@@ -40,6 +40,7 @@ fn main() -> std::process::ExitCode {
         gps: Arc::default(),
         battery: Arc::default(),
         telephony: Arc::default(),
+        network: Arc::default(),
         car: None,
         sound: None,
         input: None,
