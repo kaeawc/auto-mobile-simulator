@@ -77,7 +77,7 @@ GRAPHICS = [('androidboot.hardware.gltransport', 'virtio-gpu-asg'), ('androidboo
             ('androidboot.hardware.angle_feature_overrides_enabled', '')]
 
 
-def prepare(sysdir, work, arch, fresh, graphics=False):
+def prepare(sysdir, work, arch, fresh, graphics=False, vsync=60):
     os.makedirs(work, exist_ok=True)
     data = os.path.join(work, 'userdata.img')
     if fresh or not os.path.exists(data):
@@ -93,7 +93,7 @@ def prepare(sysdir, work, arch, fresh, graphics=False):
     pairs = [('androidboot.hardware', 'ranchu'), ('androidboot.boot_devices', boot_dev), ('androidboot.qemu', '1'),
              ('androidboot.serialno', 'EMULATOR0EMURS0'), ('androidboot.veritymode', 'enforcing'),
              ('androidboot.dalvik.vm.heapsize', '576m'), ('androidboot.logcat', '*:S'), ('androidboot.qemu.skin', '720x1280'),
-             ('androidboot.qemu.vsync', '60'), ('androidboot.opengles.version', '196609'), ('androidboot.console', console)]
+             ('androidboot.qemu.vsync', str(vsync)), ('androidboot.opengles.version', '196609'), ('androidboot.console', console)]
     pairs += vbmeta(sysdir)
     if graphics:
         pairs += GRAPHICS
@@ -366,6 +366,7 @@ def main():
     p.add_argument('--lib64', help="the renderer's lib64, with --emu-devices")
     p.add_argument('--icd', choices=['swiftshader', 'lavapipe'], help="the renderer's software Vulkan")
     p.add_argument('--adb-port', type=int, default=5555)
+    p.add_argument('--vsync', type=int, default=60, help="the guest display's refresh rate (androidboot.qemu.vsync)")
     p.add_argument('--stock', help="the SDK's emulator binary: boot --avd under its software mode instead")
     p.add_argument('--avd', help='the AVD for --stock')
     p.add_argument('--stock-port', type=int, default=5560)
@@ -387,7 +388,7 @@ def main():
     abi = re.search(r'abi=(\S+)', open(os.path.join(a.sysdir, 'source.properties')).read().replace('SystemImage.Abi', 'abi'))
     arch = 'x86_64' if abi and abi.group(1) == 'x86_64' else 'arm64'
     fresh = not os.path.exists(os.path.join(a.workdir, 'userdata.img'))
-    prepare(a.sysdir, a.workdir, arch, fresh, graphics=bool(a.emu_devices))
+    prepare(a.sysdir, a.workdir, arch, fresh, graphics=bool(a.emu_devices), vsync=a.vsync)
     if a.emu_devices:
         if fresh:
             print('first boot (formats userdata, not counted):', boot_emu(a, a.sysdir, a.workdir, arch, 'first'), flush=True)

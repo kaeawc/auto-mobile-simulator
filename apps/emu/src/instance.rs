@@ -879,7 +879,7 @@ fn bootconfig(avd: &Avd, opts: &Opts, graphics: bool) -> BootConfig {
         .set("androidboot.dalvik.vm.heapsize", "576m")
         .set("androidboot.logcat", logcat_filter(avd, opts))
         .set("androidboot.qemu.skin", format!("{w}x{h}"))
-        .set("androidboot.qemu.vsync", "60")
+        .set("androidboot.qemu.vsync", avd.vsync_hz().to_string())
         .set("androidboot.qemu.settings.system.screen_off_timeout", "2147483647")
         .set("androidboot.opengles.version", "196609");
     if graphics {
@@ -1703,6 +1703,15 @@ mod tests {
         assert!(x86.devices().iter().any(|d| d.contains("QEMU")), "{:?}", x86.devices());
         assert!(x86.to_string().contains("userdata  pci 00:05.0 "), "{x86}");
         assert_eq!(boot_devices(&arm).as_deref(), Some("a003600.virtio_mmio"));
+        // The display's refresh rate is the AVD's `hw.lcd.vsync`, as stock reads it.
+        let vsync = |p: &BootPlan| p.bootconfig.entries().iter().find(|(k, _)| k == "androidboot.qemu.vsync").map(|(_, v)| v.clone());
+        assert_eq!(vsync(&x86).as_deref(), Some("60"));
+        let config = s.env.load("x86").expect("load").dir.join("config.ini");
+        let mut text = std::fs::read_to_string(&config).expect("config");
+        text.push_str("hw.lcd.vsync=30\n");
+        std::fs::write(&config, text).expect("config");
+        let slow = BootPlan::new(&s.env.load("x86").expect("load"), &Opts::default(), None);
+        assert_eq!(vsync(&slow).as_deref(), Some("30"));
         assert!(arm.cmdline.contains("console=ttyAMA0"));
         let _ = std::fs::remove_dir_all(&s.root);
     }

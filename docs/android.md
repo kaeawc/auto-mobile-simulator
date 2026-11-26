@@ -238,6 +238,13 @@ EMU_QEMU=/path/to/qemu-system-x86_64 emu -avd phone   # QEMU 11.1 or newer; with
   fail: `captureAudio` and `injectAudioInput` (AutoMobile reaches audio over the stock
   emulator's gRPC endpoint, which emu doesn't serve), `deviceSnapshot` (emu has no snapshots),
   and `videoRecording` stop (the guest's `screenrecord` wrote zero bytes; not yet explained).
+- **Idle cost.** Settled, a software-mode device takes about 0.7 of a host core. A quiet
+  Perfetto trace of the guest puts about a third of that on vsync: the ranchu composer marks its
+  present fences unreliable, so SurfaceFlinger keeps hardware vsync on and handles 60 composer
+  callbacks a second while nothing draws. The sensors HAL and logd/logcat are the next largest.
+  `hw.lcd.vsync=30` in the AVD's `config.ini` (emu honours it as stock does) settles 0.12 cores
+  lower, with no frames lost at software mode's rate
+  ([benchmarks](benchmarks.md#software-mode-through-emu--avd)).
 - **KFENCE sampling off** (`kfence.sample_interval=0` on the x86 board's command line). These
   kernels build KFENCE with static keys, so every 500 ms its sampler flips a branch inside every
   slab allocation, live-patching kernel text through an `int3`. Under multi-threaded TCG another
