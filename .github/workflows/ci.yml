@@ -131,3 +131,22 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cd desktop && cargo clippy --locked --all-targets --profile ci -- -D warnings
       - run: cd desktop && cargo test --locked --profile ci
+
+  # Temporary probe (#54): which hosted runners expose /dev/kvm.
+  kvm-probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, ubuntu-22.04-arm, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - run: |
+          uname -a; nproc; free -m
+          ls -l /dev/kvm || echo "no /dev/kvm"
+          grep -m1 -E 'vmx|svm' /proc/cpuinfo >/dev/null && echo "x86 virt flag present" || echo "no x86 virt flag"
+          dmesg 2>/dev/null | grep -i kvm | head || true
+          sudo dmesg | grep -iE 'kvm|el2|hyp' | head -20 || true
+          ls /sys/module | grep -i kvm || echo "no kvm module"
+          cat /sys/devices/system/cpu/cpu0/regs/identification/midr_el1 2>/dev/null || true
+          ls -l /dev/hugepages /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null; cat /sys/kernel/mm/transparent_hugepage/enabled || true
