@@ -4,13 +4,13 @@
 //! touched, so the same AVD keeps working with both. What a boot involves is decided first, with
 //! no side effects, as a [`BootPlan`] (`emu -avd NAME -dry-run` prints it on any host); the
 //! [`Instance`] that creates the disks and runs the plan exists only on Apple silicon.
-#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(boots)]
 use std::fs::File;
-#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(boots)]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(boots)]
 use anyhow::{Context, Result, bail};
 use emu_avd::{Avd, BootConfig};
 use emu_vmm::layout::slots;
@@ -19,7 +19,7 @@ use sim_core::platform::{AndroidOs, SubPlatform};
 
 use crate::args::Opts;
 
-#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(boots)]
 const CACHE_BYTES: u64 = 66 << 20;
 
 /// Kernel arguments the stock board passes for ranchu images.
@@ -79,7 +79,7 @@ fn follows_rotation(avd: &Avd) -> bool {
 /// Whether the guest may turn its display without emu knowing: a display that turns on an image
 /// whose rotation emu doesn't follow ([`follows_rotation`]). Frames and touches stay in panel
 /// space there, and the console's `rotation` answers `unknown` rather than a turn it never read.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(not(hv), allow(dead_code))]
 pub fn rotation_unknown(avd: &Avd) -> bool {
     sim_core::rotation::turns(avd.profile().kind.form_factor) && !follows_rotation(avd)
 }
@@ -98,7 +98,7 @@ fn logcat_filter(avd: &Avd, opts: &Opts) -> String {
     if guest == parsed { user.to_owned() } else { guest.spec() }
 }
 
-#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(boots)]
 pub struct Instance {
     avd: Avd,
     /// Console port (the `emulator-<port>` serial); adb listens on port + 1.
@@ -134,7 +134,7 @@ pub struct Instance {
     pub logcat: Option<emu_vmm::virtio::console::Spool>,
 }
 
-#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(boots)]
 impl Instance {
     pub fn prepare(avd: &Avd, opts: &Opts) -> Result<Instance> {
         let dir = emu_avd::state_dir(&avd.dir);
@@ -195,8 +195,13 @@ impl Instance {
             File::create(dir.join("console.log")).with_context(|| format!("creating {}", dir.join("console.log").display()))?;
         let adb_port = console_port + 1;
         let adb = emu_vmm::pipe::adb::AdbListener::bind(adb_port).with_context(|| format!("binding adb port {adb_port}"))?;
-        let gpu_lib64 = renderer(avd, opts);
-        if gpu_lib64.is_none() && !gpu_off(opts) {
+        // The KVM backend builds its machine without the renderer so far: there the boot has no
+        // host graphics.
+        let gpu_lib64 = if cfg!(any(hv_hvf, soft)) { renderer(avd, opts) } else { None };
+        if cfg!(hv_kvm) && !gpu_off(opts) {
+            eprintln!("emu: no host GPU renderer on this host yet; booting without graphics");
+        }
+        if cfg!(any(hv_hvf, soft)) && gpu_lib64.is_none() && !gpu_off(opts) {
             eprintln!(
                 "emu: no gfxstream renderer in the SDK (emulator/lib64 or simee/renderer); booting without graphics \
                  (install it with emu -provision-renderer)"
@@ -207,7 +212,7 @@ impl Instance {
         {
             eprintln!("emu: gfxstream renderer from {}", lib64.display());
         }
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(hv_hvf)]
         if let Some(lib64) = &gpu_lib64
             && let Some(emulator_dir) = lib64.parent()
         {
@@ -271,7 +276,7 @@ impl Instance {
     }
 
     /// The GPU this boot gets, if any (`emu_vmm::start_renderer` takes it early, `run` again).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(hv)]
     pub fn gpu_spec(&self, opts: &Opts) -> Option<emu_vmm::GpuSpec> {
         self.gpu_lib64.as_ref().zip(self.display.as_ref()).map(|(lib64, display)| emu_vmm::GpuSpec {
             lib64: lib64.clone(),
@@ -287,7 +292,7 @@ impl Instance {
     }
 
     /// `launched`: when the process started, for `-verbose` launch timings.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(hv)]
     pub fn machine_config(&self, opts: &Opts, launched: std::time::Instant) -> Result<emu_vmm::MachineConfig> {
         let plan = self.plan(opts);
         if let Some(missing) = plan.missing().first() {
@@ -365,7 +370,7 @@ impl Instance {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(soft)]
 impl Instance {
     /// Software mode's config (#55): the plan on QEMU's TCG with emu's devices
     /// (`emu_vmm::soft`). The renderer runs on SwiftShader: the SDK's lavapipe crashed in a render
@@ -440,12 +445,12 @@ impl Instance {
 }
 
 /// Console ports stock and simee pick from (adb is each one + 1); stock's ceiling.
-#[cfg_attr(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))), allow(dead_code))]
+#[cfg_attr(not(boots), allow(dead_code))]
 pub const PORTS: std::ops::RangeInclusive<u16> = 5554..=5682;
 
 /// Claims console port `port` for this process: its lock file, held until the returned file is
 /// dropped or the process exits. None when another simee instance holds it.
-#[cfg_attr(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))), allow(dead_code))]
+#[cfg_attr(not(boots), allow(dead_code))]
 pub fn claim_port(dir: &Path, port: u16) -> Option<std::fs::File> {
     std::fs::create_dir_all(dir).ok()?;
     let f = std::fs::File::create(dir.join(format!("{port}.lock"))).ok()?;
@@ -457,7 +462,7 @@ pub fn claim_port(dir: &Path, port: u16) -> Option<std::fs::File> {
 /// probing a pair free and binding it (both picked the same pair, one then failed); the claim is
 /// taken before the probe and kept, so two simee instances never pick one pair. A stock
 /// emulator doesn't take claims, so the bind probe still keeps clear of the ones it holds.
-#[cfg_attr(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))), allow(dead_code))]
+#[cfg_attr(not(boots), allow(dead_code))]
 pub fn pick_port(dir: &Path, range: std::ops::RangeInclusive<u16>, free: impl Fn(u16) -> bool) -> Option<(u16, std::fs::File)> {
     range.step_by(2).find_map(|p| {
         let claim = claim_port(dir, p)?;
@@ -465,12 +470,12 @@ pub fn pick_port(dir: &Path, range: std::ops::RangeInclusive<u16>, free: impl Fn
     })
 }
 
-#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(boots)]
 fn port_free(p: u16) -> bool {
     std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, p)).is_ok()
 }
 
-#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(boots)]
 /// Creates `image` as a sparse, empty ext4 filesystem of `size` bytes.
 fn create_userdata(image: &std::path::Path, size: u64) -> Result<()> {
     let mut uuid = [0u8; 16];
@@ -481,10 +486,10 @@ fn create_userdata(image: &std::path::Path, size: u64) -> Result<()> {
     emu_ext4::format(&file, size, "userdata", uuid).with_context(|| format!("formatting {} as ext4", image.display()))
 }
 
-#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(boots)]
 struct Tee<A, B>(A, B);
 
-#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(boots)]
 impl<A: Write, B: Write> Write for Tee<A, B> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.write_all(buf)?;
@@ -512,7 +517,7 @@ const LOGCAT_SPOOL_DEPTH: usize = 1024;
 /// drops output when its writer falls behind; the watch reads every chunk inline, before the
 /// spool's queue, on the thread that hands it the guest's log (the console worker), so it never
 /// misses a rotation line.
-#[cfg_attr(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))), allow(dead_code))]
+#[cfg_attr(not(boots), allow(dead_code))]
 pub fn logcat_sink(
     opts: &Opts,
     watch: Option<std::sync::Arc<emu_vmm::display::FrameStore>>,
@@ -961,7 +966,7 @@ fn pipe_gles(avd: &Avd) -> bool {
 ///   about 4.3 s whenever Metal's shader cache misses (a new emu path, a macOS update, an evicted
 ///   cache), and the boot waits for the init (#70). On SwiftShader the display takes about 30 ms
 ///   and compiles nothing.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(not(hv_hvf), allow(dead_code))]
 fn host_angle(api: Option<u32>, first_boot: bool, without_gl: bool) -> Option<&'static str> {
     (without_gl || (first_boot && api == Some(29))).then_some("swiftshader")
 }
@@ -969,7 +974,7 @@ fn host_angle(api: Option<u32>, first_boot: bool, without_gl: bool) -> Option<&'
 /// The guest draws with ANGLE on its Vulkan (an image that boots on bootconfig, its GLES ANGLE),
 /// so the renderer can run without GL ([`emu_vmm::GpuSpec::vulkan_only`]). Images without
 /// bootconfig have no ANGLE: their GLES is the encoder, on the host's GL.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(not(hv_hvf), allow(dead_code))]
 fn guest_on_angle(avd: &Avd) -> bool {
     guest_egl(avd) == "angle" && takes_bootconfig(avd)
 }
@@ -1126,7 +1131,7 @@ fn guest_graphics(egl: &str, image: AngleImage) -> Vec<(&'static str, String)> {
 /// (`VulkanVirtualQueue`, [`emu_vmm::GpuSpec::virtual_queue`]), which HWUI on Vulkan needs: only
 /// when the guest is on ANGLE (so [`guest_graphics`] gives it `skiavk`) and its image
 /// advertises the feature.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(not(hv), allow(dead_code))]
 fn virtual_queue(egl: &str, image: AngleImage) -> bool {
     egl == "angle" && image.virtual_queue
 }
@@ -1445,7 +1450,7 @@ mod tests {
 
     /// A guest reset builds a new machine config; what the boot before it logged (a panic's
     /// text) stays in console.log and the logcat file.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(hv)]
     #[test]
     fn a_reset_keeps_the_logs_of_the_boot_before() {
         let s = sdk("reset-logs");

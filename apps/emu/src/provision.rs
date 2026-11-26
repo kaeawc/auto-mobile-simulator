@@ -9,12 +9,12 @@ use emu_sdk::{Host, Sdk, renderer};
 
 use crate::args::Opts;
 
-/// Whether this host boots guests (and so needs the renderer): Apple silicon, and x86_64 Linux in
-/// software mode.
-const BOOTS: bool = cfg!(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")));
+/// Whether this host boots guests with the renderer (and so needs it): Apple silicon, and x86_64
+/// Linux in software mode. KVM on arm64 Linux boots without one so far.
+const BOOTS: bool = cfg!(any(hv_hvf, soft));
 const DEFAULT_TAG: &str = "google_apis";
 /// The images this host boots: software mode on x86_64 Linux runs x86_64 images only.
-const DEFAULT_ABI: &str = if cfg!(all(target_os = "linux", target_arch = "x86_64")) { "x86_64" } else { "arm64-v8a" };
+const DEFAULT_ABI: &str = if cfg!(soft) { "x86_64" } else { "arm64-v8a" };
 
 /// The SDK to provision: the resolved SDK root, else the platform default; created if missing.
 fn sdk(env: &Env) -> Result<Sdk> {
@@ -83,7 +83,7 @@ pub fn provision(env: &Env, api: &str, opts: &Opts) -> Result<()> {
             renderer(&sdk, opts, opts.provision_renderer)?;
         } else {
             println!(
-                "skipping the renderer: emu boots guests only on Apple silicon and x86_64 Linux (-provision-renderer installs it anyway)"
+                "skipping the renderer: emu renders guests only on Apple silicon and x86_64 Linux (-provision-renderer installs it anyway)"
             );
         }
     }
@@ -144,7 +144,7 @@ fn renderer(sdk: &Sdk, opts: &Opts, update: bool) -> Result<()> {
 /// Initializes the renderer boots will use once, in a child process: its init compiles ANGLE's
 /// Metal shader library (about 4 s), which then sits in emu's own shader cache, so the first
 /// boot doesn't wait for it.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(hv_hvf)]
 fn warm_renderer(root: &std::path::Path) {
     let Some(lib64) = renderer::find_lib64(root) else { return };
     let (ok, warmed, took) = crate::vkprobe::warm(&lib64);
@@ -157,7 +157,7 @@ fn warm_renderer(root: &std::path::Path) {
     }
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(not(hv_hvf))]
 fn warm_renderer(_: &std::path::Path) {}
 
 /// Installs the gfxstream renderer out of the `emulator` package. With `update` the newest
