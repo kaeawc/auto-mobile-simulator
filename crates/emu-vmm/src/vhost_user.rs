@@ -56,6 +56,9 @@ pub mod req {
     pub const GET_CONFIG: u32 = 24;
     pub const SET_CONFIG: u32 = 25;
     pub const RESET_DEVICE: u32 = 34;
+    pub const GET_MAX_MEM_SLOTS: u32 = 36;
+    pub const ADD_MEM_REG: u32 = 37;
+    pub const REM_MEM_REG: u32 = 38;
     pub const GET_SHMEM_CONFIG: u32 = 44;
 }
 
@@ -72,12 +75,18 @@ pub mod proto {
     pub const BACKEND_REQ: u64 = 1 << 5;
     pub const CONFIG: u64 = 1 << 9;
     pub const RESET_DEVICE: u64 = 1 << 13;
+    pub const CONFIGURE_MEM_SLOTS: u64 = 1 << 15;
     pub const SHMEM: u64 = 1 << 22;
 }
 
 /// The device feature bit that says the backend speaks protocol features.
 pub const F_PROTOCOL_FEATURES: u64 = 1 << 30;
-const SUPPORTED_PROTOCOL: u64 = proto::MQ | proto::REPLY_ACK | proto::CONFIG | proto::RESET_DEVICE;
+/// `CONFIGURE_MEM_SLOTS`: regions one at a time. `SET_MEM_TABLE` holds at most 8, which a guest
+/// with GPU blobs and the goldfish address space mapped outgrows (QEMU: "Failed preparing vhost-user
+/// memory table msg", and every device's memory update fails).
+const SUPPORTED_PROTOCOL: u64 = proto::MQ | proto::REPLY_ACK | proto::CONFIG | proto::RESET_DEVICE | proto::CONFIGURE_MEM_SLOTS;
+/// Memory slots offered with `CONFIGURE_MEM_SLOTS`.
+const MAX_MEM_SLOTS: u64 = 256;
 /// Also offered to a device with shared memory regions (the GPU's host-visible blobs).
 const SHMEM_PROTOCOL: u64 = proto::BACKEND_REQ | proto::SHMEM;
 /// `VIRTIO_MAX_SHMEM_REGIONS`: the slots of a `GET_SHMEM_CONFIG` reply.
@@ -191,7 +200,16 @@ struct Memory {
     /// (device, inode) of the fd mapped, and its guest-physical address minus file offset.
     file: (u64, u64),
     delta: u64,
+    /// The regions of that fd: the ones ring addresses translate through.
     regions: Vec<Region>,
+}
+
+/// A region of an fd that isn't known to be guest RAM yet (it came before the region that maps
+/// guest-physical 0): kept in case it is.
+struct Pending {
+    file: (u64, u64),
+    delta: u64,
+    region: Region,
 }
 
 impl Memory {
@@ -268,6 +286,7 @@ pub struct Session {
     features: Option<u64>,
     protocol: u64,
     mem: Option<Memory>,
+    pending: Vec<Pending>,
     rings: Vec<Ring>,
     calls: Calls,
     active: Option<Active>,
@@ -282,6 +301,7 @@ impl Session {
             features: None,
             protocol: 0,
             mem: None,
+            pending: Vec::new(),
             rings: (0..n).map(|_| Ring::default()).collect(),
             calls: Arc::new(RwLock::new((0..n).map(|_| None).collect())),
             active: None,
@@ -347,49 +367,67 @@ impl Session {
         Ok(())
     }
 
+    /// One region of guest memory, from `fd` at `offset`. Guest RAM is the fd whose region maps
+    /// guest-physical 0, mapped once in whole; regions of other fds are other memory the frontend
+    /// maps into the guest (GPU blobs, the goldfish address space), where no ring or buffer of
+    /// these devices lives, and are left alone.
+    fn add_region(&mut self, region: Region, offset: u64, fd: &OwnedFd) -> Result<()> {
+        let st = rustix::fs::fstat(fd).map_err(std::io::Error::from)?;
+        let (file, delta) = ((st.st_dev, st.st_ino), region.gpa.wrapping_sub(offset));
+        match &mut self.mem {
+            Some(mem) if mem.file == file => {
+                if mem.delta != delta {
+                    return Err(protocol("guest RAM at more than one offset in its fd (QEMU: one memory-backend-memfd below 4 GiB)"));
+                }
+                if !mem.regions.contains(&region) {
+                    mem.regions.push(region);
+                }
+            }
+            Some(_) => {}
+            None if region.gpa == 0 => {
+                if self.active.is_some() {
+                    return Err(protocol("the guest RAM moved to another fd while the device runs"));
+                }
+                let ram = GuestRam::map_shared(delta, st.st_size as u64, fd.as_fd(), 0)
+                    .map_err(|e| protocol(format!("mapping guest RAM: {e}")))?;
+                let mut regions = vec![region];
+                for p in std::mem::take(&mut self.pending) {
+                    if p.file == file && p.delta == delta {
+                        regions.push(p.region);
+                    }
+                }
+                self.mem = Some(Memory { ram: Arc::new(ram), file, delta, regions });
+            }
+            None => self.pending.push(Pending { file, delta, region }),
+        }
+        Ok(())
+    }
+
+    fn remove_region(&mut self, gpa: u64, size: u64, uaddr: u64) {
+        let same = |r: &Region| r.gpa == gpa && r.size == size && r.uaddr == uaddr;
+        if let Some(mem) = &mut self.mem {
+            mem.regions.retain(|r| !same(r));
+        }
+        self.pending.retain(|p| !same(&p.region));
+    }
+
+    /// A whole memory table: the regions it lists replace the ones before (RAM stays mapped).
     fn set_mem_table(&mut self, m: &mut Msg) -> Result<()> {
         let n = m.u32_at(0)? as usize;
         if n == 0 || n > MAX_FDS || m.fds.len() != n {
             return Err(protocol(format!("memory table of {n} regions with {} fds", m.fds.len())));
         }
-        // Each region with its fd's identity and guest-physical minus file offset.
-        let mut all = Vec::with_capacity(n);
+        if let Some(mem) = &mut self.mem {
+            mem.regions.clear();
+        }
+        self.pending.clear();
         for i in 0..n {
             let o = 8 + i * 32;
-            let (gpa, size, uaddr, offset) = (m.u64_at(o)?, m.u64_at(o + 8)?, m.u64_at(o + 16)?, m.u64_at(o + 24)?);
-            let st = rustix::fs::fstat(&m.fds[i]).map_err(std::io::Error::from)?;
-            all.push(((st.st_dev, st.st_ino), gpa.wrapping_sub(offset), Region { gpa, size, uaddr }, i));
+            let region = Region { gpa: m.u64_at(o)?, size: m.u64_at(o + 8)?, uaddr: m.u64_at(o + 16)? };
+            let offset = m.u64_at(o + 24)?;
+            let fd = m.fds[i].try_clone()?;
+            self.add_region(region, offset, &fd)?;
         }
-        let (file, delta, ram_fd) = ram_file(&all).ok_or_else(|| protocol("empty memory table"))?;
-        let mut regions = Vec::new();
-        for (f, d, r, _) in &all {
-            if *f != file {
-                // Another fd: memory the frontend maps into the guest besides its RAM (a GPU
-                // blob this backend or another one had it map). No ring or buffer of these
-                // devices lives there.
-                continue;
-            }
-            if *d != delta {
-                return Err(protocol("guest RAM at more than one offset in its fd (QEMU: one memory-backend-memfd below 4 GiB)"));
-            }
-            regions.push(*r);
-        }
-        if let Some(mem) = &mut self.mem
-            && mem.file == file
-            && mem.delta == delta
-        {
-            // Same RAM, another view of it (regions split or joined around ROM and PAM, or
-            // other memory coming and going beside it).
-            mem.regions = regions;
-            return Ok(());
-        }
-        if self.active.is_some() {
-            return Err(protocol("the guest RAM moved to another fd while the device runs"));
-        }
-        let fd = &m.fds[ram_fd];
-        let len = rustix::fs::fstat(fd).map_err(std::io::Error::from)?.st_size as u64;
-        let ram = GuestRam::map_shared(delta, len, fd.as_fd(), 0).map_err(|e| protocol(format!("mapping guest RAM: {e}")))?;
-        self.mem = Some(Memory { ram: Arc::new(ram), file, delta, regions });
         Ok(())
     }
 
@@ -435,6 +473,19 @@ impl Session {
             req::SET_MEM_TABLE => {
                 self.set_mem_table(m)?;
                 self.try_activate()?;
+                Ok(None)
+            }
+            req::GET_MAX_MEM_SLOTS => u64_reply(MAX_MEM_SLOTS),
+            req::ADD_MEM_REG => {
+                // A u64 of padding, then the region.
+                let region = Region { gpa: m.u64_at(8)?, size: m.u64_at(16)?, uaddr: m.u64_at(24)? };
+                let fd = m.fds.pop().ok_or_else(|| protocol("ADD_MEM_REG without an fd"))?;
+                self.add_region(region, m.u64_at(32)?, &fd)?;
+                self.try_activate()?;
+                Ok(None)
+            }
+            req::REM_MEM_REG => {
+                self.remove_region(m.u64_at(8)?, m.u64_at(16)?, m.u64_at(24)?);
                 Ok(None)
             }
             req::SET_VRING_NUM => {
@@ -524,18 +575,6 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.deactivate();
     }
-}
-
-/// Which fd of a memory table is the guest's RAM: the one that maps guest-physical address 0,
-/// else the one covering the most guest memory. Returns its identity, its guest-physical minus
-/// file offset, and the index of a region (and so of an fd) of it.
-fn ram_file(all: &[((u64, u64), u64, Region, usize)]) -> Option<((u64, u64), u64, usize)> {
-    let at_zero = all.iter().find(|(_, _, r, _)| r.gpa == 0);
-    let pick = at_zero.or_else(|| {
-        let total = |f: (u64, u64)| all.iter().filter(|(g, ..)| *g == f).map(|(_, _, r, _)| r.size).sum::<u64>();
-        all.iter().max_by_key(|(f, ..)| total(*f))
-    })?;
-    Some((pick.0, pick.1, pick.3))
 }
 
 /// Waits on the kick eventfds and tells the device which queue was kicked, until `stop` fires.
@@ -986,6 +1025,52 @@ mod tests {
         });
         window.map(7, None, 0x2_0000, 0x4000).expect("map");
         assert_eq!(frontend.join().expect("join"), [(backend_req::SHMEM_UNMAP, 0x1_0000, 0), (backend_req::SHMEM_MAP, 0x2_0000, 1)]);
+    }
+
+    /// Memory slots: regions added and removed one at a time, other fds' left alone, and RAM
+    /// recognised even when another of its regions came first.
+    #[test]
+    fn memory_slots_add_and_remove_regions_one_at_a_time() {
+        let (mut fe, be) = Frontend::new();
+        let t = rng_backend(be);
+        fe.u64_req(req::SET_PROTOCOL_FEATURES, proto::REPLY_ACK | proto::CONFIGURE_MEM_SLOTS);
+        fe.send(req::GET_PROTOCOL_FEATURES, 0, &[], &[]);
+        let p = u64::from_le_bytes(fe.reply(req::GET_PROTOCOL_FEATURES).try_into().unwrap_or_default());
+        assert_ne!(p & proto::CONFIGURE_MEM_SLOTS, 0, "offered");
+        fe.send(req::GET_MAX_MEM_SLOTS, 0, &[], &[]);
+        assert_eq!(fe.reply(req::GET_MAX_MEM_SLOTS), MAX_MEM_SLOTS.to_le_bytes());
+        let add = |fe: &mut Frontend, gpa: u64, size: u64, uaddr: u64, off: u64, fd: &OwnedFd| {
+            let mut p = 0u64.to_le_bytes().to_vec();
+            for v in [gpa, size, uaddr, off] {
+                p.extend_from_slice(&v.to_le_bytes());
+            }
+            fe.send(req::ADD_MEM_REG, FLAG_NEED_REPLY, &p, &[fd]);
+            assert_eq!(fe.reply(req::ADD_MEM_REG), 0u64.to_le_bytes(), "acked");
+        };
+        let blob = rustix::fs::memfd_create("blob", rustix::fs::MemfdFlags::CLOEXEC).expect("memfd");
+        rustix::fs::ftruncate(&blob, 0x1_0000).expect("size");
+        let ram = fe.memfd.try_clone().expect("dup");
+        // RAM's upper region first, then a blob, then RAM's region at 0.
+        add(&mut fe, 0xc_0000, RAM - 0xc_0000, UADDR + 0xc_0000, 0xc_0000, &ram);
+        add(&mut fe, 0x8_0000_0000, 0x1_0000, 0x7e00_0000_0000, 0, &blob);
+        add(&mut fe, 0, 0xa_0000, UADDR, 0, &ram);
+        fe.u64_req(req::SET_FEATURES, F_VERSION_1);
+        // The ring sits in the region that came before RAM was known.
+        let mut d = Driver::at(0x10_0000, 8);
+        let (kick, call) = (eventfd(0, EventfdFlags::CLOEXEC).expect("kick"), eventfd(0, EventfdFlags::CLOEXEC).expect("call"));
+        fe.ring(&d, &kick, &call);
+        fe.state(req::SET_VRING_ENABLE, 0, 1);
+        d.push(&fe.ram, &[(0x20_0000, 16, true)]);
+        rustix::io::write(&kick, &1u64.to_ne_bytes()).expect("kick");
+        assert!(wait_readable(&call), "the device called");
+        let mut p = 0u64.to_le_bytes().to_vec();
+        for v in [0x8_0000_0000u64, 0x1_0000, 0x7e00_0000_0000, 0] {
+            p.extend_from_slice(&v.to_le_bytes());
+        }
+        fe.send(req::REM_MEM_REG, FLAG_NEED_REPLY, &p, &[]);
+        assert_eq!(fe.reply(req::REM_MEM_REG), 0u64.to_le_bytes(), "removing other memory is fine");
+        drop(fe);
+        t.join().expect("join").expect("clean end");
     }
 
     #[test]
