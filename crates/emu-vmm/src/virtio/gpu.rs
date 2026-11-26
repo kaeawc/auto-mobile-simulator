@@ -109,11 +109,11 @@ pub struct HvWindow {
 impl ShmWindow for HvWindow {
     fn map(&self, _id: u32, host: Option<HostRange>, offset: u64, _len: usize) -> Result<(), String> {
         let host = host.ok_or("no host mapping")?;
-        emu_hvf::Vm::map_raw(host, self.base + offset).map_err(|e| format!("hv_vm_map: {e}"))
+        crate::hv::map_raw(host, self.base + offset).map_err(|e| format!("hv_vm_map: {e}"))
     }
 
     fn unmap(&self, offset: u64, len: usize) {
-        let _ = emu_hvf::Vm::unmap_raw(self.base + offset, len);
+        let _ = crate::hv::unmap_raw(self.base + offset, len);
     }
 }
 

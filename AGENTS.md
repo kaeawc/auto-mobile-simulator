@@ -157,10 +157,12 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   access), `Vm` (memory slots, `KVM_IRQ_LINE`, ioeventfd, irqfd, the arm64 vGICv3), `Vcpu` and its
   decoded exits, `Kicks` (signals that force vCPU threads out of `KVM_RUN`). Linux only;
   `x86_tests.rs` drives real-mode guests on a host with `/dev/kvm` (CI's Linux job).
-- `crates/emu-vmm` — `machine.rs` (`run`), `layout.rs`, `board.rs` (DT), `vcpu.rs` (exits, PSCI,
-  wakers), `bus.rs`, `devices/` (PL011, PL031, goldfish), `virtio/` (mmio transport, queue, blk,
-  rng, vsock, gpu with `legacy_asg.rs` (API 31–33's address-space graphics on the renderer's
-  protocol), input incl. XR's dual-mode mouse, console, snd), `pipe/` (adb bridge, qemud
+- `crates/emu-vmm` — `machine.rs` (`run`), `layout.rs`, `board.rs` (DT), `hv/` (the hypervisor
+  seam: one backend per host, each owning its vCPU run loop; `hvf.rs` has HVF's PSCI, WFI and
+  wakers), `vcpu.rs` (what every backend shares: stop protocol, exit counters, MMIO dispatch,
+  syndrome decoding), `wake.rs`, `bus.rs`, `devices/` (PL011, PL031, goldfish), `virtio/` (mmio
+  transport, queue, blk, rng, vsock, gpu with `legacy_asg.rs` (API 31–33's address-space graphics
+  on the renderer's protocol), input incl. XR's dual-mode mouse, console, snd), `pipe/` (adb bridge, qemud
   services incl. `car.rs`, the vehicle HAL, and `xr.rs`, Android XR's `xr_service`), `modem/`,
   `disk.rs`, `boot.rs`, `display.rs` (`FrameStore`), `vhost_user.rs` (serves a device to QEMU
   over vhost-user, for software mode on Linux; `examples/vhost_user_vsock.rs`), `vfio_user.rs`
@@ -168,7 +170,7 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   carrier), `acpi.rs` (the SSDT that describes the pipe to x86 guests), `soft.rs` (software mode:
   QEMU's command line for stock's x86 board, the device set it serves, QEMU's supervision);
   `examples/soft_devices.rs`
-  serves the whole software-mode device set. Everything but `machine.rs`, `vcpu.rs` and
+  serves the whole software-mode device set. Everything but `machine.rs`, `hv/` and
   `virtio/gpu.rs` builds and tests on Linux: put device logic there, not behind the hypervisor.
 - `crates/emu-avd` — `Env` (SDK/AVD paths), `Avd` (config, `profile()`), `NewAvd`
   (`for_profile`), running-instance advertisements (`Running`), `BootConfig`, ini parsing.

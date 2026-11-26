@@ -6,18 +6,18 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use emu_hvf::{GuestRam, Vm};
+use emu_hvf::GuestRam;
 
 use crate::bus::Bus;
 use crate::disk::{DiskMode, DiskSpec};
-use crate::irq::{GicSpi, IrqLine};
+use crate::hv::Hypervisor;
+use crate::irq::IrqLine;
 use crate::layout::*;
+use crate::vcpu::Cpus;
 pub use crate::vcpu::StopReason;
-use crate::vcpu::{Cpus, HvVcpus, Wakers};
 use crate::virtio::Interrupt;
 use crate::virtio::input::Inputs;
 use crate::virtio::mmio::MmioTransport;
-use crate::wake::Mode as WakeMode;
 use crate::{board, boot, devices, disk, pipe, telephony, virtio};
 
 /// Host GPU rendering through gfxstream.
@@ -447,7 +447,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     if cfg.cpus == 0 || cfg.cpus > 16 {
         bail!("cpus must be in 1..=16 (got {})", cfg.cpus);
     }
-    let vm = Vm::new().context("creating the VM (is the binary signed with com.apple.security.hypervisor?)")?;
+    let vm = Arc::new(Hypervisor::new(cfg.cpus)?);
     let mem = Arc::new(GuestRam::new(RAM_BASE, cfg.ram_bytes)?);
     vm.map_ram(&mem)?;
     let gic = vm.create_gic(GIC_DIST_BASE, GIC_REDIST_BASE)?;
@@ -496,12 +496,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     mem.write(DTB_ADDR, &dtb)?;
 
     // Devices.
-    let wakers = Arc::new(Wakers::new(cfg.cpus as usize, HvVcpus::new(cfg.cpus as usize), WakeMode::from_env()));
-    let wake: Arc<dyn Fn(u32) + Send + Sync> = {
-        let w = wakers.clone();
-        Arc::new(move |intid| w.wake_spi(intid))
-    };
-    let spi = |n: u32| -> Arc<dyn IrqLine> { Arc::new(GicSpi::new(spi_intid(n), wake.clone())) };
+    let spi = |n: u32| -> Arc<dyn IrqLine> { vm.spi(spi_intid(n)) };
 
     let mut bus = Bus::new();
     // Goldfish address space (the ranchu gralloc's host memory) on a PCIe host, with graphics.
@@ -705,15 +700,9 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         bus.insert(virtio_slot_addr(n), VIRTIO_MMIO_STRIDE, Arc::new(MmioTransport::new(dev, irq, mem.clone())));
     }
 
-    // Guest counter starts near zero, identical on every vCPU.
-    let cpus = Arc::new(Cpus::new(bus, wakers, emu_hvf::host_ticks()));
+    let cpus = Arc::new(Cpus::new(bus, cfg.cpus as usize, vm.clone()));
     *EXIT_STATS.lock().unwrap_or_else(PoisonError::into_inner) = Some(cpus.stats.clone());
-    let mut threads = Vec::new();
-    for idx in 0..cpus.count() {
-        let c = cpus.clone();
-        let boot = (idx == 0).then_some((entry, DTB_ADDR));
-        threads.push(std::thread::Builder::new().name(format!("vcpu{idx}")).spawn(move || c.thread_main(idx, boot))?);
-    }
+    let threads = vm.start_vcpus(&cpus, entry, DTB_ADDR)?;
     if let Some(launched) = cfg.launched {
         eprintln!(
             "emu: vCPUs started {} ms after launch ({} ms in machine setup)",
@@ -896,8 +885,7 @@ mod tests {
     }
 
     fn idle_cpus() -> Arc<Cpus> {
-        let wakers = Arc::new(Wakers::new(1, HvVcpus::new(1), WakeMode::from_env()));
-        Arc::new(Cpus::new(Bus::new(), wakers, 0))
+        Arc::new(Cpus::new(Bus::new(), 1, Arc::new(crate::vcpu::NoVcpus)))
     }
 
     /// A display that notes, when it is blanked, whether the ticker was already holding.
