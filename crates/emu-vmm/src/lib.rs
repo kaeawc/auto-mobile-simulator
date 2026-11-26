@@ -1,8 +1,9 @@
 //! The simee virtual machine: an arm64 board that boots unmodified Android emulator system
 //! images on Hypervisor.framework.
 //!
-//! The device models build and test on any unix host; the machine that runs them (vCPUs, the GIC,
-//! the GPU renderer) needs Hypervisor.framework on Apple silicon.
+//! The device models and the vCPU threads' shared half ([`vcpu`]) build and test on any unix host;
+//! the machine that runs them needs a hypervisor backend ([`hv`]: Hypervisor.framework on Apple
+//! silicon) and the GPU renderer.
 #![cfg(unix)]
 
 pub mod acpi;
@@ -14,6 +15,8 @@ pub mod bus;
 pub mod devices;
 pub mod disk;
 pub mod display;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod hv;
 pub mod irq;
 pub mod layout;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -22,7 +25,6 @@ pub mod modem;
 pub mod net;
 pub mod pipe;
 pub mod telephony;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod vcpu;
 #[cfg(target_os = "linux")]
 pub mod vfio_user;

@@ -1,44 +1,12 @@
-//! vCPU threads: entering the guest and handling its exits (MMIO, PSCI, WFI, sysreg traps).
+//! What every hypervisor backend's vCPU threads share: the stop protocol, exit counters and
+//! profile, MMIO dispatch onto the [`Bus`], and decoding the trapped accesses (backend-free, so
+//! it builds and tests on any unix host). The run loops themselves are in [`crate::hv`].
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use emu_hvf::{Exit, Reg, SysReg, Vcpu, VcpuHandle};
-
 use crate::bus::{Bus, ExitProfile, le_value};
-use crate::wake::{self, VcpuControl};
-
-const EC_WFX: u64 = 0x01;
-const EC_HVC64: u64 = 0x16;
-const EC_SMC64: u64 = 0x17;
-const EC_SYSREG: u64 = 0x18;
-const EC_IABT_LOWER: u64 = 0x20;
-const EC_DABT_LOWER: u64 = 0x24;
-
-/// EL1h with D, A, I and F masked: the state the arm64 boot protocol requires.
-const CPSR_EL1H_DAIF: u64 = 0x3c5;
-const VTIMER_PPI: u32 = 27;
-
-mod psci {
-    pub const VERSION: u32 = 0x8400_0000;
-    pub const CPU_SUSPEND_32: u32 = 0x8400_0001;
-    pub const CPU_SUSPEND_64: u32 = 0xc400_0001;
-    pub const CPU_OFF: u32 = 0x8400_0002;
-    pub const CPU_ON_32: u32 = 0x8400_0003;
-    pub const CPU_ON_64: u32 = 0xc400_0003;
-    pub const AFFINITY_INFO_32: u32 = 0x8400_0004;
-    pub const AFFINITY_INFO_64: u32 = 0xc400_0004;
-    pub const MIGRATE_INFO_TYPE: u32 = 0x8400_0006;
-    pub const SYSTEM_OFF: u32 = 0x8400_0008;
-    pub const SYSTEM_RESET: u32 = 0x8400_0009;
-
-    pub const SUCCESS: i64 = 0;
-    pub const NOT_SUPPORTED: i64 = -1;
-    pub const INVALID_PARAMS: i64 = -2;
-    pub const ALREADY_ON: i64 = -4;
-    pub const ON_PENDING: i64 = -5;
-}
 
 /// Why the machine stopped.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,42 +18,10 @@ pub enum StopReason {
     Fault(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Power {
-    Off,
-    Pending { entry: u64, ctx: u64 },
-    On,
-}
-
-struct CpuSlot {
-    power: Mutex<Power>,
-    cv: Condvar,
-}
-
-/// What device threads use to rouse vCPUs after raising an interrupt (see [`wake`]).
-pub type Wakers = wake::Wakers<HvVcpus>;
-
-/// The framework side of [`Wakers`]: each vCPU's handle (registered by its thread) and the
-/// GIC's SPI routing.
-pub struct HvVcpus {
-    handles: Vec<OnceLock<VcpuHandle>>,
-}
-
-impl HvVcpus {
-    pub fn new(cpus: usize) -> HvVcpus {
-        HvVcpus { handles: (0..cpus).map(|_| OnceLock::new()).collect() }
-    }
-}
-
-impl VcpuControl for HvVcpus {
-    fn kick(&self, cpus: u64) {
-        let handles = self.handles.iter().enumerate().filter(|(i, _)| cpus & (1 << i) != 0);
-        emu_hvf::kick_vcpus(handles.filter_map(|(_, h)| h.get().copied()));
-    }
-
-    fn spi_router(&self, intid: u32) -> Option<u64> {
-        emu_hvf::Vm::spi_router(intid).ok()
-    }
+/// How [`Cpus::request_stop`] reaches vCPUs: the backend forces each one out of the guest and
+/// out of any host-side wait, so it sees the stop. Callable from any thread.
+pub trait ForceExit: Send + Sync {
+    fn force_exit_all(&self);
 }
 
 /// Per-vCPU exit counters, each vCPU's alone in its cache line (128 bytes on Apple silicon):
@@ -119,10 +55,9 @@ impl ExitStats {
 
 pub struct Cpus {
     pub bus: Bus,
-    slots: Vec<CpuSlot>,
-    wakers: Arc<Wakers>,
+    count: usize,
+    force: Arc<dyn ForceExit>,
     pub stats: Arc<[ExitStats]>,
-    vtimer_offset: u64,
     stopping: AtomicBool,
     stop: Mutex<Option<StopReason>>,
     stop_cv: Condvar,
@@ -165,10 +100,10 @@ fn spawn_profile_writer(p: &Arc<ExitProfile>, path: PathBuf) {
 }
 
 impl Cpus {
-    pub fn new(bus: Bus, wakers: Arc<Wakers>, vtimer_offset: u64) -> Cpus {
-        let n = wakers.len();
+    /// `count` vCPUs on `bus`; `force` is the backend's way to force them out of the guest.
+    pub fn new(bus: Bus, count: usize, force: Arc<dyn ForceExit>) -> Cpus {
         let target = crate::bus::profile_target(std::env::var("EMU_EXIT_PROFILE").ok().as_deref());
-        let profile = target.as_ref().map(|_| Arc::new(ExitProfile::new(&bus, n)));
+        let profile = target.as_ref().map(|_| Arc::new(ExitProfile::new(&bus, count)));
         let profile_file = target.flatten();
         if let (Some(p), Some(path)) = (&profile, &profile_file) {
             spawn_profile_writer(p, path.clone());
@@ -177,10 +112,9 @@ impl Cpus {
             profile,
             profile_file,
             bus,
-            slots: (0..n).map(|_| CpuSlot { power: Mutex::new(Power::Off), cv: Condvar::new() }).collect(),
-            wakers,
-            stats: (0..n).map(|_| ExitStats::default()).collect(),
-            vtimer_offset,
+            count,
+            force,
+            stats: (0..count).map(|_| ExitStats::default()).collect(),
             stopping: AtomicBool::new(false),
             stop: Mutex::new(None),
             stop_cv: Condvar::new(),
@@ -190,7 +124,7 @@ impl Cpus {
     }
 
     pub fn count(&self) -> usize {
-        self.slots.len()
+        self.count
     }
 
     /// Records the first stop reason and forces every vCPU out of the guest.
@@ -203,11 +137,7 @@ impl Cpus {
             self.stopping.store(true, Ordering::SeqCst);
             self.stop_cv.notify_all();
         }
-        self.wakers.wake_all();
-        for slot in &self.slots {
-            let _g = slot.power.lock().unwrap_or_else(|e| e.into_inner());
-            slot.cv.notify_all();
-        }
+        self.force.force_exit_all();
     }
 
     pub fn is_stopping(&self) -> bool {
@@ -221,289 +151,66 @@ impl Cpus {
         s.clone()
     }
 
-    /// Body of vCPU thread `idx`. The boot CPU starts at `boot`; the rest wait for PSCI CPU_ON.
-    pub fn thread_main(&self, idx: usize, boot: Option<(u64, u64)>) {
-        if let Err(e) = self.thread_inner(idx, boot) {
+    /// Ends vCPU thread `idx`: a backend error stops the machine with it as the fault.
+    pub fn finish<E: std::fmt::Display>(&self, idx: usize, result: Result<(), E>) {
+        if let Err(e) = result {
             self.request_stop(StopReason::Fault(format!("vcpu{idx}: {e}")));
         }
     }
 
-    fn thread_inner(&self, idx: usize, boot: Option<(u64, u64)>) -> Result<(), emu_hvf::Error> {
-        // The guest waits on this thread: keep it eligible for performance cores even when emu's
-        // parent runs at a low QoS. Not inherited by threads it spawns (see `set_qos`).
-        emu_hvf::host::set_qos(emu_hvf::host::Qos::UserInitiated);
-        let vcpu = Vcpu::new()?;
-        vcpu.set_sys_reg(SysReg::MPIDR_EL1, idx as u64)?;
-        vcpu.set_vtimer_offset(self.vtimer_offset)?;
-        let sctlr_reset = vcpu.sys_reg(SysReg::SCTLR_EL1)?;
-        let slot = &self.slots[idx];
-        let _ = self.wakers.control().handles[idx].set(vcpu.handle());
-        if let Some((entry, x0)) = boot {
-            *slot.power.lock().unwrap_or_else(|e| e.into_inner()) = Power::Pending { entry, ctx: x0 };
-        }
-        loop {
-            let (entry, ctx) = {
-                let mut p = slot.power.lock().unwrap_or_else(|e| e.into_inner());
-                loop {
-                    if self.is_stopping() {
-                        return Ok(());
-                    }
-                    if let Power::Pending { entry, ctx } = *p {
-                        *p = Power::On;
-                        self.wakers.online(idx);
-                        break (entry, ctx);
-                    }
-                    p = slot.cv.wait(p).unwrap_or_else(|e| e.into_inner());
-                }
-            };
-            // Architectural reset state, then the PSCI/boot entry contract: x0 = context.
-            for r in 0..=30 {
-                vcpu.set_reg(Reg::x(r), 0)?;
-            }
-            vcpu.set_sys_reg(SysReg::SCTLR_EL1, sctlr_reset)?;
-            vcpu.set_reg(Reg::x(0), ctx)?;
-            vcpu.set_reg(Reg::PC, entry)?;
-            vcpu.set_reg(Reg::CPSR, CPSR_EL1H_DAIF)?;
-            match self.run(idx, &vcpu)? {
-                Flow::CpuOff => {
-                    self.wakers.offline(idx);
-                    *slot.power.lock().unwrap_or_else(|e| e.into_inner()) = Power::Off;
-                }
-                Flow::Stop => return Ok(()),
-            }
+    /// Call right before vCPU `idx` enters the guest; hand the result to [`Cpus::left_guest`].
+    pub fn entering_guest(&self) -> Option<Instant> {
+        self.profile.as_ref().map(|p| {
+            p.entered();
+            Instant::now()
+        })
+    }
+
+    /// vCPU `idx` is back from the guest it entered at `entered` ([`Cpus::entering_guest`]).
+    pub fn left_guest(&self, idx: usize, entered: Option<Instant>) {
+        if let (Some(p), Some(t)) = (&self.profile, entered) {
+            let c = p.cpu(idx);
+            c.runs.fetch_add(1, Ordering::Relaxed);
+            c.guest_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
     }
 
-    fn run(&self, idx: usize, vcpu: &Vcpu) -> Result<Flow, emu_hvf::Error> {
-        let stats = &self.stats[idx];
-        let mut vtimer_masked = false;
-        loop {
-            if self.is_stopping() {
-                return Ok(Flow::Stop);
-            }
-            if vtimer_masked {
-                // Unmask once the guest has handled the tick (timer no longer asserting).
-                let ctl = vcpu.sys_reg(SysReg::CNTV_CTL_EL0)?;
-                if ctl & 0b111 != 0b101 {
-                    vcpu.set_vtimer_mask(false)?;
-                    vtimer_masked = false;
-                }
-            }
-            let t = self.profile.as_ref().map(|p| {
-                p.entered();
-                Instant::now()
-            });
-            self.wakers.enter(idx);
-            let exit = vcpu.run();
-            self.wakers.leave(idx);
-            if let (Some(p), Some(t)) = (&self.profile, t) {
-                let c = p.cpu(idx);
-                c.runs.fetch_add(1, Ordering::Relaxed);
-                c.guest_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
-            match exit? {
-                Exit::Canceled => {
-                    stats.canceled.fetch_add(1, Ordering::Relaxed);
-                }
-                Exit::VtimerActivated => {
-                    // Only seen without an in-kernel GIC; raise the PPI ourselves.
-                    stats.vtimer.fetch_add(1, Ordering::Relaxed);
-                    vcpu.set_ppi_pending(VTIMER_PPI)?;
-                    vtimer_masked = true;
-                }
-                Exit::Exception { syndrome, ipa, .. } => {
-                    if let Some(flow) = self.exception(idx, vcpu, syndrome, ipa)? {
-                        return Ok(flow);
-                    }
-                }
-                Exit::Unknown(r) => {
-                    self.request_stop(StopReason::Fault(format!("vcpu{idx}: unknown exit reason {r}")));
-                    return Ok(Flow::Stop);
-                }
-            }
-        }
-    }
-
-    fn advance_pc(vcpu: &Vcpu) -> Result<(), emu_hvf::Error> {
-        let pc = vcpu.reg(Reg::PC)?;
-        vcpu.set_reg(Reg::PC, pc + 4)
-    }
-
-    fn exception(&self, idx: usize, vcpu: &Vcpu, syndrome: u64, ipa: u64) -> Result<Option<Flow>, emu_hvf::Error> {
-        let stats = &self.stats[idx];
-        let ec = (syndrome >> 26) & 0x3f;
-        let iss = syndrome & 0x01ff_ffff;
-        match ec {
-            EC_DABT_LOWER => {
-                if (iss >> 24) & 1 == 0 {
-                    let pc = vcpu.reg(Reg::PC)?;
-                    self.request_stop(StopReason::Fault(format!(
-                        "vcpu{idx}: data abort without syndrome at ipa {ipa:#x} (pc {pc:#x}, esr {syndrome:#x})"
-                    )));
-                    return Ok(Some(Flow::Stop));
-                }
-                let size = 1usize << ((iss >> 22) & 3);
-                let sign_extend = (iss >> 21) & 1 == 1;
-                let rt = ((iss >> 16) & 0x1f) as u32;
-                let sixty_four = (iss >> 15) & 1 == 1;
-                let write = (iss >> 6) & 1 == 1;
-                let t = self.profile.as_ref().map(|_| Instant::now());
-                if write {
-                    stats.mmio_write.fetch_add(1, Ordering::Relaxed);
-                    let v = if rt == 31 { 0 } else { vcpu.reg(Reg::x(rt))? };
-                    let hit = self.bus.write_at(ipa, &v.to_le_bytes()[..size]);
-                    if let (Some(p), Some(t)) = (&self.profile, t) {
-                        p.record(idx, hit, true, t.elapsed().as_nanos() as u64);
-                    }
-                    if hit.is_none() {
-                        self.log_unmapped(ipa, true);
-                    }
-                } else {
-                    stats.mmio_read.fetch_add(1, Ordering::Relaxed);
-                    let mut buf = [0u8; 8];
-                    let hit = self.bus.read_at(ipa, &mut buf[..size]);
-                    if let (Some(p), Some(t)) = (&self.profile, t) {
-                        p.record(idx, hit, false, t.elapsed().as_nanos() as u64);
-                    }
-                    if hit.is_none() {
-                        self.log_unmapped(ipa, false);
-                    }
-                    let mut v = le_value(&buf[..size]);
-                    if sign_extend && size < 8 {
-                        let shift = 64 - size * 8;
-                        v = (((v << shift) as i64) >> shift) as u64;
-                    }
-                    if !sixty_four {
-                        v &= 0xffff_ffff;
-                    }
-                    if rt != 31 {
-                        vcpu.set_reg(Reg::x(rt), v)?;
-                    }
-                }
-                Self::advance_pc(vcpu)?;
-            }
-            EC_HVC64 | EC_SMC64 => {
-                stats.hvc.fetch_add(1, Ordering::Relaxed);
-                // HVC leaves PC past the instruction already; SMC traps with PC on it.
-                if ec == EC_SMC64 {
-                    Self::advance_pc(vcpu)?;
-                }
-                return self.psci(idx, vcpu);
-            }
-            EC_WFX => {
-                stats.wfi.fetch_add(1, Ordering::Relaxed);
-                let is_wfe = iss & 1 == 1;
-                Self::advance_pc(vcpu)?;
-                if !is_wfe {
-                    self.wfi(idx, vcpu)?;
-                }
-            }
-            EC_SYSREG => {
-                stats.sysreg.fetch_add(1, Ordering::Relaxed);
-                // Registers the framework doesn't handle (debug, PMU, ...): RAZ/WI.
-                let is_read = iss & 1 == 1;
-                let rt = ((iss >> 5) & 0x1f) as u32;
-                let enc = iss & !(0x1f << 5) & !1;
-                self.log_sysreg(enc, is_read);
-                if is_read && rt != 31 {
-                    vcpu.set_reg(Reg::x(rt), 0)?;
-                }
-                Self::advance_pc(vcpu)?;
-            }
-            EC_IABT_LOWER => {
-                let pc = vcpu.reg(Reg::PC)?;
-                self.request_stop(StopReason::Fault(format!(
-                    "vcpu{idx}: instruction fetch from unmapped ipa {ipa:#x} (pc {pc:#x}, esr {syndrome:#x})"
-                )));
-                return Ok(Some(Flow::Stop));
-            }
-            _ => {
-                let pc = vcpu.reg(Reg::PC)?;
-                self.request_stop(StopReason::Fault(format!(
-                    "vcpu{idx}: unhandled exception class {ec:#x} (pc {pc:#x}, esr {syndrome:#x})"
-                )));
-                return Ok(Some(Flow::Stop));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Host-side WFI: waits for the timer deadline, an interrupt for this vCPU, or (while
-    /// another vCPU could send an SGI, which never reaches the VMM) at most [`wake::SGI_POLL`].
-    fn wfi(&self, idx: usize, vcpu: &Vcpu) -> Result<(), emu_hvf::Error> {
-        let ctl = vcpu.sys_reg(SysReg::CNTV_CTL_EL0)?;
-        let mut timer = None;
-        if ctl & 1 == 1 && ctl & 2 == 0 {
-            let cval = vcpu.sys_reg(SysReg::CNTV_CVAL_EL0)?;
-            let now = emu_hvf::host_ticks().wrapping_sub(self.vtimer_offset);
-            if cval <= now {
-                return Ok(());
-            }
-            timer = Some(Duration::from_nanos(emu_hvf::ticks_to_nanos(cval - now)));
-        }
+    /// Times a host-side wait of vCPU `idx` (WFI, PSCI CPU_SUSPEND) for the profile.
+    pub fn parked<T>(&self, idx: usize, wait: impl FnOnce() -> T) -> T {
         let t = self.profile.as_ref().map(|_| Instant::now());
-        self.wakers.park(idx, timer);
+        let r = wait();
         if let (Some(p), Some(t)) = (&self.profile, t) {
             p.cpu(idx).parked_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
-        Ok(())
+        r
     }
 
-    fn psci(&self, idx: usize, vcpu: &Vcpu) -> Result<Option<Flow>, emu_hvf::Error> {
-        let func = vcpu.reg(Reg::x(0))? as u32;
-        let arg = |n| vcpu.reg(Reg::x(n));
-        let ret: i64 = match func {
-            psci::VERSION => 0x2, // PSCI 0.2, matching the device tree
-            psci::CPU_SUSPEND_32 | psci::CPU_SUSPEND_64 => {
-                self.wfi(idx, vcpu)?;
-                psci::SUCCESS
-            }
-            psci::CPU_OFF => return Ok(Some(Flow::CpuOff)),
-            psci::CPU_ON_32 | psci::CPU_ON_64 => {
-                let target = (arg(1)? & 0xff) as usize;
-                let (entry, ctx) = (arg(2)?, arg(3)?);
-                match self.slots.get(target) {
-                    None => psci::INVALID_PARAMS,
-                    Some(slot) => {
-                        let mut p = slot.power.lock().unwrap_or_else(|e| e.into_inner());
-                        match *p {
-                            Power::On => psci::ALREADY_ON,
-                            Power::Pending { .. } => psci::ON_PENDING,
-                            Power::Off => {
-                                // Online before it runs: from now on it can send SGIs.
-                                self.wakers.online(target);
-                                *p = Power::Pending { entry, ctx };
-                                slot.cv.notify_all();
-                                psci::SUCCESS
-                            }
-                        }
-                    }
-                }
-            }
-            psci::AFFINITY_INFO_32 | psci::AFFINITY_INFO_64 => {
-                let target = (arg(1)? & 0xff) as usize;
-                match self.slots.get(target) {
-                    None => psci::INVALID_PARAMS,
-                    Some(slot) => match *slot.power.lock().unwrap_or_else(|e| e.into_inner()) {
-                        Power::On => 0,
-                        Power::Off => 1,
-                        Power::Pending { .. } => 2,
-                    },
-                }
-            }
-            psci::MIGRATE_INFO_TYPE => 2, // no trusted OS
-            psci::SYSTEM_OFF => {
-                self.request_stop(StopReason::PowerOff);
-                return Ok(Some(Flow::Stop));
-            }
-            psci::SYSTEM_RESET => {
-                self.request_stop(StopReason::Reset);
-                return Ok(Some(Flow::Stop));
-            }
-            _ => psci::NOT_SUPPORTED,
-        };
-        vcpu.set_reg(Reg::x(0), ret as u64)?;
-        Ok(None)
+    /// A guest store of `data` (little-endian, 1 to 8 bytes) to device address `ipa` by vCPU `idx`.
+    pub fn mmio_write(&self, idx: usize, ipa: u64, data: &[u8]) {
+        self.stats[idx].mmio_write.fetch_add(1, Ordering::Relaxed);
+        let t = self.profile.as_ref().map(|_| Instant::now());
+        let hit = self.bus.write_at(ipa, data);
+        if let (Some(p), Some(t)) = (&self.profile, t) {
+            p.record(idx, hit, true, t.elapsed().as_nanos() as u64);
+        }
+        if hit.is_none() {
+            self.log_unmapped(ipa, true);
+        }
+    }
+
+    /// A guest load of `data.len()` bytes from device address `ipa` by vCPU `idx`; unmapped
+    /// addresses read as zeroes.
+    pub fn mmio_read(&self, idx: usize, ipa: u64, data: &mut [u8]) {
+        self.stats[idx].mmio_read.fetch_add(1, Ordering::Relaxed);
+        let t = self.profile.as_ref().map(|_| Instant::now());
+        let hit = self.bus.read_at(ipa, data);
+        if let (Some(p), Some(t)) = (&self.profile, t) {
+            p.record(idx, hit, false, t.elapsed().as_nanos() as u64);
+        }
+        if hit.is_none() {
+            data.fill(0);
+            self.log_unmapped(ipa, false);
+        }
     }
 
     fn log_unmapped(&self, ipa: u64, write: bool) {
@@ -512,7 +219,9 @@ impl Cpus {
         }
     }
 
-    fn log_sysreg(&self, enc: u64, is_read: bool) {
+    /// Reports a trapped system register (ESR ISS encoding, Rt and direction masked off) the
+    /// first time it is seen.
+    pub fn log_sysreg(&self, enc: u64, is_read: bool) {
         if self.sysreg_logged.first_sighting(enc) {
             let (op0, op2, op1, crn, crm) = ((enc >> 20) & 3, (enc >> 17) & 7, (enc >> 14) & 7, (enc >> 10) & 0xf, (enc >> 1) & 0xf);
             eprintln!(
@@ -520,6 +229,49 @@ impl Cpus {
                 if is_read { "read" } else { "write" }
             );
         }
+    }
+}
+
+/// A data abort's instruction syndrome (ESR_EL2 ISS with ISV set): what a trapped load or store
+/// did, for backends that decode MMIO themselves (Hypervisor.framework).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DataAbort {
+    /// Access size in bytes: 1, 2, 4 or 8.
+    pub size: usize,
+    pub sign_extend: bool,
+    /// The transfer register; 31 is XZR.
+    pub rt: u32,
+    /// The load targets a 64-bit register (else the result is zero-extended from 32 bits).
+    pub sixty_four: bool,
+    pub write: bool,
+}
+
+impl DataAbort {
+    /// Decodes `iss`; `None` without a valid syndrome (ISV clear: a load/store pair, say).
+    pub fn decode(iss: u64) -> Option<DataAbort> {
+        if (iss >> 24) & 1 == 0 {
+            return None;
+        }
+        Some(DataAbort {
+            size: 1usize << ((iss >> 22) & 3),
+            sign_extend: (iss >> 21) & 1 == 1,
+            rt: ((iss >> 16) & 0x1f) as u32,
+            sixty_four: (iss >> 15) & 1 == 1,
+            write: (iss >> 6) & 1 == 1,
+        })
+    }
+
+    /// The register value a load of `data` (little-endian, `size` bytes) leaves in Rt.
+    pub fn load_value(&self, data: &[u8]) -> u64 {
+        let mut v = le_value(&data[..self.size]);
+        if self.sign_extend && self.size < 8 {
+            let shift = 64 - self.size * 8;
+            v = (((v << shift) as i64) >> shift) as u64;
+        }
+        if !self.sixty_four {
+            v &= 0xffff_ffff;
+        }
+        v
     }
 }
 
@@ -561,9 +313,13 @@ impl SeenOnce {
     }
 }
 
-enum Flow {
-    CpuOff,
-    Stop,
+/// A [`ForceExit`] with no vCPUs to force (tests).
+#[cfg(test)]
+pub(crate) struct NoVcpus;
+
+#[cfg(test)]
+impl ForceExit for NoVcpus {
+    fn force_exit_all(&self) {}
 }
 
 #[cfg(test)]
@@ -600,7 +356,97 @@ mod tests {
     }
 
     fn cpus(n: usize) -> Cpus {
-        Cpus::new(Bus::new(), Arc::new(Wakers::new(n, HvVcpus::new(n), wake::Mode::Targeted)), 0)
+        Cpus::new(Bus::new(), n, Arc::new(NoVcpus))
+    }
+
+    /// ESR ISS for a data abort with a valid syndrome.
+    fn iss(size_log2: u64, sign_extend: bool, rt: u64, sixty_four: bool, write: bool) -> u64 {
+        1 << 24 | size_log2 << 22 | u64::from(sign_extend) << 21 | rt << 16 | u64::from(sixty_four) << 15 | u64::from(write) << 6
+    }
+
+    #[test]
+    fn data_aborts_decode_size_register_and_direction() {
+        // `str w3, [x0]`
+        assert_eq!(
+            DataAbort::decode(iss(2, false, 3, false, true)),
+            Some(DataAbort { size: 4, sign_extend: false, rt: 3, sixty_four: false, write: true })
+        );
+        // `ldrsb x30, [x1]`
+        let ldrsb = DataAbort::decode(iss(0, true, 30, true, false)).expect("valid");
+        assert_eq!((ldrsb.size, ldrsb.rt, ldrsb.write), (1, 30, false));
+        // No valid syndrome (ISV clear): the VMM can't emulate it.
+        assert_eq!(DataAbort::decode(iss(2, false, 3, false, true) & !(1 << 24)), None);
+    }
+
+    #[test]
+    fn loads_sign_or_zero_extend_into_the_register() {
+        let load = |size_log2, sign, sixty_four, data: &[u8]| {
+            DataAbort::decode(iss(size_log2, sign, 0, sixty_four, false)).expect("valid").load_value(data)
+        };
+        assert_eq!(load(0, true, true, &[0x80]), 0xffff_ffff_ffff_ff80, "ldrsb x");
+        assert_eq!(load(0, true, false, &[0x80]), 0xffff_ff80, "ldrsb w");
+        assert_eq!(load(1, false, true, &[0x34, 0x92]), 0x9234, "ldrh");
+        assert_eq!(load(2, true, true, &[0, 0, 0, 0x80]), 0xffff_ffff_8000_0000, "ldrsw");
+        assert_eq!(load(3, false, true, &[1, 2, 3, 4, 5, 6, 7, 8]), 0x0807_0605_0403_0201, "ldr x");
+        // Bytes past the access size are ignored.
+        assert_eq!(load(1, false, true, &[1, 2, 0xff, 0xff, 0, 0, 0, 0]), 0x0201);
+    }
+
+    /// A register that remembers the last write and reads back its offset.
+    #[derive(Default)]
+    struct Reg(Mutex<Vec<(u64, Vec<u8>)>>);
+
+    impl crate::bus::MmioDevice for Reg {
+        fn read(&self, offset: u64, data: &mut [u8]) {
+            data.copy_from_slice(&offset.to_le_bytes()[..data.len()]);
+        }
+        fn write(&self, offset: u64, data: &[u8]) {
+            self.0.lock().expect("lock").push((offset, data.to_vec()));
+        }
+    }
+
+    #[test]
+    fn mmio_goes_to_the_device_and_is_counted_per_vcpu() {
+        let reg = Arc::new(Reg::default());
+        let mut bus = Bus::new();
+        bus.insert(0x900_0000, 0x1000, reg.clone());
+        let c = Cpus::new(bus, 2, Arc::new(NoVcpus));
+        c.mmio_write(1, 0x900_0010, &[1, 2, 3, 4]);
+        let mut buf = [0xaa; 4];
+        c.mmio_read(1, 0x900_0024, &mut buf);
+        assert_eq!(buf, [0x24, 0, 0, 0]);
+        // Unmapped: reads as zero, writes go nowhere; both still count.
+        let mut buf = [0xaa; 2];
+        c.mmio_read(0, 0x10, &mut buf);
+        assert_eq!(buf, [0, 0]);
+        c.mmio_write(0, 0x10, &[9]);
+        assert_eq!(*reg.0.lock().expect("lock"), [(0x10, vec![1, 2, 3, 4])]);
+        let counts = |i: usize| (c.stats[i].mmio_read.load(Ordering::Relaxed), c.stats[i].mmio_write.load(Ordering::Relaxed));
+        assert_eq!((counts(0), counts(1)), ((1, 1), (1, 1)));
+    }
+
+    #[derive(Default)]
+    struct Forced(AtomicU64);
+
+    impl ForceExit for Forced {
+        fn force_exit_all(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_stop_keeps_the_first_reason_and_forces_the_vcpus_out_each_time() {
+        let forced = Arc::new(Forced::default());
+        let c = Cpus::new(Bus::new(), 1, forced.clone());
+        assert_eq!(c.wait_stop(Duration::from_millis(1)), None);
+        assert!(!c.is_stopping());
+        c.finish(0, Ok::<(), String>(()));
+        assert!(!c.is_stopping(), "a vCPU thread that ends cleanly doesn't stop the machine");
+        c.finish(0, Err("hv_vcpu_run failed"));
+        c.request_stop(StopReason::PowerOff);
+        assert!(c.is_stopping());
+        assert_eq!(c.wait_stop(Duration::ZERO), Some(StopReason::Fault("vcpu0: hv_vcpu_run failed".into())));
+        assert_eq!(forced.0.load(Ordering::SeqCst), 2);
     }
 
     /// Per-exit bookkeeping with N vCPU threads: each one's exit counter, and the sysreg trap
