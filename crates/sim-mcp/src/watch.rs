@@ -151,8 +151,16 @@ mod tests {
         let (emit, rx) = collecting();
         let watcher = spawn(fake.clone(), Spec { uris: vec![], list_changed: true }, TICK, emit);
         drop(watcher);
-        std::thread::sleep(Duration::from_millis(100));
-        let calls = fake.called("devices").len();
+        // The thread may be mid-read when it is dropped: wait until its reads have stopped for good.
+        let mut calls = fake.called("devices").len();
+        loop {
+            std::thread::sleep(Duration::from_millis(150));
+            let now = fake.called("devices").len();
+            if now == calls {
+                break;
+            }
+            calls = now;
+        }
         fake.answer("devices", Ok(json!([])));
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(fake.called("devices").len(), calls, "no more reads");

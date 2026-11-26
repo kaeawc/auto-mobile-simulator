@@ -391,11 +391,21 @@ mod tests {
 
     #[test]
     fn finished_tasks_expire_after_their_ttl() {
-        let tasks = Tasks::with_ttl(Duration::from_millis(30));
-        let id = tasks.create("boot", || json!({"content": []})).expect("create")["taskId"].as_str().expect("id").to_owned();
-        wait_for(&tasks, &id, "completed");
-        std::thread::sleep(Duration::from_millis(60));
-        assert!(tasks.get(&id).is_none(), "swept");
+        let ttl = Duration::from_secs(60);
+        let tasks = Tasks::with_ttl(ttl);
+        let (release, work) = gated();
+        let working = tasks.create("boot", work).expect("create")["taskId"].as_str().expect("id").to_owned();
+        let done = tasks.create("boot", || json!({"content": []})).expect("create")["taskId"].as_str().expect("id").to_owned();
+        wait_for(&tasks, &done, "completed");
+        // Both are older than the time to live (their clocks are set back, so no test waits on a
+        // timer): the finished one is swept, the one still working is not.
+        let old = Instant::now().checked_sub(ttl + Duration::from_secs(1)).expect("the host has been up a minute");
+        for entry in tasks.lock().entries.values_mut() {
+            entry.started = old;
+        }
+        assert!(tasks.get(&done).is_none(), "swept");
+        assert_eq!(status(&tasks, &working), "working");
+        release.send(()).ok();
     }
 
     #[test]
