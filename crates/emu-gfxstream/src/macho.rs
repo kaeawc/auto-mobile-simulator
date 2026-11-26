@@ -222,6 +222,16 @@ pub fn pointer_test_offsets(code: [u32; 5]) -> Option<(usize, usize)> {
     (base == 0 && mid == ra && code[2] == cmp_zero && code[3] == 0x1a9f_07e0 && code[4] == 0xd65f_03c0).then_some((a, b))
 }
 
+/// The size a function allocates first, from its code: the immediate of the first `mov w0, #imm`
+/// (`MOVZ`, 32 or 64 bit, no shift) that is followed at once by a `bl` (the call to `operator
+/// new` that `std::make_shared` makes), among the first `code` words. `None` if there's no such
+/// pair.
+pub fn first_allocation_size(code: &[u32]) -> Option<usize> {
+    let movz_x0 = |w: u32| (w & 0x7fe0_001f == 0x5280_0000).then_some(((w >> 5) & 0xffff) as usize);
+    let bl = |w: u32| w & 0xfc00_0000 == 0x9400_0000;
+    code.windows(2).find_map(|p| movz_x0(p[0]).filter(|_| bl(p[1])))
+}
+
 fn read_up_to(f: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
@@ -381,6 +391,26 @@ pub(crate) mod tests {
         not_ret[4] = 0xd503_201f; // nop
         assert_eq!(pointer_test_offsets(not_ret), None);
         assert_eq!(pointer_test_offsets([0xd65f_03c0; 5]), None);
+    }
+
+    #[test]
+    fn finds_the_make_shared_allocation_size() {
+        // emulator 37.2.13's RendererImpl::createRenderChannel: a frame setup, the argument moves,
+        // `mov w0, #0x1b0` and `bl operator new`.
+        let real = [0xd102_03ff, 0xa9026ffc, 0xaa0203f6, 0xaa0103f7, 0xaa0003f4, 0xaa0803f3, 0x5280_3600, 0x9420_aa02];
+        assert_eq!(first_allocation_size(&real), Some(0x1b0));
+        let mut x0 = real;
+        x0[6] = 0xd280_3600; // mov x0, #0x1b0
+        assert_eq!(first_allocation_size(&x0), Some(0x1b0));
+        let mut other_reg = real;
+        other_reg[6] = 0x5280_3601; // mov w1, #0x1b0
+        assert_eq!(first_allocation_size(&other_reg), None);
+        let mut shifted = real;
+        shifted[6] = 0x52a0_3600; // mov w0, #0x1b0, lsl #16
+        assert_eq!(first_allocation_size(&shifted), None);
+        let mut no_call = real;
+        no_call[7] = 0xd503_201f; // nop
+        assert_eq!(first_allocation_size(&no_call), None);
     }
 
     #[test]

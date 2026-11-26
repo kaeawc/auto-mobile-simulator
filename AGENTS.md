@@ -45,6 +45,11 @@ for both is to match the stock tools exactly and then exceed them.
   Callers gate their use the same way (`sim-api`'s `ios.rs` vs `ios_unavailable.rs`).
 - The CLI is a thin front over `sim-api`'s method table: a new device command is an API method
   first, then a CLI subcommand that calls it.
+- The MCP server (`crates/sim-mcp`) is another thin front over the method table: a new API method
+  is a tool with no code in `sim-mcp`. Give a new parameter name its type in `sim-api`'s
+  `schema.rs` (a test names the ones missing), put a method that can run for many seconds in
+  `tools::LONG_RUNNING` so it becomes a task, and keep `docs/mcp.md`'s tool table in step (a test
+  fails otherwise). Stdout is the protocol in `simee mcp`: print nothing to it.
 - Every device, API method and UI element says which platform it belongs to: devices carry
   `platform`, `form_factor` and `sub_platform`; `help` lists each method's platforms. Validate a
   (platform, form factor) pair with `Kind::new`, which explains unsupported combinations.
@@ -155,13 +160,18 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   rng, vsock, gpu with `legacy_asg.rs` (API 31–33's address-space graphics on the renderer's
   protocol), input incl. XR's dual-mode mouse, console, snd), `pipe/` (adb bridge, qemud
   services incl. `car.rs`, the vehicle HAL, and `xr.rs`, Android XR's `xr_service`), `modem/`,
-  `disk.rs`, `boot.rs`, `display.rs` (`FrameStore`). Everything but `machine.rs`, `vcpu.rs` and
+  `disk.rs`, `boot.rs`, `display.rs` (`FrameStore`), `vhost_user.rs` (serves a device to QEMU
+  over vhost-user, for software mode on Linux; `examples/vhost_user_vsock.rs`), `vfio_user.rs`
+  (serves a PCI function over vfio-user: the goldfish address space, and the goldfish pipe's
+  carrier), `acpi.rs` (the SSDT that describes the pipe to x86 guests); `examples/soft_devices.rs`
+  serves the whole software-mode device set. Everything but `machine.rs`, `vcpu.rs` and
   `virtio/gpu.rs` builds and tests on Linux: put device logic there, not behind the hypervisor.
 - `crates/emu-avd` — `Env` (SDK/AVD paths), `Avd` (config, `profile()`), `NewAvd`
   (`for_profile`), running-instance advertisements (`Running`), `BootConfig`, ini parsing.
 - `crates/emu-sdk` — Java-free provisioning: repository manifests, verified downloads, the
   on-demand gfxstream renderer.
-- `crates/emu-gfxstream` — `stream_renderer_*` FFI; `examples/renderer_caps.rs` checks a renderer.
+- `crates/emu-gfxstream` — `stream_renderer_*` FFI (macOS `.dylib`, Linux `.so`; `macho.rs` and
+  `elf.rs` list what to preload); `examples/renderer_caps.rs` checks a renderer.
 - `crates/emu-ext4` — the native ext4 formatter for first-boot userdata. `crates/emu-fdt` — the
   device tree writer.
 - `crates/sim-api` — the JSON-lines unix socket API: `METHODS` table and dispatcher
@@ -169,9 +179,17 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   non-macOS hosts `ios_unavailable.rs`), the Android backend's methods (`android.rs`), server
   and client (`lib.rs`). The CLI, the socket and the
   desktop panel all go through it; add a capability here once and every surface gets it.
+- `crates/sim-mcp` — the MCP server behind `simee mcp` (stdio only; no FFI, no new dependencies):
+  `rpc.rs` (messages, versions, error codes), `server.rs` (which request does what; the current
+  revision statelessly, `initialize` for older clients), `tools.rs` (one tool per `METHODS` entry,
+  annotations, results, which methods are tasks), `resources.rs` (`simee://` URIs), `tasks.rs` (the
+  Tasks extension), `watch.rs` (polled change notifications), `app.rs` + `app.html` (the device
+  view, an MCP App), `backend.rs` (`Backend`: `sim-api` in production, a fake in tests; worker
+  threads). Parameter schemas come from `sim-api`'s `schema.rs`. Docs: `docs/mcp.md`.
 - `apps/simee` — CLI: argument parsing and output formatting over `sim-api`'s methods;
   `tests/e2e.rs` runs against a booted iOS device when `SIMEE_E2E_UDID` is set,
-  `tests/e2e_android.rs` against a running AVD when `SIMEE_E2E_AVD` is.
+  `tests/e2e_android.rs` against a running AVD when `SIMEE_E2E_AVD` is; `tests/mcp.rs` runs
+  `simee mcp` as a subprocess against a fake emulator.
 - `apps/emu` — the Android emulator binary, a drop-in for the SDK's `emulator`: `args.rs` (SDK
   flags), `instance.rs` (disks, bootconfig, boot props), `console.rs` (console server,
   running-instance file; its commands build and test on any host), `display_server.rs` (frames

@@ -42,15 +42,46 @@ fn full_console(opts: &Opts) -> bool {
     opts.show_kernel || std::env::var("EMU_CONSOLE").is_ok_and(|v| v == "full")
 }
 
-/// The guest's logcat filter for `goldfish-logcat` (`logcat -f /dev/hvc1 ${ro.boot.logcat}`):
-/// `-logcat`'s, everything with `-logcat-output` alone, else silent (`*:S`): the stream is
-/// discarded then (stock's null chardev), so formatting and writing it is wasted guest work.
-fn logcat_filter(opts: &Opts) -> &str {
+/// The logcat filter the user asked for: `-logcat`'s, everything with `-logcat-output` alone,
+/// else silent (`*:S`): the stream is discarded then (stock's null chardev).
+fn user_logcat_filter(opts: &Opts) -> &str {
     match (&opts.logcat, &opts.logcat_output) {
         (Some(tags), _) => tags,
         (None, Some(_)) => "*:V",
         (None, None) => "*:S",
     }
+}
+
+/// Whether emu follows the guest's display rotation: on the form factors whose displays turn
+/// ([`sim_core::rotation::turns`]), from the lines the guest logs when it rotates, on images with
+/// a logcat console (bootconfig, API 31 and later). Images without one (API 29 and 30) aren't
+/// followed, and their logcat filter stays the user's: it goes through `qemu.cmdline`, which holds
+/// [`PROP_VALUE_MAX`] bytes, and the rotation tags would take the default past it (logcat then
+/// shows every tag). There `rotation` says it doesn't know ([`rotation_unknown`]).
+fn follows_rotation(avd: &Avd) -> bool {
+    sim_core::rotation::turns(avd.profile().kind.form_factor) && takes_bootconfig(avd)
+}
+
+/// Whether the guest may turn its display without emu knowing: a display that turns on an image
+/// whose rotation emu doesn't follow ([`follows_rotation`]). Frames and touches stay in panel
+/// space there, and the console's `rotation` answers `unknown` rather than a turn it never read.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub fn rotation_unknown(avd: &Avd) -> bool {
+    sim_core::rotation::turns(avd.profile().kind.form_factor) && !follows_rotation(avd)
+}
+
+/// The guest's logcat filter for `goldfish-logcat` (`logcat -f /dev/hvc1 ${ro.boot.logcat}`):
+/// the user's ([`user_logcat_filter`]), plus, on a device whose display turns, the lines that
+/// report its rotation ([`sim_core::rotation::ROTATION_TAGS`], a few per rotation or app start)
+/// for emu to read. Anything else stays unformatted in the guest unless the user asked for it.
+fn logcat_filter(avd: &Avd, opts: &Opts) -> String {
+    let user = user_logcat_filter(opts);
+    if !follows_rotation(avd) {
+        return user.to_owned();
+    }
+    let parsed = sim_core::logcat::Filter::parse(user);
+    let guest = sim_core::logcat::with_tags(&parsed, &sim_core::rotation::ROTATION_TAGS);
+    if guest == parsed { user.to_owned() } else { guest.spec() }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -119,9 +150,9 @@ impl Instance {
         // formatted by the guest (`formattable` in the fstab). The ext4 formatter is native
         // (`emu-ext4`) and writes only metadata, so the image stays sparse.
         let userdata = dir.join("userdata.img");
-        if !userdata.exists()
-            && let Err(e) = create_userdata(&userdata, avd.data_partition_bytes())
-        {
+        // A first boot, as stock tells one: no user data yet (a new AVD, or `-wipe-data`).
+        let first_boot = !userdata.exists();
+        if first_boot && let Err(e) = create_userdata(&userdata, avd.data_partition_bytes()) {
             let _ = std::fs::remove_file(&userdata);
             return Err(e);
         }
@@ -148,8 +179,6 @@ impl Instance {
         // the boot before it wrote, panic text included.
         let console_log =
             File::create(dir.join("console.log")).with_context(|| format!("creating {}", dir.join("console.log").display()))?;
-        let logcat =
-            logcat_sink(opts).with_context(|| format!("opening -logcat-output {}", opts.logcat_output.as_deref().unwrap_or("")))?;
         let adb_port = console_port + 1;
         let adb = emu_vmm::pipe::adb::AdbListener::bind(adb_port).with_context(|| format!("binding adb port {adb_port}"))?;
         let gpu_lib64 = renderer(avd, opts);
@@ -185,9 +214,18 @@ impl Instance {
             // `<sdk>/simee/renderer/<revision>/`; gfxstream finds `lib64/vulkan` and
             // `lib64/gles_*` under it.
             emu_gfxstream::link_beside_exe(lib64);
+            if let Some(platform) = first_boot_angle(avd.api_level(), first_boot) {
+                if opts.verbose && std::env::var_os("ANGLE_DEFAULT_PLATFORM").is_none() {
+                    eprintln!("emu: API 29 first boot: host GLES is ANGLE on {platform} (ANGLE_DEFAULT_PLATFORM=metal overrides)");
+                }
+                emu_gfxstream::prefer_angle_platform(platform);
+            }
             emu_gfxstream::configure_environment(emulator_dir, icd);
         }
         let display = gpu_lib64.as_ref().map(|_| std::sync::Arc::new(emu_vmm::display::FrameStore::default()));
+        let watch = display.clone().filter(|_| follows_rotation(avd));
+        let logcat =
+            logcat_sink(opts, watch).with_context(|| format!("opening -logcat-output {}", opts.logcat_output.as_deref().unwrap_or("")))?;
         Ok(Instance {
             avd: avd.clone(),
             console_port,
@@ -226,6 +264,8 @@ impl Instance {
             // Images without bootconfig have no ANGLE: their GLES is the encoder, on the host's GL.
             vulkan_only: guest_egl(&self.avd) == "angle" && takes_bootconfig(&self.avd),
             virtual_queue: virtual_queue(&guest_egl(&self.avd), AngleImage::of(&self.avd)),
+            // Their GLES encoder's transport (see `legacy_cmdline`).
+            pipe_gles: !takes_bootconfig(&self.avd),
         })
     }
 
@@ -375,15 +415,94 @@ pub const LOGCAT_ROTATE_BYTES: u64 = 4 << 20;
 const LOGCAT_SPOOL_DEPTH: usize = 1024;
 
 /// Where logcat's stream goes for this process: `-logcat-output`'s file (rotated), stdout with
-/// `-logcat` alone, else nowhere. Behind a spool either way.
+/// `-logcat` alone, and `watch`, the display that turns as the guest's log says it rotated
+/// ([`rotation_watch`]); nowhere without either. The user's output is behind a spool, which
+/// drops output when its writer falls behind; the watch reads every chunk inline, before the
+/// spool's queue, on the thread that hands it the guest's log (the console worker), so it never
+/// misses a rotation line.
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
-pub fn logcat_sink(opts: &Opts) -> std::io::Result<Option<emu_vmm::virtio::console::Spool>> {
-    let out: Box<dyn std::io::Write + Send> = match (&opts.logcat_output, &opts.logcat) {
-        (Some(path), _) => Box::new(RotatingFile::create(Path::new(path), LOGCAT_ROTATE_BYTES)?),
-        (None, Some(_)) => Box::new(std::io::stdout()),
-        (None, None) => return Ok(None),
+pub fn logcat_sink(
+    opts: &Opts,
+    watch: Option<std::sync::Arc<emu_vmm::display::FrameStore>>,
+) -> std::io::Result<Option<emu_vmm::virtio::console::Spool>> {
+    use emu_vmm::virtio::console::Spool;
+    let out: Option<Box<dyn std::io::Write + Send>> = match (&opts.logcat_output, &opts.logcat) {
+        (Some(path), _) => Some(Box::new(RotatingFile::create(Path::new(path), LOGCAT_ROTATE_BYTES)?)),
+        (None, Some(_)) => Some(Box::new(std::io::stdout())),
+        (None, None) => None,
     };
-    emu_vmm::virtio::console::Spool::new("logcat-out", out, LOGCAT_SPOOL_DEPTH).map(Some)
+    Ok(match (out, watch) {
+        (None, None) => None,
+        (None, Some(display)) => Some(Spool::tap_only(rotation_watch(display))),
+        // Nothing but the user's: as they asked, untouched.
+        (Some(out), None) => Some(Spool::new("logcat-out", out, LOGCAT_SPOOL_DEPTH)?),
+        // The guest also logs the tags emu reads for itself; the user's output drops them.
+        (Some(out), Some(display)) => {
+            let filter = sim_core::logcat::Filter::parse(user_logcat_filter(opts));
+            let out = Box::new(UserLines { out, filter, lines: Lines::default() });
+            Some(Spool::new("logcat-out", out, LOGCAT_SPOOL_DEPTH)?.with_tap(rotation_watch(display)))
+        }
+    })
+}
+
+/// Reads the guest's logcat stream a line at a time: a line that reports the display's rotation
+/// ([`sim_core::rotation::guest_rotation`]) turns `display`'s frames and touches to match. Cheap
+/// enough to run inline: a line is copied once and its tag compared.
+fn rotation_watch(display: std::sync::Arc<emu_vmm::display::FrameStore>) -> emu_vmm::virtio::console::Tap {
+    let mut lines = Lines::default();
+    Box::new(move |buf| {
+        lines
+            .feed(buf, |line| {
+                if let Some(r) = sim_core::rotation::guest_rotation(&String::from_utf8_lossy(line)) {
+                    display.set_rotation(r);
+                }
+                Ok(())
+            })
+            .unwrap_or(())
+    })
+}
+
+/// The lines of the guest's log the user's filter shows, passed on to `out` (the tags emu added
+/// for itself aren't, unless the user's filter shows them too).
+struct UserLines {
+    out: Box<dyn std::io::Write + Send>,
+    filter: sim_core::logcat::Filter,
+    lines: Lines,
+}
+
+impl std::io::Write for UserLines {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let (out, filter) = (&mut self.out, &self.filter);
+        self.lines.feed(buf, |line| if filter.passes(String::from_utf8_lossy(line).trim_end()) { out.write_all(line) } else { Ok(()) })?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
+/// A byte stream cut into lines.
+#[derive(Default)]
+struct Lines(Vec<u8>);
+
+/// A line longer than this is taken as it is (logcat's own limit is about 4 KB a message).
+const LOGCAT_LINE_MAX: usize = 16 << 10;
+
+impl Lines {
+    /// Hands each line `buf` completes to `line`, with its end. A line is done with even when
+    /// `line` fails (a full disk loses it, nothing more); the first failure is returned.
+    fn feed(&mut self, buf: &[u8], mut line: impl FnMut(&[u8]) -> std::io::Result<()>) -> std::io::Result<()> {
+        for piece in buf.split_inclusive(|b| *b == b'\n') {
+            self.0.extend_from_slice(piece);
+            if piece.ends_with(b"\n") || self.0.len() >= LOGCAT_LINE_MAX {
+                let done = line(&self.0);
+                self.0.clear();
+                done?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A log file that, before a write would take it past `cap` bytes, is renamed to `<path>.1`
@@ -474,6 +593,9 @@ pub struct BootPlan {
     /// The dual-mode mouse: XR images that enable `VirtioDualModeMouse` (the headsets, not the
     /// display glasses), as stock adds it.
     pub dual_mode_mouse: bool,
+    /// The GLES encoder goes over the goldfish `opengles` pipe and the board has no virtio-gpu
+    /// (images without bootconfig: API 30 and older).
+    pub pipe_gles: bool,
 }
 
 impl BootPlan {
@@ -518,6 +640,7 @@ impl BootPlan {
             touch_screen: avd.touch_screen(),
             touchpad: avd.touchpad(),
             dual_mode_mouse: xr && avd.image_feature("VirtioDualModeMouse").unwrap_or(true),
+            pipe_gles: !takes_bootconfig(avd),
         };
         let bc = bootconfig(avd, opts, plan.renderer.is_some());
         if takes_bootconfig(avd) {
@@ -530,7 +653,16 @@ impl BootPlan {
             plan.cmdline = plan.cmdline.replace(" bootconfig", "");
             plan.cmdline.push(' ');
             plan.cmdline.push_str(&legacy_cmdline(&bc, plan.renderer.is_some()));
-            plan.boot_props.push(("qemu.cmdline".to_string(), logcat_pipe_cmdline(logcat_filter(opts))));
+            let filter = logcat_filter(avd, opts);
+            let line = logcat_pipe_cmdline(&filter);
+            if !line.contains(&filter.split_whitespace().collect::<Vec<_>>().join(",")) {
+                eprintln!("emu: -logcat '{filter}' is too long for these images' qemu.cmdline property; logcat shows every tag (*:V)");
+            }
+            // First, then `qemu.logcat=start`, as stock sends them: qemu-props sets the second
+            // as `vendor.qemu.logcat`, which starts `goldfish-logcat`, and `logcat -Q` reads
+            // the first once and exits quietly if it isn't set yet.
+            plan.boot_props.insert(0, ("qemu.cmdline".to_string(), line));
+            plan.boot_props.insert(1, ("qemu.logcat".to_string(), "start".to_string()));
         }
         plan
     }
@@ -570,8 +702,10 @@ impl BootPlan {
         if self.touchpad.is_some() {
             out.push("virtio-input: touchpad");
         }
-        if self.renderer.is_some() {
-            out.push("virtio-gpu (gfxstream), goldfish address space");
+        match (self.renderer.is_some(), self.pipe_gles) {
+            (true, false) => out.push("virtio-gpu (gfxstream), goldfish address space"),
+            (true, true) => out.push("goldfish pipe (opengles, GLProcessPipe; gfxstream), goldfish address space"),
+            (false, _) => {}
         }
         if self.sound {
             out.push("virtio-snd");
@@ -646,7 +780,7 @@ fn bootconfig(avd: &Avd, opts: &Opts, graphics: bool) -> BootConfig {
         .set("androidboot.serialno", "EMULATOR0EMURS0")
         .set("androidboot.veritymode", "enforcing")
         .set("androidboot.dalvik.vm.heapsize", "576m")
-        .set("androidboot.logcat", logcat_filter(opts))
+        .set("androidboot.logcat", logcat_filter(avd, opts))
         .set("androidboot.qemu.skin", format!("{w}x{h}"))
         .set("androidboot.qemu.vsync", "60")
         .set("androidboot.qemu.settings.system.screen_off_timeout", "2147483647")
@@ -672,6 +806,10 @@ fn bootconfig(avd: &Avd, opts: &Opts, graphics: bool) -> BootConfig {
     if avd.circular() {
         bc.set("androidboot.emulator.circular", "1");
     }
+    // A Pixel Fold image's device states for its hinge, as stock sends them.
+    if let Some(states) = crate::fold::guest_device_states(avd) {
+        bc.set("androidboot.qemu.device_state", states);
+    }
     for (k, v) in avd.vbmeta_params() {
         bc.set(k, v);
     }
@@ -691,21 +829,30 @@ fn takes_bootconfig(avd: &Avd) -> bool {
     avd.image_feature("AndroidbootProps2") == Some(true) || avd.api_level().is_none_or(|api| api >= 31)
 }
 
-/// Why emu can't run this AVD's image yet, if it can't: system images below API 31 boot their
-/// kernel and init but never get graphics, so a boot would only loop. emu refuses them up front
-/// with the reason; `EMU_ALLOW_OLD_IMAGES=1` boots them anyway, for work on the issue named.
-/// (API 31–33 guests set up address-space graphics the old way; the GPU translates it,
-/// `virtio/legacy_asg.rs`.)
+/// The host ANGLE backend for a boot that can't use Metal, if any: SwiftShader for an API 29
+/// image's first boot. There a guest `glClear` reaches ANGLE's Metal clear with a color
+/// attachment whose texture is gone and faults; gfxstream's exception handler retries the load
+/// forever under ANGLE's global lock, and every render thread stops behind it (#94). Stock renders
+/// a headless first boot with ANGLE on SwiftShader too. Later boots (user data exists) and API 30
+/// run on Metal. `ANGLE_DEFAULT_PLATFORM` overrides it either way.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn first_boot_angle(api: Option<u32>, first_boot: bool) -> Option<&'static str> {
+    (first_boot && api == Some(29)).then_some("swiftshader")
+}
+
+/// Why emu can't run this AVD's image yet, if it can't: images below API 29, which emu has never
+/// been brought up on. emu refuses them up front with the reason; `EMU_ALLOW_OLD_IMAGES=1` boots
+/// them anyway, to work on them. (API 29–30 guests draw through the goldfish `opengles` pipe,
+/// `emu_vmm::pipe::opengles`; API 31–33 guests set up address-space graphics the old way, which
+/// the GPU translates, `virtio/legacy_asg.rs`.)
 pub fn unsupported(avd: &Avd) -> Option<String> {
     let api = avd.api_level()?;
     let why = match api {
-        ..=30 => {
-            "its GLES goes over the `opengles` goldfish pipe, which emu doesn't bridge to the renderer yet (https://github.com/kaeawc/simee/issues/38)"
-        }
+        ..=28 => "emu was brought up on API 29 and newer, and older boards differ (goldfish devices where newer ones have virtio)",
         _ => return None,
     };
     Some(format!(
-        "{}: API {api} images don't run on emu yet: {why}. emu runs API 31 and newer; create the AVD from a newer image (`emu -provision 36`), or boot this one with the SDK's emulator",
+        "{}: API {api} images don't run on emu yet: {why}. emu runs API 29 and newer; create the AVD from a newer image (`emu -provision 36`), or boot this one with the SDK's emulator",
         avd.name
     ))
 }
@@ -754,11 +901,18 @@ fn legacy_cmdline(bc: &BootConfig, graphics: bool) -> String {
 /// `goldfish-logcat` runs `logcat -Q`, which takes its filter and destination from this property
 /// (SELinux keeps it from `/proc/cmdline`), as stock sets it: `androidboot.logcat=<filter>` and
 /// `androidboot.consolepipe=qemu_pipe,pipe:logcat`. logcat stops the filter at the first space
-/// and splits it on commas, so the filter's spaces become commas.
+/// and splits it on commas, so the filter's spaces become commas. The property isn't read-only,
+/// so its value is at most [`PROP_VALUE_MAX`] bytes and a longer one isn't set at all (logcat -Q
+/// then exits quietly): a filter that doesn't fit becomes `*:V`, every tag, which does.
 fn logcat_pipe_cmdline(filter: &str) -> String {
-    let filter: Vec<&str> = filter.split_whitespace().collect();
-    format!("androidboot.logcat={} androidboot.consolepipe=qemu_pipe,pipe:logcat", filter.join(","))
+    let line = |f: &str| format!("androidboot.logcat={f} androidboot.consolepipe=qemu_pipe,pipe:logcat");
+    let full = line(&filter.split_whitespace().collect::<Vec<_>>().join(","));
+    if full.len() <= PROP_VALUE_MAX { full } else { line("*:V") }
 }
+
+/// The longest value bionic stores for a property that isn't `ro.` (`PROP_VALUE_MAX` less the
+/// NUL).
+const PROP_VALUE_MAX: usize = 91;
 
 /// The guest's GLES driver: `EMU_GUEST_EGL` if set, else [`default_egl`]. Under ANGLE no guest
 /// process uses the host's GL, so the renderer runs without it
@@ -961,6 +1115,9 @@ mod tests {
             Some("androidboot.logcat=ActivityManager:I,*:S androidboot.consolepipe=qemu_pipe,pipe:logcat")
         );
 
+        let first: Vec<&str> = q.boot_props.iter().take(2).map(|(k, _)| k.as_str()).collect();
+        assert_eq!(first, ["qemu.cmdline", "qemu.logcat"], "logcat -Q's property before the start that runs it");
+
         let new = plan(&s, "s");
         assert_eq!(cmdline_prop(&new), None, "bootconfig images have a logcat console");
         assert_eq!(new.bootconfig.get("androidboot.qemu.avd_name"), Some("s"));
@@ -1015,6 +1172,15 @@ mod tests {
     }
 
     #[test]
+    fn only_an_api_29_first_boot_runs_angle_on_swiftshader() {
+        assert_eq!(first_boot_angle(Some(29), true), Some("swiftshader"));
+        assert_eq!(first_boot_angle(Some(29), false), None);
+        for api in [Some(30), Some(33), Some(36), None] {
+            assert_eq!(first_boot_angle(api, true), None, "{api:?}");
+        }
+    }
+
+    #[test]
     fn images_below_api_34_get_the_gles_encoder() {
         // API 31–33's ANGLE gives SurfaceFlinger no EGL config on the renderer's Vulkan.
         for api in [31, 32, 33] {
@@ -1057,21 +1223,44 @@ mod tests {
     }
 
     #[test]
-    fn images_below_api_31_are_refused_with_the_reason() {
+    fn images_below_api_29_are_refused_with_the_reason() {
         let s = sdk("old");
+        add_image(&s, "p", 28, "");
         add_image(&s, "q", 29, "");
         add_image(&s, "r", 30, "");
         add_image(&s, "s", 31, "AndroidbootProps2 = on\n");
-        add_image(&s, "t", 33, "AndroidbootProps2 = on\n");
         add_image(&s, "u", 34, "AndroidbootProps2 = on\n");
         let why = |n: &str| unsupported(&s.env.load(n).expect("load"));
-        for (n, api, issue) in [("q", 29, "issues/38"), ("r", 30, "issues/38")] {
-            let w = why(n).unwrap_or_default();
-            assert!(w.starts_with(&format!("{n}: API {api} images")) && w.contains(issue) && w.contains("API 31 and newer"), "{w}");
-        }
-        // API 31–33 set up address-space graphics the old way, which the GPU translates (#39).
-        assert_eq!((why("s"), why("t"), why("u")), (None, None, None));
+        let w = why("p").unwrap_or_default();
+        assert!(w.starts_with("p: API 28 images") && w.contains("API 29 and newer"), "{w}");
+        // API 29–30 draw through the opengles pipe (#38); API 31–33 through translated ASG (#39).
+        assert_eq!((why("q"), why("r"), why("s"), why("u")), (None, None, None, None));
         assert_eq!(why("phone"), None, "no API level: not refused");
+    }
+
+    #[test]
+    fn pipe_images_get_no_virtio_gpu() {
+        let s = sdk("pipe-gles");
+        add_image(&s, "q", 29, "");
+        add_image(&s, "s", 31, "AndroidbootProps2 = on\n");
+        let gpu = Some(PathBuf::from("/renderer/lib64"));
+        let q = BootPlan::new(&s.env.load("q").expect("load"), &Opts::default(), gpu.clone());
+        let s31 = BootPlan::new(&s.env.load("s").expect("load"), &Opts::default(), gpu);
+        assert!(q.pipe_gles && !s31.pipe_gles);
+        assert!(q.devices().iter().any(|d| d.starts_with("goldfish pipe (opengles")), "{:?}", q.devices());
+        assert!(!q.devices().iter().any(|d| d.contains("virtio-gpu")), "{:?}", q.devices());
+        assert!(s31.devices().iter().any(|d| d.starts_with("virtio-gpu")), "{:?}", s31.devices());
+    }
+
+    #[test]
+    fn a_logcat_filter_too_long_for_the_property_shows_every_tag() {
+        let fits = logcat_pipe_cmdline("ActivityManager:I *:S");
+        assert!(fits.len() <= PROP_VALUE_MAX && fits.contains("ActivityManager:I,*:S"), "{fits}");
+        // 65 bytes around the filter: 26 fit, 27 don't.
+        let at_cap = "A".repeat(24) + ":I";
+        assert_eq!(logcat_pipe_cmdline(&at_cap).len(), PROP_VALUE_MAX);
+        let long = logcat_pipe_cmdline(&("A".repeat(25) + ":I"));
+        assert_eq!(long, "androidboot.logcat=*:V androidboot.consolepipe=qemu_pipe,pipe:logcat");
     }
 
     fn plan(s: &Sdk, name: &str) -> BootPlan {
@@ -1174,6 +1363,41 @@ mod tests {
     }
 
     #[test]
+    fn a_pixel_fold_gets_its_images_device_states_and_skin_overlays() {
+        let s = sdk("fold");
+        let rel = "system-images/android-36/google_apis/arm64-v8a";
+        let image = s.root.join("sdk").join(rel);
+        std::fs::write(image.join("advancedFeatures.ini"), "VirtioSndCard = on\nDeviceStateOnBoot = on\nDeviceSkinOverlay = on\n")
+            .expect("features");
+        let states = image.join("data/misc/pixel_fold/devicestate");
+        std::fs::create_dir_all(&states).expect("mkdir");
+        std::fs::write(states.join("device_state_configuration.xml"), "<device-state-config>\n  <device-state/>\n</device-state-config>\n")
+            .expect("xml");
+        let fold = sim_core::form_factor::Kind::new(sim_core::platform::Platform::Android, sim_core::form_factor::FormFactor::Foldable)
+            .expect("fold")
+            .profile();
+        s.env.create_avd(&NewAvd::for_profile("pf", rel, &fold)).expect("create");
+        let avd = s.env.load("pf").expect("load");
+        let p = plan(&s, "pf");
+        assert_eq!(p.bootconfig.get("androidboot.qemu.device_state"), Some("<device-state-config><device-state/></device-state-config>"));
+        assert_eq!(
+            crate::fold::skin_overlays(&avd),
+            [
+                "cmd overlay enable com.android.internal.emulation.pixel_fold",
+                "cmd overlay enable com.android.systemui.emulation.pixel_fold"
+            ]
+        );
+        // A phone on the same image gets neither.
+        assert_eq!(plan(&s, "phone").bootconfig.get("androidboot.qemu.device_state"), None);
+        assert!(crate::fold::skin_overlays(&s.env.load("phone").expect("load")).is_empty());
+        // Nor does a foldable whose image doesn't ship its device.
+        s.env
+            .create_avd(&NewAvd::for_profile("duo", rel, &fold.clone().with_screen(2784, 1800, sim_core::form_factor::Density::Dpi(401))))
+            .expect("duo");
+        assert_eq!(plan(&s, "duo").bootconfig.get("androidboot.qemu.device_state"), None);
+    }
+
+    #[test]
     fn plans_tell_the_guest_its_screen_and_shape() {
         let s = sdk("boot");
         let watch = plan(&s, "watch");
@@ -1201,6 +1425,128 @@ mod tests {
         assert_eq!(plan(&s, "car").kind, "Android Automotive · Auto");
     }
 
+    /// Only phones, tablets and foldables follow their guest's rotation: an XR headset, display
+    /// glasses, a TV, a car and a watch log nothing for it and get no watch on their log.
+    #[test]
+    fn only_displays_that_turn_follow_the_guests_rotation() {
+        let s = sdk("turns");
+        for name in ["watch", "tv", "car", "headset", "glasses"] {
+            let avd = s.env.load(name).expect("load");
+            assert!(!follows_rotation(&avd), "{name}");
+            assert_eq!(BootPlan::new(&avd, &Opts::default(), None).bootconfig.get("androidboot.logcat"), Some("*:S"), "{name}");
+            let mine = Opts { logcat: Some("MyApp:D *:S".into()), ..Opts::default() };
+            assert_eq!(BootPlan::new(&avd, &mine, None).bootconfig.get("androidboot.logcat"), Some("MyApp:D *:S"), "{name}");
+        }
+        let phone = s.env.load("phone").expect("load");
+        assert!(follows_rotation(&phone));
+        let mine = Opts { logcat: Some("MyApp:D *:S".into()), ..Opts::default() };
+        assert_eq!(
+            BootPlan::new(&phone, &mine, None).bootconfig.get("androidboot.logcat"),
+            Some("MyApp:D WindowManager:I ActivityTaskManager:I *:S")
+        );
+        // Without a display to turn or output to write, there's no stream to keep.
+        assert!(logcat_sink(&Opts::default(), None).expect("sink").is_none());
+    }
+
+    /// API 29 and 30 take their logcat filter through `qemu.cmdline`, at most `PROP_VALUE_MAX`
+    /// bytes (a longer value isn't set, and logcat -Q logs nothing): emu adds nothing to it there
+    /// and doesn't follow their rotation, so the property is main's, the default and a typical
+    /// `-logcat` fit, and `rotation` says it doesn't know. API 31 and later read it from the log.
+    #[test]
+    fn images_whose_log_goes_through_qemu_cmdline_keep_the_users_filter() {
+        let s = sdk("cmdline-rotation");
+        add_image(&s, "q", 29, "");
+        add_image(&s, "r", 30, "");
+        add_image(&s, "s", 31, "AndroidbootProps2 = on\n");
+        let prop = |name: &str, opts: &Opts| {
+            let p = BootPlan::new(&s.env.load(name).expect("load"), opts, None);
+            p.boot_props.iter().find(|(k, _)| k == "qemu.cmdline").map(|(_, v)| v.clone())
+        };
+        let typical = Opts { logcat: Some("ActivityManager:I *:S".into()), ..Opts::default() };
+        let to_file = Opts { logcat_output: Some("/tmp/l".into()), ..Opts::default() };
+        for name in ["q", "r"] {
+            let avd = s.env.load(name).expect("load");
+            assert!(sim_core::rotation::turns(avd.profile().kind.form_factor), "{name}: a phone");
+            assert!(!follows_rotation(&avd) && rotation_unknown(&avd), "{name}");
+            for (opts, filter) in [(&Opts::default(), "*:S"), (&typical, "ActivityManager:I,*:S"), (&to_file, "*:V")] {
+                let line = prop(name, opts).expect("qemu.cmdline");
+                assert!(line.len() <= PROP_VALUE_MAX, "{name}: {} bytes: {line}", line.len());
+                assert_eq!(line, format!("androidboot.logcat={filter} androidboot.consolepipe=qemu_pipe,pipe:logcat"), "{name}");
+            }
+        }
+        let s31 = s.env.load("s").expect("load");
+        assert!(follows_rotation(&s31) && !rotation_unknown(&s31));
+        assert_eq!(prop("s", &Opts::default()), None);
+        assert_eq!(
+            BootPlan::new(&s31, &typical, None).bootconfig.get("androidboot.logcat"),
+            Some("ActivityManager:I WindowManager:I ActivityTaskManager:I *:S")
+        );
+        // A display that never turns is upright, not unknown.
+        assert!(!rotation_unknown(&s.env.load("tv").expect("load")));
+    }
+
+    /// The rotation watch reads the guest's log as it's sent, not behind the spool's queue (whose
+    /// writer thread runs at utility priority and drops chunks when it falls behind): the turn
+    /// has happened by the time `send` returns.
+    #[test]
+    fn the_rotation_watch_reads_each_line_as_it_is_sent() {
+        use sim_core::rotation::Rotation;
+        let display = std::sync::Arc::new(emu_vmm::display::FrameStore::default());
+        let spool = logcat_sink(&Opts::default(), Some(display.clone())).expect("sink").expect("a stream to watch");
+        for (line, want) in [
+            ("11-26 09:58:57.210   642   680 I WindowManager: Display id=0 rotation changed to 1 from 0\n", Rotation::Deg270),
+            ("11-26 09:58:58.210   642   680 I WindowManager: Display id=0 rotation changed to 0 from 1\n", Rotation::Deg0),
+            ("11-26 09:58:59.210   642   680 I WindowManager: Display id=0 rotation changed to 3 from 0\n", Rotation::Deg90),
+        ] {
+            spool.send(line.as_bytes());
+            assert_eq!(display.rotation(), want, "{line}");
+        }
+        assert_eq!(spool.dropped(), 0);
+    }
+
+    /// The guest's log turns the display as each rotation line arrives (split across writes or
+    /// not), and the user's output keeps only what their filter shows.
+    #[test]
+    fn the_guests_log_turns_the_display_and_the_user_sees_their_own_lines() {
+        use sim_core::rotation::Rotation;
+        use std::io::Write as _;
+        #[derive(Clone, Default)]
+        struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("out").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let display = std::sync::Arc::new(emu_vmm::display::FrameStore::default());
+        let out = Shared::default();
+        let user = sim_core::logcat::Filter::parse("MyApp:D *:S");
+        let mut watch = rotation_watch(display.clone());
+        let mut shown = UserLines { out: Box::new(out.clone()), filter: user, lines: Lines::default() };
+        let mut send = |b: &[u8]| {
+            watch(b);
+            shown.write_all(b).expect("write");
+        };
+        let turn = "11-26 09:58:57.210   642   680 I WindowManager: Display id=0 rotation changed to 3 from 0, lastOrientation=-1\n";
+        let (a, b) = turn.split_at(60);
+        send(a.as_bytes());
+        assert_eq!(display.rotation(), Rotation::Deg0, "half a line");
+        send(format!("{b}11-26 09:58:57.300  4242  4242 D MyApp: hello\n11-26 09:58:57.301  4242  4242 V MyApp: quiet\n").as_bytes());
+        assert_eq!(display.rotation(), Rotation::Deg90);
+        assert_eq!(String::from_utf8_lossy(&out.0.lock().expect("out")), "11-26 09:58:57.300  4242  4242 D MyApp: hello\n");
+        // API 34's line, back upright.
+        send(
+            b"11-26 10:07:09.487   540  1888 I ActivityTaskManager: Config changes=20000580 {winConfig={ mDisplayRotation=ROTATION_0 }}\n",
+        );
+        assert_eq!(display.rotation(), Rotation::Deg0);
+        // An app that logs the same words under its own tag turns nothing.
+        send(b"11-26 10:07:10.000  4242  4242 I MyApp: Display id=0 rotation changed to 1 from 0\n");
+        assert_eq!(display.rotation(), Rotation::Deg0);
+    }
+
     #[test]
     fn plans_follow_the_command_line_and_find_missing_files() {
         let s = sdk("opts");
@@ -1212,10 +1558,11 @@ mod tests {
         assert_eq!(p.bootconfig.get("androidboot.debug.sf.nobootanimation"), Some("1"));
         assert!(p.missing().is_empty(), "the AVD's own disks are made at boot");
 
-        // The console is quiet unless -show-kernel; logcat's stream is silent unless asked for.
+        // The console is quiet unless -show-kernel; logcat's stream is silent unless asked for,
+        // but for the lines that say the display rotated.
         let p = BootPlan::new(&avd, &Opts::default(), None);
         assert!(p.cmdline.contains(" loglevel=3") && p.cmdline.contains("console=ttyAMA0"), "{}", p.cmdline);
-        assert_eq!(p.bootconfig.get("androidboot.logcat"), Some("*:S"));
+        assert_eq!(p.bootconfig.get("androidboot.logcat"), Some("WindowManager:I ActivityTaskManager:I *:S"));
         let shown = BootPlan::new(&avd, &Opts { show_kernel: true, logcat: Some("*:I".into()), ..Opts::default() }, None);
         assert!(!shown.cmdline.contains("loglevel="), "{}", shown.cmdline);
         assert_eq!(shown.bootconfig.get("androidboot.logcat"), Some("*:I"));

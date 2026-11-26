@@ -8,6 +8,11 @@
 //! this process maps, writes each frame into (downscaled straight into its slot), and announces
 //! with a 32-byte record; only that record crosses the socket. Other clients get the RGBA rows on
 //! the socket, as before.
+//!
+//! A turned device's frames go to a client that sent `rotates` as the panel lies, with an `EMUO`
+//! record saying how to turn them, so it turns them as it draws and nothing here turns them; any
+//! other client gets them turned upright ([`FrameStore::latest_upright`]). Touches are in pixels
+//! of the upright screen either way ([`FrameStore::to_scanout`]).
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -20,6 +25,7 @@ use emu_hvf::SharedMap;
 use emu_vmm::display::FrameStore;
 use sim_core::gesture::Phase;
 use sim_core::pixels::{downscale_factor, downscale_into, downscaled_size};
+use sim_core::rotation::Rotation;
 use sim_core::stream::{FrameHeader, Input, Record, ring};
 
 /// The shortest time between two frames to one client unless it asks otherwise (`fps <n>`):
@@ -87,6 +93,8 @@ struct Wants {
     /// From `hello`; 0 pauses the stream (the client keeps its last frame).
     max_width: AtomicU32,
     shared: AtomicBool,
+    /// The client turns frames itself (`rotates`): frames as the panel lies, with `EMUO`.
+    rotates: AtomicBool,
     done: AtomicBool,
     /// Frames per second asked for with `fps <n>`; 0 for [`DEFAULT_INTERVAL`].
     fps: AtomicU32,
@@ -166,18 +174,24 @@ fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<e
             }
             (Input::Shared, _) => wants.shared.store(true, Ordering::Relaxed),
             (Input::Socket, _) => wants.shared.store(false, Ordering::Relaxed),
-            (Input::Touch { x, y, phase }, Some(emu_vmm::Inputs { touch: Some(touch), .. })) => match phase {
-                Phase::Down | Phase::Move => {
-                    finger_down = true;
-                    touch.touch(x as i32, y as i32, true);
-                }
-                Phase::Up => {
-                    if finger_down {
-                        touch.touch(x as i32, y as i32, false);
+            (Input::Rotates, _) => wants.rotates.store(true, Ordering::Relaxed),
+            (Input::Touch { x, y, phase }, Some(emu_vmm::Inputs { touch: Some(touch), .. })) => {
+                // Clients point at the screen they show: upright as the guest rotated its
+                // display, a folded foldable's view from its origin on the scanout.
+                let (x, y) = display.to_scanout(f64::from(x), f64::from(y));
+                match phase {
+                    Phase::Down | Phase::Move => {
+                        finger_down = true;
+                        touch.touch(x, y, true);
                     }
-                    finger_down = false;
+                    Phase::Up => {
+                        if finger_down {
+                            touch.touch(x, y, false);
+                        }
+                        finger_down = false;
+                    }
                 }
-            },
+            }
             // A console key name, or a raw Linux keycode (as the console's `event send` takes).
             (Input::Key(name), Some(i)) => {
                 if let Some(code) = sim_core::goldfish::keycode(&name) {
@@ -212,6 +226,14 @@ enum Out {
     Shared { header: FrameHeader, slot: u32, announce: Option<PathBuf> },
 }
 
+/// How a stream's frames are turned: as the panel lies for a client that turns them itself, else
+/// upright.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    Panel,
+    Upright,
+}
+
 fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &AtomicBool, dir: &Path) {
     let mut sent = 0u64;
     // Pacing is a GCRA (a token bucket kept as one instant): `tat` is when the next frame would
@@ -223,6 +245,8 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
     let mut rows = Vec::new();
     let mut ring: Option<Ring> = None;
     let mut ring_failed = false;
+    // The rotation last told to a client that turns frames itself.
+    let mut told: Option<Rotation> = None;
     let mut stats = std::env::var_os("EMU_FRAME_STATS").is_some().then(Stats::default);
     while !wants.done.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
         wants.passes.fetch_add(1, Ordering::Relaxed);
@@ -246,15 +270,16 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
         }
         let n = display.frames().max(n);
         let started = Instant::now();
+        let turn = if wants.rotates.load(Ordering::Relaxed) { Turn::Panel } else { Turn::Upright };
         let frame = if wants.shared.load(Ordering::Relaxed) && !ring_failed {
-            shared_frame(display, mw, n, &mut ring, dir).unwrap_or_else(|e| {
+            shared_frame(display, mw, n, &mut ring, dir, turn).unwrap_or_else(|e| {
                 // No ring: this client gets its frames on the socket from the next one.
                 eprintln!("emu: display: no shared frame ring ({e}); sending frames on the socket");
                 ring_failed = true;
                 None
             })
         } else {
-            socket_frame(display, mw, &mut rows)
+            socket_frame(display, mw, &mut rows, turn)
         };
         let Some(frame) = frame else {
             // Nothing readable: try again after the interval, not in a spin.
@@ -262,14 +287,22 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
             continue;
         };
         let captured = started.elapsed();
+        // Read after the frame: a turn counts the frame again once it's set, so a frame taken
+        // before a turn is followed by one that carries it.
+        let rotation = display.rotation();
+        let tell = (turn == Turn::Panel && told != Some(rotation)).then(|| Record::Rotation(rotation).encode());
         let result = match &frame {
             Out::Socket(header) => {
                 sent = header.frame;
-                out.write_all(&header.encode()).and_then(|()| out.write_all(&rows))
+                let mut head = Vec::with_capacity(64);
+                head.extend(tell.iter().flatten());
+                head.extend(header.encode());
+                out.write_all(&head).and_then(|()| out.write_all(&rows))
             }
             Out::Shared { header, slot, announce } => {
                 sent = header.frame;
-                let mut msg = Vec::with_capacity(128);
+                let mut msg = Vec::with_capacity(160);
+                msg.extend(tell.iter().flatten());
                 if let Some(path) = announce {
                     let p = path.as_os_str().as_encoded_bytes();
                     msg.extend(Record::Ring { path_len: p.len() as u32 }.encode());
@@ -281,6 +314,9 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
         };
         if result.is_err() {
             break;
+        }
+        if tell.is_some() {
+            told = Some(rotation);
         }
         let done = Instant::now();
         // From when this frame was due (or taken, if later), not when it finished going out: a
@@ -336,25 +372,38 @@ impl Stats {
 
 /// The latest frame, scaled into the socket buffer `rows` while the capture is held (sent after,
 /// so a slow client never holds up other streams or screenshots).
-fn socket_frame(display: &FrameStore, max_width: u32, rows: &mut Vec<u8>) -> Option<Out> {
-    display
-        .latest(|cap| {
-            let factor = downscale_factor(cap.width, max_width);
-            let (w, h) = downscaled_size(cap.width, cap.height, factor);
-            let header = FrameHeader::new(w, h, cap.width, cap.height, cap.frame)?;
-            rows.resize(header.len as usize, 0);
-            downscale_into(cap.width, cap.height, &cap.rgba, factor, rows);
-            Some(Out::Socket(header))
-        })
-        .flatten()
+fn socket_frame(display: &FrameStore, max_width: u32, rows: &mut Vec<u8>, turn: Turn) -> Option<Out> {
+    let scale = |cap: &emu_vmm::display::Capture| {
+        let factor = downscale_factor(cap.width, max_width);
+        let (w, h) = downscaled_size(cap.width, cap.height, factor);
+        let header = FrameHeader::new(w, h, cap.width, cap.height, cap.frame)?;
+        rows.resize(header.len as usize, 0);
+        downscale_into(cap.width, cap.height, &cap.rgba, factor, rows);
+        Some(Out::Socket(header))
+    };
+    match turn {
+        Turn::Panel => display.latest(scale),
+        Turn::Upright => display.latest_upright(scale),
+    }
+    .flatten()
 }
 
 /// Frame `frame` written into the next slot of `ring` (created, or replaced by a larger one, as
 /// needed, and then announced): downscaled from the shared capture, or, at full size, read back
 /// from the renderer straight into the slot. `Ok(None)` when the frame can't be read; `Err` when
 /// no ring can be made.
-fn shared_frame(display: &FrameStore, max_width: u32, frame: u64, ring: &mut Option<Ring>, dir: &Path) -> std::io::Result<Option<Out>> {
-    let (width, height, _) = display.geometry();
+fn shared_frame(
+    display: &FrameStore,
+    max_width: u32,
+    frame: u64,
+    ring: &mut Option<Ring>,
+    dir: &Path,
+    turn: Turn,
+) -> std::io::Result<Option<Out>> {
+    // Turned upright, frames come from the turned copy; unturned, that's the capture itself, so
+    // a full-size frame still reads straight into the slot.
+    let upright = turn == Turn::Upright && display.rotation() != Rotation::Deg0;
+    let (width, height, _) = if upright { display.upright_geometry() } else { display.geometry() };
     let factor = downscale_factor(width, max_width);
     let (w, h) = downscaled_size(width, height, factor);
     let Some(header) = FrameHeader::new(w, h, width, height, frame) else { return Ok(None) };
@@ -367,18 +416,19 @@ fn shared_frame(display: &FrameStore, max_width: u32, frame: u64, ring: &mut Opt
         }
     };
     let mut ok = false;
-    let slot = if factor == 1 {
+    let slot = if factor == 1 && !upright {
         ring.publish(&header, |dst| ok = display.read_into(width, height, frame, dst))
     } else {
         ring.publish(&header, |dst| {
             // The capture may hold a newer frame than `frame` by now: it's at least as new.
-            let scaled = display.latest(|cap| {
+            let scale = |cap: &emu_vmm::display::Capture| {
                 let same = (cap.width, cap.height) == (width, height);
                 if same {
                     downscale_into(width, height, &cap.rgba, factor, dst);
                 }
                 same
-            });
+            };
+            let scaled = if upright { display.latest_upright(scale) } else { display.latest(scale) };
             ok = scaled == Some(true);
         })
     };
@@ -796,6 +846,141 @@ mod tests {
         rig.store.posted(4, 4);
         assert!(std::io::Read::read(&mut r, &mut [0u8; 1]).is_err());
         assert_eq!(rig.reads.load(Ordering::Relaxed), 0);
+    }
+
+    /// `pixels(w, h, n)` turned clockwise by `r`.
+    fn turned(w: u32, h: u32, n: u64, r: Rotation) -> Vec<u8> {
+        let src = pixels(w, h, n);
+        let mut out = vec![0; src.len()];
+        sim_core::rotation::rotate_rgba_into(&src, w, h, r, &mut out);
+        out
+    }
+
+    /// The records a raw socket reader gets up to and including the next frame, its pixels
+    /// skipped.
+    fn records_to_frame(r: &mut UnixStream) -> Vec<Record> {
+        let mut got = Vec::new();
+        loop {
+            let mut hdr = [0u8; sim_core::stream::HEADER_LEN];
+            std::io::Read::read_exact(r, &mut hdr).expect("record");
+            let rec = Record::decode(&hdr).expect("decode");
+            got.push(rec);
+            if let Record::Frame(h) = rec {
+                let mut px = vec![0; h.len as usize];
+                std::io::Read::read_exact(r, &mut px).expect("pixels");
+                return got;
+            }
+        }
+    }
+
+    #[test]
+    fn a_turned_device_streams_upright_frames_to_clients_that_dont_turn_them() {
+        let rig = Rig::new("upright");
+        // A landscape panel (a tablet), turned a quarter clockwise: portrait frames.
+        let (w, h) = (12u32, 8u32);
+        rig.store.posted(w, h);
+        rig.store.set_rotation(Rotation::Deg90);
+        let n = rig.store.frames();
+        let (_old, mut old) = rig.connect(false, 4096);
+        let (h_old, px_old) = read_frame(&mut old).expect("socket frame");
+        assert_eq!((h_old.width, h_old.height, h_old.device_width, h_old.device_height), (8, 12, 8, 12));
+        assert_eq!(px_old, turned(w, h, n, Rotation::Deg90), "the header-only decoder sees an upright frame");
+        // Through the ring, full size and downscaled.
+        let (_full, full) = rig.connect(true, 4096);
+        let (hf, pf) = Frames::new(full).next_frame().expect("ring frame");
+        assert_eq!(((hf.width, hf.height), pf), ((8, 12), turned(w, h, n, Rotation::Deg90)));
+        let (_half, half) = rig.connect(true, 4);
+        let (hh, ph) = Frames::new(half).next_frame().expect("ring frame");
+        assert_eq!((hh.width, hh.height, hh.device_width, hh.device_height), (4, 6, 8, 12));
+        assert_eq!(ph, downscale(8, 12, &turned(w, h, n, Rotation::Deg90), 2).2);
+        assert_eq!(rig.reads.load(Ordering::Relaxed), 1, "three streams, one readback and one turn");
+    }
+
+    #[test]
+    fn clients_that_turn_frames_get_them_as_the_panel_lies_with_the_turn() {
+        let rig = Rig::new("rotates");
+        let (w, h) = (6u32, 10u32);
+        rig.store.posted(w, h);
+        // Raw records on the socket: the turn goes before the first frame and when it changes.
+        let mut d = Display::connect(&rig.dir).expect("connect");
+        d.request_rotation().expect("rotates");
+        d.send(&Input::Hello { max_width: 4096 }).expect("hello");
+        let mut r = d.try_clone().expect("clone");
+        r.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+        let header = |recs: &[Record]| match recs.last() {
+            Some(Record::Frame(h)) => (h.width, h.height),
+            other => panic!("{other:?}"),
+        };
+        let recs = records_to_frame(&mut r);
+        assert_eq!((recs[0], header(&recs)), (Record::Rotation(Rotation::Deg0), (6, 10)), "{recs:?}");
+        rig.store.set_rotation(Rotation::Deg270);
+        let recs = records_to_frame(&mut r);
+        assert_eq!((recs.len(), recs[0], header(&recs)), (2, Record::Rotation(Rotation::Deg270), (6, 10)), "the panel's frame");
+        rig.store.posted(w, h);
+        assert_eq!(records_to_frame(&mut r).len(), 1, "no turn again while it holds");
+        // Through the ring, the client reads the turn with the frame it applies to.
+        let mut d = Display::connect(&rig.dir).expect("connect");
+        d.request_rotation().expect("rotates");
+        d.request_shared().expect("shm");
+        d.send(&Input::Hello { max_width: 4096 }).expect("hello");
+        let reader = d.try_clone().expect("clone");
+        reader.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+        let mut frames = Frames::new(reader);
+        let (hd, px) = frames.next_frame().expect("frame");
+        assert_eq!(((hd.width, hd.height), frames.rotation), ((6, 10), Rotation::Deg270));
+        assert_eq!(px, pixels(w, h, rig.store.frames()), "as the panel lies: nothing turned it");
+        rig.store.set_rotation(Rotation::Deg180);
+        frames.next_frame().expect("frame");
+        assert_eq!(frames.rotation, Rotation::Deg180);
+        assert_eq!(turned_copy_bytes(&rig.store), 0, "no stream asked for turned frames");
+    }
+
+    /// Bytes the store holds beyond the capture of a posted frame (whose pixels the renderer
+    /// keeps): the turned copy, when anything made one.
+    fn turned_copy_bytes(store: &FrameStore) -> usize {
+        store.buffered_bytes() - store.latest(|c| c.rgba.capacity()).unwrap_or(0)
+    }
+
+    #[test]
+    fn touches_on_a_turned_screen_land_where_they_would_unturned() {
+        // Phone, landscape tablet, and a folded Pixel Fold's outer screen on its scanout.
+        let cases: [((u32, u32), Option<emu_vmm::display::View>); 3] =
+            [((720, 1280), None), ((1280, 800), None), ((2208, 1840), Some((629, 0, 949, 1840)))];
+        for ((sw, sh), view) in cases {
+            let (touch, th) = emu_vmm::virtio::input::Input::new(Kind::Touch { width: sw, height: sh, screen: true }, "touch");
+            let (_k, kh) = emu_vmm::virtio::input::Input::new(Kind::Keyboard, "keyboard");
+            let (rotary, rh) = emu_vmm::virtio::input::Input::new(Kind::Rotary, "rotary");
+            let inputs = emu_vmm::Inputs { screen: (sw, sh), touch: Some(th), keyboard: kh, rotary: rh, mouse: None, touchpad: None };
+            let rig = Rig::with(&format!("turn-touch-{sw}"), Some(inputs), None);
+            rig.store.posted(sw, sh);
+            rig.store.set_view(view);
+            let (_, _, vw, vh) = view.unwrap_or((0, 0, sw, sh));
+            let mut d = Display::connect(&rig.dir).expect("connect");
+            // A tap at view pixel `p`, sent where the turned screen shows it.
+            let tap = |d: &mut Display, r: Rotation, (x, y): (u32, u32)| {
+                let (sx, sy) = r.panel_to_screen((x, y), (vw, vh));
+                for phase in [Phase::Down, Phase::Up] {
+                    d.send(&Input::Touch { x: sx as f32, y: sy as f32, phase }).expect("send");
+                }
+                // A marker after the touches: once it's in, they are.
+                d.send(&Input::Wheel(1)).expect("wheel");
+                let start = Instant::now();
+                while rotary.take_queued().is_empty() {
+                    assert!(start.elapsed() < Duration::from_secs(5), "no marker");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                touch.take_queued()
+            };
+            for p in [(0, 0), (vw - 1, vh - 1), (vw / 3, vh / 7)] {
+                rig.store.set_rotation(Rotation::Deg0);
+                let want = tap(&mut d, Rotation::Deg0, p);
+                assert_eq!(want.len(), 2, "down and up");
+                for r in [Rotation::Deg90, Rotation::Deg180, Rotation::Deg270] {
+                    rig.store.set_rotation(r);
+                    assert_eq!(tap(&mut d, r, p), want, "{r:?} {sw}x{sh} {view:?} at {p:?}");
+                }
+            }
+        }
     }
 
     /// `hello 0` pauses a stream (the desktop's switched-away screen). While the guest keeps

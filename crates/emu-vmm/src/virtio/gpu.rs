@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use emu_gfxstream::{Backing, Box3, Fence, Renderer, ResourceCreateArgs};
-use emu_hvf::{GuestRam, Vm};
+use emu_gfxstream::{Backing, Box3, Fence, HostRange, Renderer, ResourceCreateArgs};
+use emu_hvf::GuestRam;
 
 use super::legacy_asg::{self, LegacyAsg};
 use super::mmio::{F_RING_EVENT_IDX, F_RING_INDIRECT_DESC};
@@ -74,12 +74,58 @@ mod cmd {
     pub const ERR_INVALID_PARAMETER: u32 = 0x1205;
 }
 
+/// Where the guest sees host-visible blobs: virtio shared memory region 1, a window of `size`
+/// bytes the device maps blobs into at offsets the guest picks. Emu's own machine maps a blob's
+/// host pages into the VM at the region's guest-physical address ([`HvWindow`]); a vhost-user
+/// frontend owns the region itself and is sent the blob's fd to map (`SHMEM_MAP`).
+pub trait ShmWindow: Send + Sync {
+    /// Whether [`ShmWindow::map`] needs the blob's host mapping (`stream_renderer_resource_map`).
+    /// A window that maps blobs by fd doesn't, and a renderer with exportable blobs refuses it.
+    fn needs_host_mapping(&self) -> bool {
+        true
+    }
+    /// Maps blob `id` (`len` bytes, whole pages) at `offset`; `host` is its host mapping when
+    /// [`ShmWindow::needs_host_mapping`].
+    fn map(&self, id: u32, host: Option<HostRange>, offset: u64, len: usize) -> Result<(), String>;
+    /// Removes the mapping at `offset` (`len` bytes) that [`ShmWindow::map`] made.
+    fn unmap(&self, offset: u64, len: usize);
+    /// [`ShmWindow::unmap`] while the device is being stopped. A frontend may be the one stopping
+    /// it and wait for that to finish before it reads anything else, so a window that would ask
+    /// the frontend to unmap defers it (to before its next map) instead of waiting on an answer.
+    fn unmap_stopping(&self, offset: u64, len: usize) {
+        self.unmap(offset, len);
+    }
+    /// Blob `id` is gone: anything kept to map it again can go.
+    fn forget(&self, _id: u32) {}
+}
+
+/// The host-visible region of emu's own machine: blobs mapped into the VM at `base + offset`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub struct HvWindow {
+    pub base: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ShmWindow for HvWindow {
+    fn map(&self, _id: u32, host: Option<HostRange>, offset: u64, _len: usize) -> Result<(), String> {
+        let host = host.ok_or("no host mapping")?;
+        emu_hvf::Vm::map_raw(host, self.base + offset).map_err(|e| format!("hv_vm_map: {e}"))
+    }
+
+    fn unmap(&self, offset: u64, len: usize) {
+        let _ = emu_hvf::Vm::unmap_raw(self.base + offset, len);
+    }
+}
+
 pub struct GpuConfig {
     pub width: u32,
     pub height: u32,
     pub renderer: Arc<Renderer>,
-    /// Guest physical base and size of the host-visible region.
+    /// Guest physical base and size of the host-visible region (the base matters only to a
+    /// transport that places the region itself, virtio-mmio).
     pub shm: (u64, u64),
+    /// How blobs get into that region.
+    pub window: Arc<dyn ShmWindow>,
     pub display: Arc<dyn DisplaySink>,
     /// Timing of each activation on stderr (`-verbose`): the last boot's release, the first
     /// command and the first fence.
@@ -290,10 +336,12 @@ struct Resource {
     width: u32,
     height: u32,
     format: u32,
-    /// Guest physical range the blob is mapped at (unmapped on unref).
+    /// Offset into the host-visible region and length the blob is mapped at (unmapped on unref).
     mapped: Option<(u64, usize)>,
     /// The context that created this blob; None for other resources.
     blob_of: Option<u32>,
+    /// A blob's size, as the guest created it.
+    blob_size: u64,
     /// A custom buffer's guest backing (`addr`, `len`), kept since the device may write it: the
     /// response page of address-space graphics the old way ([`legacy_asg`]). Other resources
     /// keep none.
@@ -611,9 +659,12 @@ impl Worker {
         let r = &self.cfg.renderer;
         let release = release_all(&mut self.resources, &mut self.contexts);
         self.legacy_asg.clear();
-        for &(id, ipa, len) in &release.unmap {
-            let _ = Vm::unmap_raw(ipa, len);
+        for &(id, offset, len) in &release.unmap {
+            self.cfg.window.unmap_stopping(offset, len);
             let _ = r.unmap(id);
+        }
+        for &id in &release.resources {
+            self.cfg.window.forget(id);
         }
         if self.cfg.verbose || trace() || unsignalled > 0 {
             eprintln!(
@@ -883,10 +934,11 @@ impl Worker {
                 let id = le32(req, 24);
                 self.legacy_asg.unref(id);
                 if let Some(res) = self.resources.remove(&id) {
-                    if let Some((ipa, len)) = res.mapped {
-                        let _ = Vm::unmap_raw(ipa, len);
+                    if let Some((offset, len)) = res.mapped {
+                        self.cfg.window.unmap(offset, len);
                         let _ = r.unmap(id);
                     }
+                    self.cfg.window.forget(id);
                     if self.scanout.is_some_and(|s| s.resource == id) {
                         self.scanout = None;
                     }
@@ -960,7 +1012,7 @@ impl Worker {
                 match r.create_blob(h.ctx_id, id, blob_mem, blob_flags, blob_id, size, backing) {
                     Ok(()) => {
                         created(id);
-                        self.resources.insert(id, Resource { blob_of: Some(h.ctx_id), ..Default::default() });
+                        self.resources.insert(id, Resource { blob_of: Some(h.ctx_id), blob_size: size, ..Default::default() });
                         if ring {
                             let mut create = asg_command(legacy_asg::OP_CREATE, id);
                             if let Err(e) = r.submit(h.ctx_id, &mut create) {
@@ -980,8 +1032,8 @@ impl Worker {
             cmd::RESOURCE_MAP_BLOB => self.map_blob(le32(req, 24), le64(req, 32), body),
             cmd::RESOURCE_UNMAP_BLOB => {
                 let id = le32(req, 24);
-                if let Some((ipa, len)) = self.resources.get_mut(&id).and_then(|res| res.mapped.take()) {
-                    let _ = Vm::unmap_raw(ipa, len);
+                if let Some((offset, len)) = self.resources.get_mut(&id).and_then(|res| res.mapped.take()) {
+                    self.cfg.window.unmap(offset, len);
                     let _ = r.unmap(id);
                 }
                 ok
@@ -1038,27 +1090,31 @@ impl Worker {
     fn map_blob(&mut self, id: u32, offset: u64, body: &mut Vec<u8>) -> u32 {
         let r = &self.cfg.renderer;
         let Some(res) = self.resources.get_mut(&id) else { return cmd::ERR_INVALID_RESOURCE_ID };
-        let host = match r.map(id) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("emu: gpu: map blob {id}: {e}");
-                return cmd::ERR_UNSPEC;
+        let host = if self.cfg.window.needs_host_mapping() {
+            match r.map(id) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    eprintln!("emu: gpu: map blob {id}: {e}");
+                    return cmd::ERR_UNSPEC;
+                }
             }
+        } else {
+            None
         };
-        let (base, size) = self.cfg.shm;
-        let len = host.len().div_ceil(4096) * 4096;
-        if offset.checked_add(len as u64).is_none_or(|end| end > size) {
+        let size = self.cfg.shm.1;
+        let len = (host.map_or(res.blob_size as usize, |h| h.len())).div_ceil(4096) * 4096;
+        if len == 0 || offset.checked_add(len as u64).is_none_or(|end| end > size) {
             let _ = r.unmap(id);
             return cmd::ERR_INVALID_PARAMETER;
         }
         // `host` stays mapped until we unmap it (RESOURCE_UNMAP_BLOB / UNREF / teardown).
-        let range = emu_gfxstream::page_range(host, len);
-        if let Err(e) = Vm::map_raw(range, base + offset) {
-            eprintln!("emu: gpu: hv_vm_map blob {id} at +{offset:#x} ({len:#x} bytes): {e}");
+        let range = host.map(|h| emu_gfxstream::page_range(h, len));
+        if let Err(e) = self.cfg.window.map(id, range, offset, len) {
+            eprintln!("emu: gpu: map blob {id} at +{offset:#x} ({len:#x} bytes): {e}");
             let _ = r.unmap(id);
             return cmd::ERR_UNSPEC;
         }
-        res.mapped = Some((base + offset, len));
+        res.mapped = Some((offset, len));
         body.extend_from_slice(&(r.map_info(id) & 0x0f).to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
         cmd::OK_MAP_INFO

@@ -17,10 +17,11 @@
 //!
 //! `cargo run` opens the window (`SIMEE_DEVICE=<udid|name|booted>` preselects a device);
 //! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
-//! tablet, ipad, watch, tv, apple-watch, apple-tv, empty); a release build needs `--features
-//! tooling` for it.
+//! folded, tablet, ipad, watch, tv, apple-watch, apple-tv, turned, turned-tablet, empty); a
+//! release build needs `--features tooling` for it.
 
 mod android;
+mod bezel;
 mod controls;
 mod debug;
 mod device;
@@ -46,6 +47,7 @@ use sim_core::form_factor::{FormFactor, Kind, Posture, Shape};
 use sim_core::gesture::Phase;
 use sim_core::hid::{Button, Direction};
 use sim_core::platform::Platform;
+use sim_core::rotation::Rotation;
 
 use device::{Context, Live};
 use keys::KeyAction;
@@ -82,6 +84,9 @@ pub enum Input {
     Hover(f32, f32),
     /// The pointer left the screen (the stylus out of range).
     Leave,
+    /// One sample of a touch that came in from the screen's edge: a drag that started on the
+    /// bezel ([`bezel`]).
+    Edge(f32, f32, Phase, sim_core::gesture::ScreenEdge),
     Key(KeyAction),
 }
 
@@ -117,6 +122,8 @@ pub struct State {
     /// Headless scenes show the screen without a live device.
     pub offline_screen: bool,
     offline_size: (u32, u32),
+    /// How far a headless scene's screen is turned (a live Android screen says itself).
+    offline_turn: Rotation,
     /// The UI thread's simulator service connection, made when an iOS device is first shown
     /// (the scanner has its own).
     ctx: Option<Result<Context, String>>,
@@ -145,6 +152,8 @@ pub struct State {
     pen: Option<stylus::Pen>,
     /// The screen element's size in points (pointer moves come in its own points).
     pub screen_view: (f32, f32),
+    /// Where the screen and its bezel are, and the edge touch in progress.
+    pub bezel: bezel::Bezel,
 }
 
 /// An Android screen switched away from, with what the window showed it with.
@@ -167,6 +176,12 @@ impl State {
     pub fn screen_size(&self) -> (u32, u32) {
         let live = self.live.as_ref().and_then(|l| l.shared.size());
         live.or_else(|| self.screen.as_ref().and_then(android::Screen::device_size)).unwrap_or(self.offline_size)
+    }
+
+    /// How far to turn the screen's pixels (as a turned Android device's panel lies) clockwise
+    /// to show them upright.
+    pub fn screen_rotation(&self) -> Rotation {
+        self.screen.as_ref().map_or(self.offline_turn, android::Screen::rotation)
     }
 
     /// Whether a device screen is shown (live, or a headless scene's).
@@ -378,6 +393,7 @@ fn init() -> State {
         offline: false,
         offline_screen: false,
         offline_size: (1206, 2622),
+        offline_turn: Rotation::Deg0,
         ctx: None,
         android_backend: None,
         scanner: None,
@@ -394,6 +410,7 @@ fn init() -> State {
         stylus: false,
         pen: None,
         screen_view: (0.0, 0.0),
+        bezel: bezel::Bezel::default(),
     }
 }
 
@@ -526,8 +543,27 @@ fn android_scene(s: &mut State) {
     select_running(s, "pixel_9", (360, 800), Shape::Rounded);
 }
 
+/// A phone turned a quarter clockwise: its frames lie as the panel does (360x800) and the view
+/// turns them as it draws, so the screen shows 800x360, upright.
+fn turned_scene(s: &mut State) {
+    select_running(s, "pixel_9", (360, 800), Shape::Rounded);
+    (s.offline_size, s.offline_turn) = ((800, 360), Rotation::Deg90);
+}
+
+/// A Pixel Tablet (landscape panel, at half size) turned a quarter clockwise: portrait.
+fn turned_tablet_scene(s: &mut State) {
+    select_running(s, "pixel_tablet", (1280, 800), Shape::Rounded);
+    (s.offline_size, s.offline_turn) = ((800, 1280), Rotation::Deg90);
+}
+
 fn foldable_scene(s: &mut State) {
     select_running(s, "pixel_fold", (552, 460), Shape::Rectangle);
+}
+
+/// The Pixel Fold folded: emu streams only its outer screen (949x1840 of the 2208x1840 scanout,
+/// here at a quarter), so the view takes that shape.
+fn folded_scene(s: &mut State) {
+    select_running(s, "pixel_fold", (237, 460), Shape::Rectangle);
 }
 
 /// A Pixel Tablet in landscape (its natural orientation), at half size.
@@ -569,6 +605,7 @@ fn headless() -> bool {
 fn setup(s: &mut State, waker: Waker) {
     s.native.set_waker(waker.clone());
     s.outbox = work::Outbox::new(Some(waker.clone()));
+    s.bezel.set_outbox(s.outbox.clone());
     s.waker = Some(waker);
     if s.offline || headless() {
         s.offline = true;
@@ -622,6 +659,17 @@ fn press_button(s: &mut State, button: Button, t: f64, tx: &mut Tx) {
     tx.wake_after(Duration::from_millis(60));
 }
 
+/// A foldable toolbar button, as stock's fold controls: fold shows the folded screen (a fold-in
+/// shut, a dual-screen folded back), unfold lays it flat, half open stands it like a book. The
+/// screen then streams at the folded screen's size, so the view resizes with it.
+fn fold_to(d: &sim_android::Device, posture: Posture) -> Result<(), String> {
+    match posture {
+        Posture::Closed => d.fold_display(true),
+        Posture::HalfOpened => d.posture(sim_core::fold::StockPosture::HalfOpen),
+        Posture::Opened => d.fold_display(false),
+    }
+}
+
 /// Queues a console action for the selected Android device on its console worker; failures go
 /// to the status line when it finishes.
 fn android_action(s: &State, f: impl FnOnce(&sim_android::Device) -> Result<(), String> + Send + 'static) {
@@ -636,7 +684,10 @@ fn android_action(s: &State, f: impl FnOnce(&sim_android::Device) -> Result<(), 
 fn coalesce_moves(inputs: Vec<Input>) -> Vec<Input> {
     let mut out: Vec<Input> = Vec::with_capacity(inputs.len());
     for input in inputs {
-        if let (Input::Move(..), Some(Input::Move(..))) | (Input::Hover(..), Some(Input::Hover(..))) = (&input, out.last()) {
+        if let (Input::Move(..), Some(Input::Move(..)))
+        | (Input::Hover(..), Some(Input::Hover(..)))
+        | (Input::Edge(.., Phase::Move, _), Some(Input::Edge(.., Phase::Move, _))) = (&input, out.last())
+        {
             out.pop();
         }
         out.push(input);
@@ -720,7 +771,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
                 Some(live) => live.rotate(),
                 None => android_action(s, sim_android::Device::rotate),
             },
-            Action::Fold(posture) => android_action(s, move |d| d.fold(posture.angle())),
+            Action::Fold(posture) => android_action(s, move |d| fold_to(d, posture)),
             Action::Rotary(ticks) => {
                 s.live.iter().for_each(|l| l.crown(ticks));
                 s.screen.iter().for_each(|sc| sc.wheel(ticks));
@@ -784,7 +835,8 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     {
         s.sized_for = Some(size);
         let form_factor = s.selected_info().and_then(|i| i.form_factor);
-        tx.resize_window(fit_window(size, form_factor));
+        let bezel = s.selected_info().and_then(controls::bezel).is_some();
+        tx.resize_window(fit_window(size, form_factor, bezel));
         changed = true;
     }
     changed
@@ -844,17 +896,21 @@ const MAX_WINDOW_W: f32 = 1440.0;
 
 /// The window that fits a device screen of `size` pixels: the sidebar (240), the gutters (32),
 /// the screen at [`android::SCREEN_POINTS`] tall (at least 420 wide, for the toolbar) and the
-/// Android panel (340); 110 points of toolbar and status around it. A landscape tablet's screen
+/// Android panel (340); 110 points of toolbar and status around it. A device with a bezel
+/// ([`controls::bezel`]) has a [`bezel::BAND`] of stage around its screen on every side, which the
+/// window budgets on top, so the screen is drawn at the size it has without one. A landscape tablet's screen
 /// (2560x1600 is 1216 points wide at that height) would make the window wider than a laptop's
 /// display, so a tablet's wide screen is shown shorter instead, as far as fits [`MAX_WINDOW_W`].
 /// Other form factors (an unfolded foldable, automotive, TV) keep the full-height screen.
-fn fit_window(size: (u32, u32), form_factor: Option<FormFactor>) -> (f32, f32) {
+fn fit_window(size: (u32, u32), form_factor: Option<FormFactor>, bezel: bool) -> (f32, f32) {
     const CHROME_W: f32 = 240.0 + 32.0 + 340.0;
     let aspect = size.0 as f32 / size.1.max(1) as f32;
     let full_w = android::SCREEN_POINTS * aspect;
-    let screen_w = if form_factor == Some(FormFactor::Tablet) { full_w.min(MAX_WINDOW_W - CHROME_W) } else { full_w };
+    let band = if bezel { 2.0 * bezel::BAND } else { 0.0 };
+    // A landscape tablet keeps its laptop-sized window: the band comes out of the screen there.
+    let screen_w = if form_factor == Some(FormFactor::Tablet) { full_w.min(MAX_WINDOW_W - CHROME_W - band) } else { full_w };
     let screen_h = screen_w / aspect;
-    (CHROME_W + screen_w.max(420.0), screen_h + 110.0)
+    (CHROME_W + (screen_w + band).max(420.0), screen_h + band + 110.0)
 }
 
 /// Sends one touch or keystroke input to the device on screen.
@@ -867,10 +923,27 @@ fn apply(s: &State, input: Input) {
             s.live.iter().for_each(|l| l.strokes(&strokes));
             return;
         }
+        Input::Edge(x, y, phase, edge) => return edge_touch(s, x, y, phase, edge),
         Input::Key(_) | Input::Hover(..) | Input::Leave => return,
     };
     if let Some(live) = &s.live {
-        live.touch(x, y, phase);
+        // Edge touches go through the API's worker; while any are still on their way, this one
+        // follows them there, so a tap after a bezel swipe can't overtake it.
+        if s.bezel.busy() {
+            s.bezel.send(&live.udid, (x, y), phase, None);
+        } else {
+            live.touch(x, y, phase);
+        }
+    } else if let Some(sc) = &s.screen {
+        sc.touch(x, y, phase);
+    }
+}
+
+/// Sends one sample of a touch from the screen's `edge` (a drag from the bezel): on iOS through the
+/// API's `touch` with `edge`, on Android as an ordinary touch, already on the edge.
+fn edge_touch(s: &State, x: f32, y: f32, phase: Phase, edge: sim_core::gesture::ScreenEdge) {
+    if let Some(live) = &s.live {
+        s.bezel.send(&live.udid, (x, y), phase, Some(edge));
     } else if let Some(sc) = &s.screen {
         sc.touch(x, y, phase);
     }
@@ -910,12 +983,15 @@ fn main() {
             ("demo", demo),
             ("android", android_scene),
             ("foldable", foldable_scene),
+            ("folded", folded_scene),
             ("tablet", tablet_scene),
             ("ipad", ipad_scene),
             ("watch", watch_scene),
             ("tv", tv_scene),
             ("apple-watch", apple_watch_scene),
             ("apple-tv", apple_tv_scene),
+            ("turned", turned_scene),
+            ("turned-tablet", turned_tablet_scene),
             ("empty", empty),
         ],
         setup: Some(setup),
@@ -1061,6 +1137,188 @@ mod tests {
             matches!(rt.state.inputs.first(), Some(Input::Down(px, py)) if near(*px, 180.0) && near(*py, 200.0)),
             "{:?}",
             rt.state.inputs
+        );
+    }
+
+    /// A turned phone's screen is upright: the view's box has the turned shape, the panel's
+    /// picture is turned into it, and a drag lands at the upright screen's pixels (emu maps
+    /// those onto the panel).
+    #[test]
+    fn a_turned_screen_is_drawn_upright_and_takes_upright_touches() {
+        for (scene, upright) in [(turned_scene as fn(&mut State), (800, 360)), (turned_tablet_scene, (800, 1280))] {
+            // The picture takes the box's size from its layout, so it fills the box the frame
+            // after: at once, not springing there.
+            let mut rt = runtime(scene);
+            rt.frame(1.0 / 60.0);
+            assert_eq!(rt.state.screen_size(), upright);
+            let ([x, y, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+            let ratio = upright.0 as f32 / upright.1 as f32;
+            assert!((w / h - ratio).abs() < 0.02, "{upright:?}: the box is {w}x{h}");
+            let ([px, py, pw, ph], _) = rt.presented("device-pixels").expect("the turned picture");
+            // Its upright bounding box: the screen's own.
+            assert!((px - x).abs() < 1.0 && (py - y).abs() < 1.0 && (pw - w).abs() < 1.0 && (ph - h).abs() < 1.0, "{:?}", [px, py, pw, ph]);
+            rt.pointer_down(x + w * 0.75, y + h * 0.25);
+            rt.frame(1.0 / 60.0);
+            rt.pointer_up(x + w * 0.75, y + h * 0.25);
+            rt.frame(1.0 / 60.0);
+            let near = |a: f32, b: f32| (a - b).abs() < 2.0;
+            let (ux, uy) = (upright.0 as f32 * 0.75, upright.1 as f32 * 0.25);
+            assert!(
+                matches!(rt.state.inputs.first(), Some(Input::Down(dx, dy)) if near(*dx, ux) && near(*dy, uy)),
+                "{upright:?}: {:?}",
+                rt.state.inputs
+            );
+        }
+        // Unturned, nothing is drawn turned.
+        let rt = runtime(android_scene);
+        assert!(rt.find("device-pixels").is_none());
+    }
+
+    /// A drag that starts just below an iPad's screen is a touch from its bottom edge, from the
+    /// edge pixel up to where the pointer goes; one on the screen stays an ordinary touch.
+    #[test]
+    fn a_drag_from_the_bezel_comes_in_from_that_edge() {
+        use sim_core::gesture::ScreenEdge;
+        let mut rt = runtime(ipad_scene);
+        let ([x, y, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+        let (dw, dh) = rt.state.screen_size();
+        let near = |a: f32, b: f32| (a - b).abs() < 2.0;
+        rt.pointer_down(x + w * 0.5, y + h + bezel::BAND * 0.5);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_move(x + w * 0.5, y + h * 0.5);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_up(x + w * 0.5, y + h * 0.5);
+        rt.frame(1.0 / 60.0);
+        let inputs = std::mem::take(&mut rt.state.inputs);
+        assert!(
+            matches!(inputs.first(), Some(Input::Edge(px, py, Phase::Down, ScreenEdge::Bottom)) if near(*px, dw as f32 * 0.5) && near(*py, dh as f32 - 1.0)),
+            "{inputs:?}"
+        );
+        assert!(
+            inputs.iter().any(|i| matches!(i, Input::Edge(_, py, Phase::Move, ScreenEdge::Bottom) if near(*py, dh as f32 * 0.5))),
+            "{inputs:?}"
+        );
+        assert!(matches!(inputs.last(), Some(Input::Edge(_, _, Phase::Up, ScreenEdge::Bottom))), "{inputs:?}");
+        assert_eq!(rt.state.bezel.edge, None, "the drag ended");
+
+        // Above the top-right corner: Control Center's edge.
+        rt.pointer_down(x + w - 4.0, y - bezel::BAND * 0.5);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_up(x + w - 4.0, y + h * 0.3);
+        rt.frame(1.0 / 60.0);
+        let inputs = std::mem::take(&mut rt.state.inputs);
+        assert!(matches!(inputs.first(), Some(Input::Edge(_, py, Phase::Down, ScreenEdge::Top)) if *py == 0.0), "{inputs:?}");
+
+        // On the screen it's a touch; far outside the bezel, nothing.
+        rt.pointer_down(x + w * 0.5, y + h - 2.0);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_up(x + w * 0.5, y + h * 0.5);
+        rt.frame(1.0 / 60.0);
+        let inputs = std::mem::take(&mut rt.state.inputs);
+        assert!(matches!(inputs.first(), Some(Input::Down(..))), "{inputs:?}");
+        assert!(!inputs.iter().any(|i| matches!(i, Input::Edge(..))), "{inputs:?}");
+        if x > bezel::BAND * 2.0 + 10.0 {
+            rt.pointer_down(x - bezel::BAND * 2.0, y + h * 0.5);
+            rt.frame(1.0 / 60.0);
+            rt.pointer_up(x, y + h * 0.5);
+            rt.frame(1.0 / 60.0);
+            assert!(rt.state.inputs.is_empty(), "{:?}", rt.state.inputs);
+        }
+    }
+
+    /// A click on the bezel that never moves does nothing (on Android its touch would tap the
+    /// screen's edge pixel); the touch-down is held until the drag has moved a few points.
+    #[test]
+    fn a_click_on_the_bezel_does_nothing_until_it_drags() {
+        use sim_core::gesture::ScreenEdge;
+        for scene in [ipad_scene as fn(&mut State), android_scene] {
+            let mut rt = runtime(scene);
+            let ([x, y, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+            let at = (x + w * 0.5, y + h + bezel::BAND * 0.5);
+            rt.pointer_down(at.0, at.1);
+            rt.frame(1.0 / 60.0);
+            rt.pointer_move(at.0 + 1.0, at.1 - 2.0);
+            rt.frame(1.0 / 60.0);
+            rt.pointer_up(at.0 + 1.0, at.1 - 2.0);
+            rt.frame(1.0 / 60.0);
+            assert!(rt.state.inputs.is_empty(), "a click sends nothing: {:?}", rt.state.inputs);
+            assert_eq!(rt.state.bezel.press, None);
+
+            // Past the threshold: down at the press, then the moves, then up.
+            rt.pointer_down(at.0, at.1);
+            rt.frame(1.0 / 60.0);
+            rt.pointer_move(at.0, at.1 - 3.0);
+            rt.frame(1.0 / 60.0);
+            assert!(rt.state.inputs.is_empty(), "still under the threshold: {:?}", rt.state.inputs);
+            rt.pointer_move(at.0, at.1 - bezel::DRAG_THRESHOLD - 4.0);
+            rt.frame(1.0 / 60.0);
+            rt.pointer_move(at.0, y + h * 0.5);
+            rt.frame(1.0 / 60.0);
+            rt.pointer_up(at.0, y + h * 0.5);
+            rt.frame(1.0 / 60.0);
+            let inputs = std::mem::take(&mut rt.state.inputs);
+            let phases: Vec<_> = inputs.iter().map(|i| if let Input::Edge(_, _, p, e) = i { (*p, *e) } else { panic!("{i:?}") }).collect();
+            assert_eq!(phases.first(), Some(&(Phase::Down, ScreenEdge::Bottom)), "{inputs:?}");
+            assert!(phases.len() >= 3 && phases[1..phases.len() - 1].iter().all(|p| p.0 == Phase::Move), "{inputs:?}");
+            assert_eq!(phases.last(), Some(&(Phase::Up, ScreenEdge::Bottom)), "{inputs:?}");
+        }
+    }
+
+    /// Android's edge gestures are ordinary touches from the edge: a bezel drag on an Android phone
+    /// starts on the left edge pixel (gesture navigation's back); a TV has no bezel.
+    #[test]
+    fn android_bezel_drags_start_on_the_edge_and_tvs_have_no_bezel() {
+        use sim_core::gesture::ScreenEdge;
+        let mut rt = runtime(android_scene);
+        let ([x, y, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+        assert!(rt.find("device-bezel").is_some());
+        rt.pointer_down(x - bezel::BAND * 0.5, y + h * 0.5);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_up(x + w * 0.3, y + h * 0.5);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            matches!(rt.state.inputs.first(), Some(Input::Edge(px, _, Phase::Down, ScreenEdge::Left)) if *px == 0.0),
+            "{:?}",
+            rt.state.inputs
+        );
+        // Turned a quarter, the edge pixels are the upright screen's (800x360), which emu maps
+        // onto the panel as it does any touch: the bottom edge is y 359, not the panel's 799.
+        let mut rt = runtime(turned_scene);
+        rt.frame(1.0 / 60.0);
+        let ([x, y, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+        assert_eq!(rt.state.screen_size(), (800, 360));
+        rt.pointer_down(x + w * 0.5, y + h + bezel::BAND * 0.5);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_up(x + w * 0.5, y + h * 0.5);
+        rt.frame(1.0 / 60.0);
+        let near = |a: f32, b: f32| (a - b).abs() < 2.0;
+        assert!(
+            matches!(rt.state.inputs.first(), Some(Input::Edge(px, py, Phase::Down, ScreenEdge::Bottom)) if near(*px, 400.0) && *py == 359.0),
+            "{:?}",
+            rt.state.inputs
+        );
+        let rt = runtime(tv_scene);
+        assert!(rt.find("device-bezel").is_none());
+        let rt = runtime(apple_tv_scene);
+        assert!(rt.find("device-bezel").is_none());
+    }
+
+    #[test]
+    fn edge_moves_coalesce_but_keep_their_ends() {
+        use sim_core::gesture::ScreenEdge::Bottom;
+        let inputs = vec![
+            Input::Edge(1.0, 9.0, Phase::Down, Bottom),
+            Input::Edge(1.0, 8.0, Phase::Move, Bottom),
+            Input::Edge(1.0, 7.0, Phase::Move, Bottom),
+            Input::Edge(1.0, 6.0, Phase::Up, Bottom),
+        ];
+        assert_eq!(
+            coalesce_moves(inputs),
+            [
+                Input::Edge(1.0, 9.0, Phase::Down, Bottom),
+                Input::Edge(1.0, 7.0, Phase::Move, Bottom),
+                Input::Edge(1.0, 6.0, Phase::Up, Bottom)
+            ]
         );
     }
 
@@ -1364,12 +1622,16 @@ mod tests {
             assert_eq!(sc.pixels.signature(), shown, "the same buffer and frame, not a new one");
             assert_eq!(sc.pixels.rgba(), [9; 8]);
             let start = std::time::Instant::now();
-            while lines.lock().expect("lines").len() < 4 {
+            while lines.lock().expect("lines").len() < 5 {
                 assert!(start.elapsed() < Duration::from_secs(5), "{:?}", lines.lock().expect("lines"));
                 std::thread::sleep(Duration::from_millis(2));
             }
             let back = if visible { "hello 1080" } else { "hello 0" };
-            assert_eq!(*lines.lock().expect("lines"), ["shm", "hello 1080", "hello 0", back], "paused, then resumed (visible: {visible})");
+            assert_eq!(
+                *lines.lock().expect("lines"),
+                ["shm", "rotates", "hello 1080", "hello 0", back],
+                "paused, then resumed (visible: {visible})"
+            );
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -1449,11 +1711,11 @@ mod tests {
     fn landscape_tablets_fit_a_laptop_display() {
         // Phones and portrait tablets keep the full-height screen.
         let tablet = Some(FormFactor::Tablet);
-        let phone = fit_window((720, 1280), Some(FormFactor::Phone));
+        let phone = fit_window((720, 1280), Some(FormFactor::Phone), false);
         assert_eq!(phone.1, android::SCREEN_POINTS + 110.0);
-        assert!(fit_window((1600, 2560), tablet).1 == phone.1 && fit_window((1600, 2560), tablet).0 < MAX_WINDOW_W);
+        assert!(fit_window((1600, 2560), tablet, false).1 == phone.1 && fit_window((1600, 2560), tablet, false).0 < MAX_WINDOW_W);
         // A Pixel Tablet in landscape would be 1828 points wide at full height: it is shorter.
-        let (w, h) = fit_window((2560, 1600), tablet);
+        let (w, h) = fit_window((2560, 1600), tablet, false);
         assert_eq!(w, MAX_WINDOW_W);
         let screen = (w - 612.0, h - 110.0);
         assert!((screen.0 / screen.1 - 1.6).abs() < 1e-3, "the screen keeps its aspect: {screen:?}");
@@ -1473,9 +1735,43 @@ mod tests {
             ((1920, 1080), FormFactor::Tv),
             ((720, 1280), FormFactor::Phone),
         ] {
-            assert_eq!(fit_window(size, Some(ff)), full(size), "{ff:?} {size:?}");
+            assert_eq!(fit_window(size, Some(ff), false), full(size), "{ff:?} {size:?}");
         }
-        assert_eq!(fit_window((2208, 1840), None), full((2208, 1840)), "an unknown form factor keeps its size");
-        assert_eq!(fit_window((2560, 1600), Some(FormFactor::Tablet)).0, MAX_WINDOW_W);
+        assert_eq!(fit_window((2208, 1840), None, false), full((2208, 1840)), "an unknown form factor keeps its size");
+        assert_eq!(fit_window((2560, 1600), Some(FormFactor::Tablet), false).0, MAX_WINDOW_W);
+    }
+
+    /// A device with a bezel has a band of stage around its screen: the window budgets it, so
+    /// the screen is drawn as tall as it was before the bezel; a landscape tablet keeps its
+    /// laptop-sized window instead, its screen narrower by the band.
+    #[test]
+    fn the_fitted_window_budgets_the_bezel_band() {
+        let band = 2.0 * bezel::BAND;
+        let phone = fit_window((720, 1280), Some(FormFactor::Phone), true);
+        assert_eq!(phone, (612.0 + android::SCREEN_POINTS * 0.5625 + band, android::SCREEN_POINTS + 110.0 + band));
+        let tablet = fit_window((2560, 1600), Some(FormFactor::Tablet), true);
+        assert_eq!(tablet.0, MAX_WINDOW_W, "a landscape tablet stays within the laptop cap");
+        assert_eq!(tablet.1, (MAX_WINDOW_W - 612.0 - band) / 1.6 + 110.0 + band);
+        // No bezel, no band: a TV is the window it had.
+        assert_eq!(
+            fit_window((1920, 1080), Some(FormFactor::Tv), false),
+            (612.0 + android::SCREEN_POINTS * 1920.0 / 1080.0, android::SCREEN_POINTS + 110.0)
+        );
+    }
+
+    /// In the fitted window the screen is drawn at least [`android::SCREEN_POINTS`] tall, bezel or
+    /// not (the headless layout has less chrome than the app, so more).
+    #[test]
+    fn a_phone_with_a_bezel_is_drawn_full_height_in_its_fitted_window() {
+        let mut s = init();
+        android_scene(&mut s);
+        let size = s.screen_size();
+        let bezel = s.selected_info().and_then(controls::bezel).is_some();
+        assert!(bezel);
+        let window = fit_window(size, Some(FormFactor::Phone), bezel);
+        let mut rt = Runtime::new(s, view::view, window, Env::new(true, 2.0));
+        rt.frame(0.0);
+        let ([_, _, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+        assert!(h >= android::SCREEN_POINTS - 1.0, "the band took height from the screen: {w}x{h} in {window:?}");
     }
 }

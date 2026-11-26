@@ -50,13 +50,14 @@ emu -list-images -tag android-wear            # other image families: android-tv
 simee create Pixel   --platform android --system-image "system-images;android-36;google_apis;arm64-v8a"
 simee create Tablet  --platform android --system-image "system-images;android-36;google_apis;arm64-v8a" --form-factor tablet
 simee create Fold    --platform android --system-image "system-images;android-36;google_apis;arm64-v8a" --form-factor foldable
+simee create Duo     --platform android --system-image "system-images;android-36;google_apis;arm64-v8a" --device surface_duo
 simee create Wear    --platform android --system-image "system-images;android-34;android-wear;arm64-v8a"
 simee create TV      --platform android --system-image "system-images;android-34;google-tv;arm64-v8a"
 simee create Car     --platform android --system-image "system-images;android-34-ext9;android-automotive;arm64-v8a"
 simee create XR      --platform android --system-image "system-images;android-34;google-xr;arm64-v8a"
 simee boot Pixel                             # starts emu; waits for sys.boot_completed
 adb -s emulator-5554 shell                    # it is an ordinary emulator to every tool
-simee fold Fold half-opened                  # the hinge (foldables only)
+simee fold Fold fold                         # the outer screen; `unfold`, a posture or an angle
 simee rotary Wear 3                          # the rotary input (watches only)
 simee xr XR recenter                         # Android XR head pose, options, pointer
 simee vehicle Car gear drive                 # a vehicle HAL property (Automotive only)
@@ -115,3 +116,9 @@ simee call ca_debug '{"device":"booted","option":"blended-layers","on":true}'
 The desktop window serves the same API on `$TMPDIR/simee-desktop.sock`. Full reference:
 [docs/api.md](api.md).
 
+## MCP server
+
+`simee mcp` serves [MCP](mcp.md) on stdin and stdout: every method above as a tool for an agent,
+with resources for devices and their screens, tasks for boots, and a device view. It runs the
+methods in its own process, like `--in-process`; configure it in the agent as the command `simee
+mcp`.

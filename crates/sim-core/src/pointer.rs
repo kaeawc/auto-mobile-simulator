@@ -7,8 +7,16 @@
 //! the pointer leaves it, so homing rises [`LIFT`] points, above the Dock, and the caller waits
 //! [`SETTLE`] for it to hide: a click on an app's bottom bar under the Dock then reaches the app
 //! (checked on iOS 26.5, where rising 100 pt left the Dock up and the click opened a Dock app). It
-//! then moves in steps no longer than [`MAX_STEP`], which iOS 26.5 takes one to one (exactly where
-//! asked) and iOS 27.2 with a little acceleration (within ~10 pt).
+//! then moves in steps no longer than [`MAX_STEP`].
+//!
+//! iOS 26.5 takes each report one to one. iOS 27.2 carries the pointer on past the end of a run of
+//! reports by half its last report (persistently: the next move starts from there), so a run of
+//! 10 pt steps lands 5 pt long, a single isolated report 1.5 times as far, and a push into an edge
+//! keeps going after the next move starts. Neither the device's pointer acceleration
+//! (`HIDMouseAcceleration`, 1.0 on both) nor backboardd's pointer
+//! preferences change it (measured 2026-11-26). So every run ends with [`TAIL`] halving steps
+//! (the overrun of the last, 1/64 of a 10 pt step, is 0.16 pt) and homing pauses after the push
+//! into the bottom edge before it rises: exact on both.
 
 use std::time::Duration;
 
@@ -17,6 +25,11 @@ use crate::reuse::BootKey;
 
 /// The longest step, in points, sent in one report.
 pub const MAX_STEP: f64 = 10.0;
+/// How many halving steps end a run in place of its last step.
+pub const TAIL: usize = 6;
+/// Reports of no motion after the push into the bottom edge: a pause (~100 ms) in which iOS 27.2's
+/// overrun of the push goes into the edge instead of into the rise that follows.
+const PAUSE: usize = 6;
 /// Time between reports.
 pub const INTERVAL: Duration = Duration::from_millis(16);
 /// One homing push, and how many: further than any iPad screen is wide or tall (1376 pt).
@@ -118,10 +131,21 @@ pub fn check(action: PointerAction, drag: bool, held: Held, lasting: bool) -> Re
     }
 }
 
-/// Splits a move by `(dx, dy)` points into equal steps of at most [`MAX_STEP`] on either axis.
+/// Splits a move by `(dx, dy)` points into equal steps of at most [`MAX_STEP`] on either axis, the
+/// last of them replaced by [`TAIL`] steps that halve it (the last two equal, so they add up to
+/// it): the pointer slows to a stop, which iOS 27.2 needs to stop where it's sent (see the module).
 pub fn steps(dx: f64, dy: f64) -> Vec<(f64, f64)> {
     let n = (dx.abs().max(dy.abs()) / MAX_STEP).ceil().max(1.0) as usize;
-    vec![(dx / n as f64, dy / n as f64); n]
+    let step = (dx / n as f64, dy / n as f64);
+    let mut out = vec![step; n - 1];
+    let mut f = 1.0;
+    for i in 0..TAIL {
+        if i + 1 < TAIL {
+            f *= 0.5;
+        }
+        out.push((step.0 * f, step.1 * f));
+    }
+    out
 }
 
 /// The relative moves that bring the pointer to `to`, in points, on a screen of `screen` points:
@@ -146,6 +170,7 @@ pub fn home() -> Vec<(f64, f64)> {
     let mut out = vec![(-PUSH, 0.0); PUSHES];
     out.extend([(CLEAR, 0.0); 2]);
     out.extend(vec![(0.0, PUSH); PUSHES]);
+    out.extend(vec![(0.0, 0.0); PAUSE]);
     out.extend(steps(0.0, -LIFT));
     out.extend(vec![(-PUSH, 0.0); PUSHES]);
     out
@@ -165,14 +190,35 @@ mod tests {
         moves.iter().fold((0.0, 0.0), |(x, y), (dx, dy)| (x + dx, y + dy))
     }
 
+    /// Homing is 85 reports (74 before its pause and the halving tail): each costs 16 ms.
+    #[test]
+    fn homing_is_85_reports() {
+        assert_eq!(home().len(), 85);
+        assert_eq!(steps(0.0, 100.0).len(), 9 + TAIL, "a move costs its steps plus the tail");
+    }
+
     #[test]
     fn steps_are_short_and_add_up() {
         let s = steps(100.0, -45.0);
-        assert_eq!(s.len(), 10);
+        assert_eq!(s.len(), 9 + TAIL);
         assert!(s.iter().all(|(dx, dy)| dx.abs() <= MAX_STEP && dy.abs() <= MAX_STEP));
         let (x, y) = sum(&s);
         assert!((x - 100.0).abs() < 1e-9 && (y + 45.0).abs() < 1e-9);
-        assert_eq!(steps(0.0, 0.0), [(0.0, 0.0)], "a move to where it is still reports once");
+        assert_eq!(steps(0.0, 0.0), vec![(0.0, 0.0); TAIL], "a move to where it is still reports");
+    }
+
+    /// iOS 27.2 carries the pointer on by half the last report of a run: the run ends slowing
+    /// down, so that overrun is at most 0.16 pt.
+    #[test]
+    fn runs_end_slowing_to_a_stop() {
+        let s = steps(500.0, -376.0);
+        assert_eq!(&s[..49], vec![(10.0, -7.52); 49].as_slice(), "full steps first");
+        let tail = &s[49..];
+        assert!(tail.windows(2).all(|w| w[1].0 <= w[0].0), "{tail:?}");
+        assert_eq!(tail[0], (5.0, -3.76));
+        let (last_x, last_y) = *s.last().expect("steps");
+        assert!(last_x * 0.5 <= 0.16 && (last_y * 0.5).abs() <= 0.16, "overrun {last_x}, {last_y}");
+        assert_eq!(steps(3.0, 0.0)[0], (1.5, 0.0), "a short move is all tail");
     }
 
     /// Where the moves leave a pointer that starts at `at`, clamped to the screen as iPadOS does.

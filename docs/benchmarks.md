@@ -37,6 +37,47 @@ scripts/android-bench.sh <label> <avd> emu|stock [-no-snapshot-load]   # one boo
 These replace the 2026-11-22 run, whose 1.67 GB peak memory for emu (against 5.09 GB) did not
 hold up when remeasured.
 
+### API 29 (GLES over the goldfish pipe)
+
+One API 29 `default` arm64 AVD (2 GB, 720x1280), same host (Apple silicon Mac, 16 CPUs, macOS
+26.6), 2026-11-26, SDK emulator 37.2.13.0. Warm boots (the AVD had booted before under both),
+medians of 3, emu and stock alternating; host load average 21–30 during the runs.
+
+```bash
+PORT=5610 scripts/android-bench.sh a29-emu-N <avd> emu
+PORT=5612 scripts/android-bench.sh a29-stock-N <avd> stock
+```
+
+| Measure | emu | SDK emulator | Ratio |
+| --- | --- | --- | --- |
+| Warm: launch until `sys.boot_completed` | 4.8 s | 6.4 s | 1.3× faster |
+| Warm: launch until `adb` lists the device | 2.4 s | 3.5 s | 1.5× faster |
+| Warm: peak RSS, process tree | 1596 MB | 1692 MB | 6% less |
+| Guest CPU, 100k shell loop, warm | 0.29 s | 0.59 s | |
+| Guest CPU, 4× md5, warm | 0.43 s | 0.94 s | |
+
+First boots (`-wipe-data`) and warm boots of one API 29 `default` AVD under emu by host GLES
+backend (#94), same host, 2026-11-26, rounds of first boot, warm boot, warm boot on SwiftShader,
+3 rounds; host load average 10–14. Seconds from launch until `sys.boot_completed` and until the
+launcher has focus (`dumpsys window`), polled once a second, so whole seconds. On Metal a first
+boot never reaches the launcher (1 of 1 that day, 4 of 4 earlier: the renderer fault in
+[android.md](android.md#performance-notes)); emu now runs a first boot on SwiftShader. Not yet
+compared with stock's first boot.
+
+```bash
+target/release/emu -avd <avd> -port 5620 -wipe-data   # first boot; without -wipe-data: warm
+ANGLE_DEFAULT_PLATFORM=swiftshader target/release/emu -avd <avd> -port 5620   # warm, SwiftShader
+# then once a second: adb -s emulator-5620 shell getprop sys.boot_completed, and
+# adb -s emulator-5620 shell dumpsys window | grep mCurrentFocus (Launcher)
+```
+
+| Boot | Host GLES | `sys.boot_completed`, median (runs) | Launcher, median (runs) |
+| --- | --- | --- | --- |
+| First | ANGLE on SwiftShader (emu's default) | 4 s (4, 3, 4) | 4 s (4, 4, 5) |
+| First | ANGLE on Metal | 9 s (1 run) | never (watchdog restarts) |
+| Warm | ANGLE on Metal (emu's default) | 5 s (4, 5, 7) | 6 s (6, 5, 7) |
+| Warm | ANGLE on SwiftShader | 4 s (4, 3, 4) | 4 s (4, 4, 5) |
+
 ### Idle host CPU
 
 The same API 36 AVD, warm-booted under emu built without and with its network device (#29),
@@ -160,8 +201,11 @@ What decided it:
   zygote, though it reaches the shell sooner (its kernel and first-stage init are lighter). What
   comes after zygote (the framework, ART) is guest code, so the guest-code ratio decides.
 - **QEMU 11 or newer.** Ubuntu 22.04's QEMU 6.2 panics this guest within seconds under
-  multi-threaded TCG (`int3` in `kmem_cache_alloc`: a stale translated block running the
-  kernel's live-patching breakpoint); 11.1.3 booted it every time, over 20 boots.
+  multi-threaded TCG (`int3` in `kmem_cache_alloc`: a CPU running the kernel's live-patching
+  breakpoint after the patch finished); 11.1.3, which has QEMU's fix for it
+  ([LP #2051965](https://bugs.launchpad.net/ubuntu/+source/qemu/+bug/2051965)), booted these
+  20-odd boots without it. The window isn't closed: one of about a dozen full boots on emu's
+  devices, before the boot rows below, hit the same panic.
 - **Hide the fast-string features.** With ERMS/FSRM advertised the guest kernel's memcpy is
   `rep movsb`, which TCG runs as a byte loop: md5 of `/dev/zero` takes 51% longer and zygote
   starts 10% later.
@@ -173,9 +217,82 @@ What decided it:
   1.98 s) falls inside the spread of an earlier set of 3 boots without it (48.8 to 50.1 s, 1.84 to
   2.05 s).
 
-The SDK emulator (37.3.10) does not start on this host: it requires 7.37 GB of free disk to
-create userdata whatever the AVD's data size (2.2 GB was free), and warns that 3939 MiB is under
-its suggested 4096 MiB of RAM. Its `-accel-check` reports `/dev/kvm is not found`.
+adb into the same guest under QEMU 11 TCG on the same host, through emu's virtio-vsock served
+over vhost-user (`crates/emu-vmm/examples/vhost_user_vsock.rs`, emu's adb bridge on the host
+side) and, for comparison on the same boot, through QEMU's own user-mode network to adbd's TCP
+listener (`-netdev user,hostfwd`). Framework stopped; 21 `adb shell echo` round trips and 3
+transfers of 64 MiB each way per round, two rounds alternating, every transfer byte-checked.
+
+| Transport | `adb shell echo`, median (2 rounds) | 64 MiB push | 64 MiB pull |
+| --- | --- | --- | --- |
+| emu's vsock over vhost-user | 149, 131 ms | 42 to 54 MiB/s | 62 to 99 MiB/s |
+| QEMU's user network to adbd's TCP port | 134, 125 ms | 38 to 45 MiB/s | 13 to 18 MiB/s |
+| emu's vsock, every queue called on each raise (before) | 157, 171 ms | 38 to 48 MiB/s | 47 to 66 MiB/s |
+
+Calling every queue on each raise cost the guest a spurious interrupt per completion, because
+vsock's queues share one MSI vector: 14 vsock interrupts per round trip before, 9 after
+(`/proc/interrupts`, 20 round trips). emu's vsock server used 0.53 s of CPU for a whole boot plus
+the 384 MiB of transfers, 21 MB peak RSS: what's left per round trip is the guest under
+translation. The SDK emulator's own adb path has no row: it doesn't start on this host (below).
+
+The SDK emulator (37.3.10) does not start on this host as first set up: it requires 7.37 GB of
+free disk to create userdata whatever the AVD's data size (2.2 GB was free), and warns that
+3939 MiB is under its suggested 4096 MiB of RAM. Its `-accel-check` reports `/dev/kvm is not
+found`. With the host grown to 8 GiB and a 20 GB disk it starts, and the boot rows below compare
+against it.
+
+The renderer on the same host, no VM: the SDK's Linux `libgfxstream_backend.so` (37.3.10, from
+`emu -provision-renderer`) on lavapipe, initialized Vulkan-only as emu runs it, then a 720×1280
+RGBA color buffer uploaded and read back the way frames are (median of 9 reads per run), 5 runs
+each. Before this, `-provision-renderer` fetched Apple silicon's archive on every host, so Linux
+had no renderer it could load.
+
+```bash
+cargo run --release -p emu-gfxstream --example renderer_caps -- -vulkan-only <lib64>
+```
+
+| Vulkan driver | Renderer init, median (runs) | 720×1280 readback, median of the runs' medians |
+| --- | --- | --- |
+| The SDK's lavapipe (`lib64/vulkan`) | 108 ms (108, 112, 140, 104, 91) | 1.26 ms |
+| The host's Mesa lavapipe (Ubuntu 22.04, LLVM 15) | 143 ms (105, 155, 143, 140, 146) | 1.21 ms |
+
+emu uses the SDK's: the two are equal here, and the SDK's is the same on every host. Rendering
+throughput, where they could differ, needs a booted guest. Booted, the SDK's lavapipe crashed in a
+render thread on every boot, so boots render on its SwiftShader (below).
+
+### Boot to `sys.boot_completed` with emu's devices
+
+The same host, grown to 8 GiB of RAM and a 20 GB disk, 2026-11-26. The API 36 `default` x86_64
+image, 4 vCPUs and 2 GB, under QEMU 11.1.3 TCG with emu's devices
+(`crates/emu-vmm/examples/soft_devices.rs`: vsock, console, net and the GPU over vhost-user, the
+goldfish address space and pipe over vfio-user). The renderer is the SDK's gfxstream on its
+SwiftShader. Five warm boots after one uncounted first boot. Each boot's time runs from QEMU's
+start to `getprop sys.boot_completed` reading 1 on the console. Host CPU is QEMU's plus emu's,
+over 60–120 s after boot complete (the window the Mac rows use) and over 240–300 s. Peak RSS is
+each process's `VmHWM`.
+
+```bash
+scripts/tcg-bench.py <sysdir> <workdir> --qemu <qemu-system-x86_64> --emu-devices target/release/examples/soft_devices \
+  --lib64 <renderer lib64> --icd swiftshader --boots 5
+```
+
+| Run | Failed boots | Boot to `sys.boot_completed`, median (runs) | Host CPU 60–120 s after | 240–300 s after | Peak RSS, QEMU + emu |
+| --- | --- | --- | --- | --- | --- |
+| emu's devices | 0 of 5 | 168 s (165.6, 150.5, 168.0, 183.7, 181.0) | 2.14 cores | 0.75 cores | 3058 + 233 MB |
+| Before: goldfish writes posted | 2 of 5 (a guest panic, a hang) | 170 s (180.9, 170.0, 160.8) | 3.94 cores | not measured | 2992 + 173 MB |
+
+The first boot of a fresh userdata took 375.5 s. With QEMU's default posted writes on the
+goldfish devices, one boot panicked (`zap_huge_pmd`) and one never completed (SurfaceFlinger
+crashed in `init`, zygote restarted). `x-no-posted-writes` fixed both (docs/android.md, "Software
+mode"). The "before" CPU column was measured from 60 s after boot complete only; most of that
+load is the guest's post-boot work, and host CPU settles at about a third of it by 240 s.
+On one interactive boot, about 4 minutes after boot complete, `top -H` showed QEMU's four vCPU
+threads at about 16% of a core each, its main loop at 7%, and emu under 1%. The guest's own
+`top` showed it 84% idle; the rest was system_server, telephony and logd.
+
+Under emulation, apps can exceed Android's startup timeouts. One interactive boot showed "System
+UI isn't responding" after com.android.phone overran its startup (its main thread runnable, not
+blocked).
 
 ## Android farm
 
@@ -253,7 +370,11 @@ in [android.md](android.md#performance-notes).
 | Same change, vCPU0 guest entries to `sys.boot_completed`, first / warm boot, median | 338k / 59.7k | 249k / 41.4k | same runs (`vcpu0_runs`) |
 | Same change, emu CPU-seconds to `sys.boot_completed`, first / warm boot, median | 25.0 / 9.3 | 23.4 / 8.7 | same runs (`cpu_s`) |
 | Same change, launcher swipes a minute after boot: janky frames, median of 6 (2 boots × 3 runs) / emu CPU | 0.40% / 28% of a core | 0.20% / 25% | same AVD, host load 5 to 11, `scripts/android-jank.sh emulator-5600 <pid>` |
-| Renderer init with Metal's shader cache cold / warm (gfxstream's compositor pipelines through MoltenVK) | 4.5 and 5.1 s (2 of 20 launches) | 0.33 s (median of the other 18) | M3 Max, 2026-11-26, `emu -verbose` (`renderer initialized in`) |
+| Renderer init with Metal's shader cache cold / warm (mostly ANGLE's Metal shader library) | 4.5 and 5.1 s (2 of 20 launches) | 0.33 s (median of the other 18) | M3 Max, 2026-11-26, `emu -verbose` (`renderer initialized in`) |
+| Same init without a guest, as an API 36 boot makes it: cold (an empty cache) / warm, median of 3 | 4.36 s (4.31, 4.36, 4.39) | 0.08 s (70 to 96 ms, 6 runs) | M3 Max, 2026-11-26, host load 23 to 27, `cargo run --release -p emu-gfxstream --example renderer_caps -- -emu <lib64>`, each cold run under a new bundle id |
+| emu with its own Metal cache (bundle `dev.simee.emu`): repeat boots of one binary at one path, renderer init / launch to `sys.boot_completed`, median (runs) | 1.01 s (4.69, 1.01, 0.35) / 11.7 s (20.0, 11.7, 8.3): the shared cache missed in 2 of 3 boots | 0.34 s (0.33 to 0.36) / 7.8 s (7.8, 7.8, 7.8, 9.8, then 7.8, 8.4, 8.0 in a third interleaved round), 7 boots (2 with the ring-yield experiment of android.md "Ring polling", since dropped); the third round's before arm, run the same minute, was warm too (init 0.32 to 0.36 s, boot 7.8, 7.8, 9.4 s, median 7.8), so that round did not reproduce the shared cache's misses | API 36 phone 720×1280, 4 vCPUs, M3 Max, 2026-11-26, arms interleaved, both binaries warmed first; host load 8 to 33 (before) and 9 to 22 (after), 15 to 17 in the third round (2026-11-26, 08:57 to 08:59); `emu -verbose` (`renderer initialized in`), `adb shell getprop sys.boot_completed` polled every 0.25 s from launch |
+| Same boots, launcher swipes 30 s after `sys.boot_completed`: janky frames / emu CPU, median (runs). Not a difference: both arms swung run to run on a host other work was loading (the 1-minute load reached 114 during the run) | 3.1% (3.1, 1.1, 27.0) / 30% (28, 30, 55) | 1.1% (0, 20.4, 0, 2.3) / 34% (28, 38, 30, 38) | same runs, `scripts/android-jank.sh emulator-5600 <pid>` |
+| A fresh install path: the boot-shaped renderer init (`emu -warm-renderer <lib64>`, timed) without / after `emu -provision-renderer` from that path, 3 interleaved rounds | 5.42, 0.83, 0.73 s (cold once: later fresh copies were warm) | 0.78, 1.00, 0.78 s | M3 Max, 2026-11-26, host load 180 to 210 (every number slow), a new copy of one emu build per run |
 | Plain `fsync` for guest flushes: first-boot APEX decompression | over 270 s | about 70 s | M-series Mac |
 | Screenshot of a 2480×1740 screen (convert and encode) | 86 ms | 19 ms | `cargo run --release -p sim-core --example frame_bench` |
 | Display stream: emulator CPU per frame besides the readback, tablet / phone | 12.8 / 7.1 ms | 2.0 / 0 ms | 4-core Linux VM |
@@ -299,6 +420,22 @@ CASE=2480,1080,true cargo test --release -p emu frame_path_latency -- --ignored 
 The injected network shaper's cost per call is measured in
 [research/netshape-overhead.md](research/netshape-overhead.md).
 
+## MCP server
+
+What the MCP server's protocol layer costs to build, against the official Rust SDK. Linux VM,
+4 vCPUs, 2026-11-26, `CARGO_BUILD_JOBS=2`, rustc 1.99.1.
+
+| Measure | `sim-mcp` (hand-written, on `serde_json`) | `rmcp` 3.11 |
+| --- | --- | --- |
+| Crates added to `Cargo.lock` | 1 (`sim-mcp`) | 75 in the normal dependency tree |
+| Clean dev build of a program that depends on it, empty `main` | not measured alone: 0 new dependencies to build | 41 s wall (62 s user, 11 s system) |
+
+`rmcp` was built from a scratch package with `rmcp = { version = "3.11", default-features = false,
+features = ["server", "transport-io"] }` and `tokio` with `rt`, `macros` and `io-std`; the crate
+count is `cargo tree --prefix none -e normal | sort -u | wc -l` in it (145 with its dev
+dependencies). `Cargo.lock` has 140 packages in all. Why this decides the protocol layer:
+[mcp.md](mcp.md#why-the-protocol-layer-is-hand-written).
+
 ## Build times (local)
 
 Apple silicon Mac, 16 CPUs, macOS 26.6, 2026-11-26. The host was heavily loaded by other builds
@@ -338,6 +475,13 @@ are what a fresh checkout, a CI cache miss or a Rune bump pays.
 
 Claims that would belong in the README once someone runs them:
 
+- Whether a farm's guest shaders, which share emu's per-bundle Metal cache (`dev.simee.emu`), push ANGLE's shader library out of it, so renderer init goes cold again on a busy farm.
+- First boot of a fresh install with and without `emu -provision-renderer`'s renderer warm-up,
+  launch to `sys.boot_completed` on a quiet host (only the renderer init itself is measured,
+  at load 180 to 210). Each round needs a temporary `ANDROID_HOME` and so a 420.6 MB download of
+  the emulator package (`-provision-renderer -dry-run`), which wasn't run without the owner's
+  go-ahead; the host load was also 15 to 17, not under 16.
+
 - First boot with and without interrupt kicks at a 1-minute load under 8: three more runs per arm (two `none` runs and three `targeted` runs are published), and the `targeted` default below macOS 26 has no measurement on that macOS.
 - `simee screenshot` against `xcrun simctl io screenshot` on a quiet host (the run above had load
   13-69).
@@ -348,7 +492,17 @@ Claims that would belong in the README once someone runs them:
   device's directory (6,562 files), so the host's `mds_stores` indexes what devices write. What
   excluding `~/Library/Developer/CoreSimulator` from Spotlight saves a farm needs a change to the
   host's Spotlight privacy settings to measure.
+- Time per automation step through `simee mcp` (a `tools/call` of `tap`, then `screenshot`) against
+  the socket API and the CLI on the same device.
+- iPad `pointer` latency on a quiet host (`simee pointer <udid> X Y click`, `pointer … --to`,
+  through `simee serve`). Measured 2026-11-26 only at host load 294-642: a homed click 3.36-3.48 s
+  and a `--to` drag 4.01-4.08 s (median of 5), against about 1.4 s of 16 ms reports. Placement
+  with 6 halving steps is measured: 0.0 / 0.0 pt on iOS 26.5, 0.32 / 0.36 pt (median / max, 12
+  targets) on 27.2.
 - Host CPU of an idle booted device, emu against the SDK emulator.
+- API 29 first boots against stock, API 30 first and warm boots, and their idle host CPU: an
+  API 29 or 30 device under emu sat at 150–170% of a core after the AutoMobile harness, with
+  `com.android.phone`, `system_server` and `logd` busy in the guest; not yet compared with stock.
 - Network throughput and latency through emu's NAT against the SDK emulator's slirp.
 - Host CPU of an idle booted device with and without the virtio-snd card (`EMU_VIRTIO_SND=0`),
   median of 3 boots each on the same host and day (an earlier sample on API 36 showed no

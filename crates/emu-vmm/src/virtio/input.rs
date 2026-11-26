@@ -573,6 +573,11 @@ impl Input {
             (Kind::Touch { screen: true, .. }, ABS_MT_SLOT) => (0, PEN_SLOT as u32),
             (Kind::Touch { .. }, ABS_MT_SLOT) => (0, MAX_SLOTS - 1),
             (Kind::Touch { screen: true, .. }, ABS_MT_TOOL_TYPE) => (0, MT_TOOL_MAX as u32),
+            // The screen's slot count, as stock's: Android 11's and 12's kernels (5.4, 5.10)
+            // size the slots from this max, not ABS_MT_SLOT's, so 0xffff there is 65535 slots
+            // and an event buffer too big to allocate (no touch screen, #93). Every kernel then
+            // sets the axis to 0..=0xffff itself, so the guest sees that either way.
+            (Kind::Touch { screen: true, .. }, ABS_MT_TRACKING_ID) => (0, PEN_SLOT as u32 + 1),
             (Kind::Touch { .. }, ABS_MT_TRACKING_ID) => (0, 0xffff),
             (Kind::Touch { screen: true, .. }, ABS_MT_PRESSURE) => (0, SCREEN_PRESSURE_MAX),
             (Kind::Touch { .. }, ABS_MT_PRESSURE) => (0, 0xff),
@@ -871,7 +876,10 @@ mod tests {
     /// Stock 37.2.13's `virtio_input_multi_touch_1` (`getevent -p` on the phone, tablet and
     /// Wear AVDs): the pen's eraser and barrel keys and no `BTN_TOUCH`; axes 0..=32767 whatever
     /// the display, `ABS_Z` 0..=1, touch size 0..=i32::MAX, orientation 0..=90, slots 0..=10,
-    /// tool type 0..=15, pressure 0..=1024; `SW_LID`; no input properties; no ids.
+    /// tool type 0..=15, pressure 0..=1024; `SW_LID`; no input properties; no ids. The tracking
+    /// id reads 0..=65535 in the guest on every kernel, which sets it so itself; its config max
+    /// is the slot count (11: API 30's kernel takes the slots from it, see
+    /// `every_guest_kernel_gets_the_screens_eleven_slots`).
     #[test]
     fn screens_look_like_stocks_virtio_multi_touch() {
         for (w, h) in [(720, 1280), (2560, 1600), (454, 454)] {
@@ -892,7 +900,7 @@ mod tests {
                 (ABS_MT_POSITION_X, 32767),
                 (ABS_MT_POSITION_Y, 32767),
                 (ABS_MT_TOOL_TYPE, 15),
-                (ABS_MT_TRACKING_ID, 65535),
+                (ABS_MT_TRACKING_ID, 11),
                 (ABS_MT_PRESSURE, 1024),
             ];
             assert_eq!(set(cfg(&mut dev, CFG_EV_BITS, EV_ABS as u8)), stock.map(|(c, _)| c));
@@ -903,6 +911,129 @@ mod tests {
             assert!(cfg(&mut dev, CFG_EV_BITS, EV_REL as u8).is_empty());
             assert!(cfg(&mut dev, CFG_PROP_BITS, 0).is_empty(), "no INPUT_PROP_DIRECT");
             assert_eq!(cfg(&mut dev, CFG_ID_DEVIDS, 0), [0x06, 0, 0, 0, 0, 0, 0, 0]);
+        }
+    }
+
+    /// The guest kernels' two ways of sizing a virtio multi-touch device. Android 11's and 12's
+    /// (android11-5.4, android12-5.10 `virtinput_cfg_abs`) take the slot count from
+    /// `ABS_MT_TRACKING_ID`'s max; android13-5.15 onwards from `ABS_MT_SLOT`'s max + 1. Both
+    /// then set the slot axis to 0..=slots-1 and the tracking id to 0..=0xffff (`TRKID_MAX`),
+    /// and `input_register_device` sizes its event buffer from the slot count: on the screen,
+    /// (slots + 1 + 9 MT axes × slots + 3 other axes + 7 + 2) 8-byte values in one `kcalloc`,
+    /// which fails (probe -ENOMEM, no touch screen) beyond 4 MiB (order 10).
+    #[derive(Clone, Copy, Debug)]
+    enum GuestKernel {
+        SlotsFromTrackingId,
+        SlotsFromSlotAxis,
+    }
+
+    impl GuestKernel {
+        /// (slots, the event buffer's bytes) for a device's config.
+        fn probe(self, dev: &mut Input) -> (u32, usize) {
+            let max = |info: Vec<u8>| u32::from_le_bytes([info[4], info[5], info[6], info[7]]);
+            let slots = match self {
+                GuestKernel::SlotsFromTrackingId => max(cfg(dev, CFG_ABS_INFO, ABS_MT_TRACKING_ID as u8)),
+                GuestKernel::SlotsFromSlotAxis => max(cfg(dev, CFG_ABS_INFO, ABS_MT_SLOT as u8)) + 1,
+            };
+            let abs = cfg(dev, CFG_EV_BITS, EV_ABS as u8);
+            let mt = |c: u16| c == ABS_MT_SLOT || (0x30..=0x3d).contains(&c);
+            let axes = (0..64u16).filter(|&c| has(&abs, c));
+            let events: usize = slots as usize + 1 + axes.map(|c| if mt(c) { slots as usize } else { 1 }).sum::<usize>() + 7;
+            (slots, (events + 2) * 8)
+        }
+    }
+
+    /// Issue #93: on API 30 the screen's probe failed (`virtio_input: probe of virtio1 failed
+    /// with error -12`: 65535 slots from the tracking id's max, a 5 MiB event buffer), so the
+    /// guest had no touch screen, its configuration said `notouch` and every accessibility
+    /// gesture was cancelled. Stock 37.2.13 on the same API 30 image: slots 0..=10, so its
+    /// tracking id max is 11; every kernel gets stock's 11 slots and a small buffer.
+    #[test]
+    fn every_guest_kernel_gets_the_screens_eleven_slots() {
+        for (w, h) in [(720, 1280), (2560, 1600), (454, 454)] {
+            let (mut dev, _h) = Input::new(Kind::Touch { width: w, height: h, screen: true }, "virtio_input_multi_touch_1");
+            for k in [GuestKernel::SlotsFromTrackingId, GuestKernel::SlotsFromSlotAxis] {
+                let (slots, buffer) = k.probe(&mut dev);
+                assert_eq!(slots, PEN_SLOT as u32 + 1, "{k:?}: fingers' slots and the pen's");
+                assert!(buffer <= 4 << 20, "{k:?}: a {buffer}-byte event buffer fails the probe");
+            }
+        }
+        // The touchpad (display glasses' images, android14 kernels and later): its ten slots.
+        let (mut pad, _h) = Input::new(Kind::Touch { width: 1542, height: 297, screen: false }, TOUCHPAD_NAME);
+        assert_eq!(GuestKernel::SlotsFromSlotAxis.probe(&mut pad).0, MAX_SLOTS);
+    }
+
+    /// Two contacts at once (a finger and the pen, or two fingers sent raw): the sequence is the
+    /// same for every API level, and every slot it selects exists on every guest kernel.
+    #[test]
+    fn two_contacts_select_only_slots_every_guest_kernel_has() {
+        let (mut dev, h) = Input::new(Kind::Touch { width: 720, height: 1280, screen: true }, "virtio_input_multi_touch_1");
+        let abs = |c: u16, v: i32| InputEvent::new(EV_ABS, c, v);
+        h.touch(100, 200, true);
+        h.pen(PenSample { x: 300, y: 400, pressure: None, phase: PenPhase::Down, button: false, eraser: false });
+        h.send(vec![
+            abs(ABS_MT_SLOT, 1),
+            abs(ABS_MT_TRACKING_ID, 1),
+            abs(ABS_MT_POSITION_X, 9000),
+            abs(ABS_MT_PRESSURE, 1024),
+            InputEvent::syn(),
+        ]);
+        h.touch(110, 200, true);
+        h.pen(PenSample { x: 300, y: 400, pressure: None, phase: PenPhase::Leave, button: false, eraser: false });
+        h.touch(110, 200, false);
+        let (x, y) = Kind::Touch { width: 720, height: 1280, screen: true }.axis(100, 200);
+        let (px, py) = Kind::Touch { width: 720, height: 1280, screen: true }.axis(300, 400);
+        let x2 = Kind::Touch { width: 720, height: 1280, screen: true }.axis(110, 200).0;
+        let got = dev.take_queued();
+        assert_eq!(
+            got,
+            [
+                vec![
+                    abs(ABS_MT_SLOT, 0),
+                    abs(ABS_MT_TRACKING_ID, 0),
+                    abs(ABS_MT_POSITION_X, x),
+                    abs(ABS_MT_POSITION_Y, y),
+                    abs(ABS_MT_PRESSURE, FINGER_PRESSURE),
+                    abs(ABS_MT_TOUCH_MAJOR, FINGER_SIZE),
+                    abs(ABS_MT_TOUCH_MINOR, FINGER_SIZE),
+                    InputEvent::syn(),
+                ],
+                vec![
+                    abs(ABS_MT_SLOT, PEN_SLOT),
+                    abs(ABS_MT_TRACKING_ID, PEN_SLOT),
+                    abs(ABS_MT_POSITION_X, px),
+                    abs(ABS_MT_POSITION_Y, py),
+                    abs(ABS_MT_TOOL_TYPE, MT_TOOL_PEN),
+                    abs(ABS_MT_PRESSURE, PEN_PRESSURE),
+                    InputEvent::syn(),
+                ],
+                vec![
+                    abs(ABS_MT_SLOT, 1),
+                    abs(ABS_MT_TRACKING_ID, 1),
+                    abs(ABS_MT_POSITION_X, 9000),
+                    abs(ABS_MT_PRESSURE, 1024),
+                    InputEvent::syn()
+                ],
+                // Raw events and the pen moved the kernel's slot: the finger selects slot 0 again.
+                vec![
+                    abs(ABS_MT_SLOT, 0),
+                    abs(ABS_MT_TRACKING_ID, 0),
+                    abs(ABS_MT_POSITION_X, x2),
+                    abs(ABS_MT_POSITION_Y, y),
+                    abs(ABS_MT_PRESSURE, FINGER_PRESSURE),
+                    abs(ABS_MT_TOUCH_MAJOR, FINGER_SIZE),
+                    abs(ABS_MT_TOUCH_MINOR, FINGER_SIZE),
+                    InputEvent::syn(),
+                ],
+                vec![abs(ABS_MT_SLOT, PEN_SLOT), abs(ABS_MT_PRESSURE, 0), abs(ABS_MT_TRACKING_ID, -1), InputEvent::syn()],
+                vec![abs(ABS_MT_SLOT, 0), abs(ABS_MT_PRESSURE, 0), abs(ABS_MT_TRACKING_ID, -1), InputEvent::syn()],
+            ]
+        );
+        for k in [GuestKernel::SlotsFromTrackingId, GuestKernel::SlotsFromSlotAxis] {
+            let slots = k.probe(&mut dev).0 as i32;
+            for e in got.iter().flatten().filter(|e| e.typ == EV_ABS && e.code == ABS_MT_SLOT) {
+                assert!((0..slots).contains(&e.value), "{k:?}: slot {} of {slots}", e.value);
+            }
         }
     }
 

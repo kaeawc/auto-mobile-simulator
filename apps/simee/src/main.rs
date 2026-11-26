@@ -93,6 +93,10 @@ enum Cmd {
         /// Fail unless the device type or system image is this form factor; shapes a new AVD.
         #[arg(long)]
         form_factor: Option<String>,
+        /// Android: the hardware a new AVD follows, as avdmanager's `-d` (foldables: pixel_fold,
+        /// surface_duo).
+        #[arg(long)]
+        device: Option<String>,
     },
     /// Delete a device and its data.
     Delete { device: String },
@@ -268,7 +272,8 @@ enum Cmd {
         #[arg(long)]
         orientation: Option<String>,
     },
-    /// Set an Android foldable's hinge: a posture (closed, half-opened, opened) or an angle (0-180).
+    /// Set an Android foldable's hinge: fold, unfold, a posture (closed, half-opened, opened, flipped, tent) or an
+    /// angle (0-180; 0-360 on a dual-screen).
     Fold { device: String, posture: String },
     /// Android XR: recenter, rotate X Y Z (radians), move DX DY DZ (metres), options day|night
     /// PASSTHROUGH (0-1), input mouse|hand|eye, viewport pan|zoom|rotate, pointer X Y [PHASE].
@@ -389,6 +394,10 @@ enum Cmd {
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
     },
+    /// Serve MCP on stdin and stdout, so an agent can do everything simee can: every API method as
+    /// a tool, devices as resources, long operations as tasks, a device view as an app. Configure
+    /// it in the agent's MCP settings as the command `simee mcp` (see docs/mcp.md).
+    Mcp,
     /// Run a program inside the device (e.g. `defaults`, `log`, `launchctl`, `notifyutil`, `heap`).
     #[command(disable_help_flag = true)]
     Exec {
@@ -409,6 +418,12 @@ fn main() -> Result<()> {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
             eprintln!("simee API on {}", path.display());
             sim_api::serve(&path)?;
+            return Ok(());
+        }
+        Cmd::Mcp => {
+            // Methods run in this process, on the server's own threads: nothing but protocol
+            // messages may reach stdout.
+            sim_mcp::serve_stdio(std::sync::Arc::new(sim_mcp::ApiBackend::new()))?;
             return Ok(());
         }
         Cmd::Call { method, params, socket } => {
@@ -571,9 +586,12 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
                 }
             }
         }
-        Cmd::Create { name, device_type, runtime, platform, system_image, form_factor } => {
-            let params = json!({"name": name, "device_type": device_type, "runtime": runtime, "platform": platform,
+        Cmd::Create { name, device_type, runtime, platform, system_image, form_factor, device } => {
+            let mut params = json!({"name": name, "device_type": device_type, "runtime": runtime, "platform": platform,
                 "system_image": system_image, "form_factor": form_factor});
+            if let Some(device) = device {
+                params["device"] = json!(device);
+            }
             let d = call("create", params)?;
             writeln!(out, "{}", text(&d["udid"]))?;
         }
@@ -701,12 +719,13 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             }
         }
         Cmd::Fold { device, posture } => {
-            let params = match posture.parse::<f64>() {
-                Ok(angle) => json!({"device": device, "angle": angle}),
-                Err(_) => json!({"device": device, "posture": posture}),
+            let params = match (posture.as_str(), posture.parse::<f64>()) {
+                // The console's `fold` and `unfold`: to the folded screen, or flat.
+                ("fold" | "unfold", _) => json!({"device": device, "folded": posture == "fold"}),
+                (_, Ok(angle)) => json!({"device": device, "angle": angle}),
+                (_, Err(_)) => json!({"device": device, "posture": posture}),
             };
-            let r = call("fold", params)?;
-            writeln!(out, "{} ({}°)", text(&r["posture"]), r["angle"])?;
+            writeln!(out, "{}", fold_line(&call("fold", params)?))?;
         }
         Cmd::Xr { device, command } => lines(out, &call("xr", xr_params(&device, &command)?)?)?,
         Cmd::Touchpad { device, x, y, phase, to, duration_ms } => {
@@ -773,7 +792,7 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             }
         }
         Cmd::Console { device, command } => lines(out, &call("console", json!({"device": device, "command": command.join(" ")}))?)?,
-        Cmd::Serve { .. } | Cmd::Call { .. } => anyhow::bail!("`serve` and `call` don't run through a transport"),
+        Cmd::Serve { .. } | Cmd::Call { .. } | Cmd::Mcp => anyhow::bail!("`serve`, `call` and `mcp` don't run through a transport"),
         Cmd::Exec { device, env, program, args } => {
             let env: serde_json::Map<String, Value> =
                 env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), Value::from(v))).collect();
@@ -910,6 +929,19 @@ fn form_factors_text(rows: &Value) -> String {
     out
 }
 
+/// `simee fold`'s line for the `fold` method's answer: the posture and angle, and the screen and
+/// its size when simee's emulator says them; the stock emulator's answer to a fold or unfold is
+/// only which was asked.
+fn fold_line(r: &Value) -> String {
+    let screen = |folded: bool| if folded { "folded" } else { "unfolded" };
+    match (r["posture"].as_str(), r["folded"].as_bool(), r["width"].as_u64(), r["height"].as_u64()) {
+        (Some(posture), Some(folded), Some(w), Some(h)) => format!("{posture} ({}°), {}, {w}x{h}", r["angle"], screen(folded)),
+        (Some(posture), ..) => format!("{posture} ({}°)", r["angle"]),
+        (None, Some(folded), ..) => screen(folded).to_owned(),
+        (None, None, ..) => r.to_string(),
+    }
+}
+
 /// The `xr` method's parameters for `simee xr DEVICE WORDS...` (the console's `xr` syntax).
 fn xr_params(device: &str, words: &[String]) -> Result<Value> {
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
@@ -987,6 +1019,16 @@ mod tests {
         ] {
             assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
         }
+    }
+
+    #[test]
+    fn fold_answers_print_what_the_emulator_said() {
+        let simee = json!({"angle": 0.0, "posture": "closed", "folded": true, "width": 1080, "height": 2092});
+        assert_eq!(fold_line(&simee), "closed (0.0°), folded, 1080x2092");
+        // The stock emulator doesn't report the hinge: what was asked.
+        assert_eq!(fold_line(&json!({"folded": true})), "folded", "not `null (null°)`");
+        assert_eq!(fold_line(&json!({"folded": false})), "unfolded");
+        assert_eq!(fold_line(&json!({"angle": 180.0, "posture": "opened"})), "opened (180.0°)");
     }
 
     #[test]
@@ -1147,6 +1189,16 @@ mod tests {
         failed["failed"] = json!(1);
         let e = print_boot_many(&failed, 2, true, &mut Vec::new(), &mut Vec::new()).expect_err("a failed boot fails");
         assert_eq!(e.to_string(), "1 of 2 devices failed to boot");
+    }
+
+    #[test]
+    fn mcp_is_a_subcommand_that_runs_no_device_command() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        assert!(matches!(parse(&["mcp"]), Ok(Cmd::Mcp)));
+        assert!(parse(&["mcp", "--http"]).is_err(), "stdio only");
+        let mut transport = Transport::local();
+        let e = run(Cmd::Mcp, &mut transport, &mut Vec::new(), &mut Vec::new()).expect_err("served by main, not run");
+        assert!(e.to_string().contains("`mcp` don't run through a transport"));
     }
 
     #[test]
