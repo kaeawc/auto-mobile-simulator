@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use rune::tok::{self, Theme, radius, type_};
-use rune::{Color, El, Icon, ScrollSpec, col, el, icon, row, text};
+use rune::{Color, El, Icon, ScrollSpec, Tx, col, el, icon, row, text};
 use serde_json::{Value, json};
 use sim_api::{Session, call_method};
 use sim_core::debug::{CA_OPTIONS, CONTENT_SIZES};
@@ -379,8 +379,9 @@ fn parse<T: serde::de::DeserializeOwned + Default>(v: Value) -> T {
 
 // ----- view -------------------------------------------------------------------------------------
 
-fn act(a: DebugAction) -> impl Fn(&mut State) + 'static {
-    move |s: &mut State| s.actions.push(Action::Debug(a.clone()))
+/// A press that queues `a` and asks for the poll that performs it.
+fn act(a: DebugAction) -> impl Fn(&mut State, &mut Tx) + 'static {
+    move |s: &mut State, tx: &mut Tx| crate::queue(s, tx, Action::Debug(a.clone()))
 }
 
 fn api(label: &'static str, method: &'static str, params: Value) -> DebugAction {
@@ -394,7 +395,7 @@ pub fn icon_button(
     label: &str,
     show_label: bool,
     t: Theme,
-    on: impl Fn(&mut State) + 'static,
+    on: impl Fn(&mut State, &mut Tx) + 'static,
 ) -> El {
     let mut b = row()
         .key(key.into())
@@ -406,7 +407,7 @@ pub fn icon_button(
         .center_y()
         .radius(radius::SM)
         .fill(t.control_off)
-        .on_press(on)
+        .on_press_tx(on)
         .child(icon(glyph, 15.0).color(t.text));
     if show_label {
         b = b.child(text(label.to_string()).font(type_::LABEL).color(t.text));
@@ -432,7 +433,7 @@ fn toggle_row(key: impl Into<String>, glyph: &'static Icon, label: &str, on: boo
         .h(30.0)
         .gap(8.0)
         .center_y()
-        .on_press(act(a))
+        .on_press_tx(act(a))
         .child(icon(glyph, 15.0).color(t.text_secondary))
         .child(text(label.to_string()).font(type_::BODY).color(t.text).grow(1.0).truncate())
         .child(switch(on, t))
@@ -731,7 +732,7 @@ pub fn panel(s: &State, t: Theme) -> El {
                 .center_y()
                 .radius(radius::SM)
                 .fill(if selected { tok::accent(0, true) } else { t.control_off })
-                .on_press(act(DebugAction::Tab(tab)))
+                .on_press_tx(act(DebugAction::Tab(tab)))
                 .child(icon(tab.icon(), 15.0).color(t.text)),
         );
     }
