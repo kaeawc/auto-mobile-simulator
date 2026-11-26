@@ -40,8 +40,6 @@ pub fn concurrency(p: &Value) -> Result<usize, String> {
 }
 
 /// An optional boolean: absent or null is `None`, any other type is refused.
-// Only iOS methods read this so far.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn opt_bool(p: &Value, key: &str) -> Result<Option<bool>, String> {
     match p.get(key) {
         None | Some(Value::Null) => Ok(None),

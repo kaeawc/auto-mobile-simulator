@@ -112,6 +112,9 @@ enum Cmd {
         /// iOS: turn off a named set of daemons once booted (`slim`).
         #[arg(long)]
         profile: Option<String>,
+        /// Android: play the device's audio on the host's default output (silent otherwise).
+        #[arg(long)]
+        audio: bool,
     },
     /// Boot several devices of one platform, a few at a time, and print each one's timings.
     /// Exits non-zero only when a device failed to boot (one that booted but didn't settle in
@@ -509,7 +512,7 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             writeln!(out, "{}", text(&d["udid"]))?;
         }
         Cmd::Delete { device } => drop(call("delete", json!({"device": device}))?),
-        Cmd::Boot { device, timeout, env, shaped, settle, settle_timeout, profile } => {
+        Cmd::Boot { device, timeout, env, shaped, settle, settle_timeout, profile, audio } => {
             let env: serde_json::Map<String, Value> =
                 env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), Value::from(v))).collect();
             let mut params = json!({"device": device, "timeout_s": timeout, "env": env, "shaped": shaped});
@@ -523,6 +526,9 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             }
             if let Some(profile) = profile {
                 params["profile"] = json!(profile);
+            }
+            if audio {
+                params["audio"] = json!(true);
             }
             let timed = call("boot", params)?;
             if !timed.is_null() {
@@ -1052,6 +1058,9 @@ mod tests {
         assert!(matches!(parse(&["boot-many", "a", "--no-settle"]), Ok(Cmd::BootMany { no_settle: true, .. })));
         assert!(parse(&["boot-many", "a", "--settle", "--no-settle"]).is_err());
         assert!(matches!(parse(&["boot-many", "a", "--first-port", "5600"]), Ok(Cmd::BootMany { first_port: Some(5600), .. })));
+        // Android devices boot silent unless `--audio`.
+        assert!(matches!(parse(&["boot", "a"]), Ok(Cmd::Boot { audio: false, .. })));
+        assert!(matches!(parse(&["boot", "a", "--audio"]), Ok(Cmd::Boot { audio: true, .. })));
     }
 
     /// A fake server's reply to a method: its result or its error.

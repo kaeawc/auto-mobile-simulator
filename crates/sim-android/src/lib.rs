@@ -118,8 +118,27 @@ impl Android {
         Android { env, running_dir: emu_avd::running_dir() }
     }
 
+    /// Every running emulator: simee's (their advertisements), then the stock emulator's
+    /// ([`Env::stock_instances`]) for AVDs simee doesn't run.
     fn running(&self) -> Vec<Running> {
+        let mut all = self.simee_running();
+        let stock = self.env.stock_instances(&all);
+        all.extend(stock);
+        all
+    }
+
+    fn simee_running(&self) -> Vec<Running> {
         self.running_dir.as_deref().map(emu_avd::running_instances_in).unwrap_or_default()
+    }
+
+    /// The emulator running AVD `name` alone (simee's, else the stock one's): reads that AVD's
+    /// lock only, not every AVD's, which is what a call on one device needs.
+    fn running_of(&self, name: &str) -> Option<Running> {
+        let simee = self.simee_running();
+        match simee.iter().find(|r| r.avd_name == name) {
+            Some(r) => Some(r.clone()),
+            None => self.env.stock_instance(name, &simee),
+        }
     }
 
     /// Every AVD, labelled with its form factor; running ones (simee or stock) are `Booted`.
@@ -138,12 +157,13 @@ impl Android {
     /// Resolves a UDID-or-name query (`booted` is the only running device) to a device. An exact
     /// AVD name loads just that AVD.
     pub fn device(&self, query: &str) -> Result<Device, String> {
-        let running = self.running();
         // One directory scan, not one for the exact-name check and another for the list.
         let names = self.env.list_avds();
+        // An exact AVD name (what every API call passes) probes that AVD alone.
         if !query.is_empty() && names.iter().any(|n| n == query) {
-            return Ok(self.describe(query, &running));
+            return Ok(self.describe(query, &self.running_of(query).into_iter().collect::<Vec<_>>()));
         }
+        let running = self.running();
         // `booted` is decided by what is running alone: load only those AVDs, not every config.
         let only_running = query.eq_ignore_ascii_case("booted");
         let devices: Vec<Device> = names
@@ -249,7 +269,8 @@ impl Android {
     pub fn boot_many(&self, avds: &[String], concurrency: usize, timeout: Duration, first_port: u16) -> Result<Vec<BootOutcome>, String> {
         let locks = emu_avd::port_lock_dir();
         let free = |p: u16| port_usable(locks.as_deref(), p, port_free);
-        self.boot_many_with(avds, concurrency, timeout, first_port, free, |d, port| d.launch_command(Some(port)))
+        // A farm stays silent: N devices would open N host audio streams.
+        self.boot_many_with(avds, concurrency, timeout, first_port, free, |d, port| d.launch_command(Some(port), false))
     }
 
     fn boot_many_with(
@@ -404,17 +425,85 @@ fn sysdir_path(image: &str) -> Result<String, String> {
     }
 }
 
-/// The `emu` binary: `$EMU_BIN`, else next to this executable, else this checkout's build, else
-/// the PATH.
+/// The `emu` binary: `$SIMEE_EMU` (or `$EMU_BIN`) if set, else the release build: an `emu` beside
+/// this executable unless that is a debug build's, else this checkout's `target/release/emu`;
+/// a debug `emu` only when there is no release one (a debug guest boots several times slower, so
+/// a debug simee or desktop must not pick it up just because it sits beside them), else the PATH.
+/// A release `emu` in this checkout older than the sources is used, with a note on stderr that
+/// it is stale: simee never builds it behind your back (`cargo build --release -p emu`).
 pub fn emu_binary() -> PathBuf {
-    if let Some(p) = std::env::var_os("EMU_BIN") {
-        return PathBuf::from(p);
-    }
-    if let Some(beside) = std::env::current_exe().ok().map(|e| e.with_file_name("emu")).filter(|p| p.is_file()) {
-        return beside;
-    }
+    let var = |n: &str| std::env::var_os(n).map(PathBuf::from);
+    let exe = std::env::current_exe().ok();
     let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
-    ["release", "debug"].iter().map(|p| target.join(p).join("emu")).find(|p| p.is_file()).unwrap_or_else(|| PathBuf::from("emu"))
+    let chosen = choose_emu(var("SIMEE_EMU").or_else(|| var("EMU_BIN")), exe.as_deref(), &target, Path::is_file);
+    if is_checkout_release(&chosen, &target) {
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        NOTED.call_once(|| {
+            if let Some(note) = stale_note(&chosen, &Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")) {
+                eprintln!("{note}");
+            }
+        });
+    }
+    chosen
+}
+
+/// Whether `emu` is a release binary under `target`, compared canonically: the running
+/// executable's path is resolved, `target` (built from `CARGO_MANIFEST_DIR/../../target`) isn't.
+fn is_checkout_release(emu: &Path, target: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (emu, target) = (canon(emu), canon(target));
+    emu.starts_with(&target) && emu.parent().is_some_and(|d| d.ends_with("release"))
+}
+
+/// Which `emu` to start (see [`emu_binary`]): `explicit` wins as given; else, in order, an `emu`
+/// beside `exe` that is not a debug build's, `target/release/emu`, an `emu` beside `exe`, then
+/// `target/debug/emu`, then `emu` on the PATH. `is_file` says which of those exist.
+pub fn choose_emu(explicit: Option<PathBuf>, exe: Option<&Path>, target: &Path, is_file: impl Fn(&Path) -> bool) -> PathBuf {
+    if let Some(p) = explicit {
+        return p;
+    }
+    let beside = exe.map(|e| e.with_file_name("emu")).filter(|p| is_file(p));
+    let beside_is_debug = beside.as_ref().and_then(|p| p.parent()).is_some_and(|d| d.ends_with("debug") || d.ends_with("deps"));
+    let release = target.join("release").join("emu");
+    let debug = target.join("debug").join("emu");
+    if let Some(b) = beside.clone().filter(|_| !beside_is_debug) {
+        return b;
+    }
+    if is_file(&release) {
+        return release;
+    }
+    beside.or_else(|| Some(debug).filter(|d| is_file(d))).unwrap_or_else(|| PathBuf::from("emu"))
+}
+
+/// The note to print when `emu` is older than the newest source in `checkout` that builds it
+/// (`apps/emu`, `crates/emu-*`, `crates/sim-core`), `None` when it is current or can't be told.
+fn stale_note(emu: &Path, checkout: &Path) -> Option<String> {
+    let built = std::fs::metadata(emu).and_then(|m| m.modified()).ok()?;
+    let mut newest = None;
+    let mut roots = vec![checkout.join("apps/emu/src"), checkout.join("crates/sim-core/src")];
+    roots.extend(
+        std::fs::read_dir(checkout.join("crates"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("emu-")).then(|| e.path().join("src"))),
+    );
+    while let Some(dir) = roots.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let Ok(meta) = e.metadata() else { continue };
+            if meta.is_dir() {
+                roots.push(e.path());
+            } else if let Ok(t) = meta.modified() {
+                newest = newest.max(Some(t));
+            }
+        }
+    }
+    (newest? > built).then(|| {
+        format!(
+            "simee: {} is older than its sources; rebuild it with `cargo build --release -p emu` (SIMEE_EMU picks another binary)",
+            emu.display()
+        )
+    })
 }
 
 /// One AVD, running or not.
@@ -429,6 +518,23 @@ pub struct Device {
 impl Device {
     fn running(&self) -> Result<&Running, String> {
         self.running.as_ref().ok_or_else(|| format!("{} isn't running; boot it first", self.info.name))
+    }
+
+    /// The running instance, for what only simee's `emu` offers (`what`: the display socket,
+    /// simee's console commands). A device the stock emulator runs gets a clear refusal.
+    fn running_simee(&self, what: &str) -> Result<&Running, String> {
+        let r = self.running()?;
+        if r.simee {
+            Ok(r)
+        } else {
+            Err(format!(
+                "{} is running under the stock emulator ({}, PID {}); {what} needs simee's emu. Shut it down and boot it with `simee boot {}`",
+                self.info.name,
+                r.serial(),
+                r.pid,
+                self.info.udid
+            ))
+        }
     }
 
     fn avd(&self) -> Result<&Avd, String> {
@@ -453,14 +559,16 @@ impl Device {
 
     /// Starts `emu` for this AVD (unless it's running) and waits until it has booted: until
     /// `sys.boot_completed` is 1 when adb is available, else until the display has a frame.
-    /// The emulator's own output goes to `<avd>/simee/emu.log`.
-    pub fn boot(&self, android: &Android, timeout: Duration) -> Result<(), String> {
-        self.boot_with(android, timeout, self.launch_command(None))
+    /// The emulator's own output goes to `<avd>/simee/emu.log`. With `audio` the device plays
+    /// on the host's default output; without it (what tools and farms want) it is silent
+    /// (`-no-audio`) and opens no host audio device.
+    pub fn boot(&self, android: &Android, timeout: Duration, audio: bool) -> Result<(), String> {
+        self.boot_with(android, timeout, self.launch_command(None, audio))
     }
 
     /// The command that starts `emu` for this AVD, on console port `port` if given (else emu
-    /// picks the first free pair).
-    fn launch_command(&self, port: Option<u16>) -> Command {
+    /// picks the first free pair), silent unless `audio`.
+    fn launch_command(&self, port: Option<u16>, audio: bool) -> Command {
         let bin = emu_binary();
         let signer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/sign-run.sh");
         let mut cmd = if cfg!(target_os = "macos") && signer.is_file() {
@@ -471,6 +579,9 @@ impl Device {
             Command::new(&bin)
         };
         cmd.args(["-avd", &self.info.udid, "-no-boot-anim"]);
+        if !audio {
+            cmd.arg("-no-audio");
+        }
         // The guest's logcat, for the desktop's panel and anyone debugging a boot: the console
         // is quiet now, and logcat over hvc1 is the cheap stream.
         if let Some(avd) = &self.avd {
@@ -549,8 +660,21 @@ impl Device {
     /// Asks the emulator to quit (console `kill`) and waits for it to go.
     pub fn shutdown(&self) -> Result<(), String> {
         let r = self.running()?;
-        // `kill` closes the session after its reply, so the reply may be cut short.
-        let _ = console::send(r.console_port, &["kill".into()]);
+        if r.simee {
+            // `kill` closes the session after its reply, so the reply may be cut short.
+            let _ = console::send(r.console_port, &["kill".into()]);
+        } else {
+            // `kill -INT` makes the stock emulator exit cleanly without a console session
+            // (which would need its auth token first). The PID came from a lock file, so first
+            // confirm it is still a qemu running this AVD: never signal a reused PID.
+            if !emu_avd::process_runs_avd(r.pid, &r.avd_name) {
+                return Err(format!(
+                    "{}: PID {} no longer looks like the stock emulator running it (its command line changed); not signalling it",
+                    self.info.name, r.pid
+                ));
+            }
+            Command::new("kill").args(["-INT", &r.pid.to_string()]).status().map_err(|e| format!("kill: {e}"))?;
+        }
         let deadline = Instant::now() + Duration::from_secs(15);
         while r.alive() && Instant::now() < deadline {
             sleep(Duration::from_millis(200));
@@ -610,6 +734,7 @@ impl Device {
     /// touchpad units: `phase` is down, move, up or tap. Through simee's console `touchpad`.
     pub fn touchpad(&self, x: u32, y: u32, phase: &str) -> Result<(), String> {
         self.touchpad_size()?;
+        self.running_simee("the touchpad console command")?;
         self.console(&[format!("touchpad {x} {y} {phase}")]).map(drop)
     }
 
@@ -625,7 +750,7 @@ impl Device {
         lines.extend((1..=STEPS).map(|i| format!("touchpad {} {} move", lerp(from.0, to.0, i), lerp(from.1, to.1, i))));
         lines.push(format!("touchpad {} {} up", to.0, to.1));
         // One console session for the whole swipe, its steps on deadlines.
-        let mut session = console::Session::open(self.running()?.console_port)?;
+        let mut session = console::Session::open(self.running_simee("the touchpad console command")?.console_port)?;
         let mut delays = vec![duration / STEPS; lines.len()];
         delays[0] = Duration::ZERO;
         let start = Instant::now();
@@ -647,7 +772,7 @@ impl Device {
     fn with_display<T>(&self, avd: &Avd, mut f: impl FnMut(&mut display::Display) -> Result<T, String>) -> Result<T, String> {
         type Slot = std::sync::Arc<std::sync::Mutex<Option<display::Display>>>;
         static DISPLAYS: std::sync::Mutex<Vec<(PathBuf, Slot)>> = std::sync::Mutex::new(Vec::new());
-        self.running()?;
+        self.running_simee("input and frames over the display socket")?;
         let path = display::socket(&avd.dir);
         let slot = {
             let mut all = DISPLAYS.lock().unwrap_or_else(|e| e.into_inner());
@@ -821,15 +946,18 @@ impl Device {
 /// Whether a running instance has finished booting.
 fn booted(r: &Running, adb: Option<&Path>) -> bool {
     let started = Instant::now();
-    let console_up = loop {
-        if console::send(r.console_port, &["ping".into()]).is_ok() {
-            break true;
-        }
-        if started.elapsed() > CONSOLE_GRACE {
-            break false;
-        }
-        sleep(Duration::from_millis(200));
-    };
+    // Only simee's console is pinged here; for the stock emulator (whose console also wants its
+    // auth token first) adb alone says whether it has booted.
+    let console_up = !r.simee
+        || loop {
+            if console::send(r.console_port, &["ping".into()]).is_ok() {
+                break true;
+            }
+            if started.elapsed() > CONSOLE_GRACE {
+                break false;
+            }
+            sleep(Duration::from_millis(200));
+        };
     if !console_up {
         return false;
     }
@@ -964,6 +1092,100 @@ mod tests {
         let mut android = Android::new(Env { sdk_root: Some(sdk), avd_home: root.join("avd") });
         android.running_dir = Some(root.join("running"));
         Fixture { root, android }
+    }
+
+    #[test]
+    fn emu_choice_prefers_release_and_an_explicit_override() {
+        let target = Path::new("/repo/target");
+        let exists = |files: &'static [&'static str]| move |p: &Path| files.iter().any(|f| Path::new(f) == p);
+        let choose = |explicit: Option<&str>, exe: &str, files: &'static [&'static str]| {
+            choose_emu(explicit.map(PathBuf::from), Some(Path::new(exe)), target, exists(files))
+        };
+        // An explicit path wins, even when it doesn't exist.
+        assert_eq!(choose(Some("/x/emu"), "/repo/target/debug/simee", &["/repo/target/release/emu"]), PathBuf::from("/x/emu"));
+        // A debug simee beside a debug emu starts the release one.
+        let both = &["/repo/target/debug/emu", "/repo/target/release/emu"];
+        assert_eq!(choose(None, "/repo/target/debug/simee", both), PathBuf::from("/repo/target/release/emu"));
+        assert_eq!(choose(None, "/repo/target/debug/deps/e2e-1a2b", both), PathBuf::from("/repo/target/release/emu"));
+        // Only a debug one exists: it's used rather than nothing.
+        assert_eq!(choose(None, "/repo/target/debug/simee", &["/repo/target/debug/emu"]), PathBuf::from("/repo/target/debug/emu"));
+        // A release simee, or an installed one, uses the emu beside it.
+        assert_eq!(choose(None, "/repo/target/release/simee", both), PathBuf::from("/repo/target/release/emu"));
+        assert_eq!(
+            choose(None, "/opt/simee/bin/simee", &["/opt/simee/bin/emu", "/repo/target/release/emu"]),
+            PathBuf::from("/opt/simee/bin/emu")
+        );
+        // Nothing found: the PATH.
+        assert_eq!(choose(None, "/opt/simee/bin/simee", &[]), PathBuf::from("emu"));
+    }
+
+    #[test]
+    fn a_release_emu_older_than_its_sources_is_called_out() {
+        let root = PathBuf::from("/tmp").join(format!("sa-stale-{}", std::process::id()));
+        let src = root.join("apps/emu/src");
+        std::fs::create_dir_all(&src).expect("src");
+        let emu = root.join("emu");
+        std::fs::write(&emu, b"bin").expect("emu");
+        std::fs::File::options()
+            .write(true)
+            .open(&emu)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600)))
+            .expect("age it");
+        assert_eq!(stale_note(&emu, &root), None, "no sources newer");
+        std::fs::write(src.join("main.rs"), b"fn main() {}").expect("source");
+        let note = stale_note(&emu, &root).expect("stale");
+        assert!(note.contains("cargo build --release -p emu") && note.contains("SIMEE_EMU"), "{note}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn stock_emulator_devices_refuse_display_only_operations_clearly() {
+        let f = fixture("stockrun");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let mut d = f.android.device("phone").expect("phone");
+        d.running = Some(Running { pid: 4242, avd_name: "phone".into(), console_port: 5750, adb_port: 5751, avd_dir: None, simee: false });
+        let err = d.touch(1.0, 1.0, Phase::Down).expect_err("stock has no display socket");
+        assert!(err.contains("stock emulator") && err.contains("emulator-5750") && err.contains("needs simee's emu"), "{err}");
+        assert!(err.contains("simee boot phone"), "{err}");
+        assert_eq!(d.running.as_ref().map(Running::emulator), Some("stock"));
+    }
+
+    #[test]
+    fn stock_shutdown_refuses_a_pid_that_is_no_longer_its_qemu() {
+        let f = fixture("stockkill");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let mut d = f.android.device("phone").expect("phone");
+        // A PID that is some other program now (as after a reuse): a `sleep` this test started.
+        let mut other = Command::new("sleep").arg("30").spawn().expect("sleep");
+        d.running = Some(Running {
+            pid: other.id() as i32,
+            avd_name: "phone".into(),
+            console_port: 5750,
+            adb_port: 5751,
+            avd_dir: None,
+            simee: false,
+        });
+        let err = d.shutdown().expect_err("not its qemu");
+        let alive = other.try_wait().expect("wait").is_none();
+        let _ = other.kill();
+        let _ = other.wait();
+        assert!(alive, "the unrelated process was not signalled");
+        assert!(err.contains("no longer looks like the stock emulator") && err.contains("not signalling"), "{err}");
+    }
+
+    #[test]
+    fn the_stale_check_sees_a_release_emu_through_a_dotdot_target() {
+        let root = PathBuf::from("/tmp").join(format!("sa-canon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("target/release")).expect("dirs");
+        std::fs::create_dir_all(root.join("crates/x")).expect("dirs");
+        std::fs::write(root.join("target/release/emu"), b"").expect("emu");
+        let canonical = std::fs::canonicalize(root.join("target/release/emu")).expect("canonical");
+        // `CARGO_MANIFEST_DIR/../../target` is not normalized; the executable's path is.
+        let target = root.join("crates/x/../../target");
+        assert!(is_checkout_release(&canonical, &target));
+        assert!(!is_checkout_release(&canonical.with_file_name("elsewhere").join("emu"), &target));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1237,11 +1459,21 @@ mod tests {
         let f = fixture("logcat-arg");
         f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
         let d = f.android.device("phone").expect("device");
-        let args: Vec<String> = d.launch_command(Some(5600)).get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = d.launch_command(Some(5600), false).get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         let at = args.iter().position(|a| a == "-logcat-output").expect("-logcat-output");
         assert_eq!(Path::new(&args[at + 1]), emu_avd::state_dir(&d.avd.as_ref().expect("avd").dir).join(LOGCAT_FILE));
         let at = args.iter().position(|a| a == "-logcat").expect("-logcat");
         assert_eq!(args[at + 1], LOGCAT_FILTER);
+    }
+
+    #[test]
+    fn launches_are_silent_unless_audio_is_asked_for() {
+        let f = fixture("audio-arg");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let d = f.android.device("phone").expect("device");
+        let silent = |audio| d.launch_command(None, audio).get_args().any(|a| a == "-no-audio");
+        assert!(silent(false), "tools and farms: no host audio stream per device");
+        assert!(!silent(true), "a person watching hears it");
     }
 
     #[test]
