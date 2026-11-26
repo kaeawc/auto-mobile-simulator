@@ -1,7 +1,8 @@
 //! virtio-input (virtio 1.2 §5.8): evdev-style events from the host into the guest.
 //!
 //! Four device kinds: a multi-touch screen (stock's `virtio-input-multi-touch.c`: axes
-//! 0..=32767, no input properties, which Android maps to the display as a touch screen), a
+//! 0..=32767, no input properties; the images' `virtio_input_multi_touch_1.idc` makes it a touch
+//! screen, so its name must stay stock's), a
 //! keyboard (hardware keys incl. power/volume/back/home), a rotary encoder (REL_WHEEL, used by
 //! Wear OS) and the stock emulator's virtio dual-mode mouse (absolute and relative axes, mouse
 //! buttons; Android XR images expect it). Host code injects through an [`InputHandle`], in
@@ -598,8 +599,9 @@ impl Input {
             .flat_map(|v| v.to_le_bytes())
             .collect(),
             CFG_PROP_BITS => match self.kind {
-                // Stock's screen has none: Android maps a multi-touch device without them to
-                // its display as a touch screen all the same.
+                // Stock's screen has none. Without INPUT_PROP_DIRECT Android would make it a
+                // pointer; the image's `virtio_input_multi_touch_1.idc` (`touch.deviceType =
+                // touchScreen`, matched by the device name) is what makes it a touch screen.
                 Kind::Touch { screen: false, .. } => vec![1 << INPUT_PROP_DIRECT],
                 _ => Vec::new(),
             },
