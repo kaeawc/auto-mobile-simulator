@@ -75,9 +75,9 @@ pub fn for_device(d: &DeviceInfo) -> Vec<Control> {
                 FormFactor::Phone | FormFactor::Tablet => out.push(control("rotate-button", &icons::ROTATE, "Rotate", Action::Rotate)),
                 FormFactor::Foldable => {
                     out.push(control("rotate-button", &icons::ROTATE, "Rotate", Action::Rotate));
-                    out.push(control("fold-closed", &icons::FOLD_CLOSED, "Fold closed", Action::Fold(Posture::Closed)));
+                    out.push(control("fold-closed", &icons::FOLD_CLOSED, "Fold", Action::Fold(Posture::Closed)));
                     out.push(control("fold-half", &icons::FOLD_HALF, "Half open", Action::Fold(Posture::HalfOpened)));
-                    out.push(control("fold-opened", &icons::FOLD_OPEN, "Open flat", Action::Fold(Posture::Opened)));
+                    out.push(control("fold-opened", &icons::FOLD_OPEN, "Unfold", Action::Fold(Posture::Opened)));
                 }
                 FormFactor::Watch => {
                     out.push(control("crown-up", &icons::CROWN_UP, "Rotary up", Action::Rotary(-1)));

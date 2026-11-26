@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use sim_android::Android;
 use sim_core::device::DeviceInfo;
+use sim_core::fold::StockPosture;
 use sim_core::form_factor::Posture;
 use sim_core::hid::Direction;
 use sim_core::xr::XrCommand;
@@ -49,6 +50,42 @@ const IOS_BOOT_PARAMS: &[(&str, &str)] = &[
 
 /// Rejects iOS-only boot parameters that ask for something (a `false`, `null`, empty or absent
 /// one asks for nothing), naming the platform that has them.
+/// `fold`: a hinge `angle`, or a `posture` (stock's names or ids: closed, half-opened, opened,
+/// flipped, tent). Answers with the hinge as the emulator then has it (angle, posture, whether
+/// folded, the display size the guest lays out for), or, from an emulator that doesn't say, what
+/// was asked.
+fn fold(d: &sim_android::Device, p: &Value) -> Result<Value, String> {
+    const POSTURES: &str = "closed, half-opened, opened, flipped, tent";
+    let asked = match (p.get("angle").and_then(Value::as_f64), str_param(p, "posture")) {
+        _ if p.get("folded").is_some() => {
+            let folded = opt_bool(p, "folded")?.unwrap_or(true);
+            d.fold_display(folded)?;
+            json!({"folded": folded})
+        }
+        (Some(a), _) => {
+            d.fold(a as f32)?;
+            json!({"angle": a as f32, "posture": Posture::from_angle(a as f32)})
+        }
+        (None, Some(name)) => {
+            let posture = StockPosture::parse(name).ok_or_else(|| format!("unknown posture `{name}` ({POSTURES})"))?;
+            d.posture(posture)?;
+            json!({"angle": Posture::parse(name).map(Posture::angle), "posture": posture.name()})
+        }
+        (None, None) => return Err(format!("give `angle` (0-180; 0-360 on a dual-screen) or `posture` ({POSTURES})")),
+    };
+    Ok(match d.fold_state()? {
+        Some(s) => json!({
+            "angle": s.angle,
+            "posture": s.posture.name(),
+            "folded": s.folded,
+            "width": s.width,
+            "height": s.height,
+            "postures": s.postures.iter().map(|p| p.name()).collect::<Vec<_>>(),
+        }),
+        None => asked,
+    })
+}
+
 fn reject_ios_boot_params(method: &str, p: &Value) -> Result<(), String> {
     for (key, why) in IOS_BOOT_PARAMS {
         let asks = match p.get(*key) {
@@ -186,16 +223,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             None => null(d.rotate()),
             Some(_) => Err("Android's rotate turns 90° clockwise per call; `orientation` is iOS-only".into()),
         },
-        "fold" => {
-            let angle = match (p.get("angle").and_then(Value::as_f64), str_param(p, "posture")) {
-                (Some(a), _) => a as f32,
-                (None, Some(name)) => {
-                    Posture::parse(name).ok_or_else(|| format!("unknown posture `{name}` (closed, half-opened, opened)"))?.angle()
-                }
-                (None, None) => return Err("give `angle` (0-180) or `posture` (closed, half-opened, opened)".into()),
-            };
-            d.fold(angle).map(|()| json!({"angle": angle, "posture": Posture::from_angle(angle)}))
-        }
+        "fold" => fold(&d, p),
         "rotary" => {
             let ticks = p.get("ticks").and_then(Value::as_i64).ok_or("missing number parameter `ticks`")?;
             null(d.rotary(i32::try_from(ticks).map_err(|e| e.to_string())?))

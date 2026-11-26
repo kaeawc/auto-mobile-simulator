@@ -11,6 +11,8 @@ mod console;
 // Builds and tests everywhere; only an Apple silicon boot serves it.
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 mod display_server;
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+mod fold;
 mod instance;
 mod provision;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -240,6 +242,21 @@ fn boot(_: &emu_avd::Env, name: &str, _: &args::Opts, _: std::sync::mpsc::Receiv
     anyhow::bail!("cannot boot {name}: simee needs Hypervisor.framework on an Apple silicon Mac")
 }
 
+/// Once the guest has booted, a foldable tells it its posture (stock sends it after boot).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn announce_fold_at_boot(cfg: &mut emu_vmm::MachineConfig, fold: Option<std::sync::Arc<fold::Foldable>>) {
+    let Some(fold) = fold else { return };
+    let before = cfg.on_guest_event.take();
+    cfg.on_guest_event = Some(std::sync::Arc::new(move |event: &str| {
+        if let Some(f) = &before {
+            f(event);
+        }
+        if event == "bootcomplete" {
+            fold.announce();
+        }
+    }));
+}
+
 /// Boots the AVD and runs it until the guest powers off or a signal arrives.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn boot(
@@ -296,6 +313,7 @@ fn boot(
             }
         });
     }
+    let fold = fold::for_avd(&avd, inst.sensors.clone(), inst.display.clone(), inst.console_port).map(Arc::new);
     console::serve(
         inst.console_port,
         console::ConsoleInfo {
@@ -312,6 +330,7 @@ fn boot(
             xr: inst.xr.clone(),
             car: inst.car.clone(),
             network: Arc::new(std::sync::Mutex::new(opts.network)),
+            fold: fold.clone(),
         },
     )?;
     let _advert = console::Advertisement::write(&avd.name, &avd.dir, inst.console_port);
@@ -320,6 +339,7 @@ fn boot(
     // On stdout: launchers watch for the first line and the `emulator-<port>` serial.
     println!("emu: {} on emulator-{} (adb port {})", avd.name, inst.console_port, inst.console_port + 1);
     let mut cfg = inst.machine_config(opts, launched)?;
+    announce_fold_at_boot(&mut cfg, fold.clone());
     // The cheap checks passed (console port bound, the boot files exist) and `prepare` has set
     // the renderer's environment: bring the renderer up beside kernel load and VM setup. Nothing
     // fallible runs between here and `run`, which claims it (or, failing before the GPU, waits
@@ -340,7 +360,10 @@ fn boot(
             }
         }
         match out.reason {
-            emu_vmm::StopReason::Reset if !stop.load(Ordering::SeqCst) => cfg = inst.machine_config(opts, launched)?,
+            emu_vmm::StopReason::Reset if !stop.load(Ordering::SeqCst) => {
+                cfg = inst.machine_config(opts, launched)?;
+                announce_fold_at_boot(&mut cfg, fold.clone());
+            }
             emu_vmm::StopReason::Fault(msg) => {
                 eprintln!("emu: guest fault: {msg}");
                 return Ok(ExitCode::FAILURE);

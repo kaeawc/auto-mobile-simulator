@@ -3,6 +3,7 @@
 pub mod carplay;
 pub mod debug;
 pub mod device;
+pub mod fold;
 pub mod form_factor;
 pub mod frame;
 pub mod geometry;

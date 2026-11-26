@@ -86,6 +86,10 @@ enum Cmd {
         /// Fail unless the device type or system image is this form factor; shapes a new AVD.
         #[arg(long)]
         form_factor: Option<String>,
+        /// Android: the hardware a new AVD follows, as avdmanager's `-d` (foldables: pixel_fold,
+        /// surface_duo).
+        #[arg(long)]
+        device: Option<String>,
     },
     /// Delete a device and its data.
     Delete { device: String },
@@ -247,7 +251,8 @@ enum Cmd {
         #[arg(long)]
         orientation: Option<String>,
     },
-    /// Set an Android foldable's hinge: a posture (closed, half-opened, opened) or an angle (0-180).
+    /// Set an Android foldable's hinge: fold, unfold, a posture (closed, half-opened, opened, flipped, tent) or an
+    /// angle (0-180; 0-360 on a dual-screen).
     Fold { device: String, posture: String },
     /// Android XR: recenter, rotate X Y Z (radians), move DX DY DZ (metres), options day|night
     /// PASSTHROUGH (0-1), input mouse|hand|eye, viewport pan|zoom|rotate, pointer X Y [PHASE].
@@ -505,9 +510,12 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
                 }
             }
         }
-        Cmd::Create { name, device_type, runtime, platform, system_image, form_factor } => {
-            let params = json!({"name": name, "device_type": device_type, "runtime": runtime, "platform": platform,
+        Cmd::Create { name, device_type, runtime, platform, system_image, form_factor, device } => {
+            let mut params = json!({"name": name, "device_type": device_type, "runtime": runtime, "platform": platform,
                 "system_image": system_image, "form_factor": form_factor});
+            if let Some(device) = device {
+                params["device"] = json!(device);
+            }
             let d = call("create", params)?;
             writeln!(out, "{}", text(&d["udid"]))?;
         }
@@ -627,12 +635,20 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             }
         }
         Cmd::Fold { device, posture } => {
-            let params = match posture.parse::<f64>() {
-                Ok(angle) => json!({"device": device, "angle": angle}),
-                Err(_) => json!({"device": device, "posture": posture}),
+            let params = match (posture.as_str(), posture.parse::<f64>()) {
+                // The console's `fold` and `unfold`: to the folded screen, or flat.
+                ("fold" | "unfold", _) => json!({"device": device, "folded": posture == "fold"}),
+                (_, Ok(angle)) => json!({"device": device, "angle": angle}),
+                (_, Err(_)) => json!({"device": device, "posture": posture}),
             };
             let r = call("fold", params)?;
-            writeln!(out, "{} ({}°)", text(&r["posture"]), r["angle"])?;
+            match (r["folded"].as_bool(), r["width"].as_u64(), r["height"].as_u64()) {
+                (Some(folded), Some(w), Some(h)) => {
+                    let screen = if folded { "folded" } else { "unfolded" };
+                    writeln!(out, "{} ({}°), {screen}, {w}x{h}", text(&r["posture"]), r["angle"])?
+                }
+                _ => writeln!(out, "{} ({}°)", text(&r["posture"]), r["angle"])?,
+            }
         }
         Cmd::Xr { device, command } => lines(out, &call("xr", xr_params(&device, &command)?)?)?,
         Cmd::Touchpad { device, x, y, phase, to, duration_ms } => {

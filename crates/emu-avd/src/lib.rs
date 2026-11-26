@@ -426,19 +426,16 @@ impl NewAvd {
             spec.extra = device.config();
         }
         match profile.kind.form_factor {
-            // The hinge sensor the stock emulator's foldable definitions declare (one hinge,
-            // 0-180°, three postures).
+            // The foldable definition the screen is (the Pixel Fold unless it is the
+            // dual-screen's), with the hinge keys avdmanager writes for it.
             FormFactor::Foldable => {
                 if let Some(fold) = profile.fold {
-                    spec.extra = vec![
-                        kv("hw.sensor.hinge", "yes"),
-                        kv("hw.sensor.hinge.count", "1"),
-                        kv("hw.sensor.hinge.type", "0"),
-                        kv("hw.sensor.hinge.ranges", "0-180"),
-                        kv("hw.sensor.hinge.defaults", &fold.angle.to_string()),
-                        kv("hw.sensor.posture_list", "1,2,3"),
-                        kv("hw.sensor.hinge_angles_posture_definitions", "0-30, 30-150, 150-180"),
-                    ];
+                    let mut device = sim_core::fold::devices()
+                        .into_iter()
+                        .find(|d| (d.lcd.0, d.lcd.1) == (profile.width, profile.height))
+                        .unwrap_or_else(sim_core::fold::pixel_fold);
+                    device.hinge.default = fold.angle.clamp(device.hinge.range.0, device.hinge.range.1);
+                    spec.extra = device.config();
                 }
             }
             // Wear OS: 512 MB, booted with stock's 512 MB of padding (see `Avd::ram_bytes`);
@@ -1102,6 +1099,14 @@ mod tests {
         assert_eq!(made.lcd(), (2208, 1840, 420));
         let p = made.profile();
         assert_eq!((p.kind.form_factor, p.fold.map(|f| f.posture())), (FormFactor::Foldable, Some(sim_core::form_factor::Posture::Opened)));
+        // The Pixel Fold's keys as avdmanager writes them, so stock folds it to its outer screen.
+        assert_eq!((made.get("hw.device.name"), made.get("hw.sensor.hinge.type")), (Some("pixel_fold"), Some("1")));
+        assert_eq!((made.get("hw.displayRegion.0.1.width"), made.get("hw.displayRegion.0.1.height")), (Some("1080"), Some("2092")));
+        let duo = fold.clone().with_screen(2784, 1800, sim_core::form_factor::Density::Dpi(401));
+        env.create_avd(&NewAvd::for_profile("duo", "system-images/android-36/google_apis/arm64-v8a", &duo)).expect("create duo");
+        let duo = env.load("duo").expect("load duo");
+        assert_eq!((duo.get("hw.device.name"), duo.get("hw.sensor.hinge.ranges")), (Some("surface_duo"), Some("0-360")));
+        assert_eq!(duo.profile().kind.form_factor, FormFactor::Foldable);
         let wear_sys = sdk.join("system-images/android-34/android-wear/arm64-v8a");
         std::fs::create_dir_all(&wear_sys).expect("mkdir");
         std::fs::write(wear_sys.join("system.img"), b"s").expect("write");

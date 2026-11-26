@@ -16,7 +16,7 @@
 //! for a while; switching back shows that frame at once and resumes the stream.
 //!
 //! `cargo run` opens the window (`SIMEE_DEVICE=<udid|name|booted>` preselects a device);
-//! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
+//! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable, folded,
 //! watch, tv, apple-watch, apple-tv, empty); a release build needs `--features tooling` for it.
 
 mod android;
@@ -512,6 +512,12 @@ fn foldable_scene(s: &mut State) {
     select_running(s, "pixel_fold", (552, 460), Shape::Rectangle);
 }
 
+/// The Pixel Fold folded: emu streams only its outer screen (949x1840 of the 2208x1840 scanout,
+/// here at a quarter), so the view takes that shape.
+fn folded_scene(s: &mut State) {
+    select_running(s, "pixel_fold", (237, 460), Shape::Rectangle);
+}
+
 fn watch_scene(s: &mut State) {
     select_running(s, "wear_round", (454, 454), Shape::Round);
 }
@@ -596,6 +602,17 @@ fn press_button(s: &mut State, button: Button, t: f64, tx: &mut Tx) {
 
 /// Queues a console action for the selected Android device on its console worker; failures go
 /// to the status line when it finishes.
+/// A foldable toolbar button, as stock's fold controls: fold shows the folded screen (a fold-in
+/// shut, a dual-screen folded back), unfold lays it flat, half open stands it like a book. The
+/// screen then streams at the folded screen's size, so the view resizes with it.
+fn fold_to(d: &sim_android::Device, posture: Posture) -> Result<(), String> {
+    match posture {
+        Posture::Closed => d.fold_display(true),
+        Posture::HalfOpened => d.posture(sim_core::fold::StockPosture::HalfOpen),
+        Posture::Opened => d.fold_display(false),
+    }
+}
+
 fn android_action(s: &State, f: impl FnOnce(&sim_android::Device) -> Result<(), String> + Send + 'static) {
     if let Some(sc) = &s.screen {
         sc.console(move |d| f(d).map(|()| None));
@@ -691,7 +708,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
                 Some(live) => live.rotate(),
                 None => android_action(s, sim_android::Device::rotate),
             },
-            Action::Fold(posture) => android_action(s, move |d| d.fold(posture.angle())),
+            Action::Fold(posture) => android_action(s, move |d| fold_to(d, posture)),
             Action::Rotary(ticks) => {
                 s.live.iter().for_each(|l| l.crown(ticks));
                 s.screen.iter().for_each(|sc| sc.wheel(ticks));
@@ -813,6 +830,7 @@ fn main() {
             ("demo", demo),
             ("android", android_scene),
             ("foldable", foldable_scene),
+            ("folded", folded_scene),
             ("watch", watch_scene),
             ("tv", tv_scene),
             ("apple-watch", apple_watch_scene),

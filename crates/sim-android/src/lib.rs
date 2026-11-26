@@ -239,6 +239,30 @@ impl Android {
     /// image's own kind: a phone for mobile images, a watch for Wear OS, ...). Rejects a form
     /// factor the image can't boot, such as a tablet from a Wear OS image.
     pub fn create(&self, name: &str, system_image: &str, form_factor: Option<FormFactor>) -> Result<DeviceInfo, String> {
+        self.create_device(name, system_image, form_factor, None)
+    }
+
+    /// [`Android::create`] following a hardware definition, as avdmanager's `-d` does: a
+    /// foldable's (`pixel_fold`, `surface_duo`; [`sim_core::fold::devices`]) screen and hinge.
+    pub fn create_device(
+        &self,
+        name: &str,
+        system_image: &str,
+        form_factor: Option<FormFactor>,
+        device: Option<&str>,
+    ) -> Result<DeviceInfo, String> {
+        let hardware = match device {
+            None => None,
+            Some(d) => Some(sim_core::fold::device(d).ok_or_else(|| {
+                let known: Vec<&str> = sim_core::fold::devices().iter().map(|d| d.id).collect();
+                format!("unknown device `{d}` (foldables: {})", known.join(", "))
+            })?),
+        };
+        let form_factor = match (form_factor, &hardware) {
+            (Some(f), Some(h)) if f != FormFactor::Foldable => return Err(format!("{} is a foldable, not {}", h.name, f.as_str())),
+            (None, Some(_)) => Some(FormFactor::Foldable),
+            (f, _) => f,
+        };
         let sysdir = sysdir_path(system_image)?;
         let tag = sysdir.split('/').nth(2).unwrap_or_default().to_owned();
         let image = android_profile(|k| (k == "tag.id").then(|| tag.clone())).kind.form_factor;
@@ -249,7 +273,17 @@ impl Android {
             let label = Kind::new(Platform::Android, image).map(|k| k.label()).unwrap_or_default();
             return Err(format!("system image `{system_image}` (tag `{tag}`) boots {label} devices, not {}", wanted.as_str()));
         }
-        self.env.create_avd(&NewAvd::for_profile(name, &sysdir, &kind.image_profile(&tag))).map_err(|e| e.to_string())?;
+        let mut profile = kind.image_profile(&tag);
+        if let Some(h) = &hardware {
+            profile = profile.with_screen(h.lcd.0, h.lcd.1, sim_core::form_factor::Density::Dpi(h.lcd.2));
+            if let Some(fold) = &mut profile.fold {
+                fold.angle = h.hinge.default;
+                if let Some(r) = h.hinge.folded {
+                    (fold.folded_width, fold.folded_height) = (r.width, r.height);
+                }
+            }
+        }
+        self.env.create_avd(&NewAvd::for_profile(name, &sysdir, &profile)).map_err(|e| e.to_string())?;
         Ok(self.describe(name, &[]).info)
     }
 
@@ -891,13 +925,35 @@ impl Device {
         }
     }
 
-    /// Sets a foldable's hinge angle (0 closed, 180 flat). Foldables only.
+    /// Sets a foldable's hinge angle (0 closed, 180 flat; a dual-screen turns on to 360, folded
+    /// back). The emulator checks it against the AVD's hinge range. Foldables only.
     pub fn fold(&self, angle: f32) -> Result<(), String> {
         self.require(InputMethod::Hinge, "folding")?;
-        if !(0.0..=180.0).contains(&angle) {
-            return Err(format!("hinge angle {angle} is outside 0-180"));
+        if !(0.0..=360.0).contains(&angle) {
+            return Err(format!("hinge angle {angle} is outside 0-360"));
         }
         self.console(&[format!("sensor set hinge-angle0 {angle}")]).map(drop)
+    }
+
+    /// Moves a foldable's hinge to `posture` (the console's `posture <id>`, as stock's). Foldables
+    /// only; the emulator refuses a posture the AVD's hinge doesn't have.
+    pub fn posture(&self, posture: sim_core::fold::StockPosture) -> Result<(), String> {
+        self.require(InputMethod::Hinge, "folding")?;
+        self.console(&[format!("posture {}", posture.id())]).map(drop)
+    }
+
+    /// Folds a foldable to its folded screen (the console's `fold`: a fold-in shut, a dual-screen
+    /// folded back), or unfolds it flat (`unfold`). Foldables only.
+    pub fn fold_display(&self, folded: bool) -> Result<(), String> {
+        self.require(InputMethod::Hinge, "folding")?;
+        self.console(&[if folded { "fold" } else { "unfold" }.to_owned()]).map(drop)
+    }
+
+    /// A foldable's hinge as the emulator has it (simee's `fold status`); None from an emulator
+    /// that doesn't say.
+    pub fn fold_state(&self) -> Result<Option<sim_core::fold::FoldState>, String> {
+        self.require(InputMethod::Hinge, "folding")?;
+        Ok(sim_core::fold::FoldState::parse(&self.console(&["fold status".into()])?))
     }
 
     /// Turns the rotary input (Wear OS crown or bezel) by `ticks` clicks, which the emulator
@@ -1195,6 +1251,23 @@ mod tests {
         let ids: Vec<&str> = rts.iter().map(|r| r.identifier.as_str()).collect();
         assert_eq!(ids, ["system-images;android-34;android-wear;arm64-v8a", "system-images;android-36;google_apis;arm64-v8a"]);
         assert_eq!((rts[1].name.as_str(), rts[1].version.as_str(), rts[1].platform), ("Android 36 (google_apis)", "36", Platform::Android));
+    }
+
+    #[test]
+    fn foldables_follow_their_hardware_definition() {
+        let f = fixture("foldables");
+        let image = "system-images;android-36;google_apis;arm64-v8a";
+        let duo = f.android.create_device("duo", image, None, Some("duo")).expect("duo");
+        assert_eq!(duo.form_factor, Some(FormFactor::Foldable), "a foldable without being told");
+        let avd = f.android.env.load("duo").expect("load");
+        assert_eq!((avd.lcd(), avd.get("hw.device.name")), ((2784, 1800, 401), Some("surface_duo")));
+        assert_eq!(avd.profile().fold.map(|f| (f.folded_width, f.folded_height)), Some((1350, 1800)));
+        f.android.create_device("pf", image, Some(FormFactor::Foldable), Some("pixel_fold")).expect("pixel fold");
+        assert_eq!(f.android.env.load("pf").expect("load").get("hw.displayRegion.0.1.height"), Some("2092"));
+        let err = f.android.create_device("x", image, Some(FormFactor::Tablet), Some("duo")).expect_err("not a tablet");
+        assert_eq!(err, "Dual-screen (Surface Duo-style) is a foldable, not tablet");
+        let err = f.android.create_device("x", image, None, Some("pixel_9")).expect_err("unknown");
+        assert_eq!(err, "unknown device `pixel_9` (foldables: pixel_fold, surface_duo)");
     }
 
     #[test]

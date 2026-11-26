@@ -28,7 +28,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("device_types", "", "List device types"),
     (
         "create",
-        "name, platform?(ios|android), form_factor?; iOS: device_type, runtime; Android: system_image",
+        "name, platform?(ios|android), form_factor?; iOS: device_type, runtime; Android: system_image, device?(pixel_fold|surface_duo)",
         "Create a device. form_factor is checked against the device type (iOS) or the system image (Android) and shapes a new AVD",
     ),
     ("delete", "device", "Delete a device"),
@@ -166,7 +166,11 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "device, orientation?(portrait|landscape-right|portrait-upside-down|landscape-left; iOS)",
         "Rotate the device 90° clockwise, or to an orientation (iOS)",
     ),
-    ("fold", "device, angle(0-180) | posture(closed|half-opened|opened)", "Set a foldable's hinge"),
+    (
+        "fold",
+        "device, folded(true|false) | angle(0-180; 0-360 dual-screen) | posture(closed|half-opened|opened|flipped|tent)",
+        "Set a foldable's hinge, as the console's fold, unfold and posture do: the hinge sensor, the posture and, folded, the outer screen; returns angle, posture, folded and the size the guest lays out for",
+    ),
     (
         "xr",
         "device, action(recenter | rotate|move: x, y, z | options: environment(day|night), passthrough(0-1) | input: mode(mouse|hand|eye) | viewport: mode(pan|zoom|rotate) | pointer: x, y, phase?(move|down|up|click) | hand|eye: x, y, press?(aim|press) | gesture: gesture(left-pinch|left-grab|left-poke|right-pinch|right-grab|right-poke))",
@@ -341,7 +345,9 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             match platform {
                 Platform::Ios => crate::ios::call(&mut s.ios, method, p),
                 Platform::Android => {
-                    let info = s.android.backend().create(need_str(p, "name")?, need_str(p, "system_image")?, form_factor)?;
+                    let device = crate::params::str_param(p, "device");
+                    let info =
+                        s.android.backend().create_device(need_str(p, "name")?, need_str(p, "system_image")?, form_factor, device)?;
                     serde_json::to_value(info).map_err(|e| e.to_string())
                 }
             }
@@ -486,7 +492,7 @@ mod tests {
         assert!(err.starts_with("folding needs a device with Hinge; watch is Wear OS · Watch"), "{err}");
         assert_eq!(
             call(&mut s, "fold", &json!({"device": "fold", "posture": "ajar"})).expect_err("posture"),
-            "unknown posture `ajar` (closed, half-opened, opened)"
+            "unknown posture `ajar` (closed, half-opened, opened, flipped, tent)"
         );
         assert_eq!(call(&mut s, "rotate", &json!({"device": "fold"})).expect_err("stopped"), "fold isn't running; boot it first");
         let err = call(&mut s, "rotate", &json!({"device": "fold", "orientation": "portrait"})).expect_err("iOS-only orientation");
@@ -551,6 +557,7 @@ mod tests {
             assert!(console.iter().any(|l| l == want), "{want} not in {console:?}");
         }
         assert!(console.iter().any(|l| l.starts_with("sensor set hinge-angle0 ")), "{console:?}");
+        assert!(console.iter().any(|l| l == "posture 2") && console.iter().any(|l| l == "fold status"), "postures as stock: {console:?}");
         assert_eq!(wait_for(&fake.display, 3)[..3], ["touch 10 20 down", "touch 10 20 up", "touch 5 6 down"]);
 
         // Form-factor checks happen before anything reaches the emulator.

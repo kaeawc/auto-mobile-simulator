@@ -416,6 +416,9 @@ pub fn android_profile(get: impl Fn(&str) -> Option<String>) -> Profile {
     }
     if let Some(fold) = &mut profile.fold {
         fold.angle = get("hw.sensor.hinge.defaults").and_then(|v| v.split(',').next()?.trim().parse().ok()).unwrap_or(180.0);
+        if let Some(region) = crate::fold::Hinge::from_config(&get).and_then(|h| h.folded) {
+            (fold.folded_width, fold.folded_height) = (region.width, region.height);
+        }
     }
     profile
 }
@@ -541,6 +544,14 @@ mod tests {
         let fold = avd(&[("tag.id", "google_apis"), ("hw.sensor.hinge", "yes"), ("hw.sensor.hinge.defaults", "90")]);
         assert_eq!((fold.kind.form_factor, fold.fold.map(|f| f.posture())), (FormFactor::Foldable, Some(Posture::HalfOpened)));
         assert_eq!(avd(&[("hw.device.name", "pixel_fold")]).kind.form_factor, FormFactor::Foldable);
+        let duo = avd(&[
+            ("hw.sensor.hinge", "yes"),
+            ("hw.displayRegion.0.1.xOffset", "0"),
+            ("hw.displayRegion.0.1.yOffset", "0"),
+            ("hw.displayRegion.0.1.width", "1350"),
+            ("hw.displayRegion.0.1.height", "1800"),
+        ]);
+        assert_eq!(duo.fold.map(|f| (f.folded_width, f.folded_height)), Some((1350, 1800)), "the folded region comes from the AVD");
         let wear = avd(&[("tag.id", "android-wear"), ("hw.device.name", "wearos_large_round")]);
         assert_eq!((wear.kind.sub_platform.as_str(), wear.shape), ("wearos", Shape::Round));
         assert_eq!(avd(&[("tag.id", "android-wear"), ("hw.device.name", "wearos_square")]).shape, Shape::Rectangle);
