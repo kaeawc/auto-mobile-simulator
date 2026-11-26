@@ -514,21 +514,29 @@ fn token_path() -> Option<PathBuf> {
 /// The auth token, creating one like the stock emulator does when the file is missing.
 /// An empty file disables authentication.
 fn auth_token() -> Option<String> {
-    let path = token_path()?;
-    match std::fs::read_to_string(&path) {
+    token_at(&token_path()?)
+}
+
+/// [`auth_token`] for the file at `path`.
+fn token_at(path: &std::path::Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
         Ok(t) => Some(t.trim().to_string()).filter(|t| !t.is_empty()),
         Err(_) => {
             let mut raw = [0u8; 12];
             use std::io::Read;
             std::fs::File::open("/dev/urandom").ok()?.read_exact(&mut raw).ok()?;
             let token: String = raw.iter().map(|b| format!("{b:02x}")).collect::<String>()[..16].to_string();
-            std::fs::write(&path, &token).ok()?;
+            std::fs::write(path, &token).ok()?;
             Some(token)
         }
     }
 }
 
 pub fn serve(port: u16, info: ConsoleInfo) -> Result<()> {
+    // Before any client can connect, as stock makes it at startup: a client reads the token file
+    // first, and one made by its own connection would leave it unauthenticated (every command
+    // then answers `KO: unknown command`).
+    let _ = auth_token();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).with_context(|| format!("binding console port {port}"))?;
     let info = Arc::new(info);
     std::thread::Builder::new().name("console".into()).spawn(move || {
@@ -862,6 +870,23 @@ mod tests {
 
     fn run(info: &ConsoleInfo, line: &str) -> String {
         command(info, &line.split_whitespace().collect::<Vec<_>>())
+    }
+
+    /// The token exists, as stock's does, before a client reads it: a missing file gets one (16 hex
+    /// digits), an existing one is kept, and an empty one turns authentication off.
+    #[test]
+    fn the_auth_token_is_made_once_and_kept() {
+        let dir = std::env::temp_dir().join(format!("emu-console-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join(".emulator_console_auth_token");
+        let _ = std::fs::remove_file(&path);
+        let made = token_at(&path).expect("made");
+        assert!(made.len() == 16 && made.bytes().all(|b| b.is_ascii_hexdigit()), "{made}");
+        assert_eq!(std::fs::read_to_string(&path).expect("written"), made);
+        assert_eq!(token_at(&path).as_deref(), Some(made.as_str()), "kept");
+        std::fs::write(&path, "").expect("empty");
+        assert_eq!(token_at(&path), None, "an empty file turns authentication off");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Round trips through the real console server, as `adb emu` and simee make them: one TCP
