@@ -198,6 +198,47 @@ pub fn boot_many(s: &mut Session, p: &Value, udids: &[String]) -> Result<Value, 
         "unsettled": 0, "devices": devices}))
 }
 
+/// `import`: the bundle at `from` as a new AVD `name`, its system image found by content (with
+/// `allow_mismatch`, another revision of it). The result says that the import keeps the exported
+/// device's guest identity, which `config.ini` keys it dropped, and any revision mismatch.
+pub fn import(s: &mut Session, p: &Value) -> Result<Value, String> {
+    let (from, name) = (need_str(p, "from")?, need_str(p, "name")?);
+    let allow_mismatch = opt_bool(p, "allow_mismatch")?.unwrap_or(false);
+    let (info, im) = s.backend().import_avd(std::path::Path::new(from), name, allow_mismatch)?;
+    Ok(json!({
+        "device": info,
+        "system_image": im.sysdir,
+        "mismatch": im.mismatch,
+        "dropped": im.dropped,
+        "extracted": im.extracted,
+        "exported_as": im.manifest.device.name,
+        "guest_identity": im.manifest.guest_identity,
+        "note": sim_android::bundle::DUPLICATED_IDENTITY,
+        "resume": im.manifest.resume,
+    }))
+}
+
+/// `contrast_check` on an AVD: its screen and its density; the appearance isn't switchable yet.
+struct ContrastTarget<'a>(&'a sim_android::Device);
+
+impl crate::contrast::Target for ContrastTarget<'_> {
+    fn capture(&mut self) -> Result<sim_core::frame::Frame, String> {
+        self.0.screenshot()
+    }
+
+    fn scale(&mut self) -> Option<f64> {
+        use sim_core::form_factor::Density;
+        Some(match self.0.profile().ok()?.density {
+            Density::Dpi(dpi) => f64::from(dpi) / 160.0,
+            Density::Scale(n) => f64::from(n),
+        })
+    }
+
+    fn set_appearance(&mut self, _: crate::contrast::Mode) -> Result<(), String> {
+        Err("appearance switching isn't available on Android devices yet".into())
+    }
+}
+
 /// Dispatches one device method for the AVD named `udid`.
 pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Value, String> {
     let android = s.backend().clone();
@@ -227,6 +268,22 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             let info = android.clone_avd(&d.info.udid, need_str(p, "name")?)?;
             serde_json::to_value(info).map_err(|e| e.to_string())
         }
+        "export" => {
+            let to = need_str(p, "to")?;
+            let ex = android.export_avd(&d, std::path::Path::new(to))?;
+            let m = &ex.manifest;
+            Ok(json!({
+                "device": d.info.udid,
+                "to": to,
+                "summary": ex.summary,
+                "identity": m.identity,
+                "captures": m.captures,
+                "resume": m.resume,
+                "secrets": m.secrets,
+                "guest_identity": m.guest_identity,
+                "dropped": m.dropped,
+            }))
+        }
         "shutdown" => null(d.shutdown()),
         // The guest's layout, which tap, swipe and touch take (a folded foldable's outer screen).
         "screen" => d.layout_size().map(|(w, h)| json!({"width": w, "height": h})),
@@ -235,6 +292,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             Some(path) => d.screenshot_png_to(std::path::Path::new(path)).map(|(w, h)| json!({"path": path, "width": w, "height": h})),
             None => d.screenshot_png().and_then(|(w, h, png)| png_result(w, h, png, p)),
         },
+        "contrast_check" => crate::contrast::run(&mut ContrastTarget(&d), p),
         "tap" => null(d.play(&tap_samples(p, TAP_HOLD)?)),
         "swipe" => null(d.play(&swipe_samples(p)?)),
         "touch" => {

@@ -14,7 +14,7 @@ pub const VIEW_TOOL: &str = "device_view";
 /// Methods that can run for many seconds: a client that declares the Tasks extension gets a task
 /// handle for these, and everything else a progress heartbeat while the call blocks. A method not
 /// listed runs inline. (`provision` and `record` aren't API methods, so they aren't tools.)
-pub const LONG_RUNNING: &[&str] = &["boot", "boot_many", "create", "clone", "install", "settle", "erase", "shutdown"];
+pub const LONG_RUNNING: &[&str] = &["boot", "boot_many", "create", "clone", "install", "settle", "erase", "shutdown", "export", "import"];
 
 /// What a method does to a device or the host, for the annotations a client's approval prompts
 /// read. Every method in the table is classified here on purpose (a test fails for one that isn't),
@@ -38,6 +38,8 @@ enum Effect {
 fn effect(method: &str) -> Option<Effect> {
     use Effect::*;
     Some(match method {
+        "prefs_stores" | "prefs_read" | "prefs_watch" => Read,
+        "prefs_write" | "prefs_delete" | "prefs_batch" => Destroy,
         "help" | "identity" | "form_factors" | "devices" | "runtimes" | "device_types" | "screen" | "screenshot" | "apps"
         | "ca_debug_state" | "logs" | "processes" | "connections" | "traffic" | "containers" | "ls" | "read" | "du" | "crash_reports"
         | "info" | "defaults_read" | "network_state" | "network_flows" | "network_env" | "audio_state" | "settle" | VIEW_TOOL => Read,
@@ -46,10 +48,11 @@ fn effect(method: &str) -> Option<Effect> {
         | "audio_mute" | "fold" | "carplay" | "profile" | "privacy" => Set,
         "create" | "boot" | "boot_many" | "clone" | "tap" | "swipe" | "touch" | "button" | "type" | "key" | "open_url" | "install"
         | "memory_warning" | "notify" | "biometric" | "rotate" | "rotary" | "watch_gesture" | "remote_swipe" | "xr" | "touchpad"
-        | "stylus" | "pointer" | "vehicle" | "audio_capture_stop" => Act,
+        | "stylus" | "pointer" | "vehicle" | "audio_capture_stop" | "contrast_check" | "import" => Act,
         // Runs programs, starts apps with an environment, replaces a network profile (inject "boot"
-        // reboots the device), delivers a payload, writes a recording to a path, drives the console.
-        "exec" | "launch" | "push" | "network_shape" | "console" | "audio_capture_start" | "kill" => Danger,
+        // reboots the device), delivers a payload, writes a recording or a bundle to a path, drives
+        // the console.
+        "exec" | "launch" | "push" | "network_shape" | "console" | "audio_capture_start" | "kill" | "export" => Danger,
         "delete" | "erase" | "shutdown" | "rm" | "uninstall" | "terminate" | "reset_keychain" | "clear_container" | "write"
         | "defaults_write" => Destroy,
         _ => return None,
@@ -59,7 +62,19 @@ fn effect(method: &str) -> Option<Effect> {
 /// Parameters the API takes but a tool doesn't: `screenshot`'s `path` writes a file anywhere on the
 /// host, which a client that auto-approves read-only tools must not be able to ask for. The image
 /// comes back in the result instead.
-const WITHHELD: &[(&str, &str, &str)] = &[("screenshot", "path", "The device's screen as a PNG image, returned in the result")];
+const WITHHELD: &[(&str, &str, &str)] = &[
+    ("screenshot", "path", "The device's screen as a PNG image, returned in the result"),
+    (
+        "contrast_check",
+        "path",
+        "Text and controls below WCAG contrast in a screenshot, from pixels alone: finds text-like regions, estimates each one's foreground and \
+         background, and reports those under 4.5:1 (normal text) or 3:1 (large text of about 18 pt, icons and controls) with their box, the \
+         two colours and the ratio. The screenshot with the findings boxed comes back as an image (one per appearance with appearance both, \
+         which on iOS checks the light and the dark UI, then leaves the device in `restore`; Android can't switch appearance yet). Text over \
+         a photo or a busy background has no one background and isn't judged. region is {x, y, width, height} in pixels; scale is pixels per \
+         point (default: the device's, else 1)",
+    ),
+];
 
 fn withheld(method: &str) -> Option<&'static str> {
     WITHHELD.iter().find(|(m, ..)| *m == method).map(|(_, p, _)| *p)
@@ -178,12 +193,38 @@ pub fn result(name: &str, outcome: Result<Value, String>, era: Era) -> Value {
         return json!({"content": [{"type": "image", "data": png, "mimeType": "image/png"},
             {"type": "text", "text": meta.to_string()}], "structuredContent": meta});
     }
+    if name == "contrast_check" {
+        return contrast_result(value);
+    }
     let text = if value.is_null() { "ok".to_owned() } else { value.to_string() };
     let mut result = json!({"content": [{"type": "text", "text": text}]});
     if !value.is_null() {
         result["structuredContent"] = if era == Era::Modern || value.is_object() { value } else { json!({"result": value}) };
     }
     result
+}
+
+/// `contrast_check`'s outcome: each annotated PNG (one, or one per appearance) becomes an image block
+/// and the findings stay as JSON text and `structuredContent`, so a client never reads a megabyte of
+/// base64 as text.
+fn contrast_result(mut value: Value) -> Value {
+    let mut images = Vec::new();
+    let mut lift = |v: &mut Value, label: &str| {
+        if let Some(png) = v.as_object_mut().and_then(|o| o.remove("png")).and_then(|p| p.as_str().map(str::to_owned)) {
+            images.push(json!({"type": "image", "data": png, "mimeType": "image/png"}));
+            v["image"] = json!(images.len() - 1);
+            v["image_of"] = json!(label);
+        }
+    };
+    lift(&mut value, "screen");
+    if let Some(each) = value.get_mut("appearances").and_then(Value::as_object_mut) {
+        for (mode, v) in each.iter_mut() {
+            lift(v, mode);
+        }
+    }
+    let mut content = vec![json!({"type": "text", "text": value.to_string()})];
+    content.extend(images);
+    json!({"content": content, "structuredContent": value})
 }
 
 /// What a tool call needs from the request to decide how to run: its name and arguments, checked.
@@ -356,6 +397,23 @@ mod tests {
         let shot = result("screenshot", Ok(json!({"width": 2, "height": 1, "png": "iVBOR"})), Era::Modern);
         assert_eq!(shot["content"][0], json!({"type": "image", "data": "iVBOR", "mimeType": "image/png"}));
         assert_eq!(shot["structuredContent"], json!({"width": 2, "height": 1}));
+        // A contrast check's PNGs become image blocks and leave the text a few lines of findings.
+        let check = result(
+            "contrast_check",
+            Ok(json!({"failing": 1, "appearances": {"light": {"png": "AAA", "findings": []}, "dark": {"png": "BBB", "findings": []}}})),
+            Era::Modern,
+        );
+        // `image` is a result's place among the image blocks (JSON objects have no order to lean on).
+        let at = |mode: &str| check["structuredContent"]["appearances"][mode]["image"].as_u64().expect("image") as usize + 1;
+        assert_eq!(check["content"][at("light")], json!({"type": "image", "data": "AAA", "mimeType": "image/png"}));
+        assert_eq!(check["content"][at("dark")]["data"], "BBB");
+        assert_ne!(at("light"), at("dark"));
+        assert!(!check["content"][0]["text"].as_str().expect("text").contains("AAA"));
+        let single = result("contrast_check", Ok(json!({"png": "CCC", "findings": []})), Era::Modern);
+        assert_eq!(
+            (single["content"][1]["data"].clone(), single["structuredContent"]["image_of"].clone()),
+            (json!("CCC"), json!("screen"))
+        );
         // Written to a path, a screenshot is plain data.
         let path = result("screenshot", Ok(json!({"path": "/tmp/x.png", "width": 2, "height": 1})), Era::Modern);
         assert_eq!(path["structuredContent"]["path"], "/tmp/x.png");

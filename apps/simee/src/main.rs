@@ -184,6 +184,18 @@ enum Cmd {
     /// Create a device as a copy of a shut-down one (iOS: a simulator; Android: an AVD from a
     /// golden booted once under simee); prints its UDID (an AVD's name).
     Clone { template: String, name: String },
+    /// Android: pack a shut-down AVD into a portable bundle (a .tar file, else a new directory)
+    /// with no host path in it; prints its sizes. iOS: not yet.
+    Export { device: String, to: String },
+    /// Android: create AVD `name` from a bundle, its system image found by content; prints its
+    /// name. The import keeps the exported device's guest identity (ro.serialno, android_id).
+    Import {
+        from: String,
+        name: String,
+        /// Use another installed revision of the same system image (API level, tag, ABI).
+        #[arg(long)]
+        allow_mismatch: bool,
+    },
     /// Shut a device down.
     Shutdown { device: String },
     /// Erase all content and settings (device must be shut down).
@@ -694,6 +706,37 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             let d = call("clone", json!({"device": template, "name": name}))?;
             writeln!(out, "{}", text(&d["udid"]))?;
         }
+        Cmd::Export { device, to } => {
+            let r = call("export", json!({"device": device, "to": absolute(&to)}))?;
+            let s = &r["summary"];
+            writeln!(
+                out,
+                "{} disk_bytes={} allocated_bytes={} zero_bytes={} unique_bytes={} bundle_bytes={} chunks={} unique_chunks={} seconds={}",
+                text(&r["to"]),
+                s["disk_bytes"],
+                s["allocated_bytes"],
+                s["zero_bytes"],
+                s["unique_bytes"],
+                s["bundle_bytes"],
+                s["chunks"],
+                s["unique_chunks"],
+                s["seconds"]
+            )?;
+            for d in items(&r["dropped"]) {
+                writeln!(err, "simee: left out {}", text(d))?;
+            }
+        }
+        Cmd::Import { from, name, allow_mismatch } => {
+            let r = call("import", json!({"from": absolute(&from), "name": name, "allow_mismatch": allow_mismatch}))?;
+            writeln!(out, "{}", text(&r["device"]["udid"]))?;
+            writeln!(err, "simee: {}", text(&r["note"]))?;
+            if r["mismatch"].is_string() {
+                writeln!(err, "simee: {}", text(&r["mismatch"]))?;
+            }
+            for d in items(&r["dropped"]) {
+                writeln!(err, "simee: left out {}", text(d))?;
+            }
+        }
         Cmd::Shutdown { device } => drop(call("shutdown", json!({"device": device}))?),
         Cmd::Erase { device } => drop(call("erase", json!({"device": device}))?),
         // To stdout: the PNG comes back raw (a binary reply from a server), never as base64.
@@ -1058,6 +1101,8 @@ mod tests {
             "settle",
             "profile",
             "clone",
+            "export",
+            "import",
         ] {
             assert!(sim_api::METHODS.iter().any(|(name, ..)| *name == m), "{m}");
         }

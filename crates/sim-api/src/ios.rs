@@ -624,6 +624,30 @@ fn capture(s: &mut Session, p: &Value) -> Result<sim_core::frame::Frame, String>
     }
 }
 
+/// `contrast_check` on a simulator: its screen, its scale, and `appearance`'s two modes.
+struct ContrastTarget<'a> {
+    s: &'a mut Session,
+    p: &'a Value,
+}
+
+impl crate::contrast::Target for ContrastTarget<'_> {
+    fn capture(&mut self) -> Result<sim_core::frame::Frame, String> {
+        capture(self.s, self.p)
+    }
+
+    fn scale(&mut self) -> Option<f64> {
+        self.s.device(self.p).ok()?.device_type().ok().map(|t| t.screen_scale).filter(|s| *s > 0.0)
+    }
+
+    fn set_appearance(&mut self, mode: crate::contrast::Mode) -> Result<(), String> {
+        let mode = match mode {
+            crate::contrast::Mode::Light => Appearance::Light,
+            crate::contrast::Mode::Dark => Appearance::Dark,
+        };
+        self.s.device(self.p)?.set_appearance(mode).map_err(err)
+    }
+}
+
 /// The simulators to resolve a `device` across platforms with: what selection reads of each.
 pub fn selection_infos(s: &mut Session) -> Result<Vec<sim_core::device::DeviceInfo>, String> {
     s.ctx()?.selection_infos().map_err(err)
@@ -1596,6 +1620,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         }
         // Captured on the device's worker, encoded here: the worker is free for input meanwhile.
         "screenshot" => screenshot_result(&capture(s, p)?, p),
+        "contrast_check" => crate::contrast::run(&mut ContrastTarget { s, p }, p),
         m if INPUT_METHODS.contains(&m) => input(s, m, p),
         "rotate" => rotate(&s.device(p)?, opt_orientation(p)?),
         "fold" => {

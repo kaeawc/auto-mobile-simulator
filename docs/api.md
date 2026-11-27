@@ -90,10 +90,13 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `settle` | iOS | device, cpu_pct?, window_s?, foreground?(true), timeout_s?(600) | Wait until a booted simulator is quiet: its processes under cpu_pct (10) % of a core for window_s (10) s (foreground, the default: only foreground-QoS CPU counts), SpringBoard running; returns settle_s, cpu_pct, foreground_cpu_pct and background_cpu_pct, and cpu_s and background_cpu_s (CPU-seconds used since the first sample) |
 | `profile` | iOS | device, name(slim), undo? | Turn a named set of daemons off on a booted simulator (disabled in its launchd database and stopped: stays off across reboots), or with undo back on (from the next boot); returns how many changed, those that failed and those that weren't loaded |
 | `clone` | Android, iOS | device, name | Create a device as a copy of a shut-down one. iOS: a simulator (data, settings, apps; APFS clones of its files); Android: an AVD from a golden that has booted under simee (copy-on-write clones of its disks). A booted-once template's copies skip the first-boot work |
+| `export` | Android | device, to | Pack a shut-down device into a portable bundle at `to` (a .tar file, else a new directory) with no host path in it: manifest.json and content-addressed chunks (1 MiB, BLAKE3, each LZ4-compressed; zero ranges stored as extents). Android: an AVD that has booted under simee (its simee disks, config.ini without host paths, boot.prop) and its system image's identity; captures disks, not RAM (resume is a cold boot). Returns sizes, the identity and the secrets inventory. iOS simulators: not yet (the next step of #170) |
+| `import` | Android | from, name, allow_mismatch?(false) | Create device `name` from a bundle `export` wrote. Android: finds the system image by content (API, tag, ABI, revision, BLAKE3 of its images, fingerprint) and refuses, naming what to install, when none matches (allow_mismatch: use another installed revision of the same API, tag and ABI, named in `mismatch`); checks every chunk and disk hash; drops config.ini keys holding host paths (listed in `dropped`); writes nothing unless it all succeeds. The import keeps the exported device's guest identity (ro.serialno, android_id). iOS: not yet |
 | `shutdown` | Android, iOS | device | Shut down |
 | `erase` | iOS | device | Erase content and settings (shut down first) |
 | `screen` | Android, iOS | device, display?(main\|outer\|inner\|carplay) | Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds). display (iOS): main is the screen in use (an unfolded iPhone Duo's inner one), outer and inner an iPhone Duo's two, carplay an iPhone's CarPlay screen |
 | `screenshot` | Android, iOS | device, path?, display?(main\|outer\|inner\|carplay) | PNG to path, else base64 in `png` (a folded Android foldable: its outer screen as the scanout shows it, a Pixel Fold's 949x1840; an iPhone Duo's inner screen as its framebuffer holds it, 2007x2853) |
+| `contrast_check` | Android, iOS | device, region?, scale?, appearance?(both), restore?(light\|dark), settle_ms?(500), path?, display?(main\|outer\|inner\|carplay) | Text and controls below WCAG contrast in a screenshot, from pixels alone: finds text-like regions, estimates each one's foreground and background, and reports those under 4.5:1 (normal text) or 3:1 (large text of about 18 pt, icons and controls) with their box, the two colours and the ratio, and the screenshot with the findings boxed (`png`, or written to path). Text over a photo or a busy background has no one background and isn't judged. appearance both (iOS) checks the light and the dark UI (switches, waits settle_ms, checks) and leaves the device in restore (default light); Android can't switch appearance yet. region is {x, y, width, height} in pixels; scale is pixels per point (default: the device's, else 1) |
 | `tap` | Android, iOS | device, x, y, hold_ms?, display?(main\|outer\|inner\|carplay) | Tap at pixels, held hold_ms (default: iOS 10, Android 60) (display, iOS only: an iPhone Duo's outer or inner screen, an iPhone's CarPlay screen) |
 | `swipe` | Android, iOS | device, x1, y1, x2, y2, duration_ms?, settle?, display?(main\|outer\|inner\|carplay), edge?(top\|bottom\|left\|right; iOS) | Swipe between pixels over duration_ms (default 300; iOS sends its samples on schedule, so a busy host doesn't stretch it); with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: home and the app switcher from the bottom, Notification Center and Control Center from the top (Android's edge gestures need only the start point) |
 | `touch` | Android, iOS | device, x, y, phase(down\|move\|up), display?(main\|outer\|inner\|carplay), edge?(top\|bottom\|left\|right; iOS) | One raw touch sample |
@@ -103,7 +106,7 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `open_url` | Android, iOS | device, url | Open a URL (Android: `am start -a VIEW`) |
 | `install` | Android, iOS | device, path | Install an .app (Android: an .apk with `adb install -r`, an .aab through bundletool when it is on the PATH) |
 | `uninstall` | Android, iOS | device, bundle_id | Uninstall an app (Android: the package name; `pm uninstall`) |
-| `launch` | Android, iOS | device, bundle_id, restart?; iOS: args?, env?, shaped? | Launch (iOS: with arguments and environment, shaped injecting the network shaper; Android: the package's launcher activity); restart: terminate a running instance first, default true (Android: `am start -S`); false brings a running app to the front; returns pid |
+| `launch` | Android, iOS | device, bundle_id, restart?; iOS: args?, env?, shaped? | Launch (iOS: with arguments and environment, shaped injecting the network shaper; Android: the package's launcher activity); restart: terminate a running instance first, default true (Android: `am start -S`); false brings a running app to the front; returns pid (Android: and the `activity` it started) |
 | `terminate` | Android, iOS | device, bundle_id | Terminate an app (Android: `am force-stop`) |
 | `apps` | Android, iOS | device; Android: all? | Installed bundle ids (Android: the third-party packages, with all the system's too) |
 | `appearance` | iOS | device, mode(light\|dark) | Light or dark UI |
@@ -139,6 +142,12 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `clear_container` | iOS | device, path | Empty a container (an app's data) without deleting it |
 | `defaults_read` | iOS | device, domain | Read a preferences domain |
 | `defaults_write` | iOS | device, domain, key, value, type? | Write a preference (type: string\|int\|float\|bool) |
+| `prefs_stores` | Android, iOS | device, bundle_id | An app's preference stores, each with the id the other prefs_* methods take: Android `shared_prefs/<name>.xml` and DataStore `datastore/<name>.preferences_pb`, iOS the app's domain (its bundle id) and its app-group suites; any other iOS domain is reachable by its name |
+| `prefs_read` | Android, iOS | device, bundle_id, store? | Every key of an app's preference stores (or one) with its typed value, {type, value}: string, int, long, float, double, bool, string_set (Android), date (ISO 8601), data (base64), array and dictionary (iOS; of typed values), and the read-only unsupported {native, raw} for what no type holds exactly. iOS reads integers as long and reals as double. Without store, each store answers {store, values} or {store, error} |
+| `prefs_write` | Android, iOS | device, bundle_id, store, key, value, type(string\|int\|long\|float\|double\|bool\|string_set\|date\|data\|array\|dictionary) | Set one key to a typed value (refused when the value isn't of its type or the store can't hold the type); visible says whether the app sees it now or after_relaunch, app what was done to the app for it (untouched, stopped, relaunched: a running Android app writes its old values back over the file), with a note on why |
+| `prefs_delete` | Android, iOS | device, bundle_id, store, key | Remove one key; visible and app as prefs_write's |
+| `prefs_batch` | Android, iOS | device, bundle_id, store, ops([{key, type, value} \| {key, delete: true}]) | Set and remove several keys of one store, all or nothing: every op is checked first (each key once), then the store is written once or not at all |
+| `prefs_watch` | Android, iOS | device, bundle_id, store?, cursor?, wait_ms? | Changes to an app's preference stores (or one), as `logs` stream does: the first call starts a feed in this process and returns a cursor; a call with it returns the changes since, {store, key, old, new, at}, oldest first, waiting up to wait_ms (at most 60000) for one, and the next cursor (reset: the feed restarted, re-read; missed: changes dropped unread past its 16 MiB; ended: the device stopped or nobody read it for 5 minutes, and a call without a cursor starts anew) |
 | `crash_reports` | iOS | device | Host crash reports for this device |
 | `info` | Android, iOS | device | Paths and identity |
 | `network_shape` | iOS | device, preset?(offline\|3g\|edge\|lte\|lossy\|very-bad\|none), offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?, port_base?, port_count?, rules?([{pattern, offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?}]), proxy?(default true), inject?(false\|true\|"launchd"\|"boot") | Shape the device's network without root. proxy: a shaping HTTP/SOCKS proxy set in the device's configd_sim. inject: an in-process socket shaper; "boot" reboots the device with it in launchd's environment so every process, WebKit included, is shaped live by the profile |
@@ -164,3 +173,109 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `remote_swipe` | iOS | device, direction(up\|down\|left\|right), duration_ms? | Swipe on the Siri Remote's touch surface (Apple TV) |
 | `pointer` | iOS | device, x, y, action?(move\|click\|down\|up), button?(primary\|secondary), hold_ms? \| x, y, to_x, to_y, button? (a drag) | The iPad's pointer (a mouse, as Simulator.app's pointer capture connects): move it to pixels and hover there, click, press or release a button there, or drag to to_x, to_y. Exact on iOS 26.5, within ~20 pt on 27.2. A button held by `down` keeps the pointer's place for the next calls on a server (`simee serve`) until a reboot. Refused: `down` without a server (the process ends with the call: use `click` or a drag), `up` with nothing held, and `move`/`up` after a failed call lost the held button (`click`, `down` or a drag lets go and starts over) |
 | `carplay` | iOS | device, on | Attach (or detach) the CarPlay display to a booted iPhone (iOS 26 runtimes); then tap/swipe/screenshot with display=carplay |
+
+## App preferences (`prefs_*`)
+
+One typed API over Android SharedPreferences and DataStore preferences and iOS user defaults,
+with no SDK in the app (`crates/sim-api/src/prefs.rs`). The iOS and Android backends are still
+being written: until a platform's lands, every `prefs_*` call on its devices checks its parameters
+and then fails with "app preferences (`prefs_*`) are not yet available on <platform> devices".
+`defaults_read` and `defaults_write` are unchanged.
+
+**Stores.** `prefs_stores {device, bundle_id}` lists the app's stores as
+`{id, kind, name, bundle_id, platform}` (`bundle_id` is the Android package name on Android); the
+other methods name a store by its `id`:
+
+| kind | Platform | id | Holds |
+| --- | --- | --- | --- |
+| `shared_preferences` | Android | `shared_prefs/<name>.xml` | string, int, long, float, bool, string_set |
+| `datastore` | Android | `datastore/<name>.preferences_pb` | string, int, long, float, double, bool, string_set, data (DataStore 1.1's `byteArrayPreferencesKey`) |
+| `app_domain` | iOS | the bundle id | string, int, long, float, double, bool, date, data, array, dictionary |
+| `app_group` | iOS | the suite, `group.…` | as `app_domain` |
+| `domain` | iOS | any other domain name | as `app_domain` |
+
+**Values.** Every value travels with its type, `{"type": <type>, "value": <value>}`, so an `int`
+comes back an `int` and a `long` a `long`:
+
+```text
+{"type": "string", "value": "Ada"}
+{"type": "int", "value": 3}                       32-bit
+{"type": "long", "value": 9007199254740993}       64-bit
+{"type": "float", "value": 0.1}                   32-bit; also "NaN", "Infinity", "-Infinity"
+{"type": "double", "value": 2.5}                  64-bit; the same three strings
+{"type": "bool", "value": true}
+{"type": "string_set", "value": ["a", "b"]}       sorted, each string once
+{"type": "date", "value": "2026-11-27T10:00:00.25Z"}   ISO 8601 in (any offset), UTC out, to the nanosecond
+{"type": "data", "value": "AAEC"}                 standard base64
+{"type": "array", "value": [{"type": "int", "value": 1}]}
+{"type": "dictionary", "value": {"k": {"type": "bool", "value": true}}}
+{"type": "unsupported", "value": {"native": "integer", "raw": "18446744073709551615"}}
+```
+
+An array's elements and a dictionary's values are typed values too, nested to any depth.
+
+- **iOS keeps no width.** A plist has one integer and one real, so an iOS store reads every
+  integer as `long` and every real as `double`, whatever wrote it: `int` and `long` write an
+  integer, `float` and `double` a real.
+- **`unsupported`** is what a store holds that no type here holds exactly: a plist integer past 64
+  bits (Swift's `UInt64.max`), a SharedPreferences `<double>` or `<null>` element that another
+  tool wrote (Android's own API writes neither). It carries the platform's name for the type
+  (`native`) and the text as stored (`raw`). It is read-only: a write or batch op naming it is
+  refused.
+
+`prefs_read {device, bundle_id, store?}` answers `[{store, values: {<key>: <typed value>}}]`. With
+`store`, an unreadable store fails the call. Without it, every store of the app answers on its own,
+`{store, values}` or `{store, error}`, so one unreadable store doesn't hide the others.
+
+**Writes.** `prefs_write {device, bundle_id, store, key, type, value}` and `prefs_delete {device,
+bundle_id, store, key}` answer `{store, key, visible, app, note?}`. A write is refused before
+anything is written when the value isn't exactly of its type (a fraction for an `int`, a number
+past its range, a string for a `bool`, an untyped array element) or the store can't hold the type
+(a `double` in SharedPreferences, a `string_set` on iOS); errors name the value (`value[2].value`,
+`ops[1].value`).
+
+- `visible`: `now` when the app sees the write at once (a running app it reached, or an app that
+  wasn't running, or was stopped for the write, and reads it when it starts), or `after_relaunch`
+  when a running app sees it only once relaunched.
+- `app`: what was done to the app for the write: `untouched` (it wasn't running, or the write
+  reached it where it runs), `stopped` (it was running and was stopped for the write; it stays
+  stopped), or `relaunched` (stopped, written, launched again).
+- `note` says why when the app was stopped or sees it only after a relaunch.
+
+On Android a running app keeps its preferences in memory and writes the whole copy back on its
+next `apply`/`commit` (SharedPreferences) or update (single-process DataStore), over a write made
+under it. So an Android write can't promise `after_relaunch` to a running app: it stops the app,
+writes, and says whether it relaunched it.
+
+**Batches.** `prefs_batch {device, bundle_id, store, ops}` takes `{key, type, value}` sets and
+`{key, delete: true}` deletes and is all or nothing: every op is checked first (each key at most
+once), and the backend then writes the store once with all of them, or fails with none applied.
+It answers `{store, keys, visible, app, note?}`.
+
+**Watching.** `prefs_watch {device, bundle_id, store?, cursor?, wait_ms?}` works like `logs`'
+`stream`: the first call (no `cursor`) starts a feed of the app's stores (or one) in the process
+that answers (a `simee serve` keeps it between commands) and returns `{cursor, events: []}`. A call
+with that cursor returns the changes since, oldest first, and the next cursor:
+
+```text
+→ {"method": "prefs_watch", "params": {"device": "pixel", "bundle_id": "com.example", "cursor": "3:0", "wait_ms": 30000}}
+← {"id":null,"ok":true,"result":{"cursor":"3:2","events":[
+    {"store":"shared_prefs/com.example_preferences.xml","key":"launches","old":{"type":"int","value":3},"new":{"type":"int","value":4},"at":"2026-11-27T10:00:01Z"},
+    {"store":"shared_prefs/com.example_preferences.xml","key":"token","old":{"type":"string","value":"x"},"new":null,"at":"2026-11-27T10:00:02Z"}]}}
+```
+
+- `old` is `null` for a key that was added, `new` for one that was removed; a write that changes
+  nothing reports nothing. Changes come from whoever made them: the app, these methods, another
+  tool.
+- A feed's own thread takes changes as the backend sends them, so a call returns what has
+  arrived. With nothing new, it waits up to `wait_ms` (at most 60000) for a change. Callers
+  sharing a feed don't hold each other up: one waiting doesn't delay another's read.
+- `missed: <n>`: the feed keeps the latest 16 MiB of changes (by their values' sizes), and `n`
+  older ones went unread.
+- `reset: true`: the cursor isn't this feed's (it stopped and another started); the new cursor
+  starts now, and changes in between may be lost, so read the store again.
+- `ended: true`: the feed has ended, because the device stopped or nobody read it for 5 minutes
+  (it then drops what it kept). A call with its cursor still gets what it had; a call without a
+  cursor starts a new feed.
+- To follow a store from a known state: `prefs_watch` first, then `prefs_read`, then poll with the
+  cursor; a change made during the read is in the feed.
