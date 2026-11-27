@@ -184,6 +184,16 @@ pub(crate) fn default_symbol(name: &CStr) -> Result<NonNull<c_void>> {
     NonNull::new(ptr).ok_or_else(|| Error::Unavailable(format!("symbol {}", name.to_string_lossy())))
 }
 
+/// The NSString an exported `NSString *const` data symbol (a framework's dictionary key, say)
+/// points to.
+pub(crate) fn string_symbol(name: &CStr) -> Result<Obj> {
+    let symbol = default_symbol(name)?;
+    // SAFETY: callers name `NSString *const` data symbols; read the pointer it holds.
+    let key = unsafe { symbol.as_ptr().cast::<*mut AnyObject>().read() };
+    // SAFETY: the key is a constant string (or nil), valid for the process' lifetime.
+    unsafe { Retained::retain(key) }.ok_or_else(|| Error::Unavailable(format!("{} has no value", name.to_string_lossy())))
+}
+
 /// Reads a string-valued property; empty when missing, nil or not a string.
 pub(crate) fn string_prop(obj: &AnyObject, sel: Sel) -> String {
     if !responds(obj, sel) {
@@ -264,6 +274,16 @@ pub(crate) fn string_dictionary(pairs: &[(String, String)]) -> Obj {
     let dict = mutable_dictionary();
     for (k, v) in pairs {
         dict_set(&dict, k, &nsstring(v));
+    }
+    dict
+}
+
+/// A dictionary of string → BOOL `NSNumber` (which a property list writes as `<true/>` /
+/// `<false/>`, where an integer would be `<integer>`).
+pub(crate) fn bool_dictionary(pairs: &[(String, bool)]) -> Obj {
+    let dict = mutable_dictionary();
+    for (k, v) in pairs {
+        dict_set(&dict, k, &nsbool(*v));
     }
     dict
 }

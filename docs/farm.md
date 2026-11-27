@@ -168,10 +168,19 @@ plist of label → bool, one file for all of the device's domains, read when it 
 the device's data directory. That is why a clone, a new UDID, starts with none. `boot --profile`
 of a shut-down device writes the profile's labels into that file before the boot
 (`sim_core::launchd`, keeping the file's other overrides; the result's `profile.preset` counts the
-labels it added), so the boot never starts those jobs, and the profile applied after the boot
-finds them all off and only reads `launchctl list` and `print-disabled`. On a runtime whose
-launchd keeps the file elsewhere the profile still applies the old way after the boot. `delete`
-also removes that directory (the service leaves it behind, ~2 MB of `launchd.log` per device).
+labels it added), so the boot never starts those jobs. It also passes them as CoreSimulator's
+`disabled_jobs` boot option (`simctl boot --disabledJob=`), which CoreSimulator writes to
+`/private/tmp/com.apple.CoreSimulator.SimDevice.<UDID>/disabled.plist` instead (and deletes on a
+boot without it). Runtimes differ in which file their launchd_sim reads: iOS 18.6 to 27.2 the
+`/private/var/tmp` one, iOS 18.0 the `/private/tmp` one (measured, CoreSimulator 1174.21), so one
+of the two works on each. After the boot simee reads back the file in the directory where
+launchd_sim wrote its `launchd.log` during this boot; when it holds every label disabled, no
+`launchctl` runs at all (the result's `profile.verified` is `file`). Otherwise (a device booted
+already, a runtime that logs in neither directory, a label enabled since) the profile applies the
+old way: `launchctl list` and `print-disabled`, then a disable and a bootout per job still on.
+`com.apple.siri.context.service` is left alone when it is disabled and not running: launchd_sim
+loads it whatever the overrides say and re-creates it 0.25 s after a bootout. `delete` also
+removes both directories (the service leaves them behind, ~1-3 MB of `launchd.log` per device).
 
 Applied after the boot instead (a device booted without it, or `simee profile` on a booted one),
 it takes ~20 s on a quiet host, 24-66 s under load (the runtime has no shell, so `launchctl
