@@ -906,7 +906,9 @@ pub struct Profile {
 /// database before the boot ([`preset_profile`], and the boot's `disabled_jobs` for a runtime
 /// that reads them, [`boot_jobs`]), so the jobs never start, and when launchd read them all
 /// ([`preset_held`]) nothing is spawned after the boot. A plain reboot keeps
-/// the disables and a clone of the device keeps none (a new UDID, a new database): apply the
+/// the disables on runtimes that read `/private/var/tmp` (iOS 18.6 and newer); on iOS 18.0,
+/// whose launchd reads the `/private/tmp` file CoreSimulator writes, any boot without the
+/// `disabled_jobs` option deletes it. A clone of the device keeps none (a new UDID, a new database): apply the
 /// profile on every boot. Again it touches only the jobs that came back, and `profile {undo}`
 /// enables the jobs.
 ///
