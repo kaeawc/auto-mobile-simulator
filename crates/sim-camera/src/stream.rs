@@ -212,7 +212,7 @@ impl Stream {
     }
 }
 
-/// The capture thread: poll, take the newest filled buffer (requeueing older ones unread), copy it
+/// The capture thread: poll, take the newest filled buffer (requeuing older ones unread), copy it
 /// out, requeue it; until told to stop or the device fails.
 fn capture<D: Device>(mut device: D, name: &str, shared: &Shared) {
     let mut seq = 0u64;
