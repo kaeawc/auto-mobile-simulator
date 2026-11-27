@@ -518,6 +518,148 @@ impl Drop for StateWatch {
     }
 }
 
+/// A failed launch's error. One that SpringBoard refused because it still holds the app as being
+/// updated (`LaunchServicesDataMismatch`, #123) says so and what clears it; any other is the
+/// service's own.
+fn launch_error(bundle_id: &str, error: *mut NSError) -> Error {
+    // SAFETY: the service wrote either nil or a valid autoreleased NSError into the out-parameter.
+    if let Some(e) = unsafe { error.as_ref() } {
+        let mut chain = Vec::new();
+        error_chain(e, &mut chain);
+        if being_updated(&chain) {
+            return Error::Service { op: "launch", message: being_updated_message(bundle_id) };
+        }
+    }
+    rt::raw_error("launch", error)
+}
+
+/// Each error's `BSErrorCodeDescription` (FrontBoard's name for its code) and
+/// `NSLocalizedFailureReason`, outermost first, following `NSUnderlyingError` at most 8 deep.
+/// SpringBoard's reason is the innermost error's: CoreSimulator wraps it twice.
+fn error_chain(error: &AnyObject, out: &mut Vec<(String, String)>) {
+    let Some(info) = rt::optional_prop(error, sel!(userInfo)) else { return };
+    if !rt::responds(&info, sel!(objectForKey:)) {
+        return;
+    }
+    let field = |key| rt::dict_string(&info, key).unwrap_or_default();
+    out.push((field("BSErrorCodeDescription"), field("NSLocalizedFailureReason")));
+    // SAFETY: `objectForKey:` takes a key object and returns nil or the value (checked to exist).
+    let underlying: Option<Obj> = unsafe { msg_send![&*info, objectForKey: &*rt::nsstring("NSUnderlyingError")] };
+    if let Some(underlying) = underlying.filter(|u| rt::responds(u, sel!(userInfo)))
+        && out.len() < 8
+    {
+        error_chain(&underlying, out);
+    }
+}
+
+/// Whether a launch error's chain (each error's code name and failure reason, see
+/// [`error_chain`]) is SpringBoard holding the app as being updated: its code
+/// `LaunchServicesDataMismatch`, or a reason that says the app "is being updated".
+fn being_updated(chain: &[(String, String)]) -> bool {
+    chain.iter().any(|(code, reason)| code == "LaunchServicesDataMismatch" || reason.to_lowercase().contains("is being updated"))
+}
+
+/// What a launch SpringBoard refused as being updated says: what happened and what clears it. It
+/// names `LaunchServicesDataMismatch`, which callers match to remember the state.
+fn being_updated_message(bundle_id: &str) -> String {
+    format!(
+        "SpringBoard holds {bundle_id} as being updated (LaunchServicesDataMismatch), which back-to-back installs can \
+         leave behind (#123). Reboot the device (`simee shutdown <udid>`, then `simee boot <udid>`): only a reboot is \
+         known to clear it"
+    )
+}
+
+#[cfg(test)]
+mod launch_error_tests {
+    use objc2::class;
+
+    use super::*;
+
+    /// An NSError in `domain` whose userInfo holds `fields` and, when given, `underlying`.
+    fn error(domain: &str, code: isize, fields: &[(&str, &str)], underlying: Option<&NSError>) -> Retained<NSError> {
+        let info = rt::mutable_dictionary();
+        for (k, v) in fields {
+            rt::dict_set(&info, k, &rt::nsstring(v));
+        }
+        if let Some(u) = underlying {
+            rt::dict_set(&info, "NSUnderlyingError", u);
+        }
+        // SAFETY: `+errorWithDomain:code:userInfo:` takes (NSString, NSInteger, NSDictionary) and
+        // returns an autoreleased NSError.
+        unsafe { msg_send![class!(NSError), errorWithDomain: &*rt::nsstring(domain), code: code, userInfo: &*info] }
+    }
+
+    /// What CoreSimulator returns when SpringBoard refuses a launch, as the service built it for a
+    /// missing app on iOS 27.2: two FBSOpenApplicationService errors around FrontBoard's own.
+    fn wrapped(code_name: &str, reason: &str) -> Retained<NSError> {
+        let inner =
+            error("FBSOpenApplicationErrorDomain", 4, &[("BSErrorCodeDescription", code_name), ("NSLocalizedFailureReason", reason)], None);
+        let request = error(
+            "FBSOpenApplicationServiceErrorDomain",
+            4,
+            &[("BSErrorCodeDescription", "InvalidRequest"), ("NSLocalizedDescription", "The request to open \"dev.simee.tiny\" failed.")],
+            Some(&inner),
+        );
+        error(
+            "FBSOpenApplicationServiceErrorDomain",
+            4,
+            &[
+                ("BSErrorCodeDescription", "InvalidRequest"),
+                ("NSLocalizedDescription", "Simulator device failed to launch dev.simee.tiny."),
+            ],
+            Some(&request),
+        )
+    }
+
+    fn message(e: &Retained<NSError>) -> String {
+        launch_error("dev.simee.tiny", Retained::as_ptr(e).cast_mut()).to_string()
+    }
+
+    #[test]
+    fn a_launch_springboard_holds_as_being_updated_says_to_reboot() {
+        let e = wrapped("LaunchServicesDataMismatch", "dev.simee.tiny is being updated");
+        let m = message(&e);
+        assert!(m.starts_with("launch failed: SpringBoard holds dev.simee.tiny as being updated (LaunchServicesDataMismatch)"), "{m}");
+        assert!(m.contains("simee shutdown <udid>") && m.contains("simee boot <udid>"), "{m}");
+    }
+
+    #[test]
+    fn the_reason_alone_or_the_code_alone_is_enough() {
+        assert!(message(&wrapped("Unspecified", "The application \"Tiny\" is being updated.")).contains("LaunchServicesDataMismatch"));
+        assert!(message(&wrapped("LaunchServicesDataMismatch", "")).contains("Reboot the device"));
+    }
+
+    #[test]
+    fn any_other_refusal_keeps_the_services_own_message() {
+        let e = wrapped("NotFound", "Application info provider (FBSApplicationLibrary) returned nil for \"dev.simee.tiny\"");
+        assert_eq!(
+            message(&e),
+            "launch failed: Simulator device failed to launch dev.simee.tiny. (The request to open \"dev.simee.tiny\" failed.)"
+        );
+        assert_eq!(
+            launch_error("dev.simee.tiny", ptr::null_mut()).to_string(),
+            "launch failed: the service reported failure without an error"
+        );
+    }
+
+    #[test]
+    fn the_chain_is_read_outermost_first_and_stops_at_8_deep() {
+        let mut chain = Vec::new();
+        error_chain(&wrapped("NotFound", "gone"), &mut chain);
+        let codes: Vec<&str> = chain.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(codes, ["InvalidRequest", "InvalidRequest", "NotFound"]);
+        assert_eq!(chain[2].1, "gone");
+        let mut deep = error("D", 0, &[("BSErrorCodeDescription", "0")], None);
+        for i in 1..20 {
+            deep = error("D", i, &[("BSErrorCodeDescription", &i.to_string())], Some(&deep));
+        }
+        let mut chain = Vec::new();
+        error_chain(&deep, &mut chain);
+        assert_eq!(chain.len(), 8);
+        assert!(!being_updated(&chain));
+    }
+}
+
 const MACH_SEND_MSG: i32 = 0x1;
 const MACH_SEND_TIMEOUT: i32 = 0x10;
 
@@ -710,7 +852,7 @@ impl Device {
         let pid: i32 = unsafe {
             msg_send![&*self.obj, launchApplicationWithID: &*rt::nsstring(bundle_id), options: &*rt::empty_dictionary(), error: &mut error]
         };
-        if pid > 0 { Ok(pid) } else { Err(rt::raw_error("launch", error)) }
+        if pid > 0 { Ok(pid) } else { Err(launch_error(bundle_id, error)) }
     }
 
     /// Terminates an app by bundle identifier.
@@ -991,7 +1133,7 @@ impl Device {
         // SAFETY: the method exists (checked) and takes (NSString, NSDictionary, NSError**), returning int.
         let pid: i32 =
             unsafe { msg_send![&*self.obj, launchApplicationWithID: &*rt::nsstring(bundle_id), options: &*options, error: &mut error] };
-        if pid > 0 { Ok(pid) } else { Err(rt::raw_error("launch", error)) }
+        if pid > 0 { Ok(pid) } else { Err(launch_error(bundle_id, error)) }
     }
 
     /// The device's main display. The device must be booted.
