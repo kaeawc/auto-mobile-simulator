@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -714,63 +714,61 @@ fn play_on(input: &mut Input, udid: &str, p: &Value, samples: &[Sample], edge: O
 }
 
 /// `pointer`: brings the iPad's pointer to a point (pixels) and hovers, clicks, presses or releases
-/// a button there, or drags from it to another. The pointer only moves relatively, so it is homed
-/// against the screen's edges first (`sim_core::pointer`), unless a button is held from an earlier
-/// call on this server in this boot (`down`), which moves on from there. A `down` that no later
-/// call could see (an in-process run), an `up` with nothing held, and a `move` or `up` after a
-/// failed call lost what was held are refused ([`pointer::check`]).
+/// a button there, or drags from it to another. The pointer only moves relatively, so it moves on
+/// from where the last call on this server in this boot left it, or from where a held button
+/// (`down`) keeps it, and is homed against the screen's edges first (`sim_core::pointer`) when
+/// neither is known: the first call, after a failure or a rotation, and every
+/// [`pointer::REHOME_EVERY`] calls (touches, the only other input, don't move the pointer). A
+/// `down` that no later call could see (an in-process run), an `up` with nothing held, and a
+/// `move` or `up` after a failed call lost what was held are refused ([`pointer::check`]).
 fn pointer_on(input: &mut Input, udid: &str, p: &Value) -> Result<Value, String> {
     let PointerRequest { at, action, button, hold, drag_to } = pointer_request(p)?;
     let boot = input.boot(udid)?;
     let held = input.pointer.get(boot);
     pointer::check(action, drag_to.is_some(), held, crate::serving())?;
+    let turns = TURNS.load(Ordering::Acquire);
+    let from = input.pointer.start(boot, turns);
     let result = input.run(udid, true, |hid, screen| {
         let screen = screen.ok_or("no screen size")?;
         let scale = if hid.scale() > 0.0 { hid.scale() } else { 1.0 };
         let points = Size::new(screen.width / scale, screen.height / scale);
         let in_points = |p: Point| Point::new(p.x.clamp(0.0, screen.width) / scale, p.y.clamp(0.0, screen.height) / scale);
         let to = in_points(at);
-        let (from, mut buttons) = match held {
-            Held::Down { at, buttons } => (Some(at), buttons),
-            Held::Nothing => (None, 0),
+        let mut buttons = match held {
+            Held::Down { buttons, .. } => buttons,
+            Held::Nothing => 0,
             Held::Lost => {
                 // Let go of whatever the guest may hold, where the pointer is, before homing: a
                 // held button would drag along the edges.
                 for b in [PointerButton::Primary, PointerButton::Secondary] {
                     hid.pointer_button(b, false, 0).map_err(err)?;
                 }
-                (None, 0)
+                0
             }
         };
-        let glide = |from: Option<Point>, to: Point, buttons: u32| -> Result<(), String> {
-            let from = match from {
-                Some(from) => from,
-                None => {
-                    // Home, then let the Dock the push into the bottom showed hide again.
-                    for (dx, dy) in pointer::home() {
-                        hid.pointer_motion(dx, dy, buttons).map_err(err)?;
-                        sleep(pointer::INTERVAL);
-                    }
-                    sleep(pointer::SETTLE);
-                    pointer::homed(points)
-                }
-            };
-            for (dx, dy) in pointer::path(Some(from), to, points) {
-                hid.pointer_motion(dx, dy, buttons).map_err(err)?;
-                sleep(pointer::INTERVAL);
-            }
-            Ok(())
+        // Against deadlines from the first report, so a busy host doesn't stretch the call; whether
+        // a report went out late (a stall), after which where the pointer stopped isn't known.
+        let glide = |from: Option<Point>, to: Point, buttons: u32| -> Result<bool, String> {
+            let plan = pointer::plan(from, to, points);
+            let started = Instant::now();
+            let late =
+                pointer::send_paced(&plan, || started.elapsed(), sleep, |(dx, dy)| hid.pointer_motion(dx, dy, buttons).map_err(err))?;
+            sleep(pointer::INTERVAL);
+            Ok(late)
         };
-        glide(from, to, buttons)?;
+        // Where the pointer is known to be after the call: not after a stall, nor on an edge or in
+        // a corner, where the guest may stop it short.
+        let known = |at: Point, late: bool| (!late && pointer::lands_at(at, points)).then_some(at);
+        let late = glide(from, to, buttons)?;
         let mask = button.mask();
         let left = |at: Point, buttons: u32| if buttons == 0 { Held::Nothing } else { Held::Down { at, buttons } };
         if let Some(end) = drag_to.map(in_points) {
             sleep(pointer::INTERVAL * 3);
             hid.pointer_button(button, true, buttons | mask).map_err(err)?;
-            glide(Some(to), end, buttons | mask)?;
+            let late = glide(Some(to), end, buttons | mask)? || late;
             sleep(pointer::INTERVAL * 3);
             hid.pointer_button(button, false, buttons).map_err(err)?;
-            return Ok(left(end, buttons));
+            return Ok((left(end, buttons), known(end, late)));
         }
         match action {
             PointerAction::Move => {}
@@ -790,10 +788,10 @@ fn pointer_on(input: &mut Input, udid: &str, p: &Value) -> Result<Value, String>
                 hid.pointer_button(button, false, buttons).map_err(err)?;
             }
         }
-        Ok(left(to, buttons))
+        Ok((left(to, buttons), known(to, late)))
     });
     match result {
-        Ok(next) => input.pointer.set(boot, next),
+        Ok((next, at)) => input.pointer.set(boot, next, at, from.is_none(), turns),
         Err(e) => {
             input.pointer.failed(boot, held, drag_to.is_some() || matches!(action, PointerAction::Click | PointerAction::Down));
             return Err(e);
@@ -810,6 +808,9 @@ fn rotate(device: &Device, wanted: Option<Orientation>) -> Result<Value, String>
     let mut guard = ORIENTATIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let known = guard.get_or_insert_with(Default::default);
     let next = wanted.unwrap_or_else(|| known.get(&udid).copied().unwrap_or(Orientation::Portrait).clockwise());
+    // Counted before and after: a pointer call that starts while the device turns, or reads the
+    // count before it, doesn't move on from where the pointer was before.
+    TURNS.fetch_add(1, Ordering::AcqRel);
     let sent = device.set_orientation(next);
     TURNS.fetch_add(1, Ordering::AcqRel);
     sent.map_err(err)?;
@@ -1504,7 +1505,9 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         m if INPUT_METHODS.contains(&m) => input(s, m, p),
         "rotate" => rotate(&s.device(p)?, opt_orientation(p)?),
         "fold" => {
-            let folded = crate::duo::fold(&s.device(p)?, p);
+            let device = s.device(p)?;
+            TURNS.fetch_add(1, Ordering::AcqRel);
+            let folded = crate::duo::fold(&device, p);
             TURNS.fetch_add(1, Ordering::AcqRel);
             folded
         }

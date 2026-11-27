@@ -244,9 +244,10 @@ without one fails that input with `Unavailable`, never a crash.
   relative motion and button events (event types `0x11` and `0x7a41`, the layout SimulatorKit's
   `IndigoHIDMessageForPointerEventFromHIDEventRef` writes, built by `sim_core::indigo`); iPadOS
   then shows its pointer (in screenshots too), hover effects and Trackpad & Mouse settings. Motion
-  is only relative, so each call homes the pointer against the left and bottom edges (never the top,
+  is only relative, so the first call homes the pointer against the left and bottom edges (never the top,
   where iPadOS opens Notification or Control Center, nor a corner, which the rounded screen stops
-  short) and moves in 10 pt steps that slow to a stop, halving over the last six reports (the last one is 0.3 pt, so the overrun is 0.16 pt). iOS 27.2 carries
+  short) and moves in steps that slow to a stop, halving until the last report is at most 0.08 pt
+  (an overrun of 0.04 pt); 10 pt steps with a last report of 0.3 pt were used until #122. iOS 27.2 carries
   the pointer on past a run of reports by half its last report (10 pt steps landed 5–11 pt long,
   median 7.9 pt over 12 targets), and pushes into an edge carry on into the next move; neither
   `HIDMouseAcceleration` (1.0 on both) nor backboardd's pointer acceleration preference changes
@@ -255,11 +256,19 @@ without one fails that input with `Unavailable`, never a crash.
   halving steps, read back by the probe app, 2026-11-26). With the six steps simee uses, 26.5 is
   still exact (0.0 / 0.0 pt) and 27.2 lands within a third of a point (median 0.32 pt, maximum
   0.36 pt over the 12 targets: about 0.1-0.2 pt long in x and 0.2-0.3 pt short in y). Each
-  report is 16 ms, so the halving steps cost time: homing is
-  85 reports (1.36 s of reports; 74 before the pause and tail) and every move after the first
-  adds 5 reports (80 ms; 144 ms with ten steps). Through `simee serve` a homed click took
-  3.36-3.48 s and a `--to` drag 4.01-4.08 s (median of 5, 2026-11-26), but at host load 294-642,
-  so those wall times are inflated; a quiet-host timing is under "Not yet measured" in
+  report is 16 ms. A server (`simee serve`) keeps where each call left the pointer, per boot, and
+  the next call moves on from there in steps of up to 120 pt (which iPadOS also takes one to one),
+  so a later click is a few reports instead of homing again (64 reports and a 400 ms settle for
+  the Dock). It homes again after a failed call, a rotation through the API, a call whose reports
+  went out more than 16 ms late (a stalled host), a call that ended on an edge or in a corner's
+  40 pt square (where the guest may stop the pointer short), and every 100 calls.
+  Touches (finger and Pencil, including the desktop window's, which sends no pointer events),
+  idle time and relaunching the app don't move the pointer, and with the 0.08 pt last report its
+  error doesn't add up: 120 calls to random points after one homing all landed within 0.32 pt on
+  iOS 27.2, where 0.3 pt last reports had drifted to 0.78 pt (2026-11-27). Pointer input simee
+  doesn't send (Simulator.app's pointer capture, another `simee` process or server driving the
+  same device) moves the pointer without the server knowing until it next homes; so does a
+  rotation from the desktop window, which turns the device without the API. Timings are in
   `benchmarks.md`. `pointer --to` drags in one call; a button held by `pointer … down`
   keeps the position for the next calls on the same server (`simee serve`) in the same boot. A
   `down` that runs in its own process (no server) is refused, since nothing would release it, as
