@@ -258,17 +258,17 @@ guest's own milestones (`logcat -b events`, uptime) on a first and a warm boot:
 | `enable_screen` | 324.5 s | 128.2 s |
 | boot animation stops | 348.8 s | 144.7 s |
 
-122 of the 126 extra seconds before zygote are one wait: init's `Wait for property
+118 of the 125 extra seconds before zygote are one wait: init's `Wait for property
 'apexd.status=activated' took 118366ms`. On a first boot `apexd` decompresses the image's 24
 compressed APEX files (`.capex`, for example `com.android.art`, `conscrypt`, `adservices`) into
 `/data/apex/decompressed`, one after the other (24 `Decompressing` lines from 11:02:48 to
-11:04:40), and finds them already there on every later boot. The host ran one vCPU's worth for
-those 180 s (1.25 to 1.45 cores, against 2.8 in a warm boot). The rest of the extra time is
+11:04:40), and finds them already there on every later boot. On the first of these boots the
+host ran about one vCPU's worth for those 180 s (1.25 to 1.45 cores, against 2.8 in a warm boot). The rest of the extra time is
 `system_server` after `pms_ready` (67 s to `ams_ready` against 20 s; a 110 s `main` handler
 delivery in `UserManagerService`, logcat's "Slow delivery") and the boot animation.
 
 Cloning a settled AVD skips all of it. `emu -clone-avd prof2 -from prof` took 12.8 s here (a plain
-file copy of 2.1 GB of mostly sparse files, since this host's file system has no reflinks) and
+copy of the AVD's 2.1 GB; this host's file system has no reflinks) and
 the clone's first boot reached `sys.boot_completed` in 161.1 s and the launcher in 190.4 s (one
 boot), against 360 and 386 s for a fresh AVD. docs/farm-android.md already describes clones for
 the farm.
