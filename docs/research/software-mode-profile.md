@@ -2,7 +2,8 @@
 
 Research for [#55](https://github.com/kaeawc/simee/issues/55): `emu -avd` on a Linux host with no
 hardware virtualization and no GPU, profiled phase by phase so the next performance work goes to
-the biggest cost. Every run is one AVD on one host over about 6 hours; the tables say how many boots each number has.
+the biggest cost. Every run is one AVD on one host over about 6 hours; the tables say how many
+boots each number has.
 
 ## 1. Environment
 
@@ -51,8 +52,8 @@ RAM, not the published run's 2 GB (the 7.8 GiB host also holds `perf` and the sa
 
 Everything reproduces within the run-to-run spread except idle, which is 0.15 cores lower here
 (0.55–0.62 in every idle window of every run in this research except one, against 0.73 published). The first
-swipe run of each boot draws about a third fewer frames than the second (the guest's ART and
-SwiftShader are still warming) and burns about 0.9 cores more host CPU for them. The 60–120 s
+swipe run of each boot draws about a third fewer frames than the second (it is the coldest
+the guest gets) and burns about 0.9 cores more host CPU for them. The 60–120 s
 window is the noisiest: 1.19 to 3.78 cores across three boots of the same AVD, because it
 catches the guest's post-boot work at different points (system_server, the composer HAL and
 Settings were the busiest guest processes there, section 3).
