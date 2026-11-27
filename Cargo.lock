@@ -1895,6 +1895,7 @@ dependencies = [
  "simee-api",
  "simee-core",
  "simee-emu-avd",
+ "simee-host",
  "simee-mcp",
 ]
 
@@ -2074,6 +2075,7 @@ version = "0.1.0"
 dependencies = [
  "rustix",
  "serde",
+ "simee-core",
  "simee-coresim",
 ]
 

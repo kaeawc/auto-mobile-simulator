@@ -182,6 +182,13 @@ fn stage(s: &State, t: Theme) -> El {
             controls = controls.child(button(c.key, c.icon, c.label, c.action, false, t));
         }
     }
+    // The 3D view's own: face on (⌘0) and flip (⌘F); orbit, pan and zoom are on the pointer.
+    if crate::scene::active(s).is_some() {
+        use crate::scene::Command;
+        controls = controls
+            .child(button("face-on-button", &icons::FACE_ON, "Face on (⌘0)", Action::View3d(Command::FaceOn), false, t))
+            .child(button("flip-button", &icons::FLIP, "Flip (⌘F)", Action::View3d(Command::Flip), false, t));
+    }
     let body = if s.showing_screen() { screen(s) } else { placeholder(s, t) };
     let mut stage = col().w_full().h_full().grow(1.0).min_w(0.0).padding(16.0).gap(12.0).child(controls).child(body);
     let footer = match (&s.status, &s.socket) {
@@ -275,7 +282,7 @@ fn screen(s: &State) -> El {
         let inset = if s.selected_info().and_then(crate::controls::bezel).is_some() { crate::bezel::BAND } else { 0.0 };
         // The slot takes the pointer, so it takes focus too (a click on the 3D view must not
         // blur the screen) and the screen's keys.
-        stage.child(crate::scene::slot(inset, ratio).focusable(true).on_key(device_key))
+        stage.child(crate::scene::slot(inset, ratio, &s.view3d.view).focusable(true).on_key(device_key))
     } else {
         stage
     }
