@@ -166,6 +166,7 @@ pub fn restore(s: &mut State, mut store: Store) {
 /// each pane at its width or left out while hidden.
 pub fn layout(s: &State, t: Theme, sidebar: El, stage: El, inspector: Option<El>) -> El {
     let c = &s.prefs.current;
+    let inspector = crate::resources::inspector(s, t, inspector);
     let mut root = row().key("window").w_full().h_full().fill(t.bg).on_layout(|s: &mut State, r: [f32; 4]| s.panes.window_w = r[2]);
     if c.sidebar.visible {
         let w = width(c, Side::Sidebar);
@@ -214,11 +215,16 @@ pub fn toggle(s: &mut State, side: Side) {
     pane.visible = !pane.visible;
 }
 
-/// ⌘⌥S shows or hides the sidebar, ⌘⌥I the inspector.
+/// ⌘⌥S shows or hides the sidebar, ⌘⌥I the inspector, ⌘⌥R the resource panel in it.
 pub fn on_key(s: &mut State, k: &KeyEvent, tx: &mut Tx) -> bool {
     let side = match k.key {
         Key::Command('s') if k.mods.alt && !k.mods.shift => Side::Sidebar,
         Key::Command('i') if k.mods.alt && !k.mods.shift => Side::Inspector,
+        Key::Command('r') if k.mods.alt && !k.mods.shift => {
+            crate::resources::toggle(s);
+            tx.request_poll();
+            return true;
+        }
         _ => return false,
     };
     toggle(s, side);

@@ -78,6 +78,8 @@ pub struct Settings {
     pub window: Option<WindowFrame>,
     /// Where ⌘S saves; the Desktop when unset.
     pub screenshot_dir: Option<PathBuf>,
+    /// The resource panel's visibility and sort ([`crate::resources`]).
+    pub resources: crate::resources::Prefs,
 }
 
 impl Default for Settings {
@@ -95,6 +97,7 @@ impl Default for Settings {
             last_tab: None,
             window: None,
             screenshot_dir: None,
+            resources: crate::resources::Prefs::default(),
         }
     }
 }
