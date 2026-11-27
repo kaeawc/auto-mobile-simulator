@@ -163,14 +163,15 @@ section beside the video); a peer that opens a channel with that label itself is
 Plain `connect` offers no channel. The channel's messages go to an `InputSession` on the
 publisher's thread, which hands validated events to an `InputSink` (`fn input(&mut self, &InputEvent)
 -> Result<(), String>`, also implemented for closures) and writes its replies back. Keep the sink
-short: it runs where the media is sent. Wiring a sink to a simee device (Android display-socket
-`touch`/`key`/`wheel`, iOS HID) is #266's.
+short: it runs where the media is sent. `stream_start {input: true}` wires one to a simee device
+("Streams from the API" below).
 
 The channel only reaches a viewer whose peer connection ends at the publisher. MediaMTX relays
 tracks between WHIP and WHEP and, as far as its documentation says, not data channels; whether it
 accepts an offer with an `m=application` section at all hasn't been run against it yet (the
-MediaMTX harness publishes with plain `connect`). Input for a MediaMTX viewer likely needs a
-direct peer connection or a relay of its own: #266 decides.
+MediaMTX harness publishes with plain `connect`). `stream_start` offers the channel to whatever
+endpoint `whip_url` names; input for a MediaMTX viewer likely still needs a direct peer
+connection or a relay of its own, which isn't built.
 
 **Messages** are one compact JSON object per text frame. Every message has `"v":1` (the version)
 and a `kind`; `seq` (an integer) and `t` (the viewer's time in milliseconds, any clock, e.g.
@@ -366,6 +367,79 @@ size change, and every access unit decoded with `VTDecompressionSession`. `tests
 same on a real device's frames (`SIMEE_E2E_UDID=<udid>` or `SIMEE_E2E_AVD=<avd>`), with the SPS
 read by `simee-rtc`'s parser.
 
+## Streams from the API (#266)
+
+`crates/sim-api/src/stream.rs` puts the encoder and the publisher behind four methods
+(docs/api.md, "Streams"), which the MCP server serves as the `stream` toolset:
+
+- `stream_start` (`device, whip_url, token?, fps?(30), max_size?(1280), bitrate?(2500000),
+  audio?(false), input?(false)`) → `{stream_id, whip_resource, lease_ttl_s, device}`.
+- `stream_status` (`stream_id`): the state, the stage timeline and the stats; renews the lease.
+- `stream_stop` (`stream_id`): ends the stream and sends the WHIP DELETE.
+- `streams` (`device?`): every stream of the process, without renewing anything.
+
+**What a stream is.** A worker thread runs `simee-encode`'s loop (`VtEncoder` on `IosSource` or
+`AndroidSource`, a 500 ms heartbeat on a still screen) and connects the publisher on the first
+access unit, offering that IDR's own `profile-level-id`, as `examples/publish_device.rs` does.
+`stream_start` waits (at most 40 s) for that connection and fails with the reason when it
+doesn't come: the URL refused before any request (as `WhipClient::new` checks it: `https`,
+plaintext to a host that isn't loopback, another scheme), a 401/403 from the WHIP server ("pass a
+valid `token`"), a device that isn't booted, `audio: true` (the Opus track is #265), or a host with
+no encoder (only macOS has one; the Linux encoder is #263). A failed start leaves nothing behind.
+The publisher's `KeyframeRequested` forces an IDR (counted as `pli` or `fir`), `BitrateEstimate`
+retargets the encoder, and `Disconnected` ends the stream.
+
+**Stages and stats.** `stages` lists what the stream reached, in order, each in milliseconds
+since the request: `requested`, `first_encoded_frame`, `whip_connected` (the WHIP answer
+applied, ICE and DTLS up), `ended`. The first frame comes before the connection because the
+offer carries that frame's profile and level. `stats` has `encoded` access units (heartbeats
+included) and `sent` ones, `keyframes`, `bytes`, `fps` and `bitrate_bps` (averaged from the first
+frame to now, or to the end), the publisher's latest `bitrate_estimate_bps`, the viewers' `pli`
+and `fir` requests, and with input the `input_events` delivered and `input_errors`. What a viewer
+sees (time to first picture over WHEP) is #268's.
+
+**Leases and ownership.** Streams outlive the call and the connection that started them: one
+registry per process (a `simee serve`, which the CLI forwards to, or the MCP server). A stream's
+lease is 30 s; `stream_status` renews it, and a thread stops any stream whose lease lapsed
+(encode loop first, then the WHIP DELETE), so a crashed client's stream ends within 30 s. A
+stream that ended on its own stays listed as `ended`, with its `reason`, until its lease lapses,
+and a new stream to the same destination replaces it. There is one stream per device and WHIP
+URL; a second `stream_start` for the pair is refused with the running one's id.
+
+**Input.** With `input: true` the publisher is opened with `connect_with_input`, and the
+session's sink maps each event through a `DisplayMap` of the device's `screen` size (the space
+`touch` and `swipe` take) and queues one device call to a thread of the stream's own, which runs
+it through the method table (so the publisher's thread never waits on a device):
+
+| Event | Device call |
+| --- | --- |
+| `touch` down/move/up | `touch` at the mapped pixel; `cancel` is an `up` where the finger was |
+| `key` down | `key {usage}` (a press; the `up` adds nothing) |
+| `text` | `type {text}` |
+| `button` press | `button` (`home`, `power` → `lock`, `volume_up`/`volume_down`, `back`, `app_switch` → `recents`, `menu`, `assistant` → `siri`, iOS) |
+| `button` down … up | `button` with `hold_ms` the time it was held (10 ms to 10 s), on the `up` |
+| `rotate` | `rotate {orientation}` (iOS); the screen size is read again so later points map onto the new shape |
+| `fold` | `fold {posture}` (`half_open` → `half-opened`, `open` → `opened`) |
+| `wheel` | a 100 ms `swipe` from the point, by the deltas scaled to device pixels, the other way |
+
+A point from a frame of another shape (the device rotated while it was in flight) is refused
+with a `sink` error, except a lift, which lifts where the finger was. One touch at a time: a
+second pointer is refused (the device methods are single-pointer). Android refuses `rotate` to an
+orientation (its `rotate` turns 90° per call) and the assistant button. A device call that fails
+counts in `input_errors` (with `last_input_error`); the viewer's `ack` means the event was queued.
+Stopping the stream lifts anything still down.
+
+**Tests.** `cargo test -p simee-api stream::` runs every method on fakes, with no network and no
+device: `simee-encode`'s own loop over a fake source and encoder, a fake WHIP publisher that logs
+each POST and DELETE (and can refuse with a status), a fake device input, and a fake clock for
+the leases. They check the start (the offered profile and token, the encoder settings), the
+stage order, a lapsed lease stopping the stream and deleting its resource, the duplicate refusal,
+stop sending the DELETE, the refusals leaving nothing behind, keyframe requests and estimates
+reaching the encoder and the stats, a peer disconnect, the input mapping (touch through the
+downscale, keys, text, a held button, a scroll, a rotation re-reading the screen, the second
+finger refused, the lift on stop), and that docs/api.md has each method's row as the table writes
+it. A real stream end to end (Chromium over WHEP) is #268's.
+
 ## Not yet
 
 - **TLS.** `https://` WHIP endpoints are refused: a TLS client (rustls) needs a crypto provider
@@ -378,7 +452,12 @@ read by `simee-rtc`'s parser.
 - **Linux in CI.** The `linux` job tests without `rust-crypto`, so the publisher's end-to-end
   tests skip there (macOS runs them).
 - **Reconnects.** A publisher reports `Disconnected`; publishing again is a new publisher with a
-  new WHIP resource. Doing that automatically is #266's.
+  new WHIP resource. A stream whose peer disconnects ends (`state: "ended"`); starting it again is
+  the client's `stream_start`.
+- **Stream input gaps.** Multi-touch, key chords (a modifier held while another key is pressed:
+  `key` presses one key), and a target orientation on Android aren't wired to devices yet.
+- **The CLI's `simee stream` and the desktop's Share control** (the rest of #266) call these
+  methods; they aren't built yet.
 - **A Linux encoder** (openh264 or x264 behind a feature) and VA-API; on Linux
   `simee-encode` has no encoder.
 - **Pipelined encoding.** One picture is in flight at a time, so a full-size iPhone stream can't

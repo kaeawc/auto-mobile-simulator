@@ -413,6 +413,13 @@ fn toolsets_pick_the_tools_and_a_hidden_one_says_where_it_is() {
     assert!(err.message.contains("SIMEE_MCP_TOOLSETS=core,debug"), "{}", err.message);
     assert_eq!(err.data, Some(json!({"tool": "exec", "toolset": "debug", "enabled": "core"})));
     assert!(parse_call(&json!({"name": "exec"}), &picked).is_ok());
+    // `stream_start` with `input: true` lets viewers touch the device: it needs the input tools.
+    let streaming = Toolsets::parse("stream").expect("stream");
+    let input = json!({"name": "stream_start", "arguments": {"whip_url": "http://127.0.0.1:1/w", "input": true}});
+    let err = parse_call(&input, &streaming).expect_err("input needs the input toolset");
+    assert!(err.message.contains("`input` toolset") && err.message.contains("SIMEE_MCP_TOOLSETS=stream,input"), "{}", err.message);
+    assert!(parse_call(&input, &Toolsets::parse("stream,input").expect("both")).is_ok());
+    assert!(parse_call(&json!({"name": "stream_start", "arguments": {"whip_url": "http://127.0.0.1:1/w"}}), &streaming).is_ok());
     assert_eq!(parse_call(&json!({"name": "teleport"}), &Toolsets::default()).expect_err("unknown").message, "Unknown tool: teleport");
 }
 
