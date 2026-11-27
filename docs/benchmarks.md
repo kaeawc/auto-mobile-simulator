@@ -35,7 +35,7 @@ commit; sign its `emu`) and pass it with `--baseline` (`--emu` for `android-rese
 scripts then alternate the builds. Rows marked "no script" say why: their method isn't
 recoverable from what was recorded, or they need something the repository doesn't hold.
 
-| Benchmark | simee | Stock baseline | Host, date | Reproduce |
+| Benchmark | simee | Baseline (stock tool, unless it says simee) | Host, date | Reproduce |
 | --- | --- | --- | --- | --- |
 | [Android boot, API 36](#android-emu-against-the-sdk-emulator) | 9.5 s cold, 3.5 s warm, 2.09 GB | SDK emulator 22.9 s, 17.1 s, 3.78 GB | M3 Max, 2026-11-24 | `scripts/bench/android-boot.sh --snapshot` |
 | [Android boot, API 29](#api-29-gles-over-the-goldfish-pipe) | 4.8 s warm | SDK emulator 6.4 s | M3 Max, 2026-11-26 | `scripts/bench/android-boot.sh --image …android-29/default…` |
@@ -49,22 +49,22 @@ recoverable from what was recorded, or they need something the repository doesn'
 | [Android farm](#android-farm) | 8 settled in 266 s | not measured | not recorded, before 2026-11-24 | `scripts/bench/android-farm.sh` |
 | [Device bundles](#android-device-bundles) | 1225 MB, 7.2 s export, 6.7 s import | no stock tool | M3 Max, 2026-11-27 | `scripts/bench/android-bundle.sh` |
 | [iOS boot](#ios-simee-against-simctl) | 15.5 s first, 2.3 s later | `simctl` 18.9 s, 2.3 s | M3 Max, 2026-11-24 | `scripts/bench/ios-boot.sh` |
-| [iOS farm, default and slim](#ios-simee-against-simctl) | slim: 8 of 8 in 392 s, 1158 MB | default: 5 of 8, 2176 MB | M3 Max, 2026-11-24 | `scripts/bench/ios-farm.sh` |
-| [iOS settle, slim profile](#ios-simee-against-simctl) | 4 clones in 43 s | before: 229 s | M3 Max, 2026-11-26/27 | `scripts/bench/ios-settle.sh`, `ios-farm.sh` |
-| [iOS slim profile, 62 or 74 jobs](#ios-the-slim-profiles-jobs-62-against-74) | 20.1 s settled | 62 jobs: 33.2 s | M3 Max, 2026-11-27 | `scripts/bench/ios-settle.sh --baseline …` |
-| [Time per automation step](#ios-simee-against-simctl) | tap 63.4 ms, screenshot 24.5 ms | before: 137.5, 99.7 ms | M3 Max, 2026-11-26 | `scripts/bench/api-steps.sh` |
+| [iOS farm, default and slim](#ios-simee-against-simctl) | slim: 8 of 8 in 392 s, 1158 MB | simee default profile: 5 of 8, 2176 MB | M3 Max, 2026-11-24 | `scripts/bench/ios-farm.sh` |
+| [iOS settle, slim profile](#ios-simee-against-simctl) | 4 clones in 43 s | simee before: 229 s | M3 Max, 2026-11-26/27 | `scripts/bench/ios-settle.sh`, `ios-farm.sh` |
+| [iOS slim profile, 62 or 74 jobs](#ios-the-slim-profiles-jobs-62-against-74) | 20.1 s settled | simee, 62-job profile: 33.2 s | M3 Max, 2026-11-27 | `scripts/bench/ios-settle.sh --baseline …` |
+| [Time per automation step](#ios-simee-against-simctl) | tap 63.4 ms, screenshot 24.5 ms | simee before: 137.5, 99.7 ms | M3 Max, 2026-11-26 | `scripts/bench/api-steps.sh` |
 | [Screenshot as a command](#ios-simee-against-simctl) | 36 ms via `simee serve` | `simctl io screenshot` 601 ms | M3 Max, 2026-11-26 | `scripts/bench/ios-command.sh` |
 | [Emulator internals](#emulator-internals) | before/after rows | | various | see the section |
 | [`launch` with and without restart](#launch-with-and-without-restart) | 17–136 ms | | M3 Max, 2026-11-27 | `scripts/bench/ios-api.py --suite launch` |
-| [Per-call device lookup](#per-call-device-lookup-on-a-crowded-host) | 0.66 / 0.04 ms | before: 1.54 / 0.34 ms | M3 Max, 2026-11-26 | `ios-api.py --suite lookup` |
+| [Per-call device lookup](#per-call-device-lookup-on-a-crowded-host) | 0.66 / 0.04 ms | simee before: 1.54 / 0.34 ms | M3 Max, 2026-11-26 | `ios-api.py --suite lookup` |
 | [Introspection](#introspection-processes-connections-kill-network_state) | 2.5–3.5 ms | `ps`/`lsof`/`kill`: 126–191 ms | M3 Max, 2026-11-27 | `ios-api.py --suite introspection` |
-| [iPad pointer click](#ipad-pointer-click) | 408 ms later click | before: 3641 ms | M3 Max, 2026-11-27 | `ios-api.py --suite pointer` (timings) |
-| [iOS input defaults](#ios-input-defaults) | tap 12.6 ms, type 20 chars 121 ms | before: 64.5, 749 ms | M3 Max, 2026-11-27 | `ios-api.py --suite input` (timings) |
+| [iPad pointer click](#ipad-pointer-click) | 408 ms later click | simee before: 3641 ms | M3 Max, 2026-11-27 | `ios-api.py --suite pointer` (timings) |
+| [iOS input defaults](#ios-input-defaults) | tap 12.6 ms, type 20 chars 121 ms | simee before: 64.5, 749 ms | M3 Max, 2026-11-27 | `ios-api.py --suite input` (timings) |
 | [iOS app preferences](#ios-app-preferences) | read 0.11 ms | | M3 Max, 2026-11-27 | `ios-api.py --suite prefs` (reads) |
 | [iOS memory tools](#ios-memory-tools) | `mem_vmmap` 0.60 s … `mem_leaks` 2.30 s | | M3 Max, 2026-11-27 | `ios-api.py --suite mem` |
 | [Desktop: Metal against wgpu](#desktop-runes-native-metal-backend-against-wgpu) | | | M3 Max, 2026-11-27 | no script (below) |
 | [MCP server](#mcp-server) | 1 crate | `rmcp`: 75 crates, 41 s build | Linux VM, 2026-11-26 | `scripts/bench/mcp-build.sh` |
-| [Build times](#build-times-local) | 74–77 CPU s | before: 131–136 | Apple silicon, 2026-11-26 | `scripts/bench/build-times.sh` |
+| [Build times](#build-times-local) | 74–77 CPU s | simee before: 131–136 | Apple silicon, 2026-11-26 | `scripts/bench/build-times.sh` |
 
 ## Android: emu against the SDK emulator
 
@@ -251,7 +251,7 @@ the Vulkan-only renderer. Host CPU is emu's process over the run; the stock emul
 child process the script doesn't track.
 
 ```bash
-scripts/bench/android-frames.sh --device tablet --runs 3   # and --device phone: both tools, warm boots
+scripts/bench/android-frames.sh --device tablet          # and --device phone: both tools, warm boots; 3 alternating runs each
 scripts/android-jank.sh emulator-<port> [emulator pid]     # one run on a booted device, one key=value line
 ```
 

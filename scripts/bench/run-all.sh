@@ -14,7 +14,10 @@
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 # name|kind|command (relative to scripts/bench)|docs/benchmarks.md section
+# RUN_ALL_REGISTRY=FILE (with RUN_ALL_DIR for the scripts) replaces the list: scripts/bench/test-run-all.sh.
+if [ -n "${RUN_ALL_REGISTRY:-}" ]; then here=${RUN_ALL_DIR:-$here}; fi
 registry() {
+  if [ -n "${RUN_ALL_REGISTRY:-}" ]; then cat "$RUN_ALL_REGISTRY"; return; fi
   cat << 'EOF'
 android-boot|android|android-boot.sh|Android: emu against the SDK emulator
 android-boot-api29|android|android-boot.sh --image system-images/android-29/default/arm64-v8a --lcd 720x1280@320|API 29 (GLES over the goldfish pipe)
@@ -67,6 +70,7 @@ if [ -n "$only" ]; then
 fi
 summary=()
 failed=0
+interrupted=0
 while IFS='|' read -r name k cmd section; do
   [ -n "$kind" ] && [ "$k" != "$kind" ] && continue
   if [ -n "$only" ]; then case ",$only," in *",$name,"*) ;; *) continue ;; esac; fi
@@ -81,8 +85,12 @@ while IFS='|' read -r name k cmd section; do
   case $rc in
     0) summary+=("ok       $name") ;;
     3) summary+=("skipped  $name") ;;
+    # 130 and 143: the child was interrupted (lib.sh turns SIGINT and SIGTERM into these exits).
+    # Stop the whole run: the next benchmark would boot another device the user asked to stop.
+    130 | 143) summary+=("STOPPED  $name (exit $rc); the remaining benchmarks were not run"); interrupted=$rc; break ;;
     *) summary+=("FAILED   $name (exit $rc)"); failed=1 ;;
   esac
 done < <(registry)
 printf '%s\n' "" "run-all:" "${summary[@]}" >&2
+[ "$interrupted" = 0 ] || exit "$interrupted"
 exit "$failed"

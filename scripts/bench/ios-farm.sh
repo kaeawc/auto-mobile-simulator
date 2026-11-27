@@ -39,6 +39,22 @@ runtime=${runtime:-$(ios_runtime)}
 bench_start ios-farm
 simee_ready
 export SIMEE_IN_PROCESS=1
+# On any exit (Ctrl-C included) shut down and delete the clones this run's farm-bench-ios.sh made,
+# found by this run's own $$-unique name prefix, by UDID. Registered before the template so it
+# runs first (cleanup is in reverse order). Other simulators are never matched.
+farm_prefix="simee-bench-farm-$$-"
+sweep_clones() {
+  local u
+  for u in $(xcrun simctl list devices -j | python3 -I -c '
+import json, sys
+for devs in json.load(sys.stdin)["devices"].values():
+    for d in devs:
+        if d["name"].startswith(sys.argv[1]):
+            print(d["udid"])' "$farm_prefix"); do
+    ios_delete "$u"
+  done
+}
+bench_on_exit sweep_clones
 ios_create "simee-bench-farm-template-$$" "$type" "$runtime"
 template=$IOS_UDID
 "$BENCH_SIMEE" boot "$template" --settle --timeout 600 >&2 || bench_die "the template didn't boot"
@@ -50,7 +66,7 @@ for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
   [ $((BENCH_ROUND % 2)) = 0 ] && [ ${#profile_list[@]} = 2 ] && order=("${profile_list[1]}" "${profile_list[0]}")
   for p in "${order[@]}"; do
     args=""; [ "$p" = default ] || args="--profile $p"
-    line=$(SIMEE="$BENCH_SIMEE" LABEL="r$BENCH_ROUND-$p" PREFIX="simee-bench-farm-$$-" MODE=clone TEMPLATE="$template" \
+    line=$(SIMEE="$BENCH_SIMEE" LABEL="r$BENCH_ROUND-$p" PREFIX="$farm_prefix" MODE=clone TEMPLATE="$template" \
       BOOT=many K="$k" BOOT_ARGS="$args" DEVICE_TYPE="$type" RUNTIME="$runtime" \
       "$BENCH_REPO/scripts/farm-bench-ios.sh" "$n" 2> "$BENCH_WORK/farm-$BENCH_ROUND-$p.err" | grep '^label=' | tail -1)
     if [ -z "$line" ]; then tail -3 "$BENCH_WORK/farm-$BENCH_ROUND-$p.err" >&2; bench_sample "$p" "all settled, s" failed; continue; fi

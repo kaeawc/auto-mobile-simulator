@@ -13,11 +13,12 @@ Measured against the stock tools on the same host and day, medians of 3 or more;
 row and the script that reruns it (it creates and deletes its own devices).
 
 - **Android boots 4.9× faster warm, 2.4× cold:** 3.5 s against the SDK emulator's 17.1 s to
-  `sys.boot_completed`, 9.5 s against 22.9 s for a new AVD, with 45% less peak memory (2.09 against
-  3.78 GB). M3 Max, 2026-11-24. [Row](docs/benchmarks.md#android-emu-against-the-sdk-emulator),
+  `sys.boot_completed`, 9.5 s against 22.9 s for a new AVD, with 45% less peak memory warm (2.09 against
+  3.78 GB; 25% cold). M3 Max, 2026-11-24. [Row](docs/benchmarks.md#android-emu-against-the-sdk-emulator),
   `scripts/bench/android-boot.sh`.
-- **Smoother frames:** 0% janky frames swiping a Pixel Tablet's launcher against 5.6%, 0.25%
-  against 6.2% on a phone. M3 Max, 2026-11-25. [Row](docs/benchmarks.md#frame-pacing),
+- **Fewer janky frames:** 0% of the frames swiping a Pixel Tablet's launcher against 5.6%, though
+  emu drew about 530 frames to stock's 1350 there; 0.25% against 6.2% on a phone, where both drew
+  about 790. M3 Max, 2026-11-25. [Row](docs/benchmarks.md#frame-pacing),
   `scripts/bench/android-frames.sh`.
 - **Cheaper idle devices:** an idle API 29 device costs 2.9% of a host core against 5.4%; API 30
   2.1% against 3.7%. M3 Max, 2026-11-26.

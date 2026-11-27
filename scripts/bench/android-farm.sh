@@ -50,7 +50,7 @@ android_stop "$BOOT_PID" "$port"
 field() { printf ' %s\n' "$2" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
 for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
   for n in $sizes; do
-    line=$(env EMU="$BENCH_EMU" EMU_TOOL="$BENCH_EMU" BASE_PORT="$port" OUT="$BENCH_WORK/farm" ${k:+K=$k} ANDROID_HOME="$BENCH_SDK" \
+    line=$(env EMU="$BENCH_EMU" EMU_TOOL="$BENCH_EMU" BASE_PORT="$port" OUT="$BENCH_WORK/farm" PREFIX="bench-farm-$$-" ${k:+K=$k} ANDROID_HOME="$BENCH_SDK" \
       "$BENCH_REPO/scripts/farm-bench-android.sh" "bench-$$-$BENCH_ROUND-$n" "$golden" "$n" 2> "$BENCH_WORK/farm-$BENCH_ROUND-$n.err" | grep '^label=' | tail -1)
     a="$n device$([ "$n" = 1 ] || echo s)"
     if [ -z "$line" ]; then bench_sample "$a" "all settled, s" failed; tail -3 "$BENCH_WORK/farm-$BENCH_ROUND-$n.err" >&2; continue; fi

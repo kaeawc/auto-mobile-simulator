@@ -39,24 +39,29 @@ avd="bench-net-$$"
 avd_create "$avd" "$IMAGE_DIR" -cores 4 -memory 2048
 quick_env=()
 [ "$BENCH_QUICK" = 1 ] && quick_env=(SETTLE=20 WINDOW=20 MIB=50)
+net_out="$BENCH_WORK/net"; mkdir -p "$net_out"
+net_rc=0
 field() { printf ' %s\n' "$2" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
 if [ "$mode" != throughput ]; then
-  env ${quick_env[@]+"${quick_env[@]}"} PORT="$port" "$BENCH_REPO/scripts/net-bench.sh" idle "$avd" "$BENCH_ROUNDS" >&2
+  env ${quick_env[@]+"${quick_env[@]}"} OUT="$net_out" PORT="$port" "$BENCH_REPO/scripts/net-bench.sh" idle "$avd" "$BENCH_ROUNDS" >&2 ||
+    { net_rc=$?; bench_log "net-bench.sh idle exited $net_rc"; bench_sample "idle run" "net-bench.sh" failed; }
   while read -r line; do
     case $line in arm=*) ;; *) continue ;; esac
     BENCH_ROUND=$(field run "$line")
     case $(field arm "$line") in link) a="link-only virtio-net" ;; *) a="virtio-net with the NAT" ;; esac
     bench_sample "$a" "idle host CPU, % of a core" "$(field cpu_pct "$line")"
-  done < "$BENCH_REPO/bench/net-idle.result"
+  done < "$net_out/net-idle.result"
 fi
 if [ "$mode" != idle ]; then
-  env ${quick_env[@]+"${quick_env[@]}"} PORT="$port" "$BENCH_REPO/scripts/net-bench.sh" throughput "$avd" "$BENCH_ROUNDS" >&2
+  env ${quick_env[@]+"${quick_env[@]}"} OUT="$net_out" PORT="$port" "$BENCH_REPO/scripts/net-bench.sh" throughput "$avd" "$BENCH_ROUNDS" >&2 ||
+    { net_rc=$?; bench_log "net-bench.sh throughput exited $net_rc"; bench_sample "throughput run" "net-bench.sh" failed; }
   while read -r line; do
     case $line in *" run="*) ;; *) continue ;; esac
     BENCH_ROUND=$(field run "$line")
     case $(field dir "$line") in up) a="guest to host" ;; *) a="host to guest" ;; esac
     bench_sample "$a" "transfer time, s" "$(field secs "$line")"
     bench_sample "$a" "rate, MB/s" "$(field MBps "$line")"
-  done < "$BENCH_REPO/bench/net-throughput.result"
+  done < "$net_out/net-throughput.result"
 fi
 bench_finish "" "Image: $IMAGE_DIR (AVD created ${AVD_MODE:-fresh}); scripts/net-bench.sh ${quick_env[*]-}"
+[ "$net_rc" = 0 ] || exit "$net_rc"
