@@ -1,5 +1,5 @@
 //! `opengles`: the GLES encoder's stream, on images whose graphics go over the goldfish pipe
-//! (API 29 and 30, `qemu.gltransport=pipe`).
+//! (API 29 to 32, `gltransport=pipe`).
 //!
 //! Each guest GL connection (one per guest thread that uses GL) opens its own pipe, and the host
 //! gives it its own render thread: a [`GlChannel`] from the [`GlBackend`] (gfxstream's
