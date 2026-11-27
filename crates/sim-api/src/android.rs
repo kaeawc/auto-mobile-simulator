@@ -37,6 +37,10 @@ impl Session {
     }
 }
 
+/// How long `tap` and `button` hold without `hold_ms` (iOS has its own, measured: `ios.rs`).
+const TAP_HOLD: Duration = Duration::from_millis(60);
+const BUTTON_HOLD: Duration = Duration::from_millis(80);
+
 /// `boot` and `boot_many` parameters only iOS devices take, and why.
 const IOS_BOOT_PARAMS: &[(&str, &str)] = &[
     ("settle", "a settle wait reads a simulator's process tree; an Android boot waits for sys.boot_completed"),
@@ -183,14 +187,14 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             Some(path) => d.screenshot_png_to(std::path::Path::new(path)).map(|(w, h)| json!({"path": path, "width": w, "height": h})),
             None => d.screenshot_png().and_then(|(w, h, png)| png_result(w, h, png, p)),
         },
-        "tap" => null(d.play(&tap_samples(p)?)),
+        "tap" => null(d.play(&tap_samples(p, TAP_HOLD)?)),
         "swipe" => null(d.play(&swipe_samples(p)?)),
         "touch" => {
             let (at, phase) = touch_sample(p)?;
             null(d.touch(at.x, at.y, phase))
         }
         "button" => {
-            let (button, hold) = button(p)?;
+            let (button, hold) = button(p, BUTTON_HOLD)?;
             d.button(button, Direction::Down)?;
             sleep(hold);
             null(d.button(button, Direction::Up))

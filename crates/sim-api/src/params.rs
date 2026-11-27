@@ -94,10 +94,11 @@ pub fn opt_form_factor(p: &Value) -> Result<Option<FormFactor>, String> {
         .transpose()
 }
 
-/// `tap`: x, y and hold_ms (default 60) as touch samples in device pixels.
-pub fn tap_samples(p: &Value) -> Result<Vec<Sample>, String> {
+/// `tap`: x, y and hold_ms as touch samples in device pixels; without hold_ms the touch is held
+/// `default_hold`, which each platform sets (Android 60 ms, iOS 10 ms).
+pub fn tap_samples(p: &Value, default_hold: Duration) -> Result<Vec<Sample>, String> {
     let at = Point::new(need_f64(p, "x")?, need_f64(p, "y")?);
-    Ok(gesture::tap(at, Duration::from_millis(opt_u64(p, "hold_ms").unwrap_or(60))))
+    Ok(gesture::tap(at, opt_u64(p, "hold_ms").map_or(default_hold, Duration::from_millis)))
 }
 
 /// `swipe`: x1, y1, x2, y2, duration_ms (default 300) and settle as touch samples.
@@ -120,11 +121,12 @@ pub fn touch_sample(p: &Value) -> Result<(Point, Phase), String> {
     Ok((Point::new(need_f64(p, "x")?, need_f64(p, "y")?), phase))
 }
 
-/// `button`: the button and how long to hold it (default 80 ms).
-pub fn button(p: &Value) -> Result<(Button, Duration), String> {
+/// `button`: the button and how long to hold it (hold_ms; without it `default_hold`, which each
+/// platform sets).
+pub fn button(p: &Value, default_hold: Duration) -> Result<(Button, Duration), String> {
     let name = need_str(p, "button")?;
     let button = Button::parse(name).ok_or_else(|| format!("unknown button `{name}`"))?;
-    Ok((button, Duration::from_millis(opt_u64(p, "hold_ms").unwrap_or(80))))
+    Ok((button, opt_u64(p, "hold_ms").map_or(default_hold, Duration::from_millis)))
 }
 
 /// The optional `orientation` parameter.
@@ -393,6 +395,18 @@ fn bytes_field(bytes: Cow<'_, [u8]>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tap_or_button_holds_the_platform_default_unless_hold_ms_says() {
+        let ms = Duration::from_millis;
+        let held = |p: Value| tap_samples(&p, ms(10)).expect("tap")[1].delay;
+        assert_eq!(held(json!({"x": 1, "y": 2})), ms(10));
+        assert_eq!(held(json!({"x": 1, "y": 2, "hold_ms": 60})), ms(60));
+        assert_eq!(held(json!({"x": 1, "y": 2, "hold_ms": 0})), ms(0), "0 is a hold, not a missing one");
+        assert_eq!(held(json!({"x": 1, "y": 2, "hold_ms": null})), ms(10), "the CLI sends null without --hold");
+        assert_eq!(button(&json!({"button": "home"}), ms(80)), Ok((Button::Home, ms(80))));
+        assert_eq!(button(&json!({"button": "home", "hold_ms": 5}), ms(80)), Ok((Button::Home, ms(5))));
+    }
 
     #[test]
     fn bytes_go_beside_the_result_only_while_a_caller_takes_them() {

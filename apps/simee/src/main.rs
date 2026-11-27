@@ -202,9 +202,9 @@ enum Cmd {
         device: String,
         x: f64,
         y: f64,
-        /// Hold time in milliseconds.
-        #[arg(long, default_value_t = 60)]
-        hold: u64,
+        /// Hold time in milliseconds (default: the platform's, Android 60, iOS 10).
+        #[arg(long)]
+        hold: Option<u64>,
         /// iOS: `outer` or `inner` for an iPhone Duo's screen (`main` is the one in use), `carplay` for an iPhone's CarPlay screen.
         #[arg(long, default_value = "main")]
         display: String,
@@ -236,9 +236,9 @@ enum Cmd {
     Button {
         device: String,
         button: String,
-        /// Hold time in milliseconds.
-        #[arg(long, default_value_t = 80)]
-        hold: u64,
+        /// Hold time in milliseconds (default: the platform's, 80).
+        #[arg(long)]
+        hold: Option<u64>,
     },
     /// Type text on the hardware keyboard (US layout).
     Type { device: String, text: String },

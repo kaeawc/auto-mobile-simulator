@@ -301,6 +301,33 @@ pub fn keystroke(c: char) -> Option<KeyStroke> {
     }
 }
 
+/// One keyboard report: a usage going down or up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyEvent {
+    pub usage: u32,
+    pub direction: Direction,
+}
+
+/// The key reports that type `text` on the US layout, in order: each character's key down and
+/// up, with left shift pressed around it when the character needs shift. `Err` is the first
+/// character that has no key ([`keystroke`]), before anything is sent.
+pub fn key_events(text: &str) -> Result<Vec<KeyEvent>, char> {
+    let mut out = Vec::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        let stroke = keystroke(c).ok_or(c)?;
+        let mut push = |usage, direction| out.push(KeyEvent { usage, direction });
+        if stroke.shift {
+            push(KEY_LEFT_SHIFT, Direction::Down);
+        }
+        push(stroke.usage, Direction::Down);
+        push(stroke.usage, Direction::Up);
+        if stroke.shift {
+            push(KEY_LEFT_SHIFT, Direction::Up);
+        }
+    }
+    Ok(out)
+}
+
 /// The largest Digital Crown delta one HID message carries; bigger turns are split. Simulator.app
 /// sends the scroll wheel's delta per event, and larger single deltas are dropped by the guest.
 pub const CROWN_MAX_STEP: f64 = 200.0;
@@ -436,6 +463,29 @@ mod tests {
         assert_eq!(keystroke('"'), Some(KeyStroke { usage: 0x34, shift: true }));
         assert_eq!(keystroke(' '), Some(KeyStroke { usage: 0x2c, shift: false }));
         assert_eq!(keystroke('é'), None);
+    }
+
+    #[test]
+    fn typed_text_is_down_up_per_key_with_shift_around_shifted_ones() {
+        let (down, up) = (Direction::Down, Direction::Up);
+        let ev = |usage, direction| KeyEvent { usage, direction };
+        assert_eq!(
+            key_events("aB!").expect("keys"),
+            [
+                ev(0x04, down),
+                ev(0x04, up),
+                ev(KEY_LEFT_SHIFT, down),
+                ev(0x05, down),
+                ev(0x05, up),
+                ev(KEY_LEFT_SHIFT, up),
+                ev(KEY_LEFT_SHIFT, down),
+                ev(0x1e, down),
+                ev(0x1e, up),
+                ev(KEY_LEFT_SHIFT, up),
+            ]
+        );
+        assert_eq!(key_events("").expect("nothing"), []);
+        assert_eq!(key_events("ok é"), Err('é'), "refused whole, naming the character");
     }
 
     #[test]
