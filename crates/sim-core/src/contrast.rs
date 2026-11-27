@@ -276,8 +276,7 @@ fn blobs(img: &Img, scale: f64) -> Vec<Blob> {
         }
     }
     let mut by_root: std::collections::HashMap<u32, Blob> = std::collections::HashMap::new();
-    for i in 0..runs.len() {
-        let r = runs[i];
+    for (i, &r) in runs.iter().enumerate() {
         let root = find(&mut parent, i as u32);
         let b = by_root.entry(root).or_insert(Blob { x0: r.x0, y0: r.y, x1: r.x1, y1: r.y, edges: 0 });
         b.x0 = b.x0.min(r.x0);
@@ -406,10 +405,10 @@ fn background(img: &Img, rect: Rect) -> Option<Plane> {
         if range <= 4 {
             return mode_colour(colours()).map(Plane::flat);
         }
-        if let Some((plane, rms)) = fit_plane(&samples) {
-            if rms <= 3.0 {
-                return Some(plane);
-            }
+        if let Some((plane, rms)) = fit_plane(&samples)
+            && rms <= 3.0
+        {
+            return Some(plane);
         }
         let mode = mode_colour(colours())?;
         let near = |c: [u8; 3]| (0..3).all(|i| (f32::from(c[i]) - mode[i]).abs() <= 24.0);

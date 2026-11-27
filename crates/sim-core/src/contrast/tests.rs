@@ -123,7 +123,7 @@ fn overlaps(a: Rect, b: Rect) -> bool {
     a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
 }
 
-fn region_in<'a>(report: &'a Report, rect: Rect) -> Vec<&'a Region> {
+fn region_in(report: &Report, rect: Rect) -> Vec<&Region> {
     report.regions.iter().filter(|r| overlaps(r.rect, rect)).collect()
 }
 
