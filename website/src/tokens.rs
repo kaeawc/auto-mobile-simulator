@@ -1,0 +1,78 @@
+//! The site's tokens: a typeset paper. White page, black ink, CMU Serif (Computer Modern) for
+//! text and IBM Plex Mono for code, rules instead of boxes, and the gem's green only for links and
+//! the mark. Keep `index.html`'s CSS (the fonts, `--rune-*`) in step with these.
+
+use rune::{Color, TextStyle, oklch};
+
+pub fn bg() -> Color {
+    Color::WHITE
+}
+/// Body text: near-black, about 15:1 on white.
+pub fn fg() -> Color {
+    oklch(0.2, 0.0, 0.0)
+}
+/// Captions and secondary text: about 7:1 on white.
+pub fn fg2() -> Color {
+    oklch(0.45, 0.0, 0.0)
+}
+/// The rules under the header and over the footer.
+pub fn rule() -> Color {
+    oklch(0.2, 0.0, 0.0)
+}
+/// Leader lines in Figure 1.
+pub fn rule_faint() -> Color {
+    oklch(0.78, 0.0, 0.0)
+}
+/// Links: the gem's green, dark enough for about 5:1 on white.
+pub fn link() -> Color {
+    oklch(0.46, 0.1, 165.0)
+}
+pub fn code_bg() -> Color {
+    oklch(0.97, 0.004, 165.0)
+}
+
+/// The text column: about 70 characters of 17 pt CMU Serif.
+pub const MEASURE: f32 = 680.0;
+
+pub const SERIF: &str = "CMU Serif";
+pub const MONO: &str = "IBM Plex Mono";
+
+pub const BODY: TextStyle = TextStyle::new(17.0, 400.0).lh(26.0);
+pub const SMALL: TextStyle = TextStyle::new(15.0, 400.0).lh(22.0);
+pub const BOLD: TextStyle = TextStyle::new(17.0, 700.0).lh(26.0);
+pub const MONO_12: TextStyle = TextStyle::new(12.0, 400.0).lh(16.0).mono();
+pub const MONO_13: TextStyle = TextStyle::new(13.0, 400.0).lh(20.0).mono();
+
+/// The page's breakpoints, read from its width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Bp {
+    /// The widest breakpoint at or under the page's width.
+    pub at: u16,
+}
+
+impl Bp {
+    pub const STEPS: [u16; 3] = [0, 480, 760];
+    /// The widths the static page is exported at (`scripts/build.sh`): every breakpoint, with
+    /// the narrowest phone for the base.
+    pub const EXPORT: &str = "360,480,760";
+
+    pub fn of(width: f32) -> Bp {
+        let at = Self::STEPS.iter().rev().copied().find(|&s| width >= f32::from(s)).unwrap_or(0);
+        Bp { at }
+    }
+    /// Under 480: a phone.
+    pub fn phone(self) -> bool {
+        self.at < 480
+    }
+    pub fn gutter(self) -> f32 {
+        if self.phone() { 16.0 } else { 32.0 }
+    }
+    /// The paper's title.
+    pub fn title(self) -> TextStyle {
+        if self.phone() { TextStyle::new(24.0, 700.0).lh(30.0) } else { TextStyle::new(30.0, 700.0).lh(38.0) }
+    }
+    /// A numbered section's heading: "1 Performance".
+    pub fn h2(self) -> TextStyle {
+        if self.phone() { TextStyle::new(19.0, 700.0).lh(26.0) } else { TextStyle::new(21.0, 700.0).lh(28.0) }
+    }
+}
