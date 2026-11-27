@@ -18,9 +18,10 @@
 //! `cargo run` opens the window (`SIMEE_DEVICE=<udid|name|booted>` preselects a device);
 //! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
 //! folded, tablet, ipad, watch, tv, apple-watch, apple-tv, turned, turned-tablet, empty,
-//! sidebar-hidden, inspector-hidden, panes-hidden, panes-wide, resources, resources-memory); a release build needs
-//! `--features tooling` for it.
+//! sidebar-hidden, inspector-hidden, panes-hidden, panes-wide, resources, resources-memory, admission,
+//! admission-many); a release build needs `--features tooling` for it.
 
+mod admission;
 mod android;
 mod bezel;
 mod controls;
@@ -63,7 +64,10 @@ use keys::KeyAction;
 pub enum Action {
     Refresh,
     Select(String),
+    /// Boot the selected device, past [`admission`] first.
     Boot,
+    /// Boot these devices now: admitted, or the user chose to on the admission sheet.
+    BootNow(Vec<String>),
     Shutdown,
     Button(Button),
     ToggleAppearance,
@@ -178,6 +182,8 @@ pub struct State {
     pub panes: panes::Panes,
     /// The resource panel's samples and its line to the API ([`resources`]).
     pub resources: resources::Resources,
+    /// The check before a boot and its warning sheet ([`admission`]).
+    pub admission: admission::Gate,
 }
 
 /// An Android screen switched away from, with what the window showed it with.
@@ -443,6 +449,7 @@ fn init() -> State {
         prefs: settings::Store::default(),
         panes: panes::Panes::default(),
         resources: resources::Resources::default(),
+        admission: admission::Gate::default(),
     }
 }
 
@@ -665,7 +672,8 @@ fn setup(s: &mut State, waker: Waker) {
     }
     if let Some(w) = s.waker.clone() {
         s.debug.start(w.clone());
-        s.resources.connect(w);
+        s.resources.connect(w.clone());
+        s.admission.connect(w);
     }
     // The window also serves the API, so scripts can drive the device it shows.
     let socket = std::env::var_os("SIMEE_SOCKET").map_or_else(|| std::env::temp_dir().join("simee-desktop.sock"), std::path::PathBuf::from);
@@ -747,7 +755,8 @@ fn coalesce_moves(inputs: Vec<Input>) -> Vec<Input> {
 }
 
 fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
-    let mut changed = false;
+    // A landed admission check queues its boot (or shows its sheet) before the actions run.
+    let mut changed = admission::poll(s);
     if let Some((button, due)) = s.held
         && t >= due
     {
@@ -791,20 +800,10 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             }
             Action::Boot => {
                 let Some(info) = s.selected_info().cloned() else { continue };
-                match info.platform {
-                    Platform::Ios => {
-                        let Some(waker) = s.waker.clone() else { continue };
-                        s.busy = Some("Booting…");
-                        s.work_done.store(false, Ordering::Relaxed);
-                        device::boot_async(info.udid, s.work_done.clone(), s.work_error.clone(), waker);
-                    }
-                    Platform::Android => {
-                        let Some(backend) = s.android_backend.clone() else { continue };
-                        // With audio: a person is watching this one (tools and farms boot silent).
-                        s.run_async("Booting…", move || backend.device(&info.udid)?.boot(&backend, Duration::from_secs(300), true));
-                    }
-                }
+                let admitted = admission::ask(s, &info);
+                boot(s, &admitted);
             }
+            Action::BootNow(udids) => boot(s, &udids),
             Action::Shutdown => {
                 if let Some(live) = s.live.take() {
                     if let Err(e) = live.shutdown() {
@@ -934,6 +933,26 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     changed |= resources::poll(s, t, tx);
     changed |= panes::poll(s, t, tx);
     changed
+}
+
+/// Boots the listed devices, past admission already.
+fn boot(s: &mut State, udids: &[String]) {
+    for udid in udids {
+        let Some(info) = s.devices.iter().find(|d| &d.udid == udid).cloned() else { continue };
+        match info.platform {
+            Platform::Ios => {
+                let Some(waker) = s.waker.clone() else { continue };
+                s.busy = Some("Booting…");
+                s.work_done.store(false, Ordering::Relaxed);
+                device::boot_async(info.udid, s.work_done.clone(), s.work_error.clone(), waker);
+            }
+            Platform::Android => {
+                let Some(backend) = s.android_backend.clone() else { continue };
+                // With audio: a person is watching this one (tools and farms boot silent).
+                s.run_async("Booting…", move || backend.device(&info.udid)?.boot(&backend, Duration::from_secs(300), true));
+            }
+        }
+    }
 }
 
 /// ⌘3: the 3D view on or off, or the reason it can't be (a backend without depth buffers, a
@@ -1142,12 +1161,14 @@ fn main() {
             ("panes-wide", panes::panes_wide_scene),
             ("resources", resources::scene),
             ("resources-memory", resources::memory_scene),
+            ("admission", admission::scene),
+            ("admission-many", admission::many_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),
         on_key: Some(on_key),
         min_size: Some((1000.0, 560.0)),
-        ..AppSpec::new("simee", (1240.0, 870.0), init, shot_preview::view)
+        ..AppSpec::new("simee", (1240.0, 870.0), init, admission::view)
     };
     // Live Rust editing runs the spec its own way, without the visibility hook.
     #[cfg(feature = "hot")]

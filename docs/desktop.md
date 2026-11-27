@@ -167,6 +167,24 @@ the panel, the inspector or the window hidden it asks for nothing and schedules 
 that changes nothing shown draws no frame. Its visibility and sort persist in the settings file
 (`resources`). The headless scenes `resources` and `resources-memory` show it with fixed data.
 
+## Admission before a boot
+
+Before the window boots a device it asks the API's `admission_check` (the device's platform,
+form factor and count; see [Admission](api.md#admission)) whether the host can take it
+(`desktop/src/admission.rs`, #275), on a thread of its own so the window never waits. On admit
+the device boots with no UI. On hold or backoff a sheet drops from the top of the window with
+the numbers ("Booting pixel_tablet would take memory used from 78% to 89%") and every reason
+the API gave, and offers Boot anyway, Boot N (when the host admits some of the devices asked
+for but not all: the first N, from `predicted.admissible`) and Cancel (or Escape). Boot N is
+the default button when offered, otherwise Cancel. "Why? See the resource panel" shows the
+[resource panel](#resource-panel) beside the sheet, with the host's verdict now. "Don't ask
+again for Android phone devices this session" skips the check for that platform and form
+factor on the next boots, until the window quits; it is remembered only when the sheet boots,
+not when it is cancelled. A check never blocks silently: one that fails or can't start boots
+anyway and says so in the status bar. The window boots one device at a time (the toolbar's
+Boot), so Boot N shows only for a request of several devices; it creates and clones no devices
+yet. The headless scenes `admission` and `admission-many` show the sheet with fixed data.
+
 ## Screenshot preview
 
 ⌘S, or the toolbar's Screenshot button, saves the device's screen to the Desktop as a PNG, as
