@@ -78,6 +78,41 @@ ANGLE_DEFAULT_PLATFORM=swiftshader target/release/emu -avd <avd> -port 5620   # 
 | Warm | ANGLE on Metal (emu's default) | 5 s (4, 5, 7) | 6 s (6, 5, 7) |
 | Warm | ANGLE on SwiftShader | 4 s (4, 3, 4) | 4 s (4, 4, 5) |
 
+### API 29 and 30: first boots and idle host CPU
+
+One API 29 `default` and one API 30 `google_apis` arm64 AVD (4 vCPU, 2 GB, 720x1280), each booted
+under emu built from `main` (1ea8508), emu with the reference RIL's modem answers (#83) and SDK
+emulator 37.2.13.0, same host (Apple silicon Mac, 16 CPUs, macOS 26.6), 2026-11-26, 3 rounds
+alternating the three (stock's third API 30 run waited 40 minutes for a boot slot and ran just
+after midnight). Every boot is a first boot (`-wipe-data`), all with `-no-window -no-audio
+-no-boot-anim -no-snapshot-save`; the boot time is launch until `sys.boot_completed` (polled every
+0.5 s). Each device then sits 120 s, and idle host CPU is the emulator's process tree's CPU time
+over the next 120 s (`ps -o time`). Other lanes' work put the 1-minute load between 5 and 48
+during the boots and idle windows (one idle window ended at 109; its numbers are in line with the
+others).
+
+```bash
+emu -avd <avd> -port 5640 -no-window -no-audio -no-boot-anim -no-snapshot-save -wipe-data
+emulator -avd <avd> -port 5644 -no-window -no-audio -no-boot-anim -no-snapshot-save -wipe-data
+# then adb -s emulator-<port> shell getprop sys.boot_completed every 0.5 s; 120 s later,
+# ps -o time= -p <pid and children> at the start and end of 120 s
+```
+
+| Measure | emu | SDK emulator |
+| --- | --- | --- |
+| API 29 first boot until `sys.boot_completed` | 3.7 s (3.7, 3.2, 7.7) | 4.8 s (5.9, 4.8, 4.8) |
+| API 30 first boot until `sys.boot_completed` | 18.0 s (31.3, 17.4, 18.0) | 17.0 s (20.5, 17.0, 16.3) |
+| API 29 idle host CPU | 2.9% of a core (2.2, 2.9, 3.0) | 5.4% (4.1, 8.2, 5.4) |
+| API 30 idle host CPU | 2.1% of a core (2.1, 2.5, 2.0) | 3.7% (3.5, 3.7, 3.8) |
+
+Before the modem fix, emu from `main` idled at 149% of a core on API 29 (141.8, 149.3, 161.7)
+and 156% on API 30 (156.3, 163.5, 156.1), with `com.android.phone` at 68% of a guest core and
+`system_server` at 28% (`top`, API 29, run 1): by the end of each idle window the radio log
+showed the phone switching between GSM and CDMA 1–10 times (none on stock or the fixed emu), and
+the reference RIL had sent the modem 593 AT commands against stock's 159 and the fixed emu's 152
+(API 30, run 2). Its first boots took 4.3 s (8.0, 4.3, 3.7) and 18.5 s (25.5, 18.5, 17.9).
+The mechanism is in [android.md](android.md#performance-notes).
+
 ### Idle host CPU
 
 The same API 36 AVD, warm-booted under emu built without and with its network device (#29),
@@ -606,10 +641,10 @@ Claims that would belong in the README once someone runs them:
   and a `--to` drag 4.01-4.08 s (median of 5), against about 1.4 s of 16 ms reports. Placement
   with 6 halving steps is measured: 0.0 / 0.0 pt on iOS 26.5, 0.32 / 0.36 pt (median / max, 12
   targets) on 27.2.
-- Host CPU of an idle booted device, emu against the SDK emulator.
-- API 29 first boots against stock, API 30 first and warm boots, and their idle host CPU: an
-  API 29 or 30 device under emu sat at 150–170% of a core after the AutoMobile harness, with
-  `com.android.phone`, `system_server` and `logd` busy in the guest; not yet compared with stock.
+- Host CPU of an idle booted device, emu against the SDK emulator, on API 31 and newer.
+- API 30 warm boots against stock (first boots and idle host CPU of API 29 and 30 are
+  [above](#api-29-and-30-first-boots-and-idle-host-cpu)), and API 29 and 30 idle host CPU after
+  the AutoMobile harness.
 - Network throughput and latency through emu's NAT against the SDK emulator's slirp.
 - Host CPU of an idle booted device with and without the virtio-snd card (`EMU_VIRTIO_SND=0`),
   median of 3 boots each on the same host and day (an earlier sample on API 36 showed no
