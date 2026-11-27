@@ -275,7 +275,7 @@ fn boot_inject(device: &Device) -> Result<(), String> {
 /// afterwards, `launchctl` too, so injection couldn't be undone without a reboot.
 fn shaper_loads(device: &Device, env: &[(String, String)]) -> Result<(), String> {
     let out = device.exec("launchctl", &["getenv".to_owned(), "SIMEE_NETSHAPE".to_owned()], env).map_err(err)?;
-    match out.stderr.lines().find(|l| l.starts_with("dyld[") || l.contains("Library not loaded")) {
+    match crate::camera::dyld_failure(&out.stderr) {
         Some(line) => Err(format!("the network shaper doesn't load on this device's runtime: {}", line.trim())),
         None => Ok(()),
     }
@@ -718,8 +718,8 @@ pub(crate) fn camera_devices(s: &mut Session) -> Result<Vec<crate::camera::IosTa
 }
 
 /// Runs the device's own `launchctl` (the runtime's, see AGENTS.md): its stdout and stderr.
-pub(crate) fn camera_launchctl(s: &mut Session, udid: &str, args: &[String]) -> Result<(String, String), String> {
-    let out = s.ctx()?.device(udid).map_err(err)?.exec("launchctl", args, &[]).map_err(err)?;
+pub(crate) fn camera_launchctl(s: &mut Session, udid: &str, args: &[String], env: &[(String, String)]) -> Result<(String, String), String> {
+    let out = s.ctx()?.device(udid).map_err(err)?.exec("launchctl", args, env).map_err(err)?;
     Ok((out.stdout, out.stderr))
 }
 

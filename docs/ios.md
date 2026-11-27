@@ -127,7 +127,10 @@ simee server serves the device's feed on `cam.sock`, injects the shim found at
 `$SIMEE_CAMERA_SHIM` or `target/ios-camera/` (the error names `build.sh` when it is missing),
 saves the link in `<data>/simee/cameras.ini` and reapplies it when simee boots the device. A
 booted device can be linked only through a running `simee serve`, which holds the feed. Running
-apps need a relaunch and an app needs its camera grant, as below.
+apps need a relaunch and an app needs its camera grant, as below. The device inserts a copy of
+the shim kept in `<data>/simee/camera-<hash>/`, and the insertion stays for the rest of the boot
+if the server exits or the device is shut down outside simee: `simee camera unlink <udid>` or a
+reboot clears it.
 
 **Per app**: grant the camera the usual way, then launch through the API with the shim and the
 socket in the environment (simee passes `env` straight to the launch, no `SIMCTL_CHILD_` prefix):

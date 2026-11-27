@@ -165,13 +165,28 @@ A simulator has no camera of its own: simee injects its capture shim (`shims/ios
 - **The shim** is found at `$SIMEE_CAMERA_SHIM`, else in `ios-camera/` beside the simee
   executable or one directory up (`target/ios-camera/`, where `shims/ios-camera/build.sh` writes
   it for `target/{debug,release}/simee`), with `libsimee-camera-hooks.dylib` beside it. A link
-  fails naming the build command when it is missing.
+  fails naming the build command when it is missing, and refuses a path with a `:` or a line
+  break (dyld would split it). The link copies the shim and its hooks to
+  `<data>/simee/camera-<hash>/` in the device's data directory and inserts that copy, so a
+  rebuild, `cargo clean` or a removed worktree can't leave the device inserting a missing
+  library; an erase removes the copy with the link. Before the `setenv`, a `launchctl` runs with
+  the shim inserted, and a dyld failure refuses the link with nothing injected. A `launchctl` that
+  prints anything on stderr is an error (never "unset"), and an unlink succeeds only once the
+  device's environment no longer holds the shim. A link and an unlink of one device run one at a
+  time.
+- **The injection outlives the server.** `DYLD_INSERT_LIBRARIES` lives in the device's launchd
+  for the rest of that boot. When `simee serve` exits, or the device is shut down outside simee
+  (`simctl`, Simulator.app, an in-process shutdown), nothing takes it out: every app launched
+  afterwards gets the hooks and a simulated camera with no frames. Clear it with `simee camera
+  unlink <udid>` (needs the device booted) or by rebooting the device. A device shut down
+  outside simee also keeps its feed thread in the server until the device is linked again.
 - **Saved** like Android's, in the simulator's data directory (`<data>/simee/cameras.ini`; an
   erase removes it). A boot through simee (`simee boot`, the `boot` method) reapplies the saved
   link: on a server it starts the feed and injects the shim; elsewhere it hands the link to a
   running server. A shutdown, erase or delete through simee stops the feed.
 - **States:** `linked` (served as saved), `relinked` (the feed serves something else; `live` says
-  what), `saved` (shut down; or booted with no feed in this server, after a boot outside simee or a
+  what), `shim missing` (a feed serves it, but `network_shape` or `network_clear` replaced the
+  device's `DYLD_INSERT_LIBRARIES`: link again), `saved` (shut down; or booted with no feed in this server, after a boot outside simee or a
   server restart, with a `fix`: link again), `off` (`none`), and a webcam's `source missing` (its
   apps get no frames until the camera is back) or `permission missing`. A webcam source is
   captured by the server, so it is the server's camera permission (the table below).
