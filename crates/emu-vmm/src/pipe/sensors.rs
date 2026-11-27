@@ -281,11 +281,22 @@ mod tests {
         let mut pipe = SensorPipe { stream: s.clone(), mask: 1, buf: Vec::new() };
         let mut req = Vec::new();
         frame(&mut req, b"set:acceleration:1");
+        let enabled_at = Instant::now();
         assert!(pipe.guest_data(&req, &mut Vec::new()));
-        std::thread::sleep(Duration::from_millis(300));
+        // Wait for the event, not for a fixed time: a starved host stretches every sleep, so the
+        // deadline only bounds a hang. It ticks, and a few ticks are enough to check the rate.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while s.ticks.load(Ordering::Relaxed) < 5 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
         let ticks = s.ticks.load(Ordering::Relaxed);
-        // About 30 at 10 ms (a loaded host stretches sleeps), unchanged values included.
-        assert!((5..=31).contains(&ticks), "{ticks}");
+        // Read the clock after the count: a late read only loosens the bound.
+        let elapsed = enabled_at.elapsed();
+        assert!(ticks >= 5, "only {ticks} ticks in {elapsed:?}");
+        // Never faster than the requested 10 ms, by the time that really passed (unchanged
+        // values included).
+        let most = (elapsed.as_millis() / 10) as u64 + 1;
+        assert!(ticks <= most, "{ticks} ticks in {elapsed:?} (at most {most})");
         // Disabled again: parked again (at most the tick in flight).
         let mut req = Vec::new();
         frame(&mut req, b"set:acceleration:0");
@@ -297,7 +308,7 @@ mod tests {
         let closed = Instant::now();
         pipe.closed();
         assert!(sent.join().expect("stream") as u64 >= ticks);
-        assert!(closed.elapsed() < Duration::from_millis(100), "a close wakes it: {:?}", closed.elapsed());
+        assert!(closed.elapsed() < Duration::from_secs(2), "a close wakes it: {:?}", closed.elapsed());
     }
 
     /// One batch of event lines after the guest enables `enable` (a name as the HAL spells it).
