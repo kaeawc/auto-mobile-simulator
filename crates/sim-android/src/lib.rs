@@ -9,6 +9,7 @@
 //! An AVD's name is its identifier (the `udid` of its [`DeviceInfo`]): AVD names are unique within
 //! an AVD home, and Android has no other stable id for a device that isn't running.
 
+pub mod apps;
 pub mod console;
 pub mod display;
 #[cfg(any(test, feature = "testing"))]

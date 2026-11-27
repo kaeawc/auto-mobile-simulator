@@ -116,3 +116,99 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
     }
     lines.lock().expect("lines").clone()
 }
+
+/// A stand-in `adb` in `android`'s SDK (`platform-tools/adb`, a shell script): it logs each
+/// invocation and answers the app commands the way a device does, with the texts a real
+/// API 36 guest prints. Package `com.example.app` is installed with a launcher activity (and
+/// third-party), `com.missing.app` isn't, `broken.apk` fails to install, `com.example.crash`
+/// has an activity that doesn't start, `com.example.svc` launches but never has a process (its
+/// `pidof` exits 1, as toybox's does), `com.example.late`'s process shows up on the third
+/// `pidof`, `com.example.leaky` has two launcher activities (LeakCanary's alias second), and
+/// `am force-stop com.example.hang` never returns (it writes its PID to `hang.pid` beside the
+/// script first).
+pub fn fake_adb(android: &Android) -> FakeAdb {
+    let dir = android.env.sdk_root.as_ref().expect("sdk root").join("platform-tools");
+    std::fs::create_dir_all(&dir).expect("platform-tools");
+    write_script(&dir.join("adb"), FAKE_ADB);
+    FakeAdb { log: dir.join("adb.log") }
+}
+
+/// Writes `body` as an executable `/bin/sh` script at `path`, ready to run: written under a
+/// temporary name and renamed into place, then run once (a probe the script answers by exiting)
+/// until Linux stops refusing it as busy. Another test thread's fork while the file was open for
+/// writing holds it open in that child until the child's exec, and an exec of the script in that
+/// window fails with ETXTBSY ("Text file busy"); once one exec succeeds, no process can still
+/// hold it open for writing.
+pub fn write_script(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().expect("script name").to_string_lossy();
+    let temp = path.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    std::fs::write(&temp, format!("#!/bin/sh\n[ -n \"$SIMEE_FAKE_PROBE\" ] && exit 0\n{body}")).expect("script");
+    std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::rename(&temp, path).expect("rename script");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::process::Command::new(path).env("SIMEE_FAKE_PROBE", "1").status() {
+            Ok(_) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && Instant::now() < deadline => sleep(Duration::from_millis(5)),
+            Err(e) => panic!("couldn't run {}: {e}", path.display()),
+        }
+    }
+}
+
+/// What a [`fake_adb`] was asked.
+pub struct FakeAdb {
+    log: std::path::PathBuf,
+}
+
+impl FakeAdb {
+    /// Each invocation's arguments, in order, without the leading `-s <serial>`.
+    pub fn calls(&self) -> Vec<String> {
+        let text = std::fs::read_to_string(&self.log).unwrap_or_default();
+        text.lines().map(|l| l.split_once(' ').and_then(|(_, rest)| rest.split_once(' ')).map_or(l, |(_, r)| r).to_owned()).collect()
+    }
+}
+
+const FAKE_ADB: &str = r#"echo "$*" >> "$(dirname "$0")/adb.log"
+[ "$1" = "-s" ] && shift 2
+case "$1" in
+install)
+  case "$*" in
+    *broken.apk*) echo "Performing Streamed Install" >&2; echo "adb: failed to install broken.apk: Failure [INSTALL_PARSE_FAILED_NOT_APK: Failed to parse /data/app/vmdl1.tmp/base.apk]" >&2; exit 1;;
+  esac
+  echo "Performing Streamed Install"
+  echo "Success";;
+shell)
+  case "$2" in
+    "pm uninstall com.missing.app") echo "Failure [DELETE_FAILED_INTERNAL_ERROR]";;
+    "pm uninstall "*) echo "Success";;
+    "pm list packages -3") printf 'package:com.example.app\npackage:com.example.zeta\n';;
+    "pm list packages") printf 'package:com.android.settings\npackage:com.example.zeta\npackage:android\npackage:com.example.app\n';;
+    "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.app") echo 'com.example.app/.MainActivity';;
+    "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.crash") echo 'com.example.crash/.Gone';;
+    "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.svc") echo 'com.example.svc/.Main';;
+    "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.late") echo 'com.example.late/.Main';;
+    "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.leaky")
+      printf 'com.example.leaky/.MainActivity\ncom.example.leaky/leakcanary.internal.activity.LeakLauncherActivity\n';;
+    "cmd package query-activities"*) echo "No activities found";;
+    "am start"*"com.example.crash/.Gone"*)
+      printf 'Starting: Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] cmp=com.example.crash/.Gone }\nError type 3\nError: Activity class {com.example.crash/com.example.crash.Gone} does not exist.\n';;
+    "am start"*"android.intent.action.VIEW"*"nowhere://"*)
+      printf 'Starting: Intent { act=android.intent.action.VIEW dat=nowhere://x }\nError: Activity not started, unable to resolve Intent { act=android.intent.action.VIEW dat=nowhere://x flg=0x10000000 }\n';;
+    "am start"*"android.intent.action.VIEW"*) printf 'Starting: Intent { act=android.intent.action.VIEW dat=https://example.com/ }\n';;
+    "am start"*) printf 'Starting: Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] cmp=com.example.app/.MainActivity }\nStatus: ok\nLaunchState: COLD\nActivity: com.example.app/.MainActivity\nTotalTime: 812\nWaitTime: 820\nComplete\n';;
+    "pidof -s com.example.app") echo "4321";;
+    "pidof -s com.example.late")
+      probes="$(dirname "$0")/late.probes"
+      echo x >> "$probes"
+      [ $(wc -l < "$probes") -ge 3 ] && echo "7777" || exit 1;;
+    "pidof -s "*) exit 1;;
+    "am force-stop com.example.hang") echo $$ > "$(dirname "$0")/hang.pid"; exec sleep 10;;
+    "am force-stop "*) ;;
+    *) echo "fake adb: unhandled: $2" >&2; exit 2;;
+  esac;;
+*) echo "fake adb: unhandled: $*" >&2; exit 2;;
+esac
+"#;

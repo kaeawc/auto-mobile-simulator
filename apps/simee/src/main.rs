@@ -266,8 +266,12 @@ enum Cmd {
     Launch { device: String, bundle_id: String },
     /// Terminate an app.
     Terminate { device: String, bundle_id: String },
-    /// List installed bundle identifiers.
-    Apps { device: String },
+    /// List installed bundle identifiers (Android: the third-party packages, `--all` with the system's).
+    Apps {
+        device: String,
+        #[arg(long)]
+        all: bool,
+    },
     /// Set light or dark appearance.
     Appearance { device: String, mode: String },
     /// Set the simulated location.
@@ -775,7 +779,10 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             writeln!(out, "{}", call("launch", json!({"device": device, "bundle_id": bundle_id}))?["pid"])?
         }
         Cmd::Terminate { device, bundle_id } => drop(call("terminate", json!({"device": device, "bundle_id": bundle_id}))?),
-        Cmd::Apps { device } => lines(out, &call("apps", json!({"device": device}))?)?,
+        Cmd::Apps { device, all } => {
+            let params = if all { json!({"device": device, "all": true}) } else { json!({"device": device}) };
+            lines(out, &call("apps", params)?)?
+        }
         Cmd::Appearance { device, mode } => drop(call("appearance", json!({"device": device, "mode": mode}))?),
         Cmd::Location { device, latitude, longitude } => {
             drop(call("location", json!({"device": device, "latitude": latitude, "longitude": longitude}))?)
