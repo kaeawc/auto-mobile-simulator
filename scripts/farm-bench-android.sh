@@ -11,7 +11,7 @@
 # perffarm-<i> AVDs of older runs are reported once and never deleted here:
 #   MODE=clone (default)  `emu -clone-avd $PREFIX<i> -from <golden>`: APFS clones of the golden
 #                         AVD's settled simee disks, so no device pays first boot
-#   MODE=fresh            `emu -create-avd $PREFIX<i> -sysdir <golden's image>`: a first boot each
+#   MODE=fresh            `emu -create-avd $PREFIX<i> -sysdir <golden's image> -no-golden`: a first boot each
 #   MODE=existing         boot the AVDs named in AVDS (space-separated) as they are; never deleted
 # Other knobs: K (devices started at once, default N; the next starts when one settles), BASE_PORT
 # (default 5600; device i gets console BASE_PORT+2(i-1), adb +1), EMU (the emu binary, default
@@ -144,7 +144,7 @@ if [ "$mode" != existing ]; then
     if [ "$mode" = clone ]; then
       "$tool" -clone-avd "$name" -from "$golden" > "$run/make-$name.log" 2>&1 || { cat "$run/make-$name.log" >&2; exit 1; }
     else
-      "$tool" -create-avd "$name" -sysdir "$sysdir" > "$run/make-$name.log" 2>&1 || { cat "$run/make-$name.log" >&2; exit 1; }
+      "$tool" -create-avd "$name" -sysdir "$sysdir" -no-golden > "$run/make-$name.log" 2>&1 || { cat "$run/make-$name.log" >&2; exit 1; }
     fi
   done
   df1=$(df -k "$avd_home" | awk 'NR==2 {print $3}')

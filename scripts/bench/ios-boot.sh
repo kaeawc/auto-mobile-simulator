@@ -17,13 +17,26 @@
 # Reproduces docs/benchmarks.md "iOS: simee against simctl", the boot table.
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
-type="iPhone 17"; runtime=""
+type="iPhone 17"
+runtime=""
 while [ $# -gt 0 ]; do
   case $1 in
-    --device-type) type=$2; shift 2 ;;
-    --runtime) runtime=$2; shift 2 ;;
-    --simee) BENCH_SIMEE=$2; shift 2 ;;
-    *) bench_opt "$@"; shift "$BENCH_SHIFT" ;;
+    --device-type)
+      type=$2
+      shift 2
+      ;;
+    --runtime)
+      runtime=$2
+      shift 2
+      ;;
+    --simee)
+      BENCH_SIMEE=$2
+      shift 2
+      ;;
+    *)
+      bench_opt "$@"
+      shift "$BENCH_SHIFT"
+      ;;
   esac
 done
 ios_env
@@ -35,9 +48,17 @@ boot() {
   local tool=$1 udid=$2 t0
   t0=$(now)
   if [ "$tool" = simee ]; then
-    SIMEE_IN_PROCESS=1 "$BENCH_SIMEE" boot "$udid" --timeout 600 > "$BENCH_WORK/boot.out" 2>&1 || { cat "$BENCH_WORK/boot.out" >&2; echo failed; return; }
+    SIMEE_IN_PROCESS=1 "$BENCH_SIMEE" boot "$udid" --timeout 600 >"$BENCH_WORK/boot.out" 2>&1 || {
+      cat "$BENCH_WORK/boot.out" >&2
+      echo failed
+      return
+    }
   else
-    xcrun simctl bootstatus "$udid" -b > "$BENCH_WORK/boot.out" 2>&1 || { cat "$BENCH_WORK/boot.out" >&2; echo failed; return; }
+    xcrun simctl bootstatus "$udid" -b >"$BENCH_WORK/boot.out" 2>&1 || {
+      cat "$BENCH_WORK/boot.out" >&2
+      echo failed
+      return
+    }
   fi
   since "$t0" 1
 }

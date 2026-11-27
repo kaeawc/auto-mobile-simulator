@@ -19,16 +19,42 @@
 # software mode (an x86_64 image) and this reproduces "Software mode through emu -avd"'s swipes.
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
-device=phone; image=""; arms="emu stock"; settle=""; runs=1; port=5720
+device=phone
+image=""
+arms="emu stock"
+settle=""
+runs=1
+port=5720
 while [ $# -gt 0 ]; do
   case $1 in
-    --device) device=$2; shift 2 ;;
-    --image) image=$2; shift 2 ;;
-    --arms) arms=$2; shift 2 ;;
-    --settle) settle=$2; shift 2 ;;
-    --runs) runs=$2; shift 2 ;;
-    --port) port=$2; shift 2 ;;
-    *) bench_opt "$@"; shift "$BENCH_SHIFT" ;;
+    --device)
+      device=$2
+      shift 2
+      ;;
+    --image)
+      image=$2
+      shift 2
+      ;;
+    --arms)
+      arms=$2
+      shift 2
+      ;;
+    --settle)
+      settle=$2
+      shift 2
+      ;;
+    --runs)
+      runs=$2
+      shift 2
+      ;;
+    --port)
+      port=$2
+      shift 2
+      ;;
+    *)
+      bench_opt "$@"
+      shift "$BENCH_SHIFT"
+      ;;
   esac
 done
 case $device in
@@ -43,12 +69,12 @@ fi
 settle=${settle:-60}
 android_env
 image_dir "$image"
-case " $arms " in *" stock "*) stock_ready ;; esac
+case " $arms " in *" stock "*) stock_ready ;; *) ;; esac
 android_port "$port"
 bench_start android-frames
 emu_ready
-read -r -a arm_list <<< "$arms"
-label() { case $1 in stock) echo "SDK emulator" ;; *) echo "$1" ;; esac; }
+read -r -a arm_list <<<"$arms"
+label() { case $1 in stock) echo "SDK emulator" ;; *) echo "$1" ;; esac }
 extra() { [ "${1%%:*}" = stock ] && echo -no-snapshot-load; }
 field() { printf ' %s\n' "$2" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
 avd="bench-frames-$$"
@@ -63,7 +89,8 @@ done
 for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
   order=("${arm_list[@]}")
   if [ $((BENCH_ROUND % 2)) = 0 ]; then
-    order=(); for ((i = ${#arm_list[@]} - 1; i >= 0; i--)); do order+=("${arm_list[i]}"); done
+    order=()
+    for ((i = ${#arm_list[@]} - 1; i >= 0; i--)); do order+=("${arm_list[i]}"); done
   fi
   for arm in "${order[@]}"; do
     a=$(label "$arm")
@@ -75,7 +102,7 @@ for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
     fi
     sleep "$settle"
     for _ in $(seq 1 "$runs"); do
-      line=$(ANDROID_HOME=$BENCH_SDK "$BENCH_REPO/scripts/android-jank.sh" "emulator-$port" "$BOOT_PID" 2> /dev/null | tail -1)
+      line=$(ANDROID_HOME=$BENCH_SDK "$BENCH_REPO/scripts/android-jank.sh" "emulator-$port" "$BOOT_PID" 2>/dev/null | tail -1)
       bench_log "$arm: $line"
       bench_sample "$a" "janky frames, %" "$(field janky_pct "$line")"
       bench_sample "$a" "frame time p50, ms" "$(field p50 "$line")"

@@ -1027,7 +1027,7 @@ gives; `scripts/bench/ios-farm.sh` runs its clone mode with a template it create
 
 ## iOS: app preferences
 
-Moved from [ios.md](ios.md#app-preferences-prefs_) (#178), which describes the backend. iPhone 17
+Moved from [ios.md](ios.md#app-preferences) (#178), which describes the backend. iPhone 17
 Pro, iOS 27.2, M3 Max, 2026-11-27, a test app reading and writing an app-group suite, through
 `simee serve`, round trips over the socket:
 

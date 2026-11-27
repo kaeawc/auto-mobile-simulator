@@ -20,15 +20,38 @@
 # Reproduces docs/benchmarks.md "Emulator internals", the reset rows.
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
-modes="hard reboot exit"; baseline=""; image=system-images/android-36/google_apis/arm64-v8a; port=5720; modes_set=0
+modes="hard reboot exit"
+baseline=""
+image=system-images/android-36/google_apis/arm64-v8a
+port=5720
+modes_set=0
 while [ $# -gt 0 ]; do
   case $1 in
-    --modes) modes=$2; modes_set=1; shift 2 ;;
-    --baseline) baseline=$2; shift 2 ;;
-    --emu) BENCH_EMU=$2; shift 2 ;;
-    --image) image=$2; shift 2 ;;
-    --port) port=$2; shift 2 ;;
-    *) bench_opt "$@"; shift "$BENCH_SHIFT" ;;
+    --modes)
+      modes=$2
+      modes_set=1
+      shift 2
+      ;;
+    --baseline)
+      baseline=$2
+      shift 2
+      ;;
+    --emu)
+      BENCH_EMU=$2
+      shift 2
+      ;;
+    --image)
+      image=$2
+      shift 2
+      ;;
+    --port)
+      port=$2
+      shift 2
+      ;;
+    *)
+      bench_opt "$@"
+      shift "$BENCH_SHIFT"
+      ;;
   esac
 done
 [ "$BENCH_QUICK" = 1 ] && [ "$modes_set" = 0 ] && modes=hard
@@ -47,14 +70,14 @@ avd_create "$avd" "$IMAGE_DIR" -cores 4 -memory 2048 -lcd 720x1280@320
 BENCH_ROUND=0
 android_boot emu "$avd" "$port" "$BENCH_WORK/first.log" && bench_log "first boot ${BOOT_S}s (not counted)"
 android_stop "$BOOT_PID" "$port"
-read -r -a mode_list <<< "$modes"
+read -r -a mode_list <<<"$modes"
 for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
   order=("${builds[@]}")
   [ $((BENCH_ROUND % 2)) = 0 ] && [ ${#builds[@]} = 2 ] && order=("${builds[1]}" "${builds[0]}")
   for mode in "${mode_list[@]}"; do
     for bin in "${order[@]}"; do
       a=$(label "$bin")
-      out=$(EMU=$bin PORT=$port ANDROID_HOME=$BENCH_SDK "$BENCH_REPO/scripts/android-reset-bench.sh" "$avd" "$mode" 1 2> /dev/null)
+      out=$(EMU=$bin PORT=$port ANDROID_HOME=$BENCH_SDK "$BENCH_REPO/scripts/android-reset-bench.sh" "$avd" "$mode" 1 2>/dev/null)
       line=$(printf '%s\n' "$out" | grep "^mode=$mode run=1" | tail -1)
       bench_log "$a: ${line:-no result: $(printf '%s' "$out" | tail -1)}"
       if [ "$mode" = exit ]; then

@@ -20,24 +20,59 @@
 # "Software mode through emu -avd" (tap and screenshot, --android on Linux without KVM).
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
-type="iPhone 17"; runtime=""; calls=20; baseline=""; android=0
-image=system-images/android-36/google_apis/arm64-v8a; port=5720
+type="iPhone 17"
+runtime=""
+calls=20
+baseline=""
+android=0
+image=system-images/android-36/google_apis/arm64-v8a
+port=5720
 while [ $# -gt 0 ]; do
   case $1 in
-    --device-type) type=$2; shift 2 ;;
-    --runtime) runtime=$2; shift 2 ;;
-    --calls) calls=$2; shift 2 ;;
-    --baseline) baseline=$2; shift 2 ;;
-    --simee) BENCH_SIMEE=$2; shift 2 ;;
-    --android) android=1; shift ;;
-    --image) image=$2; shift 2 ;;
-    --port) port=$2; shift 2 ;;
-    *) bench_opt "$@"; shift "$BENCH_SHIFT" ;;
+    --device-type)
+      type=$2
+      shift 2
+      ;;
+    --runtime)
+      runtime=$2
+      shift 2
+      ;;
+    --calls)
+      calls=$2
+      shift 2
+      ;;
+    --baseline)
+      baseline=$2
+      shift 2
+      ;;
+    --simee)
+      BENCH_SIMEE=$2
+      shift 2
+      ;;
+    --android)
+      android=1
+      shift
+      ;;
+    --image)
+      image=$2
+      shift 2
+      ;;
+    --port)
+      port=$2
+      shift 2
+      ;;
+    *)
+      bench_opt "$@"
+      shift "$BENCH_SHIFT"
+      ;;
   esac
 done
 [ "$BENCH_QUICK" = 1 ] && calls=5
 if [ "$android" = 1 ]; then
-  android_env; image_dir "$image"; android_port "$port"; export ANDROID_HOME
+  android_env
+  image_dir "$image"
+  android_port "$port"
+  export ANDROID_HOME
 else
   ios_env
   runtime=${runtime:-$(ios_runtime)}
@@ -57,7 +92,7 @@ if [ "$android" = 1 ]; then
 else
   ios_create "simee-bench-steps-$$" "$type" "$runtime"
   device=$IOS_UDID
-  xcrun simctl bootstatus "$device" -b > /dev/null || bench_die "simctl boot $device failed"
+  xcrun simctl bootstatus "$device" -b >/dev/null || bench_die "simctl boot $device failed"
   sleep "$([ "$BENCH_QUICK" = 1 ] && echo 10 || echo 30)"
   xy=(600 2500)
   what="$type, $runtime"
@@ -74,14 +109,18 @@ for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
     sock="$SOCK_DIR/$a.sock"
     rm -f "$sock"
     serve_start "$bin" "$sock"
-    python3 -I "$BENCH_REPO/scripts/ios-step-bench.py" "$sock" "$device" "$calls" "${xy[@]}" > "$BENCH_WORK/steps.out" 2>&1
+    python3 -I "$BENCH_REPO/scripts/ios-step-bench.py" "$sock" "$device" "$calls" "${xy[@]}" >"$BENCH_WORK/steps.out" 2>&1
     bench_stop_pid "$SERVE_PID"
-    grep -q 'median' "$BENCH_WORK/steps.out" || { cat "$BENCH_WORK/steps.out" >&2; bench_sample "$a" "tap, median ms" failed; continue; }
+    grep -q 'median' "$BENCH_WORK/steps.out" || {
+      cat "$BENCH_WORK/steps.out" >&2
+      bench_sample "$a" "tap, median ms" failed
+      continue
+    }
     while IFS= read -r line; do
       step=${line%%: median*}
       ms=$(printf '%s\n' "$line" | sed -n 's/.*: median \([0-9.]*\) ms.*/\1/p')
       [ -n "$ms" ] && bench_sample "$a" "$step, median ms" "$ms"
-    done < "$BENCH_WORK/steps.out"
+    done <"$BENCH_WORK/steps.out"
   done
 done
 [ "$android" = 1 ] && android_stop "$BOOT_PID" "$port"

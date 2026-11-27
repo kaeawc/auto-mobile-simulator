@@ -17,8 +17,11 @@ here=$(cd "$(dirname "$0")" && pwd)
 # RUN_ALL_REGISTRY=FILE (with RUN_ALL_DIR for the scripts) replaces the list: scripts/bench/test-run-all.sh.
 if [ -n "${RUN_ALL_REGISTRY:-}" ]; then here=${RUN_ALL_DIR:-$here}; fi
 registry() {
-  if [ -n "${RUN_ALL_REGISTRY:-}" ]; then cat "$RUN_ALL_REGISTRY"; return; fi
-  cat << 'EOF'
+  if [ -n "${RUN_ALL_REGISTRY:-}" ]; then
+    cat "$RUN_ALL_REGISTRY"
+    return
+  fi
+  cat <<'EOF'
 android-boot|android|android-boot.sh|Android: emu against the SDK emulator
 android-boot-api29|android|android-boot.sh --image system-images/android-29/default/arm64-v8a --lcd 720x1280@320|API 29 (GLES over the goldfish pipe)
 android-idle-api29|android|android-idle.sh|API 29 and 30: first boots and idle host CPU
@@ -50,45 +53,83 @@ build-times|host|build-times.sh|Build times (local)
 mcp-build|host|mcp-build.sh|MCP server
 EOF
 }
-only=""; kind=""; pass=()
+only=""
+kind=""
+pass=()
 while [ $# -gt 0 ]; do
   case $1 in
-    -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
+    -h | --help)
+      awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+      exit 0
+      ;;
     --list)
       printf '%-24s %-8s %s\n' NAME NEEDS COMMAND
       registry | while IFS='|' read -r name k cmd _; do printf '%-24s %-8s scripts/bench/%s\n' "$name" "$k" "$cmd"; done
-      exit 0 ;;
-    --only) only=$2; shift 2 ;;
-    --kind) kind=$2; shift 2 ;;
-    --quick) pass+=(--quick); shift ;;
-    --rounds | --out) pass+=("$1" "$2"); shift 2 ;;
-    *) echo "run-all.sh: unknown option $1 (--help)" >&2; exit 2 ;;
+      exit 0
+      ;;
+    --only)
+      only=$2
+      shift 2
+      ;;
+    --kind)
+      kind=$2
+      shift 2
+      ;;
+    --quick)
+      pass+=(--quick)
+      shift
+      ;;
+    --rounds | --out)
+      pass+=("$1" "$2")
+      shift 2
+      ;;
+    *)
+      echo "run-all.sh: unknown option $1 (--help)" >&2
+      exit 2
+      ;;
   esac
 done
 if [ -n "$only" ]; then
-  for n in ${only//,/ }; do registry | grep -q "^$n|" || { echo "run-all.sh: no benchmark $n (--list)" >&2; exit 2; }; done
+  for n in ${only//,/ }; do registry | grep -q "^$n|" || {
+    echo "run-all.sh: no benchmark $n (--list)" >&2
+    exit 2
+  }; done
 fi
 summary=()
 failed=0
 interrupted=0
 while IFS='|' read -r name k cmd section; do
   [ -n "$kind" ] && [ "$k" != "$kind" ] && continue
-  if [ -n "$only" ]; then case ",$only," in *",$name,"*) ;; *) continue ;; esac; fi
+  if [ -n "$only" ]; then case ",$only," in *",$name,"*) ;; *) continue ;; esac fi
   echo "== $name ($section): scripts/bench/$cmd ${pass[*]-}" >&2
   # The registry's commands are plain words and double-quoted --arms values.
   eval "set -- $cmd"
-  script=$1; shift
+  script=$1
+  shift
   case $script in
-    *.py) python3 -I "$here/$script" "$@" ${pass[@]+"${pass[@]}"} < /dev/null; rc=$? ;;
-    *) "$here/$script" "$@" ${pass[@]+"${pass[@]}"} < /dev/null; rc=$? ;;
+    *.py)
+      python3 -I "$here/$script" "$@" ${pass[@]+"${pass[@]}"} </dev/null
+      rc=$?
+      ;;
+    *)
+      "$here/$script" "$@" ${pass[@]+"${pass[@]}"} </dev/null
+      rc=$?
+      ;;
   esac
   case $rc in
     0) summary+=("ok       $name") ;;
     3) summary+=("skipped  $name") ;;
     # 130 and 143: the child was interrupted (lib.sh turns SIGINT and SIGTERM into these exits).
     # Stop the whole run: the next benchmark would boot another device the user asked to stop.
-    130 | 143) summary+=("STOPPED  $name (exit $rc); the remaining benchmarks were not run"); interrupted=$rc; break ;;
-    *) summary+=("FAILED   $name (exit $rc)"); failed=1 ;;
+    130 | 143)
+      summary+=("STOPPED  $name (exit $rc); the remaining benchmarks were not run")
+      interrupted=$rc
+      break
+      ;;
+    *)
+      summary+=("FAILED   $name (exit $rc)")
+      failed=1
+      ;;
   esac
 done < <(registry)
 printf '%s\n' "" "run-all:" "${summary[@]}" >&2

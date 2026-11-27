@@ -26,27 +26,48 @@
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
 image=system-images/android-36/google_apis/arm64-v8a
-lcd=""; arms="emu stock"; snapshot=0; port=5720
+lcd=""
+arms="emu stock"
+snapshot=0
+port=5720
 while [ $# -gt 0 ]; do
   case $1 in
-    --image) image=$2; shift 2 ;;
-    --lcd) lcd=$2; shift 2 ;;
-    --arms) arms=$2; shift 2 ;;
-    --snapshot) snapshot=1; shift ;;
-    --port) port=$2; shift 2 ;;
-    *) bench_opt "$@"; shift "$BENCH_SHIFT" ;;
+    --image)
+      image=$2
+      shift 2
+      ;;
+    --lcd)
+      lcd=$2
+      shift 2
+      ;;
+    --arms)
+      arms=$2
+      shift 2
+      ;;
+    --snapshot)
+      snapshot=1
+      shift
+      ;;
+    --port)
+      port=$2
+      shift 2
+      ;;
+    *)
+      bench_opt "$@"
+      shift "$BENCH_SHIFT"
+      ;;
   esac
 done
 android_env
 image_dir "$image"
-case " $arms " in *" stock "*) stock_ready ;; esac
+case " $arms " in *" stock "*) stock_ready ;; *) ;; esac
 [ "$snapshot" = 1 ] && stock_ready
 android_port "$port"
 bench_start android-boot
 emu_ready
 
-read -r -a arm_list <<< "$arms"
-label() { case $1 in stock) echo "SDK emulator" ;; *) echo "$1" ;; esac; }
+read -r -a arm_list <<<"$arms"
+label() { case $1 in stock) echo "SDK emulator" ;; *) echo "$1" ;; esac }
 field() { printf ' %s\n' "$2" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
 # One boot through android-bench.sh; records its numbers under PHASE.
 bench_boot() {
@@ -54,13 +75,15 @@ bench_boot() {
   shift 3
   case $arm in
     stock) kind=stock ;;
-    emu:*) IFS=, read -r -a envs <<< "${arm#emu:}" ;;
+    emu:*) IFS=, read -r -a envs <<<"${arm#emu:}" ;;
+    *) ;;
   esac
   [ "$phase" = warm ] && [ "$kind" = stock ] && extra=(-no-snapshot-load)
   line=$(env ${envs[@]+"${envs[@]}"} PORT="$port" "$BENCH_REPO/scripts/android-bench.sh" \
     "bench-$BENCH_ROUND-$phase-${arm%%:*}-$$" "$avd" "$kind" ${extra[@]+"${extra[@]}"} | tail -1)
   state=$(field state "$line")
-  local a; a=$(label "$arm")
+  local a
+  a=$(label "$arm")
   if [ "$state" != booted ]; then
     bench_sample "$a" "$phase: launch until sys.boot_completed, s" "${state:-failed}"
     return 1
@@ -84,7 +107,8 @@ for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
   avd_create "$avd" "$IMAGE_DIR" "${avd_args[@]}"
   order=("${arm_list[@]}")
   if [ $((BENCH_ROUND % 2)) = 0 ]; then
-    order=(); for ((i = ${#arm_list[@]} - 1; i >= 0; i--)); do order+=("${arm_list[i]}"); done
+    order=()
+    for ((i = ${#arm_list[@]} - 1; i >= 0; i--)); do order+=("${arm_list[i]}"); done
   fi
   for arm in "${order[@]}"; do bench_boot "$arm" "$avd" cold; done
   for arm in "${order[@]}"; do bench_boot "$arm" "$avd" warm; done

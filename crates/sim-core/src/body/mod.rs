@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub use mesh::{CUTOUT_LIFT, MIN_RADIUS, Mesh, Part, Role, cached_mesh, mesh};
 
 use crate::device::DeviceTypeInfo;
+use crate::fold::Hinge;
 use crate::form_factor::{Density, FormFactor, Profile, Shape};
 use crate::platform::Platform;
 
@@ -116,6 +117,19 @@ pub enum Published {
 }
 
 /// One screen on the body.
+///
+/// The face is drawn upright in the body's natural orientation and the mesh's UVs (`Role::Screen`)
+/// follow it: (0, 0) is the face's top-left, u grows to the right, v grows down. [`px`](Self::px)
+/// is that face's pixel size, so a frame whose size is `px` goes on the face as is.
+///
+/// A screen whose panel is stored on its side is the exception: the iPhone Duo's inner screen
+/// (`iPhone-Duo`, [`Display::Inner`]) is a landscape panel the simulator holds a quarter turn from
+/// upright, so its frame arrives 2007x2853 (portrait) while the face, and `px`, are 2853x2007.
+/// The scene turns the frame a quarter turn clockwise onto the face: the frame's top edge runs
+/// down the face's right side, its left edge along the face's top, and its right edge (where
+/// `simee swipe --edge right` goes home) is the face's bottom. A face UV (u, v) samples the frame
+/// at (v, 1 - u); the frame's (u, v) lands on the face at (1 - v, u). The `docs/ios-versions.md`
+/// iPhone Duo section has the framebuffer side of this.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Screen {
     pub display: Display,
@@ -248,6 +262,23 @@ impl HingeAxis {
 pub struct FoldBody {
     pub panels: [Panel; 2],
     pub hinge: HingeAxis,
+    /// The gap between the inner display's two halves at the hinge, mm: 0 for one flexible
+    /// display, drawn as one face across the hinge (a Pixel Fold); the hinge's width for a device
+    /// with two real screens (a Surface Duo). Each half stays on its panel either way.
+    pub screen_gap: f32,
+}
+
+impl FoldBody {
+    /// The side of panel `panel` the hinge is on, as seen from the front: panel 0's right for a
+    /// book fold (a vertical hinge), its top for a flip.
+    pub fn hinge_side(&self, panel: usize) -> Side {
+        match (self.hinge.vertical, panel == 0) {
+            (true, true) => Side::Right,
+            (true, false) => Side::Left,
+            (false, true) => Side::Top,
+            (false, false) => Side::Bottom,
+        }
+    }
 }
 
 /// A device type's body.
@@ -339,23 +370,40 @@ pub fn for_apple_type(info: &DeviceTypeInfo) -> Option<Arc<Body>> {
     let form_factor = info.form_factor.filter(|f| has_body(*f))?;
     let density = Density::Scale(info.screen_scale.round().max(1.0) as u32);
     let shape = if form_factor == FormFactor::Tv { Shape::Rectangle } else { Shape::Rounded };
-    generic(Platform::Ios, form_factor, px, density, shape, None)
+    generic(Platform::Ios, form_factor, px, density, shape, None, table::HingeSpec::default())
 }
 
 /// The body for an Android virtual device: the table's row for its hardware definition
 /// (`hw.device.name`) when the AVD's screen is that row's, else [`for_profile`].
 pub fn for_android(device_name: &str, profile: &Profile) -> Option<Arc<Body>> {
+    for_android_hinge(device_name, profile, None)
+}
+
+/// [`for_android`] with the AVD's own hinge (`fold::Hinge::from_config` on its `config.ini`): a
+/// foldable the table doesn't list folds the way that hinge says.
+pub fn for_android_hinge(device_name: &str, profile: &Profile, hinge: Option<&Hinge>) -> Option<Arc<Body>> {
     let known = get(device_name).filter(|b| {
         b.platform == Platform::Android && b.form_factor == profile.kind.form_factor && b.shows((profile.width, profile.height))
     });
-    known.or_else(|| for_profile(profile))
+    known.or_else(|| for_profile_hinge(profile, hinge))
 }
 
 /// A generic body for a profile's screen (its density, shape and fold), cached by its key; the
-/// reference profiles' bodies are rows of the table.
+/// reference profiles' bodies are rows of the table. A foldable's hinge is a vertical one turning
+/// through 0-180°: see [`for_profile_hinge`] for any other.
 pub fn for_profile(profile: &Profile) -> Option<Arc<Body>> {
+    for_profile_hinge(profile, None)
+}
+
+/// [`for_profile`] with a foldable's hinge, as the AVD describes it (`fold::Hinge`): its
+/// orientation (a vertical hinge is a book, a horizontal one a flip), the angles it turns
+/// through, and for a physical hinge with an area, the gap it leaves between two real screens. A
+/// profile that isn't a foldable ignores it, and `None` is a vertical hinge over 0-180° with one
+/// flexible screen.
+pub fn for_profile_hinge(profile: &Profile, hinge: Option<&Hinge>) -> Option<Arc<Body>> {
     let folded = profile.fold.map(|f| (f.folded_width, f.folded_height));
-    generic(profile.kind.platform, profile.kind.form_factor, (profile.width, profile.height), profile.density, profile.shape, folded)
+    let hinge = hinge.map(table::HingeSpec::from_hinge).unwrap_or_default();
+    generic(profile.kind.platform, profile.kind.form_factor, (profile.width, profile.height), profile.density, profile.shape, folded, hinge)
 }
 
 fn generic(
@@ -365,16 +413,19 @@ fn generic(
     density: Density,
     shape: Shape,
     folded: Option<(u32, u32)>,
+    hinge: table::HingeSpec,
 ) -> Option<Arc<Body>> {
     if !has_body(form_factor) || px.0 == 0 || px.1 == 0 {
         return None;
     }
-    let id = table::generic_id(platform, form_factor, px, density, shape, folded);
+    let hinge = if form_factor == FormFactor::Foldable { hinge } else { table::HingeSpec::default() };
+    let id = table::generic_id(platform, form_factor, px, density, shape, folded, hinge);
     if let Some(b) = get(&id) {
         return Some(b);
     }
     static GENERIC: OnceLock<Mutex<HashMap<String, Arc<Body>>>> = OnceLock::new();
     let mut map = GENERIC.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    let body = map.entry(id).or_insert_with_key(|id| Arc::new(table::generic(id, platform, form_factor, px, density, shape, folded)));
+    let body =
+        map.entry(id).or_insert_with_key(|id| Arc::new(table::generic(id, platform, form_factor, px, density, shape, folded, hinge)));
     Some(Arc::clone(body))
 }

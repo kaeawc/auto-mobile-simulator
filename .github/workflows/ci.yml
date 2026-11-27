@@ -70,6 +70,42 @@ jobs:
       - run: cargo fmt --all --check
       - run: rustfmt --check --edition 2024 desktop/src/main.rs
 
+  # The script and docs linters (scripts/lint.sh, configs at the root): shellcheck and shfmt over
+  # the shell scripts, typos over code and docs, actionlint and yamllint over the workflows, and
+  # lychee over the Markdown's links to files and anchors, offline. Seconds, on every change.
+  docs-scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: shellcheck@0.11.0,shfmt@3.14.1,typos@1.52.2
+      # actionlint ships no install action: its release tarball, checked against the release's
+      # SHA-256.
+      - name: Install actionlint
+        env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          tgz="$RUNNER_TEMP/actionlint.tar.gz"
+          curl -sSfL --retry 3 -o "$tgz" "https://github.com/rhysd/actionlint/releases/download/v$VERSION/actionlint_${VERSION}_linux_amd64.tar.gz"
+          echo "$SHA256  $tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$tgz" -C "$RUNNER_TEMP/bin" actionlint
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: pipx install yamllint==1.38.0
+      - run: scripts/lint.sh --require shellcheck shfmt typos actionlint yamllint
+      # lychee reads lychee.toml; its report goes to the job summary, outside the checkout.
+      - if: ${{ !cancelled() }}
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          lycheeVersion: v0.24.2
+          args: .
+          output: ${{ runner.temp }}/lychee.md
+
   # The shared core, the API, the CLI and the Android device models build everywhere; the
   # macOS-only backends (and the VMM's hypervisor half) compile to nothing here, so this job checks
   # everything that isn't FFI without a macOS runner, and measures its coverage.
@@ -248,7 +284,7 @@ jobs:
   # cancelled (a failed `changes` fails it too, though the jobs after it show as skipped).
   ci-ok:
     if: always()
-    needs: [changes, fmt, linux, kvm-x86, lint-test, emu-desktop, desktop-linux]
+    needs: [changes, fmt, docs-scripts, linux, kvm-x86, lint-test, emu-desktop, desktop-linux]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

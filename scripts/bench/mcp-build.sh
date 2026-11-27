@@ -19,16 +19,22 @@ set -uo pipefail
 rmcp=3.11
 while [ $# -gt 0 ]; do
   case $1 in
-    --rmcp) rmcp=$2; shift 2 ;;
-    *) bench_opt "$@"; shift "$BENCH_SHIFT" ;;
+    --rmcp)
+      rmcp=$2
+      shift 2
+      ;;
+    *)
+      bench_opt "$@"
+      shift "$BENCH_SHIFT"
+      ;;
   esac
 done
-command -v cargo > /dev/null || bench_skip "no cargo"
+command -v cargo >/dev/null || bench_skip "no cargo"
 bench_start mcp-build
 BENCH_ROUND=1
 cd "$BENCH_REPO" || exit 2
 members=$(cargo metadata --no-deps --format-version 1 | python3 -I -c 'import json, sys; print("\n".join(p["name"] for p in json.load(sys.stdin)["packages"]))')
-deps=$(cargo tree -p sim-mcp -e normal --depth 1 --prefix none 2> /dev/null | awk '{ print $1 }' | sort -u | grep -vxF -f <(printf '%s\n' "$members"))
+deps=$(cargo tree -p sim-mcp -e normal --depth 1 --prefix none 2>/dev/null | awk '{ print $1 }' | sort -u | grep -vxF -f <(printf '%s\n' "$members"))
 bench_log "sim-mcp's direct dependencies outside the workspace: $(printf '%s' "$deps" | tr '\n' ' ')"
 bench_sample sim-mcp "direct dependencies outside the workspace" "$(printf '%s\n' "$deps" | grep -c .)"
 bench_sample sim-mcp "packages in Cargo.lock" "$(grep -c '^\[\[package\]\]' Cargo.lock)"
@@ -38,9 +44,9 @@ if [ "$BENCH_QUICK" = 1 ]; then
 fi
 pkg="$BENCH_WORK/rmcp-scratch"
 mkdir -p "$pkg/src"
-cp "$BENCH_REPO/rust-toolchain.toml" "$pkg/" 2> /dev/null
-printf 'fn main() {}\n' > "$pkg/src/main.rs"
-cat > "$pkg/Cargo.toml" << EOF
+cp "$BENCH_REPO/rust-toolchain.toml" "$pkg/" 2>/dev/null
+printf 'fn main() {}\n' >"$pkg/src/main.rs"
+cat >"$pkg/Cargo.toml" <<EOF
 [package]
 name = "rmcp-scratch"
 version = "0.0.0"
@@ -58,8 +64,12 @@ bench_sample "rmcp $rmcp" "lines of cargo tree --prefix none -e normal | sort -u
   "$(cargo tree -e normal --prefix none | sort -u | wc -l | tr -d ' ')"
 for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
   rm -rf "$pkg/target"
-  read -r wall cpu rc <<< "$(CARGO_BUILD_JOBS=2 cpu_timed cargo build --quiet)"
-  [ "$rc" = 0 ] || { tail -5 "$BENCH_WORK/cpu_timed.log" >&2; bench_sample "rmcp $rmcp" "clean dev build, wall s" failed; continue; }
+  read -r wall cpu rc <<<"$(CARGO_BUILD_JOBS=2 cpu_timed cargo build --quiet)"
+  [ "$rc" = 0 ] || {
+    tail -5 "$BENCH_WORK/cpu_timed.log" >&2
+    bench_sample "rmcp $rmcp" "clean dev build, wall s" failed
+    continue
+  }
   bench_sample "rmcp $rmcp" "clean dev build, wall s" "$wall"
   bench_sample "rmcp $rmcp" "clean dev build, CPU s" "$cpu"
 done

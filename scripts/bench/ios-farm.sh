@@ -19,16 +19,41 @@
 # slim), and docs/farm.md's settle tables.
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
-n=""; k=4; profiles="default slim"; type="iPhone 17"; runtime=""
+n=""
+k=4
+profiles="default slim"
+type="iPhone 17"
+runtime=""
 while [ $# -gt 0 ]; do
   case $1 in
-    --n) n=$2; shift 2 ;;
-    --k) k=$2; shift 2 ;;
-    --profiles) profiles=$2; shift 2 ;;
-    --device-type) type=$2; shift 2 ;;
-    --runtime) runtime=$2; shift 2 ;;
-    --simee) BENCH_SIMEE=$2; shift 2 ;;
-    *) bench_opt "$@"; shift "$BENCH_SHIFT" ;;
+    --n)
+      n=$2
+      shift 2
+      ;;
+    --k)
+      k=$2
+      shift 2
+      ;;
+    --profiles)
+      profiles=$2
+      shift 2
+      ;;
+    --device-type)
+      type=$2
+      shift 2
+      ;;
+    --runtime)
+      runtime=$2
+      shift 2
+      ;;
+    --simee)
+      BENCH_SIMEE=$2
+      shift 2
+      ;;
+    *)
+      bench_opt "$@"
+      shift "$BENCH_SHIFT"
+      ;;
   esac
 done
 [ "$BENCH_QUICK" = 1 ] && n=${n:-1}
@@ -59,17 +84,22 @@ ios_create "simee-bench-farm-template-$$" "$type" "$runtime"
 template=$IOS_UDID
 "$BENCH_SIMEE" boot "$template" --settle --timeout 600 >&2 || bench_die "the template didn't boot"
 ios_shutdown "$template" || bench_die "the template didn't shut down"
-read -r -a profile_list <<< "$profiles"
+read -r -a profile_list <<<"$profiles"
 field() { printf ' %s\n' "$2" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
 for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
   order=("${profile_list[@]}")
   [ $((BENCH_ROUND % 2)) = 0 ] && [ ${#profile_list[@]} = 2 ] && order=("${profile_list[1]}" "${profile_list[0]}")
   for p in "${order[@]}"; do
-    args=""; [ "$p" = default ] || args="--profile $p"
+    args=""
+    [ "$p" = default ] || args="--profile $p"
     line=$(SIMEE="$BENCH_SIMEE" LABEL="r$BENCH_ROUND-$p" PREFIX="$farm_prefix" MODE=clone TEMPLATE="$template" \
       BOOT=many K="$k" BOOT_ARGS="$args" DEVICE_TYPE="$type" RUNTIME="$runtime" \
-      "$BENCH_REPO/scripts/farm-bench-ios.sh" "$n" 2> "$BENCH_WORK/farm-$BENCH_ROUND-$p.err" | grep '^label=' | tail -1)
-    if [ -z "$line" ]; then tail -3 "$BENCH_WORK/farm-$BENCH_ROUND-$p.err" >&2; bench_sample "$p" "all settled, s" failed; continue; fi
+      "$BENCH_REPO/scripts/farm-bench-ios.sh" "$n" 2>"$BENCH_WORK/farm-$BENCH_ROUND-$p.err" | grep '^label=' | tail -1)
+    if [ -z "$line" ]; then
+      tail -3 "$BENCH_WORK/farm-$BENCH_ROUND-$p.err" >&2
+      bench_sample "$p" "all settled, s" failed
+      continue
+    fi
     unsettled=$(field unsettled "$line")
     if [ "${unsettled:-1}" = 0 ]; then
       bench_sample "$p" "all settled, s" "$(field all_settled_s "$line")"

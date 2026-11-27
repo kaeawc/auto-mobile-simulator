@@ -20,15 +20,36 @@
 # Reproduces docs/benchmarks.md "Android farm" (and docs/farm-android.md's benchmark).
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
-sizes=""; k=""; image=system-images/android-36/google_apis/arm64-v8a; port=5720
+sizes=""
+k=""
+image=system-images/android-36/google_apis/arm64-v8a
+port=5720
 while [ $# -gt 0 ]; do
   case $1 in
-    --sizes) sizes=$2; shift 2 ;;
-    --k) k=$2; shift 2 ;;
-    --image) image=$2; shift 2 ;;
-    --emu) BENCH_EMU=$2; shift 2 ;;
-    --port) port=$2; shift 2 ;;
-    *) bench_opt "$@"; shift "$BENCH_SHIFT" ;;
+    --sizes)
+      sizes=$2
+      shift 2
+      ;;
+    --k)
+      k=$2
+      shift 2
+      ;;
+    --image)
+      image=$2
+      shift 2
+      ;;
+    --emu)
+      BENCH_EMU=$2
+      shift 2
+      ;;
+    --port)
+      port=$2
+      shift 2
+      ;;
+    *)
+      bench_opt "$@"
+      shift "$BENCH_SHIFT"
+      ;;
   esac
 done
 [ "$BENCH_QUICK" = 1 ] && sizes=${sizes:-1}
@@ -36,7 +57,8 @@ sizes=${sizes:-1 4 8}
 [ "$(uname -s)" = Darwin ] || bench_skip "scripts/farm-bench-android.sh uses macOS's vm_stat, footprint and top"
 android_env
 image_dir "$image"
-max=0; for n in $sizes; do [ "$n" -gt "$max" ] && max=$n; done
+max=0
+for n in $sizes; do [ "$n" -gt "$max" ] && max=$n; done
 for i in $(seq 0 $((max - 1))); do android_port $((port + 2 * i)); done
 bench_start android-farm
 emu_ready
@@ -51,9 +73,13 @@ field() { printf ' %s\n' "$2" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
 for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
   for n in $sizes; do
     line=$(env EMU="$BENCH_EMU" EMU_TOOL="$BENCH_EMU" BASE_PORT="$port" OUT="$BENCH_WORK/farm" PREFIX="bench-farm-$$-" ${k:+K=$k} ANDROID_HOME="$BENCH_SDK" \
-      "$BENCH_REPO/scripts/farm-bench-android.sh" "bench-$$-$BENCH_ROUND-$n" "$golden" "$n" 2> "$BENCH_WORK/farm-$BENCH_ROUND-$n.err" | grep '^label=' | tail -1)
+      "$BENCH_REPO/scripts/farm-bench-android.sh" "bench-$$-$BENCH_ROUND-$n" "$golden" "$n" 2>"$BENCH_WORK/farm-$BENCH_ROUND-$n.err" | grep '^label=' | tail -1)
     a="$n device$([ "$n" = 1 ] || echo s)"
-    if [ -z "$line" ]; then bench_sample "$a" "all settled, s" failed; tail -3 "$BENCH_WORK/farm-$BENCH_ROUND-$n.err" >&2; continue; fi
+    if [ -z "$line" ]; then
+      bench_sample "$a" "all settled, s" failed
+      tail -3 "$BENCH_WORK/farm-$BENCH_ROUND-$n.err" >&2
+      continue
+    fi
     bench_sample "$a" "all settled, s" "$(field all_settled_s "$line")"
     bench_sample "$a" "failures" "$(field failures "$line")"
     bench_sample "$a" "host memory used per device, MB" "$(awk -v s="$(field sys_mb "$line")" -v n="$n" 'BEGIN { printf "%d", s / n }')"

@@ -21,17 +21,38 @@
 # docs/farm.md "Forwarding to simee serve".
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
-type="iPhone 17"; runtime=""; calls=3; wait_s=30
+type="iPhone 17"
+runtime=""
+calls=3
+wait_s=30
 while [ $# -gt 0 ]; do
   case $1 in
-    --device-type) type=$2; shift 2 ;;
-    --runtime) runtime=$2; shift 2 ;;
-    --calls) calls=$2; shift 2 ;;
-    --simee) BENCH_SIMEE=$2; shift 2 ;;
-    *) bench_opt "$@"; shift "$BENCH_SHIFT" ;;
+    --device-type)
+      type=$2
+      shift 2
+      ;;
+    --runtime)
+      runtime=$2
+      shift 2
+      ;;
+    --calls)
+      calls=$2
+      shift 2
+      ;;
+    --simee)
+      BENCH_SIMEE=$2
+      shift 2
+      ;;
+    *)
+      bench_opt "$@"
+      shift "$BENCH_SHIFT"
+      ;;
   esac
 done
-[ "$BENCH_QUICK" = 1 ] && { calls=1; wait_s=10; }
+[ "$BENCH_QUICK" = 1 ] && {
+  calls=1
+  wait_s=10
+}
 ios_env
 runtime=${runtime:-$(ios_runtime)}
 [ -n "$runtime" ] || bench_skip "no iOS simulator runtime installed"
@@ -39,7 +60,7 @@ bench_start ios-command
 simee_ready
 ios_create "simee-bench-command-$$" "$type" "$runtime"
 udid=$IOS_UDID
-xcrun simctl bootstatus "$udid" -b > /dev/null || bench_die "simctl boot $udid failed"
+xcrun simctl bootstatus "$udid" -b >/dev/null || bench_die "simctl boot $udid failed"
 sleep "$wait_s"
 sock_dir
 serve_start "$BENCH_SIMEE" "$SOCK_DIR/s.sock"
@@ -48,7 +69,7 @@ png="$BENCH_WORK/shot.png"
 # recorded.
 for BENCH_ROUND in 0 $(seq 1 "$BENCH_ROUNDS"); do
   [ "$BENCH_ROUND" = 0 ] && out=/dev/null || out=$BENCH_SAMPLES
-  python3 -I - "$BENCH_ROUND" "$([ "$BENCH_ROUND" = 0 ] && echo 1 || echo "$calls")" "$BENCH_SIMEE" "$SOCK_DIR/s.sock" "$udid" "$png" >> "$out" <<'EOF'
+  python3 -I - "$BENCH_ROUND" "$([ "$BENCH_ROUND" = 0 ] && echo 1 || echo "$calls")" "$BENCH_SIMEE" "$SOCK_DIR/s.sock" "$udid" "$png" >>"$out" <<'EOF'
 import os, subprocess, sys, time
 rnd, calls, simee, sock, udid, png = sys.argv[1], int(sys.argv[2]), *sys.argv[3:]
 base = {k: v for k, v in os.environ.items() if not k.startswith('SIMEE_')}

@@ -94,6 +94,12 @@ impl Env {
     /// The identity of the system image in `sysdir`: `source.properties`'s API level, tag, ABI
     /// and revision, the BLAKE3 of each of [`IMAGE_FILES`] it has, and `build.prop`'s fingerprint.
     pub fn image_identity(&self, sysdir: &Path) -> Result<AndroidImage> {
+        self.image_identity_with(sysdir, &|p| Ok(sim_bundle::hash_file(p)?))
+    }
+
+    /// [`Env::image_identity`] with `hash_file` as the hash of each image file (a cache of hashes
+    /// that is sure the file is unchanged, for one).
+    pub(crate) fn image_identity_with(&self, sysdir: &Path, hash_file: &dyn Fn(&Path) -> Result<String>) -> Result<AndroidImage> {
         let props = parse_ini(&read(&sysdir.join("source.properties"))?);
         let prop =
             |k: &str| props.get(k).cloned().ok_or_else(|| Error::Config(format!("{}: source.properties has no {k}", sysdir.display())));
@@ -101,7 +107,7 @@ impl Env {
         for f in IMAGE_FILES {
             let p = sysdir.join(f);
             if p.is_file() {
-                files.insert(f.to_owned(), sim_bundle::hash_file(&p)?);
+                files.insert(f.to_owned(), hash_file(&p)?);
             }
         }
         let build = std::fs::read_to_string(sysdir.join("build.prop")).map(|t| parse_ini(&t)).unwrap_or_default();

@@ -12,15 +12,24 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 real="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}"
 shim="${1:-$HOME/.simee/sdk}"
 
-[ -d "$real" ] || { echo "real SDK not found at $real" >&2; exit 1; }
-case "$shim" in "$real"*) echo "shim dir must not be inside the real SDK" >&2; exit 1 ;; esac
+[ -d "$real" ] || {
+  echo "real SDK not found at $real" >&2
+  exit 1
+}
+case "$shim" in
+  "$real"*)
+    echo "shim dir must not be inside the real SDK" >&2
+    exit 1
+    ;;
+  *) ;;
+esac
 
 cargo build --release -p emu --manifest-path "$repo/Cargo.toml"
 mkdir -p "$shim/emulator"
 for entry in "$real"/*; do
-    name="$(basename "$entry")"
-    [ "$name" = emulator ] && continue
-    ln -sfn "$entry" "$shim/$name"
+  name="$(basename "$entry")"
+  [ "$name" = emulator ] && continue
+  ln -sfn "$entry" "$shim/$name"
 done
 # Keep the stock emulator's helper tools (e2fsck, resize2fs, ...) for tools that look for them;
 # simee itself formats userdata natively and needs none of them.
@@ -29,5 +38,5 @@ done
 [ -d "$real/emulator/lib64" ] && ln -sfn "$real/emulator/lib64" "$shim/emulator/lib64"
 cp "$repo/target/release/emu" "$shim/emulator/emulator"
 codesign --sign - --force --entitlements "$repo/scripts/hypervisor.entitlements" "$shim/emulator/emulator"
-printf 'Pkg.Path=emulator\nPkg.Desc=simee\nPkg.Revision=0.1.0\n' > "$shim/emulator/source.properties"
+printf 'Pkg.Path=emulator\nPkg.Desc=simee\nPkg.Revision=0.1.0\n' >"$shim/emulator/source.properties"
 echo "simee SDK overlay ready: export ANDROID_HOME=$shim ANDROID_SDK_ROOT=$shim"

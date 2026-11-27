@@ -20,16 +20,41 @@
 # --runtime) and docs/farm.md's 62-against-74-job table (each build as --simee / --baseline).
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
-profiles=slim; settle_cpu=""; baseline=""; type="iPhone 17 Pro"; runtime=""
+profiles=slim
+settle_cpu=""
+baseline=""
+type="iPhone 17 Pro"
+runtime=""
 while [ $# -gt 0 ]; do
   case $1 in
-    --profiles) profiles=$2; shift 2 ;;
-    --settle-cpu) settle_cpu=$2; shift 2 ;;
-    --baseline) baseline=$2; shift 2 ;;
-    --device-type) type=$2; shift 2 ;;
-    --runtime) runtime=$2; shift 2 ;;
-    --simee) BENCH_SIMEE=$2; shift 2 ;;
-    *) bench_opt "$@"; shift "$BENCH_SHIFT" ;;
+    --profiles)
+      profiles=$2
+      shift 2
+      ;;
+    --settle-cpu)
+      settle_cpu=$2
+      shift 2
+      ;;
+    --baseline)
+      baseline=$2
+      shift 2
+      ;;
+    --device-type)
+      type=$2
+      shift 2
+      ;;
+    --runtime)
+      runtime=$2
+      shift 2
+      ;;
+    --simee)
+      BENCH_SIMEE=$2
+      shift 2
+      ;;
+    *)
+      bench_opt "$@"
+      shift "$BENCH_SHIFT"
+      ;;
   esac
 done
 ios_env
@@ -44,7 +69,7 @@ template=$IOS_UDID
 ios_shutdown "$template" || bench_die "the template didn't shut down"
 builds=("$BENCH_SIMEE")
 [ -n "$baseline" ] && builds+=("$baseline")
-read -r -a profile_list <<< "$profiles"
+read -r -a profile_list <<<"$profiles"
 arms=()
 for b in "${builds[@]}"; do for p in "${profile_list[@]}"; do arms+=("$b|$p"); done; done
 label() {
@@ -56,16 +81,24 @@ field() { printf ' %s\n' "$2" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
 for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
   order=("${arms[@]}")
   if [ $((BENCH_ROUND % 2)) = 0 ]; then
-    order=(); for ((i = ${#arms[@]} - 1; i >= 0; i--)); do order+=("${arms[i]}"); done
+    order=()
+    for ((i = ${#arms[@]} - 1; i >= 0; i--)); do order+=("${arms[i]}"); done
   fi
   for arm in "${order[@]}"; do
-    bin=${arm%|*}; p=${arm#*|}; a=$(label "$arm")
-    clone=$("$BENCH_SIMEE" clone "$template" "simee-bench-settle-$$-$BENCH_ROUND-$p" 2> "$BENCH_WORK/clone.err" | tail -1)
-    case $clone in ????????-????-????-????-????????????) ;; *) cat "$BENCH_WORK/clone.err" >&2; bench_die "simee clone failed" ;; esac
+    bin=${arm%|*}
+    p=${arm#*|}
+    a=$(label "$arm")
+    clone=$("$BENCH_SIMEE" clone "$template" "simee-bench-settle-$$-$BENCH_ROUND-$p" 2>"$BENCH_WORK/clone.err" | tail -1)
+    case $clone in ????????-????-????-????-????????????) ;; *)
+      cat "$BENCH_WORK/clone.err" >&2
+      bench_die "simee clone failed"
+      ;;
+    esac
     bench_on_exit ios_delete "$clone"
-    extra=(); [ "$p" = default ] || extra=(--profile "$p")
+    extra=()
+    [ "$p" = default ] || extra=(--profile "$p")
     [ -n "$settle_cpu" ] && extra+=(--settle-cpu "$settle_cpu")
-    line=$("$bin" boot "$clone" --settle --timeout 600 "${extra[@]}" 2> "$BENCH_WORK/boot.err" | tail -1)
+    line=$("$bin" boot "$clone" --settle --timeout 600 "${extra[@]}" 2>"$BENCH_WORK/boot.err" | tail -1)
     bench_log "$a: $line"
     if [ "$(field settled "$line")" = true ]; then
       bench_sample "$a" "booted until settled, s" "$(awk -v s="$(field settle_s "$line")" -v b="$(field boot_s "$line")" 'BEGIN { printf "%.1f", s - b }')"

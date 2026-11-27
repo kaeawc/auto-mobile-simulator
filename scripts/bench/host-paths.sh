@@ -25,18 +25,28 @@
 # and renderer-init rows; the published vsock and adb rows were measured on a 4-core Linux VM).
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
-only=""; lib64=""
+only=""
+lib64=""
 while [ $# -gt 0 ]; do
   case $1 in
-    --only) only=$2; shift 2 ;;
-    --lib64) lib64=$2; shift 2 ;;
-    *) bench_opt "$@"; shift "$BENCH_SHIFT" ;;
+    --only)
+      only=$2
+      shift 2
+      ;;
+    --lib64)
+      lib64=$2
+      shift 2
+      ;;
+    *)
+      bench_opt "$@"
+      shift "$BENCH_SHIFT"
+      ;;
   esac
 done
 items=${only:-frame vsock adb present frame-path renderer}
 if [ -z "$lib64" ]; then
   if [ "$(uname -s)" = Darwin ]; then sdk=${ANDROID_HOME:-$HOME/Library/Android/sdk}; else sdk=${ANDROID_HOME:-$HOME/Android/Sdk}; fi
-  lib64=$(find "$sdk/simee/renderer" -maxdepth 2 -type d -name lib64 2> /dev/null | sort | tail -1)
+  lib64=$(find "$sdk/simee/renderer" -maxdepth 2 -type d -name lib64 2>/dev/null | sort | tail -1)
 fi
 bench_start host-paths
 cd "$BENCH_REPO" || exit 2
@@ -86,19 +96,23 @@ run() {
     present) cargo test -q --release -p emu-vmm present_cost -- --ignored --nocapture --test-threads=1 ;;
     frame-path) CASE=2480,1080,true cargo test -q --release -p emu frame_path_latency -- --ignored --nocapture --test-threads=1 ;;
     renderer)
-      if [ -z "$lib64" ] || [ ! -d "$lib64" ]; then bench_log "renderer: no lib64 (emu -provision-renderer); skipped"; return 0; fi
+      if [ -z "$lib64" ] || [ ! -d "$lib64" ]; then
+        bench_log "renderer: no lib64 (emu -provision-renderer); skipped"
+        return 0
+      fi
       if [ "$(uname -s)" = Darwin ]; then
         cargo run -q --release -p emu-gfxstream --example renderer_caps -- -emu "$lib64"
       else
         cargo run -q --release -p emu-gfxstream --example renderer_caps -- -vulkan-only "$lib64"
-      fi ;;
+      fi
+      ;;
     *) bench_die "unknown item $1" ;;
   esac
 }
 for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
   for item in $items; do
-    if run "$item" > "$BENCH_WORK/$item.out" 2>&1; then
-      parse "$item" < "$BENCH_WORK/$item.out" >> "$BENCH_SAMPLES"
+    if run "$item" >"$BENCH_WORK/$item.out" 2>&1; then
+      parse "$item" <"$BENCH_WORK/$item.out" >>"$BENCH_SAMPLES"
     else
       tail -5 "$BENCH_WORK/$item.out" >&2
       bench_sample "$item" "run" failed

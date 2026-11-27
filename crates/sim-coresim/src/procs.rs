@@ -600,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn a_spawned_childs_task_path_and_tree_are_read_and_it_can_be_signalled() {
+    fn a_spawned_child_task_path_and_tree_are_read_and_it_can_be_signalled() {
         let mut child = std::process::Command::new("/bin/sleep").arg("5").spawn().expect("sleep");
         let pid = child.id() as i32;
         let me = std::process::id() as i32;

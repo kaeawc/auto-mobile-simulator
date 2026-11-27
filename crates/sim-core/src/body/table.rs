@@ -34,8 +34,9 @@ pub(super) fn rows() -> Vec<Body> {
     for f in [FormFactor::Phone, FormFactor::Tablet, FormFactor::Foldable, FormFactor::Watch] {
         let p = Kind::new(Platform::Android, f).expect("Android offers it").profile();
         let folded = p.fold.map(|f| (f.folded_width, f.folded_height));
-        let id = generic_id(Platform::Android, f, (p.width, p.height), p.density, p.shape, folded);
-        out.push(generic(&id, Platform::Android, f, (p.width, p.height), p.density, p.shape, folded));
+        let hinge = HingeSpec::default();
+        let id = generic_id(Platform::Android, f, (p.width, p.height), p.density, p.shape, folded, hinge);
+        out.push(generic(&id, Platform::Android, f, (p.width, p.height), p.density, p.shape, folded, hinge));
     }
     out
 }
@@ -412,8 +413,57 @@ fn watch(p: &Watch) -> Body {
 
 // --- Foldables ---
 
-/// A book-fold body: two equal panels either side of a vertical hinge through the centre, the
-/// inner screen across both on the front, the outer screen (if any) on the back of panel 0.
+/// How a foldable's hinge runs, from its AVD's `fold::Hinge`: what a generic body is built to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct HingeSpec {
+    /// The fold runs top to bottom (a book), else across (a flip).
+    pub vertical: bool,
+    /// The angles the hinge turns through, degrees.
+    pub range: (f32, f32),
+    /// The width of the hinge between two real screens, in pixels of the unfolded display: 0 for
+    /// one flexible screen.
+    pub gap_px: u32,
+}
+
+impl Default for HingeSpec {
+    /// What a foldable with no hinge description gets: a book over 0-180° with one flexible screen.
+    fn default() -> Self {
+        HingeSpec { vertical: true, range: (0.0, HingeAxis::FLAT), gap_px: 0 }
+    }
+}
+
+impl HingeSpec {
+    pub(super) fn from_hinge(h: &fold::Hinge) -> Self {
+        let sane = h.range.0.is_finite() && h.range.1.is_finite() && h.range.0 >= 0.0 && h.range.1 <= 360.0 && h.range.0 < h.range.1;
+        let range = if sane { h.range } else { Self::default().range };
+        // A physical hinge with width leaves a gap between two screens; a fold in one screen has none.
+        let gap_px = match (h.physical, h.area) {
+            (true, Some(a)) => {
+                if h.vertical {
+                    a.width
+                } else {
+                    a.height
+                }
+            }
+            _ => 0,
+        };
+        HingeSpec { vertical: h.vertical, range, gap_px }
+    }
+
+    /// The hinge's axis and the gap between the screens' halves, for a body `size` (width,
+    /// height, thickness, mm) whose inner screen is `inner`.
+    fn axis(&self, [_, _, t]: [f32; 3], inner: &Screen) -> (HingeAxis, f32) {
+        let axis = HingeAxis { vertical: self.vertical, at: 0.0, range: self.range, fold_in_z: t / 2.0, fold_out_z: -t / 2.0 };
+        let [iw, ih] = inner.size();
+        let gap = self.gap_px as f32 * MM_PER_INCH / inner.ppi;
+        // A hinge wider than a quarter of the screen is a bad description, not a device.
+        (axis, gap.min(if self.vertical { iw } else { ih } / 4.0))
+    }
+}
+
+/// A two-panel body folding about a hinge through its centre, the inner screen across both on the
+/// front, the outer screen (if any) on the back: of panel 0 for a book (a vertical hinge, panels
+/// left and right), of the lid (panel 1, on top) for a flip (a horizontal hinge).
 #[allow(clippy::too_many_arguments)]
 fn book(
     id: &str,
@@ -425,15 +475,25 @@ fn book(
     bevel: f32,
     inner: Screen,
     outer: Option<Screen>,
-    range: (f32, f32),
+    hinge: HingeSpec,
 ) -> Body {
-    let [w, h, t] = size;
+    let [w, h, _] = size;
     let hinge_corner = bevel + MIN_RADIUS;
-    let (r, half) = (corner.radius, w / 2.0);
-    let panels = [
-        Panel { center: [-half / 2.0, 0.0], size: [half, h], radii: [hinge_corner, r, r, hinge_corner] },
-        Panel { center: [half / 2.0, 0.0], size: [half, h], radii: [r, hinge_corner, hinge_corner, r] },
-    ];
+    let r = corner.radius;
+    let panels = if hinge.vertical {
+        let half = w / 2.0;
+        [
+            Panel { center: [-half / 2.0, 0.0], size: [half, h], radii: [hinge_corner, r, r, hinge_corner] },
+            Panel { center: [half / 2.0, 0.0], size: [half, h], radii: [r, hinge_corner, hinge_corner, r] },
+        ]
+    } else {
+        let half = h / 2.0;
+        [
+            Panel { center: [0.0, -half / 2.0], size: [w, half], radii: [hinge_corner, hinge_corner, r, r] },
+            Panel { center: [0.0, half / 2.0], size: [w, half], radii: [r, r, hinge_corner, hinge_corner] },
+        ]
+    };
+    let (axis, screen_gap) = hinge.axis(size, &inner);
     let mut screens = vec![inner];
     screens.extend(outer);
     Body {
@@ -450,7 +510,7 @@ fn book(
         bump: None,
         buttons: Vec::new(),
         crown: None,
-        fold: Some(FoldBody { panels, hinge: HingeAxis { vertical: true, at: 0.0, range, fold_in_z: t / 2.0, fold_out_z: -t / 2.0 } }),
+        fold: Some(FoldBody { panels, hinge: axis, screen_gap }),
     }
 }
 
@@ -482,7 +542,7 @@ fn pixel_fold() -> Body {
         0.7,
         inner,
         Some(outer),
-        d.hinge.range,
+        HingeSpec::from_hinge(&d.hinge),
     );
     // The camera bar across the top of the other panel's back.
     b.bump = Some(Bump {
@@ -500,7 +560,8 @@ fn surface_duo() -> Body {
     let d = fold::dual_screen();
     let (w, h, t) = (186.9, 145.2, 4.8);
     let shape = reference_shape(Platform::Android, FormFactor::Foldable);
-    // simee draws the two 1350x1800 screens and the hinge between them as one display.
+    // simee draws the two 1350x1800 screens and the hinge between them as one display; the body
+    // has two screens with the hinge's 84 px between them.
     let inner = Screen {
         published: Some(Published::Diagonal(8.1)),
         ..foldable_screen(Display::Inner, Face::Front, (d.lcd.0, d.lcd.1), 401.0, [0.0, 0.0], shape, 1.0)
@@ -515,7 +576,7 @@ fn surface_duo() -> Body {
         0.6,
         inner,
         None,
-        d.hinge.range,
+        HingeSpec::from_hinge(&d.hinge),
     );
     let key = |name, at, length| Button { name, side: Side::Right, at, length, depth: 0.4, width: 2.0 };
     b.buttons = vec![key("power", h / 2.0 - 30.0, 12.0), key("volume", h / 2.0 - 52.0, 20.0)];
@@ -533,33 +594,57 @@ fn generic_book(
     outer: Option<(u32, u32)>,
     ppi: f32,
     shape: Shape,
-    range: (f32, f32),
+    hinge: HingeSpec,
     exponent: f32,
 ) -> Body {
     let (side, top, t, bevel) = (2.5, 4.0, 6.0, 0.6);
     let radius = |shape| if shape == Shape::Rounded { 4.0 } else { 0.0 };
     let inner = foldable_screen(Display::Inner, Face::Front, inner, ppi, [0.0, 0.0], shape, radius(shape));
     let [iw, ih] = inner.size();
-    let outer_size = outer.map(|px| foldable_screen(Display::Outer, Face::Back, px, ppi, [0.0, 0.0], Shape::Rounded, 4.0).size());
+    let outer_screen = |center| outer.map(|px| foldable_screen(Display::Outer, Face::Back, px, ppi, center, Shape::Rounded, 4.0));
+    let outer_size = outer_screen([0.0, 0.0]).map(|s| s.size());
+    let corner = Corner { radius: 7.0, exponent };
+    let note = Source::Generic(note);
+    let key = |name, side, at, length| Button { name, side, at, length, depth: 0.5, width: 2.4 };
+    if !hinge.vertical {
+        // A flip: the screen's top half is the lid, with the cover screen and the camera on its
+        // back, side by side along its top.
+        let panel = outer_size.map_or(ih / 2.0 + top, |[_, oh]| (ih / 2.0 + top).max(oh + 2.0 * top));
+        let w = iw.max(outer_size.map_or(0.0, |[ow, _]| ow)) + 2.0 * side;
+        let h = 2.0 * panel;
+        let row = panel - top - outer_size.map_or(12.0, |[_, oh]| oh) / 2.0;
+        let outer = outer_screen([-w / 2.0 + side + outer_size.map_or(0.0, |[ow, _]| ow) / 2.0, row]);
+        let mut b = book(id, name, platform, note, [w, h, t], corner, bevel, inner, outer, hinge);
+        let free = w - 2.0 * side - outer_size.map_or(0.0, |[ow, _]| ow + 2.0);
+        if free >= 8.0 {
+            let width = free.min(22.0);
+            b.bump = Some(Bump {
+                center: [w / 2.0 - side - width / 2.0, row],
+                size: [width, 12.0],
+                corner: Corner { radius: 4.0, exponent: 2.0 },
+                height: 1.2,
+            });
+        }
+        b.buttons = vec![key("power", Side::Right, 0.3 * h, 12.0), key("volume", Side::Right, 0.1 * h, 20.0)];
+        return b;
+    }
     let panel = outer_size.map_or(iw / 2.0 + side, |[ow, _]| (iw / 2.0 + side).max(ow + 2.0 * side));
     let h = ih.max(outer_size.map_or(0.0, |[_, oh]| oh)) + 2.0 * top;
-    let outer = outer.map(|px| foldable_screen(Display::Outer, Face::Back, px, ppi, [-panel / 2.0, 0.0], Shape::Rounded, 4.0));
-    let mut b =
-        book(id, name, platform, Source::Generic(note), [2.0 * panel, h, t], Corner { radius: 7.0, exponent }, bevel, inner, outer, range);
+    let mut b = book(id, name, platform, note, [2.0 * panel, h, t], corner, bevel, inner, outer_screen([-panel / 2.0, 0.0]), hinge);
     b.bump = Some(Bump {
         center: [panel / 2.0, h / 2.0 - 10.0],
         size: [panel - 10.0, 12.0],
         corner: Corner { radius: 6.0, exponent: 2.0 },
         height: 1.6,
     });
-    let key = |name, at, length| Button { name, side: Side::Right, at, length, depth: 0.5, width: 2.4 };
-    b.buttons = vec![key("power", h / 2.0 - 0.2 * h, 12.0), key("volume", h / 2.0 - 0.4 * h, 20.0)];
+    b.buttons = vec![key("power", Side::Right, h / 2.0 - 0.2 * h, 12.0), key("volume", Side::Right, h / 2.0 - 0.4 * h, 20.0)];
     b
 }
 
 fn iphone_duo() -> Body {
     // The inner screen as the simulator stores it is 2007x2853, a landscape panel stored portrait;
-    // the body carries it the way it lies unfolded.
+    // the body carries it the way it lies unfolded, 2853x2007 (see [`Screen`] for how a frame
+    // goes onto it). One panel across the hinge, so one face.
     generic_book(
         "iPhone-Duo",
         "iPhone Duo",
@@ -569,7 +654,7 @@ fn iphone_duo() -> Body {
         Some((1398, 2034)),
         460.0,
         Shape::Rounded,
-        (duo::CLOSED as f32, duo::OPEN as f32),
+        HingeSpec { range: (duo::CLOSED as f32, duo::OPEN as f32), ..HingeSpec::default() },
         3.0,
     )
 }
@@ -594,6 +679,7 @@ pub(super) fn generic_id(
     density: Density,
     shape: Shape,
     folded: Option<(u32, u32)>,
+    hinge: HingeSpec,
 ) -> String {
     let density = match density {
         Density::Dpi(d) => format!("{d}dpi"),
@@ -605,11 +691,19 @@ pub(super) fn generic_id(
         Shape::Round => "round",
     };
     let folded = folded.map(|(fw, fh)| format!("-folded-{fw}x{fh}")).unwrap_or_default();
-    format!("{}-{}-{w}x{h}-{density}-{shape}{folded}", platform.as_str(), form_factor.as_str())
+    // The default hinge (a book over 0-180° with one flexible screen) has no part in the key.
+    let hinge = if hinge == HingeSpec::default() {
+        String::new()
+    } else {
+        let (lo, hi) = hinge.range;
+        format!("-{}-hinge-{lo}-{hi}-gap{}", if hinge.vertical { "vertical" } else { "horizontal" }, hinge.gap_px)
+    };
+    format!("{}-{}-{w}x{h}-{density}-{shape}{folded}{hinge}", platform.as_str(), form_factor.as_str())
 }
 
 /// A body for a screen with no published dimensions: the screen at its density inside generic
 /// bezels for its form factor.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn generic(
     id: &str,
     platform: Platform,
@@ -618,6 +712,7 @@ pub(super) fn generic(
     density: Density,
     shape: Shape,
     folded: Option<(u32, u32)>,
+    hinge: HingeSpec,
 ) -> Body {
     let ppi = match density {
         Density::Dpi(d) => d.max(1) as f32,
@@ -625,7 +720,7 @@ pub(super) fn generic(
     };
     let name = format!("Generic {} {} ({}x{})", platform.label(), form_factor.as_str(), px.0, px.1);
     if form_factor == FormFactor::Foldable {
-        return generic_book(id, &name, platform, GENERIC, px, folded, ppi, shape, (0.0, HingeAxis::FLAT), 2.0);
+        return generic_book(id, &name, platform, GENERIC, px, folded, ppi, shape, hinge, 2.0);
     }
     // Side bezel, top bezel, thickness, screen corner radius, edge bevel.
     let (side, top, t, radius, bevel) = match form_factor {

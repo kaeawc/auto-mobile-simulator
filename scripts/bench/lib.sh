@@ -29,7 +29,10 @@ bench_help() {
   awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
-bench_die() { echo "$(basename "$0"): $*" >&2; exit 2; }
+bench_die() {
+  echo "$(basename "$0"): $*" >&2
+  exit 2
+}
 bench_log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 
 # Options every benchmark takes. Call from the script's option loop with "$@"; on success it sets
@@ -37,16 +40,33 @@ bench_log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 bench_opt() {
   BENCH_SHIFT=1
   case $1 in
-    -h | --help) bench_help; exit 0 ;;
-    --rounds) [ $# -ge 2 ] || bench_die "--rounds needs a number"; BENCH_ROUNDS=$2; BENCH_SHIFT=2 ;;
-    --quick) BENCH_QUICK=1; BENCH_ROUNDS=1 ;;
-    --out) [ $# -ge 2 ] || bench_die "--out needs a directory"; BENCH_OUT=$2; BENCH_SHIFT=2 ;;
+    -h | --help)
+      bench_help
+      exit 0
+      ;;
+    --rounds)
+      [ $# -ge 2 ] || bench_die "--rounds needs a number"
+      BENCH_ROUNDS=$2
+      BENCH_SHIFT=2
+      ;;
+    --quick)
+      BENCH_QUICK=1
+      BENCH_ROUNDS=1
+      ;;
+    --out)
+      [ $# -ge 2 ] || bench_die "--out needs a directory"
+      BENCH_OUT=$2
+      BENCH_SHIFT=2
+      ;;
     *) bench_die "unknown option $1 (--help lists them)" ;;
   esac
 }
 
 # Exit status 3: this host can't run the benchmark (run-all.sh reports it as skipped).
-bench_skip() { echo "$(basename "$0"): skipped: $*" >&2; exit 3; }
+bench_skip() {
+  echo "$(basename "$0"): skipped: $*" >&2
+  exit 3
+}
 
 now() { perl -MTime::HiRes=time -e 'printf "%.3f\n", time'; }
 since() { awk -v a="$(now)" -v b="$1" -v d="${2:-2}" 'BEGIN { printf "%.*f\n", d, a - b }'; }
@@ -63,9 +83,9 @@ bench_start() {
   BENCH_NAME=$1
   BENCH_WORK=$(mktemp -d "${TMPDIR:-/tmp}/bench-$BENCH_NAME.XXXXXX")
   BENCH_SAMPLES="$BENCH_WORK/samples.tsv"
-  : > "$BENCH_SAMPLES"
+  : >"$BENCH_SAMPLES"
   mkdir -p "$BENCH_OUT"
-  python3 -I "$BENCH_DIR/summarize.py" host > "$BENCH_WORK/host-start.json"
+  python3 -I "$BENCH_DIR/summarize.py" host >"$BENCH_WORK/host-start.json"
   trap bench_cleanup EXIT
   trap 'exit 130' INT TERM
   bench_log "$BENCH_NAME: rounds=$BENCH_ROUNDS quick=$BENCH_QUICK work=$BENCH_WORK"
@@ -73,14 +93,14 @@ bench_start() {
 
 # bench_sample ARM METRIC VALUE: one measurement of round $BENCH_ROUND.
 bench_sample() {
-  printf '%s\t%s\t%s\t%s\t%s\n' "$BENCH_ROUND" "$1" "$2" "$3" "$(load1)" >> "$BENCH_SAMPLES"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$BENCH_ROUND" "$1" "$2" "$3" "$(load1)" >>"$BENCH_SAMPLES"
   bench_log "round $BENCH_ROUND $1 $2=$3"
 }
 
 # Writes bench/results/<name>-<time>.json and prints the table. Optional: the arms' column order
 # (comma-separated) and a note printed under the table.
 bench_finish() {
-  python3 -I "$BENCH_DIR/summarize.py" host > "$BENCH_WORK/host-end.json"
+  python3 -I "$BENCH_DIR/summarize.py" host >"$BENCH_WORK/host-end.json"
   local out
   out="$BENCH_OUT/$BENCH_NAME-$(date +%Y%m%d-%H%M%S).json"
   python3 -I "$BENCH_DIR/summarize.py" finish --name "$BENCH_NAME" --samples "$BENCH_SAMPLES" \
@@ -99,12 +119,21 @@ bench_untrack() {
 # Stops a PID this run started: SIGINT, then SIGTERM after $2 s (30), then waits.
 bench_stop_pid() {
   local pid=$1 grace=${2:-30} i
-  kill -0 "$pid" 2>/dev/null || { bench_untrack "$pid"; return 0; }
+  kill -0 "$pid" 2>/dev/null || {
+    bench_untrack "$pid"
+    return 0
+  }
   kill -INT "$pid" 2>/dev/null
-  for i in $(seq 1 $((grace * 10))); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  for i in $(seq 1 $((grace * 10))); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
   if kill -0 "$pid" 2>/dev/null; then
     kill -TERM "$pid" 2>/dev/null
-    for i in $(seq 1 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    for i in $(seq 1 100); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
   fi
   wait "$pid" 2>/dev/null
   bench_untrack "$pid"
@@ -130,7 +159,8 @@ cpu_s() {
   local pids
   pids=$(tree_pids "$@")
   if [ -r /proc/self/stat ]; then
-    local tck; tck=$(getconf CLK_TCK)
+    local tck
+    tck=$(getconf CLK_TCK)
     for p in $pids; do [ -r "/proc/$p/stat" ] && sed 's/^.*) //' "/proc/$p/stat"; done |
       awk -v t="$tck" '{ s += $12 + $13 } END { printf "%.2f\n", s / t }'
   else
@@ -193,18 +223,30 @@ avd_create() {
   local name=$1 sysdir=$2 nog=()
   shift 2
   [ -e "$BENCH_AVD_HOME/$name.avd" ] && bench_die "AVD $name already exists; not touching it"
-  if "$BENCH_EMU" -help 2>&1 | grep -q -- '-no-golden'; then nog=(-no-golden); AVD_MODE="fresh, -no-golden"; else AVD_MODE=fresh; fi
-  "$BENCH_EMU" -create-avd "$name" -sysdir "$sysdir" ${nog[@]+"${nog[@]}"} "$@" > "$BENCH_WORK/create-$name.log" 2>&1 ||
-    { cat "$BENCH_WORK/create-$name.log" >&2; bench_die "emu -create-avd $name failed"; }
+  if "$BENCH_EMU" -help 2>&1 | grep -q -- '-no-golden'; then
+    nog=(-no-golden)
+    AVD_MODE="fresh, -no-golden"
+  else AVD_MODE=fresh; fi
+  "$BENCH_EMU" -create-avd "$name" -sysdir "$sysdir" ${nog[@]+"${nog[@]}"} "$@" >"$BENCH_WORK/create-$name.log" 2>&1 ||
+    {
+      cat "$BENCH_WORK/create-$name.log" >&2
+      bench_die "emu -create-avd $name failed"
+    }
   bench_on_exit avd_delete "$name"
   bench_log "created AVD $name ($AVD_MODE)"
 }
 avd_delete() {
   local i
   [ -e "$BENCH_AVD_HOME/$1.avd" ] || [ -e "$BENCH_AVD_HOME/$1.ini" ] || return 0
-  [ -n "${BENCH_KEEP_DEVICES:-}" ] && { bench_log "kept AVD $1"; return 0; }
+  [ -n "${BENCH_KEEP_DEVICES:-}" ] && {
+    bench_log "kept AVD $1"
+    return 0
+  }
   for i in 1 2 3 4 5; do
-    "$BENCH_EMU" -delete-avd "$1" > /dev/null 2>&1 && { bench_log "deleted AVD $1"; return 0; }
+    "$BENCH_EMU" -delete-avd "$1" >/dev/null 2>&1 && {
+      bench_log "deleted AVD $1"
+      return 0
+    }
     sleep 2
   done
   echo "could not delete AVD $1: $BENCH_EMU -delete-avd $1" >&2
@@ -214,7 +256,7 @@ avd_delete() {
 port_free() {
   local p
   for p in "$1" $(($1 + 1)); do
-    if (exec 3<> "/dev/tcp/127.0.0.1/$p") 2>/dev/null; then return 1; fi
+    if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then return 1; fi
   done
   return 0
 }
@@ -234,25 +276,37 @@ android_boot() {
   local envs=() own=()
   case $arm in
     stock*) bin=$BENCH_STOCK ;;
-    emu*) bin=$BENCH_EMU; own=(-verbose) ;;
+    emu*)
+      bin=$BENCH_EMU
+      own=(-verbose)
+      ;;
     *) bench_die "arm $arm: expected emu, stock or emu:K=V" ;;
   esac
   # The SDK emulator saves a quickboot snapshot on exit unless told not to; SNAPSHOT_SAVE=1 lets it.
   [ "${SNAPSHOT_SAVE:-0}" = 1 ] || own+=(-no-snapshot-save)
-  case $arm in *:*) IFS=, read -r -a envs <<< "${arm#*:}" ;; esac
+  case $arm in *:*) IFS=, read -r -a envs <<<"${arm#*:}" ;; *) ;; esac
   t0=$(now)
   env -i HOME="$HOME" USER="${USER:-$(id -un)}" TMPDIR="${TMPDIR:-/tmp}" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     ANDROID_HOME="$BENCH_SDK" ANDROID_SDK_ROOT="$BENCH_SDK" ${ANDROID_AVD_HOME:+ANDROID_AVD_HOME="$ANDROID_AVD_HOME"} \
     ${envs[@]+"${envs[@]}"} "$bin" -avd "$avd" -port "$port" -no-window -no-audio -no-boot-anim \
-    ${own[@]+"${own[@]}"} "$@" > "$log" 2>&1 &
+    ${own[@]+"${own[@]}"} "$@" >"$log" 2>&1 &
   BOOT_PID=$!
   bench_track "$BOOT_PID"
-  BOOT_S=""; ADB_S=""; PEAK_RSS_MB=0
+  BOOT_S=""
+  ADB_S=""
+  PEAK_RSS_MB=0
   deadline=$((SECONDS + ${BOOT_TIMEOUT:-600}))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    kill -0 "$BOOT_PID" 2>/dev/null || { bench_log "$arm exited; see $log"; tail -5 "$log" >&2; return 1; }
+    kill -0 "$BOOT_PID" 2>/dev/null || {
+      bench_log "$arm exited; see $log"
+      tail -5 "$log" >&2
+      return 1
+    }
     tick=$((tick + 1))
-    if [ $((tick % 4)) -eq 1 ]; then r=$(rss_mb "$BOOT_PID"); [ "${r:-0}" -gt "$PEAK_RSS_MB" ] && PEAK_RSS_MB=$r; fi
+    if [ $((tick % 4)) -eq 1 ]; then
+      r=$(rss_mb "$BOOT_PID")
+      [ "${r:-0}" -gt "$PEAK_RSS_MB" ] && PEAK_RSS_MB=$r
+    fi
     [ -z "$ADB_S" ] && "$BENCH_ADB" -s "$serial" get-state 2>/dev/null | grep -q device && ADB_S=$(since "$t0")
     if [ -n "$ADB_S" ] && [ "$("$BENCH_ADB" -s "$serial" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; then
       BOOT_S=$(since "$t0")
@@ -266,15 +320,21 @@ android_boot() {
 # Stops the device android_boot started: the console's kill, then SIGINT/SIGTERM by PID.
 android_stop() {
   local pid=$1 port=$2 i
-  "$BENCH_ADB" -s "emulator-$port" emu kill > /dev/null 2>&1
-  for i in $(seq 1 150); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  "$BENCH_ADB" -s "emulator-$port" emu kill >/dev/null 2>&1
+  for i in $(seq 1 150); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
   bench_stop_pid "$pid"
 }
 # Seconds from now until the launcher has focus (dumpsys window), polled each second, or "never".
 launcher_s() {
   local serial=$1 t0=$2 deadline=$((SECONDS + ${3:-120}))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    "$BENCH_ADB" -s "$serial" shell dumpsys window 2>/dev/null | grep mCurrentFocus | grep -qi launcher && { since "$t0" 1; return; }
+    "$BENCH_ADB" -s "$serial" shell dumpsys window 2>/dev/null | grep mCurrentFocus | grep -qi launcher && {
+      since "$t0" 1
+      return
+    }
     sleep 1
   done
   echo never
@@ -284,7 +344,7 @@ launcher_s() {
 
 ios_env() {
   [ "$(uname -s)" = Darwin ] || bench_skip "iOS needs macOS with Xcode"
-  xcrun simctl help > /dev/null 2>&1 || bench_skip "no simctl (Xcode with a simulator runtime)"
+  xcrun simctl help >/dev/null 2>&1 || bench_skip "no simctl (Xcode with a simulator runtime)"
 }
 # simee: $BENCH_SIMEE when given (--simee), else this checkout's release build.
 simee_ready() {
@@ -312,24 +372,33 @@ ios_create() {
 }
 ios_delete() {
   xcrun simctl list devices | grep -qF "($1)" || return 0
-  [ -n "${BENCH_KEEP_DEVICES:-}" ] && { bench_log "kept simulator $1"; return 0; }
-  xcrun simctl shutdown "$1" > /dev/null 2>&1
+  [ -n "${BENCH_KEEP_DEVICES:-}" ] && {
+    bench_log "kept simulator $1"
+    return 0
+  }
+  xcrun simctl shutdown "$1" >/dev/null 2>&1
   xcrun simctl delete "$1" && bench_log "deleted simulator $1"
 }
 # Shut down one of this run's simulators and wait until it says so.
 ios_shutdown() {
   local i
-  xcrun simctl shutdown "$1" > /dev/null 2>&1
-  for i in $(seq 1 60); do xcrun simctl list devices | grep -F "$1" | grep -q '(Shutdown)' && return 0; sleep 1; done
+  xcrun simctl shutdown "$1" >/dev/null 2>&1
+  for i in $(seq 1 60); do
+    xcrun simctl list devices | grep -F "$1" | grep -q '(Shutdown)' && return 0
+    sleep 1
+  done
   return 1
 }
 # serve_start SIMEE SOCKET: `simee serve` on SOCKET, tracked; returns once the socket exists.
 serve_start() {
   local i
-  SIMEE_SOCKET=$2 "$1" serve > "$BENCH_WORK/serve-$$-$RANDOM.log" 2>&1 &
+  SIMEE_SOCKET=$2 "$1" serve >"$BENCH_WORK/serve-$$-$RANDOM.log" 2>&1 &
   SERVE_PID=$!
   bench_track "$SERVE_PID"
-  for i in $(seq 1 100); do [ -S "$2" ] && return 0; sleep 0.1; done
+  for i in $(seq 1 100); do
+    [ -S "$2" ] && return 0
+    sleep 0.1
+  done
   bench_die "simee serve didn't open $2"
 }
 # SOCK_DIR: a short directory for unix sockets (the 104-byte sun_path limit rules out a long

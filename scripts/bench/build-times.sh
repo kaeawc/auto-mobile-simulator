@@ -21,27 +21,46 @@ set -uo pipefail
 only=""
 while [ $# -gt 0 ]; do
   case $1 in
-    --only) only=$2; shift 2 ;;
-    *) bench_opt "$@"; shift "$BENCH_SHIFT" ;;
+    --only)
+      only=$2
+      shift 2
+      ;;
+    *)
+      bench_opt "$@"
+      shift "$BENCH_SHIFT"
+      ;;
   esac
 done
 [ "$BENCH_QUICK" = 1 ] && only=${only:-workspace}
 only=${only:-workspace desktop emu}
-command -v cargo > /dev/null || bench_skip "no cargo"
+command -v cargo >/dev/null || bench_skip "no cargo"
 bench_start build-times
 for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
   for b in $only; do
     target="$BENCH_WORK/target-$b"
     rm -rf "$target"
     case $b in
-      workspace) dir=$BENCH_REPO; cmd=(cargo test --no-run --quiet) ;;
-      desktop) dir=$BENCH_REPO/desktop; cmd=(cargo test --no-run --quiet) ;;
-      emu) dir=$BENCH_REPO; cmd=(cargo build --release --quiet -p emu) ;;
+      workspace)
+        dir=$BENCH_REPO
+        cmd=(cargo test --no-run --quiet)
+        ;;
+      desktop)
+        dir=$BENCH_REPO/desktop
+        cmd=(cargo test --no-run --quiet)
+        ;;
+      emu)
+        dir=$BENCH_REPO
+        cmd=(cargo build --release --quiet -p emu)
+        ;;
       *) bench_die "unknown build $b" ;;
     esac
-    read -r wall cpu rc <<< "$(cd "$dir" && CARGO_TARGET_DIR=$target cpu_timed "${cmd[@]}")"
+    read -r wall cpu rc <<<"$(cd "$dir" && CARGO_TARGET_DIR=$target cpu_timed "${cmd[@]}")"
     rm -rf "$target"
-    if [ "$rc" != 0 ]; then tail -5 "$BENCH_WORK/cpu_timed.log" >&2; bench_sample "$b" "clean build, CPU s" failed; continue; fi
+    if [ "$rc" != 0 ]; then
+      tail -5 "$BENCH_WORK/cpu_timed.log" >&2
+      bench_sample "$b" "clean build, CPU s" failed
+      continue
+    fi
     bench_sample "$b" "clean build, CPU s" "$cpu"
     bench_sample "$b" "clean build, wall s" "$wall"
   done

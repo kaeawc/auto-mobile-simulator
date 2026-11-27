@@ -31,75 +31,121 @@
 # scripts/tcg-bench.py directly).
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
-qemu=${EMU_QEMU:-}; sysdir=""; lib64=""; icd=swiftshader; arms=""; budget=""
+qemu=${EMU_QEMU:-}
+sysdir=""
+lib64=""
+icd=swiftshader
+arms=""
+budget=""
 while [ $# -gt 0 ]; do
   case $1 in
-    --qemu) qemu=$2; shift 2 ;;
-    --sysdir) sysdir=$2; shift 2 ;;
-    --lib64) lib64=$2; shift 2 ;;
-    --icd) icd=$2; shift 2 ;;
-    --arms) arms=$2; shift 2 ;;
-    --budget) budget=$2; shift 2 ;;
-    *) bench_opt "$@"; shift "$BENCH_SHIFT" ;;
+    --qemu)
+      qemu=$2
+      shift 2
+      ;;
+    --sysdir)
+      sysdir=$2
+      shift 2
+      ;;
+    --lib64)
+      lib64=$2
+      shift 2
+      ;;
+    --icd)
+      icd=$2
+      shift 2
+      ;;
+    --arms)
+      arms=$2
+      shift 2
+      ;;
+    --budget)
+      budget=$2
+      shift 2
+      ;;
+    *)
+      bench_opt "$@"
+      shift "$BENCH_SHIFT"
+      ;;
   esac
 done
-[ "$BENCH_QUICK" = 1 ] && { arms=${arms:-emu}; budget=${budget:-900}; }
-arms=${arms:-emu stock}; budget=${budget:-2400}
+[ "$BENCH_QUICK" = 1 ] && {
+  arms=${arms:-emu}
+  budget=${budget:-900}
+}
+arms=${arms:-emu stock}
+budget=${budget:-2400}
 [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || bench_skip "software mode is measured on x86_64 Linux"
 [ -e /dev/kvm ] && bench_skip "this host has /dev/kvm; software mode is for hosts without it"
 [ -n "$qemu" ] && [ -x "$qemu" ] || bench_skip "needs --qemu or EMU_QEMU: qemu-system-x86_64, 11 or newer"
 android_env
 image_dir "${sysdir:-system-images/android-36/default/x86_64}"
 if [ -z "$lib64" ]; then
-  lib64=$(find "$BENCH_SDK/simee/renderer" -maxdepth 2 -type d -name lib64 2> /dev/null | sort | tail -1)
+  lib64=$(find "$BENCH_SDK/simee/renderer" -maxdepth 2 -type d -name lib64 2>/dev/null | sort | tail -1)
 fi
 [ -n "$lib64" ] && [ -d "$lib64" ] || bench_skip "no renderer lib64 (emu -provision-renderer)"
-case " $arms " in *" stock "*) stock_ready ;; esac
+case " $arms " in *" stock "*) stock_ready ;; *) ;; esac
 bench_start software-mode
 emu_ready
 (cd "$BENCH_REPO" && cargo build -q --release -p emu-vmm --example soft_devices) || bench_die "building soft_devices failed"
 soft="$BENCH_REPO/target/release/examples/soft_devices"
 avd=""
-case " $arms " in *" stock "*) avd="bench-soft-$$"; avd_create "$avd" "$IMAGE_DIR" -cores 4 -memory 2048 ;; esac
-read -r -a arm_list <<< "$arms"
+case " $arms " in *" stock "*)
+  avd="bench-soft-$$"
+  avd_create "$avd" "$IMAGE_DIR" -cores 4 -memory 2048
+  ;;
+*) ;;
+esac
+read -r -a arm_list <<<"$arms"
 field() { printf ' %s\n' "$2" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
 slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'; }
 for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
   order=("${arm_list[@]}")
   if [ $((BENCH_ROUND % 2)) = 0 ]; then
-    order=(); for ((i = ${#arm_list[@]} - 1; i >= 0; i--)); do order+=("${arm_list[i]}"); done
+    order=()
+    for ((i = ${#arm_list[@]} - 1; i >= 0; i--)); do order+=("${arm_list[i]}"); done
   fi
   for arm in "${order[@]}"; do
     log="$BENCH_WORK/tcg-$BENCH_ROUND-$(slug "$arm").log"
     extra=()
-    case $arm in *:*) IFS=, read -r -a extra <<< "${arm#*:}" ;; esac
+    case $arm in *:*) IFS=, read -r -a extra <<<"${arm#*:}" ;; *) ;; esac
     case $arm in
       emu | emu:*)
-        a="emu's devices"; [ "$arm" = emu ] || a="emu's devices ${extra[*]}"
+        a="emu's devices"
+        [ "$arm" = emu ] || a="emu's devices ${extra[*]}"
         python3 -I "$BENCH_REPO/scripts/tcg-bench.py" "$IMAGE_DIR" "$BENCH_WORK/work-$(slug "$arm")" --qemu "$qemu" \
-          --emu-devices "$soft" --lib64 "$lib64" --icd "$icd" --boots 1 --budget "$budget" ${extra[@]+"${extra[@]}"} > "$log" 2>&1 ;;
+          --emu-devices "$soft" --lib64 "$lib64" --icd "$icd" --boots 1 --budget "$budget" ${extra[@]+"${extra[@]}"} >"$log" 2>&1
+        ;;
       tcg | tcg:*)
-        cpu=(); [ "$arm" = tcg ] || cpu=(--cpu "${arm#tcg:}")
+        cpu=()
+        [ "$arm" = tcg ] || cpu=(--cpu "${arm#tcg:}")
         a="plain TCG${cpu[*]:+ ${cpu[*]}}"
         python3 -I "$BENCH_REPO/scripts/tcg-bench.py" "$IMAGE_DIR" "$BENCH_WORK/work-$(slug "$arm")" --qemu "$qemu" \
-          ${cpu[@]+"${cpu[@]}"} --boots 1 --budget "$budget" > "$log" 2>&1 ;;
+          ${cpu[@]+"${cpu[@]}"} --boots 1 --budget "$budget" >"$log" 2>&1
+        ;;
       stock)
         a="SDK emulator -accel off"
         python3 -I "$BENCH_REPO/scripts/tcg-bench.py" "$IMAGE_DIR" "$BENCH_WORK/stock-work" --stock "$BENCH_STOCK" --avd "$avd" \
-          --boots 1 --budget "$budget" > "$log" 2>&1 ;;
+          --boots 1 --budget "$budget" >"$log" 2>&1
+        ;;
       *) bench_die "arm $arm: expected emu, emu:ARGS, tcg, tcg:CPU or stock" ;;
     esac
     line=$(grep '^MEDIAN' "$log" | tail -1)
     bench_log "$a: ${line:-no result}"
     case $arm in
       tcg*)
-        [ -n "$line" ] || { bench_sample "$a" "zygote starts (guest uptime), s" failed; continue; }
+        [ -n "$line" ] || {
+          bench_sample "$a" "zygote starts (guest uptime), s" failed
+          continue
+        }
         bench_sample "$a" "root shell, s" "$(field shell_s "$line")"
         bench_sample "$a" "zygote starts (guest uptime), s" "$(field zygote_uptime_s "$line")"
         bench_sample "$a" "guest 100k shell loop, s" "$(field loop100k_s "$line")"
         bench_sample "$a" "guest 4x md5 of 64 MiB, s" "$(field md5x4_s "$line")"
         bench_sample "$a" "QEMU peak RSS, MB" "$(field peak_rss_mb "$line")"
-        continue ;;
+        continue
+        ;;
+      *) ;;
     esac
     if grep -q '^failed boots: 1 of 1' "$log" || [ -z "$line" ]; then
       bench_sample "$a" "boot to sys.boot_completed, s" "over-$budget"

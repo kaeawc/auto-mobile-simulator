@@ -24,6 +24,10 @@ sim-android = { path = "../crates/sim-android" }
 sim-netshape = { path = "../crates/sim-netshape" }
 serde = "1"
 serde_json = "1"
+# The 3D view's own pipeline (`src/scene/`) in a Rune compositor, which hands it Rune's wgpu
+# device. Rune doesn't re-export wgpu: this is the version and features Rune already builds, so
+# it adds no crate (its backends come from Rune's per-target features). Bump it with Rune's.
+wgpu = { version = "30.0.2", default-features = false, features = ["std", "wgsl"] }
 rune = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
 
 [features]
