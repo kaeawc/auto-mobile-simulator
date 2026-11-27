@@ -327,15 +327,17 @@ pub fn run(cfg: Config, stop: Arc<AtomicBool>) -> anyhow::Result<Exit> {
         let console_out = copy_console(child.stdout.take(), console.clone());
         let last_err = forward_stderr(child.stderr.take(), cfg.verbose);
         let exit = supervise(&mut child, &stop);
-        let _ = console_out.map(std::thread::JoinHandle::join);
-        let last = last_err.and_then(|t| t.join().ok()).flatten();
+        let guest_output = console_out.and_then(|t| t.join().ok()).unwrap_or(0) > 0;
+        let err = last_err.and_then(|t| t.join().ok()).unwrap_or_default();
+        let last = err.last.clone();
         let exit = match exit? {
             Some(status) if status.success() => Exit::PowerOff,
             Some(_) if stop.load(Ordering::SeqCst) => Exit::Stopped,
             None => Exit::Stopped,
             Some(status) => Exit::Failed(format!("QEMU {status}{}", last.map(|l| format!(": {l}")).unwrap_or_default())),
         };
-        if retry_on_tcg(cfg.accel_fallback, accel, &exit, started.elapsed()) {
+        let seen = Failure { kvm_named: err.kvm_named, said_anything: err.said_anything, guest_output };
+        if retry_on_tcg(cfg.accel_fallback, accel, &exit, started.elapsed(), seen) {
             if let Exit::Failed(why) = &exit {
                 eprintln!("emu: {why} on KVM; starting again on TCG (-accel off skips KVM)");
             }
@@ -347,15 +349,39 @@ pub fn run(cfg: Config, stop: Arc<AtomicBool>) -> anyhow::Result<Exit> {
     }
 }
 
-/// How long QEMU may have run on KVM and still be retried on TCG when it fails: failing to set up
-/// KVM (another hypervisor holding VT-x, a QEMU built without KVM) ends it before the guest runs.
+/// How long QEMU may have run on KVM and still be retried on TCG when it fails: a backstop to
+/// [`Failure`]'s evidence, since failing to set up KVM (another hypervisor holding VT-x, a QEMU
+/// built without KVM) ends QEMU before the guest runs.
 pub const KVM_EARLY_FAILURE: Duration = Duration::from_secs(10);
 
+/// What a failed QEMU left behind, for [`retry_on_tcg`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Failure {
+    /// A line on QEMU's stderr named KVM or the accelerator ([`names_kvm`]).
+    pub kvm_named: bool,
+    /// QEMU printed anything on stderr.
+    pub said_anything: bool,
+    /// The guest wrote to its console: it ran.
+    pub guest_output: bool,
+}
+
+/// Whether a QEMU stderr line is about KVM or the accelerator: `invalid accelerator kvm`,
+/// `Could not access KVM kernel module`, `failed to initialize kvm: Device or resource busy`,
+/// `kvm_init_vcpu: ...`.
+pub fn names_kvm(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    l.contains("kvm") || l.contains("accelerator")
+}
+
 /// Whether a QEMU that ended with `exit` after `ran` on `accel` is started again on TCG: only
-/// when the accelerator was chosen automatically (`fallback`), it was KVM, and QEMU failed within
-/// [`KVM_EARLY_FAILURE`]. A guest that ran and then failed is not retried, nor is a stop.
-pub fn retry_on_tcg(fallback: bool, accel: Accel, exit: &Exit, ran: Duration) -> bool {
-    fallback && accel == Accel::Kvm && matches!(exit, Exit::Failed(_)) && ran < KVM_EARLY_FAILURE
+/// when the accelerator was chosen automatically (`fallback`), it was KVM, QEMU failed within
+/// [`KVM_EARLY_FAILURE`], and the failure is KVM's: its stderr named KVM or the accelerator, or it
+/// died silently before the guest wrote anything. Any other failure (a bad disk, a device socket)
+/// is reported as it is, without a TCG attempt that would fail the same way; so is a guest that
+/// ran, or a stop.
+pub fn retry_on_tcg(fallback: bool, accel: Accel, exit: &Exit, ran: Duration, seen: Failure) -> bool {
+    let kvms = seen.kvm_named || (!seen.said_anything && !seen.guest_output);
+    fallback && accel == Accel::Kvm && matches!(exit, Exit::Failed(_)) && ran < KVM_EARLY_FAILURE && kvms
 }
 
 /// Waits for QEMU; once `stop` is set, asks it to quit (SIGTERM, which QEMU handles by shutting
@@ -384,38 +410,53 @@ fn supervise(child: &mut Child, stop: &AtomicBool) -> std::io::Result<Option<std
     }
 }
 
-fn copy_console(from: Option<std::process::ChildStdout>, to: Arc<Mutex<Box<dyn Write + Send>>>) -> Option<std::thread::JoinHandle<()>> {
+/// Copies the guest console to `to`; the thread's result is how many bytes the guest wrote.
+fn copy_console(from: Option<std::process::ChildStdout>, to: Arc<Mutex<Box<dyn Write + Send>>>) -> Option<std::thread::JoinHandle<u64>> {
     let mut from = from?;
     std::thread::Builder::new()
         .name("qemu-console".into())
         .spawn(move || {
             let mut buf = [0u8; 4096];
+            let mut total = 0u64;
             while let Ok(n) = from.read(&mut buf) {
                 let Ok(mut to) = to.lock() else { break };
                 if n == 0 || to.write_all(&buf[..n]).is_err() {
                     break;
                 }
+                total += n as u64;
                 let _ = to.flush();
             }
+            total
         })
         .ok()
 }
 
-/// QEMU's stderr on emu's (all of it with `verbose`, else what isn't [`benign`]); the thread's
-/// result is the last line.
-fn forward_stderr(from: Option<std::process::ChildStderr>, verbose: bool) -> Option<std::thread::JoinHandle<Option<String>>> {
+/// What QEMU said on stderr.
+#[derive(Debug, Default)]
+struct Stderr {
+    /// The last line that isn't [`benign`] (any line with `verbose`).
+    last: Option<String>,
+    /// Some line, benign or not, [`names_kvm`].
+    kvm_named: bool,
+    said_anything: bool,
+}
+
+/// QEMU's stderr on emu's (all of it with `verbose`, else what isn't [`benign`]).
+fn forward_stderr(from: Option<std::process::ChildStderr>, verbose: bool) -> Option<std::thread::JoinHandle<Stderr>> {
     let from = from?;
     std::thread::Builder::new()
         .name("qemu-stderr".into())
         .spawn(move || {
-            let mut last = None;
+            let mut seen = Stderr::default();
             for line in BufReader::new(from).lines().map_while(Result::ok) {
+                seen.said_anything = true;
+                seen.kvm_named |= names_kvm(&line);
                 if verbose || !benign(&line) {
                     eprintln!("emu: qemu: {line}");
-                    last = Some(line);
+                    seen.last = Some(line);
                 }
             }
-            last
+            seen
         })
         .ok()
 }
@@ -646,12 +687,41 @@ mod tests {
     fn an_early_kvm_failure_in_auto_mode_is_retried_on_tcg() {
         let failed = Exit::Failed("QEMU exit status: 1: invalid accelerator kvm".into());
         let early = Duration::from_millis(300);
-        assert!(retry_on_tcg(true, Accel::Kvm, &failed, early));
-        assert!(!retry_on_tcg(false, Accel::Kvm, &failed, early), "-accel on: KVM or fail");
-        assert!(!retry_on_tcg(true, Accel::Tcg, &failed, early), "TCG failing has nowhere to fall back to");
-        assert!(!retry_on_tcg(true, Accel::Kvm, &failed, KVM_EARLY_FAILURE), "the guest ran: a real failure");
-        assert!(!retry_on_tcg(true, Accel::Kvm, &Exit::Stopped, early));
-        assert!(!retry_on_tcg(true, Accel::Kvm, &Exit::PowerOff, early));
+        let kvm = Failure { kvm_named: true, said_anything: true, guest_output: false };
+        assert!(retry_on_tcg(true, Accel::Kvm, &failed, early, kvm));
+        assert!(!retry_on_tcg(false, Accel::Kvm, &failed, early, kvm), "-accel on: KVM or fail");
+        assert!(!retry_on_tcg(true, Accel::Tcg, &failed, early, kvm), "TCG failing has nowhere to fall back to");
+        assert!(!retry_on_tcg(true, Accel::Kvm, &failed, KVM_EARLY_FAILURE, kvm), "the time bound is a backstop");
+        assert!(!retry_on_tcg(true, Accel::Kvm, &Exit::Stopped, early, kvm));
+        assert!(!retry_on_tcg(true, Accel::Kvm, &Exit::PowerOff, early, kvm));
+    }
+
+    #[test]
+    fn a_failure_that_isnt_kvms_is_reported_without_a_tcg_attempt() {
+        let failed = Exit::Failed("QEMU exit status: 1: Could not open '/d/userdata.img'".into());
+        let early = Duration::from_millis(300);
+        let disk = Failure { kvm_named: false, said_anything: true, guest_output: false };
+        assert!(!retry_on_tcg(true, Accel::Kvm, &failed, early, disk), "QEMU said why, and it isn't KVM");
+        let ran = Failure { kvm_named: false, said_anything: false, guest_output: true };
+        assert!(!retry_on_tcg(true, Accel::Kvm, &failed, early, ran), "the guest ran");
+        let silent = Failure::default();
+        assert!(retry_on_tcg(true, Accel::Kvm, &failed, early, silent), "died silently before the guest ran: maybe KVM");
+        let kvm_after_run = Failure { kvm_named: true, said_anything: true, guest_output: true };
+        assert!(retry_on_tcg(true, Accel::Kvm, &failed, early, kvm_after_run), "named KVM: KVM's, wherever the guest got");
+    }
+
+    #[test]
+    fn qemus_kvm_errors_are_recognized() {
+        for line in [
+            "qemu-system-x86_64: invalid accelerator kvm",
+            "Could not access KVM kernel module: Permission denied",
+            "qemu-system-x86_64: failed to initialize kvm: Device or resource busy",
+            "qemu-system-x86_64: -accel kvm: failed to initialize kvm: No such file or directory",
+        ] {
+            assert!(names_kvm(line), "{line}");
+        }
+        assert!(!names_kvm("qemu-system-x86_64: -drive file=/d/userdata.img: Could not open '/d/userdata.img': No such file or directory"));
+        assert!(!names_kvm("Failed to connect to '/r/gpu.sock': Connection refused"));
     }
 
     #[test]

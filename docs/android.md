@@ -226,16 +226,27 @@ EMU_QEMU=/path/to/qemu-system-x86_64 emu -avd phone   # QEMU 11.1 or newer; with
 emu -avd phone -accel off   # TCG even where /dev/kvm is usable (-accel on: KVM or fail)
 ```
 
-- **KVM when the host has it.** When this user can open `/dev/kvm` (`emu_kvm::open`, which also
-  says how to fix a missing or denied device), QEMU runs the guest with `-accel kvm -cpu host`
-  and keeps everything else: the board, emu's devices over vhost-user and vfio-user, the shared
-  memfd RAM. `-accel` and `-no-accel` mean what they mean to stock (`auto` by default).
-  GitHub's x86_64 hosted runners expose `/dev/kvm`, as root:kvm 0660;
-  `.github/actions/enable-kvm` opens it to the runner user, and the `Software mode` workflow
-  boots once on KVM and once with `-accel off`. The KVM run then first-boots the same image in
-  the stock emulator on the same runner and writes both times to the job summary. GitHub's arm64
-  hosted runners have no `/dev/kvm` (probed in #56), so the arm64 KVM backend can't run natively
-  there.
+- **KVM when the host has it.** emu probes KVM the way QEMU will use it: `/dev/kvm` opens with
+  what QEMU needs (`emu_kvm::open`, whose error says how to fix a missing or denied device), it
+  creates a VM (which fails with EBUSY on kernels before 6.12 while VirtualBox or VMware holds
+  VT-x), and the QEMU's `-accel help` lists `kvm` (a QEMU built with `--disable-kvm` doesn't).
+  Then QEMU runs the guest with `-accel kvm -cpu host` and keeps everything else: the board,
+  emu's devices over vhost-user and vfio-user, the shared memfd RAM. Otherwise the guest runs on
+  TCG, and `-verbose` and `-accel-check` say why. `-accel` and `-no-accel` mean what they mean to
+  stock: `auto` by default, `on` is KVM or fail, `off` is TCG.
+- **Retry on TCG.** In `auto`, a QEMU that still fails on KVM is started once more on TCG, with
+  a one-line notice, on the devices already served (their accept loops take the new
+  connection). It retries only a failure that is KVM's: QEMU's stderr named KVM or the
+  accelerator, or QEMU died silently before the guest wrote to its console; and only within
+  10 s of starting, as a backstop (`soft::retry_on_tcg`). Any other failure is reported as is.
+- **CI on GitHub's KVM.** GitHub's x86_64 hosted runners expose `/dev/kvm` as root:kvm 0660;
+  `.github/actions/enable-kvm` opens it to the runner user. The `Software mode` workflow boots
+  once on KVM and once with `-accel off`. The KVM leg then runs `scripts/bench/android-boot.sh`
+  against the stock emulator, a pinned release checked against its SHA-256 in an SDK of its own,
+  on the same runner: one round on a pull request, three on main or a manual run
+  ([benchmarks](benchmarks.md#android-software-mode-on-kvm-githubs-x86_64-runner)). GitHub's
+  arm64 hosted runners have no `/dev/kvm` (probed in #56), so the arm64 KVM backend can't run
+  natively there.
 
 - **Host:** x86_64 Linux with QEMU 11.1 or newer and the SDK's Linux renderer
   (`emu -provision-renderer`); no GPU. The smallest host it has run on is 4 cores and 8 GiB.
