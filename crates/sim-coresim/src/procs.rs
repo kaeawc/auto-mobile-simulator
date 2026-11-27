@@ -358,18 +358,26 @@ fn fds(pid: i32) -> Vec<libc::proc_fdinfo> {
     if estimate <= 0 {
         return Vec::new();
     }
-    // Room for a few more fds opened between the two calls.
-    let cap = estimate as usize / size_of::<libc::proc_fdinfo>() + 16;
-    let mut fds: Vec<libc::proc_fdinfo> = Vec::with_capacity(cap);
-    let bytes = (cap * size_of::<libc::proc_fdinfo>()).min(i32::MAX as usize) as i32;
-    // SAFETY: the buffer is `fds`'s spare capacity, `bytes` long; the kernel writes at most that
-    // and returns how many bytes it wrote.
-    let n = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, fds.as_mut_ptr().cast(), bytes) };
-    if n > 0 {
-        // SAFETY: the first `n` bytes (whole entries) were written, at most the capacity.
-        unsafe { fds.set_len((n as usize / size_of::<libc::proc_fdinfo>()).min(cap)) };
+    // Room for a few more fds opened between the two calls; a buffer that comes back full may
+    // have missed some, so read again with four times the room.
+    let mut cap = estimate as usize / size_of::<libc::proc_fdinfo>() + 16;
+    loop {
+        let mut fds: Vec<libc::proc_fdinfo> = Vec::with_capacity(cap);
+        let bytes = (cap * size_of::<libc::proc_fdinfo>()).min(i32::MAX as usize) as i32;
+        // SAFETY: the buffer is `fds`'s spare capacity, `bytes` long; the kernel writes at most
+        // that and returns how many bytes it wrote.
+        let n = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, fds.as_mut_ptr().cast(), bytes) };
+        if n <= 0 {
+            return Vec::new();
+        }
+        let len = (n as usize / size_of::<libc::proc_fdinfo>()).min(cap);
+        if len < cap || cap >= 1 << 20 {
+            // SAFETY: the first `len` entries were written, at most the capacity.
+            unsafe { fds.set_len(len) };
+            return fds;
+        }
+        cap *= 4;
     }
-    fds
 }
 
 /// `PROC_PIDFDSOCKETINFO` and `INI_IPV4` (`sys/proc_info.h`; libc doesn't name them).

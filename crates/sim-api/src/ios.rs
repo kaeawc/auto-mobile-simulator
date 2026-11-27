@@ -158,7 +158,8 @@ fn device_tree(udid: &str) -> Result<Vec<i32>, String> {
 }
 
 /// `processes`: each process of `tree` as `ps` showed it (read through libproc; a process that
-/// exits meanwhile is left out).
+/// exits meanwhile is left out, and so is a zombie, which has no task left to read, where `ps`
+/// listed it).
 fn processes_in(tree: &[i32]) -> Vec<sim_debug::process::Process> {
     let samples: Vec<sim_debug::process::Sample> = tree.iter().filter_map(|&pid| sample(pid)).collect();
     let now_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -2142,6 +2143,37 @@ mod tests {
         assert!(reaped() > before);
     }
 
+    /// The kernel's own records, for executable paths of every length mod 8 and an empty argv[0]:
+    /// the padding after the path is skipped exactly, so "" stays argv[0] and FOO stays in the
+    /// environment.
+    #[test]
+    fn procargs_of_live_processes_keep_an_empty_argv0() {
+        use std::os::unix::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!("simee-procargs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        for n in 1..=8 {
+            let link = dir.join("s".repeat(n));
+            std::os::unix::fs::symlink("/bin/sleep", &link).expect("symlink");
+            let mut child = std::process::Command::new(&link).arg0("").arg("30").env_clear().env("FOO", "bar").spawn().expect("spawn");
+            let pid = child.id() as i32;
+            // Read once exec has replaced the forked image (its path is the link's).
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let args = loop {
+                let a = sim_coresim::procs::procargs(pid).and_then(|b| sim_debug::process::ProcArgs::parse(&b));
+                if a.as_ref().is_some_and(|a| a.exec_path == link.to_str().expect("utf-8")) || std::time::Instant::now() > deadline {
+                    break a.expect("procargs");
+                }
+                sleep(Duration::from_millis(5));
+            };
+            child.kill().ok();
+            child.wait().ok();
+            assert_eq!(args.exec_path, link.to_str().expect("utf-8"));
+            assert_eq!(args.argv, vec![String::new(), "30".into()], "path of {} bytes", args.exec_path.len());
+            assert_eq!(args.var("FOO"), Some("bar"), "{args:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Records sim-debug's libproc fixtures from a booted device: its tree read through libproc
     /// with `ps` (processes), and its sockets with `lsof` (connections), each between two reads
     /// that agree. The user's home and every non-loopback address are rewritten.
@@ -2255,8 +2287,10 @@ mod tests {
             // The record's own layout, with only the variables the check reads (and the user's home
             // rewritten): argc, the path, padding, argv, the environment, then apple[] dropped.
             let mut out = (args.argv.len() as i32).to_ne_bytes().to_vec();
-            out.extend_from_slice(private(&args.exec_path).as_bytes());
-            out.extend_from_slice(&[0; 4]);
+            let path = private(&args.exec_path);
+            out.extend_from_slice(path.as_bytes());
+            // Its NUL and the kernel's padding to a multiple of 8 bytes.
+            out.resize(4 + (path.len() + 1).next_multiple_of(8), 0);
             let keep = ["DYLD_INSERT_LIBRARIES=", "SIMEE_NETSHAPE=", "HOME=", "CFFIXED_USER_HOME=", "SIMULATOR_UDID="];
             let env = args.env.iter().filter(|e| keep.iter().any(|k| e.starts_with(k)));
             for s in args.argv.iter().chain(env) {

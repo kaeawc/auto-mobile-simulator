@@ -93,7 +93,11 @@ fn replace(data_path: &Path, key: &str, value: Scalar) -> Result<(), String> {
     }
     let mut entries = read_settings(&path)?;
     sim_core::plist::set(&mut entries, key, value);
-    let tmp = path.with_extension("plist.simee");
+    // Unique per process and call, so two writers never share a temporary file (the last rename
+    // wins whole).
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("plist.simee-{}-{n}", std::process::id()));
     std::fs::write(&tmp, sim_core::plist::render_dict(&entries)).map_err(|e| format!("{}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, &path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -194,7 +198,8 @@ mod tests {
         set_route(&root, true, "default").expect("route");
         let s = settings(&root).expect("read");
         assert_eq!(s, serde_json::json!({"sim_volume": 40, "sim_output_device_uid": HOST_DEFAULT_UID}));
-        assert!(!path.with_extension("plist.simee").exists(), "no temporary file left");
+        let left: Vec<_> = std::fs::read_dir(path.parent().expect("parent")).expect("dir").flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("audiosettings.plist")], "no temporary file left");
         std::fs::remove_dir_all(root).ok();
     }
 

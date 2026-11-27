@@ -69,7 +69,8 @@ pub fn elapsed(secs: u64) -> String {
 }
 
 /// The device's processes from samples of its tree (its `launchd_sim` and every descendant),
-/// sorted by CPU then memory, descending, then by pid.
+/// sorted by CPU then memory, descending, then by pid. Zombies have no task to sample, so unlike
+/// `ps` they aren't listed.
 pub fn tree(samples: &[Sample], now_s: u64) -> Vec<Process> {
     let mut out: Vec<Process> = samples.iter().map(|s| Process::from_sample(s, now_s)).collect();
     out.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(b.rss_kb.cmp(&a.rss_kb)).then(a.pid.cmp(&b.pid)));
@@ -90,12 +91,20 @@ impl ProcArgs {
     /// padding, then `argc` arguments and the environment, each NUL-terminated (the environment
     /// ends at an empty string; the `apple[]` strings after it are left out). `None` when it is
     /// too short to hold `argc`.
+    ///
+    /// The kernel pads the path with NULs to a multiple of 8 bytes from its start (`exec_extract_
+    /// strings`), so exactly that padding is skipped: an empty argv[0] stays an argument rather
+    /// than being taken for padding.
     pub fn parse(buf: &[u8]) -> Option<ProcArgs> {
         let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?).max(0) as usize;
         let rest = &buf[4..];
         let path_end = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
         let exec_path = String::from_utf8_lossy(&rest[..path_end]).into_owned();
-        let mut strings = rest[path_end..].split(|b| *b == 0).skip_while(|s| s.is_empty());
+        let after = (path_end + 1).min(rest.len());
+        let aligned = (path_end + 1).next_multiple_of(8).min(rest.len());
+        // Padding is all NULs; anything else means another layout: start right after the path.
+        let start = if rest[after..aligned].iter().all(|b| *b == 0) { aligned } else { after };
+        let mut strings = rest[start..].split(|b| *b == 0);
         let argv: Vec<String> = strings.by_ref().take(argc).map(|s| String::from_utf8_lossy(s).into_owned()).collect();
         let env = strings.take_while(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect();
         Some(ProcArgs { exec_path, argv, env })
@@ -238,7 +247,8 @@ mod tests {
     fn procargs_are_split_into_path_arguments_and_environment() {
         let mut buf = 2i32.to_ne_bytes().to_vec();
         buf.extend_from_slice(
-            b"/x/SpringBoard\0\0\0\0/x/SpringBoard\0-flag\0HOME=/h\0DYLD_INSERT_LIBRARIES=/a.dylib:/b.dylib\0\0executable_path=/x\0",
+            // 14 bytes of path, its NUL and one of padding: 16.
+            b"/x/SpringBoard\0\0/x/SpringBoard\0-flag\0HOME=/h\0DYLD_INSERT_LIBRARIES=/a.dylib:/b.dylib\0\0executable_path=/x\0",
         );
         let a = ProcArgs::parse(&buf).expect("parse");
         assert_eq!(a.exec_path, "/x/SpringBoard");
@@ -251,6 +261,23 @@ mod tests {
         assert_eq!(ProcArgs::parse(b"\x01\0"), None);
         let none = ProcArgs::parse(&0i32.to_ne_bytes()).expect("empty");
         assert_eq!(none, ProcArgs::default());
+    }
+
+    #[test]
+    fn an_empty_argv0_is_an_argument_not_padding() {
+        // `/bin/sleep` (10 bytes, NUL, 5 of padding) run with argv ["", "30"] and FOO=bar.
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/bin/sleep\0\0\0\0\0\0\0\x330\0FOO=bar\0\0ptr_munge=\0");
+        let a = ProcArgs::parse(&buf).expect("parse");
+        assert_eq!(
+            (a.exec_path.as_str(), a.argv.clone(), a.env.clone()),
+            ("/bin/sleep", vec!["".to_owned(), "30".into()], vec!["FOO=bar".to_owned()])
+        );
+        // A path whose NUL ends on the 8-byte boundary has no padding.
+        let mut buf = 1i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/bin/aa\0\0FOO=bar\0\0");
+        let a = ProcArgs::parse(&buf).expect("parse");
+        assert_eq!((a.argv.clone(), a.var("FOO")), (vec![String::new()], Some("bar")));
     }
 
     /// SpringBoard's record on an iPhone 17 Pro (iOS 27.2) booted with simee's network shaper in
