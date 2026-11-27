@@ -404,8 +404,8 @@ fn until_head(feed: &Feed, cursor: &str, n: u64) {
 
 #[test]
 fn two_watchers_on_one_feed_do_not_hold_each_other_up() {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let feed = Feed::start(rx, FEED_BYTES, Duration::from_secs(60)).expect("feed");
+    let (tx, source) = sink();
+    let feed = Feed::start(source, FEED_BYTES, Duration::from_secs(60)).expect("feed");
     let cursor = feed.poll(None, Duration::ZERO)["cursor"].as_str().expect("cursor").to_owned();
     // One watcher long-polls...
     let (waiting, from) = (feed.clone(), cursor.clone());
@@ -422,7 +422,7 @@ fn two_watchers_on_one_feed_do_not_hold_each_other_up() {
     let start = Instant::now();
     assert_eq!(feed.poll(Some(&cursor), Duration::ZERO)["events"], json!([]));
     assert!(start.elapsed() < Duration::from_millis(500), "not held by the waiting watcher: {:?}", start.elapsed());
-    tx.send(change("k", PrefValue::Int(1))).expect("send");
+    assert!(tx.send(change("k", PrefValue::Int(1))), "send");
     let (got, waited) = long.join().expect("long poll");
     assert_eq!(got["events"][0]["key"], "k");
     assert!(waited < Duration::from_secs(5), "woke on the change: {waited:?}");
@@ -431,12 +431,12 @@ fn two_watchers_on_one_feed_do_not_hold_each_other_up() {
 
 #[test]
 fn a_feed_keeps_its_byte_budget_and_counts_what_it_dropped() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, source) = sink();
     let each = change("k0", PrefValue::String("x".repeat(400))).size();
-    let feed = Feed::start(rx, each * 3 + each / 2, Duration::from_secs(60)).expect("feed");
+    let feed = Feed::start(source, each * 3 + each / 2, Duration::from_secs(60)).expect("feed");
     let cursor = feed.poll(None, Duration::ZERO)["cursor"].as_str().expect("cursor").to_owned();
     for i in 0..10 {
-        tx.send(change(&format!("k{i}"), PrefValue::String("x".repeat(400)))).expect("send");
+        assert!(tx.send(change(&format!("k{i}"), PrefValue::String("x".repeat(400)))), "send");
     }
     until_head(&feed, &cursor, 10);
     let got = feed.poll(Some(&cursor), Duration::ZERO);
@@ -452,9 +452,9 @@ fn an_idle_feed_stops_on_its_own_and_its_backend_stops_sending() {
     let fake = Fake::default();
     let mut backend = fake.clone();
     let store = Store::new(StoreKind::AppDomain, "com.example", "com.example");
-    let mut feeds = Feeds::new(FEED_BYTES, Duration::from_millis(200));
+    let feeds = Mutex::new(Some(Feeds::new(FEED_BYTES, Duration::from_millis(200), MAX_FEEDS)));
     let key = FeedKey { platform: Platform::Ios, device: "d".into(), app: "com.example".into(), store: None };
-    let first = feeds.get(key.clone(), None, || backend.watch("d", "com.example", None)).expect("feed");
+    let first = feed_for(&feeds, key.clone(), None, |sink| backend.watch("d", "com.example", None, sink)).expect("feed");
     // Nobody polls: its thread ends it, drops the receiver, and the backend's next send fails.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut n = 0;
@@ -469,9 +469,9 @@ fn an_idle_feed_stops_on_its_own_and_its_backend_stops_sending() {
     drop(state);
     assert_eq!(first.poll(Some(&format!("{}:0", first.id)), Duration::ZERO)["ended"], true);
     // A call with its cursor still finds it ended; one without starts a new feed.
-    let held = feeds.get(key.clone(), Some(first.id), || backend.watch("d", "com.example", None)).expect("feed");
+    let held = feed_for(&feeds, key.clone(), Some(first.id), |sink| backend.watch("d", "com.example", None, sink)).expect("feed");
     assert_eq!(held.id, first.id);
-    let fresh = feeds.get(key, None, || backend.watch("d", "com.example", None)).expect("feed");
+    let fresh = feed_for(&feeds, key, None, |sink| backend.watch("d", "com.example", None, sink)).expect("feed");
     assert_ne!(fresh.id, first.id);
     assert_eq!(fake.watchers(), 1);
 }
@@ -564,4 +564,115 @@ fn the_prefs_schemas_type_every_parameter() {
         (watch["properties"]["cursor"]["type"].clone(), watch["properties"]["wait_ms"]["type"].clone()),
         (json!("string"), json!("integer"))
     );
+}
+
+#[test]
+fn a_backend_learns_its_feed_ended_without_sending_anything() {
+    let feeds = Mutex::new(Some(Feeds::new(FEED_BYTES, Duration::from_millis(100), MAX_FEEDS)));
+    let key = FeedKey { platform: Platform::Ios, device: "d".into(), app: "com.example".into(), store: None };
+    let mut kept = None;
+    let feed = feed_for(&feeds, key, None, |sink| {
+        kept = Some(sink);
+        Ok(())
+    })
+    .expect("feed");
+    let sink = kept.expect("the backend got a sink");
+    assert!(sink.is_open());
+    // Nobody reads it and nothing changes: the feed ends, and the sink says so.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sink.is_open() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!sink.is_open() && feed.state().ended, "closed by the feed ending, with no send");
+    assert!(!sink.send(change("k", PrefValue::Int(1))), "and a send says so too");
+}
+
+#[test]
+fn a_backends_watch_starts_without_holding_the_feeds_lock() {
+    let feeds = Mutex::new(Some(Feeds::new(FEED_BYTES, FEED_IDLE, MAX_FEEDS)));
+    let key = FeedKey { platform: Platform::Ios, device: "d".into(), app: "com.example".into(), store: None };
+    let mut free = false;
+    let mut kept = None;
+    feed_for(&feeds, key.clone(), None, |sink| {
+        // Another feed's caller could take the lock now.
+        free = feeds.try_lock().is_ok();
+        kept = Some(sink);
+        Ok(())
+    })
+    .expect("feed");
+    assert!(free, "the lock is free while the backend starts");
+    // Two starts of one feed at once: the first one in is kept, the other's sink closes.
+    let (late, source) = sink();
+    let first = with_feeds(&feeds, |f| f.find(&key, None)).expect("find").expect("running");
+    let again = with_feeds(&feeds, |f| f.insert(key.clone(), None, source)).expect("insert");
+    assert_eq!(again.id, first.id);
+    assert!(!late.is_open(), "the second start's sink is closed");
+    assert!(kept.is_some_and(|s| s.is_open()), "the kept feed's isn't");
+}
+
+#[test]
+fn a_process_runs_at_most_so_many_feeds() {
+    let feeds = Mutex::new(Some(Feeds::new(FEED_BYTES, FEED_IDLE, 2)));
+    let key = |app: &str| FeedKey { platform: Platform::Ios, device: "d".into(), app: app.into(), store: None };
+    let mut sinks = Vec::new();
+    for app in ["a", "b"] {
+        feed_for(&feeds, key(app), None, |sink| {
+            sinks.push(sink);
+            Ok(())
+        })
+        .expect(app);
+    }
+    let mut started = false;
+    let Err(err) = feed_for(&feeds, key("c"), None, |_| {
+        started = true;
+        Ok(())
+    }) else {
+        panic!("a third feed started")
+    };
+    assert!(err.starts_with("2 preference feeds are running in this process, the most it runs"), "{err}");
+    assert!(!started, "refused before the backend starts watching");
+    // A running feed is still found by its callers.
+    feed_for(&feeds, key("a"), None, |_| Err("not started again".into())).expect("found");
+}
+
+#[test]
+fn a_fresh_read_asks_the_backend_for_one() {
+    struct Fresh;
+    impl Backend for Fresh {
+        fn stores(&mut self, _: &str, app: &str) -> Result<Vec<Store>, String> {
+            Ok(vec![Store::new(StoreKind::AppDomain, app, app)])
+        }
+        fn read(&mut self, _: &str, _: &Store) -> Result<Entries, String> {
+            Ok([("from".to_owned(), PrefValue::String("file".into()))].into())
+        }
+        fn read_fresh(&mut self, _: &str, _: &Store) -> Result<Entries, String> {
+            Ok([("from".to_owned(), PrefValue::String("cfprefsd".into()))].into())
+        }
+        fn write_batch(&mut self, _: &str, _: &Store, _: &[Op]) -> Result<WriteResult, String> {
+            Err("no".into())
+        }
+        fn watch(&mut self, _: &str, _: &str, _: Option<&Store>, _: Sink) -> Result<(), String> {
+            Err("no".into())
+        }
+    }
+    let read = |p: Value| call(&mut Fresh, Platform::Ios, "D", "prefs_read", &p).expect("read")[0]["values"]["from"]["value"].clone();
+    assert_eq!(read(json!({"bundle_id": "com.example"})), "file");
+    assert_eq!(read(json!({"bundle_id": "com.example", "fresh": true})), "cfprefsd");
+    assert_eq!(read(json!({"bundle_id": "com.example", "store": "com.example", "fresh": true})), "cfprefsd");
+    let err = call(&mut Fresh, Platform::Ios, "D", "prefs_read", &json!({"bundle_id": "com.example", "fresh": "yes"}));
+    assert!(err.is_err(), "fresh is a bool");
+}
+
+#[test]
+fn android_devices_still_answer_not_yet_available_and_ios_has_a_backend() {
+    let mut session = Session::default();
+    let err = call(&mut *session.android, Platform::Android, "pixel", "prefs_stores", &json!({"bundle_id": "com.example"}));
+    assert_eq!(err.expect_err("android"), "app preferences (`prefs_*`) are not yet available on Android devices");
+    // The iOS backend answers from the device's files (here: a device that doesn't exist).
+    let udid = "1111AAAA-BBBB-CCCC-DDDD-EEEEFFFF0000";
+    let err = call(&mut *session.ios, Platform::Ios, udid, "prefs_stores", &json!({"bundle_id": "com.example"})).expect_err("no device");
+    #[cfg(target_os = "macos")]
+    assert!(err.ends_with(&format!("doesn't exist: is `{udid}` a simulator of the default device set?")), "{err}");
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(err, "app preferences (`prefs_*`) are not yet available on iOS devices");
 }
