@@ -15,6 +15,7 @@ pub const DEVICES: &str = "simee://devices";
 pub const RUNTIMES: &str = "simee://runtimes";
 pub const DEVICE_TYPES: &str = "simee://device-types";
 pub const FORM_FACTORS: &str = "simee://form-factors";
+pub const CAMERA_SOURCES: &str = "simee://camera/sources";
 
 /// What a resource URI names.
 #[derive(Debug, PartialEq, Eq)]
@@ -23,6 +24,8 @@ pub enum Target {
     Runtimes,
     DeviceTypes,
     FormFactors,
+    /// `simee://camera/sources`: what a camera can link to (`camera_sources`).
+    CameraSources,
     /// `simee://devices/{device}`: the device's info.
     Device(String),
     /// `simee://devices/{device}/screenshot`
@@ -80,6 +83,7 @@ pub fn parse(uri: &str) -> Option<Target> {
         "runtimes" => return Some(Target::Runtimes),
         "device-types" => return Some(Target::DeviceTypes),
         "form-factors" => return Some(Target::FormFactors),
+        "camera/sources" => return Some(Target::CameraSources),
         _ => {}
     }
     let mut parts = path.strip_prefix("devices/")?.split('/');
@@ -119,6 +123,8 @@ pub fn list(backend: &dyn Backend) -> Vec<Value> {
             "description": "iOS device types a simulator can be created from."}),
         json!({"uri": FORM_FACTORS, "name": "form-factors", "title": "Form factors", "mimeType": "application/json",
             "description": "Every form factor on every platform, with its inputs, or why it is unsupported."}),
+        json!({"uri": CAMERA_SOURCES, "name": "camera-sources", "title": "Camera sources", "mimeType": "application/json",
+            "description": "Every source a device camera can link to (the host's cameras, synthetic sources) and the host's camera permission."}),
         app::listing(),
     ];
     let devices = backend.call("devices", &json!({})).unwrap_or(Value::Null);
@@ -166,6 +172,7 @@ pub fn read(backend: &dyn Backend, uri: &str) -> Result<Vec<Value>, RpcError> {
         Target::Runtimes => json_text(uri, &call("runtimes", json!({}))?),
         Target::DeviceTypes => json_text(uri, &call("device_types", json!({}))?),
         Target::FormFactors => json_text(uri, &call("form_factors", json!({}))?),
+        Target::CameraSources => json_text(uri, &call("camera_sources", json!({}))?),
         Target::Device(d) => json_text(uri, &call("info", json!({"device": d}))?),
         Target::Apps(d) => json_text(uri, &call("apps", json!({"device": d}))?),
         Target::Screenshot(d) => {
@@ -209,6 +216,7 @@ mod tests {
         assert_eq!(parse(RUNTIMES), Some(Target::Runtimes));
         assert_eq!(parse(DEVICE_TYPES), Some(Target::DeviceTypes));
         assert_eq!(parse(FORM_FACTORS), Some(Target::FormFactors));
+        assert_eq!(parse(CAMERA_SOURCES), Some(Target::CameraSources));
         assert_eq!(parse(app::URI), Some(Target::View));
         for junk in [
             "",
@@ -229,7 +237,7 @@ mod tests {
         let fake = Fake::with_devices();
         let list = list(&fake);
         let uris: Vec<&str> = list.iter().filter_map(|r| r["uri"].as_str()).collect();
-        for fixed in [DEVICES, RUNTIMES, DEVICE_TYPES, FORM_FACTORS, app::URI] {
+        for fixed in [DEVICES, RUNTIMES, DEVICE_TYPES, FORM_FACTORS, CAMERA_SOURCES, app::URI] {
             assert!(uris.contains(&fixed), "{fixed}");
         }
         // The booted Android device: info and screenshot, no iOS-only logs or apps.
@@ -248,7 +256,7 @@ mod tests {
         // No devices (or a failing listing) is just the fixed ones.
         let none = Fake::default();
         none.answer("devices", Err("boom".into()));
-        assert_eq!(super::list(&none).len(), 5);
+        assert_eq!(super::list(&none).len(), 6);
     }
 
     #[test]
@@ -289,6 +297,11 @@ mod tests {
         assert_eq!((page["mimeType"].clone(), page["uri"].clone()), (json!(app::MIME), json!(app::URI)));
         assert_eq!(read1(FORM_FACTORS)["mimeType"], "application/json");
         assert_eq!(read1(DEVICE_TYPES)["mimeType"], "application/json");
+        fake.answer("camera_sources", Ok(json!({"permission": {"status": "authorized"}, "sources": [{"source": "qr:hello"}]})));
+        let sources = read1(CAMERA_SOURCES);
+        assert_eq!((sources["uri"].clone(), sources["mimeType"].clone()), (json!(CAMERA_SOURCES), json!("application/json")));
+        assert!(sources["text"].as_str().is_some_and(|t| t.contains("qr:hello")));
+        assert_eq!(fake.called("camera_sources"), [json!({})]);
         // Logs that aren't lines are shown as JSON.
         fake.answer("logs", Ok(json!({"lines": 2})));
         assert!(read1("simee://devices/phone/logs")["text"].as_str().is_some_and(|t| t.contains("\"lines\": 2")));

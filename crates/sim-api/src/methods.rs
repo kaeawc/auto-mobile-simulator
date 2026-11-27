@@ -57,13 +57,14 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     (
         "boot",
         "device, timeout_s?, admission?(ignore|refuse|wait), admission_timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, \
-         settle_foreground?(true), settle_timeout_s?, profile?(\"slim\"); Android: audio?(false)",
+         settle_foreground?(true), settle_timeout_s?, profile?(\"slim\"); Android: audio?(false), camera_back?, camera_front?",
         "Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; settle also waits \
          up to settle_timeout_s (600) until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s \
          (settle_foreground, the default: counting only foreground-QoS CPU) and returns the timings with cpu_pct, foreground_cpu_pct, \
          background_cpu_pct and cpu_s (CPU-seconds the tree used since the boot; for a device already booted, since the first sample), settled false if it ran out of time; profile turns off a named set \
          of daemons (written before the boot of a shut-down device, so they never start); Android: starts emu and \
-         waits for sys.boot_completed, silent unless audio, which plays the device on the host's default output). Returns `admission`, \
+         waits for sys.boot_completed, silent unless audio, which plays the device on the host's default output; camera_back and \
+         camera_front link a camera source first, as camera_link does, saved for later boots too). Returns `admission`, \
          what the device would do to the host (as `admission_check`; nothing for one already booted): admission ignore, the default, \
          only reports it; refuse fails fast unless the verdict is admit; wait waits until it is (at most admission_timeout_s, 600) \
          and returns `pacing`",
@@ -350,6 +351,39 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     ("audio_capture_stop", "capture_id", "Stop a capture: frames, duration_ms, rms, peak, dbfs, path"),
     ("audio_mute", "device, on", "Silence (or restore) this device's audio on the host: a per-device null sink"),
+    // Device cameras (#323): host cameras, virtual cameras and synthetic sources (`sim-camera`).
+    (
+        "camera_sources",
+        "kind?(host|virtual|synthetic)",
+        "The sources a device camera can link to, each with the `source` id camera_link takes: the host's cameras (built-in, \
+         external, Continuity Camera, and virtual cameras such as OBS Virtual Camera, flagged `virtual`) and the synthetic kinds \
+         (pattern:testcard, qr:, text:, image:, solid:); and the host's camera permission (macOS: the TCC status of the app that \
+         started the server, with the fix when it blocks capture), read without ever prompting",
+    ),
+    (
+        "camera_link",
+        "device, facing(back|front|both), source",
+        "Feed a device camera from a source: a source id (webcam:<id>, pattern:testcard, qr:<text>, text:<text>, image:<absolute path>, \
+         solid:<colour>; emulated is the test card, none turns the camera off) or a host camera's name, index or part of its name \
+         (obs finds OBS Virtual Camera; an ambiguous one fails listing the matches), saved by its stable id. Saved with the device: \
+         it comes back on every boot and survives a server restart. Android: a running device is relinked live through emu's console \
+         (`camera link`), a shut-down one gets it at boot (-camera-back, -camera-front); a camera that was off at boot appears only \
+         after a reboot (the guest lists its cameras once). iOS: not yet (#322)",
+    ),
+    (
+        "camera_unlink",
+        "device, facing?(back|front|both)",
+        "Remove a device camera's link (default both): it goes back to the AVD's own camera (config.ini hw.camera.*), live on a running \
+         device and at every boot",
+    ),
+    (
+        "camera_links",
+        "device?",
+        "Each linked device camera (one device, or every device): facing, source (and a host camera's name), live (what the running \
+         emulator shows) and state: linked, saved (applies at the next boot), relinked (changed from the console; the next boot \
+         restores the saved link), unsaved (linked from the console only), off, source missing (the host no longer lists the camera: \
+         the device shows the test card until it is back) or permission missing, with the fix",
+    ),
     ("network_env", "device", "Environment that makes one app launch shaped (for simctl: prefix each key with SIMCTL_CHILD_)"),
     (
         "console",
@@ -421,6 +455,7 @@ pub struct Session {
     pub(crate) ios: crate::ios::Session,
     pub(crate) android: crate::android::Session,
     pub(crate) prefs: crate::prefs::Session,
+    pub(crate) camera: crate::camera::Session,
     /// A host state admission judges by instead of this host's (and the seed costs).
     #[cfg(test)]
     pub(crate) fake_host: Option<sim_host::admission::HostState>,
@@ -430,6 +465,13 @@ impl Session {
     /// A session whose Android backend uses this SDK and AVD home instead of the environment's.
     pub fn with_android(android: sim_android::Android) -> Session {
         Session { android: crate::android::Session::with(android), ..Session::default() }
+    }
+
+    /// This session with the host's cameras replaced by these, (id, name, virtual) each, and the
+    /// camera permission authorized or denied: for front ends' tests of the camera methods.
+    #[doc(hidden)]
+    pub fn with_cameras(self, cameras: &[(&str, &str, bool)], authorized: bool) -> Session {
+        Session { camera: crate::camera::Session::fixed(cameras, authorized), ..self }
     }
 }
 
@@ -480,9 +522,11 @@ const ALL_PLATFORMS: &[&str] = &[
     "prefs_delete",
     "prefs_batch",
     "prefs_watch",
+    // Needs no device: the host's camera sources.
+    "camera_sources",
 ];
-/// Methods only Android devices have.
-const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad", "export", "import"];
+/// Methods only Android devices have (camera links: iOS comes with #322's camera feed).
+const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad", "export", "import", "camera_link", "camera_unlink", "camera_links"];
 
 /// The platforms whose devices `method` works on.
 pub fn platforms(method: &str) -> &'static [Platform] {
@@ -498,7 +542,7 @@ pub fn platforms(method: &str) -> &'static [Platform] {
 /// Resolves the `device` parameter to a platform and an exact id. With no Android devices around
 /// (and no `platform` asking for one), the query goes to the iOS backend unchanged, which resolves
 /// it exactly as it always has.
-fn resolve(s: &mut Session, p: &Value) -> Result<(Platform, String), String> {
+pub(crate) fn resolve(s: &mut Session, p: &Value) -> Result<(Platform, String), String> {
     let query = str_param(p, "device").unwrap_or("booted");
     let only = opt_platform(p)?;
     // An AVD's name is its UDID: resolve it without listing every device on both platforms
@@ -530,7 +574,7 @@ fn resolve(s: &mut Session, p: &Value) -> Result<(Platform, String), String> {
 /// Fails with the "no device matches" error when `query` was routed to iOS only by its UDID shape
 /// and no such simulator exists. [`resolve`] doesn't look the simulator up (that listing costs more
 /// than the call it routes), so a platform error that would be about a mistyped UDID checks first.
-fn ios_device_exists(s: &mut Session, platform: Platform, query: &str) -> Result<(), String> {
+pub(crate) fn ios_device_exists(s: &mut Session, platform: Platform, query: &str) -> Result<(), String> {
     if platform != Platform::Ios || !sim_core::device::is_udid(query) {
         return Ok(());
     }
@@ -886,7 +930,12 @@ fn merge_chunks(results: &[Result<Value, String>], ids: &[Vec<String>]) -> Resul
 
 /// Dispatches one method, past admission.
 fn dispatch(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
+    // `camera_back` / `camera_front` are linked (and saved) first, so the boot passes them to emu.
+    if method == "boot" {
+        crate::camera::before_boot(s, p)?;
+    }
     match method {
+        m if crate::camera::is_method(m) => crate::camera::call(s, m, p),
         "help" => Ok(METHODS
             .iter()
             .map(|(m, params, doc)| {

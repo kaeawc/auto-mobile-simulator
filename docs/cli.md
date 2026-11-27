@@ -68,8 +68,20 @@ simee rotary Wear 3                          # the rotary input (watches only)
 simee xr XR recenter                         # Android XR head pose, options, pointer
 simee vehicle Car gear drive                 # a vehicle HAL property (Automotive only)
 simee console Pixel sensor get acceleration  # anything the emulator console speaks
+simee camera sources                         # host cameras (virtual ones flagged), synthetic sources, permission
+simee camera link Pixel --back qr:hello      # live on a running device, else at its next boot
+simee camera link Pixel --front obs          # part of a camera's name: "OBS Virtual Camera"
+simee camera links                           # every link and its state (source missing, ...)
+simee camera unlink Pixel                    # both cameras back to the AVD's own (--back, --front)
+simee boot Pixel --camera-back pattern:testcard --camera-front image:face.png
 simee shutdown Pixel
 ```
+
+Camera links are saved with the device and passed to emu on every boot, so they survive a reboot
+and a server restart. A source is a source id (`qr:TEXT`, `text:TEXT`, `image:PATH`,
+`solid:COLOUR`, `pattern:testcard`, `webcam:ID`, `none`) or part of a host camera's name; a name
+that matches several cameras fails and lists them. iOS devices get camera links with #322. See
+[docs/camera.md](camera.md).
 
 The form factor comes from the image (Wear OS, TV and Automotive images) or `--form-factor`
 (phone, tablet or foldable from a mobile image, which also sizes the screen and adds a foldable's
@@ -98,7 +110,7 @@ simee shutdown|delete <device>
 iOS-only commands: `install|uninstall|launch|terminate|apps`, `open-url`, `appearance`, `privacy`,
 `memory-warning`, `erase`, `exec`, `carplay`, `watch-gesture`, `remote-swipe`, `pointer`
 (and `swipe --edge`); Android-only:
-`console`, `xr`, `touchpad`, `vehicle` (`fold` works on Android foldables and the iPhone Duo). `stylus` works on both: a pen on the touch screen
+`console`, `xr`, `touchpad`, `vehicle`, `camera link|unlink|links` (`fold` works on Android foldables and the iPhone Duo). `stylus` works on both: a pen on the touch screen
 (`simee stylus <device> 400 300 hover`, `... down --pressure 200 --button`, `... 100 100 --to 900 600`
 for a stroke, `--eraser` for the eraser end); on an iPad it is the Apple Pencil, which takes taps,
 `down`/`move`/`up` and strokes but no hover, pressure, button or eraser (the simulator's touch

@@ -29,6 +29,7 @@ mod icons;
 #[cfg(target_os = "macos")]
 mod ios;
 mod keys;
+mod mark;
 mod scan;
 mod scene;
 mod stylus;
@@ -161,6 +162,10 @@ pub struct State {
     pub bezel: bezel::Bezel,
     /// The 3D device view's switch.
     pub view3d: scene::Toggle,
+    /// Seconds the mark has been moving (a job running, a device starting or stopping), and the
+    /// poll time it started at; `None` while it rests.
+    pub mark_t: f32,
+    mark_from: Option<f64>,
 }
 
 /// An Android screen switched away from, with what the window showed it with.
@@ -393,6 +398,8 @@ fn init() -> State {
         shape: Shape::Rounded,
         held: None,
         busy: None,
+        mark_t: 0.0,
+        mark_from: None,
         status: view3d_status,
         debug: debug::Debug::default(),
         socket: None,
@@ -868,6 +875,16 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
         let form_factor = s.selected_info().and_then(|i| i.form_factor);
         let bezel = s.selected_info().and_then(controls::bezel).is_some();
         tx.resize_window(fit_window(size, form_factor, bezel));
+        changed = true;
+    }
+    // The mark turns while a job runs or a device starts or stops: a frame every
+    // `mark::FRAME`, and none once everything rests.
+    if s.busy.is_some() || s.devices.iter().any(|d| mark::moves(d.state)) {
+        let from = *s.mark_from.get_or_insert(t);
+        s.mark_t = (t - from) as f32;
+        changed = true;
+        tx.wake_after(mark::FRAME);
+    } else if s.mark_from.take().is_some() {
         changed = true;
     }
     // The 3D view's camera and turn: a frame for every step of a running change and one to land

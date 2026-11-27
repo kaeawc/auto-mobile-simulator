@@ -138,6 +138,13 @@ enum Cmd {
         /// Android: play the device's audio on the host's default output (silent otherwise).
         #[arg(long)]
         audio: bool,
+        /// Android: link the back camera to this source first, as `camera link --back` does (and
+        /// keep it for later boots).
+        #[arg(long, value_name = "SOURCE")]
+        camera_back: Option<String>,
+        /// Android: link the front camera to this source first, as `camera link --front` does.
+        #[arg(long, value_name = "SOURCE")]
+        camera_front: Option<String>,
     },
     /// Boot several devices of one platform, a few at a time, and print each one's timings.
     /// Exits non-zero only when a device failed to boot (one that booted but didn't settle in
@@ -399,6 +406,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Device cameras: the host's camera sources, and which one feeds each device camera (saved
+    /// with the device, so links come back on every boot). Android now; iOS with #322.
+    Camera {
+        #[command(subcommand)]
+        command: CameraCmd,
+    },
     /// Send commands to an Android device's emulator console (`adb emu`'s protocol).
     Console {
         device: String,
@@ -453,6 +466,54 @@ enum Cmd {
         program: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+}
+
+/// `simee camera`'s commands.
+#[derive(Subcommand)]
+enum CameraCmd {
+    /// The host's cameras (built-in, external, Continuity Camera, virtual ones such as OBS) and
+    /// the synthetic sources, with the host's camera permission (read, never prompted for).
+    Sources {
+        /// Only these: host (the host's cameras), virtual (its virtual cameras) or synthetic.
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Feed a device camera from a source: an id (qr:hello, pattern:testcard, text:Hi,
+    /// image:PATH, solid:red, webcam:ID, none) or part of a host camera's name (`obs` finds "OBS
+    /// Virtual Camera"; a name that matches several fails, listing them). The back camera unless
+    /// --front or --both.
+    Link {
+        device: String,
+        source: String,
+        /// The back camera (the default).
+        #[arg(long, conflicts_with_all = ["front", "both"])]
+        back: bool,
+        #[arg(long, conflicts_with = "both")]
+        front: bool,
+        #[arg(long)]
+        both: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a device camera's link (both unless --back or --front): it goes back to the AVD's
+    /// own camera.
+    Unlink {
+        device: String,
+        #[arg(long, conflicts_with = "front")]
+        back: bool,
+        #[arg(long)]
+        front: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Each linked device camera (of one device, or of every device) and its state.
+    Links {
+        device: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -703,7 +764,7 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             writeln!(out, "{}", text(&d["udid"]))?;
         }
         Cmd::Delete { device } => drop(call("delete", json!({"device": device}))?),
-        Cmd::Boot { device, timeout, env, shaped, settle, settle_timeout, settle_cpu, profile, audio } => {
+        Cmd::Boot { device, timeout, env, shaped, settle, settle_timeout, settle_cpu, profile, audio, camera_back, camera_front } => {
             let env: serde_json::Map<String, Value> =
                 env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), Value::from(v))).collect();
             let mut params = json!({"device": device, "timeout_s": timeout, "env": env, "shaped": shaped});
@@ -723,6 +784,11 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             }
             if audio {
                 params["audio"] = json!(true);
+            }
+            for (key, source) in [("camera_back", camera_back), ("camera_front", camera_front)] {
+                if let Some(source) = source {
+                    params[key] = json!(camera_source(&source));
+                }
             }
             let timed = call("boot", params)?;
             // Without settle or a profile there are no timings, only the admission (#275).
@@ -941,6 +1007,7 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
                 }
             }
         }
+        Cmd::Camera { command } => camera(command, &mut call, out, err)?,
         Cmd::Console { device, command } => lines(out, &call("console", json!({"device": device, "command": command.join(" ")}))?)?,
         Cmd::Serve { .. } | Cmd::Call { .. } | Cmd::Mcp { .. } => anyhow::bail!("`serve`, `call` and `mcp` don't run through a transport"),
         Cmd::Exec { device, env, program, args } => {
@@ -953,6 +1020,106 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
     }
     if input {
         transport.flush();
+    }
+    Ok(())
+}
+
+/// A camera source as the server should read it: an `image:` path made absolute.
+fn camera_source(source: &str) -> String {
+    match source.strip_prefix("image:") {
+        Some(path) => format!("image:{}", absolute(path)),
+        None => source.to_owned(),
+    }
+}
+
+/// `simee camera ...`: the camera methods, printed one line per source or link (or as JSON).
+fn camera(command: CameraCmd, call: &mut dyn FnMut(&str, Value) -> Result<Value>, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
+    let print_json = |out: &mut dyn Write, v: &Value| -> Result<()> { Ok(writeln!(out, "{}", serde_json::to_string_pretty(v)?)?) };
+    match command {
+        CameraCmd::Sources { kind, json } => {
+            let r = call("camera_sources", json!({"kind": kind}))?;
+            if json {
+                return print_json(out, &r);
+            }
+            let permission = &r["permission"];
+            writeln!(out, "camera permission: {}", text(&permission["status"]))?;
+            if let Some(fix) = permission["fix"].as_str() {
+                writeln!(err, "simee: {fix}")?;
+            }
+            if let Some(e) = r["cameras_error"].as_str() {
+                writeln!(err, "simee: the host's cameras can't be listed: {e}")?;
+            }
+            for s in items(&r["sources"]) {
+                let what = if s["kind"] == "synthetic" {
+                    let note = if s["supported"] == false { " (not yet)" } else { "" };
+                    format!("{}{note}", text(&s["description"]))
+                } else {
+                    let flag = if s["virtual"] == true && s["kind"] != "virtual" { ", virtual" } else { "" };
+                    format!("{} ({}{flag})", text(&s["name"]), text(&s["kind"]))
+                };
+                writeln!(out, "{:<32} {what}", text(&s["source"]))?;
+            }
+        }
+        CameraCmd::Link { device, source, back: _, front, both, json } => {
+            let facing = if both {
+                "both"
+            } else if front {
+                "front"
+            } else {
+                "back"
+            };
+            let r = call("camera_link", json!({"device": device, "facing": facing, "source": camera_source(&source)}))?;
+            if json {
+                return print_json(out, &r);
+            }
+            link_lines(out, &r["links"])?;
+            if let Some(note) = r["note"].as_str() {
+                writeln!(err, "simee: {note}")?;
+            }
+        }
+        CameraCmd::Unlink { device, back, front, json } => {
+            let facing = if back {
+                "back"
+            } else if front {
+                "front"
+            } else {
+                "both"
+            };
+            let r = call("camera_unlink", json!({"device": device, "facing": facing}))?;
+            if json {
+                return print_json(out, &r);
+            }
+            for n in items(&r["now"]) {
+                writeln!(out, "{} {}: {} (unlinked)", text(&r["device"]), text(&n["facing"]), text(&n["source"]))?;
+            }
+        }
+        CameraCmd::Links { device, json } => {
+            let r = call("camera_links", json!({"device": device}))?;
+            if json {
+                return print_json(out, &r);
+            }
+            link_lines(out, &r)?;
+        }
+    }
+    Ok(())
+}
+
+/// One line per camera link: `device facing: source [name] (state)`, the live source when it
+/// differs, and the fix when there is one.
+fn link_lines(out: &mut dyn Write, rows: &Value) -> Result<()> {
+    for l in items(rows) {
+        let mut line = format!("{} {}: {}", text(&l["device"]), text(&l["facing"]), text(&l["source"]));
+        if let Some(name) = l["name"].as_str() {
+            line.push_str(&format!(" [{name}]"));
+        }
+        line.push_str(&format!(" ({})", text(&l["state"])));
+        if let Some(live) = l["live"].as_str().filter(|live| *live != text(&l["source"])) {
+            line.push_str(&format!(", live: {live}"));
+        }
+        if let Some(fix) = l["fix"].as_str() {
+            line.push_str(&format!(": {fix}"));
+        }
+        writeln!(out, "{line}")?;
     }
     Ok(())
 }
@@ -1575,6 +1742,71 @@ mod tests {
         let (_, _, err) = outputs(&mut local, &["boot-many", "pixel", "--profile", "slim"]);
         assert!(err.expect("refused").starts_with("`boot_many` takes `profile` for iOS devices only"));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn camera_commands_link_swap_and_unlink_through_the_api() {
+        let root = android_root("camera");
+        let cameras = [("OBS-1", "OBS Virtual Camera", true), ("CAMO-1", "Camo Camera", true), ("FT-1", "FaceTime HD Camera", false)];
+        let session = android_session(&root).with_cameras(&cameras, true);
+        let mut local = Transport { local: Some(Box::new(session)), ..Transport::local() };
+        let image = "system-images;android-36;google_apis;arm64-v8a";
+        assert_eq!(outputs(&mut local, &["create", "pixel", "--platform", "android", "--system-image", image]).0, "pixel\n");
+        let saved = || std::fs::read_to_string(root.join("avd/pixel.avd/simee/cameras.ini")).unwrap_or_default();
+        // Shut down: saved for its boot.
+        assert_eq!(
+            outputs(&mut local, &["camera", "link", "pixel", "--back", "qr:hello"]),
+            ("pixel back: qr:hello (saved)\n".into(), String::new(), None)
+        );
+        // Part of a name finds the camera; it is saved by its id.
+        let (out, _, e) = outputs(&mut local, &["camera", "link", "pixel", "--front", "obs"]);
+        assert_eq!(e, None);
+        assert_eq!(out, "pixel back: qr:hello (saved)\npixel front: webcam:OBS-1 [OBS Virtual Camera] (saved)\n");
+        let (_, _, e) = outputs(&mut local, &["camera", "link", "pixel", "camera"]);
+        let e = e.expect("ambiguous");
+        assert!(
+            e.contains("matches more than one camera: OBS Virtual Camera (OBS-1), Camo Camera (CAMO-1), FaceTime HD Camera (FT-1)"),
+            "{e}"
+        );
+        assert_eq!(saved(), "back=qr:hello\nfront=webcam:OBS-1\n", "the failed link changed nothing");
+        assert_eq!(outputs(&mut local, &["camera", "links"]).0, out, "every device's links");
+        // Running: relinked live through the console, then unlinked back to the AVD's own (none).
+        let emulator = sim_android::testing::fake_emulator(&android_backend(&root), "pixel");
+        let (out, _, e) = outputs(&mut local, &["camera", "link", "pixel", "--both", "emulated"]);
+        assert_eq!(e, None);
+        assert_eq!(out, "pixel back: pattern:testcard (linked)\npixel front: pattern:testcard (linked)\n");
+        assert_eq!(outputs(&mut local, &["camera", "unlink", "pixel", "--back"]).0, "pixel back: none (unlinked)\n");
+        // The boot links first (stopped after that by an iOS-only flag: no boot wait on the fake).
+        let (_, _, e) = outputs(&mut local, &["boot", "pixel", "--camera-front", "solid:orange", "--settle"]);
+        assert!(e.expect("settle is iOS's").contains("for iOS devices only"));
+        let console: Vec<String> =
+            emulator.console.lock().expect("console").iter().filter(|c| c.starts_with("camera link")).cloned().collect();
+        assert_eq!(
+            console,
+            [
+                "camera link back pattern:testcard",
+                "camera link front pattern:testcard",
+                "camera link back none",
+                "camera link front solid:orange"
+            ]
+        );
+        assert_eq!(saved(), "front=solid:orange\n");
+        let (out, _, _) = outputs(&mut local, &["camera", "sources", "--kind", "virtual"]);
+        assert_eq!(
+            out,
+            "camera permission: authorized\nwebcam:OBS-1                     OBS Virtual Camera (virtual)\nwebcam:CAMO-1                    Camo Camera (virtual)\n"
+        );
+        assert!(outputs(&mut local, &["camera", "sources", "--kind", "synthetic"]).0.contains("qr:hello"));
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        assert!(parse(&["camera", "link", "pixel", "--back", "--front", "qr:x"]).is_err(), "one facing");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn android_backend(root: &std::path::Path) -> sim_android::Android {
+        let env = emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") };
+        let mut android = sim_android::Android::new(env);
+        android.running_dir = Some(root.join("running"));
+        android
     }
 
     #[test]

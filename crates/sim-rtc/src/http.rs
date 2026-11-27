@@ -99,8 +99,10 @@ fn connect(url: &Url, deadline: Instant) -> Result<TcpStream> {
         let left = remaining(deadline).ok_or_else(|| Error::Timeout(format!("connecting to {url}")))?;
         match TcpStream::connect_timeout(&addr, left) {
             Ok(s) => {
-                // Small requests and responses: don't wait for Nagle.
-                s.set_nodelay(true)?;
+                // Small requests and responses: don't wait for Nagle. Best effort: a socket the
+                // server already reset refuses options (see `set_timeouts`), and the write that
+                // follows reports the reset as it is.
+                let _ = s.set_nodelay(true);
                 return Ok(s);
             }
             Err(e) => last = Some(e),
@@ -137,10 +139,18 @@ fn remaining(deadline: Instant) -> Option<Duration> {
     deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())
 }
 
+/// Bounds reads and writes by what is left of the deadline.
+///
+/// A socket the server has reset takes no options: macOS's `setsockopt` fails with EINVAL (Linux
+/// accepts them). A server that replies and closes without reading the whole request (an early
+/// error, or a body that arrived after it stopped reading) resets the connection, yet its reply
+/// is still there to read. So a failure to set a timeout is left to the read or write that
+/// follows, which can't block on a reset socket: a read returns what the server sent, then the
+/// reset. Any timeout set before still holds.
 fn set_timeouts(stream: &TcpStream, deadline: Instant) -> Result<()> {
     let left = remaining(deadline).ok_or_else(|| Error::Timeout("HTTP request".into()))?;
-    stream.set_read_timeout(Some(left))?;
-    stream.set_write_timeout(Some(left))?;
+    let _ = stream.set_read_timeout(Some(left));
+    let _ = stream.set_write_timeout(Some(left));
     Ok(())
 }
 
@@ -187,7 +197,8 @@ impl Reader {
             return Err(ReadError::Protocol("response too large".into()));
         }
         let left = remaining(self.deadline).ok_or(ReadError::Timeout)?;
-        self.stream.set_read_timeout(Some(left)).map_err(ReadError::Io)?;
+        // Fails only on a reset socket, whose read can't block (see `set_timeouts`).
+        let _ = self.stream.set_read_timeout(Some(left));
         // What was consumed is dead weight: drop it so the buffer holds only the unread tail.
         if self.pos > 0 {
             self.buf.drain(..self.pos);
@@ -344,11 +355,61 @@ mod tests {
                 let n = s.read(&mut chunk).expect("read");
                 req.extend_from_slice(&chunk[..n]);
             }
-            let text = String::from_utf8_lossy(&req).into_owned();
+            // The body too: closing with request bytes unread would reset the connection.
+            let end = find(&req, b"\r\n\r\n").expect("head") + 4;
+            let text = String::from_utf8_lossy(&req[..end]).into_owned();
+            let length =
+                text.lines().find_map(|l| l.strip_prefix("Content-Length: ")).and_then(|n| n.trim().parse::<usize>().ok()).unwrap_or(0);
+            while req.len() < end + length {
+                let n = s.read(&mut chunk).expect("read");
+                assert!(n > 0, "the client closed inside the body");
+                req.extend_from_slice(&chunk[..n]);
+            }
             s.write_all(reply).expect("write");
-            text
+            String::from_utf8_lossy(&req).into_owned()
         });
         (Url::parse(&format!("http://127.0.0.1:{port}/p?q=1")).expect("url"), handle)
+    }
+
+    /// A server that replies without reading the request's body resets the connection when it
+    /// closes. macOS then refuses socket options (EINVAL), which used to fail the request although
+    /// the whole reply had arrived: the flake behind this test's CI failure on PR kaeawc/simee#309.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_reply_from_a_server_that_reset_the_connection_is_still_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            // The head a byte at a time, so the body is never read with it.
+            let mut req = Vec::new();
+            let mut byte = [0u8; 1];
+            while !req.ends_with(b"\r\n\r\n") {
+                s.read_exact(&mut byte).expect("read");
+                req.push(byte[0]);
+            }
+            // Wait until the body is in the socket, leave it unread, reply and close: a reset.
+            while s.peek(&mut [0u8; 1]).expect("peek") == 0 {}
+            s.write_all(b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 5\r\n\r\nlarge").expect("write");
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        client.write_all(b"POST /p HTTP/1.1\r\nContent-Length: 3\r\n\r\n").expect("head");
+        client.write_all(b"v=0").expect("body");
+        server.join().expect("server");
+        // The reset has landed once the socket refuses options.
+        let until = Instant::now() + Duration::from_secs(2);
+        while client.set_nodelay(true).is_ok() {
+            assert!(Instant::now() < until, "the server's close never reset the connection");
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        set_timeouts(&client, deadline).expect("timeouts on a reset socket");
+        let mut reader = Reader { stream: client, buf: Vec::new(), pos: 0, deadline, eof: false, total: 0 };
+        let head = reader.read_head().ok().expect("the reply's head");
+        let mut response = parse_head(&head).expect("head");
+        response.body = reader.read_body(&response).ok().expect("the reply's body");
+        assert_eq!((response.status, response.text().as_str()), (413, "large"));
     }
 
     #[test]

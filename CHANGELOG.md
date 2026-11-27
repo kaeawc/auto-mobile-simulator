@@ -6,12 +6,26 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ## [Unreleased]
 
+### Added
+
+- simee's mark, a cut emerald, drawn from one description in `sim_core::mark` (its cut, light,
+  colours and motion states): the macOS app icon (`.icns`), favicon, menu bar template, PNGs and
+  SVGs in `assets/brand/` (`scripts/brand.sh` redraws them), and in the desktop window the
+  activity indicator beside a running job, each device's state in the list and the empty stage.
+  `scripts/desktop-app.sh` bundles the window as `simee.app` with its icon.
+
 ### Changed
 
 - The iPhone Duo is iOS's foldable: `form_factors` lists (iOS, foldable) as supported with the
   Duo's reference profile (2853×2007 unfolded, 1398×2034 folded, @3x), its devices and device type
   report `form_factor: foldable`, and `create --form-factor foldable` takes an iPhone Duo. Rotation,
   CarPlay's form factor check and the desktop's edge gestures treat it as the iPhone it is.
+
+### Fixed
+
+- `simee-rtc` on macOS: a WHIP server that replies and then resets the connection (an early
+  error, or a request body it didn't read) no longer fails the request with "Invalid argument";
+  its reply is read.
 
 ## [0.2.0] - 2026-11-27
 

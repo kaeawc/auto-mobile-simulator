@@ -132,7 +132,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `EmulatorMessage` codec, property names and values), `network.rs` (the stock console's
   `network speed|delay` presets, parsing and `network status` report), `framebuffer.rs` (which
   framebuffer port is an Apple device's main display), BGRA→RGBA conversion,
-  `Frame` and PNG encoding. No FFI.
+  `Frame` and PNG encoding, `mark/` (the simee mark: the cut, its light, colours and motion
+  states, a seam-free rasterizer and every file in `assets/brand/`; `docs/design/brand.md`). No FFI.
 - `crates/sim-coresim` — the service boundary: `Context` (service + device set), `Device`
   (lifecycle, apps, settings, orientation, CarPlay), `Display` (framebuffer surface, capture; main
   or external), `Hid` (touch, buttons, keyboard, the Digital Crown, watch gestures, the Siri
@@ -217,7 +218,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
 - `desktop/` — Rune app, one window for both platforms: `device.rs` (the live iOS device facade; a
   stub where there's no simulator service, so the window builds and tests on Linux), `ios.rs`
   (live iOS device, capture thread; macOS), `surface.rs` (zero-copy IOSurface bridge; macOS),
-  `android.rs` (live Android device: frames and input over `display.sock`), `controls.rs` (the
+  `android.rs` (live Android device: frames and input over `display.sock`), `mark.rs` (the mark
+  drawn live: the activity indicator and each device's state), `controls.rs` (the
   toolbar each platform and form factor gets), `debug.rs` (debug panel: tabs, API worker thread, views), `icons.rs` (SVG
   icons), `keys.rs` (host keys → HID), `view.rs`, `main.rs` (state, actions, poll, tests).
   Headless `--snap` works in debug builds, and in release with the `tooling` feature (Rune's
@@ -232,7 +234,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   plus each page's static HTML); deployed to Fly by `.github/workflows/website.yml`. `media/` is
   the live demo's MediaMTX relay on Fly (`website-media.yml`), fed by `scripts/live-demo.sh`. Its copy carries no number of its own:
   measured claims come from the README and docs. Docs: `website/README.md`.
-- `scripts/` — `parity.sh`, `ios-matrix.sh` (every iOS feature on one device: the
+- `scripts/` — `brand.sh` (redraws `assets/brand/` from `sim_core::mark`), `desktop-app.sh` (the
+  desktop as `simee.app` with its icon), `parity.sh`, `ios-matrix.sh` (every iOS feature on one device: the
   `docs/ios-versions.md` table), `automobile-harness.sh`, `automobile-farm.sh` (every device through
   one private AutoMobile daemon; `automobile-daemon.sh` starts, joins and stops it, and the
   harnesses join it through `AM_DAEMON_ENV`), `pf-shape.sh` (pf/dummynet, needs sudo);

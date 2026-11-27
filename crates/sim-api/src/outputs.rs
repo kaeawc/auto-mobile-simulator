@@ -52,6 +52,11 @@ const DEFS: &[(&str, &str)] = &[
             fold: {angle: number, folded_width: number, folded_height: number}|null, inputs: [string]}"#,
     ),
     ("store", "{id: string, kind: string, name: string, bundle_id: string, platform: string}"),
+    (
+        "camera_link",
+        r#"{device: string, platform: string, facing: "back"|"front", source: string, name?: string, live?: string|null,
+            state: "linked"|"saved"|"relinked"|"unsaved"|"off"|"source missing"|"permission missing", fix?: string}"#,
+    ),
     ("prefs_change", r#"store: string, visible: "now"|"after_relaunch", app: "untouched"|"stopped"|"relaunched", note?: string"#),
     ("frame", "{address: string, symbol: string, image?: string, source?: string}"),
     (
@@ -248,6 +253,19 @@ pub const OUTPUTS: &[(&str, &str)] = &[
             error?: string}",
     ),
     ("audio_mute", "{muted: boolean}"),
+    (
+        "camera_sources",
+        "{permission: {status: string, fix: string|null}, sources: [{source: string, name: string, kind: string, virtual: boolean,
+            manufacturer?: string|null, model?: string|null, transport?: string|null, formats?: [object], description?: string,
+            supported?: boolean}], cameras_error?: string}",
+    ),
+    ("camera_link", r#"{device: string, applied: "live"|"at_boot", links: [@camera_link], name?: string, note?: string}"#),
+    (
+        "camera_unlink",
+        r#"{device: string, unlinked: [string], now: [{facing: string, source: string}], applied: "live"|"at_boot",
+            links: [@camera_link]}"#,
+    ),
+    ("camera_links", "[@camera_link]"),
     ("network_env", "{*: string}"),
     ("console", "[string]"),
     ("rotate", "null|{orientation: string}"),

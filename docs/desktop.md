@@ -12,6 +12,11 @@ cargo run -- --snap shot.png --scene demo   # headless render; scenes: demo, and
 cargo run --release --features tooling -- --snap shot.png --scene demo   # the same, optimized
 ```
 
+`scripts/desktop-app.sh` builds the window as `simee.app`, a macOS bundle with simee's icon, so
+the Dock and Finder show the mark. The mark in the window ([brand.md](design/brand.md)) is the
+activity indicator: it turns beside a running job and on the empty stage while a device boots, and
+each device in the list shows its state with it.
+
 The window draws with Rune's native Metal backend. `SIMEE_GPU_BACKEND=wgpu` switches it to wgpu's
 Metal backend, which the 3D device view needs, and `metal` chooses the default. The window looks
 and behaves the same on both, but wgpu costs a little more:

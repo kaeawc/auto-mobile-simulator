@@ -1205,6 +1205,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "font8x8"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
+
+[[package]]
 name = "fontique"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2849,6 +2855,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
+name = "qrcodegen"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4339fc7a1021c9c1621d87f5e3505f2805c8c105420ba2f2a4df86814590c142"
+
+[[package]]
 name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3575,6 +3587,7 @@ dependencies = [
  "serde_json",
  "simee-android",
  "simee-audio",
+ "simee-camera",
  "simee-core",
  "simee-coresim",
  "simee-debug",
@@ -3603,6 +3616,23 @@ dependencies = [
  "serde_json",
  "simee-core",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "simee-camera"
+version = "0.2.0"
+dependencies = [
+ "block2 0.6.2",
+ "font8x8",
+ "libc",
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
+ "png 0.18.1",
+ "qrcodegen",
+ "serde",
+ "simee-core",
+ "thiserror 2.0.21",
+ "zune-jpeg",
 ]
 
 [[package]]

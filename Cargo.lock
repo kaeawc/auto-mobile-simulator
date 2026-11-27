@@ -1929,6 +1929,7 @@ dependencies = [
  "serde_json",
  "simee-android",
  "simee-audio",
+ "simee-camera",
  "simee-core",
  "simee-coresim",
  "simee-debug",

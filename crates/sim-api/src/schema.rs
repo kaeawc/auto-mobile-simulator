@@ -50,6 +50,8 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         // mem_* (and launch's stack logging for them)
         "address" => Str,
         "raw" | "malloc_stack_logging" => Bool,
+        // camera_* and boot's camera links (#323)
+        "facing" | "source" | "kind" | "camera_back" | "camera_front" => Str,
         // boot, boot_many, create and clone's admission, and admission_check (#275)
         "admission" => Str,
         "admission_timeout_s" | "count" => Int,
