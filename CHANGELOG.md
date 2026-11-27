@@ -16,6 +16,10 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   device and to simee itself (#274).
 - `simee-rtc`, a new crate: a WebRTC publisher written in Rust on str0m that sends H.264 over
   WHIP, and feeds PLI and bitrate requests back to the encoder (#264).
+- `simee-encode`, a new crate: an H.264 encoder on macOS VideoToolbox that takes device frames
+  directly. iOS frames are encoded with no copy, and Android frames are copied once. Encoding is
+  paced by the device's own frames, keyframes are sent on request, and output is Annex B (#263;
+  there is no Linux encoder yet).
 - macOS support matrix: each feature has a minimum macOS version, simee gives a clear error below
   it, and `simee doctor` reports where the host stands (#238).
 - Desktop: orbit, pan and zoom the 3D device view, a 1:1 face-on view, saved views, and flip and
