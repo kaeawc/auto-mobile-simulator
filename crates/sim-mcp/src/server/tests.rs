@@ -696,6 +696,52 @@ fn per_call_us(mut f: impl FnMut()) -> f64 {
 /// request through the server (dispatch to a worker, reply through the sink).
 ///     cargo test --release -p simee-mcp tool_call_overhead -- --ignored --nocapture
 #[test]
+fn prompts_are_listed_and_got_in_every_revision() {
+    let get = json!({"name": "find-slowness", "arguments": {"device": "phone"}});
+    let check = |list: &Value, got: &Value, missing: &Value, titles: bool, label: &str| {
+        let prompts = list["result"]["prompts"].as_array().unwrap_or_else(|| panic!("{label}: {list}"));
+        assert_eq!(prompts.len(), crate::prompts::PROMPTS.len(), "{label}");
+        assert_eq!(prompts[0].get("title").is_some(), titles, "{label}");
+        let text = got["result"]["messages"][0]["content"]["text"].as_str().unwrap_or_else(|| panic!("{label}: {got}"));
+        assert!(text.contains("`processes` {device: \"phone\"}") && text.contains("This server serves all of them."), "{label}");
+        assert_eq!(missing["error"]["code"], rpc::INVALID_PARAMS, "{label}");
+        assert_eq!(missing["error"]["data"]["missing"], json!(["device"]), "{label}");
+    };
+    let rig = Rig::new();
+    let discover = rig.modern("server/discover", json!({}));
+    assert_eq!(discover["result"]["capabilities"]["prompts"], json!({"listChanged": false}));
+    let list = rig.modern("prompts/list", json!({}));
+    assert_eq!((list["result"]["resultType"].clone(), list["result"]["cacheScope"].clone()), (json!("complete"), json!("public")));
+    let got = rig.modern("prompts/get", get.clone());
+    assert_eq!(got["result"]["resultType"], "complete");
+    check(&list, &got, &rig.modern("prompts/get", json!({"name": "find-slowness"})), true, MODERN);
+    assert_eq!(rig.modern("prompts/list", json!({"cursor": "junk"}))["error"]["code"], rpc::INVALID_PARAMS);
+    for version in LEGACY {
+        let rig = Rig::new();
+        let id = rig.send_raw("initialize", json!({"protocolVersion": version, "capabilities": {}}));
+        let init = rig.response(id);
+        assert_eq!(init["result"]["capabilities"]["prompts"], json!({"listChanged": false}), "{version}");
+        let id = rig.send_raw("prompts/list", json!({}));
+        let list = rig.response(id);
+        assert_eq!(list["result"].get("ttlMs"), None, "{version}");
+        let id = rig.send_raw("prompts/get", get.clone());
+        let got = rig.response(id);
+        let id = rig.send_raw("prompts/get", json!({"name": "find-slowness", "arguments": {}}));
+        check(&list, &got, &rig.response(id), *version != "2025-03-26", version);
+    }
+}
+
+#[test]
+fn a_prompt_says_which_of_its_tools_this_server_lacks() {
+    let rig = Rig::serving(Toolsets::default());
+    let arguments = json!({"app_path": "/a.app", "form_factors": "phone,tablet"});
+    let got = rig.modern("prompts/get", json!({"name": "across-form-factors", "arguments": arguments}));
+    let text = got["result"]["messages"][0]["content"]["text"].as_str().expect("text");
+    assert!(text.contains("and not `form_factors`, `create`, `boot_many`:"), "{text}");
+    assert!(text.contains("SIMEE_MCP_TOOLSETS=core,lifecycle (or all)"), "{text}");
+}
+
+#[test]
 #[ignore = "benchmark"]
 fn tool_call_overhead() {
     let backend: Arc<dyn Backend> = Arc::new(crate::ApiBackend::new());
