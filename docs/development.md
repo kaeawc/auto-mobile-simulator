@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- macOS on Apple silicon to run devices: Xcode (`xcode-select -p`, or `DEVELOPER_DIR`) with at
+- macOS on Apple silicon to run devices (versions per feature: [Support matrix](#support-matrix)): Xcode (`xcode-select -p`, or `DEVELOPER_DIR`) with at
   least one simulator runtime for iOS; for Android, an SDK system image (`emu -provision` fetches
   one, no Java needed).
   Xcode 26 and 27 both work, and several can be installed side by side: `DEVELOPER_DIR` picks one
@@ -14,6 +14,64 @@
 - Rust 1.99.1 (pinned in `rust-toolchain.toml`).
 - On Linux the shared core, the API, the CLI and the desktop window build and test (CI runs them
   there); there are no devices to run, since both runtimes need macOS.
+
+## Support matrix
+
+`simee doctor` (`--json` for the same as JSON) checks this host against the table below. It
+prints the chip, the macOS and Xcode versions, whether Hypervisor.framework is available
+(`kern.hv_support`) and whether `emu` is signed with the hypervisor entitlement, the host's thermal
+and power state (the `host` method), and which features are on or off and why. `emu` checks the
+Android rows when it starts: below the Android floor it refuses to boot and names the floor, and it
+prints a line for each optional feature that is off. The table is `sim_core::support::FLOORS`; a
+test fails if a row here goes missing.
+
+**Chips.** Apple silicon, M1 and later, is supported. Intel Macs are not yet: iOS on Intel is
+planned in [#241](https://github.com/kaeawc/simee/issues/241) and Android on Intel (x86_64 images)
+in [#242](https://github.com/kaeawc/simee/issues/242). Every macOS release that runs on Apple
+silicon runs on M1, so a feature's floor is the same on every Apple silicon chip.
+
+| Feature | Id | macOS | What sets the floor | Below it |
+| --- | --- | --- | --- | --- |
+| iOS simulator devices | `ios` | Xcode's own floor | Xcode with a simulator runtime | no iOS devices |
+| iOS audio capture and mute | `audio_capture` | 14.2 | the Core Audio process tap, `AudioHardwareCreateProcessTap` | `audio_capture` and `audio_mute` fail with "needs macOS 14.2" |
+| Android emulator (`emu`) | `android` | 15.0 | the in-kernel GICv3, `hv_gic_create` (emu has no userspace GIC) | `emu` refuses to boot with "needs macOS 15" |
+| 4 KiB guest memory granule | `granule_4k` | 26.0 | `hv_vm_config_set_ipa_granule` | guest memory is mapped in 16 KiB pages, so host-visible GPU memory the guest maps at 4 KiB offsets can't be; `emu` says which granule it got |
+
+Where each floor comes from:
+
+- `AudioHardwareCreateProcessTap` is `API_AVAILABLE(macos(14.2))` in the macOS 26.5 SDK's
+  `CoreAudio/AudioHardwareTapping.h`, and Apple's reference lists macOS 14.2
+  ([AudioHardwareCreateProcessTap](https://developer.apple.com/documentation/coreaudio/audiohardwarecreateprocesstap(_:_:))).
+  The audio helper (`crates/sim-audio/native/simaudio.swift`) marks its tap `@available(macOS 14.2, *)`
+  and answers an error naming the floor before it; `sim-audio` checks the floor before it builds the
+  helper.
+- Every `hv_gic_*` function emu calls is `API_AVAILABLE(macos(15.0))` in the SDK's
+  `Hypervisor/hv_gic*.h`, and Apple's reference lists macOS 15.0
+  ([hv_gic_create](https://developer.apple.com/documentation/hypervisor/hv_gic_create(_:))).
+- `hv_vm_config_set_ipa_granule` and `HV_IPA_GRANULE_4KB` are `API_AVAILABLE(macos(26.0))` in
+  `Hypervisor/hv_vm_config.h`, and Apple's reference lists macOS 26.0
+  ([hv_vm_config_set_ipa_granule](https://developer.apple.com/documentation/hypervisor/hv_vm_config_set_ipa_granule(_:_:))).
+- The VM configuration (`hv_vm_config_create`, the IPA size) is macOS 13.0
+  ([hv_vm_config_create](https://developer.apple.com/documentation/hypervisor/hv_vm_config_create())),
+  below the Android floor.
+- emu-hvf links only the Hypervisor.framework functions every Apple silicon macOS has and looks the
+  newer ones up at run time (`crates/emu-hvf/src/ffi.rs`): a linked function the framework lacks
+  stops dyld from loading the binary, so emu would exit before `main` on an older macOS instead of
+  naming what it needs. emu also links CoreAudio weakly (`apps/emu/build.rs`), because cpal imports
+  the macOS 14.2 process tap functions; below macOS 15 emu exits at startup, before any audio code.
+  `scripts/check-imports.sh` (run by `scripts/check.sh` on macOS) fails if a release `emu` or
+  `simee` strongly imports a symbol newer than macOS 11.0.
+
+**Xcode.** simee is tested with Xcode 26 and 27 (the SimulatorKit path change between them is
+under Requirements); `simee doctor` marks an older Xcode "unverified". Apple's
+[Xcode system requirements](https://developer.apple.com/xcode/system-requirements/): Xcode 26.0 to
+26.3 need macOS 15.6, Xcode 26.4 and later need macOS 26.2, and Xcode 27 needs macOS 26.6. So the
+tested iOS floor is macOS 15.6 with Xcode 26.3 or earlier.
+
+**Unverified.** Every floor above is read from the SDK headers and Apple's documentation, and is
+exercised only on macOS 26 (M3 Max). No host below a floor has run simee: the macOS 14 and 15
+behaviour (the audio helper's error, emu's refusal, the 16 KiB granule) is the code's, not yet
+observed; nor has M1 or M2 hardware run it.
 
 
 Build and check commands, the working rules and the code map are in [AGENTS.md](../AGENTS.md).

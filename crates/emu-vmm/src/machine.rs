@@ -448,6 +448,10 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         bail!("cpus must be in 1..=16 (got {})", cfg.cpus);
     }
     let vm = Vm::new().context("creating the VM (is the binary signed with com.apple.security.hypervisor?)")?;
+    if cfg.launched.is_some() {
+        let why = if vm.granule_kib() == 4 { "" } else { " (4 KiB needs macOS 26: hv_vm_config_set_ipa_granule)" };
+        eprintln!("emu: guest memory granule {} KiB{why}", vm.granule_kib());
+    }
     let mem = Arc::new(GuestRam::new(RAM_BASE, cfg.ram_bytes)?);
     vm.map_ram(&mem)?;
     let gic = vm.create_gic(GIC_DIST_BASE, GIC_REDIST_BASE)?;

@@ -94,7 +94,15 @@ measured yet: [docs/benchmarks.md](docs/benchmarks.md). The full comparison:
 ## Quick start
 
 Needs macOS on Apple silicon, Rust (pinned in `rust-toolchain.toml`) and, for iOS, Xcode with a
-simulator runtime.
+simulator runtime. `simee doctor` says what this Mac can run and why.
+
+| | Apple silicon (M1 and later) | Intel |
+| --- | --- | --- |
+| iOS devices | Xcode 26 or 27 (macOS 15.6+) | planned ([#241](https://github.com/kaeawc/simee/issues/241)) |
+| iOS audio capture and mute | macOS 14.2+ | planned |
+| Android devices (`emu`) | macOS 15+; 4 KiB guest memory pages on macOS 26+ | planned ([#242](https://github.com/kaeawc/simee/issues/242)) |
+
+Tested on macOS 26; the floors and their sources: [docs/development.md](docs/development.md#support-matrix).
 
 ```bash
 cargo build && alias simee=target/debug/simee
@@ -126,7 +134,8 @@ Unsupported combinations are refused with the reason. The matrix and its gaps:
 
 ## Not yet
 
-- iOS needs an Apple silicon Mac. Android runs on Apple silicon, and on x86_64 Linux in software
+- iOS needs an Apple silicon Mac (Intel: [#241](https://github.com/kaeawc/simee/issues/241)). Android
+  runs on Apple silicon (Intel: [#242](https://github.com/kaeawc/simee/issues/242)), and on x86_64 Linux in software
   mode (x86_64 images; slow frames, see above). KVM on Linux is in progress
   ([#54](https://github.com/kaeawc/simee/issues/54)).
 - No Android snapshots, so every boot is a full boot.

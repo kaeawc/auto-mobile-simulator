@@ -10,7 +10,11 @@ alias simee=target/debug/simee
 simee list                                   # every device, grouped by runtime, labelled
 simee list --platform android --form-factor watch
 simee form-factors
+simee doctor                                 # chip, macOS, Xcode, hypervisor; each feature on or off and why (--json)
 ```
+
+`doctor` isn't an API method: it reads this host itself (and the `host`
+method for thermal and power) against the [support matrix](development.md#support-matrix).
 
 ## iOS
 

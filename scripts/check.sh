@@ -98,6 +98,10 @@ if cargo nextest --version >/dev/null 2>&1; then
 else
   step tests cargo test --workspace --quiet
 fi
+# A strong import newer than macOS 11.0 stops dyld from loading emu or simee on older macOS.
+if [[ $(uname -s) == Darwin ]]; then
+  step "release imports" bash -c 'cargo build --release --quiet -p simee-emu -p simee && scripts/check-imports.sh'
+fi
 # The desktop is its own workspace with a large dependency (Rune): only when it changed. CI builds
 # it on every pull request, which catches a shared crate's change breaking it.
 if [[ $mode != quick ]] && touches '^desktop/'; then
