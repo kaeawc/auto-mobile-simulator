@@ -4,7 +4,7 @@
 # robots.txt, sitemap.xml and llms.txt. Serve dist/ with any static host; the Dockerfile serves
 # it on Fly.
 #
-#   website/scripts/build.sh                 # production: https://simee-web.fly.dev
+#   website/scripts/build.sh                 # production: https://simee.fly.dev
 #   website/scripts/build.sh --dev           # quicker, larger wasm; noindex everywhere
 #   SIMEE_WEB_ORIGIN=https://simee.dev website/scripts/build.sh
 #
@@ -14,7 +14,7 @@ set -euo pipefail
 site=$(cd "$(dirname "$0")/.." && pwd)
 repo=$(cd "$site/.." && pwd)
 out=${OUT:-$site/dist}
-origin=${SIMEE_WEB_ORIGIN:-https://simee-web.fly.dev}
+origin=${SIMEE_WEB_ORIGIN:-https://simee.fly.dev}
 # The live demo's relay (website/media), which /demos/ plays from.
 media=${SIMEE_WEB_MEDIA_ORIGIN:-https://simee-media.fly.dev}
 dev=false

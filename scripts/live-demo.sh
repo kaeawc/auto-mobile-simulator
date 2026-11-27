@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The website's live demo: streams running Android devices to the demo relay (website/media) so
-# https://simee-web.fly.dev/demos/ plays them. One device under emu and one under the SDK's
+# https://simee.fly.dev/demos/ plays them. One device under emu and one under the SDK's
 # emulator, the same AVD, give the side-by-side; either alone works.
 #
 #   SIMEE_MEDIA_PASS=... scripts/live-demo.sh --emu emulator-5554 --sdk emulator-5556

@@ -47,7 +47,7 @@ exported HTML switches only styles with `@media`.
 
 ## Hosting and deploys
 
-Fly app `simee-web`, served at https://simee-web.fly.dev: Caddy serving `dist/` (`Dockerfile`,
+Fly app `simee`, served at https://simee.fly.dev: Caddy serving `dist/` (`Dockerfile`,
 `Caddyfile`, `fly.toml`). `.github/workflows/website.yml` builds and tests on every pull request
 that touches what the site reads, and on a push to main deploys with `flyctl deploy` using the
 `FLY_API_TOKEN` secret of the `website` environment. Nothing builds on Fly; the image is Caddy
@@ -56,8 +56,8 @@ plus the files Actions built.
 One-time setup, by someone with access to the Fly organization and the repository:
 
 ```bash
-fly apps create simee-web
-fly tokens create deploy -a simee-web -x 8760h | gh secret set FLY_API_TOKEN --env website -R kaeawc/simee
+fly apps create simee
+fly tokens create deploy -a simee -x 8760h | gh secret set FLY_API_TOKEN --env website -R kaeawc/simee
 ```
 
 A deploy token is scoped to that one app, so the secret can't touch anything else in the Fly
@@ -66,9 +66,9 @@ exists, a push to main builds the site and the deploy job passes with a notice t
 nothing. To deploy without waiting for a push, run the workflow by hand (Actions, Website, Run
 workflow) or `cd website && scripts/build.sh && fly deploy --remote-only`.
 
-To serve a custom domain: `fly certs add <domain> -a simee-web`, point the domain's DNS at the
+To serve a custom domain: `fly certs add <domain> -a simee`, point the domain's DNS at the
 app as `fly certs show` says, then set the repository variable `SIMEE_WEB_ORIGIN` to
 `https://<domain>` so canonical URLs, the sitemap and social cards name it.
 
-Check an image before deploying: `docker build -t simee-web website && docker run --rm -p 8080:8080
-simee-web`, then http://localhost:8080 (WebGPU works on localhost).
+Check an image before deploying: `docker build -t simee website && docker run --rm -p 8080:8080
+simee`, then http://localhost:8080 (WebGPU works on localhost).

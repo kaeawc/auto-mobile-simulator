@@ -31,7 +31,7 @@ permissions:
 env:
   # Canonical URLs, the sitemap and social cards name this origin. Set the repository variable
   # SIMEE_WEB_ORIGIN when the site moves to its own domain.
-  SIMEE_WEB_ORIGIN: ${{ vars.SIMEE_WEB_ORIGIN || 'https://simee-web.fly.dev' }}
+  SIMEE_WEB_ORIGIN: ${{ vars.SIMEE_WEB_ORIGIN || 'https://simee.fly.dev' }}
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10

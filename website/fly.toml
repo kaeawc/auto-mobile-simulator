@@ -1,6 +1,6 @@
 # The public website: static files from website/dist behind Caddy. Deployed by
 # .github/workflows/website.yml on pushes to main; see website/README.md.
-app = "simee-web"
+app = "simee"
 primary_region = "iad"
 
 [build]
