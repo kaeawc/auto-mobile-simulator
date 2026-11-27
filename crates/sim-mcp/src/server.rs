@@ -376,7 +376,7 @@ impl Inner {
         let version = LEGACY.iter().find(|v| **v == requested).unwrap_or(&LEGACY[0]);
         *lock(&self.legacy) = Some((params.get("capabilities").cloned().unwrap_or(Value::Null), version));
         json!({"protocolVersion": version,
-            "capabilities": {"tools": {}, "resources": {"subscribe": true, "listChanged": true}, "prompts": {"listChanged": false}},
+            "capabilities": {"tools": {}, "resources": {"subscribe": true}, "prompts": {"listChanged": false}},
             "serverInfo": server_info(), "instructions": INSTRUCTIONS})
     }
 
@@ -409,20 +409,20 @@ impl Inner {
             "server/discover" => reply(Ok(self.discover())),
             "tools/list" => reply(Ok(cacheable(json!({"tools": tools::list(&self.toolsets, &ctx)}), STATIC_TTL_MS, "public"))),
             "resources/templates/list" => {
-                reply(Ok(cacheable(json!({"resourceTemplates": resources::templates()}), STATIC_TTL_MS, "public")));
+                reply(Ok(cacheable(json!({"resourceTemplates": resources::templates(&self.toolsets)}), STATIC_TTL_MS, "public")));
             }
             "tools/call" => self.tools_call(id.clone(), &params, &ctx),
             "prompts/list" => reply(prompts::list(&params, &ctx).map(|page| cacheable(page, STATIC_TTL_MS, "public"))),
             "prompts/get" => reply(prompts::get(&params, &self.toolsets)),
-            "resources/list" => {
-                self.offload(id.clone(), ctx.clone(), |i| Ok(cacheable(json!({"resources": resources::list(&*i.backend)}), 0, "private")))
-            }
+            "resources/list" => self.offload(id.clone(), ctx.clone(), |i| {
+                Ok(cacheable(json!({"resources": resources::list(&*i.backend, &i.toolsets)}), 0, "private"))
+            }),
             "resources/read" => match params.get("uri").and_then(Value::as_str) {
                 Some(uri) => {
                     let uri = uri.to_owned();
                     let era = ctx.era;
                     self.offload(id.clone(), ctx.clone(), move |i| {
-                        resources::read(&*i.backend, &uri)
+                        resources::read(&*i.backend, &i.toolsets, &uri)
                             .map(|contents| cacheable(json!({"contents": contents}), 0, "private"))
                             .map_err(|error| rpc::for_era(error, era))
                     });
@@ -530,8 +530,11 @@ impl Inner {
         if !task_ids.is_empty() && !ctx.has_extension(EXT_TASKS) {
             return Err(rpc::missing_extension(EXT_TASKS));
         }
-        let uris: Vec<String> = strings(&filter, "resourceSubscriptions").into_iter().filter(|u| resources::parse(u).is_some()).collect();
-        let list_changed = filter["resourcesListChanged"] == true;
+        // What isn't ours, or reads through a tool this server doesn't serve, isn't acknowledged.
+        let uris: Vec<String> =
+            strings(&filter, "resourceSubscriptions").into_iter().filter(|u| resources::check(u, &self.toolsets).is_ok()).collect();
+        // The list is of devices, which a server without `devices` doesn't say.
+        let list_changed = filter["resourcesListChanged"] == true && self.toolsets.contains("devices");
         let sink = self.sink.clone();
         let acknowledge = {
             let (sink, id, uris) = (sink.clone(), id.clone(), uris.clone());
@@ -573,18 +576,15 @@ impl Inner {
     /// A legacy client's `resources/subscribe` and `resources/unsubscribe`.
     fn legacy_subscription(self: &Arc<Self>, method: &str, params: &Value) -> Result<Value, RpcError> {
         let uri = params.get("uri").and_then(Value::as_str).ok_or_else(|| RpcError::invalid_params("`uri` is required"))?;
-        if resources::parse(uri).is_none() {
-            return Err(rpc::for_era(RpcError::invalid_params("Resource not found").with_data(json!({"uri": uri})), Era::Legacy));
-        }
+        resources::check(uri, &self.toolsets).map_err(|error| rpc::for_era(error, Era::Legacy))?;
         let mut subscribed = lock(&self.subscribed);
         if method == "resources/subscribe" {
             subscribed.uris.insert(uri.to_owned());
         } else {
             subscribed.uris.remove(uri);
         }
-        // An older client has no way to ask for `list_changed`, so its subscribing to anything is
-        // the ask: it is watched while some subscription is.
-        let spec = Spec { uris: subscribed.uris.iter().cloned().collect(), list_changed: !subscribed.uris.is_empty() };
+        // An older client has no way to ask for `list_changed` (and isn't told it is offered).
+        let spec = Spec { uris: subscribed.uris.iter().cloned().collect(), list_changed: false };
         if spec.uris.is_empty() {
             subscribed.watcher = None;
         } else if let Some(watcher) = &subscribed.watcher {

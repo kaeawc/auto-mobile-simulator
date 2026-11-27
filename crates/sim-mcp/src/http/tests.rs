@@ -940,7 +940,7 @@ fn the_router_puts_the_clients_ids_back() {
     }
     // Progress for no request, and messages with no route, go nowhere; the rest go to the session.
     let standalone: Standalone = Mutex::new(None);
-    let (tx, rx) = channel();
+    let (tx, rx) = sync_channel(STANDALONE_QUEUE);
     *lock(&standalone) = Some((0, tx));
     router.deliver(
         r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"h99","progress":1}}"#.into(),
@@ -951,6 +951,27 @@ fn the_router_puts_the_clients_ids_back() {
     let Ok(Out::Note(note)) = rx.try_recv() else { panic!("the update") };
     assert!(note.contains("resources/updated"));
     assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn a_get_stream_nobody_reads_queues_a_bounded_number_and_never_blocks_the_sender() {
+    let router = Router::default();
+    let standalone: Standalone = Mutex::new(None);
+    let (tx, rx) = sync_channel(STANDALONE_QUEUE);
+    *lock(&standalone) = Some((0, tx));
+    // A screen at 30 frames a second for a client that stopped reading: more than the queue holds,
+    // and every `deliver` returns at once.
+    for n in 0..STANDALONE_QUEUE * 3 {
+        let line = json!({"jsonrpc": "2.0", "method": "notifications/resources/updated", "params": {"uri": format!("u{n}")}});
+        router.deliver(line.to_string(), Some(&standalone));
+    }
+    let queued: Vec<String> =
+        std::iter::from_fn(|| rx.try_recv().ok()).filter_map(|o| if let Out::Note(n) = o { Some(n) } else { None }).collect();
+    assert_eq!(queued.len(), STANDALONE_QUEUE);
+    assert!(queued[0].contains("\"u0\""), "the oldest are kept");
+    // Once read, it takes more.
+    router.deliver(r#"{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"later"}}"#.into(), Some(&standalone));
+    assert!(matches!(rx.try_recv(), Ok(Out::Note(n)) if n.contains("later")));
 }
 
 #[test]

@@ -1,7 +1,7 @@
 {
   "name": "read-resources-find-heavy-process",
   "goal": "Without calling a tool, read the simee resources to find the booted iPhone and name the process using the most CPU on it.",
-  "toolsets": "core",
+  "toolsets": "core,debug",
   "world": {
     "devices": [
       {"udid": "iphone-17", "name": "iPhone 17", "platform": "ios", "form_factor": "phone", "state": "Booted",

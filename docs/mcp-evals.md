@@ -37,7 +37,7 @@ The tasks, from #296 and one per prompt in [mcp.md](mcp.md#prompts):
 | `crash-log-line` | `core` | Launch an app, tap what crashes it, return the log line that says why |
 | `foldable-tabletop` | `core,input` | Rotate an Android foldable to landscape and fold it half open |
 | `audit-contrast` | `core,observe` | Report each contrast failure, light and dark, with its ratio; the appearance is put back |
-| `read-resources-find-heavy-process` | `core` | Read `simee://devices` and the iPhone's `processes` resource, no tool, and name the process using the most CPU |
+| `read-resources-find-heavy-process` | `core,debug` | Read `simee://devices` and the iPhone's `processes` resource, no tool, and name the process using the most CPU |
 | `prompt-boot-and-install` | `core,lifecycle` | The prompt with no tablet to hand: create one, boot it, install and launch |
 | `prompt-reproduce-bug` | `core,debug` | The prompt's steps with logs and screenshots, ending in the crash line and report |
 | `prompt-audit-contrast` | `core,observe` | The prompt from the home screen: open the app, then check it in both appearances |

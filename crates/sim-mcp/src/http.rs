@@ -29,7 +29,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
@@ -546,9 +546,14 @@ struct Route {
     tx: Sender<Out>,
 }
 
+/// How many messages a session's `GET` stream queues for a client that reads slowly. Past it the
+/// newest are dropped: they are notifications that something changed, and the client reads the
+/// state when it next looks.
+const STANDALONE_QUEUE: usize = 256;
+
 /// A session's stream for messages that belong to no request, with the generation of the `GET`
 /// that holds it.
-type Standalone = Mutex<Option<(u64, Sender<Out>)>>;
+type Standalone = Mutex<Option<(u64, SyncSender<Out>)>>;
 
 #[derive(Default)]
 struct Router {
@@ -631,7 +636,11 @@ impl Router {
             return;
         }
         if let Some((_, tx)) = standalone.and_then(|s| lock(s).clone()) {
-            let _ = tx.send(Out::Note(line));
+            // Never wait for a client that has stopped reading: that would stall the server's
+            // watcher, and its other subscriptions with it.
+            if let Err(TrySendError::Full(_)) = tx.try_send(Out::Note(line)) {
+                // Dropped.
+            }
         }
     }
 }
@@ -1526,7 +1535,7 @@ impl Exchange<'_> {
             return self.fail(404, INVALID_REQUEST, "no such session (it ended or expired)", &[]);
         };
         let idle = self.shared.config.limits.session_idle;
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(STANDALONE_QUEUE);
         let generation = self.shared.router.next.fetch_add(1, Ordering::Relaxed);
         *lock(&session.standalone) = Some((generation, tx));
         let ended = match Sse::start(self.stream(), self.head.http11, &[]) {

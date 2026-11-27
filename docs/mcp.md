@@ -216,7 +216,7 @@ A test keeps this page honest: it fails if a tool isn't named here.
 | `simee://devices/{device}` | The device's info (`info`): identity, form factor, sub-platform, profile, paths |
 | `simee://devices/{device}/screen` | The screen now, a PNG shrunk so its longest side is at most 1024 px (a 1206×2622 iPhone is 402×874): what an agent reads (a booted device) |
 | `simee://devices/{device}/screenshot` | The screen now, a PNG at the device's own size (a booted device) |
-| `simee://devices/{device}/logs` | The newest 200 lines of the last minute of the unified log (`text/plain`; iOS) |
+| `simee://devices/{device}/logs` | The newest 200 lines of the last 30 seconds of the unified log (`text/plain`; iOS) |
 | `simee://devices/{device}/apps` | Installed bundle ids (iOS) |
 | `simee://devices/{device}/processes` | The device's processes with CPU and memory (`processes`; iOS) |
 | `simee://devices/{device}/prefs/{bundle_id}` | Every key of an app's preference stores, typed (`prefs_read`, read fresh) |
@@ -226,7 +226,11 @@ A test keeps this page honest: it fails if a tool isn't named here.
 `{device}` is a UDID or an AVD name; `{bundle_id}` and `{store}` are as the `prefs_*` tools take
 them. Each is percent-encoded as one path segment. `simee://device/{device}…` is read as
 `simee://devices/{device}…`, and a subscription is announced under the spelling the client gave.
-`resources/list` includes each device's resources that apply to it (screens for a booted device,
+A resource is served only when the server serves the tool it reads through (`processes` is the
+`debug` toolset's, `prefs_read` the `prefs` toolset's, `runtimes`, `device_types` and
+`form_factors` the `lifecycle` toolset's, `camera_sources` the `camera` toolset's): a client of the
+default `core` server can't read, list, template or subscribe to them, and a read says which
+toolset has it. `resources/list` includes each device's resources that apply to it (screens for a booted device,
 logs and processes for a booted iOS one, apps for an iOS one), and `resources/templates/list` all
 eight templates. Preferences are templates only, since every app has some. Android has no log or
 process resource (its console is the `console` tool) and no preferences yet (they answer as
@@ -247,9 +251,9 @@ state at that moment:
 | Resource | Re-read every | Counts as a change |
 | --- | --- | --- |
 | `screen`, `screenshot` | 1 s (`SIMEE_MCP_SCREEN_FPS`, above 0 and up to 30 frames a second) | The device's frame differs; an unchanged frame isn't shrunk or sent |
-| `logs` | 1 s | A new newest line: lines aging out of the minute say nothing, and a burst is one notification |
+| `logs` | 1 s, through the device's log stream (the first read starts it; later reads spawn no `log show`) | A new newest line: lines aging out of the window say nothing, and a burst is one notification |
 | `processes` | 2 s | A process starts or exits (its pid and path); CPU and memory moving don't count |
-| `devices` and the resource list (`resourcesListChanged`) | 1 s | A device appears, disappears, or starts or stops running (`notifications/resources/list_changed`) |
+| `devices` and the resource list (`resourcesListChanged`, a server that serves `devices`) | 1 s | A device appears, disappears, or starts or stops running (`notifications/resources/list_changed`) |
 | Everything else (`info`, `apps`, `prefs`, the catalogues) | 2 s | The bytes differ |
 
 What is already there when a subscription starts is its baseline: nothing is sent for it. A
@@ -257,19 +261,26 @@ subscription added to a connection that has others keeps their baselines. A reso
 be read (a device that isn't running) counts as a state, so booting a device announces its screen.
 
 **Cost.** A connection with no subscriptions has no thread and makes no read: reading, listing
-and listing templates are the calls they ask for and no more. A subscription is one thread per
-connection (per session over HTTP, which is its own server) that sleeps until the next read is
-due: 1 wake-up a second for a screen, the list, or both, and no CPU a test can see
+and listing templates are the calls they ask for and no more. A `subscriptions/listen` is one thread (and an older client's
+subscriptions together another, per connection or HTTP session), reading what it watches one
+resource after another, and sleeping until the next read is due: 1 wake-up a second for a screen,
+the list, or both, and no CPU a test can see
 ([benchmarks.md](benchmarks.md#mcp-idle-subscription)). The reads themselves are what costs:
-a subscribed screen is one `screenshot` a second (more at a higher `SIMEE_MCP_SCREEN_FPS`), each
+a subscribed screen is one `screenshot` a second, and a subscribed iOS `logs` keeps the device's log stream running for as long as someone reads it (it stops after 5 idle minutes) (more at a higher `SIMEE_MCP_SCREEN_FPS`), each
 read one period after the last finished, so a slow screenshot lowers the rate instead of piling
 up. The thread stops when the client cancels the listen (`notifications/cancelled`),
 unsubscribes its last resource, or its connection ends (stdin closes; the HTTP session is deleted
 or expires), and no notification follows.
 
-An older client has no way to ask for `list_changed`, so for it the list is watched while it has
-any subscription. `listChanged` is advertised for both. The server never changes its tool list,
-so it doesn't offer `toolsListChanged`.
+Subscribing to `simee://device/{device}/…` and `simee://devices/{device}/…` is one read, announced
+under each spelling. An older client (`initialize`) has no way to ask for `list_changed`, so it is
+not offered it and the device list isn't read for it; `subscriptions/listen` is where
+`resourcesListChanged` is. The server never changes its tool list, so it doesn't offer
+`toolsListChanged`.
+
+Over HTTP a session's `GET` stream queues 256 messages for a client that reads slowly and drops
+the newer ones past that (each is only "something changed"; the client reads the state when it
+next looks), so a stalled client never holds up the watcher.
 
 ## Prompts
 

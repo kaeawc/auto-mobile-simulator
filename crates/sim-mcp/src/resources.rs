@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use crate::app;
 use crate::backend::Backend;
 use crate::rpc::{INTERNAL_ERROR, RpcError};
+use crate::tools::{self, Toolsets};
 
 const SCHEME: &str = "simee://";
 pub const DEVICES: &str = "simee://devices";
@@ -23,6 +24,9 @@ pub const CAMERA_SOURCES: &str = "simee://camera/sources";
 
 /// How many of a device's newest log lines the `logs` resource holds.
 pub const LOG_TAIL_LINES: usize = 200;
+/// How far back the `logs` resource reaches. It reads through the device's log stream (started by
+/// the first read), so a subscription's reads answer from it and spawn no `log show` each time.
+const LOG_WINDOW: &str = "30s";
 
 /// What a resource URI names.
 #[derive(Debug, PartialEq, Eq)]
@@ -39,7 +43,7 @@ pub enum Target {
     Screen(String),
     /// `simee://devices/{device}/screenshot`: the screen at the device's own size.
     Screenshot(String),
-    /// `simee://devices/{device}/logs`: the newest [`LOG_TAIL_LINES`] lines of the last minute.
+    /// `simee://devices/{device}/logs`: the newest [`LOG_TAIL_LINES`] lines of the last [`LOG_WINDOW`].
     Logs(String),
     /// `simee://devices/{device}/apps`
     Apps(String),
@@ -53,6 +57,77 @@ pub enum Target {
     },
     /// The device view's page.
     View,
+}
+
+impl Target {
+    /// The API method this resource reads through. A server serves the resource only if it serves
+    /// that tool, so a resource is never a way around a toolset.
+    fn method(&self) -> &'static str {
+        match self {
+            Target::Devices => "devices",
+            Target::Runtimes => "runtimes",
+            Target::DeviceTypes => "device_types",
+            Target::FormFactors => "form_factors",
+            Target::CameraSources => "camera_sources",
+            Target::Device(_) => "info",
+            Target::Screen(_) | Target::Screenshot(_) => "screenshot",
+            Target::Logs(_) => "logs",
+            Target::Apps(_) => "apps",
+            Target::Processes(_) => "processes",
+            Target::Prefs { .. } => "prefs_read",
+            Target::View => tools::VIEW_TOOL,
+        }
+    }
+
+    /// The one spelling of the URI: `simee://devices/…`, percent-encoded as [`device_uri`] does.
+    fn uri(&self) -> String {
+        let leaf = |device: &str, leaf: &str| device_uri(device, leaf);
+        match self {
+            Target::Devices => DEVICES.into(),
+            Target::Runtimes => RUNTIMES.into(),
+            Target::DeviceTypes => DEVICE_TYPES.into(),
+            Target::FormFactors => FORM_FACTORS.into(),
+            Target::CameraSources => CAMERA_SOURCES.into(),
+            Target::View => app::URI.into(),
+            Target::Device(d) => leaf(d, ""),
+            Target::Screen(d) => leaf(d, "screen"),
+            Target::Screenshot(d) => leaf(d, "screenshot"),
+            Target::Logs(d) => leaf(d, "logs"),
+            Target::Apps(d) => leaf(d, "apps"),
+            Target::Processes(d) => leaf(d, "processes"),
+            Target::Prefs { device, bundle_id, store } => {
+                let base = leaf(device, &format!("prefs/{}", encode(bundle_id)));
+                store.as_ref().map_or(base.clone(), |s| format!("{base}/{}", encode(s)))
+            }
+        }
+    }
+}
+
+/// Refuses a resource whose tool `toolsets` doesn't serve, naming the toolset that has it.
+fn gate(target: &Target, toolsets: &Toolsets, uri: &str) -> Result<(), RpcError> {
+    let method = target.method();
+    if toolsets.contains(method) {
+        return Ok(());
+    }
+    let (set, label) = (tools::toolset_of(method), toolsets.label());
+    Err(RpcError::invalid_params(format!(
+        "Resource `{uri}` isn't served here: it reads through the `{method}` tool, which is in the `{set}` toolset, and this server serves \
+         `{label}`. Start it with {}={label},{set} (or all)",
+        tools::TOOLSETS_ENV
+    ))
+    .with_data(json!({"uri": uri, "tool": method, "toolset": set, "enabled": label})))
+}
+
+/// The URI `uri` names in the one spelling every alias shares (`None` for one that isn't ours).
+/// Subscriptions are keyed on it, so two spellings of a resource are one read.
+pub fn spelling(uri: &str) -> Option<String> {
+    parse(uri).map(|target| target.uri())
+}
+
+/// [`spelling`], for a resource `toolsets` serves; `None` for any other.
+pub fn canonical(uri: &str, toolsets: &Toolsets) -> Option<String> {
+    let target = parse(uri)?;
+    toolsets.contains(target.method()).then(|| target.uri())
 }
 
 /// Percent-encodes everything but unreserved characters, so a device name is one path segment.
@@ -129,9 +204,9 @@ pub fn parse(uri: &str) -> Option<Target> {
     parts.next().is_none().then_some(target)
 }
 
-/// `resources/templates/list`: the per-device resources as URI templates.
-pub fn templates() -> Value {
-    json!([
+/// `resources/templates/list`: the per-device resources as URI templates, those `toolsets` serves.
+pub fn templates(toolsets: &Toolsets) -> Value {
+    let all = json!([
         {"uriTemplate": "simee://devices/{device}", "name": "device", "title": "Device info", "mimeType": "application/json",
          "description": "A device's paths, identity and profile (the `info` method). `device` is a UDID or an AVD name."},
         {"uriTemplate": "simee://devices/{device}/screen", "name": "screen", "title": "Screen", "mimeType": "image/png",
@@ -140,7 +215,7 @@ pub fn templates() -> Value {
         {"uriTemplate": "simee://devices/{device}/screenshot", "name": "screenshot", "title": "Screenshot", "mimeType": "image/png",
          "description": "The device's screen now at the device's own size, as a PNG (a booted device)."},
         {"uriTemplate": "simee://devices/{device}/logs", "name": "logs", "title": "Device logs", "mimeType": "text/plain",
-         "description": "The newest 200 lines of the last minute of the device's unified log (the `logs` method; iOS). A \
+         "description": "The newest 200 lines of the last 30 seconds of the device's unified log (the `logs` method; iOS). A \
                          subscription says when new lines arrived, once a second at most."},
         {"uriTemplate": "simee://devices/{device}/apps", "name": "apps", "title": "Installed apps", "mimeType": "application/json",
          "description": "The device's installed bundle ids (the `apps` method; iOS)."},
@@ -153,13 +228,19 @@ pub fn templates() -> Value {
         {"uriTemplate": "simee://devices/{device}/prefs/{bundle_id}/{store}", "name": "prefs-store", "title": "App preference store",
          "mimeType": "application/json",
          "description": "One preference store of an app (a `store` id from `prefs_stores`). A subscription says when a key changes."},
-    ])
+    ]);
+    let served = |t: &Value| {
+        let sample = t["uriTemplate"].as_str().unwrap_or("").replace("{device}", "d").replace("{bundle_id}", "b").replace("{store}", "s");
+        parse(&sample).is_some_and(|target| toolsets.contains(target.method()))
+    };
+    Value::Array(all.as_array().into_iter().flatten().filter(|t| served(t)).cloned().collect())
 }
 
 /// `resources/list`: the fixed resources, then each device's. A screen is listed for a booted
 /// device; logs and processes for a booted iOS one, apps for an iOS one (Android's console is
-/// the `console` tool). Preferences are by template only: every app has some.
-pub fn list(backend: &dyn Backend) -> Vec<Value> {
+/// the `console` tool). Preferences are by template only: every app has some. Only what `toolsets`
+/// serves is listed.
+pub fn list(backend: &dyn Backend, toolsets: &Toolsets) -> Vec<Value> {
     let mut out = vec![
         json!({"uri": DEVICES, "name": "devices", "title": "Devices", "mimeType": "application/json",
             "description": "Every device on both platforms: UDID, name, state, platform, form factor."}),
@@ -173,7 +254,8 @@ pub fn list(backend: &dyn Backend) -> Vec<Value> {
             "description": "Every source a device camera can link to (the host's cameras, synthetic sources) and the host's camera permission."}),
         app::listing(),
     ];
-    let devices = backend.call("devices", &json!({})).unwrap_or(Value::Null);
+    // Without the `devices` tool the server doesn't say which devices there are, and so lists none.
+    let devices = if toolsets.contains("devices") { backend.call("devices", &json!({})).unwrap_or(Value::Null) } else { Value::Null };
     for d in devices.as_array().into_iter().flatten() {
         let (Some(udid), name) = (d["udid"].as_str(), d["name"].as_str().unwrap_or("device")) else { continue };
         let platform = d["platform"].as_str().unwrap_or("");
@@ -194,6 +276,7 @@ pub fn list(backend: &dyn Backend) -> Vec<Value> {
             out.push(json!({"uri": device_uri(udid, "apps"), "name": label("apps"), "mimeType": "application/json"}));
         }
     }
+    out.retain(|r| r["uri"].as_str().is_some_and(|uri| canonical(uri, toolsets).is_some()));
     out
 }
 
@@ -219,7 +302,8 @@ fn screenshot_png(backend: &dyn Backend, uri: &str, device: &str) -> Result<Stri
 
 /// A device's log lines as one text, the newest [`LOG_TAIL_LINES`].
 fn log_tail(backend: &dyn Backend, uri: &str, device: &str) -> Result<String, RpcError> {
-    let logs = backend.call("logs", &json!({"device": device})).map_err(|e| failed(uri, e))?;
+    let params = json!({"device": device, "last": LOG_WINDOW, "stream": true});
+    let logs = backend.call("logs", &params).map_err(|e| failed(uri, e))?;
     let text = match &logs {
         Value::String(s) => s.clone(),
         Value::Array(lines) if lines.iter().all(Value::is_string) => lines.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"),
@@ -242,9 +326,21 @@ fn not_found(uri: &str) -> RpcError {
     RpcError::invalid_params("Resource not found").with_data(json!({"uri": uri}))
 }
 
-/// `resources/read`: the contents of `uri`.
-pub fn read(backend: &dyn Backend, uri: &str) -> Result<Vec<Value>, RpcError> {
+/// Whether `uri` names a resource this server serves: not found if it isn't one of ours, refused
+/// if `toolsets` doesn't serve what it reads through.
+pub fn check(uri: &str, toolsets: &Toolsets) -> Result<(), RpcError> {
+    gate(&parse(uri).ok_or_else(|| not_found(uri))?, toolsets, uri)
+}
+
+/// `resources/read`: the contents of `uri`, if `toolsets` serves what it reads through.
+pub fn read(backend: &dyn Backend, toolsets: &Toolsets, uri: &str) -> Result<Vec<Value>, RpcError> {
     let target = parse(uri).ok_or_else(|| not_found(uri))?;
+    gate(&target, toolsets, uri)?;
+    fetch(backend, target, uri)
+}
+
+/// The contents of a resource, whatever the server serves.
+fn fetch(backend: &dyn Backend, target: Target, uri: &str) -> Result<Vec<Value>, RpcError> {
     let call = |method: &str, params: Value| backend.call(method, &params).map_err(|e| failed(uri, e));
     let content = match target {
         Target::View => app::contents(),
@@ -294,7 +390,7 @@ pub fn fingerprint(backend: &dyn Backend, uri: &str) -> Option<u64> {
             who.sort();
             Some(hash_of(&who.join("\n")))
         }
-        _ => read(backend, uri).ok().map(|contents| hash_of(&Value::Array(contents).to_string())),
+        other => fetch(backend, other, uri).ok().map(|contents| hash_of(&Value::Array(contents).to_string())),
     }
 }
 
@@ -367,7 +463,7 @@ mod tests {
     #[test]
     fn the_list_has_the_fixed_resources_and_each_devices() {
         let fake = Fake::with_devices();
-        let list = list(&fake);
+        let list = list(&fake, &Toolsets::all());
         let uris: Vec<&str> = list.iter().filter_map(|r| r["uri"].as_str()).collect();
         for fixed in [DEVICES, RUNTIMES, DEVICE_TYPES, FORM_FACTORS, CAMERA_SOURCES, app::URI] {
             assert!(uris.contains(&fixed), "{fixed}");
@@ -390,7 +486,7 @@ mod tests {
         assert!(list.iter().all(|r| r["name"].is_string() && r["uri"].is_string()));
         // A booted iPhone has them all.
         fake.answer("devices", Ok(json!([{"udid": IPHONE, "name": "iPhone 17", "state": "Booted", "platform": "ios"}])));
-        let booted = super::list(&fake);
+        let booted = super::list(&fake, &Toolsets::all());
         let uris: Vec<&str> = booted.iter().filter_map(|r| r["uri"].as_str()).collect();
         for leaf in ["", "/screen", "/screenshot", "/logs", "/apps", "/processes"] {
             assert!(uris.contains(&format!("simee://devices/{IPHONE}{leaf}").as_str()), "{leaf}");
@@ -398,12 +494,12 @@ mod tests {
         // No devices (or a failing listing) is just the fixed ones.
         let none = Fake::default();
         none.answer("devices", Err("boom".into()));
-        assert_eq!(super::list(&none).len(), 6);
+        assert_eq!(super::list(&none, &Toolsets::all()).len(), 6);
     }
 
     #[test]
     fn templates_cover_the_per_device_resources() {
-        let templates = templates();
+        let templates = templates(&Toolsets::all());
         let names: Vec<&str> = templates.as_array().expect("array").iter().filter_map(|t| t["name"].as_str()).collect();
         assert_eq!(names, ["device", "screen", "screenshot", "logs", "apps", "processes", "prefs", "prefs-store"]);
         for t in templates.as_array().expect("array") {
@@ -423,7 +519,7 @@ mod tests {
         fake.answer("apps", Ok(json!(["com.example.app"])));
         fake.answer("processes", Ok(json!([{"pid": 1, "path": "/sbin/launchd", "cpu": 0.5}])));
         fake.answer("prefs_read", Ok(json!({"store": "com.example.app", "values": {"theme": {"type": "string", "value": "dark"}}})));
-        let read1 = |uri: &str| read(&fake, uri).expect(uri).remove(0);
+        let read1 = |uri: &str| read(&fake, &Toolsets::all(), uri).expect(uri).remove(0);
         let devices = read1(DEVICES);
         assert_eq!(devices["mimeType"], "application/json");
         assert!(devices["text"].as_str().is_some_and(|t| t.contains("iPhone 17")));
@@ -438,6 +534,8 @@ mod tests {
             json!({"uri": "simee://devices/phone/screenshot", "mimeType": "image/png", "blob": "iVBOR"})
         );
         assert_eq!(read1("simee://devices/phone/logs")["text"], "line one\nline two");
+        // Through the device's log stream, so a poll doesn't spawn a `log show` each time.
+        assert_eq!(fake.called("logs"), [json!({"device": "phone", "last": "30s", "stream": true})]);
         assert!(read1("simee://devices/phone/apps")["text"].as_str().is_some_and(|t| t.contains("com.example.app")));
         let procs = read1("simee://devices/phone/processes");
         assert!(procs["text"].as_str().is_some_and(|t| t.contains("/sbin/launchd")) && procs["mimeType"] == "application/json");
@@ -471,19 +569,19 @@ mod tests {
         let fake = Fake::with_devices();
         let full = png(1206, 2622);
         fake.answer("screenshot", Ok(json!({"width": 1206, "height": 2622, "png": full})));
-        let screen = read(&fake, "simee://device/phone/screen").expect("screen").remove(0);
+        let screen = read(&fake, &Toolsets::all(), "simee://device/phone/screen").expect("screen").remove(0);
         assert_eq!((screen["uri"].clone(), screen["mimeType"].clone()), (json!("simee://device/phone/screen"), json!("image/png")));
         let blob = screen["blob"].as_str().expect("blob");
         assert!(blob.len() < full.len() / 4, "{} bytes of {}", blob.len(), full.len());
         use base64::Engine as _;
         let bytes = base64::engine::general_purpose::STANDARD.decode(blob).expect("base64");
         assert_eq!(sim_core::frame::png_size(&bytes), Some((402, 874)));
-        let shot = read(&fake, "simee://devices/phone/screenshot").expect("screenshot").remove(0);
+        let shot = read(&fake, &Toolsets::all(), "simee://devices/phone/screenshot").expect("screenshot").remove(0);
         assert_eq!(shot["blob"], json!(full));
         assert_eq!(fake.called("screenshot"), [json!({"device": "phone"}), json!({"device": "phone"})]);
         // Not a PNG: the server's error, not an empty image.
         fake.answer("screenshot", Ok(json!({"png": "iVBOR"})));
-        assert_eq!(read(&fake, "simee://devices/phone/screen").expect_err("garbage").code, INTERNAL_ERROR);
+        assert_eq!(read(&fake, &Toolsets::all(), "simee://devices/phone/screen").expect_err("garbage").code, INTERNAL_ERROR);
     }
 
     #[test]
@@ -491,12 +589,13 @@ mod tests {
         let fake = Fake::with_devices();
         let lines: Vec<String> = (0..LOG_TAIL_LINES + 50).map(|n| format!("line {n}")).collect();
         fake.answer("logs", Ok(json!(lines)));
-        let text = read(&fake, "simee://devices/phone/logs").expect("logs").remove(0)["text"].as_str().expect("text").to_owned();
+        let text =
+            read(&fake, &Toolsets::all(), "simee://devices/phone/logs").expect("logs").remove(0)["text"].as_str().expect("text").to_owned();
         let got: Vec<&str> = text.lines().collect();
         assert_eq!((got.len(), got[0], got[got.len() - 1]), (LOG_TAIL_LINES, "line 50", "line 249"));
         // A text answer is cut the same way, and a short one is whole.
         fake.answer("logs", Ok(json!("a\nb\nc")));
-        assert_eq!(read(&fake, "simee://devices/phone/logs").expect("logs").remove(0)["text"], "a\nb\nc");
+        assert_eq!(read(&fake, &Toolsets::all(), "simee://devices/phone/logs").expect("logs").remove(0)["text"], "a\nb\nc");
     }
 
     #[test]
@@ -506,19 +605,22 @@ mod tests {
         fake.answer("logs", Err("`logs` isn't available on Android devices (it works on iOS)".into()));
         fake.answer("screenshot", Err("phone isn't running; boot it first".into()));
         fake.answer("prefs_read", Err("app preferences (`prefs_*`) are not yet available on Android devices".into()));
-        let err = read(&fake, "simee://devices/ghost").expect_err("missing");
+        let err = read(&fake, &Toolsets::all(), "simee://devices/ghost").expect_err("missing");
         assert_eq!((err.code, err.message.as_str()), (crate::rpc::INVALID_PARAMS, "Resource not found"));
         assert_eq!(err.data.as_ref().map(|d| d["uri"].clone()), Some(json!("simee://devices/ghost")));
-        assert_eq!(read(&fake, "simee://devices/phone/logs").expect_err("android").code, crate::rpc::INVALID_PARAMS);
-        assert_eq!(read(&fake, "simee://devices/phone/prefs/a.b").expect_err("android prefs").code, crate::rpc::INVALID_PARAMS);
+        assert_eq!(read(&fake, &Toolsets::all(), "simee://devices/phone/logs").expect_err("android").code, crate::rpc::INVALID_PARAMS);
+        assert_eq!(
+            read(&fake, &Toolsets::all(), "simee://devices/phone/prefs/a.b").expect_err("android prefs").code,
+            crate::rpc::INVALID_PARAMS
+        );
         for leaf in ["screenshot", "screen"] {
-            let down = read(&fake, &format!("simee://devices/phone/{leaf}")).expect_err("stopped");
+            let down = read(&fake, &Toolsets::all(), &format!("simee://devices/phone/{leaf}")).expect_err("stopped");
             assert_eq!((down.code, down.message.as_str()), (INTERNAL_ERROR, "phone isn't running; boot it first"));
         }
-        assert_eq!(read(&fake, "simee://nope").expect_err("not ours").code, crate::rpc::INVALID_PARAMS);
+        assert_eq!(read(&fake, &Toolsets::all(), "simee://nope").expect_err("not ours").code, crate::rpc::INVALID_PARAMS);
         // A screenshot written to a path has no image to return.
         fake.answer("screenshot", Ok(json!({"path": "/tmp/x.png"})));
-        assert_eq!(read(&fake, "simee://devices/phone/screenshot").expect_err("no png").code, INTERNAL_ERROR);
+        assert_eq!(read(&fake, &Toolsets::all(), "simee://devices/phone/screenshot").expect_err("no png").code, INTERNAL_ERROR);
     }
 
     #[test]
@@ -554,5 +656,67 @@ mod tests {
         fake.answer("apps", Err("gone".into()));
         assert_eq!(print("simee://devices/phone/apps"), None);
         assert_eq!(print("simee://nope"), None);
+    }
+
+    #[test]
+    fn a_resource_is_served_only_with_the_toolset_of_the_tool_it_reads_through() {
+        let fake = Fake::with_devices();
+        fake.answer("processes", Ok(json!([{"pid": 1, "path": "/a"}])));
+        fake.answer("prefs_read", Ok(json!({"values": {"token": {"type": "string", "value": "secret"}}})));
+        fake.answer("camera_sources", Ok(json!({})));
+        let core = Toolsets::default();
+        let secrets = [format!("simee://devices/{IPHONE}/processes"), "simee://devices/phone/prefs/com.bank.app".to_owned()];
+        for uri in secrets.iter().map(String::as_str).chain(["simee://device/phone/prefs/com.bank.app/s", CAMERA_SOURCES, RUNTIMES]) {
+            let err = read(&fake, &core, uri).expect_err(uri);
+            assert_eq!(err.code, crate::rpc::INVALID_PARAMS, "{uri}");
+            assert!(err.message.contains("isn't served here") && err.message.contains("SIMEE_MCP_TOOLSETS=core,"), "{}", err.message);
+            assert_eq!(check(uri, &core).expect_err(uri).message, err.message);
+            assert_eq!(canonical(uri, &core), None, "{uri}");
+        }
+        assert_eq!(
+            fake.called("processes").len() + fake.called("prefs_read").len() + fake.called("camera_sources").len(),
+            0,
+            "never called"
+        );
+        let err = read(&fake, &core, "simee://devices/phone/prefs/b").expect_err("prefs");
+        assert_eq!(err.data.as_ref().map(|d| (d["toolset"].clone(), d["tool"].clone())), Some((json!("prefs"), json!("prefs_read"))));
+        // What core serves reads, and the toolset that has the rest unlocks it.
+        for uri in
+            [DEVICES, "simee://devices/phone", "simee://devices/phone/screen", "simee://devices/phone/apps", "simee://devices/phone/logs"]
+        {
+            assert_eq!(canonical(uri, &core).as_deref(), Some(uri));
+        }
+        assert!(read(&fake, &Toolsets::parse("core,debug").expect("sets"), &secrets[0]).is_ok());
+        assert!(read(&fake, &Toolsets::parse("core,debug").expect("sets"), &secrets[1]).is_err());
+        assert!(read(&fake, &Toolsets::parse("core,prefs").expect("sets"), &secrets[1]).is_ok());
+        // Nor are they listed or offered as templates.
+        let uris =
+            |sets: &Toolsets| -> Vec<String> { list(&fake, sets).iter().filter_map(|r| r["uri"].as_str().map(str::to_owned)).collect() };
+        fake.answer("devices", Ok(json!([{"udid": IPHONE, "name": "iPhone 17", "state": "Booted", "platform": "ios"}])));
+        assert!(!uris(&core).iter().any(|u| u.ends_with("/processes") || u == RUNTIMES || u == CAMERA_SOURCES || u == FORM_FACTORS));
+        assert!(uris(&core).contains(&format!("simee://devices/{IPHONE}/logs")));
+        assert!(uris(&Toolsets::parse("core,debug").expect("sets")).contains(&format!("simee://devices/{IPHONE}/processes")));
+        let names = |sets: &Toolsets| -> Vec<String> {
+            templates(sets).as_array().expect("array").iter().filter_map(|t| t["name"].as_str().map(str::to_owned)).collect()
+        };
+        assert_eq!(names(&core), ["device", "screen", "screenshot", "logs", "apps"]);
+        assert_eq!(names(&Toolsets::all()).len(), 8);
+        // Without `devices` no device is named at all, and the device calls aren't made.
+        let none = Fake::with_devices();
+        let blind = Toolsets::parse("debug").expect("sets");
+        assert!(list(&none, &blind).iter().all(|r| r["uri"].as_str().is_some_and(|u| !u.contains("/devices/"))));
+        assert!(none.called("devices").is_empty());
+    }
+
+    #[test]
+    fn every_spelling_of_a_resource_has_one_canonical_form() {
+        let all = Toolsets::all();
+        assert_eq!(canonical("simee://device/My%20Phone/screen", &all).as_deref(), Some("simee://devices/My%20Phone/screen"));
+        assert_eq!(canonical("simee://devices/My%20Phone/screen", &all).as_deref(), Some("simee://devices/My%20Phone/screen"));
+        assert_eq!(canonical("simee://devices/%41/prefs/a%2Eb/g%2Fx", &all).as_deref(), Some("simee://devices/A/prefs/a.b/g%2Fx"));
+        for uri in [DEVICES, RUNTIMES, CAMERA_SOURCES, app::URI, "simee://devices/x/processes", "simee://devices/x/prefs/b"] {
+            assert_eq!(spelling(uri).as_deref(), Some(uri));
+        }
+        assert_eq!(spelling("simee://nope"), None);
     }
 }

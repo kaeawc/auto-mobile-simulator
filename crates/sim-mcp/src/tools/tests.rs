@@ -351,7 +351,11 @@ fn the_docs_name_every_tool_and_resource() {
             .into_iter()
             .map(str::to_owned)
             .chain(
-                crate::resources::templates().as_array().into_iter().flatten().filter_map(|t| t["uriTemplate"].as_str().map(str::to_owned)),
+                crate::resources::templates(&Toolsets::all())
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|t| t["uriTemplate"].as_str().map(str::to_owned)),
             )
     {
         assert!(docs.contains(&format!("`{uri}`")), "docs/mcp.md doesn't name the resource `{uri}`");

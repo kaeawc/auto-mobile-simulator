@@ -104,8 +104,10 @@ fn hash_str(text: &str) -> u64 {
 /// One thing being watched: when it is next read, and what the last read of it was (`None`
 /// before the first, the baseline, which announces nothing).
 struct Item {
-    /// The resource's URI; `None` for the resource list.
+    /// The resource's URI in its one spelling; `None` for the resource list.
     uri: Option<String>,
+    /// The spellings it was subscribed under, each announced when it changes.
+    names: Vec<String>,
     period: Duration,
     due: Instant,
     seen: Option<Option<u64>>,
@@ -127,14 +129,27 @@ impl Schedule {
     /// read (a change since is still announced); what is new is read at once, as its baseline;
     /// what is gone is forgotten.
     pub fn set(&mut self, spec: &Spec, now: Instant) {
-        let wanted: Vec<Option<&str>> = spec.uris.iter().map(|u| Some(u.as_str())).chain(spec.list_changed.then_some(None)).collect();
-        self.items.retain(|item| wanted.contains(&item.uri.as_deref()));
-        for uri in wanted {
-            if self.items.iter().any(|item| item.uri.as_deref() == uri) {
+        // Spellings of one resource are one item, read once.
+        let mut wanted: Vec<(Option<String>, Vec<String>)> = Vec::new();
+        for name in &spec.uris {
+            let key = resources::spelling(name).unwrap_or_else(|| name.clone());
+            match wanted.iter_mut().find(|(k, _)| k.as_deref() == Some(key.as_str())) {
+                Some((_, names)) if names.contains(name) => {}
+                Some((_, names)) => names.push(name.clone()),
+                None => wanted.push((Some(key), vec![name.clone()])),
+            }
+        }
+        if spec.list_changed {
+            wanted.push((None, Vec::new()));
+        }
+        self.items.retain(|item| wanted.iter().any(|(key, _)| *key == item.uri));
+        for (key, names) in wanted {
+            if let Some(item) = self.items.iter_mut().find(|item| item.uri == key) {
+                item.names = names;
                 continue;
             }
-            let period = uri.map_or(self.pace.state, |u| self.pace.of(u));
-            self.items.push(Item { uri: uri.map(str::to_owned), period, due: now, seen: None });
+            let period = key.as_deref().map_or(self.pace.state, |u| self.pace.of(u));
+            self.items.push(Item { uri: key, names, period, due: now, seen: None });
         }
     }
 
@@ -153,9 +168,11 @@ impl Schedule {
                 None => list_fingerprint(backend),
             };
             if item.seen.is_some_and(|before| before != print) {
-                match &item.uri {
-                    Some(uri) => emit("notifications/resources/updated", json!({"uri": uri})),
-                    None => emit("notifications/resources/list_changed", json!({})),
+                if item.uri.is_none() {
+                    emit("notifications/resources/list_changed", json!({}));
+                }
+                for name in &item.names {
+                    emit("notifications/resources/updated", json!({"uri": name}));
                 }
             }
             item.seen = Some(print);
