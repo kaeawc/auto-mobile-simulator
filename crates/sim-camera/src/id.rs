@@ -1,5 +1,5 @@
 //! Source ids: `webcam:<id or part of the name>`, `pattern:testcard`, `qr:<text>`, `text:<text>`,
-//! `image:<path>`, `video:<path>`, `solid:<colour>`, `device:<udid or name>[:x,y,w,h]`. A string with no known prefix and no `:` is a
+//! `image:<path>`, `video:<path>`, `solid:<colour>`, `device:<udid or name>[:x,y,w,h]`, `feed:<socket>`. A string with no known prefix and no `:` is a
 //! webcam name, so `obs` finds "OBS Virtual Camera".
 
 use std::fmt;
@@ -42,9 +42,12 @@ pub enum SourceSpec {
     Solid(String),
     /// Another device's screen, optionally cropped ([`crate::device`]).
     Device(DeviceSpec),
+    /// A camera feed's socket ([`crate::feed`]): what the simee server serves another device's
+    /// screen to emu on. emu links an Android camera's `device:` source as this.
+    Feed(PathBuf),
 }
 
-const KINDS: &[&str] = &["webcam", "pattern", "qr", "text", "image", "video", "solid", "device"];
+const KINDS: &[&str] = &["webcam", "pattern", "qr", "text", "image", "video", "solid", "device", "feed"];
 
 impl SourceSpec {
     pub fn parse(id: &str) -> Result<SourceSpec> {
@@ -92,6 +95,12 @@ impl SourceSpec {
                 SourceSpec::Solid(rest.to_string())
             }
             "device" => SourceSpec::Device(DeviceSpec::parse(rest)?),
+            "feed" => {
+                if !rest.starts_with('/') {
+                    return Err(Error::Invalid(format!("feed: needs a camera feed's absolute socket path, as in feed:{}", example(kind))));
+                }
+                SourceSpec::Feed(PathBuf::from(rest))
+            }
             _ => {
                 return Err(Error::Invalid(format!(
                     "unknown source kind {kind:?}; use one of {} (a camera named with a colon: webcam:<name>)",
@@ -113,6 +122,7 @@ impl SourceSpec {
             SourceSpec::Video(_) => "video",
             SourceSpec::Solid(_) => "solid",
             SourceSpec::Device(_) => "device",
+            SourceSpec::Feed(_) => "feed",
         }
     }
 }
@@ -135,13 +145,16 @@ impl fmt::Display for SourceSpec {
             SourceSpec::Video(p) => write!(f, "video:{}", p.display()),
             SourceSpec::Solid(c) => write!(f, "solid:{c}"),
             SourceSpec::Device(d) => write!(f, "device:{d}"),
+            SourceSpec::Feed(p) => write!(f, "feed:{}", p.display()),
         }
     }
 }
 
 fn example(kind: &str) -> &'static str {
-    if kind == "device" {
-        return "<udid or name>";
+    match kind {
+        "device" => return "<udid or name>",
+        "feed" => return "/path/to/cam.sock",
+        _ => {}
     }
     crate::catalog::SYNTHETIC
         .iter()

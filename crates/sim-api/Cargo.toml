@@ -21,7 +21,9 @@ serde.workspace = true
 serde_json.workspace = true
 sim-core.workspace = true
 sim-android.workspace = true
-sim-camera = { workspace = true, features = ["device-source"] }
+# `device:` camera sources are read here (`src/camera_device.rs`), not in sim-camera, which emu
+# links: emu reads them from this crate's server as a `feed:`.
+sim-camera.workspace = true
 sim-coresim.workspace = true
 sim-debug.workspace = true
 sim-netshape.workspace = true

@@ -1,11 +1,14 @@
-//! The iOS camera feed: one simulator's linked camera source, served to the capture shim injected
-//! into its apps (`shims/ios-camera`) over a Unix socket.
+//! The camera feed: one device camera's linked source, served over a Unix socket to whatever
+//! reads that camera. Two readers speak it: the capture shim injected into an iOS simulator's apps
+//! (`shims/ios-camera`), and emu's camera HAL through a `feed:<socket>` source ([`open`]), which is
+//! how an Android device gets another device's screen (`device:`) without emu capturing it.
 //!
 //! A [`Feed`] listens on a socket path (by default in the device's data directory, see
-//! [`socket_path`]) and serves every reader that connects: each says the size and rate it wants,
-//! gets its own hub subscription (readers of one source share one capture) and is sent frames as
-//! the source produces them. [`Feed::set_source`] relinks the feed: every reader moves to the new
-//! source within [`POLL`] plus a frame, without reconnecting.
+//! [`socket_path`] and [`socket_path_in`]) and serves every reader that connects: each says the
+//! size and rate it wants, gets its own hub subscription (readers of one source share one capture)
+//! and is sent frames as the source produces them, so the source paces them. [`Feed::set_source`]
+//! relinks the feed: every reader moves to the new source within [`POLL`] plus a frame, without
+//! reconnecting.
 //!
 //! The wire format, little-endian:
 //!
@@ -16,7 +19,10 @@
 //!   started in nanoseconds; then `width * height * 4` bytes of BGRA, top row first.
 //!
 //! A reader that stops reading for [`WRITE_TIMEOUT`] is dropped; the shim reconnects. A reader
-//! that goes away while its source is failing to open or silent is noticed within [`POLL`].
+//! that goes away while its source is failing to open or silent is noticed within [`POLL`]. A
+//! source that fails (to open, or mid-stream before its first frame) is tried again after
+//! [`RETRY_MIN`], doubling to [`RETRY_MAX`], so a source that can't work never turns into a storm of
+//! opens.
 //!
 //! Access: the socket is mode 0600 and a fallback path lives in a private (0700, ours) directory,
 //! but any process running as the same user can connect, and so read a linked camera without a
@@ -28,14 +34,15 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
-use crate::frame::{CameraFrame, FrameSpec};
+use crate::frame::{CameraFrame, FrameSpec, Tick};
 use crate::hub::Hub;
 use crate::id::SourceSpec;
+use crate::source::Source;
 
 /// The environment variable that names the feed's socket to the shim.
 pub const SOCKET_ENV: &str = "SIMEE_CAMERA_SOCKET";
@@ -52,22 +59,37 @@ pub const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a new reader has to send its [`Hello`].
 const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long a reader waits before subscribing again after its source failed to open or stopped.
-const RETRY: Duration = Duration::from_millis(250);
+/// The first wait before a reader subscribes again after its source failed to open or stopped;
+/// each failure in a row doubles it, up to [`RETRY_MAX`]. A source that delivered frames before it
+/// failed starts over at the first wait.
+pub const RETRY_MIN: Duration = Duration::from_millis(500);
+pub const RETRY_MAX: Duration = Duration::from_secs(8);
+
+/// How long a `feed:` source waits for its feed's first frame, and how long a feed that has sent
+/// frames may go silent (its source failing on the serving side) before the source counts as
+/// missing. A live feed sends at its rate even while the picture is still.
+const SILENCE: Duration = Duration::from_secs(2);
 
 /// The longest socket path `bind` takes (`sun_path` is 104 bytes on macOS, NUL included).
 const MAX_SOCKET_PATH: usize = 103;
 
-/// Where a device's feed listens: `cam.sock` in its data directory, or, when that path is too long
-/// for a Unix socket (a long home directory), a name derived from it in a private per-user
-/// directory of the host's temp directory (created 0700; refused if it exists and isn't ours and
-/// 0700, so another user can't plant the socket).
+/// Where an iOS device's feed listens: `cam.sock` in its data directory ([`socket_path_in`]).
 pub fn socket_path(data_dir: &Path) -> Result<PathBuf> {
-    let path = data_dir.join("cam.sock");
+    socket_path_in(data_dir, "cam.sock")
+}
+
+/// Where a feed named `name` of the device whose directory is `dir` listens: `dir/name`, or, when
+/// that path is too long for a Unix socket (a long home directory), a name derived from `dir` in a
+/// private per-user directory of the host's temp directory (`<hash of dir>.sock` for `cam.sock`,
+/// `<hash of dir>-<name>` otherwise; created 0700; refused if it exists and isn't ours and 0700, so
+/// another user can't plant the socket). `sim_android::camera_feed_socket` computes the same path
+/// for an AVD's `device:` cameras, so a boot hands emu the socket this side serves.
+pub fn socket_path_in(dir: &Path, name: &str) -> Result<PathBuf> {
+    let path = dir.join(name);
     if path.as_os_str().len() <= MAX_SOCKET_PATH {
         return Ok(path);
     }
-    let hash = data_dir
+    let hash = dir
         .as_os_str()
         .as_encoded_bytes()
         .iter()
@@ -75,7 +97,8 @@ pub fn socket_path(data_dir: &Path) -> Result<PathBuf> {
     let user: String =
         std::env::var("USER").unwrap_or_default().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(24).collect();
     let dir = private_dir_in(&std::env::temp_dir(), &format!("simee-cam-{}", if user.is_empty() { "user" } else { &user }))?;
-    let path = dir.join(format!("{hash:016x}.sock"));
+    let file = if name == "cam.sock" { format!("{hash:016x}.sock") } else { format!("{hash:016x}-{name}") };
+    let path = dir.join(file);
     if path.as_os_str().len() > MAX_SOCKET_PATH {
         return Err(Error::Invalid(format!("camera feed: socket path {} is longer than {MAX_SOCKET_PATH} bytes", path.display())));
     }
@@ -386,6 +409,7 @@ fn serve(shared: &Shared, stream: &mut UnixStream) {
     let Ok(hello) = Hello::parse(&hello) else { return };
     let spec = hello.spec(shared.default_spec);
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+    let mut backoff = RETRY_MIN;
     while !shared.stop.load(Ordering::SeqCst) {
         let (source, generation) = {
             let link = lock(&shared.link);
@@ -393,11 +417,17 @@ fn serve(shared: &Shared, stream: &mut UnixStream) {
         };
         match stream_source(shared, stream, &source, generation, spec) {
             // Relinked: subscribe to the new source.
-            Ok(true) => {}
-            // The source didn't open, or its capture ended: try again shortly (or on a relink).
-            Ok(false) => {
-                if !wait_for_retry(shared, stream, generation) {
-                    return;
+            Ok(Streamed::Relinked) => backoff = RETRY_MIN,
+            // The source didn't open, or its capture ended: try again after the backoff (at once
+            // on a relink).
+            Ok(Streamed::Failed { delivered }) => {
+                if delivered {
+                    backoff = RETRY_MIN;
+                }
+                match wait_for_retry(shared, stream, generation, backoff) {
+                    Retry::Gone => return,
+                    Retry::Relinked => backoff = RETRY_MIN,
+                    Retry::Again => backoff = (backoff * 2).min(RETRY_MAX),
                 }
             }
             // The reader went away.
@@ -406,21 +436,30 @@ fn serve(shared: &Shared, stream: &mut UnixStream) {
     }
 }
 
-/// Waits [`RETRY`] before the source is opened again, watching the reader meanwhile: false when it
-/// went away or the feed stopped, so a reader of a source that won't open doesn't leave a thread
-/// behind. A relink ends the wait early.
-fn wait_for_retry(shared: &Shared, stream: &UnixStream, seen: u32) -> bool {
-    let until = Instant::now() + RETRY;
+/// How a wait before the next try ended.
+enum Retry {
+    /// The wait is over: try the same source again.
+    Again,
+    /// Relinked meanwhile: try the new source now.
+    Relinked,
+    /// The reader went away, or the feed stopped.
+    Gone,
+}
+
+/// Waits `delay` before the source is opened again, watching the reader meanwhile, so a reader of
+/// a source that won't open doesn't leave a thread behind. A relink ends the wait early.
+fn wait_for_retry(shared: &Shared, stream: &UnixStream, seen: u32, delay: Duration) -> Retry {
+    let until = Instant::now() + delay;
     while Instant::now() < until {
         if shared.stop.load(Ordering::SeqCst) || peer_gone(stream) {
-            return false;
+            return Retry::Gone;
         }
         if lock(&shared.link).generation != seen {
-            return true;
+            return Retry::Relinked;
         }
         thread::sleep(POLL.min(until.saturating_duration_since(Instant::now())));
     }
-    true
+    Retry::Again
 }
 
 /// Whether the reader closed its end: a nonblocking read that finds the end of the stream. (The
@@ -438,25 +477,38 @@ fn peer_gone(stream: &UnixStream) -> bool {
     gone
 }
 
-/// Streams `source` to the reader until the link changes (`Ok(true)`), the source fails or the
-/// feed stops (`Ok(false)`), or a write fails (`Err`).
-fn stream_source(shared: &Shared, stream: &mut UnixStream, source: &SourceSpec, generation: u32, spec: FrameSpec) -> io::Result<bool> {
-    let Ok(sub) = shared.hub.subscribe(source, spec) else { return Ok(false) };
+/// How streaming one source to a reader ended.
+enum Streamed {
+    /// The link changed.
+    Relinked,
+    /// The source failed to open, its capture ended, or the feed stopped; `delivered`: it sent a
+    /// frame first.
+    Failed { delivered: bool },
+}
+
+/// Streams `source` to the reader until the link changes, the source fails or the feed stops, or
+/// a write fails (`Err`).
+fn stream_source(shared: &Shared, stream: &mut UnixStream, source: &SourceSpec, generation: u32, spec: FrameSpec) -> io::Result<Streamed> {
+    let Ok(sub) = shared.hub.subscribe(source, spec) else { return Ok(Streamed::Failed { delivered: false }) };
+    let mut delivered = false;
     loop {
         if shared.stop.load(Ordering::SeqCst) {
-            return Ok(false);
+            return Ok(Streamed::Failed { delivered });
         }
         if lock(&shared.link).generation != generation {
-            return Ok(true);
+            return Ok(Streamed::Relinked);
         }
         match sub.recv_timeout(POLL) {
-            Ok(Some(frame)) => write_frame(stream, &frame, generation)?,
+            Ok(Some(frame)) => {
+                write_frame(stream, &frame, generation)?;
+                delivered = true;
+            }
             Ok(None) => {
                 if peer_gone(stream) {
                     return Err(io::Error::new(ErrorKind::BrokenPipe, "reader went away"));
                 }
             }
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(Streamed::Failed { delivered }),
         }
     }
 }
@@ -495,6 +547,117 @@ pub fn read_frame(r: &mut impl Read) -> Result<(FrameHeader, Vec<u8>)> {
     let mut bgra = vec![0u8; header.pixel_len()];
     r.read_exact(&mut bgra).map_err(|e| Error::Io(format!("camera feed: reading {} bytes of pixels: {e}", bgra.len())))?;
     Ok((header, bgra))
+}
+
+/// Opens `feed:<path>`: a [`FeedSource`] reading the feed at `path`, asking for `spec`'s size and
+/// rate. No feed listening there is [`Error::Missing`], which a camera shows as its source missing
+/// and tries again later.
+pub fn open(path: &Path, spec: FrameSpec) -> Result<Box<dyn Source>> {
+    Ok(Box::new(FeedSource::connect(path, spec)?))
+}
+
+/// The newest frame a feed sent, as its reader thread posts it.
+#[derive(Default)]
+struct Newest {
+    slot: Mutex<Slot>,
+    arrived: Condvar,
+}
+
+#[derive(Default)]
+struct Slot {
+    /// Frames read so far, and the last of them.
+    count: u64,
+    frame: Option<(FrameHeader, Arc<[u8]>)>,
+    at: Option<Instant>,
+    gone: Option<String>,
+}
+
+/// A feed read as a camera source: emu's camera HAL reads another device's screen this way, from
+/// the feed the simee server serves it on (`feed:<socket path>`). A thread reads the feed's frames,
+/// which come at the size and rate the source was opened at, paced by the serving side; each
+/// capture tick takes the newest, waiting up to a tick for one. The feed closing, or going silent
+/// for [`SILENCE`] (its source failing on the serving side), is [`Error::Missing`].
+pub struct FeedSource {
+    path: PathBuf,
+    newest: Arc<Newest>,
+    seen: u64,
+    stream: UnixStream,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl FeedSource {
+    pub fn connect(path: &Path, spec: FrameSpec) -> Result<FeedSource> {
+        let missing = |e: io::Error| {
+            Error::Missing(format!(
+                "no camera feed at {} ({e}); the simee server serves it while the device's camera is linked",
+                path.display()
+            ))
+        };
+        let mut stream = UnixStream::connect(path).map_err(missing)?;
+        stream.write_all(&Hello { width: spec.width, height: spec.height, fps: spec.fps }.to_bytes()).map_err(missing)?;
+        let newest = Arc::new(Newest::default());
+        let mut reader = stream.try_clone().map_err(|e| Error::Io(format!("camera feed {}: {e}", path.display())))?;
+        let (post, shown) = (newest.clone(), path.display().to_string());
+        let thread = thread::Builder::new()
+            .name("camera feed source".into())
+            .spawn(move || {
+                loop {
+                    let read = read_frame(&mut reader);
+                    let mut slot = lock(&post.slot);
+                    match read {
+                        Ok((header, bgra)) => {
+                            slot.count += 1;
+                            slot.frame = Some((header, bgra.into()));
+                            slot.at = Some(Instant::now());
+                        }
+                        Err(e) => {
+                            slot.gone = Some(format!("the camera feed at {shown} closed ({e})"));
+                            drop(slot);
+                            post.arrived.notify_all();
+                            return;
+                        }
+                    }
+                    drop(slot);
+                    post.arrived.notify_all();
+                }
+            })
+            .map_err(|e| Error::Capture(format!("camera feed: can't start the reader thread: {e}")))?;
+        Ok(FeedSource { path: path.to_owned(), newest, seen: 0, stream, thread: Some(thread) })
+    }
+}
+
+impl Drop for FeedSource {
+    fn drop(&mut self) {
+        // Closing both directions ends the reader's blocking read, and tells the feed it left.
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Source for FeedSource {
+    fn frame(&mut self, spec: FrameSpec, tick: Tick) -> Result<CameraFrame> {
+        let wait = if self.seen == 0 { SILENCE } else { spec.interval() };
+        let deadline = Instant::now() + wait;
+        let mut slot = lock(&self.newest.slot);
+        while slot.count == self.seen && slot.gone.is_none() {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            slot = self.newest.arrived.wait_timeout(slot, deadline - now).map_or_else(|p| p.into_inner().0, |(g, _)| g);
+        }
+        if let Some(why) = &slot.gone {
+            return Err(Error::Missing(why.clone()));
+        }
+        let silent = slot.at.is_none_or(|at| at.elapsed() >= SILENCE);
+        let Some((header, bgra)) = slot.frame.clone().filter(|_| !silent) else {
+            return Err(Error::Missing(format!("the camera feed at {} sent no frame in {} s", self.path.display(), SILENCE.as_secs())));
+        };
+        self.seen = slot.count;
+        Ok(CameraFrame { width: header.width, height: header.height, bgra, tick })
+    }
 }
 
 #[cfg(test)]
@@ -761,5 +924,83 @@ mod tests {
         std::os::unix::fs::symlink(&base, base.join("link")).unwrap_or_else(|e| panic!("{e}"));
         assert!(private_dir_in(&base, "link").is_err(), "a symlink is refused");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_source_that_keeps_failing_is_retried_with_a_doubling_wait() {
+        let (feed, opened) = feed("backoff", SourceSpec::Solid("red".into()), 30);
+        let _r = reader(&feed, DEFAULT);
+        // Opens at 0, 0.5 s, 1.5 s, 3.5 s: three in 2.2 s (a flat 250 ms retry would make nine).
+        thread::sleep(Duration::from_millis(2200));
+        let n = opened.load(Ordering::SeqCst);
+        assert!((2..=3).contains(&n), "{n} opens in 2.2 s");
+    }
+
+    #[test]
+    fn socket_paths_in_a_device_directory_fit_and_keep_the_ios_name() {
+        let short = Path::new("/Users/a/.android/avd/Pixel_9.avd/simee");
+        assert_eq!(socket_path_in(short, "cam-back.sock").ok(), Some(short.join("cam-back.sock")));
+        if std::env::temp_dir().as_os_str().len() > 50 {
+            eprintln!("skipped the fallback paths: this temp directory is too long for them");
+            return;
+        }
+        let long = Path::new("/Users/someone-with-a-long-name/some/deeply/nested/avd/home/that/goes/on/Pixel_9_API_36.avd/simee");
+        let (back, front) = (socket_path_in(long, "cam-back.sock"), socket_path_in(long, "cam-front.sock"));
+        let (back, front) = (back.unwrap_or_else(|e| panic!("{e}")), front.unwrap_or_else(|e| panic!("{e}")));
+        assert_ne!(back, front, "one socket per camera");
+        assert!(back.file_name().is_some_and(|n| n.to_string_lossy().ends_with("-cam-back.sock")), "{}", back.display());
+        let data = Path::new("/Users/someone-with-a-long-name/Library/Developer/CoreSimulator/Devices/0053A2F9-1FD0/data/x/y/zz");
+        assert_eq!(socket_path(data).ok(), socket_path_in(data, "cam.sock").ok(), "the iOS feed's path is unchanged");
+        assert!(socket_path(data).is_ok_and(|p| p.file_name().is_some_and(|n| !n.to_string_lossy().contains('-'))));
+    }
+
+    /// A feed's opener that records the spec each capture was opened at.
+    struct Recording(Arc<Mutex<Vec<FrameSpec>>>);
+
+    impl Opener for Recording {
+        fn open(&self, source: &SourceSpec, spec: FrameSpec) -> Result<Box<dyn Source>> {
+            self.0.lock().unwrap_or_else(|p| p.into_inner()).push(spec);
+            match source {
+                SourceSpec::Text(t) => Ok(Box::new(Fill(t.bytes().next().unwrap_or(0)))),
+                other => Err(Error::Unsupported(format!("recording opener: {other}"))),
+            }
+        }
+    }
+
+    /// emu's side: a camera hub that opens `feed:<socket>` through the host opener reads the feed
+    /// at the size and rate it subscribes at, relinks included, and a feed that stops is missing.
+    #[test]
+    fn a_feed_source_reads_the_feed_at_the_size_and_rate_it_asks_for() {
+        let specs = Arc::new(Mutex::new(Vec::new()));
+        let serving = Arc::new(Hub::new(Recording(specs.clone())));
+        let feed = Feed::serve(serving, sock("source"), text("k"), FrameSpec::default()).unwrap_or_else(|e| panic!("{e}"));
+        let emu = Hub::new(crate::HostOpener::new());
+        let linked = SourceSpec::parse(&format!("feed:{}", feed.path().display())).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(linked, SourceSpec::Feed(feed.path().to_owned()));
+        let want = FrameSpec::new(176, 144, 15).unwrap_or_default();
+        let sub = emu.subscribe(&linked, want).unwrap_or_else(|e| panic!("{e}"));
+        let frame = sub.recv_timeout(Duration::from_secs(5)).ok().flatten().expect("a frame");
+        assert_eq!((frame.width, frame.height, frame.bgra[0]), (176, 144, b'k'));
+        assert_eq!(lock(&specs).first(), Some(&want), "the serving side captures at the camera's size and rate");
+        feed.set_source(text("m"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let f = sub.recv_timeout(Duration::from_secs(5)).ok().flatten().expect("a frame");
+            if f.bgra[0] == b'm' {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the relink reached the camera");
+        }
+        drop(feed);
+        let end = loop {
+            match sub.recv_timeout(Duration::from_secs(5)) {
+                Ok(Some(_)) => continue,
+                other => break other,
+            }
+        };
+        assert!(matches!(&end, Err(Error::Missing(m)) if m.contains("closed")), "{end:?}");
+        // Nothing listening: missing at once, naming who serves it.
+        let err = open(&sock("absent"), want).err();
+        assert!(matches!(&err, Some(Error::Missing(m)) if m.contains("simee server")), "{err:?}");
     }
 }

@@ -1974,9 +1974,7 @@ dependencies = [
  "qrcodegen",
  "serde",
  "serde_json",
- "simee-android",
  "simee-core",
- "simee-coresim",
  "thiserror 2.0.21",
  "zune-jpeg",
 ]

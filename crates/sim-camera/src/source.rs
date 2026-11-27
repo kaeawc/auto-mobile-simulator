@@ -1,6 +1,8 @@
 //! The `Source` trait every camera source implements, and the opener that turns a source id into
-//! one: synthetic kinds directly, another device's screen through its reader, webcams after
-//! resolving the id and checking the permission.
+//! one: synthetic kinds directly, a camera feed by connecting to it, webcams after resolving the id
+//! and checking the permission. Another device's screen (`device:`) is captured by the simee server
+//! (`sim-api` wraps this opener), never here, so emu, which links this crate, links neither device
+//! stack.
 
 use std::sync::Arc;
 
@@ -42,8 +44,8 @@ pub trait Opener: Send + Sync {
 
 type CameraList = dyn Fn() -> Result<Vec<HostCamera>> + Send + Sync;
 
-/// The opener for real use: synthetic sources, other devices' screens, and the host's cameras
-/// behind the permission check.
+/// The opener for real use: synthetic sources, camera feeds, and the host's cameras behind the
+/// permission check. A `device:` source is refused with who serves it.
 pub struct HostOpener {
     authorizer: Arc<dyn Authorizer>,
     cameras: Box<CameraList>,
@@ -80,8 +82,9 @@ impl Opener for HostOpener {
     fn open(&self, source: &SourceSpec, spec: FrameSpec) -> Result<Box<dyn Source>> {
         let query = match source {
             SourceSpec::Webcam(query) => query,
-            // A device's screen needs no camera permission.
-            SourceSpec::Device(device) => return crate::device::open(device),
+            SourceSpec::Device(device) => return Err(crate::device::served_by_simee(device)),
+            // A feed needs no camera permission: whoever serves it captured the source.
+            SourceSpec::Feed(path) => return open_feed(path, spec),
             other => return synth::open(other),
         };
         // The permission first: a capture without it would deliver black frames, or none.
@@ -90,6 +93,16 @@ impl Opener for HostOpener {
         let camera = resolve_webcam(query, &cameras)?;
         open_webcam(camera, spec)
     }
+}
+
+#[cfg(unix)]
+fn open_feed(path: &std::path::Path, spec: FrameSpec) -> Result<Box<dyn Source>> {
+    crate::feed::open(path, spec)
+}
+
+#[cfg(not(unix))]
+fn open_feed(path: &std::path::Path, _spec: FrameSpec) -> Result<Box<dyn Source>> {
+    Err(crate::Error::Unsupported(format!("feed:{}: camera feeds need Unix sockets", path.display())))
 }
 
 #[cfg(target_os = "macos")]

@@ -19,6 +19,14 @@
 //! session resubscribes at the size it is open at, so a relink never changes what the guest sees
 //! but the pixels. Captures go through one [`Hub`], so two cameras on one source share it.
 //!
+//! Another device's screen comes as `feed:<socket>` (`sim_camera::feed`): the simee server
+//! captures that device and serves it on the socket, at the size and rate this camera subscribes
+//! at; emu only reads it, and links neither the Android nor the iOS stack (a `device:` link here
+//! says who serves it). A linked source that fails, to open or before its first frame, shows the
+//! test card and is tried again after [`RETRY_MIN`], doubling to [`RETRY_MAX`]: a feed that isn't
+//! served yet (the server starts it as the device boots) or a source that can't work is never
+//! reopened on every guest frame.
+//!
 //! The guest's pipe transport serves every pipe on one thread, so each session answers from a
 //! thread of its own: waiting for a source's first frame and converting it never stall adb.
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -426,7 +434,10 @@ struct Feed {
     /// it ("source missing"), and the source is tried again at `retry_at`.
     missing: bool,
     retry_at: Instant,
+    /// The wait before this try; the next failure in a row doubles it.
     backoff: Duration,
+    /// The linked source delivered a frame: its failure starts the backoff over.
+    delivered: bool,
 }
 
 struct Started {
@@ -587,11 +598,13 @@ impl Session {
             // Keep the old frame across a relink (not a resize) until the new source delivers.
             let last = old.filter(|f| (f.width, f.height) == (width, height)).and_then(|f| f.last);
             let (sub, missing) = link.source.as_ref().map_or((None, false), |source| self.subscribe(source, width, height));
-            let mut feed = Feed { width, height, generation: link.generation, sub, last, missing, retry_at: now + backoff, backoff };
+            let mut feed =
+                Feed { width, height, generation: link.generation, sub, last, missing, retry_at: now + backoff, backoff, delivered: false };
             if let Some(sub) = &feed.sub
                 && let Ok(Some(first)) = sub.recv_timeout(FIRST_FRAME)
             {
                 feed.last = Some(first);
+                feed.delivered = !feed.missing;
             }
             self.feed = Some(feed);
         }
@@ -601,14 +614,22 @@ impl Session {
         if let Some(sub) = &feed.sub {
             loop {
                 match sub.try_recv() {
-                    Ok(Some(f)) => feed.last = Some(f),
+                    Ok(Some(f)) => {
+                        feed.last = Some(f);
+                        feed.delivered |= !feed.missing;
+                    }
                     Ok(None) => break,
                     Err(e) => {
-                        eprintln!("emu: camera {label}: source missing: {e}; trying it again");
+                        // A source that streamed and then died starts the backoff over; one that
+                        // dies before its first frame (a region off the screen, a feed with no
+                        // source) waits longer each time instead of reopening on every frame.
+                        if feed.delivered {
+                            feed.backoff = retry;
+                        }
+                        eprintln!("emu: camera {label}: source missing: {e}; trying it again in {:.1} s", feed.backoff.as_secs_f32());
                         feed.sub = None;
                         feed.missing = true;
-                        feed.retry_at = Instant::now();
-                        feed.backoff = retry;
+                        feed.retry_at = Instant::now() + feed.backoff;
                         break;
                     }
                 }
@@ -977,6 +998,70 @@ mod tests {
         }
         assert!(opens.load(Ordering::SeqCst) >= 2, "reopened after it died");
         assert!(luma_after(&mut s, 82), "red again");
+    }
+
+    /// A webcam that opens every time and fails on its first frame, like a region off the source
+    /// device's screen used to.
+    struct DiesAtOnce(Arc<AtomicUsize>);
+
+    impl sim_camera::Opener for DiesAtOnce {
+        fn open(&self, source: &SourceSpec, _spec: FrameSpec) -> sim_camera::Result<Box<dyn sim_camera::Source>> {
+            let SourceSpec::Webcam(_) = source else { return sim_camera::synth::open(source) };
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Dying { inner: sim_camera::synth::open(&SourceSpec::parse("solid:red").expect("red"))?, left: Some(0) }))
+        }
+    }
+
+    #[test]
+    fn a_source_that_opens_but_never_delivers_is_retried_with_a_doubling_wait_not_every_frame() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let c = Arc::new(Cameras::with_opener(DiesAtOnce(opens.clone()), Duration::from_millis(40)));
+        c.link(Facing::Back, Some(SourceSpec::Webcam("cam".into())));
+        let mut s = Session::new(Some(Facing::Back), c, None);
+        assert_eq!(payload(&s.handle(&format!("start dim=176x144 pix={}", nv21()))), b"ok\0");
+        // The guest asks for frames every 5 ms for a second.
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(1) {
+            let r = s.handle("frame video=38016 preview=0");
+            assert_eq!(payload(&r).len(), 3 + 38016, "a frame every time (the test card)");
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Waits of 40, 80, 160, 320 ms: about five opens, where reopening per frame made ~150.
+        let n = opens.load(Ordering::SeqCst);
+        assert!((3..=7).contains(&n), "{n} opens in a second");
+    }
+
+    /// Another device's screen as the simee server serves it: a feed on a socket. The camera shows
+    /// the test card until the feed is served, then reads it, at the size the guest opened.
+    #[test]
+    fn a_feed_link_reads_the_feed_the_server_serves_once_it_is_there() {
+        let path = std::path::PathBuf::from("/tmp").join(format!("emu-cam-feed-{}.sock", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        let c = Arc::new(Cameras::with_opener(HostOpener::new(), Duration::from_millis(40)));
+        c.link(Facing::Back, parse_link(&format!("feed:{}", path.display())).expect("feed link"));
+        let mut s = Session::new(Some(Facing::Back), c, None);
+        assert_eq!(payload(&s.handle(&format!("start dim=176x144 pix={}", nv21()))), b"ok\0");
+        let r = s.handle("frame video=38016 preview=0");
+        let luma = &payload(&r)[3..3 + 176 * 144];
+        assert!(luma.iter().any(|&y| y != luma[0]), "the test card while nothing serves the feed");
+        // The server starts the feed (here, a red source behind it).
+        let hub = Arc::new(Hub::new(HostOpener::new()));
+        let feed =
+            sim_camera::feed::Feed::serve(hub, &path, SourceSpec::parse("solid:red").expect("red"), FrameSpec::default()).expect("serve");
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(5) && payload(&s.handle("frame video=38016 preview=0"))[3] != 82 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(luma_after(&mut s, 82), "red from the feed");
+        assert_eq!(feed.readers(), 1, "one connection, at the camera's size");
+        drop(feed);
+    }
+
+    #[test]
+    fn a_device_link_says_the_server_serves_it() {
+        let link = parse_link("device:Pixel_9").expect("parses");
+        let err = sim_camera::Opener::open(&HostOpener::new(), link.as_ref().expect("a source"), FrameSpec::default()).err();
+        assert!(matches!(&err, Some(sim_camera::Error::Unsupported(m)) if m.contains("simee server")), "{err:?}");
     }
 
     #[test]

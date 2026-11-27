@@ -1,21 +1,21 @@
 //! `device:<udid or name>[:x,y,w,h]`: another simee device's live screen as a camera, optionally
 //! cropped to a region of it, so one device can scan a QR code another one shows.
 //!
-//! A backend's reader thread posts the source device's frames to a [`Screen`] as the device
-//! presents them, and a [`DeviceSource`] turns the newest one into camera frames:
+//! A reader thread posts the source device's frames to a [`Screen`] as the device presents them,
+//! and a [`DeviceSource`] turns the newest one into camera frames. The readers (an Android device
+//! through emu's display socket, a simulator through its framebuffer surface) link that platform's
+//! stack, so they live in `sim-api`, which the simee server runs: this crate never links them, and
+//! neither does emu, which reads another device's screen as a `feed:` the server serves it
+//! ([`crate::feed`]). Here a `device:` source opens to [`served_by_simee`]'s error.
 //!
-//! - **Android** (an AVD name): emu's display socket and shared frame ring
-//!   (`sim_android::display`), at full size: one `pread` from the ring per device frame.
-//! - **iOS** (a simulator's UDID or name, macOS only): the framebuffer `IOSurface`'s frame
-//!   callback, then one copy out of the locked surface (`sim_coresim::Display::capture`) when its
-//!   seed says the contents changed.
-//!
-//! Each subscriber size is then drawn in one pass from that frame: the region cropped, the result
+//! Each subscriber size is drawn in one pass from the device frame: the region cropped, the result
 //! scaled to fill the size (aspect kept, overflow cropped from both sides, nearest neighbour) and
 //! swizzled to BGRA. Pacing follows the device: a capture tick takes a frame the device presented
 //! since the last one, waiting up to one tick for it, and repeats the last frame (shared, not
-//! redrawn) while the screen is still. The source device going away (shut down, its display
-//! closed) is [`Error::Missing`], which the hub reports as `SourceMissing`.
+//! redrawn) while the screen is still. A region the screen no longer covers (the device rotated)
+//! draws black, said once, until it is on the screen again: the capture never fails over it, so
+//! nothing reconnects. The source device going away (shut down, its display closed) is
+//! [`Error::Missing`], which the hub reports as `SourceMissing`.
 
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -73,6 +73,43 @@ impl DeviceSpec {
     pub fn names(&self, names: &[&str]) -> bool {
         names.iter().map(|n| n.trim()).any(|n| !n.is_empty() && n.eq_ignore_ascii_case(&self.device))
     }
+
+    /// Whether this is `device:booted`, which names whichever simulator is booted: resolve it
+    /// before comparing it with anything.
+    pub fn is_booted(&self) -> bool {
+        self.device.eq_ignore_ascii_case("booted")
+    }
+}
+
+/// What opening a `device:` source says outside the simee server: who captures it.
+pub fn served_by_simee(spec: &DeviceSpec) -> Error {
+    Error::Unsupported(format!(
+        "device:{}: another device's screen is captured by the simee server (`simee serve`), not here; link it with `simee camera \
+         link`, which serves it to this device as a feed: source",
+        spec.device
+    ))
+}
+
+/// Checks `region` against a device whose screen is `screen` now: a region off the screen is an
+/// error naming the screen's size; one partly off is clipped to it (fine).
+pub fn check_region(name: &str, region: Option<Region>, screen: (u32, u32)) -> Result<()> {
+    window(region, screen, screen).map(drop).map_err(|e| Error::Invalid(format!("device:{name}: {e}")))
+}
+
+/// The frame width to ask a `screen`-sized device for (its frames come downscaled by a whole
+/// factor to at most this wide) so that `region` (the whole screen without one) still fills a
+/// `spec`-sized camera frame at its own resolution or better: the smallest such frame, never wider
+/// than the screen.
+pub fn needed_width(region: Option<Region>, screen: (u32, u32), spec: FrameSpec) -> u32 {
+    let (sw, sh) = (screen.0.max(1), screen.1.max(1));
+    let r = window(region, (sw, sh), (sw, sh)).unwrap_or(Region { x: 0, y: 0, width: sw, height: sh });
+    let (rw, rh, dw, dh) = (u64::from(r.width), u64::from(r.height), u64::from(spec.width), u64::from(spec.height));
+    // The part of the region the camera frame shows (aspect kept, the overflow cropped).
+    let visible = if rw * dh > dw * rh { (rh * dw / dh).max(1) } else { rw };
+    // The screen width at which that part is `dw` wide, as a whole downscale factor of the screen.
+    let wanted = (u64::from(sw) * dw).div_ceil(visible).min(u64::from(sw));
+    let factor = (u64::from(sw) / wanted.max(1)).max(1);
+    u64::from(sw).div_ceil(factor) as u32
 }
 
 impl fmt::Display for DeviceSpec {
@@ -187,7 +224,7 @@ const FIRST_FRAME: Duration = Duration::from_secs(5);
 const SIZES: usize = 8;
 
 /// What keeps a backend's reader running; dropping it stops the reader.
-type Reader = Box<dyn Send>;
+pub type Reader = Box<dyn Send>;
 
 /// A camera frame drawn from the current device frame, by its size.
 type Drawn = ((u32, u32), Arc<[u8]>);
@@ -204,11 +241,14 @@ pub struct DeviceSource {
     /// drawn from the same one.
     waited: Option<u64>,
     drawn: Vec<Drawn>,
+    /// The region is off the screen now, and that was said.
+    off_screen: bool,
     _reader: Option<Reader>,
 }
 
 impl DeviceSource {
-    /// A source over `screen`, which something else posts `name`'s frames to (a test's fake).
+    /// A source over `screen`, which something else posts `name`'s frames to (a reader thread,
+    /// or a test's fake).
     pub fn new(name: &str, region: Option<Region>, screen: Arc<Screen>) -> DeviceSource {
         DeviceSource {
             name: name.to_string(),
@@ -218,13 +258,33 @@ impl DeviceSource {
             shot: None,
             waited: None,
             drawn: Vec::new(),
+            off_screen: false,
             _reader: None,
         }
     }
 
-    fn reading(mut self, reader: Reader) -> DeviceSource {
+    /// Keeps `reader` (whatever posts to the screen) for the source's life: dropping the source
+    /// drops it, which stops it.
+    pub fn reading(mut self, reader: Reader) -> DeviceSource {
         self._reader = Some(reader);
         self
+    }
+
+    /// The window of `shot` to draw: `None` (black) while the region is off the screen, said once
+    /// each time it goes off.
+    fn window_of(&mut self, shot: &Shot) -> Option<Region> {
+        match window(self.region, (shot.width, shot.height), shot.screen) {
+            Ok(w) => {
+                self.off_screen = false;
+                Some(w)
+            }
+            Err(e) => {
+                if !std::mem::replace(&mut self.off_screen, true) {
+                    eprintln!("simee: camera device:{}: {e} (rotated?); the camera shows black until it is on the screen again", self.name);
+                }
+                None
+            }
+        }
     }
 }
 
@@ -238,16 +298,17 @@ impl Source for DeviceSource {
                 self.drawn.clear();
             }
         }
-        let Some(shot) = &self.shot else {
+        let Some(shot) = self.shot.clone() else {
             return Err(Error::Capture(format!("no frames from device {} in {} s", self.name, self.first_frame.as_secs())));
         };
         let size = (spec.width, spec.height);
         let bgra = match self.drawn.iter().find(|(s, _)| *s == size) {
             Some((_, bgra)) => bgra.clone(),
             None => {
-                let window = window(self.region, (shot.width, shot.height), shot.screen)
-                    .map_err(|e| Error::Invalid(format!("device:{}: {e}", self.name)))?;
-                let bgra: Arc<[u8]> = crop_fill(&shot.rgba, shot.width, shot.height, window, spec.width, spec.height)?.into();
+                let bgra: Arc<[u8]> = match self.window_of(&shot) {
+                    Some(window) => crop_fill(&shot.rgba, shot.width, shot.height, window, spec.width, spec.height)?.into(),
+                    None => black(spec.width, spec.height).into(),
+                };
                 if self.drawn.len() >= SIZES {
                     self.drawn.clear();
                 }
@@ -283,6 +344,11 @@ pub fn window(region: Option<Region>, frame: (u32, u32), screen: (u32, u32)) -> 
     Ok(Region { x, y, width, height })
 }
 
+/// An opaque black BGRA frame.
+fn black(width: u32, height: u32) -> Vec<u8> {
+    [0, 0, 0, 255].repeat(width as usize * height as usize)
+}
+
 /// Draws `window` of an RGBA picture into a `dst_w`x`dst_h` BGRA frame the way a camera fills
 /// its sensor: aspect kept, the whole frame covered, the overflow cropped equally from both sides
 /// (nearest neighbour), every pixel opaque.
@@ -312,228 +378,6 @@ pub fn crop_fill(src: &[u8], src_w: u32, src_h: u32, window: Region, dst_w: u32,
         }
     }
     Ok(out)
-}
-
-/// Opens `device:` `spec`: an AVD of that name, else (macOS) a simulator by UDID or name.
-pub fn open(spec: &DeviceSpec) -> Result<Box<dyn Source>> {
-    let screen = Arc::new(Screen::default());
-    let reader = start(&spec.device, screen.clone())?;
-    Ok(Box::new(DeviceSource::new(&spec.device, spec.region, screen).reading(reader)))
-}
-
-#[cfg(all(unix, feature = "device-source"))]
-fn start(name: &str, screen: Arc<Screen>) -> Result<Reader> {
-    let env = sim_android::Env::from_env();
-    if env.has_avd(name) {
-        let avd = env.load(name).map_err(|e| Error::Io(format!("device:{name}: {e}")))?;
-        return Ok(Box::new(android::Reader::start(&avd.dir, name, screen)?));
-    }
-    ios(name, screen)
-}
-
-#[cfg(all(not(unix), feature = "device-source"))]
-fn start(name: &str, _screen: Arc<Screen>) -> Result<Reader> {
-    Err(Error::Unsupported(format!("device:{name}: a device's screen as a camera source needs macOS or Linux")))
-}
-
-/// Without the `device-source` feature (emu's build): the id parses, and opening it says who serves it.
-#[cfg(not(feature = "device-source"))]
-fn start(name: &str, _screen: Arc<Screen>) -> Result<Reader> {
-    Err(Error::Unsupported(format!("device:{name}: device sources are served by simee, not emu")))
-}
-
-#[cfg(all(target_os = "macos", feature = "device-source"))]
-fn ios(name: &str, screen: Arc<Screen>) -> Result<Reader> {
-    Ok(Box::new(ios::Reader::start(name, screen)?))
-}
-
-#[cfg(all(unix, not(target_os = "macos"), feature = "device-source"))]
-fn ios(name: &str, _screen: Arc<Screen>) -> Result<Reader> {
-    Err(Error::Unsupported(format!(
-        "device:{name}: no AVD is named {name:?}, and an iOS simulator's screen as a camera source needs macOS"
-    )))
-}
-
-/// Android: emu's display socket, frames through its shared ring.
-#[cfg(all(unix, feature = "device-source"))]
-mod android {
-    use std::os::unix::net::UnixStream;
-    use std::path::Path;
-    use std::sync::Arc;
-    use std::thread::JoinHandle;
-
-    use sim_android::display::{Display, Frames};
-    use sim_core::stream::Input;
-
-    use super::Screen;
-    use crate::error::{Error, Result};
-
-    /// The reader thread of one display connection.
-    pub(super) struct Reader {
-        link: UnixStream,
-        thread: Option<JoinHandle<()>>,
-    }
-
-    impl Reader {
-        /// Connects to the AVD in `avd_dir` and posts its frames, at full size, to `screen`.
-        pub(super) fn start(avd_dir: &Path, name: &str, screen: Arc<Screen>) -> Result<Reader> {
-            let io = |e: String| Error::Io(format!("device:{name}: {e}"));
-            let mut display = Display::connect(avd_dir).map_err(|e| Error::Missing(format!("{name} isn't running under emu: {e}")))?;
-            display.request_shared().map_err(io)?;
-            // `hello 0` would pause the stream; full size is a width no frame exceeds.
-            display.send(&Input::Hello { max_width: u32::MAX }).map_err(io)?;
-            let mut frames = Frames::new(display.try_clone().map_err(io)?).with_fallback(display.try_clone().map_err(io)?);
-            let link = display.try_clone().map_err(io)?;
-            let name = name.to_string();
-            let thread = std::thread::Builder::new()
-                .name("camera device android".into())
-                .spawn(move || {
-                    let mut buf = Vec::new();
-                    loop {
-                        match frames.newest_frame_into(&mut buf, || true) {
-                            Ok(h) => buf = screen.post(h.width, h.height, (h.device_width, h.device_height), std::mem::take(&mut buf)),
-                            Err(e) => return screen.close(format!("{name}'s display closed (the device shut down?): {e}")),
-                        }
-                    }
-                })
-                .map_err(|e| Error::Capture(format!("can't start the device reader: {e}")))?;
-            Ok(Reader { link, thread: Some(thread) })
-        }
-    }
-
-    impl Drop for Reader {
-        fn drop(&mut self) {
-            // Closing both directions wakes the reader out of its blocking read.
-            let _ = self.link.shutdown(std::net::Shutdown::Both);
-            if let Some(t) = self.thread.take() {
-                let _ = t.join();
-            }
-        }
-    }
-}
-
-/// iOS: the framebuffer surface's frame callback. The service's objects aren't `Send`, so one
-/// thread makes the context, finds the device and reads its display for the capture's life.
-#[cfg(all(target_os = "macos", feature = "device-source"))]
-mod ios {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
-    use std::sync::{Arc, Condvar, Mutex};
-    use std::thread::JoinHandle;
-    use std::time::Duration;
-
-    use sim_core::device::DeviceState;
-    use sim_coresim::{Context, Device, Display, FrameWatch};
-
-    use super::Screen;
-    use crate::error::{Error, Result};
-
-    /// How often an idle reader checks that the device is still booted (and whether to stop).
-    const IDLE: Duration = Duration::from_millis(250);
-
-    /// "The device presented a frame", from the service's callback thread.
-    #[derive(Default)]
-    struct Presented {
-        flag: Mutex<bool>,
-        cv: Condvar,
-    }
-
-    impl Presented {
-        fn post(&self) {
-            *self.flag.lock().unwrap_or_else(|p| p.into_inner()) = true;
-            self.cv.notify_all();
-        }
-
-        /// Waits up to `timeout`: whether a frame was presented.
-        fn wait(&self, timeout: Duration) -> bool {
-            let flag = self.flag.lock().unwrap_or_else(|p| p.into_inner());
-            let (mut flag, _) = self.cv.wait_timeout_while(flag, timeout, |f| !*f).unwrap_or_else(|p| p.into_inner());
-            std::mem::take(&mut *flag)
-        }
-    }
-
-    pub(super) struct Reader {
-        stop: Arc<AtomicBool>,
-        presented: Arc<Presented>,
-        thread: Option<JoinHandle<()>>,
-    }
-
-    impl Reader {
-        /// Finds simulator `name` (a UDID or a name), checks it is booted, and posts its main
-        /// display's frames to `screen`; fails here when it can't.
-        pub(super) fn start(name: &str, screen: Arc<Screen>) -> Result<Reader> {
-            let (stop, presented) = (Arc::new(AtomicBool::new(false)), Arc::new(Presented::default()));
-            let (ready, opened) = mpsc::channel();
-            let (n, s, p) = (name.to_string(), stop.clone(), presented.clone());
-            let thread = std::thread::Builder::new()
-                .name("camera device ios".into())
-                .spawn(move || run(&n, &screen, &s, &p, &ready))
-                .map_err(|e| Error::Capture(format!("can't start the device reader: {e}")))?;
-            match opened.recv() {
-                Ok(Ok(())) => Ok(Reader { stop, presented, thread: Some(thread) }),
-                Ok(Err(e)) => {
-                    let _ = thread.join();
-                    Err(e)
-                }
-                Err(_) => {
-                    let _ = thread.join();
-                    Err(Error::Capture(format!("device:{name}: the device reader stopped before it started")))
-                }
-            }
-        }
-    }
-
-    impl Drop for Reader {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::Release);
-            self.presented.post();
-            if let Some(t) = self.thread.take() {
-                let _ = t.join();
-            }
-        }
-    }
-
-    fn open(name: &str, presented: &Arc<Presented>) -> Result<(Context, Device, Display, FrameWatch)> {
-        let context = Context::new().map_err(|e| Error::Unavailable(format!("device:{name}: the simulator service: {e}")))?;
-        let device =
-            context.device(name).map_err(|e| Error::Invalid(format!("device:{name}: no AVD or simulator is named {name:?} ({e})")))?;
-        if device.state() != DeviceState::Booted {
-            return Err(Error::Missing(format!("{name} isn't booted; boot it first (`simee boot {name}`)")));
-        }
-        let display = device.display().map_err(|e| Error::Missing(format!("{name} has no display yet: {e}")))?;
-        let p = presented.clone();
-        let watch =
-            display.watch_frames(move || p.post()).map_err(|e| Error::Unavailable(format!("device:{name}: frame callback: {e}")))?;
-        Ok((context, device, display, watch))
-    }
-
-    fn run(name: &str, screen: &Screen, stop: &AtomicBool, presented: &Arc<Presented>, ready: &mpsc::Sender<Result<()>>) {
-        let (_context, device, display, _watch) = match sim_coresim::autoreleasepool(|| open(name, presented)) {
-            Ok(opened) => opened,
-            Err(e) => {
-                let _ = ready.send(Err(e));
-                return;
-            }
-        };
-        let _ = ready.send(Ok(()));
-        // The surface already on screen counts as the first frame.
-        let mut frame = true;
-        let mut seed = None;
-        while !stop.load(Ordering::Acquire) {
-            if frame {
-                let now = display.seed();
-                if seed != Some(now)
-                    && let Ok(f) = sim_coresim::autoreleasepool(|| display.capture())
-                {
-                    seed = Some(now);
-                    screen.post(f.width, f.height, (f.width, f.height), f.rgba);
-                }
-            } else if sim_coresim::autoreleasepool(|| device.state()) != DeviceState::Booted {
-                return screen.close(format!("{name} shut down"));
-            }
-            frame = presented.wait(IDLE);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -731,13 +575,68 @@ mod tests {
         assert!(matches!(&err, Error::Capture(m) if m.contains("Pixel_9")), "{err:?}");
     }
 
+    /// A portrait 64x128 screen whose rows below 80 are 200, above 80 are 10.
+    fn portrait(screen: &Screen) {
+        let rgba: Vec<u8> = (0..128u32).flat_map(|y| [if y >= 80 { 200 } else { 10 }; 64 * 4]).collect();
+        screen.post(64, 128, (64, 128), rgba);
+    }
+
     #[test]
-    fn a_region_off_the_screen_fails_when_drawn() {
+    fn a_region_the_screen_stops_covering_draws_black_and_comes_back_without_failing() {
         let screen = Arc::new(Screen::default());
-        let mut source = DeviceSource::new("A", Some(Region { x: 100, y: 0, width: 10, height: 10 }), screen.clone());
-        solid(&screen, 1);
-        let err = source.frame(fps(32, 32, 30), tick(0)).expect_err("off screen");
-        assert!(matches!(&err, Error::Invalid(m) if m.contains("device:A") && m.contains("outside the 64x64")), "{err:?}");
+        // The bottom of a portrait screen: off the screen once it turns landscape (128x64).
+        let mut source = DeviceSource::new("A", Some(Region { x: 0, y: 96, width: 64, height: 32 }), screen.clone());
+        portrait(&screen);
+        assert_eq!(take(&mut source, fps(32, 32, 30), 0).pixel(0, 0), [200, 200, 200, 255]);
+        // Rotated: no error (an error would end the capture, and every reader would reconnect).
+        screen.post(128, 64, (128, 64), vec![10; 128 * 64 * 4]);
+        let f = take(&mut source, fps(32, 32, 30), 1);
+        assert!(f.bgra.chunks(4).all(|p| p == [0, 0, 0, 255]), "black while off the screen");
+        assert!(source.off_screen, "said once");
+        let again = take(&mut source, fps(32, 32, 30), 2);
+        assert!(Arc::ptr_eq(&again.bgra, &f.bgra) || again.bgra.chunks(4).all(|p| p == [0, 0, 0, 255]));
+        // Back to portrait: the region again.
+        portrait(&screen);
+        assert_eq!(take(&mut source, fps(32, 32, 30), 3).pixel(0, 0), [200, 200, 200, 255]);
+        assert!(!source.off_screen);
+    }
+
+    #[test]
+    fn outside_the_server_a_device_source_says_who_captures_it() {
+        let spec = SourceSpec::parse("device:Pixel_9:0,0,10,10").unwrap_or_else(|e| panic!("{e}"));
+        let err = crate::HostOpener::new().open(&spec, FrameSpec::default()).err();
+        assert!(matches!(&err, Some(Error::Unsupported(m)) if m.contains("device:Pixel_9") && m.contains("simee server")), "{err:?}");
+    }
+
+    #[test]
+    fn a_region_is_checked_against_the_screen_it_will_crop() {
+        let r = |x, y, width, height| Some(Region { x, y, width, height });
+        assert_eq!(check_region("A", r(0, 1500, 1080, 600), (1080, 2400)), Ok(()));
+        assert_eq!(check_region("A", r(1000, 0, 500, 10), (1080, 2400)), Ok(()), "partly off: clipped");
+        assert_eq!(check_region("A", None, (1080, 2400)), Ok(()));
+        for (region, screen) in [(r(0, 1500, 1080, 600), (2400, 1080)), (r(5000, 5000, 10, 10), (1080, 2400))] {
+            let err = check_region("A", region, screen).expect_err("off the screen").to_string();
+            assert!(err.contains("device:A") && err.contains(&format!("outside the {}x{} screen", screen.0, screen.1)), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_frame_asked_of_a_device_is_the_smallest_that_keeps_the_cameras_resolution() {
+        let vga = fps(640, 480, 30);
+        // A whole 1080x2400 screen into 640x480: the visible part is 1080x810, so 640 wide does;
+        // the widest whole downscale of 1080 that is at least 640 is 1080 itself.
+        assert_eq!(needed_width(None, (1080, 2400), vga), 1080);
+        assert_eq!(needed_width(None, (1080, 2400), fps(176, 144, 30)), 180, "a sixth: 180 >= 176");
+        // A small region needs the screen at full size.
+        assert_eq!(needed_width(Some(Region { x: 0, y: 1500, width: 540, height: 600 }), (1080, 2400), vga), 1080);
+        // A big screen and a small camera: a quarter (1440 / 4 = 360 >= 352), never below it.
+        assert_eq!(needed_width(None, (1440, 3120), fps(352, 288, 30)), 360);
+        // Landscape into VGA: the visible part is 1440 of 2400 wide, so half (1200) keeps 720.
+        assert_eq!(needed_width(None, (2400, 1080), vga), 1200);
+        for (screen, spec) in [((1440, 3120), fps(352, 288, 30)), ((1080, 2400), fps(176, 144, 30)), ((2400, 1080), vga)] {
+            let w = needed_width(None, screen, spec);
+            assert!(w <= screen.0 && w >= spec.width.min(screen.0), "{screen:?} {spec:?}: {w}");
+        }
     }
 
     #[test]
@@ -813,59 +712,5 @@ mod tests {
             }
         };
         assert_eq!(event, Event::SourceMissing { source: "device:A:0,0,32,32".into(), error: missing });
-    }
-
-    /// The Android reader against a fake display socket: the hello it sends, a frame it posts,
-    /// and the socket closing as the device going away.
-    #[cfg(all(unix, feature = "device-source"))]
-    #[test]
-    fn the_android_reader_posts_display_frames_and_reports_the_device_gone() {
-        use sim_core::stream::FrameHeader;
-        use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::UnixListener;
-
-        // Under /tmp: the socket path must fit a unix socket address (104 bytes on macOS).
-        let dir = std::path::PathBuf::from("/tmp").join(format!("simee-camera-device-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("simee")).unwrap_or_else(|e| panic!("{e}"));
-        let listener = UnixListener::bind(sim_android::display::socket(&dir)).unwrap_or_else(|e| panic!("{e}"));
-        let server = thread::spawn(move || {
-            let (mut conn, _) = listener.accept().unwrap_or_else(|e| panic!("{e}"));
-            let mut lines = BufReader::new(conn.try_clone().unwrap_or_else(|e| panic!("{e}"))).lines();
-            let got: Vec<String> = (0..2).filter_map(|_| lines.next()?.ok()).collect();
-            let h = FrameHeader { width: 2, height: 1, device_width: 4, device_height: 2, frame: 1, len: 8 };
-            conn.write_all(&h.encode()).and_then(|()| conn.write_all(&[1, 2, 3, 4, 5, 6, 7, 8])).unwrap_or_else(|e| panic!("{e}"));
-            // Wait for the client to have read it, then close: the device shut down.
-            thread::sleep(Duration::from_millis(100));
-            got
-        });
-        let screen = Arc::new(Screen::default());
-        let reader = android::Reader::start(&dir, "A", screen.clone()).unwrap_or_else(|e| panic!("{e}"));
-        let shot = screen.newer(None, Duration::from_secs(5)).ok().flatten().expect("a frame");
-        assert_eq!((shot.width, shot.height, shot.screen, shot.rgba.as_slice()), (2, 1, (4, 2), &[1, 2, 3, 4, 5, 6, 7, 8][..]));
-        assert_eq!(server.join().unwrap_or_default(), ["shm", "hello 4294967295"]);
-        let gone = screen.newer(Some(shot.seq), Duration::from_secs(5));
-        assert!(matches!(&gone, Err(Error::Missing(m)) if m.contains("A's display closed")), "{gone:?}");
-        drop(reader);
-        std::fs::remove_dir_all(dir).ok();
-
-        // No display socket: the device isn't running.
-        let err = android::Reader::start(std::path::Path::new("/nonexistent-avd"), "B", Arc::new(Screen::default())).err();
-        assert!(matches!(&err, Some(Error::Missing(m)) if m.contains("B isn't running")), "{err:?}");
-    }
-
-    #[cfg(all(unix, not(target_os = "macos"), feature = "device-source"))]
-    #[test]
-    fn an_ios_device_source_is_unsupported_off_macos() {
-        let err = ios("iPhone 16", Arc::new(Screen::default())).err();
-        assert!(matches!(&err, Some(Error::Unsupported(m)) if m.contains("needs macOS")), "{err:?}");
-    }
-
-    #[cfg(not(feature = "device-source"))]
-    #[test]
-    fn a_device_source_parses_but_is_unsupported_without_the_device_source_feature() {
-        let d = spec("device:Pixel_9:0,0,10,10");
-        assert_eq!(d.device, "Pixel_9");
-        let err = open(&d).err();
-        assert!(matches!(&err, Some(Error::Unsupported(m)) if m.contains("served by simee, not emu")), "{err:?}");
     }
 }
