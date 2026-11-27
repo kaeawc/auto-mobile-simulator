@@ -652,7 +652,12 @@ mod tests {
         let (joules, cpu_s) =
             ((after.energy_nj.unwrap_or(0) - me.energy_nj.unwrap_or(0)) as f64 / 1e9, (after.cpu_ns - me.cpu_ns) as f64 / 1e9);
         println!("{joules:.3} J for {cpu_s:.3} CPU-s: {:.2} W per busy core", joules / cpu_s);
-        assert!(joules > 0.0, "busy CPU costs energy");
+        // A macOS VM (GitHub's runners) reports no energy: the counters stay at zero there.
+        let in_vm = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.hv_vmm_present"])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "1");
+        assert!(joules > 0.0 || in_vm, "busy CPU costs energy");
         let mut child = std::process::Command::new("/bin/sleep").arg("5").spawn().expect("sleep");
         let kid = usage(child.id() as i32).expect("child usage");
         child.kill().ok();
