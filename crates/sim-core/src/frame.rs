@@ -8,22 +8,37 @@ pub struct Frame {
     pub rgba: Vec<u8>,
 }
 
-/// Encodes a frame as an 8-bit RGBA PNG, favouring speed over size: screenshots are taken after
-/// nearly every automated step. `Fast` (fdeflate) encodes a 2480x1740 screen in 11 ms against
-/// `Balanced`'s 74, for a file 1.7x larger (`examples/frame_bench.rs`).
+/// Encodes a frame as an 8-bit PNG, favouring speed over size: screenshots are taken after nearly
+/// every automated step. It is RGB when every alpha byte is 0xff (all of the iOS and Android
+/// frames: 25% fewer bytes to filter and compress), RGBA otherwise.
 pub fn encode_png(frame: &Frame) -> Result<Vec<u8>, String> {
     encode_rgba(frame.width, frame.height, &frame.rgba)
 }
 
 /// [`encode_png`] for RGBA rows held elsewhere (a capture shared with the display stream), with no
 /// copy into a [`Frame`] first.
+///
+/// `Fastest` is fdeflate with the `Up` filter alone. `Fast` also filters each row five ways and
+/// keeps the smallest, which on a 1206x2622 home screen costs 1.3x the time for a file half the
+/// size (`examples/frame_bench.rs`); a screenshot goes to a local file or a socket, so time wins.
 pub fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
+    // One pass drops alpha and ANDs the alpha bytes together (0xff only if all are); a frame with
+    // real alpha throws the RGB copy away, which is rare.
+    // A zeroed Vec this size comes straight from the allocator's zeroed pages: no fill pass.
+    let mut rgb = vec![0u8; rgba.len() / 4 * 3];
+    let mut alpha = 0xffu8;
+    for (d, p) in rgb.as_chunks_mut::<3>().0.iter_mut().zip(rgba.as_chunks::<4>().0) {
+        *d = [p[0], p[1], p[2]];
+        alpha &= p[3];
+    }
+    let (color, data) = if alpha == 0xff { (png::ColorType::Rgb, rgb.as_slice()) } else { (png::ColorType::Rgba, rgba) };
+    // Fastest output is about half its input; sized for that, and the Vec grows if it is not.
+    let mut out = Vec::with_capacity(data.len() / 2 + 1024);
     let mut encoder = png::Encoder::new(&mut out, width, height);
-    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_color(color);
     encoder.set_depth(png::BitDepth::Eight);
-    encoder.set_compression(png::Compression::Fast);
-    encoder.write_header().and_then(|mut w| w.write_image_data(rgba)).map_err(|e| e.to_string())?;
+    encoder.set_compression(png::Compression::Fastest);
+    encoder.write_header().and_then(|mut w| w.write_image_data(data)).map_err(|e| e.to_string())?;
     Ok(out)
 }
 
@@ -45,11 +60,45 @@ mod tests {
         let frame = Frame { width: 2, height: 1, rgba: vec![255, 0, 0, 255, 0, 0, 255, 255] };
         let png = encode_png(&frame).expect("encode");
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let (info, pixels) = decode(&png);
+        assert_eq!((info.width, info.height), (2, 1));
+        assert_eq!(pixels, [255, 0, 0, 0, 0, 255]);
+    }
+
+    fn decode(png: &[u8]) -> (png::OutputInfo, Vec<u8>) {
         let mut reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().expect("header");
         let mut buf = vec![0; reader.output_buffer_size().expect("size")];
         let info = reader.next_frame(&mut buf).expect("frame");
-        assert_eq!((info.width, info.height), (2, 1));
-        assert_eq!(&buf[..info.buffer_size()], frame.rgba.as_slice());
+        buf.truncate(info.buffer_size());
+        (info, buf)
+    }
+
+    /// Deterministic busy pixels, with `alpha(i)` for pixel `i`.
+    fn busy_frame(width: u32, height: u32, alpha: impl Fn(usize) -> u8) -> Frame {
+        let rgba = (0..(width * height) as usize)
+            .flat_map(|i| {
+                let v = i.wrapping_mul(2_654_435_761) >> 7;
+                [v as u8, (v >> 8) as u8, (v >> 16) as u8, alpha(i)]
+            })
+            .collect();
+        Frame { width, height, rgba }
+    }
+
+    #[test]
+    fn an_opaque_frame_round_trips_as_rgb() {
+        let frame = busy_frame(61, 37, |_| 0xff);
+        let (info, pixels) = decode(&encode_png(&frame).expect("encode"));
+        assert_eq!((info.width, info.height, info.color_type), (61, 37, png::ColorType::Rgb));
+        let want: Vec<u8> = frame.rgba.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
+        assert_eq!(pixels, want);
+    }
+
+    #[test]
+    fn a_frame_with_real_alpha_stays_rgba() {
+        let frame = busy_frame(61, 37, |i| if i == 1000 { 0x7f } else { 0xff });
+        let (info, pixels) = decode(&encode_png(&frame).expect("encode"));
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        assert_eq!(pixels, frame.rgba);
     }
 
     #[test]

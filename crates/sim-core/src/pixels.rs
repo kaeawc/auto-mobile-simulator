@@ -49,10 +49,13 @@ pub fn to_rgba_into(src: &[u8], width: usize, height: usize, stride: usize, form
     if stride < row_bytes || fits() != Some(true) {
         return false;
     }
-    out.resize(row_bytes * height, 0);
+    // Appended to a cleared Vec, so no byte is written twice (a zero fill first costs a tenth of a
+    // 1206x2622 capture).
+    out.clear();
+    out.reserve(row_bytes * height);
     // One loop per format, so the byte shuffle is a fixed permutation the compiler vectorizes.
-    let convert: fn(&[u8], &mut [u8]) = match format {
-        PixelFormat::Rgba => |src, dst| dst.copy_from_slice(src),
+    let convert: fn(&[u8], &mut Vec<u8>) = match format {
+        PixelFormat::Rgba => |src, dst| dst.extend_from_slice(src),
         PixelFormat::Bgra => |src, dst| shuffle(src, dst, |p| [p[2], p[1], p[0], p[3]]),
         PixelFormat::Bgrx => |src, dst| shuffle(src, dst, |p| [p[2], p[1], p[0], 0xff]),
         PixelFormat::Argb => |src, dst| shuffle(src, dst, |p| [p[1], p[2], p[3], p[0]]),
@@ -61,17 +64,15 @@ pub fn to_rgba_into(src: &[u8], width: usize, height: usize, stride: usize, form
         PixelFormat::Abgr => |src, dst| shuffle(src, dst, |p| [p[3], p[2], p[1], p[0]]),
         PixelFormat::Xbgr => |src, dst| shuffle(src, dst, |p| [p[3], p[2], p[1], 0xff]),
     };
-    for (row, dst) in out.chunks_exact_mut(row_bytes.max(1)).enumerate().take(height) {
-        convert(&src[row * stride..row * stride + row_bytes], dst);
+    for row in 0..height {
+        convert(&src[row * stride..row * stride + row_bytes], out);
     }
     true
 }
 
 #[inline(always)]
-fn shuffle(src: &[u8], dst: &mut [u8], f: impl Fn(&[u8; 4]) -> [u8; 4]) {
-    for (s, d) in src.as_chunks::<4>().0.iter().zip(dst.as_chunks_mut::<4>().0) {
-        *d = f(s);
-    }
+fn shuffle(src: &[u8], dst: &mut Vec<u8>, f: impl Fn(&[u8; 4]) -> [u8; 4]) {
+    dst.extend(src.as_chunks::<4>().0.iter().flat_map(f));
 }
 
 /// Converts a BGRA framebuffer into tightly packed opaque RGBA (the iOS framebuffer's alpha byte

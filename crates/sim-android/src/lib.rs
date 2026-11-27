@@ -1189,16 +1189,19 @@ fn display_rotation(lines: &[String]) -> Rotation {
     lines.iter().find_map(|l| Rotation::from_degrees(l.strip_prefix("rotation: ")?.trim().parse().ok()?)).unwrap_or_default()
 }
 
-/// Decodes an 8-bit RGBA PNG (what the emulator's `screenshot` writes).
+/// Decodes an 8-bit RGBA or RGB PNG (the emulator's `screenshot` writes RGBA; `encode_png` writes
+/// RGB for an opaque frame).
 fn decode_png(bytes: &[u8]) -> Result<Frame, String> {
     let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().map_err(|e| e.to_string())?;
     let mut buf = vec![0; reader.output_buffer_size().ok_or("PNG too large")?];
     let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
-    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
-        return Err(format!("unexpected screenshot format {:?} {:?}", info.color_type, info.bit_depth));
-    }
     buf.truncate(info.buffer_size());
-    Ok(Frame { width: info.width, height: info.height, rgba: buf })
+    let rgba = match (info.color_type, info.bit_depth) {
+        (png::ColorType::Rgba, png::BitDepth::Eight) => buf,
+        (png::ColorType::Rgb, png::BitDepth::Eight) => buf.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1], p[2], 0xff]).collect(),
+        (color, depth) => return Err(format!("unexpected screenshot format {color:?} {depth:?}")),
+    };
+    Ok(Frame { width: info.width, height: info.height, rgba })
 }
 
 #[cfg(test)]
