@@ -257,6 +257,18 @@ impl Session {
     }
 }
 
+/// From now on, this process's HID sends report when they have left, for [`flush_input`]. Only
+/// a process that exits after its input asks (an in-process CLI command): a server never waits.
+pub fn track_input() {
+    sim_coresim::track_sends();
+}
+
+/// Waits up to `timeout` for the HID messages sent since [`track_input`] to leave this process;
+/// whether they all did.
+pub fn flush_input(timeout: Duration) -> bool {
+    sim_coresim::wait_sent(timeout)
+}
+
 /// The methods that send input, each run on its device's input worker.
 const INPUT_METHODS: &[&str] =
     &["tap", "swipe", "touch", "rotary", "watch_gesture", "remote_swipe", "button", "type", "key", "pointer", "stylus"];

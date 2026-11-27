@@ -18,6 +18,13 @@ pub(crate) type Obj = Retained<AnyObject>;
 unsafe extern "C" {
     fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut c_void;
+}
+
+/// The default-priority global dispatch queue, for the service's completion handlers.
+pub(crate) fn global_queue() -> *const AnyObject {
+    // SAFETY: the default-priority global queue always exists and is never deallocated.
+    unsafe { dispatch_get_global_queue(0, 0) }.cast()
 }
 
 const RTLD_NOW: c_int = 0x2;

@@ -5,7 +5,11 @@
 use std::cell::Cell;
 use std::ffi::{CStr, c_void};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex, PoisonError};
+use std::time::Duration;
 
+use block2::{Block, RcBlock};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{msg_send, sel};
@@ -39,7 +43,7 @@ type TrackpadFn = unsafe extern "C" fn(CGPoint, u32) -> Message;
 type CreateCarPlayFn = unsafe extern "C" fn(bool) -> Message;
 type RemoveCarPlayFn = unsafe extern "C" fn() -> Message;
 type ServiceFn = unsafe extern "C" fn() -> Message;
-type SendFn = unsafe extern "C" fn(*const AnyObject, Sel, Message, bool, *const AnyObject, *const c_void);
+type SendFn = unsafe extern "C" fn(*const AnyObject, Sel, Message, bool, *const AnyObject, *const Block<dyn Fn(*mut NSError)>);
 
 /// Touch digitizer target.
 const TARGET_TOUCH: u32 = 0x32;
@@ -77,6 +81,52 @@ unsafe extern "C" {
 
 /// `CLOCK_UPTIME_RAW`: the clock SimulatorKit stamps its messages with, in nanoseconds.
 const CLOCK_UPTIME_RAW: u32 = 8;
+
+/// HID sends the client has yet to finish, counted once a process asks ([`track_sends`]).
+struct Pending {
+    on: AtomicBool,
+    /// (sent, finished).
+    counts: Mutex<(u64, u64)>,
+    finished: Condvar,
+}
+
+impl Pending {
+    const fn new() -> Self {
+        Self { on: AtomicBool::new(false), counts: Mutex::new((0, 0)), finished: Condvar::new() }
+    }
+
+    fn sent(&self) {
+        self.counts.lock().unwrap_or_else(PoisonError::into_inner).0 += 1;
+    }
+
+    fn finish(&self) {
+        self.counts.lock().unwrap_or_else(PoisonError::into_inner).1 += 1;
+        self.finished.notify_all();
+    }
+
+    /// Waits up to `timeout` for every send made so far to finish; whether they all did.
+    fn wait(&self, timeout: Duration) -> bool {
+        let counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        let sent = counts.0;
+        let (counts, _) = self.finished.wait_timeout_while(counts, timeout, |c| c.1 < sent).unwrap_or_else(PoisonError::into_inner);
+        counts.1 >= sent
+    }
+}
+
+static PENDING: Pending = Pending::new();
+
+/// From now on, every HID send in this process carries a completion handler, so [`wait_sent`]
+/// can tell when the last message has left. For a process that exits right after its input (an
+/// in-process CLI command); a long-lived server never calls it and sends without one.
+pub fn track_sends() {
+    PENDING.on.store(true, Ordering::Relaxed);
+}
+
+/// Waits up to `timeout` for every HID send made since [`track_sends`] to finish: true when they
+/// all did (at once when there are none).
+pub fn wait_sent(timeout: Duration) -> bool {
+    PENDING.wait(timeout)
+}
 
 /// A HID session with one booted device.
 pub struct Hid {
@@ -128,13 +178,21 @@ impl Hid {
             return Err(Error::Service { op: "HID", message: "message builder returned nothing".into() });
         }
         // SAFETY: `objc_msgSend` is called through the method's real signature
-        // (message*, BOOL, dispatch queue, block); nil queue and completion are accepted.
+        // (message*, BOOL, dispatch queue, void (^)(NSError *)); nil queue and completion are accepted.
         let send: SendFn = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
-        // SAFETY: the client responds to the selector (checked at connect); `message` is a valid
-        // malloc'd message whose ownership passes to the client (`freeWhenDone`).
-        unsafe {
-            send(&*self.client, sel!(sendWithMessage:freeWhenDone:completionQueue:completion:), message, true, ptr::null(), ptr::null())
-        };
+        let sel = sel!(sendWithMessage:freeWhenDone:completionQueue:completion:);
+        if !PENDING.on.load(Ordering::Relaxed) {
+            // SAFETY: the client responds to the selector (checked at connect); `message` is a
+            // valid malloc'd message whose ownership passes to the client (`freeWhenDone`).
+            unsafe { send(&*self.client, sel, message, true, ptr::null(), ptr::null()) };
+            return Ok(());
+        }
+        PENDING.sent();
+        // The client calls it once the message has left (with nil, or the error that stopped it).
+        let done = RcBlock::with_encoding::<_, _, _, rt::ErrorBlock>(|_error: *mut NSError| PENDING.finish());
+        // SAFETY: as above; the queue is a global one, and the client copies the block, which
+        // outlives the call.
+        unsafe { send(&*self.client, sel, message, true, rt::global_queue(), &*done) };
         Ok(())
     }
 
@@ -416,4 +474,62 @@ fn patch_trackpad(message: Message, phase: Phase) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use super::*;
+
+    #[test]
+    fn a_wait_with_nothing_sent_returns_at_once() {
+        let pending = Pending::new();
+        let start = Instant::now();
+        assert!(pending.wait(Duration::from_secs(1)));
+        assert!(start.elapsed() < Duration::from_millis(50), "{:?}", start.elapsed());
+    }
+
+    #[test]
+    fn a_wait_ends_when_the_last_send_finishes() {
+        let pending = Arc::new(Pending::new());
+        pending.sent();
+        pending.sent();
+        pending.finish();
+        let finisher = Arc::clone(&pending);
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            finisher.finish();
+        });
+        let start = Instant::now();
+        assert!(pending.wait(Duration::from_secs(1)), "both sends finished");
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_millis(25) && waited < Duration::from_millis(500), "{waited:?}");
+        thread.join().expect("finisher");
+    }
+
+    #[test]
+    fn a_send_that_never_finishes_gives_up_at_the_timeout() {
+        let pending = Pending::new();
+        pending.sent();
+        let start = Instant::now();
+        assert!(!pending.wait(Duration::from_millis(40)));
+        assert!(start.elapsed() >= Duration::from_millis(40), "{:?}", start.elapsed());
+    }
+
+    #[test]
+    fn a_send_made_after_a_wait_is_waited_for_by_the_next() {
+        let pending = Pending::new();
+        pending.sent();
+        pending.finish();
+        assert!(pending.wait(Duration::ZERO), "finished before the wait");
+        pending.sent();
+        assert!(!pending.wait(Duration::ZERO), "a new send is pending");
+    }
+
+    #[test]
+    fn tracking_is_off_until_asked_for() {
+        assert!(!Pending::new().on.load(Ordering::Relaxed), "a server sends without completion handlers");
+    }
 }

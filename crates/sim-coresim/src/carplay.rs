@@ -11,7 +11,7 @@
 //! The screen objects are remote proxies, so every message goes through `objc_msgSend` with its
 //! real signature, after a `respondsToSelector:` check.
 
-use std::ffi::{CStr, c_void};
+use std::ffi::CStr;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -32,16 +32,6 @@ const WAIT: Duration = Duration::from_secs(20);
 /// How long the screen stays off before CarPlay reconnects (less and iOS 26.5 may keep the old
 /// display and never render CarPlay).
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
-
-unsafe extern "C" {
-    fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut c_void;
-}
-
-/// A global dispatch queue for completion handlers.
-fn queue() -> *const AnyObject {
-    // SAFETY: the default-priority global queue always exists and is never deallocated.
-    unsafe { dispatch_get_global_queue(0, 0) }.cast()
-}
 
 type ErrorBlock = Block<dyn Fn(*mut NSError)>;
 
@@ -89,7 +79,7 @@ fn screens_of(adapter: &AnyObject) -> Result<Vec<Obj>> {
     let send: EnumerateFn = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
     // SAFETY: `adapter` responds to the selector (callers check); the block outlives the call and
     // the service copies it.
-    unsafe { send(adapter, enumerate, queue(), &*block) };
+    unsafe { send(adapter, enumerate, rt::global_queue(), &*block) };
     let raw = match rx.recv_timeout(WAIT) {
         Ok(Ok(raw)) => raw,
         Ok(Err(message)) => return Err(Error::Service { op: "enumerate screens", message }),
@@ -141,7 +131,7 @@ fn set_power(screen: &AnyObject, on: bool) -> Result<()> {
     // SAFETY: the method's signature is (int, dispatch_queue_t, void (^)(NSError *)).
     let send: PowerFn = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
     // SAFETY: `screen` responds (checked); the block outlives the call and the service copies it.
-    unsafe { send(screen, sel, i32::from(on), queue(), &*block) };
+    unsafe { send(screen, sel, i32::from(on), rt::global_queue(), &*block) };
     wait(&rx, "set the external screen's power")
 }
 
@@ -180,7 +170,7 @@ fn set_carplay_mode(screen: &AnyObject) -> Result<()> {
     let size = CGSize { width: f64::from(carplay::WIDTH), height: f64::from(carplay::HEIGHT) };
     // SAFETY: `screen` responds (checked); every object argument is live for the call and the
     // block is copied by the service.
-    unsafe { send(screen, sel, &*mode, size, &*properties, queue(), &*block) };
+    unsafe { send(screen, sel, &*mode, size, &*properties, rt::global_queue(), &*block) };
     wait(&rx, "set the CarPlay mode")
 }
 

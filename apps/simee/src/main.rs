@@ -8,7 +8,6 @@
 //! output is the same either way.
 
 use std::io::Write;
-use std::thread::sleep;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -448,6 +447,9 @@ fn flag(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
+/// How long an in-process command waits for its last HID message to leave.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Where a command's method runs: a matching server already listening, or this process.
 ///
 /// The server is tried on the first method that may be forwarded (`sim_api::forwards`; `boot`
@@ -513,17 +515,20 @@ impl Transport {
         }
         let result = match (&mut self.server, forward) {
             (Some(client), true) => client.call(method, &params),
-            _ => sim_api::call_method(self.local.get_or_insert_with(Box::default), method, &params),
+            _ => {
+                sim_api::track_input();
+                sim_api::call_method(self.local.get_or_insert_with(Box::default), method, &params)
+            }
         };
         result.map_err(anyhow::Error::msg)
     }
 
-    /// HID messages are delivered asynchronously: a command that ran in this process gives the
-    /// last one time to leave before the process (and its HID client) exits. A server keeps its
-    /// client, so there is nothing to wait for.
+    /// HID messages are delivered asynchronously: a command that ran in this process waits (up to
+    /// [`FLUSH_TIMEOUT`]) for the last one to leave before the process (and its HID client)
+    /// exits. A server keeps its client, so there is nothing to wait for.
     fn flush(&self) {
-        if self.local.is_some() {
-            sleep(Duration::from_millis(100));
+        if self.local.is_some() && !sim_api::flush_input(FLUSH_TIMEOUT) && self.verbose {
+            eprintln!("simee: input was still being sent after {} ms", FLUSH_TIMEOUT.as_millis());
         }
     }
 }
@@ -1304,6 +1309,21 @@ mod tests {
             assert_eq!(outputs(&mut transport, &["form-factors", "--json"]), expected, "{tag}");
             assert_eq!(*seen.lock().expect("lock"), ["identity"], "{tag}: nothing forwarded");
         }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn an_in_process_command_waits_only_for_input_still_being_sent() {
+        let root = android_root("flush");
+        // An Android command's input has left by the time it returns, and no HID send is pending.
+        let local = Transport { local: Some(Box::new(android_session(&root))), ..Transport::local() };
+        let start = std::time::Instant::now();
+        local.flush();
+        assert!(start.elapsed() < Duration::from_millis(50), "no fixed pause: {:?}", start.elapsed());
+        // A command that never ran here has nothing to wait for.
+        let start = std::time::Instant::now();
+        Transport::open(&root.join("none.sock")).flush();
+        assert!(start.elapsed() < Duration::from_millis(50), "{:?}", start.elapsed());
         std::fs::remove_dir_all(root).ok();
     }
 
