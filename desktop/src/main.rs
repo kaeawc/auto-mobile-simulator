@@ -1015,7 +1015,33 @@ fn main() {
     #[cfg(feature = "hot")]
     rune::run(spec);
     #[cfg(not(feature = "hot"))]
-    rune::App::new(spec).on_visibility(on_visibility).run();
+    {
+        let app = rune::App::new(spec).on_visibility(on_visibility);
+        let app = match gpu_backend(std::env::var("SIMEE_GPU_BACKEND").ok().as_deref()) {
+            Ok(Some(backend)) => app.gpu_backend(backend),
+            Ok(None) => app,
+            Err(e) => {
+                eprintln!("simee-desktop: {e}");
+                app
+            }
+        };
+        app.run();
+    }
+}
+
+/// The GPU backend `SIMEE_GPU_BACKEND` chooses on macOS: `metal` (Rune's native Metal backend,
+/// what the window draws with when it is unset) or `wgpu` (wgpu's Metal backend, which a depth
+/// buffer and MSAA resolves need, anomalyco/rune#2547). Unset or empty keeps Rune's default; an
+/// unknown name is an error the caller reports before keeping it. `RUNE_GPU_BACKEND` still wins
+/// over either. The cost of `wgpu` for the flat view is in docs/benchmarks.md.
+#[cfg_attr(feature = "hot", allow(dead_code))]
+fn gpu_backend(setting: Option<&str>) -> Result<Option<rune::GpuBackend>, String> {
+    match setting.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => Ok(None),
+        Some("metal") => Ok(Some(rune::GpuBackend::Metal)),
+        Some("wgpu") => Ok(Some(rune::GpuBackend::Wgpu)),
+        Some(other) => Err(format!("SIMEE_GPU_BACKEND={other}: expected metal or wgpu; drawing with the default")),
+    }
 }
 
 #[cfg(test)]
@@ -1785,5 +1811,21 @@ mod tests {
         rt.frame(0.0);
         let ([_, _, w, h], _) = rt.presented("device-screen").expect("screen drawn");
         assert!(h >= android::SCREEN_POINTS - 1.0, "the band took height from the screen: {w}x{h} in {window:?}");
+    }
+
+    #[test]
+    fn the_gpu_backend_setting_names_either_backend() {
+        assert_eq!(gpu_backend(Some("wgpu")), Ok(Some(rune::GpuBackend::Wgpu)));
+        assert_eq!(gpu_backend(Some(" WGPU ")), Ok(Some(rune::GpuBackend::Wgpu)));
+        assert_eq!(gpu_backend(Some("metal")), Ok(Some(rune::GpuBackend::Metal)));
+    }
+
+    /// Unset, empty or misspelt, the window keeps Rune's default (its native Metal backend on macOS).
+    #[test]
+    fn without_a_valid_gpu_backend_setting_the_default_stays() {
+        assert_eq!(gpu_backend(None), Ok(None));
+        assert_eq!(gpu_backend(Some("")), Ok(None));
+        let err = gpu_backend(Some("vulkan")).expect_err("unknown backend");
+        assert!(err.contains("SIMEE_GPU_BACKEND") && err.contains("vulkan"), "{err}");
     }
 }
