@@ -116,6 +116,10 @@ crate:
   file anywhere on the host isn't something a read-only tool may do, so the schema leaves it out
   and a call that passes it gets a tool error. Other results are JSON as text and as
   `structuredContent`.
+- `contrast_check` is held to the same rule: no `path`, and each annotated PNG (one per appearance
+  with `appearance: both`) is an image block, so the findings, a few lines of JSON, are the only
+  text (each result's `image` is its place among the image blocks). It is marked as an action, not a read: with `appearance: both` it switches an iOS
+  device's appearance and puts it back.
 
 `device_view` is the one tool that is not an API method (see [the app](#the-device-view-app)).
 
@@ -128,7 +132,7 @@ reverse):
 
 | Tools | Platforms |
 | --- | --- |
-| `help`, `identity`, `form_factors`, `devices`, `runtimes`, `create`, `delete`, `boot`, `boot_many`, `clone`, `shutdown`, `screen`, `screenshot`, `tap`, `swipe`, `touch`, `button`, `type`, `key`, `location`, `info`, `rotate`, `rotary`, `stylus`, `device_view` | Android, iOS |
+| `help`, `identity`, `form_factors`, `devices`, `runtimes`, `create`, `delete`, `boot`, `boot_many`, `clone`, `shutdown`, `screen`, `screenshot`, `contrast_check`, `tap`, `swipe`, `touch`, `button`, `type`, `key`, `location`, `info`, `rotate`, `rotary`, `stylus`, `device_view` | Android, iOS |
 | `console`, `fold`, `xr`, `vehicle`, `touchpad` | Android |
 | `device_types`, `settle`, `profile`, `erase`, `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `appearance`, `privacy`, `push`, `status_bar`, `clear_status_bar`, `content_size`, `increase_contrast`, `dynamic_island`, `backlight`, `keyboard_language`, `hardware_keyboard`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `memory_warning`, `notify`, `biometric`, `exec`, `logs`, `processes`, `kill`, `connections`, `traffic`, `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container`, `defaults_read`, `defaults_write`, `crash_reports`, `network_shape`, `network_state`, `network_flows`, `network_clear`, `network_env`, `audio_state`, `audio_volume`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `audio_mute`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
 
