@@ -32,6 +32,7 @@ on:
       - "crates/sim-api/**"
       - "crates/sim-audio/**"
       - "crates/sim-bundle/**"
+      - "crates/sim-camera/**"
       - "crates/sim-core/**"
       - "crates/sim-coresim/**"
       - "crates/sim-debug/**"
