@@ -48,9 +48,13 @@ struct Watch {
     listeners: Vec<(u64, Sender<Event>)>,
     next_id: u64,
     running: bool,
-    /// Why the watch stopped, when it failed: what every stream's next receive returns.
-    failure: Option<Error>,
+    /// Why this generation of the watch stopped, when it failed: what each of its streams' next
+    /// receive returns. A restart gets a fresh cell, so it can't overwrite a cause a stream of the
+    /// failed watch hasn't read yet.
+    cause: Cause,
 }
+
+type Cause = Arc<Mutex<Option<Error>>>;
 
 /// A source's slot in the hub: being opened (by one subscriber, outside the lock) or running.
 #[derive(Clone)]
@@ -159,13 +163,14 @@ impl Hub {
                 .name("camera hot-plug".into())
                 .spawn(move || run_watch(weak, signals, known))
                 .map_err(|e| Error::Capture(format!("can't start the hot-plug thread: {e}")))?;
-            (watch.running, watch.failure) = (true, None);
+            watch.running = true;
+            watch.cause = Cause::default();
         }
         let (tx, rx) = mpsc::channel();
         let id = watch.next_id;
         watch.next_id += 1;
         watch.listeners.push((id, tx));
-        Ok(Events { id, inner: self.inner.clone(), rx })
+        Ok(Events { id, inner: self.inner.clone(), rx, cause: watch.cause.clone() })
     }
 
     /// Subscribes to `source` at `spec`. Opens the source (and fails here, with the reason, when
@@ -256,7 +261,8 @@ fn run_watch(hub: Weak<Inner>, mut signals: Box<dyn Signals>, mut known: Vec<Hos
             Err(e) => {
                 let mut watch = lock(&inner.watch);
                 // Dropping the senders ends every stream; each then reads `failure`.
-                (watch.running, watch.failure) = (false, Some(e));
+                watch.running = false;
+                *lock(&watch.cause) = Some(e);
                 watch.listeners.clear();
                 return;
             }
@@ -340,6 +346,7 @@ pub struct Events {
     id: u64,
     inner: Arc<Inner>,
     rx: Receiver<Event>,
+    cause: Cause,
 }
 
 impl Events {
@@ -363,7 +370,7 @@ impl Events {
     }
 
     fn ended(&self) -> Error {
-        let failure = lock(&self.inner.watch).failure.clone();
+        let failure = lock(&self.cause).clone();
         failure.unwrap_or_else(|| Error::Capture("the hot-plug watch stopped".into()))
     }
 }
@@ -971,5 +978,18 @@ mod tests {
         // The next stream starts a fresh watch.
         assert!(hub.events().is_ok());
         assert_eq!(plug.watches.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_restarted_watch_keeps_the_cause_for_streams_that_had_not_read_it() {
+        let (hub, plug) = plugged(None);
+        let first = hub.events().unwrap_or_else(|e| panic!("{e}"));
+        plug.signal(Err(Error::Io("inotify: read failed".into())));
+        wait_until("the watch to fail", || !lock(&hub.inner.watch).running);
+        // Another caller restarts the watch before `first` reads the failure.
+        let second = hub.events().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(plug.watches.load(Ordering::SeqCst), 2);
+        assert_eq!(first.try_recv(), Err(Error::Io("inotify: read failed".into())));
+        assert_eq!(second.try_recv(), Ok(None));
     }
 }

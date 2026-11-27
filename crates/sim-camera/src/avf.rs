@@ -35,6 +35,7 @@ type Obj = Retained<AnyObject>;
 
 const AVFOUNDATION: &CStr = c"/System/Library/Frameworks/AVFoundation.framework/AVFoundation";
 const COREMEDIA: &CStr = c"/System/Library/Frameworks/CoreMedia.framework/CoreMedia";
+const COREMEDIAIO: &CStr = c"/System/Library/Frameworks/CoreMediaIO.framework/CoreMediaIO";
 const COREVIDEO: &CStr = c"/System/Library/Frameworks/CoreVideo.framework/CoreVideo";
 
 /// The device types to discover, newest first; each is skipped when this macOS lacks it.
@@ -436,8 +437,46 @@ pub(crate) struct DeviceNotifications {
 // back to it (`removeObserver:`); nothing else touches them.
 unsafe impl Send for DeviceNotifications {}
 
+/// `CMIOObjectPropertyAddress`.
+#[repr(C)]
+struct CmioAddress {
+    selector: u32,
+    scope: u32,
+    element: u32,
+}
+
+/// `OSStatus CMIOObjectSetPropertyData(CMIOObjectID, const CMIOObjectPropertyAddress *, UInt32
+/// qualifierDataSize, const void *qualifierData, UInt32 dataSize, const void *data)`.
+type CmioSetPropertyData = unsafe extern "C" fn(u32, *const CmioAddress, u32, *const c_void, u32, *const c_void) -> i32;
+
+/// Makes CoreMediaIO post its device notifications from its own thread. AVFoundation's
+/// `AVCaptureDeviceWasConnected` / `WasDisconnected` arrive on the run loop named by
+/// `kCMIOHardwarePropertyRunLoop`, by default the main thread's, which a CLI or daemon never runs;
+/// setting it to NULL moves delivery to CoreMediaIO's own thread. Once per process; the error says
+/// why delivery is left as it was.
+fn own_notification_thread() -> std::result::Result<(), String> {
+    static DONE: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    DONE.get_or_init(|| {
+        let lib = open(COREMEDIAIO).map_err(|e| e.to_string())?;
+        let set = function::<CmioSetPropertyData>(lib, c"CMIOObjectSetPropertyData").map_err(|e| e.to_string())?;
+        // 'rnlp' on the system object (1), global scope ('glob'), main element (0).
+        let address = CmioAddress { selector: u32::from_be_bytes(*b"rnlp"), scope: u32::from_be_bytes(*b"glob"), element: 0 };
+        let none: *const c_void = ptr::null();
+        // SAFETY: the address and the pointer-sized data (a NULL CFRunLoopRef) outlive the call;
+        // there is no qualifier.
+        let status = unsafe { set(1, &address, 0, ptr::null(), size_of::<*const c_void>() as u32, (&raw const none).cast::<c_void>()) };
+        if status == 0 { Ok(()) } else { Err(format!("CMIOObjectSetPropertyData failed with OSStatus {status}")) }
+    })
+    .clone()
+}
+
 pub(crate) fn watch() -> Result<Box<dyn Signals>> {
     let api = api()?;
+    if let Err(note) = own_notification_thread() {
+        // Notifications then depend on the host running a main run loop; the hub's stall
+        // detection still reports an unplugged camera's capture.
+        eprintln!("sim-camera: hot-plug notifications may not be delivered without a main run loop ({note})");
+    }
     if api.plugged.len() < 2 {
         return Err(Error::Unavailable("AVCaptureDeviceWasConnectedNotification".into()));
     }
@@ -747,6 +786,13 @@ mod tests {
         let api = api().unwrap_or_else(|e| panic!("{e}"));
         assert!(!api.device_types.is_empty(), "at least the built-in camera type");
         assert_eq!(api.plugged.len(), 2, "both hot-plug notifications");
+    }
+
+    /// CoreMediaIO accepts a NULL run loop (touches no camera: nothing is opened, no prompt). Live
+    /// delivery of a real plug still needs the #335 live check.
+    #[test]
+    fn hot_plug_notifications_move_to_coremediaio_own_thread() {
+        assert_eq!(own_notification_thread(), Ok(()));
     }
 
     /// Registers and removes the hot-plug observers (no camera is opened, nothing prompts).

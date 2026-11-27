@@ -25,6 +25,9 @@ use crate::select::{Interval, Mode, Rates};
 use crate::stream::{Dequeued, Device, Negotiated, Offer, Stream, classify};
 use crate::tcc::Authorization;
 
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("sim-camera's V4L2 structs (v4l2_format, v4l2_buffer) are laid out for 64-bit Linux; 32-bit kernels use smaller ones");
+
 const CAP_VIDEO_CAPTURE: u32 = 0x0000_0001;
 const CAP_VIDEO_CAPTURE_MPLANE: u32 = 0x0000_1000;
 const CAP_DEVICE_CAPS: u32 = 0x8000_0000;

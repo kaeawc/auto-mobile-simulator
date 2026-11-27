@@ -170,7 +170,10 @@ impl Stream {
             )));
         };
         let (fourcc, mode) = &usable[choice.index];
-        let format = device.set_format(*fourcc, mode.width, mode.height).map_err(|e| classify(&e, "VIDIOC_S_FMT", name))?;
+        // YUYV packs two pixels per four bytes, so ask for an even width (a continuous size range
+        // can offer an odd one).
+        let width = if *fourcc == convert::YUYV { (mode.width & !1).max(2) } else { mode.width };
+        let format = device.set_format(*fourcc, width, mode.height).map_err(|e| classify(&e, "VIDIOC_S_FMT", name))?;
         let pixel = Pixel::from_fourcc(format.fourcc).ok_or_else(|| {
             Error::Unsupported(format!("{name} switched to {} instead of the format asked for", convert::fourcc_text(format.fourcc)))
         })?;
@@ -178,6 +181,12 @@ impl Stream {
             return Err(Error::Capture(format!(
                 "{name} reported a {}x{} YUYV format with {}-byte rows",
                 format.width, format.height, format.stride
+            )));
+        }
+        if pixel == Pixel::Yuyv && format.width % 2 != 0 {
+            return Err(Error::Unsupported(format!(
+                "{name} settled on a {}-pixel-wide YUYV format; YUYV needs an even width",
+                format.width
             )));
         }
         // Best effort: a driver without S_PARM runs at its own rate.
@@ -558,6 +567,18 @@ pub(crate) mod tests {
         push(&script, Step::Frame(row.repeat(240)));
         let frame = stream.frame(spec(320, 240, 30), Tick::start()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((frame.width, frame.height, frame.pixel(319, 239)), (320, 240, [255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn yuyv_is_requested_at_an_even_width_and_an_odd_negotiated_width_is_refused() {
+        let (fake, script) = Fake::new(vec![offer(YUYV, 641, 480, &[30])]);
+        assert!(Stream::open(fake, "Cam", spec(641, 480, 30)).is_ok());
+        assert!(calls(&script).contains(&"S_FMT YUYV 640x480".to_string()), "{:?}", calls(&script));
+
+        let (mut fake, _) = Fake::new(vec![offer(YUYV, 640, 480, &[30])]);
+        fake.negotiate = Some(Negotiated { fourcc: YUYV, width: 639, height: 480, stride: 1278 });
+        let err = Stream::open(fake, "Cam", spec(640, 480, 30)).err();
+        assert!(matches!(&err, Some(Error::Unsupported(m)) if m.contains("even width")), "{err:?}");
     }
 
     #[test]
