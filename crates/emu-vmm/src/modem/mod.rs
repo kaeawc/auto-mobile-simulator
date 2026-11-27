@@ -85,7 +85,9 @@
 //! - `AT+CGREG?`/`AT+CEREG?` -> `+CGREG: <n>,<stat>,"<lac>","<ci>","<tech hex>"` whatever `<n>`,
 //!   the last field an Android radio technology (LTE = `000e`).
 //! - `AT+CTEC?` -> `+CTEC: <index>,<preferred hex>` and `AT+CTEC=<index>,"<preferred hex>"` ->
-//!   `+CTEC: DONE` (or `+CTEC: <index>` when it changes): indices, not bit masks.
+//!   `+CTEC: DONE` (or `+CTEC: <index>` when it changes): indices, not bit masks. That is
+//!   stock's format; the values are emu's own (`+CTEC: 5,23`, `=?` lists `0,1,5`, where stock's
+//!   GSM-only modem answers `0,f` and `0,1,2,3`), and the RIL accepts them.
 pub mod calls;
 pub mod pdu;
 pub mod sim;

@@ -489,9 +489,9 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   (`7`, E-UTRAN), which the RIL read as `EVDO_0`: the phone switched to CDMA, the next GPRS
   report switched it back, and the device idled at 149–156% of a host core with
   `com.android.phone` and `system_server` busy. Once a guest opens `qemud:gsm`, the modem answers
-  as stock's does (`crates/emu-vmm/src/modem/mod.rs`): `+CREG` without a technology,
+  in stock's formats (`crates/emu-vmm/src/modem/mod.rs`): `+CREG` without a technology,
   `+CGREG`/`+CEREG` with the Android one in hex (LTE `000e`), and `+CTEC` with technology
-  indices. Idle CPU fell to 2.9% and 2.1% of a core (stock: 5.4% and 3.7%;
+  indices (emu's own values, not stock's GSM-only ones). Idle CPU fell to 2.9% and 2.1% of a core (stock: 5.4% and 3.7%;
   [benchmarks](benchmarks.md#api-29-and-30-first-boots-and-idle-host-cpu)).
 
 - **In-kernel GICv3.** The stock board emulates a GICv2 in userspace. Here interrupt
