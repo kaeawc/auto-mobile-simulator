@@ -108,7 +108,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "device, button(home|lock|side|siri|apple-pay|action | back|volume-up|volume-down|recents|menu|up|down|left|right|select|play-pause), hold_ms?",
         "Press a hardware button, as the device's form factor has it: the Siri Remote on Apple TV (menu/back, home, select, \
          play-pause, arrows) and the D-pad on Android TV; on Apple Watch home is the crown's press. Held hold_ms (default: 10 \
-         on an iPhone or iPad, 80 elsewhere)",
+         for home and lock on an iPhone or iPad, else 80)",
     ),
     ("type", "device, text", "Type on the hardware keyboard (iOS: a key report every 3 ms)"),
     ("key", "device, usage", "Press a key by HID usage (iOS: down and up 3 ms apart)"),

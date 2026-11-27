@@ -617,8 +617,22 @@ jumps: ok? Yes!`) and Return into the text field, 10 times per gap; autocorrect 
 | 0 ms | 9/10 (one run lost its keys) | 10/10 |
 | 1, 2, 3 and 5 ms | 10/10 | 10/10 |
 
-The defaults are now a 10 ms `tap` hold, a 10 ms `button` hold on an iPhone or iPad (Apple TV
-and Apple Watch keep 80 ms: not measured), and a key report every 3 ms for `type` and `key`,
+Repeated keys at the 3 ms gap (a key goes up and the same key down again 3 ms later), into a
+field that corrects nothing (no autocorrect, capitals, spelling or smart punctuation), 10 runs
+each, compared exactly; once at 1-minute load 20-22 and once at 123-167 (other lanes' devices
+booting):
+
+| String | load 20-22 | load 123-167 |
+| --- | --- | --- |
+| `hello` | 10/10 | 10/10 |
+| `1000` | 10/10 | 10/10 |
+| `pass11` | 10/10 | 10/10 |
+| `aaabbb` | 10/10 | 10/10 |
+| `Mississippi` | 10/10 | 10/10 |
+
+The defaults are now a 10 ms `tap` hold, a 10 ms hold for `button` `home` and `lock` on an iPhone
+or iPad (every other button, Apple TV and Apple Watch keep 80 ms: not measured), and a key report
+every 3 ms for `type` and `key`,
 sent against deadlines from the first. 10 ms and 3 ms leave a margin over the shortest holds and
 gaps that passed everywhere (0 ms and 1 ms). Every iOS touch gesture (`tap`, `swipe`, `touch`,
 `stylus`, `remote_swipe`, CarPlay touches) and the Digital Crown now send their samples against
@@ -715,9 +729,13 @@ Claims that would belong in the README once someone runs them:
   host's Spotlight privacy settings to measure.
 - Time per automation step through `simee mcp` (a `tools/call` of `tap`, then `screenshot`) against
   the socket API and the CLI on the same device.
-- The iOS `button` default on Apple TV (the Siri Remote's keys) and Apple Watch, which keep the
-  80 ms hold, and the iOS tap and key defaults in Safari and Settings themselves (measured on the
-  same components in a test app).
+- A 10 ms `button` hold for the iPhone's side, Siri, Apple Pay, Action and volume buttons and on
+  Apple TV (the Siri Remote's keys) and Apple Watch, which all keep 80 ms.
+- The iOS 10 ms tap and 3 ms key gap on what the test app doesn't have (measured only on a UIKit
+  button, a SwiftUI button, a WKWebView link, a table row and a UITextField): Safari's toolbar and
+  address bar, SpringBoard alerts, Control Center, the software keyboard's keys, UISwitch and
+  UISlider, launching an app from its home-screen icon, and typing into a WKWebView field or a
+  secure text field.
 - iPad `pointer … --to` drag latency on a quiet host, and `pointer` timing and placement on
   iOS 26.5 since #122 (clicks on 27.2 are under "iPad `pointer` click").
 - Host CPU of an idle booted device, emu against the SDK emulator.

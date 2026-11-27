@@ -236,7 +236,7 @@ enum Cmd {
     Button {
         device: String,
         button: String,
-        /// Hold time in milliseconds (default: the platform's, 80).
+        /// Hold time in milliseconds (default: 10 for home and lock on an iPhone or iPad, else 80).
         #[arg(long)]
         hold: Option<u64>,
     },

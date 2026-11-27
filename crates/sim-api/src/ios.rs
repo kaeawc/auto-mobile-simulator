@@ -14,7 +14,7 @@ use sim_core::duo;
 use sim_core::form_factor::FormFactor;
 use sim_core::geometry::{Point, Size};
 use sim_core::gesture::{Sample, ScreenEdge, pace, pace_samples};
-use sim_core::hid::{KeyEvent, key_events};
+use sim_core::hid::{Button, KeyEvent, key_events};
 use sim_core::indigo::PointerButton;
 use sim_core::pointer::{self, Held, HeldPointer, PointerAction};
 use sim_core::reuse::{BootKey, Reuse};
@@ -343,18 +343,19 @@ pub fn flush_input(timeout: Duration) -> bool {
 /// as idb does) to 30 ms, quiet and with 32 busy processes on the host (docs/benchmarks.md
 /// "iOS input defaults"); 10 ms keeps a margin over that floor while a tap stays one display frame.
 pub const TAP_HOLD: Duration = Duration::from_millis(10);
-/// How long `button` holds without `hold_ms` on an iPhone or iPad ([`button_hold`]): home and lock
+/// How long `home` and `lock` hold without `hold_ms` on an iPhone or iPad ([`button_hold`]): both
 /// were recognised 20 of 20 times at every hold from 0 ms to 30 ms, quiet and loaded
 /// (docs/benchmarks.md "iOS input defaults").
 pub const BUTTON_HOLD: Duration = Duration::from_millis(10);
-/// The hold before `BUTTON_HOLD` was measured, kept where it wasn't: the Siri Remote's keys on
-/// Apple TV, the Apple Watch's buttons, and a device whose form factor isn't known.
+/// The hold before `BUTTON_HOLD` was measured, kept where it wasn't: the other buttons (side, Siri,
+/// Apple Pay, Action, volume), the Siri Remote's keys on Apple TV, the Apple Watch's buttons, and a
+/// device whose form factor isn't known.
 const UNMEASURED_BUTTON_HOLD: Duration = Duration::from_millis(80);
 
 /// How long `button` holds without `hold_ms` on a device of `form_factor`.
-fn button_hold(form_factor: Option<FormFactor>) -> Duration {
-    match form_factor {
-        Some(FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable) => BUTTON_HOLD,
+fn button_hold(button: Button, form_factor: Option<FormFactor>) -> Duration {
+    match (button, form_factor) {
+        (Button::Home | Button::Lock, Some(FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable)) => BUTTON_HOLD,
         _ => UNMEASURED_BUTTON_HOLD,
     }
 }
@@ -669,7 +670,7 @@ fn input_method(input: &mut Input, udid: &str, method: &str, p: &Value) -> Resul
         "button" => {
             let (button, given) = (button(p, Duration::ZERO)?.0, opt_u64(p, "hold_ms").map(Duration::from_millis));
             null(input.run(udid, false, |hid, _| {
-                let hold = given.unwrap_or_else(|| button_hold(hid.form_factor()));
+                let hold = given.unwrap_or_else(|| button_hold(button, hid.form_factor()));
                 hid.button(button, Direction::Down).map_err(err)?;
                 sleep(hold);
                 hid.button(button, Direction::Up).map_err(err)
@@ -677,7 +678,7 @@ fn input_method(input: &mut Input, udid: &str, method: &str, p: &Value) -> Resul
         }
         "type" => {
             let text = need_str(p, "text")?;
-            let keys = key_events(text).map_err(|c| format!("no key for {c:?} on the US layout"))?;
+            let keys = key_events(text).map_err(|c| format!("no key for {c:?} on the US layout; nothing was typed"))?;
             null(input.run(udid, false, |hid, _| send_keys(hid, &keys)))
         }
         "key" => {
@@ -2149,13 +2150,19 @@ mod tests {
     }
 
     #[test]
-    fn a_button_holds_the_measured_default_only_on_an_iphone_or_ipad() {
+    fn only_home_and_lock_hold_the_measured_default_and_only_on_an_iphone_or_ipad() {
         use sim_core::form_factor::FormFactor;
+        use sim_core::hid::Button;
         for f in [FormFactor::Phone, FormFactor::Tablet, FormFactor::Foldable] {
-            assert_eq!(super::button_hold(Some(f)), super::BUTTON_HOLD, "{f:?}");
+            for b in [Button::Home, Button::Lock] {
+                assert_eq!(super::button_hold(b, Some(f)), super::BUTTON_HOLD, "{b:?} on {f:?}");
+            }
+            for b in [Button::Side, Button::Siri, Button::ApplePay, Button::Action, Button::VolumeUp] {
+                assert_eq!(super::button_hold(b, Some(f)), Duration::from_millis(80), "{b:?} on {f:?}: unmeasured, as before");
+            }
         }
         for f in [Some(FormFactor::Tv), Some(FormFactor::Watch), Some(FormFactor::Vision), None] {
-            assert_eq!(super::button_hold(f), Duration::from_millis(80), "{f:?}: unmeasured, as before");
+            assert_eq!(super::button_hold(Button::Home, f), Duration::from_millis(80), "{f:?}: unmeasured, as before");
         }
         assert!(super::TAP_HOLD <= Duration::from_millis(20) && super::BUTTON_HOLD <= Duration::from_millis(20));
     }
