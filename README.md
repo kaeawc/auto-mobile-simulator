@@ -129,7 +129,7 @@ To put emu behind tools that launch `emulator` themselves: `make shim`, then
 
 Phones, tablets, foldables, watches, TVs, cars and headsets on both platforms, each with its own
 inputs (hinge, rotary, D-pad, Digital Crown, Siri Remote, vehicle properties, XR head pose).
-Unsupported combinations are refused with the reason. The matrix and its gaps:
+iOS's foldable is the iPhone Duo. The matrix and its gaps:
 [docs/form-factors.md](docs/form-factors.md).
 
 ## Not yet

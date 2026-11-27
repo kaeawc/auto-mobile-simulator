@@ -6,6 +6,13 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ## [Unreleased]
 
+### Changed
+
+- The iPhone Duo is iOS's foldable: `form_factors` lists (iOS, foldable) as supported with the
+  Duo's reference profile (2853×2007 unfolded, 1398×2034 folded, @3x), its devices and device type
+  report `form_factor: foldable`, and `create --form-factor foldable` takes an iPhone Duo. Rotation,
+  CarPlay's form factor check and the desktop's edge gestures treat it as the iPhone it is.
+
 ## [0.2.0] - 2026-11-27
 
 ### Added
