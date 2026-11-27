@@ -11,6 +11,27 @@ A connection may send any number of requests, each answered before the next is r
 rather than connecting per call. Large results (a base64 `screenshot`) are written as one line
 straight from the result, so read up to the newline before parsing.
 
+**Per-call overhead** (#202). Measured with `cargo run --release -p sim-api --example api_overhead --
+before=<old simee> after=target/release/simee`: a private `simee serve` and `simee mcp` per binary,
+rounds interleaved, the median of 5 (Apple M3 Max, 16 cores, 2026-11-27, host load 19 to 22):
+
+| µs per call | kept connection | connection per call | MCP (stdio) |
+|---|---|---|---|
+| `identity` (no-op) | 7.2 | 22.2 (33.5 before) | 18.3 |
+| `form_factors` (6 KB) | 49.4 | 66.5 (78.9 before) | 132.4 |
+| `help` (25 KB) | 88.6 | 110.7 (123.2 before) | 211.8 |
+| `devices` (no boot) | 75 560 | 73 930 | 75 210 |
+
+- On a kept connection the server spends under 1 µs on a no-op (parse, dispatch, response line);
+  the rest is the socket round trip. A larger result costs building it and writing it
+  (`cargo test --release -p sim-api call_overhead -- --ignored --nocapture` splits it up).
+- A new connection costs about 15 µs more: the connection thread is reused (a thread whose client
+  disconnected waits 30 s for the next, at most 8 wait), and its session is still made new for it.
+- MCP adds JSON-RPC framing, the tool result's text and `structuredContent`, and handing each call
+  to a worker thread (`cargo test --release -p sim-mcp tool_call_overhead -- --ignored --nocapture`).
+- `devices` on a host with Android AVDs is the Android listing, not the API: it probes the stock
+  emulators running with `ps` and `lsof`. `device: "booted"` (or a name) resolves through it too.
+
 **Binary replies.** A request may add `"binary": true` to take a result's bytes raw instead of as
 base64 in the line (a local client that wants the PNG skips the base64 encode, the JSON escaping and
 a third more bytes on the socket). When the result has a bytes field (today `screenshot`'s `png`
