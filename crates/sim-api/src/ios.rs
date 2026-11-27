@@ -1136,6 +1136,62 @@ fn launch_restart(p: &Value) -> Result<bool, String> {
     Ok(opt_bool(p, "restart")?.unwrap_or(true))
 }
 
+/// How long a launch SpringBoard refused as being updated is answered from memory before one goes
+/// to the device again.
+const BEING_UPDATED_RECHECK: Duration = Duration::from_secs(60);
+
+/// Apps whose launch SpringBoard refused as being updated (`LaunchServicesDataMismatch`, #123), by
+/// (UDID, bundle id): the boot it happened in (the device's `launchd_sim` pid), when, and the
+/// error. SpringBoard retries for about 12.6 s before it refuses and only a reboot is known to clear
+/// the state, so a launch of one of them fails at once with that error until the device reboots or
+/// [`BEING_UPDATED_RECHECK`] passes.
+#[derive(Default)]
+struct BeingUpdated(std::collections::HashMap<(String, String), (i32, Instant, String)>);
+
+impl BeingUpdated {
+    /// The error to fail this launch with at once, if `bundle` on `udid` was refused in this boot
+    /// less than [`BEING_UPDATED_RECHECK`] ago. `boot` (the device's `launchd_sim` pid now) is asked
+    /// only for an app listed here, so other launches pay nothing.
+    fn refusal(&mut self, udid: &str, bundle: &str, now: Instant, boot: impl FnOnce() -> Option<i32>) -> Option<String> {
+        let key = (udid.to_owned(), bundle.to_owned());
+        let (seen_boot, at, message) = self.0.get(&key)?;
+        let age = now.saturating_duration_since(*at);
+        if age < BEING_UPDATED_RECHECK && boot() == Some(*seen_boot) {
+            return Some(format!(
+                "{message} (simee answered from memory: SpringBoard refused this launch {} s ago in this boot; it asks the \
+                 device again after a reboot or {} s)",
+                age.as_secs(),
+                BEING_UPDATED_RECHECK.as_secs()
+            ));
+        }
+        self.0.remove(&key);
+        None
+    }
+
+    /// Remembers `error` for `bundle` on `udid` when it is SpringBoard's being-updated refusal and
+    /// the device's boot is known.
+    fn note(&mut self, udid: &str, bundle: &str, error: &sim_coresim::Error, now: Instant, boot: impl FnOnce() -> Option<i32>) {
+        if is_being_updated(error)
+            && let Some(boot) = boot()
+        {
+            self.0.insert((udid.to_owned(), bundle.to_owned()), (boot, now, error.to_string()));
+        }
+    }
+}
+
+/// Whether a launch failed because SpringBoard holds the app as being updated (sim-coresim names
+/// `LaunchServicesDataMismatch` in that error alone).
+fn is_being_updated(error: &sim_coresim::Error) -> bool {
+    matches!(error, sim_coresim::Error::Service { op: "launch", message } if message.contains("LaunchServicesDataMismatch"))
+}
+
+static BEING_UPDATED: std::sync::Mutex<Option<BeingUpdated>> = std::sync::Mutex::new(None);
+
+fn with_being_updated<T>(f: impl FnOnce(&mut BeingUpdated) -> T) -> T {
+    let mut guard = BEING_UPDATED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(guard.get_or_insert_with(Default::default))
+}
+
 /// The plan for `p`, booting `concurrent` devices at once (1 for `boot`); `settle_default` when
 /// `settle` isn't given. `shapers` resolves the network shapers the devices need (built on first
 /// use), called at most once, here on the caller's thread.
@@ -1730,6 +1786,12 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "uninstall" => ok(s.device(p)?.uninstall(need_str(p, "bundle_id")?)),
         "launch" => {
             let d = s.device(p)?;
+            let bundle = need_str(p, "bundle_id")?;
+            let udid = d.udid();
+            let boot = || sim_coresim::procs::launchd_sim(&udid);
+            if let Some(refused) = with_being_updated(|b| b.refusal(&udid, bundle, Instant::now(), boot)) {
+                return Err(refused);
+            }
             let mut env = pairs(p, "env");
             if p.get("shaped").and_then(Value::as_bool).unwrap_or(false) {
                 env.extend(shaper_env(&d)?);
@@ -1737,7 +1799,10 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             if opt_bool(p, "malloc_stack_logging")?.unwrap_or(false) {
                 env.push(("MallocStackLogging".into(), "1".into()));
             }
-            let pid = d.launch_with(need_str(p, "bundle_id")?, &strings(p, "args"), &env, launch_restart(p)?).map_err(err)?;
+            let pid = d
+                .launch_with(bundle, &strings(p, "args"), &env, launch_restart(p)?)
+                .inspect_err(|e| with_being_updated(|b| b.note(&udid, bundle, e, Instant::now(), boot)))
+                .map_err(err)?;
             Ok(json!({"pid": pid}))
         }
         "terminate" => ok(s.device(p)?.terminate(need_str(p, "bundle_id")?)),
@@ -2864,6 +2929,52 @@ mod tests {
         assert_eq!(launch_restart(&json!({"restart": false})), Ok(false));
         assert_eq!(launch_restart(&json!({"restart": "no"})), Err("`restart` must be true or false, not \"no\"".to_owned()));
         assert!(launch_restart(&json!({"restart": 0})).is_err());
+    }
+
+    fn being_updated_error() -> sim_coresim::Error {
+        sim_coresim::Error::Service {
+            op: "launch",
+            message: "SpringBoard holds dev.simee.tiny as being updated (LaunchServicesDataMismatch), ... Reboot the device".into(),
+        }
+    }
+
+    #[test]
+    fn a_launch_refused_as_being_updated_fails_at_once_until_the_device_reboots() {
+        let mut b = BeingUpdated::default();
+        let t0 = Instant::now();
+        b.note("U", "dev.simee.tiny", &being_updated_error(), t0, || Some(41));
+        let refused = b.refusal("U", "dev.simee.tiny", t0 + Duration::from_secs(5), || Some(41)).expect("remembered");
+        assert!(refused.starts_with("launch failed: SpringBoard holds dev.simee.tiny as being updated"), "{refused}");
+        assert!(refused.contains("refused this launch 5 s ago in this boot"), "{refused}");
+        assert!(b.refusal("U", "dev.simee.other", t0, || panic!("an app not listed never asks for the boot")).is_none());
+        assert!(b.refusal("V", "dev.simee.tiny", t0, || panic!("nor does another device")).is_none());
+        assert!(b.refusal("U", "dev.simee.tiny", t0 + Duration::from_secs(6), || Some(77)).is_none(), "rebooted: ask the device");
+        assert!(b.refusal("U", "dev.simee.tiny", t0 + Duration::from_secs(7), || Some(41)).is_none(), "and forgotten");
+    }
+
+    #[test]
+    fn a_remembered_refusal_is_asked_again_after_a_minute_or_when_the_device_is_down() {
+        let mut b = BeingUpdated::default();
+        let t0 = Instant::now();
+        b.note("U", "dev.simee.tiny", &being_updated_error(), t0, || Some(41));
+        assert!(b.refusal("U", "dev.simee.tiny", t0 + BEING_UPDATED_RECHECK, || Some(41)).is_none());
+        b.note("U", "dev.simee.tiny", &being_updated_error(), t0, || Some(41));
+        assert!(b.refusal("U", "dev.simee.tiny", t0, || None).is_none(), "shut down");
+        b.note("U", "dev.simee.tiny", &being_updated_error(), t0, || None);
+        assert!(b.0.is_empty(), "no boot to tie it to: nothing remembered");
+    }
+
+    #[test]
+    fn only_springboards_being_updated_refusal_is_remembered() {
+        let mut b = BeingUpdated::default();
+        let t0 = Instant::now();
+        let other = sim_coresim::Error::Service { op: "launch", message: "Simulator device failed to launch dev.simee.tiny.".into() };
+        b.note("U", "dev.simee.tiny", &other, t0, || panic!("not asked for another error"));
+        let install = sim_coresim::Error::Service { op: "install", message: "LaunchServicesDataMismatch".into() };
+        b.note("U", "dev.simee.tiny", &install, t0, || Some(41));
+        assert!(b.0.is_empty());
+        assert!(is_being_updated(&being_updated_error()));
+        assert!(!is_being_updated(&sim_coresim::Error::Invalid("LaunchServicesDataMismatch".into())));
     }
 
     #[test]

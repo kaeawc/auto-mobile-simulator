@@ -1885,8 +1885,9 @@ mod tests {
         assert_eq!(all.as_array().map(Vec::len), Some(14));
         let fold = call(&mut s, "form_factors", &json!({"form_factor": "foldable"})).expect("foldable");
         let ios = fold.as_array().and_then(|a| a.iter().find(|x| x["platform"] == "ios")).expect("ios row");
-        assert_eq!(ios["supported"], false);
-        assert!(ios["reason"].as_str().is_some_and(|r| r.contains("Android-only")));
+        // The iPhone Duo: iOS's foldable, closed on its outer screen.
+        assert_eq!((ios["supported"].as_bool(), ios["sub_platform"].as_str()), (Some(true), Some("ios")));
+        assert_eq!(ios["profile"]["fold"]["folded_width"], 1398);
         let watch = call(&mut s, "form_factors", &json!({"form_factor": "watch", "platform": "ios"})).expect("watch");
         assert_eq!(watch[0]["sub_platform"], "watchos");
         assert_eq!(watch[0]["inputs"][1]["label"], "Digital Crown");
@@ -1895,13 +1896,13 @@ mod tests {
         assert_eq!((xr[0]["supported"].as_bool(), xr[0]["sub_platform"].as_str()), (Some(true), Some("androidxr")));
         assert_eq!(xr[0]["inputs"][0]["label"], "Eye tracking");
         assert_eq!((xr[0]["profile"]["width"].as_u64(), xr[0]["profile"]["height"].as_u64()), (Some(2560), Some(2558)));
-        let unsupported: Vec<&Value> = all.as_array().expect("rows").iter().filter(|r| r["supported"] == false).collect();
-        assert_eq!(unsupported.len(), 1, "a foldable iPhone is the only gap");
+        assert!(all.as_array().expect("rows").iter().all(|r| r["supported"] == true), "every pair exists: {all}");
         let err = call(&mut s, "form_factors", &json!({"form_factor": "laptop"})).expect_err("unknown");
         assert!(err.contains("phone, tablet, foldable, watch, tv, auto, vision"), "{err}");
         assert!(call(&mut s, "devices", &json!({"platform": "windows"})).expect_err("unknown").contains("android or ios"));
+        // An iOS foldable passes the matrix; whether `y` is one is the device type's to say.
         let err = call(&mut s, "create", &json!({"name": "x", "device_type": "y", "runtime": "z", "form_factor": "foldable"}));
-        assert!(err.expect_err("no foldable iPhone").starts_with("foldable is not supported on iOS"));
+        assert!(!err.expect_err("no such type").contains("not supported on iOS"));
     }
 
     /// The parameters a dispatcher's "missing" error names: "missing number parameter `x`",

@@ -12,6 +12,7 @@
 pub mod apps;
 pub mod console;
 pub mod display;
+pub mod listing;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
@@ -43,6 +44,8 @@ pub struct Android {
     pub env: Env,
     /// Where running emulators advertise themselves (default: [`emu_avd::running_dir`]).
     pub running_dir: Option<PathBuf>,
+    /// Stock emulators found by earlier lookups, so a listing asks `ps` only about new ones.
+    stock: std::sync::Arc<listing::StockCache>,
 }
 
 impl Default for Android {
@@ -120,14 +123,19 @@ impl Android {
     }
 
     pub fn new(env: Env) -> Self {
-        Android { env, running_dir: emu_avd::running_dir() }
+        Android::with_host(env, std::sync::Arc::new(listing::Ps))
+    }
+
+    /// [`Android::new`] asking `host` about processes instead of `ps` and `lsof`.
+    pub fn with_host(env: Env, host: std::sync::Arc<dyn listing::Host>) -> Self {
+        Android { env, running_dir: emu_avd::running_dir(), stock: std::sync::Arc::new(listing::StockCache::new(host)) }
     }
 
     /// Every running emulator: simee's (their advertisements), then the stock emulator's
     /// ([`Env::stock_instances`]) for AVDs simee doesn't run.
     fn running(&self) -> Vec<Running> {
         let mut all = self.simee_running();
-        let stock = self.env.stock_instances(&all);
+        let stock = self.stock.instances(&self.env, &all);
         all.extend(stock);
         all
     }
@@ -142,7 +150,7 @@ impl Android {
         let simee = self.simee_running();
         match simee.iter().find(|r| r.avd_name == name) {
             Some(r) => Some(r.clone()),
-            None => self.env.stock_instance(name, &simee),
+            None => self.stock.instance(&self.env, name, &simee),
         }
     }
 

@@ -809,9 +809,10 @@ def desktop_deps(crates):
 
 REFERENCED = re.compile(r'"(?:\.\./)*((?:docs|scripts)/[A-Za-z0-9_./-]+)"')
 
-# Paths no job here reads: docs, other workflows, local tooling, the script and docs linters'
-# configs, and scripts nothing below names.
-NONE = re.compile(r"^(docs/|\.github/workflows/(?:software-mode|release)\.yml$|\.githooks/|\.local/|LICENSE$|\.gitignore$"
+# Paths no job here reads: docs, other workflows, the website (its own workspace and workflow,
+# website.yml), local tooling, the script and docs linters' configs, and scripts nothing below
+# names.
+NONE = re.compile(r"^(docs/|website/|\.github/workflows/(?:software-mode|release|website)\.yml$|\.githooks/|\.local/|LICENSE$|\.gitignore$"
                   r"|Makefile$|bacon\.toml$|rustfmt\.toml$|\.editorconfig$|\.shellcheckrc$|\.yamllint\.yml$"
                   r"|lychee\.toml$|_typos\.toml$)|\.md$|^scripts/")
 # Scripts only the docs-scripts job runs: it runs on every change, so they reach no scoped job.
