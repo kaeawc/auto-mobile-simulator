@@ -102,8 +102,33 @@ impl<T> Drop for Worker<T> {
 /// Where a screenshot taken now is saved: the Desktop, or the temp dir without a home.
 pub fn screenshot_path() -> PathBuf {
     let dir = std::env::var("HOME").map(|h| PathBuf::from(h).join("Desktop")).unwrap_or_else(|_| std::env::temp_dir());
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    dir.join(format!("simee-{secs}.png"))
+    let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    unique_path(&dir, &format!("simee-{millis}"))
+}
+
+/// `<dir>/<stem>.png`, or `<stem>-2.png`, `-3`… when that name is taken: quick shots stack in the
+/// preview, so two in the same moment must not overwrite one file.
+fn unique_path(dir: &std::path::Path, stem: &str) -> PathBuf {
+    let first = dir.join(format!("{stem}.png"));
+    if !first.exists() {
+        return first;
+    }
+    (2..).map(|n| dir.join(format!("{stem}-{n}.png"))).find(|p| !p.exists()).expect("a free name")
+}
+
+#[cfg(test)]
+mod screenshot_name_tests {
+    #[test]
+    fn a_taken_name_gets_a_suffix_instead_of_being_overwritten() {
+        let dir = std::env::temp_dir().join(format!("simee-shot-name-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let a = super::unique_path(&dir, "simee-1");
+        std::fs::write(&a, b"x").expect("write");
+        let b = super::unique_path(&dir, "simee-1");
+        assert_ne!(a, b);
+        assert!(b.ends_with("simee-1-2.png"), "{}", b.display());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Encodes a frame as PNG and writes it to `path` on its own thread; the result goes to `outbox`,
