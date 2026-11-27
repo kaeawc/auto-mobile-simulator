@@ -8,6 +8,7 @@
 //! output is the same either way.
 
 mod doctor;
+mod stream_cli;
 
 use std::io::Write;
 use std::time::Duration;
@@ -412,6 +413,12 @@ enum Cmd {
         #[command(subcommand)]
         command: CameraCmd,
     },
+    /// Publish device screens over WHIP (WebRTC): start, inspect, keep alive and stop streams.
+    /// Streams live in a running `simee serve` (never in this process).
+    Stream {
+        #[command(subcommand)]
+        command: stream_cli::StreamCmd,
+    },
     /// Send commands to an Android device's emulator console (`adb emu`'s protocol).
     Console {
         device: String,
@@ -685,6 +692,24 @@ impl Transport {
         if self.local.is_some() && !sim_api::flush_input(FLUSH_TIMEOUT) && self.verbose {
             eprintln!("simee: input was still being sent after {} ms", FLUSH_TIMEOUT.as_millis());
         }
+    }
+}
+
+/// The stream commands' view of the transport: only a server answers. A stream dies with the
+/// process that holds it and sends its WHIP DELETE only if that process stops it, so one started
+/// here would be gone when this command exits.
+struct ServerOnly<'a>(&'a mut Transport);
+
+impl stream_cli::Api for ServerOnly<'_> {
+    fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        if !self.0.connected() {
+            let why = self.0.unused.as_deref().unwrap_or("no server answered");
+            anyhow::bail!(
+                "`simee stream` needs a running server of this build (`simee serve`): a stream lives in the process that started it and \
+                 would die with this command without sending its WHIP DELETE ({why})"
+            );
+        }
+        self.0.call(method, params)
     }
 }
 
@@ -1008,6 +1033,11 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             }
         }
         Cmd::Camera { command } => camera(command, &mut call, out, err)?,
+        Cmd::Stream { command } => {
+            let mut api = ServerOnly(transport);
+            let mut stop = stream_cli::enter_to_stop();
+            stream_cli::run(command, &mut api, &mut stop, out)?;
+        }
         Cmd::Console { device, command } => lines(out, &call("console", json!({"device": device, "command": command.join(" ")}))?)?,
         Cmd::Serve { .. } | Cmd::Call { .. } | Cmd::Mcp { .. } => anyhow::bail!("`serve`, `call` and `mcp` don't run through a transport"),
         Cmd::Exec { device, env, program, args } => {
@@ -1305,6 +1335,17 @@ mod tests {
         assert!(out.contains("foldable  ios      iOS · Foldable (inputs: Touch, Keyboard, Hardware buttons, Hinge)"), "{out}");
         assert!(!out.contains("unsupported"), "{out}");
         assert_eq!(out.lines().count(), 7);
+    }
+
+    #[test]
+    fn stream_commands_refuse_to_run_without_a_server() {
+        use stream_cli::Api as _;
+        let missing = std::env::temp_dir().join(format!("simee-no-server-{}.sock", std::process::id()));
+        for mut transport in [Transport::local(), Transport::open(&missing)] {
+            let e = ServerOnly(&mut transport).call("streams", json!({})).expect_err("refused").to_string();
+            assert!(e.contains("needs a running server") && e.contains("simee serve") && e.contains("WHIP DELETE"), "{e}");
+            assert!(transport.local.is_none(), "nothing ran in this process");
+        }
     }
 
     #[test]

@@ -587,6 +587,16 @@ orientation (its `rotate` turns 90° per call) and the assistant button. A devic
 counts in `input_errors` (with `last_input_error`); the viewer's `ack` means the event was queued.
 Stopping the stream lifts anything still down.
 
+**CLI.** `simee stream start|status|stop|list|watch` (docs/cli.md) calls these methods on a
+running `simee serve`. It never runs in-process, even with `--in-process`: a stream dies with its
+process without sending its DELETE, so with no server it refuses and says so. `watch` renews the
+lease (a `stream_status`) every `lease_ttl_s / 3`, prints one line per renewal, stops the stream
+on Enter, and exits with an error when the stream ended on its own. Ctrl-C ends `watch` without a
+stop (the CLI has no safe signal hook; the server's lease reaper deletes the resource within
+30 s). The token comes from `--token-file` or `SIMEE_STREAM_TOKEN` and is never printed.
+`stream_cli.rs` has the tests: argument parsing, the no-server refusal, and the watch loop's
+renew and stop against a fake client.
+
 **Tests.** `cargo test -p simee-api stream::` runs every method on fakes, with no network and no
 device: `simee-encode`'s own loop over a fake source and encoder, a fake WHIP publisher that logs
 each POST and DELETE (and can refuse with a status), a fake device input, and a fake clock for
