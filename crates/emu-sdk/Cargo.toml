@@ -1,13 +1,20 @@
 [package]
-name = "emu-sdk"
+name = "simee-emu-sdk"
 description = "SDK provisioning without Java: repository manifests, verified downloads, unpacking."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["android", "sdk", "emulator", "provisioning"]
+categories = ["emulators", "development-tools"]
+include = ["/Cargo.toml", "/src", "/testdata"]
 
 [lib]
+# Code names the crate as it did before the crates.io rename: `emu_sdk::`.
+name = "emu_sdk"
 doctest = false
 
 [dependencies]

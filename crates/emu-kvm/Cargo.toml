@@ -1,13 +1,20 @@
 [package]
-name = "emu-kvm"
+name = "simee-emu-kvm"
 description = "Safe wrappers over Linux KVM (kvm-ioctls): the VM, guest memory slots, the in-kernel vGICv3, ioeventfd/irqfd, vCPUs and their kicks. FFI crate: unsafe is allowed here."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["kvm", "hypervisor", "linux", "virtualization", "arm64"]
+categories = ["virtualization", "os::linux-apis"]
+include = ["/Cargo.toml", "/src"]
 
 [lib]
+# Code names the crate as it did before the crates.io rename: `emu_kvm::`.
+name = "emu_kvm"
 doctest = false
 
 [dependencies]

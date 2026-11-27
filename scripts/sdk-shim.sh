@@ -15,7 +15,7 @@ shim="${1:-$HOME/.simee/sdk}"
 [ -d "$real" ] || { echo "real SDK not found at $real" >&2; exit 1; }
 case "$shim" in "$real"*) echo "shim dir must not be inside the real SDK" >&2; exit 1 ;; esac
 
-cargo build --release -p emu --manifest-path "$repo/Cargo.toml"
+cargo build --release -p simee-emu --manifest-path "$repo/Cargo.toml"
 mkdir -p "$shim/emulator"
 for entry in "$real"/*; do
     name="$(basename "$entry")"

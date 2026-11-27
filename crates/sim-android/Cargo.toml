@@ -1,13 +1,20 @@
 [package]
-name = "sim-android"
+name = "simee-android"
 description = "The Android backend's client: lists AVDs as devices, starts and stops simee, drives running instances over their console and display socket."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["android", "emulator", "avd", "adb", "mobile"]
+categories = ["development-tools::testing", "emulators"]
+include = ["/Cargo.toml", "/src"]
 
 [lib]
+# Code names the crate as it did before the crates.io rename: `sim_android::`.
+name = "sim_android"
 doctest = false
 
 [dependencies]

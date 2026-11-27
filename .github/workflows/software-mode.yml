@@ -9,7 +9,7 @@ on:
   # Every push to main runs the full check.
   push:
     branches: [main]
-  # A pull request runs it only when the change can reach what `cargo build -p emu -p simee`
+  # A pull request runs it only when the change can reach what `cargo build -p simee-emu -p simee`
   # compiles on Linux: every crate those two pull in, the lockfile and the toolchain. Not: tests,
   # examples, benches and docs, and the files that build gates off Linux from another file
   # (macOS-only modules behind a `#[cfg] mod` line, the Objective-C only they include). A file
@@ -134,7 +134,7 @@ jobs:
           make -j"$(nproc)"
           make install
       - run: $EMU_QEMU -version
-      - run: cargo build --locked --release -p emu -p simee
+      - run: cargo build --locked --release -p simee-emu -p simee
       - id: sdk-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

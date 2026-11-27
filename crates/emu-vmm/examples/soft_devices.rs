@@ -10,7 +10,7 @@
 //!   `GFSH0003`.
 //!
 //! ```text
-//! cargo run --release -p emu-vmm --example soft_devices -- <socket dir> <adb port> [prop=value ...]
+//! cargo run --release -p simee-emu-vmm --example soft_devices -- <socket dir> <adb port> [prop=value ...]
 //! ```
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {

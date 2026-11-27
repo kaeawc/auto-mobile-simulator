@@ -50,7 +50,7 @@ The wait reads the tree through libproc (`sim_coresim::procs`) once a second: th
 table (pid, parent, name), then the CPU time of the device's own processes. It used to spawn a
 host-wide `ps -Ao pid=,ppid=,time=,args=` instead, 6.5-8.4 % of a core during a `boot_many` on a
 host with ~2000 processes. Measured on this host with ~1200 processes and no device booted
-(`cargo test -p sim-coresim --release poll_cost -- --ignored --nocapture --test-threads=1`, median
+(`cargo test -p simee-coresim --release poll_cost -- --ignored --nocapture --test-threads=1`, median
 of 3): the `ps` listing cost 38.2 ms of CPU per poll; the table costs 0.24 ms, and reading CPU
 costs 1.1 µs per process, so a poll of a 100-300 process device costs about 0.35-0.6 ms. Each wait
 reads the table itself, so 8 waits at once cost about 4 ms a second, where one shared `ps` listing

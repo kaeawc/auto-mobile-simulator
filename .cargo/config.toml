@@ -6,7 +6,7 @@ lint = "clippy --all-targets -- -D warnings"
 # Tests through nextest (one process per test, parallel across binaries).
 t = "nextest run"
 # Tests in a single crate without touching the rest.
-tc = "nextest run -p sim-core"
+tc = "nextest run -p simee-core"
 
 # Hypervisor.framework refuses unsigned callers. Every binary cargo runs (the `emu` emulator, the
 # simee CLI and test binaries) is ad-hoc signed with the hypervisor entitlement first; for

@@ -1081,7 +1081,7 @@ mod tests {
     /// SDK's `emulator/lib64`); no guest. The test binary lacks `emu`'s rpaths, so gfxstream's
     /// bare-name dlopen of ANGLE needs a fallback path (without it, init crashes in the renderer):
     ///     L=~/Library/Android/sdk/emulator/lib64; DYLD_FALLBACK_LIBRARY_PATH=$L:$L/gles_angle:/usr/lib \
-    ///       cargo test --release -p emu-vmm renderer_init_off_thread -- --ignored --nocapture
+    ///       cargo test --release -p simee-emu-vmm renderer_init_off_thread -- --ignored --nocapture
     #[test]
     #[ignore = "needs a gfxstream renderer and a host GPU"]
     fn renderer_init_off_thread() {

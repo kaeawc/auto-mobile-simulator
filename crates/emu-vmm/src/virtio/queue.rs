@@ -549,7 +549,7 @@ pub(crate) mod tests {
 
     /// Device-side cost of popping a Linux-shaped block request: one indirect descriptor whose
     /// table holds a header, 32 data pages and a status byte.
-    ///     cargo test --release -p emu-vmm queue_pop_indirect -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-vmm queue_pop_indirect -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn queue_pop_indirect() {

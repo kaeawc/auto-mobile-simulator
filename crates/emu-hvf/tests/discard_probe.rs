@@ -1,7 +1,7 @@
 //! Measures how host memory mapped into a Hypervisor.framework VM can be given back to the host
 //! (`phys_footprint`) and what the guest reads afterwards. Needs Apple silicon and the hypervisor
 //! entitlement (cargo's runner signs test binaries). One VM per process, so run each test on its
-//! own: `cargo test -p emu-hvf --test discard_probe -- --ignored --nocapture --exact <name>` (or
+//! own: `cargo test -p simee-emu-hvf --test discard_probe -- --ignored --nocapture --exact <name>` (or
 //! `cargo nextest run --run-ignored only`, a process per test).
 //!
 //! 64 MiB, half written by the host and half by the guest, M-series, macOS 26 (2026-11-24):

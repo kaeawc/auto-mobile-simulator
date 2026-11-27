@@ -334,7 +334,7 @@ mod tests {
 
     /// Device-side cost of reads, as the guest issues them during boot: batches of requests at
     /// spread sectors, each popped, served by `pread` into guest RAM, and completed.
-    ///     cargo test --release -p emu-vmm blk_read_throughput -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-vmm blk_read_throughput -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn blk_read_throughput() {
@@ -386,7 +386,7 @@ mod tests {
     /// Linux-shaped requests: one indirect table of a header, 32 scattered 4 KiB pages (every
     /// other page, so no two are guest-adjacent) and a status byte, i.e. one 128 KiB request.
     /// Reads and writes, persistent and ephemeral.
-    ///     cargo test --release -p emu-vmm blk_scattered_throughput -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-vmm blk_scattered_throughput -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn blk_scattered_throughput() {
@@ -515,7 +515,7 @@ mod tests {
     }
 
     /// Kicks (MMIO exits on a real guest) per request while the worker drains.
-    ///     cargo test --release -p emu-vmm blk_kicks_while_draining -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-vmm blk_kicks_while_draining -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn blk_kicks_while_draining() {

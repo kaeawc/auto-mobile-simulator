@@ -1,13 +1,20 @@
 [package]
-name = "emu-avd"
+name = "simee-emu-avd"
 description = "AVD discovery and config: ini files, system image resolution, bootconfig, form factor, running instances."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["android", "emulator", "avd", "mobile"]
+categories = ["emulators", "development-tools::testing"]
+include = ["/Cargo.toml", "/src"]
 
 [lib]
+# Code names the crate as it did before the crates.io rename: `emu_avd::`.
+name = "emu_avd"
 doctest = false
 
 [dependencies]

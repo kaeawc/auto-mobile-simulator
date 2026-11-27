@@ -611,7 +611,7 @@ fn a_region_drawn_tightly_round_a_label_checks_it() {
     assert_eq!(report.findings().count(), 1, "{:?}", report.regions);
 }
 
-/// Timing of the check on a 1206x2622 frame: `cargo test --release -p sim-core contrast_cost -- --ignored --nocapture`.
+/// Timing of the check on a 1206x2622 frame: `cargo test --release -p simee-core contrast_cost -- --ignored --nocapture`.
 #[test]
 #[ignore = "benchmark"]
 fn contrast_cost() {

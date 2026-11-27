@@ -1,13 +1,20 @@
 [package]
-name = "sim-netshape"
+name = "simee-netshape"
 description = "No-root network shaping for simulator apps: an injected socket shaper and its live profile."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["ios", "simulator", "network", "shaping", "macos"]
+categories = ["development-tools::testing", "network-programming"]
+include = ["/Cargo.toml", "/native", "/src", "/tests"]
 
 [lib]
+# Code names the crate as it did before the crates.io rename: `sim_netshape::`.
+name = "sim_netshape"
 doctest = false
 
 [dependencies]

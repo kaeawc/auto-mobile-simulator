@@ -2,7 +2,7 @@
 //! frontend: QEMU running an Android guest under TCG on a host without KVM (#55).
 //!
 //! ```text
-//! cargo run --release -p emu-vmm --example vhost_user_vsock -- <socket> <adb port> [prop=value ...]
+//! cargo run --release -p simee-emu-vmm --example vhost_user_vsock -- <socket> <adb port> [prop=value ...]
 //! qemu-system-x86_64 ... -object memory-backend-memfd,id=mem,size=2G,share=on -machine memory-backend=mem \
 //!     -chardev socket,id=vs,path=<socket> -device vhost-user-vsock-pci,chardev=vs
 //! adb connect 127.0.0.1:<adb port>

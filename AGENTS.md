@@ -108,7 +108,7 @@ SIMEE_E2E_UDID=<udid> cargo nextest run -p simee --test e2e
 scripts/parity.sh <udid>                 # simee vs simctl
 scripts/automobile-harness.sh <udid>     # auto-mobile drives a simee device
 # Android (Apple silicon; cargo signs emu with the hypervisor entitlement via scripts/sign-run.sh)
-cargo run -p emu -- -avd <name> -show-kernel -verbose
+cargo run -p simee-emu -- -avd <name> -show-kernel -verbose
 adb -s emulator-5554 shell getprop sys.boot_completed      # after VMM changes, boot an AVD and check
 SIMEE_E2E_AVD=<avd> cargo nextest run -p simee --test e2e_android
 scripts/automobile-harness-android.sh emulator-5554

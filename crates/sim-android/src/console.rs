@@ -274,7 +274,7 @@ mod tests {
         assert!(s.command("ping").is_err());
     }
 
-    /// `cargo test --release -p sim-android console_bench -- --ignored --nocapture`
+    /// `cargo test --release -p simee-android console_bench -- --ignored --nocapture`
     ///
     /// Sessions and time per call against the fake console: the old shape of a button press
     /// (two `send` sessions around the hold), a 10-step swipe (12 sessions), against one kept

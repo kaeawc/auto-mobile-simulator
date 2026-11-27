@@ -605,7 +605,7 @@ mod tests {
 
     /// Per-exit bookkeeping with N vCPU threads: each one's exit counter, and the sysreg trap
     /// log for an encoding already logged (the PMU and debug registers a guest polls).
-    /// `cargo test --release -p emu-vmm exit_bookkeeping_cost -- --ignored --nocapture`
+    /// `cargo test --release -p simee-emu-vmm exit_bookkeeping_cost -- --ignored --nocapture`
     #[test]
     #[ignore = "benchmark"]
     fn exit_bookkeeping_cost() {

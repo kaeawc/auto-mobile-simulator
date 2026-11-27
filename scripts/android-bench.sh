@@ -24,7 +24,7 @@ out="$repo/bench"; mkdir -p "$out"
 port=${PORT:-5600}; serial="emulator-$port"
 own=()
 case "$kind" in
-  emu) (cd "$repo" && cargo build -q --release -p emu) && codesign -s - -f --entitlements "$repo/scripts/hypervisor.entitlements" "$repo/target/release/emu" 2>/dev/null
+  emu) (cd "$repo" && cargo build -q --release -p simee-emu) && codesign -s - -f --entitlements "$repo/scripts/hypervisor.entitlements" "$repo/target/release/emu" 2>/dev/null
        bin="$repo/target/release/emu"; own=(-verbose) ;;
   stock) bin="$sdk/emulator/emulator" ;;
   *) echo "kind must be emu or stock" >&2; exit 2 ;;

@@ -980,7 +980,7 @@ mod tests {
 
     /// Shared-slot ALLOCATE latency (the vCPU exit) for a 1080x2400 RGBA buffer, and lookup cost
     /// with 2048 holes in front of the first fit.
-    ///     cargo test --release -p emu-vmm allocate_cost -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-vmm allocate_cost -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn allocate_cost() {

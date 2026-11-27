@@ -103,7 +103,7 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - run: cargo llvm-cov nextest --locked -p emu-kvm --cargo-profile ci --no-report --hide-progress-bar --run-ignored only -E 'not test(notify_cost)'
+      - run: cargo llvm-cov nextest --locked -p simee-emu-kvm --cargo-profile ci --no-report --hide-progress-bar --run-ignored only -E 'not test(notify_cost)'
       - run: |
           {
             echo '### Coverage (Linux)'
@@ -139,7 +139,7 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
       - run: |
-          cargo test --locked --release -p emu-kvm notify_cost -- --ignored --nocapture | tee bench.txt
+          cargo test --locked --release -p simee-emu-kvm notify_cost -- --ignored --nocapture | tee bench.txt
           { echo '### KVM notify cost (x86_64 runner)'; echo '```text'; grep notify_cost: bench.txt; nproc; grep -m1 'model name' /proc/cpuinfo; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   # The simulator service and Hypervisor.framework only exist on macOS, so the iOS and Android
@@ -202,7 +202,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - if: needs.changes.outputs.emu == 'true'
-        run: cargo build --locked --release -p emu
+        run: cargo build --locked --release -p simee-emu
       - if: needs.changes.outputs.emu == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

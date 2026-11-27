@@ -520,7 +520,7 @@ mod tests {
     /// Launch cost of a real gzip kernel into fresh guest RAM, interleaved: the old path (read
     /// the file, inflate into a Vec, copy), a cache miss (chunked inflate, then the cache write)
     /// and a cache hit (`pread`).
-    ///     cargo test --release -p emu-vmm kernel_load -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-vmm kernel_load -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn kernel_load() {

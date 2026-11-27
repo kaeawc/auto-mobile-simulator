@@ -1,13 +1,20 @@
 [package]
-name = "sim-bundle"
+name = "simee-bundle"
 description = "Portable device bundles: a manifest, content-addressed LZ4 chunks, and the same as one plain tar; verified on import."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["android", "emulator", "snapshot", "bundle", "lz4"]
+categories = ["development-tools::testing", "compression"]
+include = ["/Cargo.toml", "/src"]
 
 [lib]
+# Code names the crate as it did before the crates.io rename: `sim_bundle::`.
+name = "sim_bundle"
 doctest = false
 
 [dependencies]

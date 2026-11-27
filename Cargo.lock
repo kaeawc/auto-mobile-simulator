@@ -295,101 +295,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "emu"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "emu-avd",
- "emu-ext4",
- "emu-gfxstream",
- "emu-hvf",
- "emu-sdk",
- "emu-vmm",
- "libc",
- "rustix",
- "sim-android",
- "sim-core",
-]
-
-[[package]]
-name = "emu-avd"
-version = "0.1.0"
-dependencies = [
- "rustix",
- "sim-bundle",
- "sim-core",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "emu-ext4"
-version = "0.1.0"
-
-[[package]]
-name = "emu-fdt"
-version = "0.1.0"
-
-[[package]]
-name = "emu-gfxstream"
-version = "0.1.0"
-dependencies = [
- "emu-hvf",
- "libc",
- "sim-core",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "emu-hvf"
-version = "0.1.0"
-dependencies = [
- "libc",
- "rustix",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "emu-kvm"
-version = "0.1.0"
-dependencies = [
- "emu-hvf",
- "kvm-bindings",
- "kvm-ioctls",
- "libc",
- "thiserror 2.0.21",
- "vmm-sys-util",
-]
-
-[[package]]
-name = "emu-sdk"
-version = "0.1.0"
-dependencies = [
- "emu-hvf",
- "flate2",
- "roxmltree",
- "sha1_smol",
- "sim-core",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "emu-vmm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cpal",
- "emu-fdt",
- "emu-gfxstream",
- "emu-hvf",
- "flate2",
- "libc",
- "rustix",
- "sim-core",
- "smoltcp",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -975,97 +880,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "sim-android"
-version = "0.1.0"
-dependencies = [
- "emu-avd",
- "png",
- "sim-core",
-]
-
-[[package]]
-name = "sim-api"
-version = "0.1.0"
-dependencies = [
- "base64",
- "emu-avd",
- "serde",
- "serde_json",
- "sim-android",
- "sim-audio",
- "sim-core",
- "sim-coresim",
- "sim-debug",
- "sim-netshape",
-]
-
-[[package]]
-name = "sim-audio"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sim-core",
-]
-
-[[package]]
-name = "sim-bundle"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "lz4_flex",
- "serde",
- "serde_json",
- "sim-core",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "sim-core"
-version = "0.1.0"
-dependencies = [
- "png",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "sim-coresim"
-version = "0.1.0"
-dependencies = [
- "block2",
- "libc",
- "objc2",
- "objc2-foundation",
- "sim-core",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "sim-debug"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "sim-mcp"
-version = "0.1.0"
-dependencies = [
- "emu-avd",
- "serde_json",
- "sim-android",
- "sim-api",
-]
-
-[[package]]
-name = "sim-netshape"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1093,13 +907,199 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "emu-avd",
  "png",
  "serde_json",
- "sim-android",
- "sim-api",
- "sim-core",
- "sim-mcp",
+ "simee-android",
+ "simee-api",
+ "simee-core",
+ "simee-emu-avd",
+ "simee-mcp",
+]
+
+[[package]]
+name = "simee-android"
+version = "0.1.0"
+dependencies = [
+ "png",
+ "simee-core",
+ "simee-emu-avd",
+]
+
+[[package]]
+name = "simee-api"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+ "simee-android",
+ "simee-audio",
+ "simee-core",
+ "simee-coresim",
+ "simee-debug",
+ "simee-emu-avd",
+ "simee-netshape",
+]
+
+[[package]]
+name = "simee-audio"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "simee-core",
+]
+
+[[package]]
+name = "simee-bundle"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "lz4_flex",
+ "serde",
+ "serde_json",
+ "simee-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "simee-core"
+version = "0.1.0"
+dependencies = [
+ "png",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "simee-coresim"
+version = "0.1.0"
+dependencies = [
+ "block2",
+ "libc",
+ "objc2",
+ "objc2-foundation",
+ "simee-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "simee-debug"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "simee-emu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "rustix",
+ "simee-android",
+ "simee-core",
+ "simee-emu-avd",
+ "simee-emu-ext4",
+ "simee-emu-gfxstream",
+ "simee-emu-hvf",
+ "simee-emu-sdk",
+ "simee-emu-vmm",
+]
+
+[[package]]
+name = "simee-emu-avd"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "simee-bundle",
+ "simee-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "simee-emu-ext4"
+version = "0.1.0"
+
+[[package]]
+name = "simee-emu-fdt"
+version = "0.1.0"
+
+[[package]]
+name = "simee-emu-gfxstream"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "simee-core",
+ "simee-emu-hvf",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "simee-emu-hvf"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "simee-emu-kvm"
+version = "0.1.0"
+dependencies = [
+ "kvm-bindings",
+ "kvm-ioctls",
+ "libc",
+ "simee-emu-hvf",
+ "thiserror 2.0.21",
+ "vmm-sys-util",
+]
+
+[[package]]
+name = "simee-emu-sdk"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "roxmltree",
+ "sha1_smol",
+ "simee-core",
+ "simee-emu-hvf",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "simee-emu-vmm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "flate2",
+ "libc",
+ "rustix",
+ "simee-core",
+ "simee-emu-fdt",
+ "simee-emu-gfxstream",
+ "simee-emu-hvf",
+ "smoltcp",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "simee-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "simee-android",
+ "simee-api",
+ "simee-emu-avd",
+]
+
+[[package]]
+name = "simee-netshape"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

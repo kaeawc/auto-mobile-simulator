@@ -5,16 +5,16 @@
 # `scripts/ci-scope.py check` (CI's fmt job, scripts/check.sh) fails when a crate is missing;
 # `scripts/ci-scope.py macos-crates` says why each one is in. A crate that needn't be here may
 # stay with a reason in a comment after its name.
-emu
-emu-avd
-emu-gfxstream
-emu-hvf
-emu-sdk
-emu-vmm
-sim-android
-sim-api
-sim-audio
-sim-coresim
-sim-mcp
-sim-netshape
 simee
+simee-android
+simee-api
+simee-audio
+simee-coresim
+simee-emu
+simee-emu-avd
+simee-emu-gfxstream
+simee-emu-hvf
+simee-emu-sdk
+simee-emu-vmm
+simee-mcp
+simee-netshape

@@ -283,7 +283,7 @@ each. Before this, `-provision-renderer` fetched Apple silicon's archive on ever
 had no renderer it could load.
 
 ```bash
-cargo run --release -p emu-gfxstream --example renderer_caps -- -vulkan-only <lib64>
+cargo run --release -p simee-emu-gfxstream --example renderer_caps -- -vulkan-only <lib64>
 ```
 
 | Vulkan driver | Renderer init, median (runs) | 720×1280 readback, median of the runs' medians |
@@ -548,7 +548,7 @@ in [android.md](android.md#performance-notes).
 | Same change, emu CPU-seconds to `sys.boot_completed`, first / warm boot, median | 25.0 / 9.3 | 23.4 / 8.7 | same runs (`cpu_s`) |
 | Same change, launcher swipes a minute after boot: janky frames, median of 6 (2 boots × 3 runs) / emu CPU | 0.40% / 28% of a core | 0.20% / 25% | same AVD, host load 5 to 11, `scripts/android-jank.sh emulator-5600 <pid>` |
 | Renderer init with Metal's shader cache cold / warm (mostly ANGLE's Metal shader library) | 4.5 and 5.1 s (2 of 20 launches) | 0.33 s (median of the other 18) | M3 Max, 2026-11-26, `emu -verbose` (`renderer initialized in`) |
-| Same init without a guest, as an API 36 boot makes it: cold (an empty cache) / warm, median of 3 | 4.36 s (4.31, 4.36, 4.39) | 0.08 s (70 to 96 ms, 6 runs) | M3 Max, 2026-11-26, host load 23 to 27, `cargo run --release -p emu-gfxstream --example renderer_caps -- -emu <lib64>`, each cold run under a new bundle id |
+| Same init without a guest, as an API 36 boot makes it: cold (an empty cache) / warm, median of 3 | 4.36 s (4.31, 4.36, 4.39) | 0.08 s (70 to 96 ms, 6 runs) | M3 Max, 2026-11-26, host load 23 to 27, `cargo run --release -p simee-emu-gfxstream --example renderer_caps -- -emu <lib64>`, each cold run under a new bundle id |
 | emu with its own Metal cache (bundle `dev.simee.emu`): repeat boots of one binary at one path, renderer init / launch to `sys.boot_completed`, median (runs) | 1.01 s (4.69, 1.01, 0.35) / 11.7 s (20.0, 11.7, 8.3): the shared cache missed in 2 of 3 boots | 0.34 s (0.33 to 0.36) / 7.8 s (7.8, 7.8, 7.8, 9.8, then 7.8, 8.4, 8.0 in a third interleaved round), 7 boots (2 with the ring-yield experiment of android.md "Ring polling", since dropped); the third round's before arm, run the same minute, was warm too (init 0.32 to 0.36 s, boot 7.8, 7.8, 9.4 s, median 7.8), so that round did not reproduce the shared cache's misses | API 36 phone 720×1280, 4 vCPUs, M3 Max, 2026-11-26, arms interleaved, both binaries warmed first; host load 8 to 33 (before) and 9 to 22 (after), 15 to 17 in the third round (2026-11-26, 08:57 to 08:59); `emu -verbose` (`renderer initialized in`), `adb shell getprop sys.boot_completed` polled every 0.25 s from launch |
 | Same boots, launcher swipes 30 s after `sys.boot_completed`: janky frames / emu CPU, median (runs). Not a difference: both arms swung run to run on a host other work was loading (the 1-minute load reached 114 during the run) | 3.1% (3.1, 1.1, 27.0) / 30% (28, 30, 55) | 1.1% (0, 20.4, 0, 2.3) / 34% (28, 38, 30, 38) | same runs, `scripts/android-jank.sh emulator-5600 <pid>` |
 | A fresh install path: the boot-shaped renderer init (`emu -warm-renderer <lib64>`, timed) without / after `emu -provision-renderer` from that path, 3 interleaved rounds | 5.42, 0.83, 0.73 s (cold once: later fresh copies were warm) | 0.78, 1.00, 0.78 s | M3 Max, 2026-11-26, host load 180 to 210 (every number slow), a new copy of one emu build per run |
@@ -559,7 +559,7 @@ in [android.md](android.md#performance-notes).
 | Same change, emu RSS after those swipes, median of 8 | 3819 MB | 3835 MB (SwiftShader's library and idle workers) | same runs |
 | Ring polling on the warm boots: render-thread samples yielding in `RingStream::readRaw` (`swtch_pri`), in fractions of a core during swipes, median of 3 | 0.57% (0.53 to 0.68) | 0.48% (0.47, 0.48, 3.79) | same runs, `sample <pid> 20 1` during a second `scripts/android-jank.sh` run |
 | Plain `fsync` for guest flushes: first-boot APEX decompression | over 270 s | about 70 s | M-series Mac |
-| Screenshot of a 2480×1740 screen (convert and encode) | 86 ms | 19 ms | `cargo run --release -p sim-core --example frame_bench` |
+| Screenshot of a 2480×1740 screen (convert and encode) | 86 ms | 19 ms | `cargo run --release -p simee-core --example frame_bench` |
 | Display stream: emulator CPU per frame besides the readback, tablet / phone | 12.8 / 7.1 ms | 2.0 / 0 ms | 4-core Linux VM |
 | vsock host to guest | 474 MiB/s | 597 MiB/s | 4-core Linux VM, `vsock_throughput` |
 | adb client to guest, end to end | 498 MiB/s | 870 MiB/s | 4-core Linux VM, `adb_throughput_to_guest` |
@@ -593,9 +593,9 @@ polled slowly), and timed `sys.boot_completed` only after the first frame; those
 The `--ignored` benches run on any host:
 
 ```bash
-cargo test --release -p emu-vmm vsock_throughput -- --ignored --nocapture
-cargo test --release -p emu-vmm present_cost -- --ignored --nocapture
-CASE=2480,1080,true cargo test --release -p emu frame_path_latency -- --ignored --nocapture
+cargo test --release -p simee-emu-vmm vsock_throughput -- --ignored --nocapture
+cargo test --release -p simee-emu-vmm present_cost -- --ignored --nocapture
+CASE=2480,1080,true cargo test --release -p simee-emu frame_path_latency -- --ignored --nocapture
 ```
 
 ## iOS
@@ -833,7 +833,7 @@ Measured and left alone:
 
 | Build | Result | Command |
 |---|---|---|
-| Release `emu`, clean | 13 s wall (57 CPU s) at load 17; release settings unchanged | `cargo build --release -p emu` |
+| Release `emu`, clean | 13 s wall (57 CPU s) at load 17; release settings unchanged | `cargo build --release -p simee-emu` |
 | Incremental after a one-line edit in `sim-core`, tests | 3.0 to 4.9 s; unchanged by `debug = 0` (3.1 to 3.6 s) or `-ld_classic` (3.6 to 4.1 s) | `cargo test --no-run` |
 | Incremental after a one-line edit in `emu-vmm`, `cargo c` / `cargo lint` | about 1 to 2 s each | `cargo c`, `cargo lint` |
 | `scripts/check.sh --all`, warm | 15 to 26 s, of which the test run is 13 to 22 s | `scripts/check.sh --all` |

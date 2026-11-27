@@ -1,7 +1,7 @@
 //! Times the screenshot path: pixel conversion and PNG encoding, on a real screen (any PNG) and on
 //! a synthetic iOS-sized home screen.
 //!
-//!     cargo run --release -p sim-core --example frame_bench [image.png ...]
+//!     cargo run --release -p simee-core --example frame_bench [image.png ...]
 use std::time::Instant;
 
 use sim_core::frame::{Frame, encode_png};

@@ -231,7 +231,7 @@ mod developer_dir_tests {
     }
 
     /// The link against the spawn this replaces (no simulator service is touched).
-    ///     cargo test --release -p sim-coresim developer_dir_cost -- --ignored --nocapture
+    ///     cargo test --release -p simee-coresim developer_dir_cost -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn developer_dir_cost() {

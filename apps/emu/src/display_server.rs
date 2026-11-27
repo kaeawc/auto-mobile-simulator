@@ -1270,7 +1270,7 @@ mod tests {
 
     /// Moving one frame's RGBA rows from the emulator to a client, on the socket and through the
     /// ring, on disk and (where there's one) on a tmpfs.
-    ///     cargo test --release -p emu transport_cost -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu transport_cost -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn transport_cost() {
@@ -1284,7 +1284,7 @@ mod tests {
     /// one, on the socket and through the ring. `CASE=<w>,<max_width>,<shared>` runs one case
     /// alone (a long run of many rigs drifts); `SAMPLES=1` prints every sample (each ring's first
     /// three frames include its slots' first page faults).
-    ///     cargo test --release -p emu frame_path_latency -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu frame_path_latency -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn frame_path_latency() {

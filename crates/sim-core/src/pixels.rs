@@ -399,7 +399,7 @@ mod tests {
     }
 
     /// The display stream's downscale on a tablet frame and a phone frame, old against new.
-    ///     cargo test --release -p sim-core downscale_cost -- --ignored --nocapture
+    ///     cargo test --release -p simee-core downscale_cost -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn downscale_cost() {

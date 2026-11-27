@@ -44,7 +44,7 @@ fi
 
 mode=${1:?usage: scripts/net-bench.sh idle|throughput <avd> [runs]}
 avd=${2:?avd}; runs=${3:-3}
-(cd "$repo" && cargo build -q --release -p emu) && codesign -s - -f --entitlements "$repo/scripts/hypervisor.entitlements" "$emu" 2>/dev/null
+(cd "$repo" && cargo build -q --release -p simee-emu) && codesign -s - -f --entitlements "$repo/scripts/hypervisor.entitlements" "$emu" 2>/dev/null
 result="$out/net-$mode.result"; : > "$result"
 say() { echo "$*" | tee -a "$result"; }
 load1() { sysctl -n vm.loadavg | awk '{print $2}'; }

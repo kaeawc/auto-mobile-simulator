@@ -3,9 +3,9 @@
 //! `<sdk>/simee/renderer/<revision>/lib64` from `emu -provision-renderer`):
 //!
 //! ```text
-//! cargo run -p emu-gfxstream --example renderer_caps -- <lib64> [moltenvk|swiftshader|lavapipe]
-//! cargo run -p emu-gfxstream --example renderer_caps -- -load-only <lib64>
-//! cargo run -p emu-gfxstream --example renderer_caps -- -emu <lib64>
+//! cargo run -p simee-emu-gfxstream --example renderer_caps -- <lib64> [moltenvk|swiftshader|lavapipe]
+//! cargo run -p simee-emu-gfxstream --example renderer_caps -- -load-only <lib64>
+//! cargo run -p simee-emu-gfxstream --example renderer_caps -- -emu <lib64>
 //! ```
 //!
 //! Like `emu`, it links `lib64` beside itself and sets the launcher directory to its parent.

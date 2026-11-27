@@ -381,8 +381,36 @@ class Crate:
             for ln in lines:
                 dm = re.match(r"([A-Za-z0-9_-]+)\s*(?:\.\s*workspace\s*=|=)", ln)
                 if dm:
-                    out.append((dm.group(1), target))
+                    out.append((package_of(dm.group(1), ln), target))
         return out
+
+
+def package_of(key, line):
+    """The package a dependency line names: its `package = "..."`, else the root's
+    `[workspace.dependencies]` entry's for a `.workspace = true` key, else the key itself (the
+    workspace crates are published as `simee-*` under their old keys)."""
+    m = re.search(r'\bpackage\s*=\s*"([^"]+)"', line)
+    if m:
+        return m.group(1)
+    if re.match(r"[A-Za-z0-9_-]+\s*\.\s*workspace\s*=|[A-Za-z0-9_-]+\s*=\s*\{[^}]*\bworkspace\s*=\s*true", line):
+        return workspace_packages().get(key, key)
+    return key
+
+
+_WORKSPACE_PACKAGES = {}
+
+
+def workspace_packages():
+    """{dependency key: package} for the renamed `[workspace.dependencies]` of the tree at ROOT."""
+    if ROOT not in _WORKSPACE_PACKAGES:
+        out = _WORKSPACE_PACKAGES[ROOT] = {}
+        for h, lines in toml_sections(read("Cargo.toml")):
+            if h == "workspace.dependencies":
+                for ln in lines:
+                    m = re.match(r'([A-Za-z0-9_-]+)\s*=\s*\{[^}]*\bpackage\s*=\s*"([^"]+)"', ln)
+                    if m:
+                        out[m.group(1)] = m.group(2)
+    return _WORKSPACE_PACKAGES[ROOT]
 
 
 def workspace():
@@ -782,7 +810,7 @@ def desktop_deps(crates):
 REFERENCED = re.compile(r'"(?:\.\./)*((?:docs|scripts)/[A-Za-z0-9_./-]+)"')
 
 # Paths no job here reads: docs, other workflows, local tooling, and scripts nothing below names.
-NONE = re.compile(r"^(docs/|\.github/workflows/software-mode\.yml$|\.githooks/|\.local/|LICENSE$|\.gitignore$"
+NONE = re.compile(r"^(docs/|\.github/workflows/(?:software-mode|release)\.yml$|\.githooks/|\.local/|LICENSE$|\.gitignore$"
                   r"|Makefile$|bacon\.toml$|rustfmt\.toml$)|\.md$|^scripts/")
 EVERYTHING = re.compile(r"^(\.github/workflows/ci\.yml|\.github/actions/|\.cargo/|rust-toolchain\.toml$|Cargo\.toml$"
                         r"|scripts/ci-scope\.py$)")
@@ -855,7 +883,7 @@ def tree_scopes(paths):
     is left to the other tree, which judges what it was (deleted) or is (added)."""
     crates = workspace()
     by_dir = sorted(((c.dir + "/", n) for n, c in crates.items()), key=lambda t: -len(t[0]))
-    emu = closure(crates, "emu")
+    emu = closure(crates, "simee-emu" if "simee-emu" in crates else "emu")
     desk = desktop_deps(crates)
     on_mac, release, desk_build, refs = {}, {}, {}, {}
     for n, c in crates.items():
