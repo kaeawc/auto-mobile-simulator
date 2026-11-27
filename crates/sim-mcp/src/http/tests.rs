@@ -991,12 +991,14 @@ fn the_first_request_head_has_one_deadline_from_the_connection() {
     let request = discover_request(addr, &format!("Content-Length: {}\r\nConnection: close", discover_body().len()), &discover_body());
     // Silent for 400 ms, then a head sent over 400 ms more: 800 ms after the connection opened.
     let mut stream = TcpStream::connect(addr).expect("connect");
+    // Set before the server can close the socket: macOS refuses SO_RCVTIMEO (EINVAL) on a socket
+    // its peer already shut.
+    stream.set_read_timeout(Some(Duration::from_secs(2))).expect("timeout");
     std::thread::sleep(Duration::from_millis(400));
     let (a, b) = request.split_at(20);
     let _ = stream.write_all(a.as_bytes());
     std::thread::sleep(Duration::from_millis(400));
     let _ = stream.write_all(b.as_bytes());
-    stream.set_read_timeout(Some(Duration::from_secs(2))).expect("timeout");
     let mut reply = String::new();
     let _ = stream.read_to_string(&mut reply);
     assert!(!reply.contains("200 OK"), "a head that arrived after its deadline was served: {reply}");
