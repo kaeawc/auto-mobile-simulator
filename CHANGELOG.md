@@ -6,6 +6,14 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ## [Unreleased]
 
+### Added
+
+- simee's mark, a cut emerald, drawn from one description in `sim_core::mark` (its cut, light,
+  colours and motion states): the macOS app icon (`.icns`), favicon, menu bar template, PNGs and
+  SVGs in `assets/brand/` (`scripts/brand.sh` redraws them), and in the desktop window the
+  activity indicator beside a running job, each device's state in the list and the empty stage.
+  `scripts/desktop-app.sh` bundles the window as `simee.app` with its icon.
+
 ## [0.1.0] - 2026-11-27
 
 The first release: iOS simulator and Android emulator devices from one Rust core, published to

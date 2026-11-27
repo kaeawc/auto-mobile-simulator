@@ -1,5 +1,7 @@
 # simee
 
+<img src="assets/brand/simee-mark.svg" alt="The simee mark: a cut emerald" align="right" height="96">
+
 iOS simulators and Android emulators without Simulator.app or the SDK emulator: one Rust core, one
 CLI, one JSON socket API and one desktop window for both platforms. Your existing tools keep
 working, because each device looks like the stock one: `adb`, `adb emu`, `simctl` and test
