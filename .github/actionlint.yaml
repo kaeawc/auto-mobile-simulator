@@ -1,0 +1,5 @@
+# Labels of the self-hosted runners workflows ask for (actionlint knows only GitHub's).
+self-hosted-runner:
+  labels:
+    # An arm64 Linux host with /dev/kvm: .github/workflows/kvm-arm64.yml.
+    - kvm-arm64

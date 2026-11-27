@@ -34,7 +34,10 @@ fetch() { # url file sha256
   local f=$dir/$2
   if [[ ! -f $f ]] || ! echo "$3  $f" | sha256sum -c --quiet - 2>/dev/null; then
     curl -sSfL --retry 3 -o "$f.part" "$1"
-    echo "$3  $f.part" | sha256sum -c --quiet - || { echo "kvm-smoke: $2: checksum mismatch" >&2; exit 1; }
+    echo "$3  $f.part" | sha256sum -c --quiet - || {
+      echo "kvm-smoke: $2: checksum mismatch" >&2
+      exit 1
+    }
     mv "$f.part" "$f"
   fi
 }
@@ -56,7 +59,8 @@ boot_kernel=${CARGO_TARGET_DIR:-target}/$target/release/examples/boot_kernel
 
 # newc initramfs archives: (path in archive, host file or "" for a directory, mode).
 mkcpio() { # out, then triples on stdin
-  python3 -I -c "$(cat <<'PY'
+  python3 -I -c "$(
+    cat <<'PY'
 import os, sys
 out = open(sys.argv[1], "wb")
 def entry(name, data, mode):
@@ -73,7 +77,7 @@ for line in sys.stdin.read().splitlines():
         entry(name, b"", 0o040755)
 entry("TRAILER!!!", b"", 0)
 PY
-)" "$1"
+  )" "$1"
 }
 
 bb=$dir/busybox/usr/bin/busybox
@@ -82,7 +86,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 # The guest under test: reports each online CPU, then powers off.
-cat > "$work/guest-init" <<'EOF'
+cat >"$work/guest-init" <<'EOF'
 #!/bin/busybox sh
 /bin/busybox mount -t proc proc /proc
 /bin/busybox mount -t devtmpfs dev /dev
@@ -104,7 +108,7 @@ if [[ $native == 1 ]]; then
 fi
 
 # The emulated KVM host: boots, runs boot_kernel on /dev/kvm, prints its verdict, powers off.
-cat > "$work/host-init" <<EOF
+cat >"$work/host-init" <<EOF
 #!/bin/busybox sh
 /bin/busybox mount -t proc proc /proc
 /bin/busybox mount -t sysfs sys /sys
