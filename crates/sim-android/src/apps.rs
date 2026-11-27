@@ -6,8 +6,11 @@
 //! from a caller is either checked against what it must be (a package name) or quoted
 //! ([`shell_quote`]).
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -18,6 +21,9 @@ use crate::{Android, Device};
 const PID_WAIT: Duration = Duration::from_secs(3);
 const PID_POLL: Duration = Duration::from_millis(100);
 
+/// The intent a launcher sends: what `launch` resolves and starts.
+const LAUNCHER_INTENT: &str = "-a android.intent.action.MAIN -c android.intent.category.LAUNCHER";
+
 /// adb bound to one running device.
 #[derive(Clone, Debug)]
 pub struct Adb {
@@ -27,6 +33,35 @@ pub struct Adb {
     pub bundletool: Option<PathBuf>,
     /// How long `launch` looks for the app's process.
     pub pid_wait: Duration,
+    /// How long each kind of adb call may take before it is stopped and reported.
+    pub deadlines: Deadlines,
+}
+
+/// How long each kind of adb (and bundletool) call may run. One that runs longer, as on a guest
+/// whose adbd is wedged but still listed as a `device`, is killed and reported as timed out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deadlines {
+    /// `adb install`, bundletool and `pm uninstall`: copying and optimizing a large app.
+    pub install: Duration,
+    /// `am start`: with `-W` it waits for the activity's first frame.
+    pub start: Duration,
+    /// Everything else (`cmd package`, `pidof`, `pm list`, `am force-stop`): answers at once.
+    pub query: Duration,
+}
+
+impl Default for Deadlines {
+    fn default() -> Self {
+        Deadlines { install: Duration::from_secs(300), start: Duration::from_secs(30), query: Duration::from_secs(10) }
+    }
+}
+
+/// What `launch` started.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Launched {
+    /// The app's process, `None` when no process named for the package showed up.
+    pub pid: Option<u32>,
+    /// The launcher activity it started (`com.example.app/.MainActivity`).
+    pub activity: String,
 }
 
 impl Device {
@@ -34,27 +69,23 @@ impl Device {
     pub fn adb(&self, android: &Android) -> Result<Adb, String> {
         let serial = self.running()?.serial();
         let adb = android.adb().ok_or("adb not found: install the SDK's platform-tools (`emu -provision`) or put adb on the PATH")?;
-        Ok(Adb { adb, serial, bundletool: on_path("bundletool"), pid_wait: PID_WAIT })
+        Ok(Adb { adb, serial, bundletool: on_path("bundletool"), pid_wait: PID_WAIT, deadlines: Deadlines::default() })
     }
 }
 
 impl Adb {
-    /// Runs adb on the device with `args` after `-s <serial>`: its success and its stdout and
-    /// stderr, in that order, as text.
-    fn run(&self, args: &[&str]) -> Result<(bool, String), String> {
-        let out = Command::new(&self.adb)
-            .args(["-s", &self.serial])
-            .args(args)
-            .output()
-            .map_err(|e| format!("couldn't run {}: {e}", self.adb.display()))?;
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&out.stderr));
-        Ok((out.status.success(), text))
+    /// Runs adb on the device with `args` after `-s <serial>`, for at most `limit`: its success
+    /// and its stdout and stderr, in that order, as text.
+    fn run(&self, args: &[&str], limit: Duration) -> Result<(bool, String), String> {
+        let what = format!("adb -s {} {}", self.serial, args.join(" "));
+        let (ok, mut text, stderr) = output_within(Command::new(&self.adb).args(["-s", &self.serial]).args(args), limit, &what)?;
+        text.push_str(&stderr);
+        Ok((ok, text))
     }
 
-    /// `adb shell <command>`: what it printed, or why it failed.
-    fn shell(&self, command: &str) -> Result<String, String> {
-        match self.run(&["shell", command])? {
+    /// `adb shell <command>`, for at most `limit`: what it printed, or why it failed.
+    fn shell(&self, command: &str, limit: Duration) -> Result<String, String> {
+        match self.run(&["shell", command], limit)? {
             (true, text) => Ok(text),
             (false, text) => Err(failure(command, &text)),
         }
@@ -68,7 +99,7 @@ impl Adb {
         }
         match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
             Some("apk") => {
-                let (ok, text) = self.run(&["install", "-r", &path.to_string_lossy()])?;
+                let (ok, text) = self.run(&["install", "-r", &path.to_string_lossy()], self.deadlines.install)?;
                 install_result(ok, &text)
             }
             Some("aab") => self.install_bundle(path),
@@ -76,20 +107,23 @@ impl Adb {
         }
     }
 
-    /// An `.aab`: `bundletool build-apks` for this device, then `install-apks`.
+    /// An `.aab`: `bundletool build-apks` for this device, then `install-apks`, through a scratch
+    /// directory of this call's own (calls can run at once on one device), removed after.
     fn install_bundle(&self, bundle: &Path) -> Result<(), String> {
+        static SCRATCH: AtomicU64 = AtomicU64::new(0);
         let bundletool = self.bundletool.as_ref().ok_or(
             "installing an .aab needs `bundletool` on the PATH (https://developer.android.com/tools/bundletool); an .apk installs without it",
         )?;
-        let dir = std::env::temp_dir().join(format!("simee-aab-{}-{}", std::process::id(), self.serial));
+        let n = SCRATCH.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("simee-aab-{}-{}-{n}", std::process::id(), self.serial));
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let apks = dir.join("app.apks");
         let tool = |args: Vec<String>| -> Result<(), String> {
-            let out = Command::new(bundletool).args(args).output().map_err(|e| format!("couldn't run {}: {e}", bundletool.display()))?;
-            if out.status.success() {
-                return Ok(());
+            let what = format!("bundletool {}", args[0]);
+            match output_within(Command::new(bundletool).args(args), self.deadlines.install, &what)? {
+                (true, ..) => Ok(()),
+                (false, stdout, stderr) => Err(failure("bundletool", &format!("{stderr}{stdout}"))),
             }
-            Err(failure("bundletool", &format!("{}{}", String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout))))
         };
         let (adb, id) = (format!("--adb={}", self.adb.display()), format!("--device-id={}", self.serial));
         let built = tool(vec![
@@ -109,57 +143,148 @@ impl Adb {
     /// `pm uninstall`.
     pub fn uninstall(&self, package: &str) -> Result<(), String> {
         let package = package_name(package)?;
-        install_result(true, &self.shell(&format!("pm uninstall {package}"))?)
+        install_result(true, &self.shell(&format!("pm uninstall {package}"), self.deadlines.install)?)
     }
 
-    /// Starts the app's launcher activity and returns its process id (`None` when no process
-    /// named for the package shows up: an activity declared in another process). With `restart`
-    /// a running instance is stopped first (`am start -S`); without, it is brought to the front.
-    pub fn launch(&self, package: &str, restart: bool) -> Result<Option<u32>, String> {
+    /// Starts the app's own launcher activity, the first one its package lists (an app can have
+    /// more than one, as a debug build with LeakCanary's "Leaks" alias does, where resolving one
+    /// gives the system's chooser), and returns it with the app's process id (`None` when no
+    /// process named for the package shows up: an activity declared in another process). With
+    /// `restart` a running instance is stopped first (`am start -S`); without, it is brought to
+    /// the front.
+    pub fn launch(&self, package: &str, restart: bool) -> Result<Launched, String> {
         let package = package_name(package)?;
-        let resolved = self.shell(&format!("cmd package resolve-activity --brief -c android.intent.category.LAUNCHER {package}"))?;
-        let component = launcher_component(&resolved)
+        let found =
+            self.shell(&format!("cmd package query-activities --brief --components {LAUNCHER_INTENT} {package}"), self.deadlines.query)?;
+        let activity = launcher_component(&found, package)
             .ok_or_else(|| format!("{package} has no launcher activity (is it installed? `apps` lists what is)"))?;
         let stop = if restart { " -S" } else { "" };
-        let started = self.shell(&format!(
-            "am start -W{stop} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n {}",
-            shell_quote(&component)
-        ))?;
+        let started = self.shell(&format!("am start -W{stop} {LAUNCHER_INTENT} -n {}", shell_quote(&activity)), self.deadlines.start)?;
         if let Some(error) = am_error(&started) {
             return Err(format!("launching {package}: {error}"));
         }
         let deadline = Instant::now() + self.pid_wait;
         loop {
-            if let Some(pid) = parse_pid(&self.shell(&format!("pidof -s {package}"))?) {
-                return Ok(Some(pid));
-            }
-            if Instant::now() >= deadline {
-                return Ok(None);
+            let pid = self.pid(package)?;
+            if pid.is_some() || Instant::now() >= deadline {
+                return Ok(Launched { pid, activity });
             }
             sleep(PID_POLL);
+        }
+    }
+
+    /// The process named `package`, if one runs. toybox's `pidof` exits 1 when none does, and adb
+    /// passes that on: a failure with no output is "no process (yet)", not an error.
+    fn pid(&self, package: &str) -> Result<Option<u32>, String> {
+        let command = format!("pidof -s {package}");
+        match self.run(&["shell", &command], self.deadlines.query)? {
+            (true, text) => Ok(parse_pid(&text)),
+            (false, text) if text.trim().is_empty() => Ok(None),
+            (false, text) => Err(failure(&command, &text)),
         }
     }
 
     /// `am force-stop`.
     pub fn terminate(&self, package: &str) -> Result<(), String> {
         let package = package_name(package)?;
-        self.shell(&format!("am force-stop {package}")).map(|_| ())
+        self.shell(&format!("am force-stop {package}"), self.deadlines.query).map(|_| ())
     }
 
     /// The installed packages, sorted: the third-party ones, or with `all` the system's too.
     pub fn apps(&self, all: bool) -> Result<Vec<String>, String> {
-        Ok(parse_packages(&self.shell(if all { "pm list packages" } else { "pm list packages -3" })?))
+        Ok(parse_packages(&self.shell(if all { "pm list packages" } else { "pm list packages -3" }, self.deadlines.query)?))
     }
 
     /// Opens `url` with whatever handles it (`am start -a android.intent.action.VIEW -d`).
     pub fn open_url(&self, url: &str) -> Result<(), String> {
         let url = checked_url(url)?;
-        let started = self.shell(&format!("am start -a android.intent.action.VIEW -d {}", shell_quote(url)))?;
+        let started = self.shell(&format!("am start -a android.intent.action.VIEW -d {}", shell_quote(url)), self.deadlines.start)?;
         match am_error(&started) {
             Some(error) => Err(format!("opening {url}: {error}")),
             None => Ok(()),
         }
     }
+}
+
+/// Runs `command` with its output captured, for at most `limit`: whether it succeeded, then its
+/// stdout and stderr. Past `limit` it is killed through its own handle (so only that process,
+/// never one reusing its PID) and the error names `what`. Output is read as it comes, so the
+/// call returns once the command exits even when a process it started still holds its pipes.
+fn output_within(command: &mut Command, limit: Duration, what: &str) -> Result<(bool, String, String), String> {
+    /// How often a quiet command is checked for having exited.
+    const TICK: Duration = Duration::from_millis(20);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("couldn't run {}: {e}", Path::new(command.get_program()).display()))?;
+    let deadline = Instant::now() + limit;
+    let (tx, rx) = mpsc::channel::<(usize, Option<Vec<u8>>)>();
+    let pipes: [Option<Box<dyn Read + Send>>; 2] = [
+        child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
+        child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
+    ];
+    let mut open = 0;
+    for (i, pipe) in pipes.into_iter().enumerate() {
+        let Some(mut pipe) = pipe else { continue };
+        open += 1;
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0; 8192];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) if tx.send((i, Some(buf[..n].to_vec()))).is_ok() => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    _ => break,
+                }
+            }
+            let _ = tx.send((i, None));
+        });
+    }
+    drop(tx);
+    let mut out = [Vec::new(), Vec::new()];
+    let status = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if open > 0 && !left.is_zero() {
+            match rx.recv_timeout(left.min(TICK)) {
+                Ok((i, Some(bytes))) => {
+                    out[i].extend(bytes);
+                    continue;
+                }
+                Ok((_, None)) => {
+                    open -= 1;
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => open = 0,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        } else if !left.is_zero() {
+            // Both pipes closed: the command is exiting.
+            sleep(left.min(Duration::from_millis(1)));
+        }
+        if let Some(status) = child.try_wait().map_err(|e| format!("`{what}`: {e}"))? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("`{what}` timed out after {limit:?}; stopped it"));
+        }
+    };
+    // It exited: what it wrote last may still be on its way from the readers. A process it left
+    // holding the pipes gets a moment, not the deadline.
+    let grace = Instant::now() + Duration::from_millis(100);
+    while open > 0 {
+        match rx.recv_timeout(grace.saturating_duration_since(Instant::now())) {
+            Ok((i, Some(bytes))) => out[i].extend(bytes),
+            Ok((_, None)) => open -= 1,
+            Err(_) => break,
+        }
+    }
+    let [stdout, stderr] = out.map(|b| String::from_utf8_lossy(&b).into_owned());
+    Ok((status.success(), stdout, stderr))
 }
 
 /// `name` if it is a package name: dot-separated segments of letters, digits and underscores,
@@ -208,12 +333,14 @@ fn failure(what: &str, text: &str) -> String {
     format!("{what} failed: {}", line.trim())
 }
 
-/// The launcher component (`com.example.app/.MainActivity`) in `cmd package resolve-activity
-/// --brief`'s output: its last line, when it is a component and not "No activity found".
-fn launcher_component(out: &str) -> Option<String> {
-    let line = out.lines().map(str::trim).rfind(|l| !l.is_empty())?;
-    let (package, class) = line.split_once('/')?;
-    (!line.contains(' ') && !package.is_empty() && !class.is_empty()).then(|| line.to_owned())
+/// `package`'s first launcher component (`com.example.app/.MainActivity`) in `cmd package
+/// query-activities --brief --components`'s output, which lists one per line in the launcher's
+/// order. A component of another package (the system's chooser) is never one.
+fn launcher_component(out: &str, package: &str) -> Option<String> {
+    out.lines()
+        .map(str::trim)
+        .find(|l| !l.contains(' ') && l.split_once('/').is_some_and(|(p, class)| p == package && !class.is_empty()))
+        .map(str::to_owned)
 }
 
 /// What `am start` reports as an error (it exits 0 either way): the first `Error` line.
@@ -279,12 +406,18 @@ mod tests {
     }
 
     #[test]
-    fn the_launcher_component_is_the_last_line() {
-        let out = "priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false\ncom.example.app/.MainActivity\n";
-        assert_eq!(launcher_component(out).as_deref(), Some("com.example.app/.MainActivity"));
-        assert_eq!(launcher_component("com.example.app/.Main$Inner").as_deref(), Some("com.example.app/.Main$Inner"));
-        assert_eq!(launcher_component("No activity found\n"), None);
-        assert_eq!(launcher_component(""), None);
+    fn the_launcher_component_is_the_packages_first() {
+        let app = "com.example.app";
+        let leaky = "com.example.app/.MainActivity\ncom.example.app/leakcanary.internal.activity.LeakLauncherActivity\n";
+        assert_eq!(launcher_component(leaky, app).as_deref(), Some("com.example.app/.MainActivity"));
+        assert_eq!(launcher_component("com.example.app/.Main$Inner", app).as_deref(), Some("com.example.app/.Main$Inner"));
+        // Without --components (an older guest) the component follows each match's details.
+        let brief = "1 activities found:\n  Activity #0:\n    priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false\n    com.example.app/.MainActivity\n";
+        assert_eq!(launcher_component(brief, app).as_deref(), Some("com.example.app/.MainActivity"));
+        assert_eq!(launcher_component("android/com.android.internal.app.ResolverActivity\n", app), None, "the chooser is never the app");
+        assert_eq!(launcher_component("com.example.app2/.Main\n", app), None, "another package");
+        assert_eq!(launcher_component("No activities found\n", app), None);
+        assert_eq!(launcher_component("", app), None);
     }
 
     #[test]
@@ -332,11 +465,14 @@ mod tests {
     #[test]
     fn launch_resolves_the_activity_and_returns_the_pid() {
         let f = fixture("launch");
-        assert_eq!(f.adb.launch("com.example.app", false), Ok(Some(4321)));
+        assert_eq!(
+            f.adb.launch("com.example.app", false),
+            Ok(Launched { pid: Some(4321), activity: "com.example.app/.MainActivity".into() })
+        );
         assert_eq!(
             f.calls.calls(),
             [
-                "shell cmd package resolve-activity --brief -c android.intent.category.LAUNCHER com.example.app",
+                "shell cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.app",
                 "shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n 'com.example.app/.MainActivity'",
                 "shell pidof -s com.example.app",
             ]
@@ -347,7 +483,7 @@ mod tests {
     #[test]
     fn launch_with_restart_stops_the_running_instance() {
         let f = fixture("restart");
-        assert_eq!(f.adb.launch("com.example.app", true), Ok(Some(4321)));
+        assert_eq!(f.adb.launch("com.example.app", true).map(|l| l.pid), Ok(Some(4321)));
         assert!(f.calls.calls()[1].starts_with("shell am start -W -S "), "{:?}", f.calls.calls());
         std::fs::remove_dir_all(&f.root).ok();
     }
@@ -366,8 +502,101 @@ mod tests {
 
     #[test]
     fn a_process_that_never_shows_up_is_no_pid() {
-        let f = fixture("nopid");
-        assert_eq!(f.adb.launch("com.example.svc", false), Ok(None));
+        // toybox `pidof` exits 1 when nothing matches: launch keeps looking, then says null.
+        let mut f = fixture("nopid");
+        f.adb.pid_wait = Duration::from_millis(250);
+        assert_eq!(f.adb.launch("com.example.svc", false).map(|l| l.pid), Ok(None));
+        let probes = f.calls.calls().iter().filter(|c| *c == "shell pidof -s com.example.svc").count();
+        assert!(probes > 1, "it polled: {:?}", f.calls.calls());
+        std::fs::remove_dir_all(&f.root).ok();
+    }
+
+    #[test]
+    fn a_process_that_shows_up_late_is_found() {
+        let mut f = fixture("latepid");
+        f.adb.pid_wait = Duration::from_secs(5);
+        assert_eq!(f.adb.launch("com.example.late", false).map(|l| l.pid), Ok(Some(7777)));
+        std::fs::remove_dir_all(&f.root).ok();
+    }
+
+    #[test]
+    fn two_launcher_activities_start_the_apps_own_first_one() {
+        // A debug build with LeakCanary has a second launcher (its "Leaks" alias): resolving one
+        // gives the system's chooser, which launch must not start.
+        let f = fixture("leaky");
+        let launched = f.adb.launch("com.example.leaky", false).expect("launch");
+        assert_eq!(launched.activity, "com.example.leaky/.MainActivity");
+        let starts: Vec<String> = f.calls.calls().into_iter().filter(|c| c.starts_with("shell am start")).collect();
+        assert_eq!(
+            starts,
+            ["shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n 'com.example.leaky/.MainActivity'"]
+        );
+        std::fs::remove_dir_all(&f.root).ok();
+    }
+
+    #[test]
+    fn concurrent_aab_installs_on_one_device_keep_their_own_apks() {
+        let mut f = fixture("aabs");
+        let tool = f.root.join("bundletool");
+        // build-apks writes the bundle's name into its output and lingers, so two calls overlap;
+        // install-apks records what it was handed.
+        crate::testing::write_script(
+            &tool,
+            &format!(
+                "for a; do case $a in --bundle=*) b=${{a#--bundle=}};; --output=*) o=${{a#--output=}};; --apks=*) i=${{a#--apks=}};; esac; done\n\
+                 case $1 in\n\
+                 build-apks) echo \"$o\" >> {root}/outputs; echo \"$b\" > \"$o\"; sleep 0.3;;\n\
+                 install-apks) cat \"$i\" >> {root}/installed || exit 1;;\n\
+                 esac\n",
+                root = f.root.display()
+            ),
+        );
+        f.adb.bundletool = Some(tool);
+        let bundles: Vec<PathBuf> = ["a.aab", "b.aab"].iter().map(|n| f.root.join(n)).collect();
+        for b in &bundles {
+            std::fs::write(b, b"PK").expect("aab");
+        }
+        let results: Vec<Result<(), String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = bundles.iter().map(|b| s.spawn(|| f.adb.install(b))).collect();
+            handles.into_iter().map(|h| h.join().expect("install thread")).collect()
+        });
+        assert_eq!(results, [Ok(()), Ok(())]);
+        let mut installed: Vec<String> =
+            std::fs::read_to_string(f.root.join("installed")).expect("installed").lines().map(str::to_owned).collect();
+        installed.sort();
+        assert_eq!(installed, bundles.iter().map(|b| b.display().to_string()).collect::<Vec<_>>(), "each installed its own bundle");
+        let outputs = std::fs::read_to_string(f.root.join("outputs")).expect("outputs");
+        let outputs: Vec<&Path> = outputs.lines().map(Path::new).collect();
+        assert_eq!(outputs.len(), 2);
+        assert_ne!(outputs[0], outputs[1], "each call has its own scratch file");
+        for o in outputs {
+            assert!(!o.parent().expect("scratch dir").exists(), "{} was cleaned up", o.display());
+        }
+        std::fs::remove_dir_all(&f.root).ok();
+    }
+
+    #[test]
+    fn a_command_that_exits_returns_its_output_while_a_child_holds_the_pipes() {
+        // As adb does when it starts its server: the server keeps the pipes, adb exits.
+        let started = Instant::now();
+        let out = output_within(Command::new("sh").args(["-c", "sleep 3 & echo out; echo err >&2; exit 3"]), Duration::from_secs(10), "sh");
+        assert_eq!(out, Ok((false, "out\n".to_owned(), "err\n".to_owned())));
+        assert!(started.elapsed() < Duration::from_secs(2), "it waited {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn an_adb_call_past_its_deadline_is_killed_and_named() {
+        let mut f = fixture("hang");
+        f.adb.deadlines.query = Duration::from_millis(300);
+        let started = Instant::now();
+        let err = f.adb.terminate("com.example.hang").expect_err("wedged");
+        assert!(started.elapsed() < Duration::from_secs(5), "it waited {:?}", started.elapsed());
+        assert_eq!(err, format!("`adb -s {} shell am force-stop com.example.hang` timed out after 300ms; stopped it", f.adb.serial));
+        let pid = std::fs::read_to_string(f.root.join("sdk/platform-tools/hang.pid")).expect("hang.pid");
+        let alive = Command::new("kill").args(["-0", pid.trim()]).stderr(Stdio::null()).status().expect("kill -0");
+        assert!(!alive.success(), "adb {} was killed", pid.trim());
+        // The deadline is per call: the next one runs normally.
+        assert_eq!(f.adb.terminate("com.example.app"), Ok(()));
         std::fs::remove_dir_all(&f.root).ok();
     }
 
@@ -403,14 +632,12 @@ mod tests {
 
     #[test]
     fn an_aab_is_built_and_installed_by_bundletool() {
-        use std::os::unix::fs::PermissionsExt;
         let mut f = fixture("bundletool");
         let aab = f.root.join("app.aab");
         std::fs::write(&aab, b"PK").expect("aab");
         let tool = f.root.join("bundletool");
         let log = f.root.join("bundletool.log");
-        std::fs::write(&tool, format!("#!/bin/sh\necho \"$@\" >> {}\n", log.display())).expect("tool");
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::testing::write_script(&tool, &format!("echo \"$@\" >> {}\n", log.display()));
         f.adb.bundletool = Some(tool);
         assert_eq!(f.adb.install(&aab), Ok(()));
         let log = std::fs::read_to_string(&log).expect("log");

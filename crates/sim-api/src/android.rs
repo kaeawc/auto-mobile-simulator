@@ -84,7 +84,7 @@ fn reject_ios_params(method: &str, p: &Value, params: &[(&str, &str)]) -> Result
 /// The app methods, over adb: the parameters are read before anything runs, so a missing one is
 /// reported whether or not the device is up. Results are iOS's: nothing for `install`,
 /// `uninstall`, `terminate` and `open_url`, `{pid}` for `launch` (null when the app's process
-/// isn't named for its package), the package names for `apps`.
+/// isn't named for its package) with the launcher `activity` it started, the package names for `apps`.
 fn app(android: &Android, d: &sim_android::Device, method: &str, p: &Value) -> Result<Value, String> {
     let null = |r: Result<(), String>| r.map(|()| Value::Null);
     match method {
@@ -100,7 +100,7 @@ fn app(android: &Android, d: &sim_android::Device, method: &str, p: &Value) -> R
             let package = need_str(p, "bundle_id")?;
             reject_ios_params(method, p, IOS_LAUNCH_PARAMS)?;
             let restart = opt_bool(p, "restart")?.unwrap_or(true);
-            d.adb(android)?.launch(package, restart).map(|pid| json!({"pid": pid}))
+            d.adb(android)?.launch(package, restart).map(|l| json!({"pid": l.pid, "activity": l.activity}))
         }
         "terminate" => {
             let package = need_str(p, "bundle_id")?;
@@ -377,7 +377,10 @@ mod tests {
         let apk = root.join("app.apk");
         std::fs::write(&apk, b"PK").expect("apk");
         assert_eq!(run(&mut s, "install", json!({"path": apk})), Ok(Value::Null));
-        assert_eq!(run(&mut s, "launch", json!({"bundle_id": "com.example.app"})), Ok(json!({"pid": 4321})));
+        assert_eq!(
+            run(&mut s, "launch", json!({"bundle_id": "com.example.app"})),
+            Ok(json!({"pid": 4321, "activity": "com.example.app/.MainActivity"}))
+        );
         assert_eq!(run(&mut s, "apps", json!({})), Ok(json!(["com.example.app", "com.example.zeta"])));
         assert_eq!(
             run(&mut s, "apps", json!({"all": true})),
