@@ -13,7 +13,7 @@ use sim_core::device::{DeviceState, privacy_service};
 use sim_core::duo;
 use sim_core::form_factor::FormFactor;
 use sim_core::geometry::{Point, Size};
-use sim_core::gesture::{Sample, ScreenEdge, pace};
+use sim_core::gesture::{Sample, ScreenEdge};
 use sim_core::hid::{KEY_LEFT_SHIFT, keystroke};
 use sim_core::indigo::PointerButton;
 use sim_core::pointer::{self, Held, HeldPointer, PointerAction};
@@ -746,25 +746,29 @@ fn pointer_on(input: &mut Input, udid: &str, p: &Value) -> Result<Value, String>
                 0
             }
         };
-        // Against deadlines from the first report, so a busy host doesn't stretch the call.
-        let glide = |from: Option<Point>, to: Point, buttons: u32| -> Result<(), String> {
+        // Against deadlines from the first report, so a busy host doesn't stretch the call; whether
+        // a report went out late (a stall), after which where the pointer stopped isn't known.
+        let glide = |from: Option<Point>, to: Point, buttons: u32| -> Result<bool, String> {
             let plan = pointer::plan(from, to, points);
-            let delays: Vec<Duration> = plan.iter().map(|(wait, _)| *wait).collect();
             let started = Instant::now();
-            pace(&delays, || started.elapsed(), sleep, |i| hid.pointer_motion(plan[i].1.0, plan[i].1.1, buttons).map_err(err))?;
+            let late =
+                pointer::send_paced(&plan, || started.elapsed(), sleep, |(dx, dy)| hid.pointer_motion(dx, dy, buttons).map_err(err))?;
             sleep(pointer::INTERVAL);
-            Ok(())
+            Ok(late)
         };
-        glide(from, to, buttons)?;
+        // Where the pointer is known to be after the call: not after a stall, nor on an edge or in
+        // a corner, where the guest may stop it short.
+        let known = |at: Point, late: bool| (!late && pointer::lands_at(at, points)).then_some(at);
+        let late = glide(from, to, buttons)?;
         let mask = button.mask();
         let left = |at: Point, buttons: u32| if buttons == 0 { Held::Nothing } else { Held::Down { at, buttons } };
         if let Some(end) = drag_to.map(in_points) {
             sleep(pointer::INTERVAL * 3);
             hid.pointer_button(button, true, buttons | mask).map_err(err)?;
-            glide(Some(to), end, buttons | mask)?;
+            let late = glide(Some(to), end, buttons | mask)? || late;
             sleep(pointer::INTERVAL * 3);
             hid.pointer_button(button, false, buttons).map_err(err)?;
-            return Ok((left(end, buttons), end));
+            return Ok((left(end, buttons), known(end, late)));
         }
         match action {
             PointerAction::Move => {}
@@ -784,7 +788,7 @@ fn pointer_on(input: &mut Input, udid: &str, p: &Value) -> Result<Value, String>
                 hid.pointer_button(button, false, buttons).map_err(err)?;
             }
         }
-        Ok((left(to, buttons), to))
+        Ok((left(to, buttons), known(to, late)))
     });
     match result {
         Ok((next, at)) => input.pointer.set(boot, next, at, from.is_none(), turns),
@@ -804,6 +808,9 @@ fn rotate(device: &Device, wanted: Option<Orientation>) -> Result<Value, String>
     let mut guard = ORIENTATIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let known = guard.get_or_insert_with(Default::default);
     let next = wanted.unwrap_or_else(|| known.get(&udid).copied().unwrap_or(Orientation::Portrait).clockwise());
+    // Counted before and after: a pointer call that starts while the device turns, or reads the
+    // count before it, doesn't move on from where the pointer was before.
+    TURNS.fetch_add(1, Ordering::AcqRel);
     let sent = device.set_orientation(next);
     TURNS.fetch_add(1, Ordering::AcqRel);
     sent.map_err(err)?;
@@ -1498,7 +1505,9 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         m if INPUT_METHODS.contains(&m) => input(s, m, p),
         "rotate" => rotate(&s.device(p)?, opt_orientation(p)?),
         "fold" => {
-            let folded = crate::duo::fold(&s.device(p)?, p);
+            let device = s.device(p)?;
+            TURNS.fetch_add(1, Ordering::AcqRel);
+            let folded = crate::duo::fold(&device, p);
             TURNS.fetch_add(1, Ordering::AcqRel);
             folded
         }

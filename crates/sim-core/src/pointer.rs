@@ -19,8 +19,10 @@
 //! the bottom edge before it rises: exact on both.
 //!
 //! Homing costs about 1.4 s (64 reports and the Dock's settle), so a server homes only when it
-//! must ([`HeldPointer::start`]): the first call in a boot, after a failed call or a rotation, and
-//! every [`REHOME_EVERY`] calls. Other calls move on from where the last one left the pointer. Touches (finger and Pencil), idle
+//! must ([`HeldPointer::start`]): the first call in a boot, after a failed call or a rotation, after
+//! a call whose reports went out late ([`send_paced`]) or that ended on an edge or in a corner
+//! ([`lands_at`]), and every [`REHOME_EVERY`] calls. Other calls move on from where the last one
+//! left the pointer. Touches (finger and Pencil), idle
 //! time (the pointer hides) and relaunching the app don't move it, and its error doesn't add up:
 //! 120 calls to random points after one homing all landed within 0.32 pt on iOS 27.2 (2026-11-27).
 //! A last report of 0.31 pt (an overrun of 0.16 pt) did add up, to 0.78 pt within 80 calls.
@@ -56,6 +58,16 @@ const CLEAR: f64 = 100.0;
 pub const LIFT: f64 = 300.0;
 /// How long the Dock takes to hide once the pointer has left it.
 pub const SETTLE: Duration = Duration::from_millis(400);
+/// How close to an edge, in points, a point counts as on it: a target outside the screen is
+/// clamped there, and the guest stops the pointer against the edge instead.
+const EDGE: f64 = 1.0;
+/// The square at each corner, in points, in which the screen's rounded corner may stop the
+/// pointer short of its target (iPad corner radii are ~18-30 pt).
+const CORNER: f64 = 40.0;
+/// How late a report may go out past its deadline before the run counts as stalled: a gap of
+/// two report intervals, which the guest may take for the end of a run and carry the pointer on
+/// by half the report before it (up to 60 pt at [`MAX_STEP`]).
+pub const LATE: Duration = INTERVAL;
 
 /// What a `pointer` call does once the pointer is at its point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,14 +147,15 @@ impl HeldPointer {
         (place.turns == turns && place.moves < REHOME_EVERY).then_some(place.at)
     }
 
-    /// Records what a call left held in `boot` and where it left the pointer (`at`), having homed
-    /// it first (`homed`) or moved on from [`HeldPointer::start`], with `turns` rotations seen.
-    pub fn set(&mut self, boot: Option<BootKey>, held: Held, at: Point, homed: bool, turns: u64) {
+    /// Records what a call left held in `boot` and where it left the pointer (`at`; `None` when
+    /// that isn't known for sure, so the next call homes: [`lands_at`], a stalled run), having
+    /// homed it first (`homed`) or moved on from [`HeldPointer::start`], with `turns` rotations seen.
+    pub fn set(&mut self, boot: Option<BootKey>, held: Held, at: Option<Point>, homed: bool, turns: u64) {
         let moves = match self.place.filter(|_| !homed && boot == self.boot) {
             Some(place) => place.moves + 1,
             None => 0,
         };
-        *self = Self { boot, held, place: Some(Place { at, moves, turns }) };
+        *self = Self { boot, held, place: at.map(|at| Place { at, moves, turns }) };
     }
 
     /// Records a call that failed in `boot`: what it held is lost when anything was or may have
@@ -232,6 +245,36 @@ pub fn plan(from: Option<Point>, to: Point, screen: Size) -> Vec<(Duration, (f64
             (wait, step)
         })
         .collect()
+}
+
+/// Whether a move to `to` on a screen of `screen` points leaves the pointer exactly there: not on
+/// an edge (where a clamped target lands and the guest stops it) nor in a corner's [`CORNER`]
+/// square (the rounded corner stops it short), so a later call can move on from `to`.
+pub fn lands_at(to: Point, screen: Size) -> bool {
+    let near = |v: f64, max: f64, margin: f64| v <= margin || v >= max - margin;
+    let on_edge = near(to.x, screen.width, EDGE) || near(to.y, screen.height, EDGE);
+    let in_corner = near(to.x, screen.width, CORNER) && near(to.y, screen.height, CORNER);
+    !on_edge && !in_corner
+}
+
+/// Sends `plan` ([`plan`]) against deadlines from its first report (`crate::gesture::pace`), each
+/// report through `send`; whether any went out more than [`LATE`] past its deadline (a stalled
+/// host), after which where the pointer stopped isn't known. `elapsed` is the time since the
+/// first report and `sleep` waits; both are injected, so a fake clock tests this anywhere.
+pub fn send_paced<E>(
+    plan: &[(Duration, (f64, f64))],
+    elapsed: impl Fn() -> Duration,
+    sleep: impl FnMut(Duration),
+    mut send: impl FnMut((f64, f64)) -> Result<(), E>,
+) -> Result<bool, E> {
+    let delays: Vec<Duration> = plan.iter().map(|(wait, _)| *wait).collect();
+    let (mut due, mut late) = (Duration::ZERO, false);
+    crate::gesture::pace(&delays, &elapsed, sleep, |i| {
+        due += delays[i];
+        late |= elapsed() > due + LATE;
+        send(plan[i].1)
+    })?;
+    Ok(late)
 }
 
 /// Homing: into the left edge, clear of it, into the bottom edge, up above the Dock and into the
@@ -391,7 +434,7 @@ mod tests {
         let reboot = BootKey::of(true, Some(3), None);
         let mut state = HeldPointer::default();
         assert_eq!(state.get(boot), Held::Nothing);
-        state.set(boot, down, Point::new(10.0, 20.0), true, 0);
+        state.set(boot, down, Some(Point::new(10.0, 20.0)), true, 0);
         assert_eq!(state.get(boot), down);
         assert_eq!(state.get(reboot), Held::Nothing, "a reboot lets go");
         assert_eq!(state.get(None), Held::Nothing, "a boot that can't be told apart keeps nothing");
@@ -412,9 +455,9 @@ mod tests {
         let (a, b) = (Point::new(100.0, 200.0), Point::new(300.0, 50.0));
         let mut state = HeldPointer::default();
         assert_eq!(state.start(boot, 0), None, "nothing known: home");
-        state.set(boot, Held::Nothing, a, true, 0);
+        state.set(boot, Held::Nothing, Some(a), true, 0);
         assert_eq!(state.start(boot, 0), Some(a));
-        state.set(boot, Held::Nothing, b, false, 0);
+        state.set(boot, Held::Nothing, Some(b), false, 0);
         assert_eq!(state.start(boot, 0), Some(b), "a later call moves on from the last one");
         assert_eq!(state.start(reboot, 0), None, "a reboot puts the pointer where simee can't see it");
         assert_eq!(state.start(None, 0), None, "a boot that can't be told apart keeps nothing");
@@ -422,18 +465,72 @@ mod tests {
 
         state.failed(boot, Held::Nothing, false);
         assert_eq!(state.start(boot, 0), None, "a failed call may have left it anywhere");
+        state.set(boot, Held::Nothing, Some(a), true, 0);
+        state.set(boot, Held::Nothing, None, false, 0);
+        assert_eq!(state.start(boot, 0), None, "a call that can't say where it left the pointer");
 
-        state.set(boot, Held::Nothing, a, true, 0);
+        state.set(boot, Held::Nothing, Some(a), true, 0);
         for _ in 0..REHOME_EVERY {
             assert_eq!(state.start(boot, 0), Some(a));
-            state.set(boot, Held::Nothing, a, false, 0);
+            state.set(boot, Held::Nothing, Some(a), false, 0);
         }
         assert_eq!(state.start(boot, 0), None, "homed again every REHOME_EVERY calls");
-        state.set(boot, Held::Nothing, b, true, 0);
+        state.set(boot, Held::Nothing, Some(b), true, 0);
         assert_eq!(state.start(boot, 0), Some(b), "and the count starts over");
 
         let down = Held::Down { at: b, buttons: 1 };
-        state.set(boot, down, b, false, REHOME_EVERY.into());
+        state.set(boot, down, None, false, REHOME_EVERY.into());
         assert_eq!(state.start(boot, 5), Some(b), "a held button keeps its place: a drag never homes");
+    }
+
+    /// A target on an edge (where a target off the screen is clamped) or in a rounded corner may
+    /// stop the pointer short of it: the next call homes instead of moving on from there.
+    #[test]
+    fn edges_and_corners_are_not_where_the_pointer_is_known_to_be() {
+        let screen = Size::new(1032.0, 1376.0);
+        for to in [
+            Point::new(0.0, 0.0),
+            Point::new(1032.0, 1376.0),
+            Point::new(20.0, 1360.0),
+            Point::new(1010.0, 30.0),
+            Point::new(0.0, 700.0),
+            Point::new(500.0, 1376.0),
+            Point::new(1031.5, 600.0),
+        ] {
+            assert!(!lands_at(to, screen), "{to:?}");
+        }
+        for to in [Point::new(500.0, 700.0), Point::new(20.0, 700.0), Point::new(500.0, 10.0), Point::new(41.0, 41.0)] {
+            assert!(lands_at(to, screen), "{to:?}");
+        }
+    }
+
+    /// A report that goes out more than `LATE` past its deadline marks the run stalled; reports
+    /// on time, or a little late, don't.
+    #[test]
+    fn a_stalled_run_is_reported() {
+        use std::cell::Cell;
+        let plan = plan(Some(Point::new(100.0, 100.0)), Point::new(600.0, 900.0), Size::new(1032.0, 1376.0));
+        let run = |stall_at: usize, stall: Duration| {
+            let now = Cell::new(Duration::ZERO);
+            let mut sent = Vec::new();
+            let late = send_paced(
+                &plan,
+                || now.get(),
+                |d| now.set(now.get() + d),
+                |step| {
+                    if sent.len() == stall_at {
+                        now.set(now.get() + stall);
+                    }
+                    sent.push(step);
+                    Ok::<(), ()>(())
+                },
+            );
+            assert_eq!(sent, plan.iter().map(|(_, s)| *s).collect::<Vec<_>>(), "every report is sent, in order");
+            late.expect("sent")
+        };
+        assert!(!run(usize::MAX, Duration::ZERO), "on time");
+        assert!(!run(3, LATE / 2), "a little late");
+        assert!(run(3, LATE * 3), "a stall");
+        assert!(run(plan.len() - 2, LATE * 3), "a stall before the last report");
     }
 }

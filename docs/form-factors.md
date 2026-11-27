@@ -259,7 +259,9 @@ without one fails that input with `Unavailable`, never a crash.
   report is 16 ms. A server (`simee serve`) keeps where each call left the pointer, per boot, and
   the next call moves on from there in steps of up to 120 pt (which iPadOS also takes one to one),
   so a later click is a few reports instead of homing again (64 reports and a 400 ms settle for
-  the Dock). It homes again after a failed call, a rotation through the API, and every 100 calls.
+  the Dock). It homes again after a failed call, a rotation through the API, a call whose reports
+  went out more than 16 ms late (a stalled host), a call that ended on an edge or in a corner's
+  40 pt square (where the guest may stop the pointer short), and every 100 calls.
   Touches (finger and Pencil, including the desktop window's, which sends no pointer events),
   idle time and relaunching the app don't move the pointer, and with the 0.08 pt last report its
   error doesn't add up: 120 calls to random points after one homing all landed within 0.32 pt on
