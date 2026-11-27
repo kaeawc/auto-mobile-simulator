@@ -221,14 +221,22 @@ mod tests {
 
     #[test]
     fn cpu_ticks_advance() {
+        // Ticks are coarse (100 Hz) and a CI VM may not account a short burst to any CPU, so spin
+        // until they move, for up to two seconds, rather than sampling after a fixed 50 ms.
+        let total = |t: [u32; 4]| t.iter().map(|&v| u64::from(v)).sum::<u64>();
         let a = cpu_ticks().expect("ticks");
         let mut x = 0u64;
-        let until = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut b = a;
         while std::time::Instant::now() < until {
-            x = std::hint::black_box(x.wrapping_add(1));
+            for _ in 0..100_000 {
+                x = std::hint::black_box(x.wrapping_add(1));
+            }
+            b = cpu_ticks().expect("ticks");
+            if total(b) != total(a) {
+                break;
+            }
         }
-        let b = cpu_ticks().expect("ticks");
-        let total = |t: [u32; 4]| t.iter().map(|&v| u64::from(v)).sum::<u64>();
         assert!(total(b).wrapping_sub(total(a)) > 0, "{a:?} -> {b:?}");
     }
 
