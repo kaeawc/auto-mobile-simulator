@@ -1,6 +1,6 @@
 [package]
 name = "simee-host"
-description = "Host health for simulator farms: load, memory pressure, swap, disk and an admit/hold/backoff verdict, sampled without forking."
+description = "Host health for simulator farms: load, memory pressure, swap, disk, an admit/hold/backoff verdict and per-device CPU, memory and I/O, sampled without forking."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

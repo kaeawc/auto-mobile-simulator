@@ -151,6 +151,17 @@ impl Android {
         self.env.list_avds().into_iter().map(|name| self.describe(&name, &running).info).collect()
     }
 
+    /// AVD `name` as a booted device, from its config alone (no emulator lookup: the caller saw
+    /// its process); `None` when no AVD has that name.
+    pub fn running_info(&self, name: &str) -> Option<DeviceInfo> {
+        if !self.env.has_avd(name) {
+            return None;
+        }
+        let mut info = self.describe(name, &[]).info;
+        info.state = DeviceState::Booted;
+        Some(info)
+    }
+
     /// Whether an AVD is named exactly `name` (its UDID), without loading or listing any: one
     /// stat of its pointer, in exact case ([`emu_avd::Env::has_avd`]).
     pub fn has_avd(&self, name: &str) -> bool {
@@ -1932,6 +1943,15 @@ mod tests {
         assert_eq!(f.android.device("pixel").expect("exact").info.udid, "pixel");
         assert!(!f.android.has_avd("Pixel"), "exact case, whatever the filesystem");
         assert_eq!(f.android.device("Pixel").map(|d| d.info.udid), Ok("pixel".into()), "the scan still matches names loosely");
+    }
+
+    #[test]
+    fn a_running_avds_info_comes_from_its_config_alone() {
+        let f = fixture("runinfo");
+        f.android.create("pixel", "system-images;android-36;google_apis;arm64-v8a", Some(FormFactor::Phone)).expect("create");
+        let info = f.android.running_info("pixel").expect("info");
+        assert_eq!((info.state, info.platform, info.form_factor), (DeviceState::Booted, Platform::Android, Some(FormFactor::Phone)));
+        assert_eq!(f.android.running_info("no-such-avd"), None);
     }
 
     #[test]

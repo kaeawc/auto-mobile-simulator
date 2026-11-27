@@ -27,6 +27,14 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          1 s ring (with time spent in each thermal state), the load trend, and an admit/hold/backoff verdict with every reason",
     ),
     (
+        "devices_usage",
+        "",
+        "Which running devices load the host, sampled without forking: per device (iOS simulator: its launchd_sim tree; Android: \
+         simee's emu or the stock emulator's qemu, with their children) id, name, platform, form factor, CPU % of a core over 1 s and \
+         1 min, resident memory and footprint, disk read/write bytes/s, energy (W) where the kernel reports it, and process count, \
+         costliest first; simee's own processes; and host totals (busy CPU, the devices' and simee's share of it)",
+    ),
+    (
         "form_factors",
         "platform?, form_factor?",
         "Every form factor on every platform: sub-platform, inputs and reference profile, or why it's unsupported",
@@ -385,6 +393,7 @@ const ALL_PLATFORMS: &[&str] = &[
     "help",
     "identity",
     "host",
+    "devices_usage",
     "form_factors",
     "devices",
     "runtimes",
@@ -497,6 +506,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             .collect()),
         "identity" => Ok(crate::identity().clone()),
         "host" => serde_json::to_value(sim_host::global().report(sim_host::Thresholds::default())).map_err(|e| e.to_string()),
+        "devices_usage" => crate::usage::devices_usage(s),
         "form_factors" => {
             let (platform, form_factor) = (opt_platform(p)?, opt_form_factor(p)?);
             Ok(matrix()
@@ -630,6 +640,27 @@ mod tests {
         assert!(h["reasons"].as_array().is_some_and(|r| !r.is_empty()));
         let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
         assert!(help.as_array().is_some_and(|a| a.iter().any(|m| m["method"] == "host" && m["platforms"] == json!(["android", "ios"]))));
+    }
+
+    #[test]
+    fn devices_usage_lists_the_running_devices_without_touching_them() {
+        let u = call(&mut Session::default(), "devices_usage", &Value::Null).expect("devices_usage");
+        assert_eq!(u["available"], cfg!(target_os = "macos"));
+        assert!(u["host"]["cpus"].as_u64().is_some_and(|c| c >= 1) && u["simee"]["id"] == "simee");
+        let rows = u["devices"].as_array().expect("devices");
+        for d in rows {
+            assert!(matches!(d["platform"].as_str(), Some("ios" | "android")) && d["name"].is_string(), "{d}");
+            assert!(d["pids"].as_u64().is_some_and(|n| n >= 1), "{d}");
+            println!("{} {} {}: {} % cpu (1 s), {} bytes", d["platform"], d["kind"], d["name"], d["cpu_pct"]["1s"], d["footprint_bytes"]);
+        }
+        if cfg!(target_os = "macos") {
+            assert!(u["samples"].as_u64().is_some_and(|n| n >= 2), "the call waits for a rate: {u}");
+        }
+        let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
+        assert!(
+            help.as_array()
+                .is_some_and(|a| a.iter().any(|m| m["method"] == "devices_usage" && m["platforms"] == json!(["android", "ios"])))
+        );
     }
 
     #[test]
