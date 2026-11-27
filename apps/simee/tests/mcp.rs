@@ -221,3 +221,19 @@ fn the_default_server_serves_core_and_says_where_the_rest_is() {
     // An unknown toolset stops the server before it serves anything.
     assert!(!e.mcp_with(Some("core,nope")).close().success());
 }
+
+#[test]
+fn the_default_server_lists_prompts_and_says_which_toolsets_they_need() {
+    let e = Env::new("prompts");
+    let mut mcp = e.mcp_with(None);
+    let list = mcp.request("prompts/list", json!({}), false)["result"].clone();
+    let names: Vec<&str> = list["prompts"].as_array().expect("prompts").iter().filter_map(|p| p["name"].as_str()).collect();
+    assert!(names.contains(&"boot-and-install") && names.contains(&"find-slowness"), "{names:?}");
+    let arguments = json!({"platform": "android", "form_factor": "phone", "app_path": "/a.apk"});
+    let got = mcp.request("prompts/get", json!({"name": "boot-and-install", "arguments": arguments}), false);
+    let text = got["result"]["messages"][0]["content"]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("`install` {device, path: \"/a.apk\"}") && text.contains("SIMEE_MCP_TOOLSETS=core,lifecycle"), "{got}");
+    let missing = mcp.request("prompts/get", json!({"name": "boot-and-install", "arguments": {"platform": "ios"}}), false);
+    assert_eq!(missing["error"]["code"], -32602, "{missing}");
+    assert!(mcp.close().success());
+}

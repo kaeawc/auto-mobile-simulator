@@ -9,6 +9,7 @@ look at their screens, read their logs, and watch them change.
 | Tools | One per method in `sim-api`'s table, generated from it, and `device_view`, with output schemas and annotations, in toolsets a client picks (`core` by default) |
 | Resources | Devices, runtimes, form factors, and each device's info, screenshot, logs and apps |
 | Subscriptions | Change notifications for those resources, by re-reading them while subscribed |
+| Prompts | Common workflows (boot and install, reproduce a bug, audit contrast, find slowness, test across form factors) that name the tools to call and their toolsets |
 | Tasks | `boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase`, `shutdown`, `export`, `import`, `mem_leaks`, `mem_heap` as pollable, cancellable tasks |
 | App | `device_view`: a device's screen with tap, swipe, type and button controls, in the conversation |
 
@@ -227,6 +228,41 @@ running. Subscribing to a screenshot costs a screenshot a second; the thread sto
 cancels the listen (`notifications/cancelled`). The server never changes its tool list, so it
 doesn't offer `toolsListChanged`.
 
+## Prompts
+
+`prompts/list` and `prompts/get` serve workflows an agent (or its user, from a prompt menu) can
+start with a few arguments. Each prompt's text is one user message that names the tools to call, in
+order, with their arguments, and the end state to reach, then a line saying which toolset has each
+tool, whether this server serves them, and if not, the `SIMEE_MCP_TOOLSETS` value to restart it
+with (the agent can't change it itself). The texts are kept short, since they land in the agent's
+context.
+
+| Prompt | Arguments | Tools, in order | End state |
+| --- | --- | --- | --- |
+| `boot-and-install` | `platform` (`ios` or `android`), `form_factor`, `app_path` | `devices`; if none, `form_factors`, `runtimes`, `device_types` (iOS), `create`; `boot` with `admission: "wait"`; `install`, `apps`, `launch`; `screenshot` | A booted device of that form factor running the app in front |
+| `reproduce-bug` | `device?`, `steps`, `capture` (`logs`, `recording` or `both`) | `devices` (no `device`); `screen`, `screenshot`; `logs` with `stream` (logs); `tap`, `swipe`, `type`, `key`, `button`, a `screenshot` after each step (recording); `logs`, `crash_reports` | Whether it reproduced, the steps as run, the screenshots and log lines |
+| `audit-contrast` | `device?`, `screen_description?` | `devices` (no `device`); `screenshot`, then `tap`, `swipe`, `button` to reach the screen; `contrast_check` with `appearance: "both"` | Each finding with its element, box, colours and ratio, worst first |
+| `find-slowness` | `device` | `host`, `devices_usage`, `processes`, then `mem_vmmap`, `mem_heap`, `mem_leaks` on the app's process (iOS) | The cause with its numbers: the host, the device's share, or a process |
+| `across-form-factors` | `app_path`, `form_factors` (separated by commas) | `form_factors`, `devices`, `create`; `boot_many` with `admission: "wait"`; per device `install`, `apps`, `launch`, `screenshot`; `shutdown` when done | A screenshot per form factor with its layout problems |
+
+- Arguments are strings, as MCP has them. `prompts/get` refuses (`-32602`) an unknown prompt,
+  an argument the prompt doesn't take, a value that isn't a string or isn't one of its choices,
+  and missing or blank required arguments (all of them, in `data.missing`).
+- Every revision the server speaks has prompts; 2025-03-26 has no `title` on a prompt or its
+  arguments, so its clients get none. The capability is `prompts: {listChanged: false}`: the
+  prompts are fixed for a build.
+- `prompts/list` pages by `cursor` and `nextCursor`, 50 to a page (so one page today); a cursor
+  that isn't a previous page's `nextCursor` is `-32602`. Its result carries the same cache hints
+  as `tools/list`.
+- There is no screen recording over MCP (recording isn't an API method), so `reproduce-bug`'s
+  `recording` is a screenshot after each step. There are no stream tools, so there is no prompt to
+  stream a device.
+- The prompts are a table in `crates/sim-mcp/src/prompts.rs`, each with the tools its text may
+  name. Tests check that each is a tool (a renamed tool fails them), that the text names nothing
+  else in backticks and every one of them in some set of arguments, and that each named tool is
+  either served or named with the toolset and setting that serve it. The eval suite (#296), which
+  will run the prompts against an agent, is not built yet.
+
 ## Tasks
 
 A client that declares `io.modelcontextprotocol/tasks` gets a task, instead of a blocked call, for
@@ -376,8 +412,8 @@ takes milliseconds). Reproduce: `cargo test --release -p simee-mcp http_call_ove
 
 ## Limits and what is not here
 
-- Prompts, completions, logging, sampling and elicitation are not offered; the specification
-  deprecates three of them.
+- Completions, logging, sampling and elicitation are not offered; the specification deprecates
+  three of them.
 - Cancelling a task doesn't stop a running device call (above).
 - The change notifications are polled, once a second, and only for what a client subscribed to.
 - Over HTTP: no TLS, no OAuth (a bearer token from a file is the only authentication; both are

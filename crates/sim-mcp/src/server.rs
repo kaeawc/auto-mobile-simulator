@@ -14,11 +14,11 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 
 use crate::backend::{Backend, Executor};
-use crate::resources;
 use crate::rpc::{self, Ctx, EXT_TASKS, Era, INTERNAL_ERROR, Incoming, LEGACY, MODERN, RpcError};
 use crate::tasks::{Ctl, Sink, Tasks};
 use crate::tools::{self, Pages, Toolsets};
 use crate::watch::{self, Emit, Spec, Watcher};
+use crate::{prompts, resources};
 
 /// What the server tells a client about using it.
 const INSTRUCTIONS: &str = "simee drives iOS simulators and Android emulators. Call `devices` first; most tools take `device` \
@@ -273,7 +273,8 @@ impl Inner {
         let versions: Vec<&str> = std::iter::once(MODERN).chain(LEGACY.iter().copied()).collect();
         cacheable(
             json!({"supportedVersions": versions,
-                "capabilities": {"tools": {}, "resources": {"subscribe": true, "listChanged": true}, "extensions": {EXT_TASKS: {}}},
+                "capabilities": {"tools": {}, "resources": {"subscribe": true, "listChanged": true},
+                    "prompts": {"listChanged": false}, "extensions": {EXT_TASKS: {}}},
                 "instructions": INSTRUCTIONS}),
             STATIC_TTL_MS,
             "public",
@@ -287,7 +288,7 @@ impl Inner {
         let version = LEGACY.iter().find(|v| **v == requested).unwrap_or(&LEGACY[0]);
         *lock(&self.legacy) = Some((params.get("capabilities").cloned().unwrap_or(Value::Null), version));
         json!({"protocolVersion": version,
-            "capabilities": {"tools": {}, "resources": {"subscribe": true}},
+            "capabilities": {"tools": {}, "resources": {"subscribe": true}, "prompts": {"listChanged": false}},
             "serverInfo": server_info(), "instructions": INSTRUCTIONS})
     }
 
@@ -323,6 +324,8 @@ impl Inner {
                 reply(Ok(cacheable(json!({"resourceTemplates": resources::templates()}), STATIC_TTL_MS, "public")));
             }
             "tools/call" => self.tools_call(id.clone(), &params, &ctx),
+            "prompts/list" => reply(prompts::list(&params, &ctx).map(|page| cacheable(page, STATIC_TTL_MS, "public"))),
+            "prompts/get" => reply(prompts::get(&params, &self.toolsets)),
             "resources/list" => {
                 self.offload(id.clone(), ctx.clone(), |i| Ok(cacheable(json!({"resources": resources::list(&*i.backend)}), 0, "private")))
             }

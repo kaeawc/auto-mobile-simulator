@@ -7,6 +7,8 @@
 //!   logs and apps ([`resources`]), with change notifications ([`watch`]).
 //! - **Tasks**: boot, create, install and the other long methods as pollable, cancellable tasks
 //!   ([`tasks`]).
+//! - **Prompts**: common workflows (boot and install, reproduce a bug, audit contrast, find
+//!   slowness, test across form factors) naming the tools to call and their toolsets ([`prompts`]).
 //! - **App**: a live, clickable view of a device, as an MCP App ([`app`]).
 //!
 //! It speaks the current revision (2026-07-28: stateless, `server/discover`, per-request `_meta`)
@@ -17,6 +19,7 @@
 pub mod app;
 pub mod backend;
 pub mod http;
+pub mod prompts;
 pub mod resources;
 pub mod rpc;
 pub mod server;
