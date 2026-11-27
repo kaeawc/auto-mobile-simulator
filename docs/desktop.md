@@ -188,3 +188,28 @@ Under the system's reduced motion it appears and leaves without sliding. The win
 frames only while a preview moves, plus one wake when the next one is due to leave. The
 `screenshot` and `android-screenshot` headless scenes show it settled.
 
+## Pop-out windows
+
+Any running device can leave the main window for a native window of its own, sized to its
+screen, and come back (`desktop/src/popout.rs`, #286). Pop it out from its row's context menu in
+the device list (Pop Out to Window), the stage toolbar's pop-out button, or ⌘⇧O; the main window
+then shows the next running device, and the list marks the one that's out. Several devices can
+be out at once. Pop back in from the pop-out's toolbar, ⌘⇧O in it, the row's menu (Pop Back In),
+or by closing the window: closing returns the device to the main window as its selected device,
+it never shuts the device down. Selecting a device that's out focuses its window. Closing the main
+window ends the app, pop-outs included.
+
+The device's connection moves with it rather than reconnecting: an iOS device's capture thread
+and HID session (the zero-copy surface keeps its latest frame and wakes the window now drawing
+it), an Android device's display stream and console worker. The pop-out's first frame is the one
+the main window last showed, and it keeps drawing while the main window is hidden. Each window
+owns the device it shows, so its touches and keys can only reach that device. A pop-out has the
+device's toolbar (the form factor's controls, without the tablet stylus) and ⌘S. It is flat: the
+3D device view stays in the main window.
+
+Each device's pop-out frame is kept in the settings file (`popouts`, by UDID or AVD name), so
+popping the same device out again, in this run or the next, opens it where it was. Reopening the
+pop-outs that were open at quit is #288. The windows open at run time through Rune's
+`open_window`, which headless runs don't do: the `popped` scene shows the main window with its
+device out, and the pop-out's own view is checked in the tests.
+
