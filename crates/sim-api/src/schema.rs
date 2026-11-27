@@ -50,7 +50,7 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         | "text" | "base64" | "domain" | "key" | "language" | "uid" | "capture_id" | "program" | "command" | "predicate" | "last"
         | "preset" | "direction" | "gesture" | "button" | "phase" | "action" | "service" | "scope" | "display" | "orientation"
         | "posture" | "mode" | "profile" | "type" | "time" | "data_network" | "wifi_mode" | "cellular_mode" | "operator"
-        | "battery_state" | "environment" | "press" | "property" | "pattern" | "appearance" | "restore" => Str,
+        | "battery_state" | "environment" | "press" | "property" | "pattern" | "appearance" | "restore" | "to" | "from" => Str,
         "scale" | "x" | "y" | "z" | "x1" | "y1" | "x2" | "y2" | "to_x" | "to_y" | "latitude" | "longitude" | "delta" | "angle"
         | "passthrough" | "settle_cpu_pct" | "settle_window_s" | "cpu_pct" | "window_s" | "latency_ms" | "down_kbps" | "up_kbps"
         | "loss_pct" => Num,
@@ -58,7 +58,7 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         | "ticks" | "pressure" | "level" | "wifi_bars" | "cellular_bars" | "battery_level" | "state" | "port_base" | "port_count"
         | "settle_ms" => Int,
         "booted" | "on" | "suppressed" | "undo" | "shaped" | "settle" | "settle_foreground" | "audio" | "mute" | "sizes" | "offline"
-        | "proxy" | "face" | "foreground" | "eraser" | "folded" | "restart" | "stream" => Bool,
+        | "proxy" | "face" | "foreground" | "eraser" | "folded" | "restart" | "stream" | "allow_mismatch" => Bool,
         "env" => StrMap,
         "payload" | "region" => Obj,
         "rules" => Objects,

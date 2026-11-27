@@ -150,6 +150,26 @@ pub fn boot_many(s: &mut Session, p: &Value, udids: &[String]) -> Result<Value, 
         "unsettled": 0, "devices": devices}))
 }
 
+/// `import`: the bundle at `from` as a new AVD `name`, its system image found by content (with
+/// `allow_mismatch`, another revision of it). The result says that the import keeps the exported
+/// device's guest identity, which `config.ini` keys it dropped, and any revision mismatch.
+pub fn import(s: &mut Session, p: &Value) -> Result<Value, String> {
+    let (from, name) = (need_str(p, "from")?, need_str(p, "name")?);
+    let allow_mismatch = opt_bool(p, "allow_mismatch")?.unwrap_or(false);
+    let (info, im) = s.backend().import_avd(std::path::Path::new(from), name, allow_mismatch)?;
+    Ok(json!({
+        "device": info,
+        "system_image": im.sysdir,
+        "mismatch": im.mismatch,
+        "dropped": im.dropped,
+        "extracted": im.extracted,
+        "exported_as": im.manifest.device.name,
+        "guest_identity": im.manifest.guest_identity,
+        "note": sim_android::bundle::DUPLICATED_IDENTITY,
+        "resume": im.manifest.resume,
+    }))
+}
+
 /// `contrast_check` on an AVD: its screen and its density; the appearance isn't switchable yet.
 struct ContrastTarget<'a>(&'a sim_android::Device);
 
@@ -199,6 +219,22 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             }
             let info = android.clone_avd(&d.info.udid, need_str(p, "name")?)?;
             serde_json::to_value(info).map_err(|e| e.to_string())
+        }
+        "export" => {
+            let to = need_str(p, "to")?;
+            let ex = android.export_avd(&d, std::path::Path::new(to))?;
+            let m = &ex.manifest;
+            Ok(json!({
+                "device": d.info.udid,
+                "to": to,
+                "summary": ex.summary,
+                "identity": m.identity,
+                "captures": m.captures,
+                "resume": m.resume,
+                "secrets": m.secrets,
+                "guest_identity": m.guest_identity,
+                "dropped": m.dropped,
+            }))
         }
         "shutdown" => null(d.shutdown()),
         // The guest's layout, which tap, swipe and touch take (a folded foldable's outer screen).

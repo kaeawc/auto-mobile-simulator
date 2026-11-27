@@ -906,6 +906,7 @@ name = "emu-avd"
 version = "0.1.0"
 dependencies = [
  "rustix 1.1.6",
+ "sim-bundle",
  "sim-core",
  "thiserror 2.0.21",
 ]
@@ -1719,6 +1720,12 @@ name = "longest-increasing-subsequence"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b3bd0dd2cd90571056fdb71f6275fada10131182f84899f4b2a916e565d81d86"
+
+[[package]]
+name = "lz4_flex"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f56455fff36934a9500d69062aec1c77037179b6f0669e4d5d6b72b84722d6a3"
 
 [[package]]
 name = "memchr"
@@ -3297,6 +3304,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sim-core",
+]
+
+[[package]]
+name = "sim-bundle"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "lz4_flex",
+ "serde",
+ "serde_json",
+ "sim-core",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
