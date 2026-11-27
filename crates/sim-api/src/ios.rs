@@ -1929,6 +1929,11 @@ impl LogStreams {
         };
         let now = (self.clock)();
         let mut tail = lock(&tail);
+        // It may have ended (idle, or the device shut down) since the check above released the
+        // lock: its ring is empty then, so `log show` answers rather than a bare header.
+        if tail.ended {
+            return None;
+        }
         tail.used = now;
         let header = tail.header.clone()?;
         let lines = tail.ring.window(now, log_window(last)?)?;
