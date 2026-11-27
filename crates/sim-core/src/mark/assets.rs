@@ -162,6 +162,11 @@ pub fn mark_png(size: u32, style: &Style) -> Result<Vec<u8>, String> {
 
 /// The app icon at `size` pixels. Under 48 px the stone is drawn in flat tones.
 pub fn icon_png(size: u32, ground: &Ground) -> Result<Vec<u8>, String> {
+    encode_rgba(size, size, &icon_rgba(size, ground))
+}
+
+/// [`icon_png`]'s pixels: straight-alpha RGBA rows.
+pub fn icon_rgba(size: u32, ground: &Ground) -> Vec<u8> {
     let style = if size < 48 { Style::MARK.finish(Finish::Flat) } else { Style::MARK };
     let k = size as f32 / 100.0;
     let mut c = Canvas::new(size);
@@ -180,7 +185,7 @@ pub fn icon_png(size: u32, ground: &Ground) -> Result<Vec<u8>, String> {
             f.points.iter().map(|p| [(STONE_AT[0] + p[0] * STONE_SCALE) * k, (STONE_AT[1] + p[1] * STONE_SCALE) * k]).collect();
         c.fill(&pts, f.rgba);
     }
-    encode_rgba(size, size, &c.into_rgba())
+    c.into_rgba()
 }
 
 /// Every motion state, one row each in [`Motion::ALL`]'s order, `frames` moments across one
@@ -216,13 +221,17 @@ pub fn motion_sheet(cell: u32, frames: u32) -> Result<Vec<u8>, String> {
     encode_rgba(w, h, &sheet)
 }
 
-/// An Apple icon family: each PNG under the OSType that names its pixel size.
-pub fn icns(pngs: &[(u32, Vec<u8>)]) -> Vec<u8> {
-    // Retina entries repeat a size under a second type: ic11 is 16@2x, ic12 32@2x, ic13 128@2x,
-    // ic14 256@2x. There is no 64-point icon (iconutil reads icp6 as 48 px).
+/// An Apple icon family from square RGBA images, each under the OSType that names its size.
+///
+/// 16 and 32 px go in `ic04` and `ic05` as ARGB, each channel run-length coded, as `iconutil`
+/// writes them: macOS reads PNG data in the older 16 and 32 px slots (`icp4`, `icp5`) as raw
+/// pixels and shows noise. Everything else is PNG. Retina entries repeat a size under a second
+/// type: ic11 is 16@2x, ic12 32@2x, ic13 128@2x, ic14 256@2x. There is no 64-point icon
+/// (iconutil reads icp6 as 48 px).
+pub fn icns(images: &[(u32, Vec<u8>)]) -> Result<Vec<u8>, String> {
     let types: &[(u32, &[u8; 4])] = &[
-        (16, b"icp4"),
-        (32, b"icp5"),
+        (16, b"ic04"),
+        (32, b"ic05"),
         (32, b"ic11"),
         (64, b"ic12"),
         (128, b"ic07"),
@@ -234,15 +243,55 @@ pub fn icns(pngs: &[(u32, Vec<u8>)]) -> Vec<u8> {
     ];
     let mut body = Vec::new();
     for (size, ty) in types {
-        if let Some((_, png)) = pngs.iter().find(|(s, _)| s == size) {
-            body.extend_from_slice(*ty);
-            body.extend_from_slice(&(png.len() as u32 + 8).to_be_bytes());
-            body.extend_from_slice(png);
-        }
+        let Some((_, rgba)) = images.iter().find(|(s, _)| s == size) else { continue };
+        let data = if matches!(*ty, b"ic04" | b"ic05") { argb(rgba) } else { encode_rgba(*size, *size, rgba)? };
+        body.extend_from_slice(*ty);
+        body.extend_from_slice(&(data.len() as u32 + 8).to_be_bytes());
+        body.extend_from_slice(&data);
     }
     let mut out = b"icns".to_vec();
     out.extend_from_slice(&(body.len() as u32 + 8).to_be_bytes());
     out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// An `ic04`/`ic05` payload: `ARGB`, then the alpha, red, green and blue planes one after
+/// another, each run-length coded.
+fn argb(rgba: &[u8]) -> Vec<u8> {
+    let mut out = b"ARGB".to_vec();
+    for channel in [3, 0, 1, 2] {
+        let plane: Vec<u8> = rgba.iter().skip(channel).step_by(4).copied().collect();
+        out.extend_from_slice(&run_length(&plane));
+    }
+    out
+}
+
+/// The icon family's run-length code: a byte under 0x80 is followed by that many plus one
+/// literal bytes; a byte from 0x80 repeats the next byte that minus 0x7d times (3 to 130).
+fn run_length(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + data.len() / 64 + 1);
+    let mut literal: Vec<u8> = Vec::new();
+    let flush = |literal: &mut Vec<u8>, out: &mut Vec<u8>| {
+        for piece in literal.chunks(128) {
+            out.push((piece.len() - 1) as u8);
+            out.extend_from_slice(piece);
+        }
+        literal.clear();
+    };
+    let mut i = 0;
+    while i < data.len() {
+        let run = data[i..].iter().take(130).take_while(|&&b| b == data[i]).count();
+        if run >= 3 {
+            flush(&mut literal, &mut out);
+            out.push((run - 3 + 0x80) as u8);
+            out.push(data[i]);
+            i += run;
+        } else {
+            literal.push(data[i]);
+            i += 1;
+        }
+    }
+    flush(&mut literal, &mut out);
     out
 }
 
@@ -296,14 +345,14 @@ pub fn rasters() -> Result<Vec<Asset>, String> {
     let mut out = Vec::new();
     let mut icons = Vec::new();
     for size in SIZES {
-        let png = icon_png(size, &Ground::DARK)?;
-        out.push(asset(&format!("png/simee-icon-{size}.png"), png.clone()));
+        let rgba = icon_rgba(size, &Ground::DARK);
+        out.push(asset(&format!("png/simee-icon-{size}.png"), encode_rgba(size, size, &rgba)?));
         out.push(asset(&format!("png/simee-icon-light-{size}.png"), icon_png(size, &Ground::LIGHT)?));
         let style = if size < 48 { FAVICON } else { MARK_PNG };
         out.push(asset(&format!("png/simee-mark-{size}.png"), mark_png(size, &style)?));
-        icons.push((size, png));
+        icons.push((size, rgba));
     }
-    out.push(asset("macos/simee.icns", icns(&icons)));
+    out.push(asset("macos/simee.icns", icns(&icons)?));
     out.push(asset("macos/simeeTemplate.png", mark_png(16, &TEMPLATE)?));
     out.push(asset("macos/simeeTemplate@2x.png", mark_png(32, &TEMPLATE)?));
     let favicons = [16, 32, 48].into_iter().map(|s| Ok((s, mark_png(s, &FAVICON)?))).collect::<Result<Vec<_>, String>>()?;
@@ -379,19 +428,104 @@ mod tests {
         assert_eq!(size_of("png/simee-motion.png"), Some((64 * 8, 64 * Motion::ALL.len() as u32)));
         assert_eq!(size_of("macos/simeeTemplate.png"), Some((16, 16)));
         assert_eq!(size_of("macos/simeeTemplate@2x.png"), Some((32, 32)));
-        assert_eq!(&std::fs::read(dir.join("macos/simee.icns")).expect("simee.icns")[..4], b"icns");
+        let icns = std::fs::read(dir.join("macos/simee.icns")).expect("simee.icns");
+        assert_eq!(&icns[..4], b"icns");
+        assert!(icns.windows(4).any(|w| w == b"ic04") && !icns.windows(4).any(|w| w == b"icp4"), "16 px is ARGB, not PNG");
         assert_eq!(&std::fs::read(dir.join("favicon.ico")).expect("favicon.ico")[..4], &[0, 0, 1, 0]);
     }
 
     #[test]
     fn the_icns_holds_every_size() {
-        let pngs: Vec<_> = [16, 32, 64, 128, 256, 512, 1024].map(|s| (s, vec![s as u8; 3])).into();
-        let icns = icns(&pngs);
+        let images: Vec<_> = SIZES.map(|s| (s, vec![s as u8; (s * s * 4) as usize])).into();
+        let icns = icns(&images).expect("icns");
         assert_eq!(&icns[..4], b"icns");
         assert_eq!(u32::from_be_bytes(icns[4..8].try_into().expect("length")) as usize, icns.len());
-        for ty in [b"icp4", b"icp5", b"ic11", b"ic12", b"ic07", b"ic08", b"ic13", b"ic09", b"ic14", b"ic10"] {
+        for ty in [b"ic04", b"ic05", b"ic11", b"ic12", b"ic07", b"ic08", b"ic13", b"ic09", b"ic14", b"ic10"] {
             assert!(icns.windows(4).any(|w| w == ty), "{}", String::from_utf8_lossy(ty));
         }
+        assert!(!icns.windows(4).any(|w| w == b"icp4" || w == b"icp5"), "no PNG in the 16 and 32 px slots");
+    }
+
+    /// The inverse of [`run_length`], `n` bytes of it, and how many coded bytes it took.
+    fn run_length_decode(data: &[u8], n: usize) -> (Vec<u8>, usize) {
+        let (mut out, mut i) = (Vec::with_capacity(n), 0);
+        while out.len() < n {
+            let b = usize::from(data[i]);
+            if b < 0x80 {
+                out.extend_from_slice(&data[i + 1..i + 2 + b]);
+                i += 2 + b;
+            } else {
+                out.extend(std::iter::repeat_n(data[i + 1], b - 0x7d));
+                i += 2;
+            }
+        }
+        (out, i)
+    }
+
+    #[test]
+    fn run_length_round_trips_runs_literals_and_long_stretches() {
+        let mut data = vec![7u8; 300];
+        data.extend((0..=255).map(|b: u8| b));
+        data.extend([1, 1, 2, 2, 2, 3]);
+        let coded = run_length(&data);
+        assert!(coded.len() < data.len(), "runs shrink");
+        assert_eq!(run_length_decode(&coded, data.len()), (data, coded.len()));
+    }
+
+    #[test]
+    fn argb_holds_the_four_planes_in_order() {
+        let rgba = [10u8, 20, 30, 40].repeat(16);
+        let payload = argb(&rgba);
+        assert_eq!(&payload[..4], b"ARGB");
+        let (planes, used) = run_length_decode(&payload[4..], 64);
+        assert_eq!(used, payload.len() - 4);
+        assert_eq!(planes, [[40u8; 16], [10; 16], [20; 16], [30; 16]].concat());
+    }
+
+    fn decode_rgba(png: &[u8]) -> (u32, Vec<u8>) {
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(png));
+        decoder.set_transformations(png::Transformations::normalize_to_color8());
+        let mut reader = decoder.read_info().expect("header");
+        let mut buf = vec![0; reader.output_buffer_size().expect("size")];
+        let info = reader.next_frame(&mut buf).expect("frame");
+        buf.truncate(info.buffer_size());
+        let rgba = match info.color_type {
+            png::ColorType::Rgba => buf,
+            png::ColorType::Rgb => buf.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+            other => panic!("unexpected PNG colour type {other:?}"),
+        };
+        (info.width, rgba)
+    }
+
+    /// macOS's own reader gives back the pixels written, at every size: no noise in the 16 and
+    /// 32 px slots.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn iconutil_reads_back_every_size() {
+        let images: Vec<_> = [16, 32, 64, 128].into_iter().map(|s| (s, icon_rgba(s, &Ground::DARK))).collect();
+        let dir = std::env::temp_dir().join(format!("simee-icns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (file, set) = (dir.join("t.icns"), dir.join("t.iconset"));
+        std::fs::write(&file, icns(&images).expect("icns")).expect("write");
+        let status = std::process::Command::new("iconutil").arg("-c").arg("iconset").arg(&file).arg("-o").arg(&set).status();
+        let Ok(status) = status else { return }; // No iconutil (no Xcode tools): nothing to compare with.
+        assert!(status.success(), "iconutil refused the file");
+        for (name, size) in [("icon_16x16", 16), ("icon_32x32", 32), ("icon_16x16@2x", 32), ("icon_32x32@2x", 64), ("icon_128x128", 128)] {
+            let (width, got) = decode_rgba(&std::fs::read(set.join(format!("{name}.png"))).expect(name));
+            let want = &images.iter().find(|(s, _)| *s == size).expect("size").1;
+            assert_eq!(width, size, "{name}");
+            let worst = got
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(want.as_chunks::<4>().0)
+                .filter(|(_, w)| w[3] == 255)
+                .map(|(g, w)| (0..4).map(|k| g[k].abs_diff(w[k])).max().unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            assert!(worst <= 2, "{name}: an opaque pixel is off by {worst}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
