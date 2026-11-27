@@ -11,6 +11,7 @@ simee-api
 simee-audio
 simee-coresim
 simee-emu
+simee-encode
 simee-emu-avd
 simee-emu-gfxstream
 simee-emu-hvf

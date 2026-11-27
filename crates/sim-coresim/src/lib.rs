@@ -17,6 +17,8 @@ pub mod host;
 pub mod procs;
 mod rt;
 mod service;
+#[cfg(feature = "videotoolbox")]
+pub mod videotoolbox;
 mod watch;
 
 pub use display::{Display, FrameWatch, Surface};
