@@ -22,6 +22,8 @@ extend-ignore-re = [
 [default.extend-words]
 # RTP's single-time aggregation packet (RFC 6184 STAP-A/STAP-B).
 stap = "stap"
+# V4L2's stream parameters (VIDIOC_S_PARM, struct v4l2_streamparm).
+parm = "parm"
 # Fragments typos splits out of real tokens: "PNGs" (PN), Linux's KEY_102ND (ND), lsof's `-F pcPnT`
 # field letters (Pn), and two-letter hex/register fragments (BA).
 pn = "pn"
