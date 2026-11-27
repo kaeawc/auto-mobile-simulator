@@ -18,7 +18,9 @@
 # A median of three: run it three times with new names, e.g. for N in 1 2 3.
 set -euo pipefail
 
-mode=${1:?golden|fresh}; name=${2:?AVD name}; sysdir=${3:?system image dir}
+mode=${1:?golden|fresh}
+name=${2:?AVD name}
+sysdir=${3:?system image dir}
 root=$(cd "$(dirname "$0")/.." && pwd)
 emu=${EMU:-$root/target/release/emu}
 adb=${ANDROID_HOME:?set ANDROID_HOME}/platform-tools/adb
@@ -33,11 +35,11 @@ flags=()
 
 t0=$(now)
 # shellcheck disable=SC2086
-"$emu" -create-avd "$name" -sysdir "$sysdir" $extra ${flags[@]+"${flags[@]}"} > "$out/create.log" 2>&1
+"$emu" -create-avd "$name" -sysdir "$sysdir" $extra ${flags[@]+"${flags[@]}"} >"$out/create.log" 2>&1
 create_s=$(since "$t0")
 
 t1=$(now)
-"$emu" -avd "$name" -no-window -no-audio > "$out/boot.log" 2>&1 &
+"$emu" -avd "$name" -no-window -no-audio >"$out/boot.log" 2>&1 &
 pid=$!
 trap 'kill -INT "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
 
@@ -45,12 +47,16 @@ port=
 boot_s=
 launcher_s=
 while awk -v t="$(since "$t1")" -v m="$timeout_s" 'BEGIN {exit !(t < m)}'; do
-  kill -0 "$pid" 2>/dev/null || { echo "emu exited early: $(tail -3 "$out/boot.log")" >&2; break; }
+  kill -0 "$pid" 2>/dev/null || {
+    echo "emu exited early: $(tail -3 "$out/boot.log")" >&2
+    break
+  }
   [ -n "$port" ] || port=$(sed -n 's/^emu: .* on emulator-\([0-9]*\) .*/\1/p' "$out/boot.log" | head -1)
   if [ -z "$boot_s" ] && grep -q '^emu: boot completed' "$out/boot.log"; then boot_s=$(since "$t1"); fi
   if [ -n "$boot_s" ] && [ -n "$port" ]; then
     if "$adb" -s "emulator-$port" shell dumpsys activity activities 2>/dev/null | grep -i ResumedActivity | grep -qi launcher; then
-      launcher_s=$(since "$t1"); break
+      launcher_s=$(since "$t1")
+      break
     fi
   fi
   sleep 2
@@ -60,7 +66,7 @@ done
 [ -n "$port" ] && "$adb" -s "emulator-$port" emu kill >/dev/null 2>&1 || true
 wait "$pid" 2>/dev/null || true
 trap - EXIT
-"$emu" -delete-avd "$name" > /dev/null
+"$emu" -delete-avd "$name" >/dev/null
 echo "mode=$mode create_s=$create_s boot_s=${boot_s:-timeout} launcher_s=${launcher_s:-timeout} avd=$name"
-cat "$out/create.log" | sed 's/^/# /'
+sed 's/^/# /' "$out/create.log"
 rm -rf "$out"
