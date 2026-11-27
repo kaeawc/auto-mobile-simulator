@@ -170,6 +170,27 @@ pub fn import(s: &mut Session, p: &Value) -> Result<Value, String> {
     }))
 }
 
+/// `contrast_check` on an AVD: its screen and its density; the appearance isn't switchable yet.
+struct ContrastTarget<'a>(&'a sim_android::Device);
+
+impl crate::contrast::Target for ContrastTarget<'_> {
+    fn capture(&mut self) -> Result<sim_core::frame::Frame, String> {
+        self.0.screenshot()
+    }
+
+    fn scale(&mut self) -> Option<f64> {
+        use sim_core::form_factor::Density;
+        Some(match self.0.profile().ok()?.density {
+            Density::Dpi(dpi) => f64::from(dpi) / 160.0,
+            Density::Scale(n) => f64::from(n),
+        })
+    }
+
+    fn set_appearance(&mut self, _: crate::contrast::Mode) -> Result<(), String> {
+        Err("appearance switching isn't available on Android devices yet".into())
+    }
+}
+
 /// Dispatches one device method for the AVD named `udid`.
 pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Value, String> {
     let android = s.backend().clone();
@@ -223,6 +244,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             Some(path) => d.screenshot_png_to(std::path::Path::new(path)).map(|(w, h)| json!({"path": path, "width": w, "height": h})),
             None => d.screenshot_png().and_then(|(w, h, png)| png_result(w, h, png, p)),
         },
+        "contrast_check" => crate::contrast::run(&mut ContrastTarget(&d), p),
         "tap" => null(d.play(&tap_samples(p, TAP_HOLD)?)),
         "swipe" => null(d.play(&swipe_samples(p)?)),
         "touch" => {
