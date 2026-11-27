@@ -183,8 +183,7 @@ measurements (docs/benchmarks.md).
 Two more `info jit` readings: the translation cache held 622 MB of its 1,053 MB 4 minutes after
 boot complete (1.00 M translated blocks) and 695 MB (1.12 M) after 31 s of swipes, and its flush
 count was 1 throughout: translating is a one-off cost after boot, and the cache has room for the
-workload of a short session. The guest's x86 CPU model is `QEMU TCG CPU version 2.5+` and
-the `max` model's features reach it as `-cpu` sets them.
+workload of a short session.
 
 ### What was tried
 
@@ -193,15 +192,15 @@ said, the same swipe scripts. The baseline is the six boots of sections 2 and 3:
 (161.0 to 179.3), launcher 186.6 s (176.2 to 197.2), idle 0.57 to 0.60 cores. Boot-to-boot spread
 is ±9 s, so a difference under about 10 s is not a result.
 
-| Configuration | Boot / launcher | Idle, 240–300 s | Launcher swipes over adb: frames, p90, janky | Result |
+| Configuration | Boot / launcher | Idle, 240–300 s | Launcher swipes over adb: frames, p50 / p90, janky | Result |
 | --- | --- | --- | --- | --- |
-| 3 vCPUs (`hw.cpu.ncore=3`) | 199.3 s / 226.1 s | 0.59 | 174, 200 ms, 98.3% | boot 16% later |
-| 2 vCPUs | 434.7 s / 518.5 s | 0.58 | 161, 150 ms, 98.1% | boot 2.5× longer |
-| QEMU confined to 3 cores (`taskset -c 0-2`), the renderer and emu on the 4th | 180.5 s / 203.0 s | 0.60 | 181, 200 ms, 97.2% | no change (within noise) |
-| `hw.lcd.vsync=30` | 180.8 s / 204.4 s | 0.55 | 175, 150 ms, 89.7% | idle 0.04 lower; fewer janky frames because there are fewer deadlines |
-| 540×960 at 240 dpi | 166.2 s / 196.4 s | 0.59 | 194, 150 ms, 94.3% | boot 3% earlier (noise); 8% more frames |
-| Animations off (window, transition, animator scales 0) | 166.0 s / 191.7 s | 0.59 | 110, 150 ms, 98.2% | no gain: fewer frames because nothing animates |
-| QEMU rebuilt with a 16× larger jump cache (`TB_JMP_CACHE_BITS` 12 → 16), 2 boots | 187.8 / 178.2 s; launcher 220.0 / 199.3 s | 0.82, 0.57 | 173, 150 ms, 97.1% and 182, 150 ms, 98.9% | slower: `tcg_flush_jmp_cache` took 0.13 to 0.17 cores (each flush clears 512 KB), the lookup share didn't fall (0.79 against 0.60 cores in boot) |
+| 3 vCPUs (`hw.cpu.ncore=3`) | 199.3 s / 226.1 s | 0.59 | 174, 200 / 350 ms, 98.3% | boot 16% later |
+| 2 vCPUs | 434.7 s / 518.5 s | 0.58 | 161, 150 / 400 ms, 98.1% | boot 2.5× longer |
+| QEMU confined to 3 cores (`taskset -c 0-2`), the renderer and emu on the 4th | 180.5 s / 203.0 s | 0.60 | 181, 200 / 350 ms, 97.2% | no change (within noise) |
+| `hw.lcd.vsync=30` | 180.8 s / 204.4 s | 0.55 | 175, 150 / 300 ms, 89.7% | idle 0.04 lower; fewer janky frames because there are fewer deadlines |
+| 540×960 at 240 dpi | 166.2 s / 196.4 s | 0.59 | 194, 150 / 200 ms, 94.3% | boot 3% earlier (noise); 8% more frames and p90 200 ms against 300 |
+| Animations off (window, transition, animator scales 0) | 166.0 s / 191.7 s | 0.59 | 110, 150 / 300 ms, 98.2% | no gain: fewer frames because nothing animates |
+| QEMU rebuilt with a 16× larger jump cache (`TB_JMP_CACHE_BITS` 12 → 16), 2 boots | 187.8 / 178.2 s; launcher 220.0 / 199.3 s | 0.82, 0.57 | 173, 150 / 300 ms, 97.1% and 182, 150 / 300 ms, 98.9% | slower: `tcg_flush_jmp_cache` took 0.13 to 0.17 cores (each flush clears 512 KB), the lookup share didn't fall (0.79 against 0.60 cores in boot) |
 | `-gpu lavapipe` (`LP_NUM_THREADS` 0 and 2) | emu exited 138 s and 66 s in | | | no boot, as docs/benchmarks.md records for the SDK's lavapipe |
 
 The first two rows say the guest is bound by single-thread speed, not by cores: 4 vCPUs are 54–65%
