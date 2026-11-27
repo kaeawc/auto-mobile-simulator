@@ -17,8 +17,9 @@
 //!
 //! `cargo run` opens the window (`SIMEE_DEVICE=<udid|name|booted>` preselects a device);
 //! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
-//! folded, tablet, ipad, watch, tv, apple-watch, apple-tv, turned, turned-tablet, empty); a
-//! release build needs `--features tooling` for it.
+//! folded, tablet, ipad, watch, tv, apple-watch, apple-tv, turned, turned-tablet, empty,
+//! sidebar-hidden, inspector-hidden, panes-hidden, panes-wide); a release build needs
+//! `--features tooling` for it.
 
 mod android;
 mod bezel;
@@ -30,8 +31,10 @@ mod icons;
 mod ios;
 mod keys;
 mod mark;
+mod panes;
 mod scan;
 mod scene;
+mod settings;
 mod shot_preview;
 mod stylus;
 #[cfg(target_os = "macos")]
@@ -169,6 +172,9 @@ pub struct State {
     /// poll time it started at; `None` while it rests.
     pub mark_t: f32,
     mark_from: Option<f64>,
+    /// The saved settings ([`settings`]) and the panes' own state ([`panes`]).
+    pub prefs: settings::Store,
+    pub panes: panes::Panes,
 }
 
 /// An Android screen switched away from, with what the window showed it with.
@@ -431,7 +437,17 @@ fn init() -> State {
         bezel: bezel::Bezel::default(),
         view3d,
         previews: shot_preview::Previews::default(),
+        prefs: settings::Store::default(),
+        panes: panes::Panes::default(),
     }
+}
+
+/// The window's state from its saved settings.
+#[cfg_attr(feature = "hot", allow(dead_code))]
+fn init_with(store: settings::Store) -> State {
+    let mut s = init();
+    panes::restore(&mut s, store);
+    s
 }
 
 fn info(udid: &str, name: &str, device_type: &str, runtime: &str, state: DeviceState) -> DeviceInfo {
@@ -879,7 +895,12 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
         s.sized_for = Some(size);
         let form_factor = s.selected_info().and_then(|i| i.form_factor);
         let bezel = s.selected_info().and_then(controls::bezel).is_some();
-        tx.resize_window(fit_window(size, form_factor, bezel));
+        // The window opened at its saved size for this device keeps it; resized or hidden panes
+        // widen or narrow the fit.
+        if s.panes.keep_window.take().is_none_or(|udid| s.selected.as_ref() != Some(&udid)) {
+            let (w, h) = fit_window(size, form_factor, bezel);
+            tx.resize_window((w + panes::chrome_delta(&s.prefs.current, true), h));
+        }
         changed = true;
     }
     // The mark turns while a job runs or a device starts or stops: a frame every
@@ -905,6 +926,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     if let Some(secs) = s.previews.wake_in(t) {
         tx.wake_after(Duration::from_secs_f64(secs));
     }
+    changed |= panes::poll(s, t, tx);
     changed
 }
 
@@ -921,8 +943,11 @@ fn toggle_view3d(s: &mut State) {
 
 /// Window shortcuts the focused control left alone: ⌘3 toggles the 3D view; while it shows, ⌘0,
 /// ⌘1 ⌘2 ⌘4 ⌘5, ⌘F and ⌘[ ⌘] move it ([`scene::Command::for_key`]). ⌘S saves a screenshot
-/// wherever the focus is.
+/// wherever the focus is. ⌘⌥S and ⌘⌥I hide and show the sidebar and the inspector ([`panes`]).
 fn on_key(s: &mut State, k: &rune::KeyEvent, tx: &mut Tx) -> bool {
+    if panes::on_key(s, k, tx) {
+        return true;
+    }
     let action = if k.key == rune::Key::Command('3') && !k.mods.shift {
         Action::ToggleView3d
     } else if keys::map(k) == KeyAction::Screenshot {
@@ -1051,7 +1076,7 @@ fn edge_touch(s: &State, x: f32, y: f32, phase: Phase, edge: sim_core::gesture::
 /// copied here and encoded on a thread. The result reaches the status line through the outbox;
 /// returns a status line only for what fails at once.
 fn screenshot(s: &State) -> Option<String> {
-    let path = work::screenshot_path();
+    let path = work::screenshot_path(s.prefs.current.screenshot_dir.as_deref());
     let inbox = s.previews.inbox();
     if let Some(sc) = &s.screen {
         sc.console(move |d| match d.screenshot_png_to(&path) {
@@ -1079,7 +1104,9 @@ fn screenshot(s: &State) -> Option<String> {
 }
 
 fn main() {
-    let spec = AppSpec::<State> {
+    // Live Rust editing runs the spec as it is: no saved window frame.
+    #[cfg_attr(feature = "hot", allow(unused_mut))]
+    let mut spec = AppSpec::<State> {
         scenes: &[
             ("demo", demo),
             ("android", android_scene),
@@ -1102,6 +1129,10 @@ fn main() {
                 android_scene(s);
                 shot_preview::demo_shots(s, 1);
             }),
+            ("sidebar-hidden", panes::sidebar_hidden_scene),
+            ("inspector-hidden", panes::inspector_hidden_scene),
+            ("panes-hidden", panes::panes_hidden_scene),
+            ("panes-wide", panes::panes_wide_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),
@@ -1118,7 +1149,19 @@ fn main() {
         // Before the window's state is made: it reads whether the 3D view can draw.
         let wgpu = scene::wgpu_backend(std::env::var("RUNE_GPU_BACKEND").ok().as_deref(), setting.as_deref(), cfg!(target_os = "macos"));
         scene::set_supported(wgpu);
-        let app = rune::App::new(spec).on_visibility(on_visibility);
+        // Headless runs and scenes never read or write the user's settings.
+        let store = if headless() { settings::Store::default() } else { settings::Store::open_default() };
+        let opened_at = panes::open_at(&mut spec, &store);
+        let app = rune::App::new(spec)
+            .on_visibility(on_visibility)
+            .on_window(panes::remember_window)
+            .on_close(panes::on_close)
+            .on_quit(panes::on_close)
+            .init(move || init_with(store));
+        let app = match opened_at {
+            Some(options) => app.window_options(options),
+            None => app,
+        };
         let app = match gpu_backend(setting.as_deref()) {
             Ok(Some(backend)) => app.gpu_backend(backend),
             Ok(None) => app,
