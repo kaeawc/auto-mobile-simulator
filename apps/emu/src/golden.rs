@@ -50,7 +50,7 @@ pub fn start_from_golden(env: &Env, name: &str, opts: &Opts) {
         return;
     }
     match env.ensure_golden(name, |a| build(env, opts, a, &mut |m| println!("golden: {m}")), &mut |m| println!("golden: {m}")) {
-        Ok(o) => println!("{}", report(&o)),
+        Ok(o) => println!("golden: {}", report(&o)),
         Err(e) => eprintln!("emu: warning: no golden for {name}: {e}; it first-boots fresh (-no-golden skips this step)"),
     }
 }

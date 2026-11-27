@@ -13,6 +13,7 @@
 //! ```text
 //! <api>_<tag>_<abi>_<id>/        one golden: userdata.img, cache.img, encryptionkey.img, golden.ini
 //! <api>_<tag>_<abi>_<id>.lock    held while that golden is built
+//! .hashes/                       the hash of each image file, so an unchanged image isn't read again
 //! .<name>.partial-<pid>/         a build in progress; renamed to <name> when complete
 //! ```
 //!
@@ -43,6 +44,9 @@ use crate::{Avd, CLONED_DISKS, Env, Error, Result, parse_ini, read, state_dir};
 
 /// Where goldens live, under the AVD home.
 pub const GOLDEN_DIR: &str = ".simee-golden";
+
+/// Under [`GOLDEN_DIR`]: hashes of image files already read ([`Env::golden_key`]).
+const HASH_CACHE: &str = ".hashes";
 
 /// The `config.ini` keys whose values a settled user data depends on: the data partition's size
 /// (the image is formatted at it), the screen (the launcher lays its grid out for it) and the
@@ -205,7 +209,7 @@ impl Env {
     /// The key of the golden for `avd`: its image's identity ([`Env::image_identity`]; this
     /// hashes the image's files) and its shape ([`SHAPE_KEYS`] and `boot.prop`).
     pub fn golden_key(&self, avd: &Avd) -> Result<GoldenKey> {
-        let id = self.image_identity(&avd.sysdir)?;
+        let id = self.image_identity_with(&avd.sysdir, &|p| self.image_file_hash(p))?;
         let image = sim_bundle::hash(canonical_image(&id).as_bytes());
         let shape = sim_bundle::hash(shape_of(avd).as_bytes());
         let package = self
@@ -216,6 +220,45 @@ impl Env {
             .unwrap_or_else(|| avd.sysdir.display().to_string());
         let name = format!("{}_{}_{}_{}{}", fs_safe(&id.api), fs_safe(&id.tag), fs_safe(&id.abi), &image[..12], &shape[..8]);
         Ok(GoldenKey { name, package, image, shape })
+    }
+
+    /// The BLAKE3 of image file `path`, remembered in `<golden root>/.hashes/` under the file's
+    /// path, size, inode and modification and change times: an image is multi-gigabyte, and
+    /// hashing it takes as long as reading it from disk (20 s of a 25 s `-create-avd` that finds a
+    /// golden). Any write to the file changes its change time, which a program can't set back, so
+    /// an edited file is hashed again; a remembered hash that doesn't look like one is ignored.
+    fn image_file_hash(&self, path: &Path) -> Result<String> {
+        use std::os::unix::fs::MetadataExt;
+        let io = |p: &Path, e| Error::Io(p.to_path_buf(), e);
+        let meta = std::fs::metadata(path).map_err(|e| io(path, e))?;
+        let real = std::fs::canonicalize(path).map_err(|e| io(path, e))?;
+        let stamp = format!(
+            "{}|{}|{}|{}.{}|{}.{}",
+            real.display(),
+            meta.len(),
+            meta.ino(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec()
+        );
+        let dir = self.golden_root().join(HASH_CACHE);
+        let entry = dir.join(&sim_bundle::hash(stamp.as_bytes())[..32]);
+        if let Ok(h) = std::fs::read_to_string(&entry)
+            && h.len() == 64
+            && h.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Ok(h);
+        }
+        let h = sim_bundle::hash_file(path)?;
+        // Best effort: a read-only AVD home just hashes every time.
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let tmp = dir.join(format!(".{}.{}", std::process::id(), now_unix()));
+            if std::fs::write(&tmp, &h).is_ok() && std::fs::rename(&tmp, &entry).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+        Ok(h)
     }
 
     /// The complete golden for `key`, if there is one. A directory whose `golden.ini` is missing
@@ -483,7 +526,7 @@ mod tests {
     }
 
     /// What a booted guest leaves: a user data image that is mostly a hole.
-    fn settle(avd: &Avd, marker: &str) {
+    fn settle(avd: &Avd, marker: &str) -> Result<()> {
         let d = state_dir(&avd.dir);
         std::fs::create_dir_all(&d).expect("simee");
         let f = File::create(d.join("userdata.img")).expect("userdata");
@@ -492,6 +535,7 @@ mod tests {
         std::fs::write(d.join("cache.img"), b"cache").expect("cache");
         std::fs::write(d.join("encryptionkey.img"), b"key").expect("key");
         std::fs::write(d.join("console.log"), b"log").expect("log");
+        Ok(())
     }
 
     fn marker(avd_dir: &Path) -> String {
@@ -513,8 +557,7 @@ mod tests {
                 "one",
                 |a| {
                     builds.fetch_add(1, Ordering::SeqCst);
-                    settle(a, "settled1");
-                    Ok(())
+                    settle(a, "settled1")
                 },
                 &mut |m| said.push(m.to_owned()),
             )
@@ -550,12 +593,12 @@ mod tests {
     fn a_changed_image_or_shape_gets_another_golden_and_the_replaced_image_loses_its_own() {
         let (tmp, env) = sdk("identity", "2");
         avd(&env, "a");
-        let a = env.ensure_golden("a", |x| Ok(settle(x, "imageone")), &mut |_| {}).expect("a");
+        let a = env.ensure_golden("a", |x| settle(x, "imageone"), &mut |_| {}).expect("a");
         // Another screen: the same image, another shape, another golden; both are kept.
         let mut spec = NewAvd::for_image("wide", SYSDIR);
         spec.lcd = (1080, 1920, 420);
         env.create_avd(&spec).expect("wide");
-        let wide = env.ensure_golden("wide", |x| Ok(settle(x, "wideshap")), &mut |_| {}).expect("wide");
+        let wide = env.ensure_golden("wide", |x| settle(x, "wideshap"), &mut |_| {}).expect("wide");
         assert_ne!(a.key.name, wide.key.name);
         assert_eq!(a.key.image, wide.key.image);
         assert_eq!(env.goldens().len(), 2);
@@ -571,7 +614,7 @@ mod tests {
         // goldens of the replaced image are removed once it is built.
         install_image(&env, "3", "system, rebuilt");
         avd(&env, "b");
-        let b = env.ensure_golden("b", |x| Ok(settle(x, "imagetwo")), &mut |_| {}).expect("b");
+        let b = env.ensure_golden("b", |x| settle(x, "imagetwo"), &mut |_| {}).expect("b");
         assert_eq!(b.source, Source::Built);
         assert_ne!(b.key.image, a.key.image);
         assert!(env.find_golden(&b.key).is_some());
@@ -581,7 +624,7 @@ mod tests {
         // Same revision, other contents: also another identity.
         install_image(&env, "3", "system, patched");
         avd(&env, "c");
-        let c = env.ensure_golden("c", |x| Ok(settle(x, "imagethr")), &mut |_| {}).expect("c");
+        let c = env.ensure_golden("c", |x| settle(x, "imagethr"), &mut |_| {}).expect("c");
         assert_eq!(c.source, Source::Built);
         let _ = std::fs::remove_dir_all(tmp);
     }
@@ -606,8 +649,7 @@ mod tests {
                                 builds.fetch_add(1, Ordering::SeqCst);
                                 // A slow boot, and a slow write of the disks.
                                 std::thread::sleep(Duration::from_millis(300));
-                                settle(a, "racedata");
-                                Ok(())
+                                settle(a, "racedata")
                             },
                             &mut |_| {},
                         )
@@ -642,7 +684,7 @@ mod tests {
             .ensure_golden(
                 "x",
                 |a| {
-                    settle(a, "halfboot");
+                    settle(a, "halfboot")?;
                     Err(Error::Config("boot timed out".into()))
                 },
                 &mut |_| {},
@@ -662,7 +704,7 @@ mod tests {
         std::fs::write(root.join(&key.name).join("userdata.img"), b"torn").expect("torn");
         std::fs::create_dir_all(root.join(format!(".{}.partial-1", key.name))).expect("partial");
         assert!(env.find_golden(&key).is_none(), "no golden.ini, no golden");
-        let built = env.ensure_golden("x", |a| Ok(settle(a, "second!!")), &mut |_| {}).expect("rebuild");
+        let built = env.ensure_golden("x", |a| settle(a, "second!!"), &mut |_| {}).expect("rebuild");
         assert_eq!(built.source, Source::Built);
         assert_eq!(marker(&env.load("x").expect("x").dir), "second!!");
         assert!(!root.join(format!(".{}.partial-1", key.name)).exists());
@@ -670,6 +712,37 @@ mod tests {
         // A golden whose disk no longer has the recorded length isn't one.
         std::fs::write(root.join(&key.name).join("cache.img"), b"longer than five").expect("truncate");
         assert!(env.find_golden(&key).is_none());
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn image_hashes_are_remembered_until_the_file_changes() {
+        let (tmp, env) = sdk("hashes", "2");
+        avd(&env, "a");
+        let a = env.load("a").expect("a");
+        let first = env.golden_key(&a).expect("key");
+        let cache = env.golden_root().join(".hashes");
+        let entries = || -> Vec<PathBuf> { std::fs::read_dir(&cache).expect("cache").flatten().map(|e| e.path()).collect() };
+        assert_eq!(entries().len(), IMAGE_FILES.len(), "one remembered hash per image file");
+        assert_eq!(env.golden_key(&a).expect("again"), first);
+        // The key is made from what is remembered: planted hashes change it.
+        for e in entries() {
+            std::fs::write(e, "a".repeat(64)).expect("plant");
+        }
+        assert_ne!(env.golden_key(&a).expect("planted").image, first.image);
+        // Something that isn't a hash is ignored and replaced by the real one.
+        for e in entries() {
+            std::fs::write(e, "not a hash").expect("garbage");
+        }
+        assert_eq!(env.golden_key(&a).expect("healed"), first);
+        // An edit in place that keeps the length and puts the modification time back is still
+        // seen (its change time moved), so the golden of the old contents isn't used.
+        let system = env.sdk_root.as_deref().expect("sdk").join(SYSDIR).join("system.img");
+        let mtime = std::fs::metadata(&system).expect("meta").modified().expect("mtime");
+        let len = std::fs::metadata(&system).expect("meta").len() as usize;
+        std::fs::write(&system, vec![b'x'; len]).expect("edit");
+        File::options().write(true).open(&system).expect("open").set_modified(mtime).expect("mtime back");
+        assert_ne!(env.golden_key(&a).expect("edited").image, first.image);
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -698,7 +771,7 @@ mod tests {
     fn a_golden_only_starts_a_new_avd() {
         let (tmp, env) = sdk("apply", "2");
         avd(&env, "one");
-        env.ensure_golden("one", |a| Ok(settle(a, "settled1")), &mut |_| {}).expect("one");
+        env.ensure_golden("one", |a| settle(a, "settled1"), &mut |_| {}).expect("one");
         // `one` has user data now: asking again is an error, not an overwrite.
         assert!(env.ensure_golden("one", |_| Ok(()), &mut |_| {}).is_err());
         assert_eq!(marker(&env.load("one").expect("one").dir), "settled1");

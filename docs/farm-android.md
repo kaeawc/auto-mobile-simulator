@@ -39,6 +39,92 @@ wall times are noisy; exit counts, console bytes and disk sizes are not). Image:
   claimed too and fails at once if another simee holds it.
 - `scripts/farm-bench-android.sh <label> <golden> <N>`: the benchmark below.
 
+## Golden user data per system image
+
+A fresh AVD's first boot is the slow one: init waits for apexd to decompress the image's compressed
+APEX files one at a time, vold formats and encrypts user data, and `system_server` does its
+first-boot work (docs/research/software-mode-profile.md, section 4). `emu -create-avd` and
+`emu -provision ... -create-avd` therefore keep one settled user data per system image and start
+every later AVD of that image from a clone of it (#226).
+
+- **First AVD of an image.** `-create-avd NAME` makes the AVD, then boots it once in a child
+  `emu -avd NAME` (no window, no audio), waits for `emu: boot completed`, then (with the SDK's adb)
+  until the launcher is the resumed activity and the guest's CPUs are under 25% busy in two samples
+  5 s apart (without adb: a fixed 120 s), runs `sync` in the guest, and stops emu through its
+  console (`kill`, the stock text protocol with `~/.emulator_console_auth_token`). Only then are its
+  simee disks (`userdata.img`, `cache.img`, `encryptionkey.img`: the set `-clone-avd` copies) kept.
+  NAME keeps its own settled disks, so it never pays a second boot of its own.
+- **Later AVDs.** `-create-avd NAME2` finds the golden, clones its disks into `NAME2/simee/` (a
+  reflink where the file system has them, else a copy that keeps the image's holes; APFS clones the
+  files) and returns: the first start of NAME2 is a warm boot.
+- **Where, and the key.** `<avd home>/.simee-golden/<api>_<tag>_<abi>_<id>/` holds the disks and
+  `golden.ini`; it is on the AVDs' file system so reflinks work, and `emu -list-avds` doesn't see
+  it. `<id>` is the BLAKE3 of the image's identity, computed as #170's bundles compute it (API
+  level, tag, ABI, revision, the hash of `system.img`, `vendor.img`, `kernel-ranchu`, `ramdisk.img`,
+  and the build fingerprint), and of the AVD's *shape*: data partition size, screen size and density,
+  `hw.mainKeys`/`dPad`/`keyboard`/`sdCard`, `tag.id`, `abi.type` and `boot.prop`. Memory, vCPU
+  count, GPU mode and names are not in it. AVDs of one image with another shape (a bigger screen,
+  a larger data partition) get their own golden, built when the first of them is created.
+- **Invalidation.** A new image revision, or the same revision with other contents (it is the
+  files' hashes that count, not the version string), has another `<id>`, so the old golden is not
+  used; when the new one is built the goldens of the image it replaced (same package path under the
+  SDK, other identity) are removed. Hashing the image's files costs a few seconds per `-create-avd`.
+  Nothing else removes a golden: delete `.simee-golden/` to start over.
+- **Concurrency.** A golden is a directory that only appears by `rename` once `golden.ini`
+  (written last) lists its disks and their lengths; a build works in `.<name>.partial-<pid>/`. The
+  build holds an `flock` on `<name>.lock` from its check for an existing golden to the rename, so
+  two `-create-avd` runs for one image build once: the second waits (up to 45 minutes, saying so),
+  then clones the golden the first made. A killed build leaves only a `.partial-*` directory,
+  which the next build removes, and a directory without a valid `golden.ini` is never used.
+- **Failure.** If the build can't boot the AVD, doesn't reach `boot completed` in 30 minutes, or
+  can't stop it, `-create-avd` still creates the AVD, removes its half-settled disks (it first-boots
+  fresh) and warns; the log of the build is `<avd>/simee/golden-build.log`. Hosts that can't boot
+  the image (an arm64 image on x86_64 Linux, any image on a host with no emulator backend, no QEMU
+  in software mode) skip the golden and say so.
+- **Opt out.** `-no-golden` neither builds nor uses a golden: a pristine first boot, as stock's
+  AVDs have. `scripts/farm-bench-android.sh`'s `MODE=fresh` passes it.
+- **Guest identity is duplicated**, as with `-clone-avd` and #170's bundle imports
+  (`emu_avd::bundle::DUPLICATED_IDENTITY`): `android_id` and the per-app SSAIDs live in the
+  encrypted user data, which emu can't edit offline, so every AVD made from one golden is the same
+  device to its guest's apps and services. `ro.serialno` is emu's constant
+  (`EMULATOR0EMURS0`) in every AVD anyway, and the adb serial `emulator-<port>` is per launch. An
+  AVD that must look like a new device to an app (a test that registers accounts, say) uses
+  `-no-golden`, or `-wipe-data` on a clone.
+
+### What it saves (software mode, 2026-11-27)
+
+One host for all of it: a 4-vCPU Firecracker VM (Intel Xeon 2.2 GHz, no `/dev/kvm`, no GPU, 3.9 GB
+of RAM, ext4 without reflinks), Ubuntu 22.04, `emu` release build with this change, QEMU 11.1.3
+built from the release tarball, API 36 `default` x86_64 r2, AVDs from `emu -create-avd` with
+`-memory 1536 -cores 4` (720x1280 at 320 dpi, 4 GB data). Times are wall clock from `emu`'s start
+(or from the start of `-create-avd`, where said) to `emu: boot completed` and to the first time
+`dumpsys activity activities` reports a launcher as the resumed activity, polled every 2 s;
+`scripts/golden-bench.sh golden|fresh <name> <sysdir>` is each row, run three times, interleaved
+(a golden run, then a fresh one), the median is shown.
+
+| Second AVD of the image | `-create-avd` | boot completed | launcher | create + launcher |
+| --- | --- | --- | --- | --- |
+| with the golden (`-create-avd NAME`) | 24.4 s (23.2, 24.4, 24.9) | 186.3 s (186.1, 188.3, 186.3) | 213.9 s (211.3, 213.9, 217.3) | 238.3 s |
+| without (`-create-avd NAME -no-golden`) | 0.0 s | 380.2 s (396.5, 380.2, 378.1) | 421.0 s (423.1, 413.8, 421.0) | 421.0 s |
+| saved | | 194 s | 207 s | 183 s |
+
+- **The golden's one-time cost** is the first AVD's `-create-avd`: 597 s here (one run): 383 s to
+  `boot completed` on a fresh AVD, then 195 s until the launcher was resumed and the guest's CPUs
+  were under 25% busy twice, then the sync, the stop and the copy of its three disks (553 MB on
+  disk, 4 GB sparse). That AVD keeps its settled disks, so it boots in 184 s / 211 s like the
+  second ones (one run).
+- **Why `-create-avd` takes 24 s with a golden here:** 21 s of it is hashing the image's
+  `system.img` (1.9 GB, the host's page cache holds none of it) for the golden's key; the hashes
+  are remembered under `.simee-golden/.hashes/` by file path, size, inode, modification and change
+  time, so the next AVD of the image takes 0.53 to 0.67 s (clone included, 553 MB of data in a sparse
+  copy; three runs 0.67, 0.55, 0.53 s). A cold cache (`.hashes` removed, page cache dropped) took
+  21.3 s once, for the first AVD of each installed image. The three runs in the table were made before that cache and
+  are the 24 s; with it the second AVD's create + launcher is about 214 s against 421 s.
+- **Not measured:** Hypervisor.framework (no Mac here), KVM (no `/dev/kvm`), a second image, a
+  filesystem with reflinks (this one reports `sparse copy`), a host with more than 4 cores. The
+  issue's "faster on HVF/KVM too" is expected from the same first-boot work (formatting,
+  encryption, apexd, dexopt) but is not measured here.
+
 ## Settled, and the benchmark
 
 Settled = `sys.boot_completed=1`, then the emu process using under 60% of one host core over 5 s

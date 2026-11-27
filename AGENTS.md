@@ -171,6 +171,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `virtio/gpu.rs` builds and tests on Linux: put device logic there, not behind the hypervisor.
 - `crates/emu-avd` — `Env` (SDK/AVD paths), `Avd` (config, `profile()`), `NewAvd`
   (`for_profile`), running-instance advertisements (`Running`), `BootConfig`, ini parsing.
+  `golden.rs`: one settled user data per system image identity (`Env::ensure_golden`: lock, build in a
+  partial directory, rename; `clone_file`: reflink, else sparse copy).
 - `crates/emu-sdk` — Java-free provisioning: repository manifests, verified downloads, the
   on-demand gfxstream renderer.
 - `crates/emu-gfxstream` — `stream_renderer_*` FFI (macOS `.dylib`, Linux `.so`; `macho.rs` and
@@ -198,7 +200,7 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   running-instance file; its commands build and test on any host), `display_server.rs` (frames
   and input on `display.sock`, frames through a shared ring for clients that ask; builds and
   tests on any host),
-  `provision.rs` (`-provision`, `-list-images`), `software.rs` (software mode's boot on x86_64
+  `provision.rs` (`-provision`, `-list-images`), `golden.rs` (`-create-avd`'s golden: boots the first AVD of an image in a child emu, settles it, stops it through the console), `software.rs` (software mode's boot on x86_64
   Linux: QEMU's TCG with emu's devices). Boots on Apple silicon, and x86_64 images on x86_64
   Linux in software mode; elsewhere it lists, creates and provisions AVDs.
 - `desktop/` — Rune app, one window for both platforms: `device.rs` (the live iOS device facade; a
