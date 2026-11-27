@@ -112,9 +112,43 @@ fn anchors_match_github() {
 
 #[test]
 fn the_readme_sections_the_home_page_shows_exist() {
-    for heading in crate::home::README_SECTIONS {
+    for heading in crate::home::README_SECTIONS.into_iter().chain(["Compared with the stock tools", "Not yet"]) {
         let md = content::readme_section(heading);
         assert!(md.lines().count() > 2, "README has no ## {heading}");
     }
     assert!(content::readme_lede().starts_with("iOS simulators and Android emulators"));
+}
+
+#[test]
+fn themes_cycle_and_round_trip() {
+    use crate::theme::Theme;
+    let mut t = Theme::System;
+    for want in [Theme::Light, Theme::Dark, Theme::System] {
+        t = t.next();
+        assert_eq!(t, want);
+        assert_eq!(Theme::parse(t.as_str()), t);
+    }
+    assert!(Theme::System.dark(true) && !Theme::System.dark(false));
+    assert!(Theme::Dark.dark(false) && !Theme::Light.dark(true));
+}
+
+#[test]
+fn code_spans_naming_repo_paths_link_to_them() {
+    let md = "rerun with `scripts/bench/android-boot.sh`, see `docs/cli.md`, not `simee list` or [`scripts/x.sh`](https://example.com/y)";
+    let out = resolve_links(md, "");
+    assert!(
+        out.contains("[`scripts/bench/android-boot.sh`](https://github.com/kaeawc/simee/blob/main/scripts/bench/android-boot.sh)"),
+        "{out}"
+    );
+    assert!(out.contains("[`docs/cli.md`](/docs/cli/)"), "{out}");
+    assert!(out.contains("`simee list`") && out.contains("[`scripts/x.sh`](https://example.com/y)"), "{out}");
+    // From a doc, the path is still the repository's.
+    assert!(resolve_links("`scripts/lint.sh`", "docs").contains("(https://github.com/kaeawc/simee/blob/main/scripts/lint.sh)"));
+}
+
+#[test]
+fn quick_start_drops_its_table() {
+    let quick = content::without_tables(&content::readme_section("Quick start"));
+    assert!(!quick.lines().any(|l| l.starts_with('|')), "{quick}");
+    assert!(quick.contains("simee doctor"), "{quick}");
 }

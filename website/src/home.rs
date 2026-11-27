@@ -1,8 +1,8 @@
-//! The home page, set as a paper: title block with Figure 1 (the turning gem), abstract, then the
-//! measured comparison and the debug surface, quick start, limitations and references. Every
-//! table and number is the README's or a doc's own text; the page adds captions only.
+//! The landing page, set as a paper: the title block with Figure 1 (the turning gem), the
+//! abstract, the headline measurements (one table, iOS and Android), the quick start and where
+//! to read on. Every number is the README's own; the page adds captions only.
 
-use rune::{Cx, El, col, el, memo, text};
+use rune::{Cx, El, col, el, memo, row, text};
 
 use crate::content::{self, REPO};
 use crate::gem;
@@ -10,15 +10,12 @@ use crate::tokens::*;
 use crate::ui::{caption, centered, link_text, markdown, prose, section};
 use crate::{State, angle};
 
-/// The README sections the page shows.
-pub const README_SECTIONS: [&str; 3] = ["Compared with the stock tools", "Quick start", "Not yet"];
-
-/// The debug surface rows Table 3 (the README's iOS comparison) doesn't already cover.
-const MORE_DEBUG: [&str; 5] = ["Logs", "In-device exec", "Device state", "Events", "Launch"];
+/// The README sections the page quotes.
+pub const README_SECTIONS: [&str; 2] = ["Performance", "Quick start"];
 
 pub fn page(s: &State, cx: &Cx<State>, bp: Bp) -> El {
-    let width = cx.layout_size("main").map_or(MEASURE, |sz| sz[0]);
-    col().key("home").w_full().child(title_block(angle(s, cx), width, bp)).child(memo("body", bp, || body(bp)))
+    let width = cx.layout_size("main").map_or(MEASURE, |sz| sz[0]).min(MEASURE);
+    col().key("home").w_full().child(title_block(angle(s, cx), width, bp)).child(memo("body", (bp, dark()), || body(bp)))
 }
 
 fn title_block(angle: f32, width: f32, bp: Bp) -> El {
@@ -43,42 +40,23 @@ fn title_block(angle: f32, width: f32, bp: Bp) -> El {
 }
 
 fn body(bp: Bp) -> El {
-    let compared = content::subsections(&content::readme_section(README_SECTIONS[0]));
-    let table = |i: usize, n: &str| -> El {
-        let (heading, body) = compared.get(i).cloned().unwrap_or_default();
-        col()
-            .key(format!("t{n}"))
-            .w_full()
-            .child(caption(&format!("t{n}-cap"), &format!("Table {n}"), &heading.replace('`', "")))
-            .child(markdown(&format!("t{n}-md"), &content::until(&body, "How each number")))
-    };
-    let debug = content::doc_section("debugging", "iOS debug surface");
-    // debugging.md's one paragraph on Android, after the iOS table.
-    let android_debug = debug.find("Android devices").map(|at| debug[at..].split("\n\n").next().unwrap_or("").replace('\n', " "));
-    let mut debugging = section("debugging", "2", "Debugging", bp)
-        .child(table(2, "3"))
-        .child(caption("t4-cap", "Table 4", "More of the iOS debug surface."))
-        .child(markdown("t4-md", &content::table_rows(&debug, &MORE_DEBUG)));
-    if let Some(android) = android_debug {
-        debugging = debugging.child(prose("android-debug", &android, BODY, fg()).mt(14.0));
-    }
-    let quick = content::readme_section(README_SECTIONS[1]);
-    let not_yet = content::readme_section(README_SECTIONS[2]);
+    let performance = strip_heading(&content::readme_section(README_SECTIONS[0]));
+    let quick = content::without_tables(&strip_heading(&content::readme_section(README_SECTIONS[1])));
     col()
         .key("paper")
         .w_full()
-        .max_w(MEASURE)
-        .self_center()
         .child(abstract_(bp))
-        .child(section("performance", "1", "Performance", bp).child(table(0, "1")).child(table(1, "2")))
-        .child(debugging)
-        .child(section("quick-start", "3", "Quick start", bp).child(markdown("qs-md", strip_heading(&quick))))
-        .child(section("limitations", "4", "Limitations", bp).child(markdown("lim-md", strip_heading(&not_yet))))
-        .child(references(bp))
+        .child(
+            section("performance", "1", "Performance", bp)
+                .child(caption("t1-cap", "Table 1", "simee against the stock tools: Android against the SDK emulator, iOS against simctl."))
+                .child(markdown("t1-md", &performance)),
+        )
+        .child(section("quick-start", "2", "Quick start", bp).child(markdown("qs-md", &quick)))
+        .child(further(bp))
 }
 
-fn strip_heading(md: &str) -> &str {
-    md.split_once('\n').map_or("", |(_, rest)| rest)
+fn strip_heading(md: &str) -> String {
+    md.split_once('\n').map_or(String::new(), |(_, rest)| rest.to_owned())
 }
 
 fn abstract_(bp: Bp) -> El {
@@ -88,26 +66,29 @@ fn abstract_(bp: Bp) -> El {
         .role("region")
         .label("Abstract")
         .w_full()
+        .max_w(MEASURE)
+        .self_center()
         .px(inset)
         .pt(28.0)
         .child(centered("abstract-h", "Abstract", BOLD, fg()).mb(6.0))
         .child(prose("abstract-p", &content::readme_lede_code(), BODY, fg()))
 }
 
-fn references(bp: Bp) -> El {
+/// Where to read on, numbered as a paper's references.
+fn further(bp: Bp) -> El {
     let refs: [(&str, &str); 6] = [
-        ("Benchmarks: every published number and the command that reruns it", "/docs/benchmarks/"),
-        ("Compared with the stock tools", "/docs/comparison/"),
-        ("Debugging: the iOS debug surface, network shaping, audio, Android counters", "/docs/debugging/"),
-        ("The Android backend: emu", "/docs/android/"),
-        ("Form factors and their support matrix", "/docs/form-factors/"),
+        ("Benchmarks: every comparison, its host and how to rerun it", "/benchmarks/"),
+        ("Debugging: what simee shows of a device that the stock tools don't", "/debugging/"),
+        ("Limitations: what doesn't work yet", "/limitations/"),
+        ("Device concepts: every form factor on both platforms", "/devices/"),
+        ("Documentation", "/docs/"),
         ("Source code (MIT)", REPO),
     ];
     let mut list = col().key("refs-list").role("list").gap(4.0);
     for (i, (label, href)) in refs.iter().enumerate() {
         list = list.child(
             el().key(format!("ref-{i}")).role("listitem").w_full().child(
-                rune::row()
+                row()
                     .key(format!("ref-{i}-row"))
                     .gap(10.0)
                     .items_start()
@@ -116,5 +97,5 @@ fn references(bp: Bp) -> El {
             ),
         );
     }
-    section("references", "", "References", bp).child(list)
+    section("further", "", "Further reading", bp).child(list)
 }

@@ -10,6 +10,10 @@ use crate::tokens::*;
 use crate::ui::{centered, link_text, prose, section};
 use crate::{State, shot};
 
+/// Whether the page shows the live demo. Off until the relay is set up and a demo Mac streams
+/// (website/media/README.md); `public/live.js` does nothing without the figures.
+const LIVE: bool = false;
+
 /// A phone's screen, width over height: the live boxes' shape before a stream says otherwise
 /// (the video keeps its own aspect inside).
 const PHONE: f32 = 1080.0 / 2400.0;
@@ -29,17 +33,17 @@ pub fn page(s: &State, cx: &Cx<State>, bp: Bp) -> El {
         .w_full()
         .pt(if bp.phone() { 28.0 } else { 44.0 })
         .child(text("Demos").key("demos-h1").role("heading").level(1).font(bp.title()).color(fg()).wrap())
-        .child(live(bp))
+        .child(if LIVE { live(bp) } else { col().key("live-off") })
         .child(
-            section("window", "2", "The desktop window", bp)
+            section("window", if LIVE { "2" } else { "" }, "The desktop window", bp)
                 .child(figure(
-                    "2",
+                    if LIVE { "2" } else { "1" },
                     "desktop.png",
                     "The desktop window with iOS and Android devices",
                     "iOS and Android devices in one window, with the iOS debug panel.",
                 ))
                 .child(figure(
-                    "3",
+                    if LIVE { "3" } else { "2" },
                     "desktop-android.png",
                     "The desktop window with an Android device",
                     "An Android device on emu, simee's emulator.",

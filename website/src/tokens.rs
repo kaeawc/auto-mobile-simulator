@@ -2,37 +2,62 @@
 //! text and IBM Plex Mono for code, rules instead of boxes, and the gem's green only for links and
 //! the mark. Keep `index.html`'s CSS (the fonts, `--rune-*`) in step with these.
 
+use std::cell::Cell;
+
 use rune::{Color, TextStyle, oklch};
 
+thread_local! {
+    /// Whether this view is dark: set once per build of the view (`view`, from the reader's
+    /// choice or the system's), read by every colour below.
+    static DARK: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn set_dark(dark: bool) {
+    DARK.set(dark);
+}
+
+pub fn dark() -> bool {
+    DARK.get()
+}
+
+fn pick(light: Color, dark_: Color) -> Color {
+    if dark() { dark_ } else { light }
+}
+
+/// The page. Dark is black: the static page's dark mode inverts the light export (index.html),
+/// and black is what white inverts to, so Rune's first frame matches it.
 pub fn bg() -> Color {
-    Color::WHITE
+    pick(Color::WHITE, Color::BLACK)
 }
-/// Body text: near-black, about 15:1 on white.
+/// Body text: about 15:1 on its page in both themes.
 pub fn fg() -> Color {
-    oklch(0.2, 0.0, 0.0)
+    pick(oklch(0.2, 0.0, 0.0), oklch(0.92, 0.0, 0.0))
 }
-/// Captions and secondary text: about 7:1 on white.
+/// Captions and secondary text: about 7:1.
 pub fn fg2() -> Color {
-    oklch(0.45, 0.0, 0.0)
+    pick(oklch(0.45, 0.0, 0.0), oklch(0.74, 0.0, 0.0))
 }
 /// The rules under the header and over the footer.
 pub fn rule() -> Color {
-    oklch(0.2, 0.0, 0.0)
+    fg()
 }
-/// Leader lines in Figure 1.
+/// Leader lines in Figure 1, table rules, frames.
 pub fn rule_faint() -> Color {
-    oklch(0.78, 0.0, 0.0)
+    pick(oklch(0.78, 0.0, 0.0), oklch(0.36, 0.0, 0.0))
 }
-/// Links: the gem's green, dark enough for about 5:1 on white.
+/// Links: the gem's green, at about 5:1 on its page.
 pub fn link() -> Color {
-    oklch(0.46, 0.1, 165.0)
+    pick(oklch(0.46, 0.1, 165.0), oklch(0.8, 0.12, 165.0))
 }
 pub fn code_bg() -> Color {
-    oklch(0.97, 0.004, 165.0)
+    pick(oklch(0.97, 0.004, 165.0), oklch(0.19, 0.01, 165.0))
 }
 
-/// The text column: about 70 characters of 17 pt CMU Serif.
+/// The text column: about 70 characters of 17 pt CMU Serif. Paragraphs stop here.
 pub const MEASURE: f32 = 680.0;
+/// The page's frame, half again the text column, for tables and figures where the browser has
+/// the room.
+pub const PAGE: f32 = MEASURE * 1.5;
 
 pub const SERIF: &str = "CMU Serif";
 pub const MONO: &str = "IBM Plex Mono";
