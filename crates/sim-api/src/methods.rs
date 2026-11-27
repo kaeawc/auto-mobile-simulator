@@ -561,8 +561,15 @@ pub(crate) fn resolve(s: &mut Session, p: &Value) -> Result<(Platform, String), 
     if only != Some(Platform::Android) && sim_core::device::is_udid(query) {
         return Ok((Platform::Ios, query.to_owned()));
     }
-    let android = if only == Some(Platform::Ios) { Vec::new() } else { s.android.devices() };
-    if android.is_empty() && only != Some(Platform::Android) {
+    // `booted` loads only the running AVDs' configs, not all of them.
+    let (android, any) = match only {
+        Some(Platform::Ios) => (Vec::new(), false),
+        _ => {
+            let (devices, any) = s.android.backend().candidates(query);
+            (devices.into_iter().map(|d| d.info).collect(), any)
+        }
+    };
+    if !any && only != Some(Platform::Android) {
         return Ok((Platform::Ios, query.to_owned()));
     }
     // Only what `select` reads of each simulator (UDID, name, state); the iOS backend reads the
@@ -1608,6 +1615,22 @@ mod tests {
         assert_eq!(call(&mut s, "tap", &missing).expect_err("missing"), "no device matches `no-such-device`");
         call(&mut s, "delete", &json!({"device": "watch"})).expect("delete");
         assert_eq!(call(&mut s, "devices", &json!({"platform": "android"})).expect("devices").as_array().map(Vec::len), Some(1));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn booted_resolves_among_android_devices_by_what_runs() {
+        let (mut s, root) = android_session("booted");
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        for name in ["a", "b", "c"] {
+            call(&mut s, "create", &json!({"platform": "android", "name": name, "system_image": mobile})).expect("create");
+        }
+        let booted = json!({"device": "booted", "platform": "android"});
+        assert_eq!(resolve(&mut s, &booted), Err("no device matches `booted`".into()), "AVDs exist, none runs");
+        let android = s.android.backend().clone();
+        let _a = sim_android::testing::fake_emulator(&android, "a");
+        assert_eq!(resolve(&mut s, &booted), Ok((Platform::Android, "a".into())));
+        assert_eq!(resolve(&mut s, &json!({"device": "c", "platform": "android"})), Ok((Platform::Android, "c".into())));
         std::fs::remove_dir_all(root).ok();
     }
 

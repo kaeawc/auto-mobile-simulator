@@ -29,8 +29,10 @@ rounds interleaved, the median of 5 (Apple M3 Max, 16 cores, 2026-11-27, host lo
   disconnected waits 30 s for the next, at most 8 wait), and its session is still made new for it.
 - MCP adds JSON-RPC framing, the tool result's text and `structuredContent`, and handing each call
   to a worker thread (`cargo test --release -p simee-mcp tool_call_overhead -- --ignored --nocapture`).
-- `devices` on a host with Android AVDs is the Android listing, not the API: it probes the stock
-  emulators running with `ps` and `lsof`. `device: "booted"` (or a name) resolves through it too.
+- `devices` on a host with Android AVDs is the Android listing, not the API: it reads each AVD's
+  lock and asks the kernel about the process that holds one. An exact AVD name resolves with one
+  `stat` and `device: "booted"` loads only the running AVDs (`docs/benchmarks.md` "Android device
+  resolution").
 
 **Binary replies.** A request may add `"binary": true` to take a result's bytes raw instead of as
 base64 in the line (a local client that wants the PNG skips the base64 encode, the JSON escaping and

@@ -94,10 +94,16 @@ an avdmanager AVD; emu has no snapshots and ignores those keys. (Earlier builds 
 AVDs the stock emulator runs list as `Booted`. The stock emulator (36.x, macOS) does not write the
 `pid_<pid>.ini` that simee's `emu` writes to `~/Library/Caches/TemporaryItems/avd/running`; it
 holds `<avd>/multiinstance.lock` and writes the qemu PID to `<avd>/hardware-qemu.ini.lock`. simee
-reads that PID, checks it is alive and a qemu started with the exact pair `-avd <name>` (`ps`), and
-takes the ports from `-port N` (adb is N + 1) or `-ports C,A`, else from the emulator-range port it
-listens on (`lsof`). A call on one AVD reads only that AVD's lock; a listing asks the host once
-(one `ps -axo`, and one `lsof` only if an emulator lacks `-port`).
+reads that PID, checks it is alive and a qemu started with the exact pair `-avd <name>`, and takes
+the ports from `-port N` (adb is N + 1) or `-ports C,A`, else from the emulator-range port it
+listens on. The process facts come from the kernel for that one PID, with nothing spawned:
+`/proc/<pid>` on Linux, libproc on macOS (`sim-android`'s `host.rs`), where a host-wide `ps -axo`
+and `lsof` cost ~60 ms each. A call on one AVD reads only that AVD's lock. A server remembers a
+qemu's command line and ports by (PID, start time), so a PID the kernel hands to another program
+is asked about again; an emulator is never listed from memory alone, as every call reads the locks
+and checks the PID is alive. The parsed pointer and `config.ini` of each AVD are remembered by
+(path, mtime, size, inode) in `emu-avd`, except files modified in the last 2 s, so resolving a
+device reads no AVD file that hasn't changed.
 `simee info` shows `running.emulator` (`stock` or `simee`), the serial, ports and PID. What needs
 simee's `emu` (touch, keys, wheel and frames over `display.sock`, the touchpad) says so and names
 the fix instead of failing on a missing socket. `shutdown` interrupts the qemu process

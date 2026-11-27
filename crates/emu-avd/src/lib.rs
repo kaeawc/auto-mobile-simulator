@@ -5,6 +5,7 @@
 
 mod bootconfig;
 pub mod bundle;
+mod cache;
 pub mod golden;
 pub mod gpu;
 mod ini;
@@ -12,6 +13,7 @@ pub mod sdk_device;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub use bootconfig::BootConfig;
 pub use ini::parse_ini;
@@ -72,7 +74,13 @@ impl Env {
             .filter_map(|e| {
                 let name = e.file_name().into_string().ok()?;
                 let stem = name.strip_suffix(".ini")?;
-                e.path().is_file().then(|| stem.to_string())
+                // The entry's own type (no stat); only a link needs following.
+                let file = match e.file_type() {
+                    Ok(t) if t.is_file() => true,
+                    Ok(t) if t.is_dir() => false,
+                    _ => e.path().is_file(),
+                };
+                file.then(|| stem.to_string())
             })
             .collect();
         names.sort();
@@ -102,15 +110,15 @@ impl Env {
 
     pub fn load(&self, name: &str) -> Result<Avd> {
         let content_dir = self.content_dir(name)?;
-        let config = parse_ini(&read(&content_dir.join("config.ini"))?);
+        let path = content_dir.join("config.ini");
+        let config = cache::ini(&path)?.ok_or_else(|| Error::Io(path, std::io::ErrorKind::NotFound.into()))?;
         Avd::new(name, content_dir, config, self.sdk_root.as_deref())
     }
 
     /// AVD `name`'s directory: its pointer's `path=` (or `path.rel=`), else `<name>.avd`.
     fn content_dir(&self, name: &str) -> Result<PathBuf> {
         let pointer = self.avd_home.join(format!("{name}.ini"));
-        Ok(if pointer.is_file() {
-            let p = parse_ini(&read(&pointer)?);
+        Ok(if let Some(p) = cache::ini(&pointer)? {
             p.get("path")
                 .map(PathBuf::from)
                 .filter(|p| p.is_dir())
@@ -181,7 +189,8 @@ fn held_lock(dir: &Path) -> Option<PathBuf> {
 pub struct Avd {
     pub name: String,
     pub dir: PathBuf,
-    pub config: BTreeMap<String, String>,
+    /// `config.ini`'s keys, shared with the remembered parse (`Arc::make_mut` to edit a copy).
+    pub config: Arc<BTreeMap<String, String>>,
     pub sysdir: PathBuf,
     /// The SDK the image came from (holds the gfxstream renderer in `emulator/lib64` or
     /// `simee/renderer/<revision>/lib64`).
@@ -189,7 +198,7 @@ pub struct Avd {
 }
 
 impl Avd {
-    fn new(name: &str, dir: PathBuf, config: BTreeMap<String, String>, sdk_root: Option<&Path>) -> Result<Avd> {
+    fn new(name: &str, dir: PathBuf, config: Arc<BTreeMap<String, String>>, sdk_root: Option<&Path>) -> Result<Avd> {
         let sysdir = (1..=3)
             .filter_map(|i| config.get(&format!("image.sysdir.{i}")))
             .map(|rel| match sdk_root {
@@ -684,7 +693,7 @@ pub struct Running {
     pub adb_port: u16,
     pub avd_dir: Option<PathBuf>,
     /// simee's `emu` runs it (it advertised itself with `emulator=simee`); `false` for the stock
-    /// emulator, found by [`Env::stock_instances`].
+    /// emulator, found by [`Env::stock_instances_among_with`].
     pub simee: bool,
 }
 
@@ -720,11 +729,11 @@ impl Running {
     }
 }
 
-/// What the host says about a process, for [`Env::stock_instances_with`].
+/// What the host says about a process, for [`Env::stock_instances_among_with`].
 pub struct Probe<'a> {
-    /// The process's command line (`ps -o args=`); `None` when it has gone.
+    /// The process's command line; `None` when it has gone.
     pub args: &'a dyn Fn(i32) -> Option<String>,
-    /// The TCP ports the process listens on (`lsof`).
+    /// The TCP ports the process listens on.
     pub listening: &'a dyn Fn(i32) -> Vec<u16>,
 }
 
@@ -760,55 +769,10 @@ pub fn console_port_from_listening(ports: &[u16]) -> Option<u16> {
     ports.iter().copied().filter(|p| (5554..=5682).contains(p) && p % 2 == 0 && ports.contains(&(p + 1))).min()
 }
 
-/// The ports a process listens on, from `lsof -nP -a -iTCP -sTCP:LISTEN -p <pid>`: each line
-/// ends with `TCP 127.0.0.1:5750 (LISTEN)`.
-pub fn parse_lsof_listening(out: &str) -> Vec<u16> {
-    out.lines()
-        .filter(|l| l.contains("(LISTEN)"))
-        .filter_map(|l| l.split_whitespace().rev().nth(1)?.rsplit(':').next()?.parse().ok())
-        .collect()
-}
-
 fn host_probe_args(pid: i32) -> Option<String> {
     let out = std::process::Command::new("ps").args(["-o", "args=", "-p", &pid.to_string()]).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     (out.status.success() && !text.is_empty()).then_some(text)
-}
-
-fn host_probe_listening(pid: i32) -> Vec<u16> {
-    std::process::Command::new("lsof")
-        .args(["-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-p", &pid.to_string()])
-        .output()
-        .map(|o| parse_lsof_listening(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or_default()
-}
-
-/// Every process's command line from one `ps -axo pid=,args=`.
-pub fn parse_ps_all(out: &str) -> BTreeMap<i32, String> {
-    out.lines()
-        .filter_map(|l| {
-            let (pid, args) = l.trim_start().split_once(char::is_whitespace)?;
-            Some((pid.parse().ok()?, args.trim().to_owned()))
-        })
-        .collect()
-}
-
-/// Every process's listening TCP ports from one `lsof -nP -iTCP -sTCP:LISTEN -Fpn`: `p<pid>`
-/// lines, each followed by that process's `n<address>:<port>` lines.
-pub fn parse_lsof_by_pid(out: &str) -> BTreeMap<i32, Vec<u16>> {
-    let mut map: BTreeMap<i32, Vec<u16>> = BTreeMap::new();
-    let mut pid = None;
-    for l in out.lines() {
-        if let Some(p) = l.strip_prefix('p') {
-            pid = p.parse().ok();
-        } else if let (Some(n), Some(pid)) = (l.strip_prefix('n'), pid)
-            && !n.contains("->")
-            && let Some(port) = n.rsplit(':').next().and_then(|p| p.parse().ok())
-        {
-            map.entry(pid).or_default().push(port);
-        }
-    }
-    map
 }
 
 impl Env {
@@ -819,52 +783,9 @@ impl Env {
     /// `-port N`; without it the console port is the emulator-range port the process listens on.
     /// Instances in `skip` (by AVD name) are left out, so a simee `emu` is never listed twice.
     ///
-    /// The host is asked once per listing: one `ps` for every live lock's command line and, only
-    /// if some emulator lacks `-port`, one `lsof` for every listening socket.
-    pub fn stock_instances(&self, skip: &[Running]) -> Vec<Running> {
-        let names = self.list_avds();
-        self.stock_instances_among(&names, skip, true)
-    }
-
-    /// [`Env::stock_instances`] for the one AVD `name` alone: its lock only, one `ps` at most.
-    pub fn stock_instance(&self, name: &str, skip: &[Running]) -> Option<Running> {
-        self.stock_instances_among(&[name.to_owned()], skip, false).pop()
-    }
-
-    fn stock_instances_among(&self, names: &[String], skip: &[Running], batch: bool) -> Vec<Running> {
-        let ps = std::cell::OnceCell::new();
-        let lsof = std::cell::OnceCell::new();
-        let run = |argv: &[&str]| {
-            std::process::Command::new(argv[0])
-                .args(&argv[1..])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                .unwrap_or_default()
-        };
-        let args = |pid: i32| {
-            if batch {
-                ps.get_or_init(|| parse_ps_all(&run(&["ps", "-axo", "pid=,args="]))).get(&pid).cloned()
-            } else {
-                host_probe_args(pid)
-            }
-        };
-        let listening = |pid: i32| {
-            if batch {
-                let all = lsof.get_or_init(|| parse_lsof_by_pid(&run(&["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"])));
-                all.get(&pid).cloned().unwrap_or_default()
-            } else {
-                host_probe_listening(pid)
-            }
-        };
-        self.stock_instances_among_with(names, skip, &Probe { args: &args, listening: &listening })
-    }
-
-    /// [`Env::stock_instances`] asking `probe` about processes.
-    pub fn stock_instances_with(&self, skip: &[Running], probe: &Probe) -> Vec<Running> {
-        self.stock_instances_among_with(&self.list_avds(), skip, probe)
-    }
-
-    fn stock_instances_among_with(&self, names: &[String], skip: &[Running], probe: &Probe) -> Vec<Running> {
+    /// Only the AVDs `names` are looked at (each one's lock), and `probe` is asked only about a
+    /// process whose lock names a live PID.
+    pub fn stock_instances_among_with(&self, names: &[String], skip: &[Running], probe: &Probe) -> Vec<Running> {
         names
             .iter()
             .filter(|name| !skip.iter().any(|r| r.avd_name == **name))
@@ -973,17 +894,8 @@ mod tests {
         assert!(!qemu_args_run_avd("qemu -avd other -writable-system lane", "lane"));
         assert!(!qemu_args_run_avd("qemu -avd lane2 -no-window", "lane"));
         assert!(!qemu_args_run_avd("vim -avd lane", "lane"), "not a qemu");
-        let ps = "  1 /sbin/launchd\n 4242 /sdk/qemu-system-aarch64 -avd lane -ports 5600,5700\nnoise\n";
-        assert_eq!(parse_ps_all(ps).get(&4242).map(String::as_str), Some("/sdk/qemu-system-aarch64 -avd lane -ports 5600,5700"));
-        let by_pid = parse_lsof_by_pid("p10\nf3\nn127.0.0.1:5751\nn[::1]:5750\nn127.0.0.1:5751->127.0.0.1:9\np11\nn*:80\n");
-        assert_eq!((by_pid.get(&10), by_pid.get(&11)), (Some(&vec![5751, 5750]), Some(&vec![80])));
         assert_eq!(console_port_from_listening(&[51686, 5555, 5554, 5555, 8080]), Some(5554));
         assert_eq!(console_port_from_listening(&[5554]), None, "an adb port must listen too");
-        let lsof = "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n\
-            qemu-syst 44692 jason 35u IPv4 0xa 0t0 TCP 127.0.0.1:5751 (LISTEN)\n\
-            qemu-syst 44692 jason 36u IPv6 0xb 0t0 TCP [::1]:5750 (LISTEN)\n\
-            qemu-syst 44692 jason 67u IPv4 0xc 0t0 TCP 127.0.0.1:5751->127.0.0.1:51699 (ESTABLISHED)\n";
-        assert_eq!(parse_lsof_listening(lsof), [5751, 5750]);
     }
 
     #[test]
@@ -1011,7 +923,7 @@ mod tests {
         let args = |_pid: i32| Some("/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64-headless -avd X -port 5750".to_owned());
         let probe = Probe { args: &|pid| args(pid).map(|a| a.replace(" X ", " live ")), listening: &|_| vec![] };
         let skip = [Running { pid: 1, avd_name: "simee".into(), console_port: 5600, adb_port: 5601, avd_dir: None, simee: true }];
-        let found = env.stock_instances_with(&skip, &probe);
+        let found = env.stock_instances_among_with(&env.list_avds(), &skip, &probe);
         let names: Vec<&str> = found.iter().map(|r| r.avd_name.as_str()).collect();
         // `noport`/`reused` lack `-avd <their name>` in the fixture args; `dead` has no process;
         // `idle` has no lock; `simee` is already listed by its advertisement.
@@ -1024,12 +936,12 @@ mod tests {
             args: &|_| Some("qemu-system-aarch64-headless -avd noport -no-window".to_owned()),
             listening: &|_| vec![5557, 5556, 51686],
         };
-        let found = env.stock_instances_with(&skip, &probe);
+        let found = env.stock_instances_among_with(&env.list_avds(), &skip, &probe);
         let noport = found.iter().find(|r| r.avd_name == "noport").expect("noport");
         assert_eq!(noport.console_port, 5556);
         // A PID that now belongs to another program is not an emulator.
         let probe = Probe { args: &|_| Some("/usr/bin/vim notes.txt".to_owned()), listening: &|_| vec![] };
-        assert!(env.stock_instances_with(&skip, &probe).is_empty());
+        assert!(env.stock_instances_among_with(&env.list_avds(), &skip, &probe).is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1155,22 +1067,22 @@ mod tests {
         assert_eq!(avd.cpus(), 4);
         assert_eq!(avd.ram_bytes(), 2 << 30);
         let mut small = avd.clone();
-        small.config.insert("hw.ramSize".into(), "512".into());
+        Arc::make_mut(&mut small.config).insert("hw.ramSize".into(), "512".into());
         assert_eq!(small.ram_bytes(), 1 << 30, "stock pads small devices by 512 MB");
         assert_eq!(avd.api_level(), Some(36));
         assert!(!avd.is_x86_64());
         assert_eq!(avd.vsync_hz(), 60, "stock's default refresh rate");
         let mut slow = avd.clone();
-        slow.config.insert("hw.lcd.vsync".into(), "30".into());
+        Arc::make_mut(&mut slow.config).insert("hw.lcd.vsync".into(), "30".into());
         assert_eq!(slow.vsync_hz(), 30);
         for bad in ["0", "1000", "sixty"] {
-            slow.config.insert("hw.lcd.vsync".into(), bad.into());
+            Arc::make_mut(&mut slow.config).insert("hw.lcd.vsync".into(), bad.into());
             assert_eq!(slow.vsync_hz(), 60, "{bad} falls back to 60");
         }
         let mut x86 = avd.clone();
-        x86.config.insert("abi.type".into(), "x86_64".into());
+        Arc::make_mut(&mut x86.config).insert("abi.type".into(), "x86_64".into());
         assert!(x86.is_x86_64(), "abi.type says so");
-        x86.config.clear();
+        Arc::make_mut(&mut x86.config).clear();
         x86.sysdir = sdk.join("system-images/android-36/default/x86_64");
         assert!(x86.is_x86_64(), "an AVD with neither key takes its image's ABI");
         assert!(env.load("nope").is_err());
@@ -1479,13 +1391,13 @@ mod tests {
 
         // An AVD without boot.prop falls back to the image's; `hw.mainKeys` defaults to yes.
         let mut bare = phone.clone();
-        bare.config.remove("hw.mainKeys");
+        Arc::make_mut(&mut bare.config).remove("hw.mainKeys");
         assert!(bare.main_keys(), "stock's default");
         std::fs::write(bare.sysdir.join("boot.prop"), "ro.emulator.circular=1\n").expect("write");
         assert!(bare.circular());
         std::fs::write(bare.dir.join("boot.prop"), "ro.emulator.circular=no\n").expect("write");
         assert!(!bare.circular(), "the AVD's boot.prop wins");
-        bare.config.insert("hw.lcd.circular".into(), "yes".into());
+        Arc::make_mut(&mut bare.config).insert("hw.lcd.circular".into(), "yes".into());
         assert!(bare.circular());
         let _ = std::fs::remove_dir_all(tmp);
     }
