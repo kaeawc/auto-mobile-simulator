@@ -1128,7 +1128,8 @@ mod tests {
         let rows = sim_api::call_method(&mut s, "form_factors", &json!({"platform": "ios"})).expect("rows");
         let out = form_factors_text(&rows);
         assert!(out.contains("watch     ios      watchOS · Watch (inputs: Touch, Digital Crown, Hardware buttons)"), "{out}");
-        assert!(out.contains("foldable  ios      unsupported: no Apple device"), "{out}");
+        assert!(out.contains("foldable  ios      iOS · Foldable (inputs: Touch, Keyboard, Hardware buttons, Hinge)"), "{out}");
+        assert!(!out.contains("unsupported"), "{out}");
         assert_eq!(out.lines().count(), 7);
     }
 
