@@ -1117,9 +1117,16 @@ mod tests {
         }
         // A home that can be searched but not read: a listing finds nothing, one stat still works.
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+        // Root (or a filesystem that ignores modes) can still list it: the permission isn't enforced.
+        let enforced = std::fs::read_dir(&home).is_err();
         let unlisted = env.list_avds();
         let (found, not) = (env.has_avd("pixel"), env.has_avd("pix"));
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).expect("chmod back");
+        if !enforced {
+            println!("SKIPPED: has_avd without listing: mode 0300 does not block listing here (running as root?)");
+            let _ = std::fs::remove_dir_all(&home);
+            return;
+        }
         assert!(unlisted.is_empty(), "the home can't be listed: {unlisted:?}");
         assert!(found, "found by its pointer alone");
         assert!(!not);
