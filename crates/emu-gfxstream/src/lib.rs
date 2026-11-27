@@ -982,16 +982,36 @@ struct FbApi {
     on_last: OnLastColorBufferRef,
 }
 
+const GET_FB: &str = "_ZN9gfxstream4host11FrameBuffer5getFBEv";
+const GET_LAST_POSTED: &str = "_ZN9gfxstream4host11FrameBuffer24getLastPostedColorBufferEv";
+const FLUSH_FROM_VK: &str = "_ZN9gfxstream4host11FrameBuffer22flushColorBufferFromVkEj";
+const ON_LAST_REF: &str = "_ZN9gfxstream4host11FrameBuffer20onLastColorBufferRefEj";
+
 impl FbApi {
+    /// The symbols [`FbApi::load`] resolves.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    const SYMBOLS: [&str; 5] = [GET_FB, GET_LAST_POSTED, FLUSH_FROM_VK, mangled::READ_COLOR_BUFFER, ON_LAST_REF];
+
     fn load(h: *mut c_void) -> Result<FbApi> {
         Ok(FbApi {
-            get_fb: sym!(h, "_ZN9gfxstream4host11FrameBuffer5getFBEv"),
-            last: sym!(h, "_ZN9gfxstream4host11FrameBuffer24getLastPostedColorBufferEv"),
-            flush: sym!(h, "_ZN9gfxstream4host11FrameBuffer22flushColorBufferFromVkEj"),
+            get_fb: sym!(h, @GET_FB),
+            last: sym!(h, @GET_LAST_POSTED),
+            flush: sym!(h, @FLUSH_FROM_VK),
             read: sym!(h, @mangled::READ_COLOR_BUFFER),
-            on_last: sym!(h, "_ZN9gfxstream4host11FrameBuffer20onLastColorBufferRefEj"),
+            on_last: sym!(h, @ON_LAST_REF),
         })
     }
+}
+
+/// Whether the renderer in `lib64` will run without GL when asked to, read from its file before
+/// it's loaded: it exports the `FrameBuffer` members [`Renderer::can_read_last_posted`] needs and
+/// has the direct Vulkan readback [`Renderer::can_read_vulkan_directly`] looks for. For choices
+/// that must be made while the process is still single-threaded, before the renderer loads off
+/// the boot path (the host ANGLE backend); the loaded image is checked again at init.
+#[cfg(target_os = "macos")]
+pub fn has_vulkan_readback(lib64: &Path) -> bool {
+    let names: Vec<&str> = FbApi::SYMBOLS.into_iter().chain([HAS_EMULATION_VK, READ_COLOR_BUFFER_VK]).collect();
+    macho::symbols(&lib64.join(BACKEND), &names).is_ok_and(|found| found.len() == names.len() && found.iter().all(Option::is_some))
 }
 
 impl Renderer {
@@ -1227,8 +1247,6 @@ unsafe impl Send for VkRead {}
 // SAFETY: as above.
 unsafe impl Sync for VkRead {}
 
-#[cfg(target_os = "macos")]
-const GET_FB: &str = "_ZN9gfxstream4host11FrameBuffer5getFBEv";
 #[cfg(target_os = "macos")]
 const HAS_EMULATION_VK: &str = "_ZNK9gfxstream4host11FrameBuffer14hasEmulationVkEv";
 #[cfg(target_os = "macos")]
@@ -1535,6 +1553,35 @@ mod tests {
         write_lib(&dir, &lib("unrelated"), &[]);
         assert_eq!(file_names(&bundled_deps(&dir, BACKEND)), [lib("abseil"), lib("metrics"), lib("common")]);
         assert!(bundled_deps(&dir.join("nowhere"), BACKEND).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A renderer file with every FrameBuffer member and the direct readback's symbols runs
+    /// without GL; one missing any of them (an unknown build) or no file at all keeps GL.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_vulkan_readback_is_read_from_the_file_before_it_loads() {
+        let dir = std::env::temp_dir().join(format!("emu-gfxstream-readback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let all: Vec<&str> = FbApi::SYMBOLS.into_iter().chain([HAS_EMULATION_VK, READ_COLOR_BUFFER_VK]).collect();
+        let write = |names: &[&str]| {
+            // The readback's read is private in real builds (n_type 0x1e); the rest are exported.
+            let syms: Vec<(&str, u8, u64)> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (*n, if *n == READ_COLOR_BUFFER_VK { 0x1e } else { 0x0f }, 0x1000 * (i as u64 + 1)))
+                .collect();
+            std::fs::write(dir.join(BACKEND), macho::tests::fake_dylib_with_symbols(&syms)).expect("write");
+        };
+        write(&all);
+        assert!(has_vulkan_readback(&dir));
+        for missing in &all {
+            let rest: Vec<&str> = all.iter().copied().filter(|n| n != missing).collect();
+            write(&rest);
+            assert!(!has_vulkan_readback(&dir), "without {missing}");
+        }
+        assert!(!has_vulkan_readback(&dir.join("nowhere")));
         let _ = std::fs::remove_dir_all(dir);
     }
 

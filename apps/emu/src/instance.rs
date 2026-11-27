@@ -229,9 +229,11 @@ impl Instance {
             // `<sdk>/simee/renderer/<revision>/`; gfxstream finds `lib64/vulkan` and
             // `lib64/gles_*` under it.
             emu_gfxstream::link_beside_exe(lib64);
-            if let Some(platform) = first_boot_angle(avd.api_level(), first_boot) {
+            let without_gl = emu_vmm::runs_without_gl(guest_on_angle(avd), lib64);
+            if let Some(platform) = host_angle(avd.api_level(), first_boot, without_gl) {
                 if opts.verbose && std::env::var_os("ANGLE_DEFAULT_PLATFORM").is_none() {
-                    eprintln!("emu: API 29 first boot: host GLES is ANGLE on {platform} (ANGLE_DEFAULT_PLATFORM=metal overrides)");
+                    let why = if without_gl { "the renderer runs without GL" } else { "API 29 first boot" };
+                    eprintln!("emu: {why}: host GLES is ANGLE on {platform} (ANGLE_DEFAULT_PLATFORM=metal overrides)");
                 }
                 emu_gfxstream::prefer_angle_platform(platform);
             }
@@ -277,8 +279,7 @@ impl Instance {
             height: self.avd.lcd().1,
             verbose: opts.verbose,
             display: display.clone(),
-            // Images without bootconfig have no ANGLE: their GLES is the encoder, on the host's GL.
-            vulkan_only: guest_egl(&self.avd) == "angle" && takes_bootconfig(&self.avd),
+            vulkan_only: guest_on_angle(&self.avd),
             virtual_queue: virtual_queue(&guest_egl(&self.avd), AngleImage::of(&self.avd)),
             // Their GLES encoder's transport (see `legacy_cmdline`).
             pipe_gles: !takes_bootconfig(&self.avd),
@@ -926,15 +927,30 @@ fn takes_bootconfig(avd: &Avd) -> bool {
     avd.image_feature("AndroidbootProps2") == Some(true) || avd.api_level().is_none_or(|api| api >= 31)
 }
 
-/// The host ANGLE backend for a boot that can't use Metal, if any: SwiftShader for an API 29
-/// image's first boot. There a guest `glClear` reaches ANGLE's Metal clear with a color
-/// attachment whose texture is gone and faults; gfxstream's exception handler retries the load
-/// forever under ANGLE's global lock, and every render thread stops behind it (#94). Stock renders
-/// a headless first boot with ANGLE on SwiftShader too. Later boots (user data exists) and API 30
-/// run on Metal. `ANGLE_DEFAULT_PLATFORM` overrides it either way.
+/// The host ANGLE backend for a boot that shouldn't use Metal, if any; `ANGLE_DEFAULT_PLATFORM`
+/// overrides it either way. SwiftShader:
+/// - for an API 29 image's first boot. There a guest `glClear` reaches ANGLE's Metal clear with
+///   a color attachment whose texture is gone and faults; gfxstream's exception handler retries
+///   the load forever under ANGLE's global lock, and every render thread stops behind it (#94).
+///   Stock renders a headless first boot with ANGLE on SwiftShader too. Later boots (user data
+///   exists) and API 30 run on Metal.
+/// - when the renderer runs without GL (`without_gl`, [`emu_vmm::runs_without_gl`]): nothing
+///   draws with the host's GLES then, but gfxstream still opens ANGLE's display at init and makes
+///   one context, and on Metal that context waits for ANGLE's built-in shader library to compile:
+///   about 4.3 s whenever Metal's shader cache misses (a new emu path, a macOS update, an evicted
+///   cache), and the boot waits for the init (#70). On SwiftShader the display takes about 30 ms
+///   and compiles nothing.
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
-fn first_boot_angle(api: Option<u32>, first_boot: bool) -> Option<&'static str> {
-    (first_boot && api == Some(29)).then_some("swiftshader")
+fn host_angle(api: Option<u32>, first_boot: bool, without_gl: bool) -> Option<&'static str> {
+    (without_gl || (first_boot && api == Some(29))).then_some("swiftshader")
+}
+
+/// The guest draws with ANGLE on its Vulkan (an image that boots on bootconfig, its GLES ANGLE),
+/// so the renderer can run without GL ([`emu_vmm::GpuSpec::vulkan_only`]). Images without
+/// bootconfig have no ANGLE: their GLES is the encoder, on the host's GL.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn guest_on_angle(avd: &Avd) -> bool {
+    guest_egl(avd) == "angle" && takes_bootconfig(avd)
 }
 
 /// Why emu can't run this AVD's image yet, if it can't: images below API 29, which emu has never
@@ -1271,11 +1287,14 @@ mod tests {
     }
 
     #[test]
-    fn only_an_api_29_first_boot_runs_angle_on_swiftshader() {
-        assert_eq!(first_boot_angle(Some(29), true), Some("swiftshader"));
-        assert_eq!(first_boot_angle(Some(29), false), None);
+    fn host_angle_is_swiftshader_for_an_api_29_first_boot_and_a_renderer_without_gl() {
+        assert_eq!(host_angle(Some(29), true, false), Some("swiftshader"));
+        assert_eq!(host_angle(Some(29), false, false), None);
         for api in [Some(30), Some(33), Some(36), None] {
-            assert_eq!(first_boot_angle(api, true), None, "{api:?}");
+            assert_eq!(host_angle(api, true, false), None, "{api:?}");
+            // Without GL nothing draws with the host's GLES, so its init cost picks the backend.
+            assert_eq!(host_angle(api, true, true), Some("swiftshader"), "{api:?}");
+            assert_eq!(host_angle(api, false, true), Some("swiftshader"), "{api:?}");
         }
     }
 

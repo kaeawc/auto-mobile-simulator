@@ -527,7 +527,8 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   the samples. Ranked by what a user waits for:
   1. *The renderer's Metal shader compiles.* With Metal's cache warm the init takes 0.33 s;
      cold it took 4.5 and 5.1 s (2 of 20 launches that day), and the boot waits for it. Mostly
-     ANGLE's own Metal shader library, and why it went cold: "Renderer init and Metal's shader
+     ANGLE's own Metal shader library, which a renderer without GL no longer compiles (host
+     ANGLE on SwiftShader, cold 1.5 s), and why it went cold: "Renderer init and Metal's shader
      cache" below.
   2. *The renderer's ring polling.* gfxstream's render threads yield-spin on the
      address-space-graphics ring (`RingStream::readRaw` → `cthread_yield`) while the guest
@@ -750,6 +751,22 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   once, sometimes: the first launch from a new path without provisioning there, and, not yet seen, likely the first after a macOS update
   (the cache's subdirectories look keyed by compiler and GPU: `32024`, `16777235_419`).
   KosmicKrisp wasn't measured.
+  A renderer without GL (guests on ANGLE, API 34 and newer) doesn't need that library at all:
+  nothing draws with the host's GLES, yet gfxstream opens ANGLE's display at init anyway
+  and makes one context there (`EglOsEglDisplay`), and on Metal that context's
+  `ProvokingVertexHelper` waits for ANGLE's whole built-in shader library. So emu runs the host
+  ANGLE on SwiftShader whenever the renderer will run without GL (`emu_vmm::runs_without_gl`,
+  which reads the renderer file's direct-readback symbols before it loads, since
+  `ANGLE_DEFAULT_PLATFORM` must be set while the process is single-threaded), as it already did
+  for an API 29 first boot; `ANGLE_DEFAULT_PLATFORM=metal` brings Metal back. ANGLE's display then
+  takes about 30 ms and compiles no Metal shaders, and what a cold cache still costs is the
+  compositor's MoltenVK pipelines (`CompositorVk::setUpGraphicsPipelines`, about 0.6 s of the
+  rest, in `sample`). Cold, the boot-shaped init went from 4.59 to 1.54 s and an API 36
+  phone's boot from 15.06 to 12.10 s; warm, both are unchanged (0.35 s, 7.45 s), as is frame
+  pacing during swipes, and the guest still draws on MoltenVK. A cold boot still takes about
+  4.6 s longer than a warm one, and only 1.2 s of that is the renderer's init. Numbers in
+  [benchmarks](benchmarks.md#emulator-internals). Guests on the GLES encoder (API 31 to 33) keep
+  ANGLE on Metal, since their GLES runs there, and so keep the cold 4 s.
 - **Ring polling.** When its address-space-graphics ring is empty, `RingStream::readRaw` polls
   it with `ring_buffer_yield()` (`sched_yield`) 30 times per round for 8 rounds, then marks the
   ring as needing a notification and blocks until the guest pings (disassembly of the SDK's
@@ -763,7 +780,11 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   of a core with it, 28 and 38% without, one run on each of two boots per arm, host load 9 to
   22) nor what `sample` showed (51 samples in `swtch_pri`, now under emu's function), since
   most polling streaks run past the first episode's 240 calls. It was dropped: the renderer's internals would change for no
-  measured gain.
+  measured gain. The SDK's 37.2.13 renderer lists no ring or wait feature either (its
+  feature list in `emu -verbose`). Measured again on 2026-11-27 (`sample` during swipes, API 36
+  phone): the render threads spend about 0.5% of a core yielding in `readRaw`, and they spend the
+  rest of their waits blocked in `MessageChannelBase::beforeRead`. Polling less would mean
+  changing `RingStream::readRaw` in gfxstream's source.
 - **Launch to first guest instruction.** Most images ship a gzip `kernel-ranchu` (an API 37
   kernel is 16 MiB that inflates to about 40 MiB). It used to be read whole, inflated into a
   `Vec` with miniz_oxide and copied into guest RAM on every launch. QEMU, and so the stock
