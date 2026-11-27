@@ -367,6 +367,9 @@ emu -avd phone -accel off   # TCG even where /dev/kvm is usable (-accel on: KVM 
 
 When the host has KVM, software mode runs the guest on it (above); TCG is the fallback.
 
+A third route for hosts with binder and no KVM, Android's userspace in a container on the host's kernel,
+is researched in [research/container-backend.md](research/container-backend.md) (#210).
+
 ## Automotive
 
 What the AAOS sources show (`device/generic/car/emulator`, `hardware/interfaces/automotive/vehicle`,
