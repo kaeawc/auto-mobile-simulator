@@ -633,6 +633,69 @@ random points after one homing stayed within 0.32 pt. A later click is now the m
 reports at most, 16 ms apart, sent against deadlines), 64 ms for the move to land and the 80 ms
 press.
 
+### iOS input defaults
+
+iPhone 17 Pro, iOS 27.2 (24B8117), through a release `simee serve`, 2026-11-27, M3 Max (16
+CPUs), macOS 26.6. The test app has a UIKit button, a SwiftUI button, a link in a WKWebView, a
+UITableView and a UITextField; it logs each one that fires, every touch its window sees (with the
+touch's timestamp) and when it goes to the background. "Loaded" adds `yes` processes: 32 for
+recognition (1-minute load 20-78), 48 for the timings (load 94-117, above 3x the CPUs); quiet
+is load 5-60 from other work while the load average decayed.
+
+Recognition, 20 taps or presses per cell, every cell the same quiet and loaded:
+
+| Hold | UIKit button | SwiftUI button | WKWebView link | table row | `home` | `lock` |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 ms (down and up back to back) | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 |
+| 5, 10, 16 and 30 ms | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 |
+
+Typing a 41-character string with capitals, digits and punctuation (`Teh quick, Brown FOX's 42
+jumps: ok? Yes!`) and Return into the text field, 10 times per gap; autocorrect turns it into
+`The quick, Brown FOX’s …` every time at 30 ms a key (before) and at every gap below from 1 ms:
+
+| Gap between key reports | quiet | loaded (32) |
+| --- | --- | --- |
+| 0 ms | 9/10 (one run lost its keys) | 10/10 |
+| 1, 2, 3 and 5 ms | 10/10 | 10/10 |
+
+Repeated keys at the 3 ms gap (a key goes up and the same key down again 3 ms later), into a
+field that corrects nothing (no autocorrect, capitals, spelling or smart punctuation), 10 runs
+each, compared exactly; once at 1-minute load 20-22 and once at 123-167 (other lanes' devices
+booting):
+
+| String | load 20-22 | load 123-167 |
+| --- | --- | --- |
+| `hello` | 10/10 | 10/10 |
+| `1000` | 10/10 | 10/10 |
+| `pass11` | 10/10 | 10/10 |
+| `aaabbb` | 10/10 | 10/10 |
+| `Mississippi` | 10/10 | 10/10 |
+
+The defaults are now a 10 ms `tap` hold, a 10 ms hold for `button` `home` and `lock` on an iPhone
+or iPad (every other button, Apple TV and Apple Watch keep 80 ms: not measured), and a key report
+every 3 ms for `type` and `key`,
+sent against deadlines from the first. 10 ms and 3 ms leave a margin over the shortest holds and
+gaps that passed everywhere (0 ms and 1 ms). Every iOS touch gesture (`tap`, `swipe`, `touch`,
+`stylus`, `remote_swipe`, CarPlay touches) and the Digital Crown now send their samples against
+deadlines too ([`sim_core::gesture::pace`](../crates/sim-core/src/gesture.rs)). An explicit
+`hold_ms` or `duration_ms` works as before. Per call, median of 10 over one persistent
+connection, timed as `scripts/ios-step-bench.py` times its calls, the build before (in its own
+target dir) and after against the same device back to back:
+
+| Call | before, quiet | after, quiet | before, loaded | after, loaded |
+| --- | --- | --- | --- | --- |
+| `tap` (default hold) | 64.5 ms | 12.6 ms | 65.0 ms | 12.9 ms |
+| `button home` (default hold) | 84.1 ms | 13.6 ms | 89.0 ms | 13.9 ms |
+| `key` | 37.0 ms | 6.9 ms | 38.3 ms | 8.0 ms |
+| `type`, 10 characters | 375.8 ms | 61.2 ms | 395.0 ms | 61.4 ms |
+| `type`, 20 characters | 749.4 ms | 121.2 ms | 782.9 ms | 121.2 ms |
+| `type`, 20 with capitals and punctuation | 883.4 ms | 151.2 ms | 919.7 ms | 151.4 ms |
+| `swipe`, `duration_ms` 300 | 375.8 ms | 320.6 ms | 422.0 ms | 320.7 ms |
+| `swipe` 300, touch down to last move as the app saw it | 355.4 ms | 302.1 ms | 397.9 ms | 302.7 ms |
+
+A 300 ms swipe's motion now takes 300 ms within 1% quiet and loaded (it took 18% and 33% longer);
+the call ends one sample step (17 ms) after the last move, when the finger lifts, as planned.
+
 ## MCP server
 
 What the MCP server's protocol layer costs to build, against the official Rust SDK. Linux VM,
@@ -710,6 +773,13 @@ Claims that would belong in the README once someone runs them:
   host's Spotlight privacy settings to measure.
 - Time per automation step through `simee mcp` (a `tools/call` of `tap`, then `screenshot`) against
   the socket API and the CLI on the same device.
+- A 10 ms `button` hold for the iPhone's side, Siri, Apple Pay, Action and volume buttons and on
+  Apple TV (the Siri Remote's keys) and Apple Watch, which all keep 80 ms.
+- The iOS 10 ms tap and 3 ms key gap on what the test app doesn't have (measured only on a UIKit
+  button, a SwiftUI button, a WKWebView link, a table row and a UITextField): Safari's toolbar and
+  address bar, SpringBoard alerts, Control Center, the software keyboard's keys, UISwitch and
+  UISlider, launching an app from its home-screen icon, and typing into a WKWebView field or a
+  secure text field.
 - iPad `pointer … --to` drag latency on a quiet host, and `pointer` timing and placement on
   iOS 26.5 since #122 (clicks on 27.2 are under "iPad `pointer` click").
 - Host CPU of an idle booted device, emu against the SDK emulator, on API 31 and newer.

@@ -87,12 +87,14 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     (
         "tap",
         "device, x, y, hold_ms?, display?(main|outer|inner|carplay)",
-        "Tap at pixels (display, iOS only: an iPhone Duo's outer or inner screen, an iPhone's CarPlay screen)",
+        "Tap at pixels, held hold_ms (default: iOS 10, Android 60) (display, iOS only: an iPhone Duo's outer or inner screen, an \
+         iPhone's CarPlay screen)",
     ),
     (
         "swipe",
         "device, x1, y1, x2, y2, duration_ms?, settle?, display?(main|outer|inner|carplay), edge?(top|bottom|left|right; iOS)",
-        "Swipe between pixels; with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: \
+        "Swipe between pixels over duration_ms (default 300; iOS sends its samples on schedule, so a busy host doesn't stretch \
+         it); with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: \
          home and the app switcher from the bottom, Notification Center and Control Center from the top (Android's edge \
          gestures need only the start point)",
     ),
@@ -105,10 +107,11 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "button",
         "device, button(home|lock|side|siri|apple-pay|action | back|volume-up|volume-down|recents|menu|up|down|left|right|select|play-pause), hold_ms?",
         "Press a hardware button, as the device's form factor has it: the Siri Remote on Apple TV (menu/back, home, select, \
-         play-pause, arrows) and the D-pad on Android TV; on Apple Watch home is the crown's press",
+         play-pause, arrows) and the D-pad on Android TV; on Apple Watch home is the crown's press. Held hold_ms (default: 10 \
+         for home and lock on an iPhone or iPad, else 80)",
     ),
-    ("type", "device, text", "Type on the hardware keyboard"),
-    ("key", "device, usage", "Press a key by HID usage"),
+    ("type", "device, text", "Type on the hardware keyboard (iOS: a key report every 3 ms)"),
+    ("key", "device, usage", "Press a key by HID usage (iOS: down and up 3 ms apart)"),
     ("open_url", "device, url", "Open a URL"),
     ("install", "device, path", "Install an .app"),
     ("uninstall", "device, bundle_id", "Uninstall an app"),

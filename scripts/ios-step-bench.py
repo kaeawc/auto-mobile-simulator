@@ -5,9 +5,9 @@
 
 Prints the median and p90 of N calls (default 20, after one warm-up) each: tap, screenshot (base64
 in the reply), screenshot to a file, and a tap followed by a screenshot (one automation step). A
-tap holds 60 ms (the API's default `hold_ms`). It taps (600, 2500), the gap between the two dock
-icons of an iPhone 17's home screen, so the taps change nothing; give X Y for another device (an
-Android phone's empty launcher workspace, say)."""
+tap holds the API's default `hold_ms` (10 ms on iOS, 60 on Android). It taps (600, 2500), the gap
+between the two dock icons of an iPhone 17's home screen, so the taps change nothing; give X Y for
+another device (an Android phone's empty launcher workspace, say)."""
 import json, os, socket, statistics, sys, time
 
 sock_path, udid = sys.argv[1], sys.argv[2]

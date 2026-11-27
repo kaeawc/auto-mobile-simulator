@@ -201,6 +201,11 @@ impl Hid {
         self.scale
     }
 
+    /// The device's form factor, when its device type says.
+    pub fn form_factor(&self) -> Option<FormFactor> {
+        self.form_factor
+    }
+
     /// Sends a message simee wrote itself: copied into a malloc'd block the client frees.
     fn send_bytes(&self, bytes: &[u8]) -> Result<()> {
         // SAFETY: malloc has no preconditions; a null result is checked.
@@ -369,12 +374,21 @@ impl Hid {
         // Not IndigoHIDMessageForScrollEvent: sent to the digitizer, it aborts backboardd.
         // SAFETY: the builder takes the rotational delta (double) and returns a malloc'd message.
         let crown = unsafe { std::mem::transmute::<*mut c_void, CrownFn>(self.builder(c"IndigoHIDMessageForDigitalCrownEvent")?) };
-        for step in crown_steps(delta) {
-            // SAFETY: plain argument; returns a message or null.
-            self.send(unsafe { crown(step) })?;
-            std::thread::sleep(std::time::Duration::from_millis(16));
-        }
-        Ok(())
+        // One step per 16 ms against deadlines from the first, ending 16 ms after the last as before.
+        let steps = crown_steps(delta);
+        let mut delays = vec![Duration::from_millis(16); steps.len() + 1];
+        delays[0] = Duration::ZERO;
+        let started = std::time::Instant::now();
+        sim_core::gesture::pace(
+            &delays,
+            || started.elapsed(),
+            std::thread::sleep,
+            |i| match steps.get(i) {
+                // SAFETY: plain argument; returns a message or null.
+                Some(&step) => self.send(unsafe { crown(step) }),
+                None => Ok(()),
+            },
+        )
     }
 
     /// Performs a watch gesture (one message, no down/up). Apple Watch only.

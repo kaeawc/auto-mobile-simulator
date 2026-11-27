@@ -13,8 +13,8 @@ use sim_core::device::{DeviceState, privacy_service};
 use sim_core::duo;
 use sim_core::form_factor::FormFactor;
 use sim_core::geometry::{Point, Size};
-use sim_core::gesture::{Sample, ScreenEdge};
-use sim_core::hid::{KEY_LEFT_SHIFT, keystroke};
+use sim_core::gesture::{Sample, ScreenEdge, pace, pace_samples};
+use sim_core::hid::{Button, KeyEvent, key_events};
 use sim_core::indigo::PointerButton;
 use sim_core::pointer::{self, Held, HeldPointer, PointerAction};
 use sim_core::reuse::{BootKey, Reuse};
@@ -338,6 +338,33 @@ pub fn flush_input(timeout: Duration) -> bool {
     sim_coresim::wait_sent(timeout)
 }
 
+/// How long `tap` holds the touch without `hold_ms`. UIKit and SwiftUI buttons, WKWebView links
+/// and table rows recognised 20 of 20 taps at every hold from 0 ms (down and up sent back to back,
+/// as idb does) to 30 ms, quiet and with 32 busy processes on the host (docs/benchmarks.md
+/// "iOS input defaults"); 10 ms keeps a margin over that floor while a tap stays one display frame.
+pub const TAP_HOLD: Duration = Duration::from_millis(10);
+/// How long `home` and `lock` hold without `hold_ms` on an iPhone or iPad ([`button_hold`]): both
+/// were recognised 20 of 20 times at every hold from 0 ms to 30 ms, quiet and loaded
+/// (docs/benchmarks.md "iOS input defaults").
+pub const BUTTON_HOLD: Duration = Duration::from_millis(10);
+/// The hold before `BUTTON_HOLD` was measured, kept where it wasn't: the other buttons (side, Siri,
+/// Apple Pay, Action, volume), the Siri Remote's keys on Apple TV, the Apple Watch's buttons, and a
+/// device whose form factor isn't known.
+const UNMEASURED_BUTTON_HOLD: Duration = Duration::from_millis(80);
+
+/// How long `button` holds without `hold_ms` on a device of `form_factor`.
+fn button_hold(button: Button, form_factor: Option<FormFactor>) -> Duration {
+    match (button, form_factor) {
+        (Button::Home | Button::Lock, Some(FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable)) => BUTTON_HOLD,
+        _ => UNMEASURED_BUTTON_HOLD,
+    }
+}
+/// The time between key reports when typing or pressing a key, sent against deadlines from the
+/// first. A 41-character mixed-case string with punctuation typed the same, autocorrected the same,
+/// 10 of 10 times at every gap from 1 ms to 5 ms, quiet and loaded; at 0 ms one run in 10 lost
+/// keys (docs/benchmarks.md "iOS input defaults").
+pub const KEY_GAP: Duration = Duration::from_millis(3);
+
 /// The methods that send input, each run on its device's input worker.
 const INPUT_METHODS: &[&str] =
     &["tap", "swipe", "touch", "rotary", "watch_gesture", "remote_swipe", "button", "type", "key", "pointer", "stylus"];
@@ -613,7 +640,7 @@ fn input(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
 fn input_method(input: &mut Input, udid: &str, method: &str, p: &Value) -> Result<Value, String> {
     let null = |r: Result<(), String>| r.map(|()| Value::Null);
     match method {
-        "tap" => play_on(input, udid, p, &tap_samples(p)?, None),
+        "tap" => play_on(input, udid, p, &tap_samples(p, TAP_HOLD)?, None),
         "swipe" => play_on(input, udid, p, &swipe_samples(p)?, opt_edge(p)?),
         "touch" => {
             let (at, phase) = touch_sample(p)?;
@@ -623,11 +650,7 @@ fn input_method(input: &mut Input, udid: &str, method: &str, p: &Value) -> Resul
             let samples = pencil_samples(p)?;
             null(input.run(udid, true, |hid, screen| {
                 let screen = screen.ok_or("no screen size")?;
-                for s in &samples {
-                    sleep(s.delay);
-                    hid.pencil(screen.normalize(s.point), s.phase).map_err(err)?;
-                }
-                Ok(())
+                paced(&samples, |s| hid.pencil(screen.normalize(s.point), s.phase).map_err(err))
             }))
         }
         "pointer" => pointer_on(input, udid, p),
@@ -642,17 +665,12 @@ fn input_method(input: &mut Input, udid: &str, method: &str, p: &Value) -> Resul
         }
         "remote_swipe" => {
             let samples = remote_swipe_samples(p)?;
-            null(input.run(udid, false, |hid, _| {
-                for sample in samples {
-                    sleep(sample.delay);
-                    hid.remote_touch(sample.point, sample.phase).map_err(err)?;
-                }
-                Ok(())
-            }))
+            null(input.run(udid, false, |hid, _| paced(&samples, |s| hid.remote_touch(s.point, s.phase).map_err(err))))
         }
         "button" => {
-            let (button, hold) = button(p)?;
+            let (button, given) = (button(p, Duration::ZERO)?.0, opt_u64(p, "hold_ms").map(Duration::from_millis));
             null(input.run(udid, false, |hid, _| {
+                let hold = given.unwrap_or_else(|| button_hold(button, hid.form_factor()));
                 hid.button(button, Direction::Down).map_err(err)?;
                 sleep(hold);
                 hid.button(button, Direction::Up).map_err(err)
@@ -660,11 +678,13 @@ fn input_method(input: &mut Input, udid: &str, method: &str, p: &Value) -> Resul
         }
         "type" => {
             let text = need_str(p, "text")?;
-            null(input.run(udid, false, |hid, _| type_text(hid, text)))
+            let keys = key_events(text).map_err(|c| format!("no key for {c:?} on the US layout; nothing was typed"))?;
+            null(input.run(udid, false, |hid, _| send_keys(hid, &keys)))
         }
         "key" => {
             let usage = opt_u64(p, "usage").ok_or("missing number parameter `usage`")? as u32;
-            null(input.run(udid, false, |hid, _| press(hid, usage)))
+            let keys = [KeyEvent { usage, direction: Direction::Down }, KeyEvent { usage, direction: Direction::Up }];
+            null(input.run(udid, false, |hid, _| send_keys(hid, &keys)))
         }
         other => Err(format!("`{other}` isn't an input method")),
     }
@@ -678,17 +698,22 @@ fn carplay_screen() -> Size {
 /// Plays samples on a built-in screen: the main digitizer, or the screen `screen_id` names (an
 /// iPhone Duo's inner screen).
 fn play(hid: &Hid, (screen, screen_id): Touched, samples: &[Sample], edge: Option<ScreenEdge>) -> Result<(), String> {
-    for s in samples {
-        sleep(s.delay);
+    paced(samples, |s| {
         let at = screen.normalize(s.point);
         match (screen_id, edge) {
             (Some(id), edge) => hid.screen_touch(id, at, s.phase, edge),
             (None, Some(edge)) => hid.edge_touch(at, s.phase, edge),
             (None, None) => hid.touch(at, s.phase),
         }
-        .map_err(err)?;
-    }
-    Ok(())
+        .map_err(err)
+    })
+}
+
+/// Sends `samples` at their deadlines from the first ([`pace_samples`]), so the time each send
+/// takes and each oversleep on a busy host don't add up: a 300 ms swipe stays 300 ms.
+fn paced(samples: &[Sample], send: impl FnMut(&Sample) -> Result<(), String>) -> Result<(), String> {
+    let started = Instant::now();
+    pace_samples(samples, || started.elapsed(), sleep, send)
 }
 
 /// Plays touch samples on the screen the `display` parameter names: the one in use (an iPhone
@@ -702,13 +727,7 @@ fn play_on(input: &mut Input, udid: &str, p: &Value, samples: &[Sample], edge: O
     }
     let played = input.run_on(udid, (!carplay).then_some(which), |hid, screen| match screen {
         Some(screen) => play(hid, screen, samples, edge),
-        None => {
-            for s in samples {
-                sleep(s.delay);
-                hid.carplay_touch(carplay_screen().normalize(s.point), s.phase).map_err(err)?;
-            }
-            Ok(())
-        }
+        None => paced(samples, |s| hid.carplay_touch(carplay_screen().normalize(s.point), s.phase).map_err(err)),
     });
     played.map(|()| Value::Null)
 }
@@ -818,29 +837,26 @@ fn rotate(device: &Device, wanted: Option<Orientation>) -> Result<Value, String>
     Ok(json!({"orientation": next.as_str()}))
 }
 
-/// Presses and releases one key.
-fn press(hid: &Hid, usage: u32) -> Result<(), String> {
-    hid.key(usage, Direction::Down).map_err(err)?;
-    sleep(Duration::from_millis(15));
-    hid.key(usage, Direction::Up).map_err(err)?;
-    sleep(Duration::from_millis(15));
-    Ok(())
+/// Sends key reports [`KEY_GAP`] apart, against deadlines from the first ([`pace`]), so a busy
+/// host doesn't stretch a string (a late report goes at once and the next keeps its deadline).
+fn send_keys(hid: &Hid, keys: &[KeyEvent]) -> Result<(), String> {
+    let delays = key_delays(keys.len(), KEY_GAP);
+    let started = Instant::now();
+    pace(
+        &delays,
+        || started.elapsed(),
+        sleep,
+        |i| match keys.get(i) {
+            Some(k) => hid.key(k.usage, k.direction).map_err(err),
+            None => Ok(()),
+        },
+    )
 }
 
-fn type_text(hid: &Hid, text: &str) -> Result<(), String> {
-    for c in text.chars() {
-        let stroke = keystroke(c).ok_or_else(|| format!("no key for {c:?} on the US layout"))?;
-        if stroke.shift {
-            hid.key(KEY_LEFT_SHIFT, Direction::Down).map_err(err)?;
-            sleep(Duration::from_millis(10));
-        }
-        press(hid, stroke.usage)?;
-        if stroke.shift {
-            hid.key(KEY_LEFT_SHIFT, Direction::Up).map_err(err)?;
-            sleep(Duration::from_millis(10));
-        }
-    }
-    Ok(())
+/// The wait before each of `keys` reports and one more `gap` after the last, so the next call's
+/// first report doesn't land on it.
+fn key_delays(keys: usize, gap: Duration) -> Vec<Duration> {
+    (0..=keys).map(|i| if i == 0 { Duration::ZERO } else { gap }).collect()
 }
 
 /// Boots (if needed) and waits until the device reports booted and its display has a frame.
@@ -2119,6 +2135,38 @@ fn read_log(reader: Box<dyn std::io::Read + Send>, tail: &SharedTail, clock: &dy
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    #[test]
+    fn keys_go_a_gap_apart_and_twenty_characters_type_in_under_a_fifth_of_a_second() {
+        let gap = Duration::from_millis(3);
+        assert_eq!(super::key_delays(2, gap), [Duration::ZERO, gap, gap], "down at once, up a gap later, then a gap");
+        assert_eq!(super::key_delays(0, gap), [Duration::ZERO]);
+        let typed =
+            |text: &str| super::key_delays(sim_core::hid::key_events(text).expect("keys").len(), super::KEY_GAP).iter().sum::<Duration>();
+        assert!(typed("abcdefghijklmnopqrst") <= Duration::from_millis(200), "{:?}", typed("abcdefghijklmnopqrst"));
+        // Before: 30 ms a key, 20 more with shift; the same plan at 15 ms a report would be 600 ms.
+        assert!(typed("Hello, World! Ok 42?") <= Duration::from_millis(200), "{:?}", typed("Hello, World! Ok 42?"));
+    }
+
+    #[test]
+    fn only_home_and_lock_hold_the_measured_default_and_only_on_an_iphone_or_ipad() {
+        use sim_core::form_factor::FormFactor;
+        use sim_core::hid::Button;
+        for f in [FormFactor::Phone, FormFactor::Tablet, FormFactor::Foldable] {
+            for b in [Button::Home, Button::Lock] {
+                assert_eq!(super::button_hold(b, Some(f)), super::BUTTON_HOLD, "{b:?} on {f:?}");
+            }
+            for b in [Button::Side, Button::Siri, Button::ApplePay, Button::Action, Button::VolumeUp] {
+                assert_eq!(super::button_hold(b, Some(f)), Duration::from_millis(80), "{b:?} on {f:?}: unmeasured, as before");
+            }
+        }
+        for f in [Some(FormFactor::Tv), Some(FormFactor::Watch), Some(FormFactor::Vision), None] {
+            assert_eq!(super::button_hold(Button::Home, f), Duration::from_millis(80), "{f:?}: unmeasured, as before");
+        }
+        assert!(super::TAP_HOLD <= Duration::from_millis(20) && super::BUTTON_HOLD <= Duration::from_millis(20));
+    }
+
     #[test]
     fn a_second_built_in_screen_is_an_inner_screen_only_on_the_duo() {
         let duo = "com.apple.CoreSimulator.SimDeviceType.iPhone-Duo";
