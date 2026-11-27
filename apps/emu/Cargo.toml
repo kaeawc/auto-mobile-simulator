@@ -28,6 +28,10 @@ libc.workspace = true
 rustix.workspace = true
 sim-core.workspace = true
 
+# Linux KVM: software mode runs the guest on it when the host's /dev/kvm is usable.
+[target.'cfg(target_os = "linux")'.dependencies]
+emu-kvm.workspace = true
+
 [dev-dependencies]
 emu-sdk = { workspace = true, features = ["testing"] }
 sim-android.workspace = true
