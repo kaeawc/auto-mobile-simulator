@@ -34,6 +34,7 @@ mod params;
 pub mod prefs;
 mod schema;
 pub mod settle;
+mod usage;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};

@@ -1,6 +1,7 @@
 //! Host health for a simulator farm: load, memory pressure, swap, disk, thermal state and power,
 //! sampled without forking, kept in a 15-minute ring, and judged by an admit / hold / backoff
 //! verdict. The thresholds and rules are ported from spectra (MIT, same author); see `verdict`.
+//! The same sampler attributes the host's load to each running device (`usage`).
 //!
 //! macOS reads sysctls, `NSProcessInfo` and IOKit through `sim-coresim` (this crate forbids
 //! `unsafe`); Linux reads `/proc` and `/sys`; `statvfs` comes from rustix. Each reading is
@@ -15,6 +16,7 @@ use serde::Serialize;
 pub mod parse;
 pub mod ring;
 pub mod sysfs;
+pub mod usage;
 pub mod verdict;
 
 pub use ring::{Average, Point, Ring, ThermalTime, Trend};
@@ -407,17 +409,22 @@ fn point(t: f64, s: &Snapshot) -> Point {
 struct Shared {
     state: Mutex<State>,
     stop: Condvar,
+    /// Notified after each sample.
+    tick: Condvar,
 }
 
 struct State {
     ring: Ring,
     latest: Option<Snapshot>,
+    usage: usage::Tracker,
     stopped: bool,
 }
 
-/// A background sampler: one snapshot per interval into the ring. Dropping it stops the thread.
+/// A background sampler: one snapshot per interval into the ring, and one pass over the host's
+/// processes into the per-device usage tracker. Dropping it stops the thread.
 pub struct Sampler {
     shared: Arc<Shared>,
+    interval: Duration,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -429,7 +436,13 @@ impl Sampler {
         let first = sample();
         let mut ring = Ring::default();
         ring.push(point(0.0, &first));
-        let shared = Arc::new(Shared { state: Mutex::new(State { ring, latest: Some(first), stopped: false }), stop: Condvar::new() });
+        let mut reader = usage::Reader::default();
+        let mut tracker = usage::Tracker::new(first.cpus);
+        if let Some(o) = reader.observe() {
+            tracker.update(o);
+        }
+        let state = State { ring, latest: Some(first), usage: tracker, stopped: false };
+        let shared = Arc::new(Shared { state: Mutex::new(state), stop: Condvar::new(), tick: Condvar::new() });
         let worker = Arc::clone(&shared);
         let handle = std::thread::Builder::new()
             .name("simee-host".into())
@@ -442,13 +455,32 @@ impl Sampler {
                     }
                     drop(guard);
                     let s = sample();
+                    let o = reader.observe();
                     let Ok(mut st) = worker.state.lock() else { return };
                     st.ring.push(point(began.elapsed().as_secs_f64(), &s));
                     st.latest = Some(s);
+                    if let Some(o) = o {
+                        st.usage.update(o);
+                    }
+                    drop(st);
+                    worker.tick.notify_all();
                 }
             })
             .ok();
-        Sampler { shared, handle }
+        Sampler { shared, interval, handle }
+    }
+
+    /// Every running device's usage, simee's and the host's totals (`devices_usage`). Right after
+    /// the sampler started there is no interval to rate yet: this waits for the second sample
+    /// (at most a few intervals); after that it never waits.
+    pub fn usage(&self) -> usage::Report {
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let wait = if usage::AVAILABLE && self.handle.is_some() { self.interval * 3 } else { Duration::ZERO };
+        let (st, _) =
+            self.shared.tick.wait_timeout_while(st, wait, |s| s.usage.samples() < 2 && !s.stopped).unwrap_or_else(|e| e.into_inner());
+        let mut r = st.usage.report();
+        r.host.memory_total_bytes = st.latest.as_ref().and_then(|s| s.memory.as_ref()).map(|m| m.total_bytes);
+        r
     }
 
     /// The newest snapshot and the report on it.
@@ -543,6 +575,10 @@ mod tests {
         assert!(ring.len() >= 3, "{}", ring.len());
         let r = s.report(Thresholds::default());
         assert!(r.averages[0].samples >= 3);
+        let u = s.usage();
+        assert_eq!(u.available, usage::AVAILABLE);
+        assert!(!u.available || (u.samples >= 3 && u.host.cpu_pct.s1.is_some()), "{u:?}");
+        assert!(u.host.memory_total_bytes.is_some());
         drop(s);
     }
 
