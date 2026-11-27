@@ -104,7 +104,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "contrast_check",
-        "device, region?, scale?, appearance?(both), restore?(light|dark), settle_ms?(500), path?, display?(main|outer|inner|carplay)",
+        "device, region?, scale?, appearance?(current|both), restore?(light|dark), settle_ms?(500), path?, display?(main|outer|inner|carplay)",
         "Text and controls below WCAG contrast in a screenshot, from pixels alone: finds text-like regions, estimates each one's foreground and \
          background, and reports those under 4.5:1 (normal text) or 3:1 (large text of about 18 pt, icons and controls) with their box, the \
          two colours and the ratio, and the screenshot with the findings boxed (`png`, or written to path). Text over a photo or a busy \

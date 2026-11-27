@@ -40,6 +40,10 @@ pub trait Target {
 
 /// How long the UI gets to redraw after an appearance switch.
 const SETTLE_MS: u64 = 500;
+/// The longest `settle_ms` taken.
+const MAX_SETTLE_MS: u64 = 10_000;
+/// The largest `scale` taken (pixels per point).
+const MAX_SCALE: f64 = 16.0;
 
 /// A region of the screen in pixels: `{x, y, width, height}`.
 fn region(p: &Value) -> Result<Option<Rect>, String> {
@@ -113,9 +117,14 @@ pub fn run(t: &mut impl Target, p: &Value) -> Result<Value, String> {
         Some(other) => return Err(format!("unknown appearance `{other}` (both, or omit it to check the screen as it is)")),
     };
     let restore = mode(p, "restore")?.unwrap_or(Mode::Light);
-    let settle = Duration::from_millis(opt_u64(p, "settle_ms").unwrap_or(SETTLE_MS));
+    let settle_ms = opt_u64(p, "settle_ms").unwrap_or(SETTLE_MS);
+    if settle_ms > MAX_SETTLE_MS {
+        return Err(format!("`settle_ms` must be at most {MAX_SETTLE_MS}"));
+    }
+    let settle = Duration::from_millis(settle_ms);
     let (scale, scale_source) = match p.get("scale").and_then(Value::as_f64) {
-        Some(s) if s.is_finite() && s > 0.0 => (s, "param"),
+        Some(s) if s.is_finite() && s > 0.0 && s <= MAX_SCALE => (s, "param"),
+        Some(s) if s.is_finite() && s > MAX_SCALE => return Err(format!("`scale` must be at most {MAX_SCALE} (pixels per point)")),
         Some(_) => return Err("`scale` must be a positive number (pixels per point)".into()),
         None => t.scale().filter(|s| s.is_finite() && *s > 0.0).map_or((1.0, "assumed"), |s| (s, "device")),
     };
@@ -297,6 +306,18 @@ mod tests {
         let (mut t, log) = fake(Some(2.0), true);
         assert!(run(&mut t, &json!({"appearance": "dark"})).expect_err("only both").contains("unknown appearance `dark`"));
         assert!(run(&mut t, &json!({"appearance": "both", "restore": "sepia"})).is_err());
+        assert!(log.borrow().is_empty(), "refused before touching the device");
+    }
+
+    #[test]
+    fn scale_and_settle_are_bounded() {
+        let (mut t, log) = fake(Some(2.0), true);
+        for bad in [json!({"scale": 17}), json!({"scale": 1e300}), json!({"scale": 16.5})] {
+            assert!(run(&mut t, &bad).expect_err("scale too large").contains("at most 16"), "{bad}");
+        }
+        assert_eq!(run(&mut t, &json!({"scale": 16})).expect("16 is fine")["scale"], 16.0);
+        let err = run(&mut t, &json!({"appearance": "both", "settle_ms": 10001})).expect_err("settle too long");
+        assert!(err.contains("at most 10000"), "{err}");
         assert!(log.borrow().is_empty(), "refused before touching the device");
     }
 
