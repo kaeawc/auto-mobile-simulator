@@ -264,6 +264,11 @@ impl Threads {
     }
 }
 
+/// Stops every running stream, each sending its WHIP DELETE: call it before the process exits.
+pub fn stop_streams() {
+    stream::stop_all();
+}
+
 /// Listens on `path` (replacing a stale socket) and serves connections until the process exits.
 pub fn serve(path: &Path) -> std::io::Result<()> {
     let listener = bind(path)?;

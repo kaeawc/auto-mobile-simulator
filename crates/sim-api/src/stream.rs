@@ -21,10 +21,10 @@
 //! The encoder, the publisher, the device input and the clock are traits, so the tests run every
 //! method on fakes with no network and no device.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -55,6 +55,17 @@ const HEARTBEAT: Duration = Duration::from_millis(500);
 const WHEEL_SWIPE_MS: u64 = 100;
 /// A button held down and up through the channel is pressed for at least, and at most, this long.
 const BUTTON_HOLD_MS: (u64, u64) = (10, 10_000);
+
+/// Device calls one stream may have waiting; more are refused with `device busy`.
+const INPUT_QUEUE: usize = 32;
+/// The most characters of `text` one device `type` call takes, so a message never holds the device
+/// for long (iOS paces a key report every 3 ms).
+const INPUT_CHUNK_CHARS: usize = 256;
+/// How long stopping waits for the device call in flight before it leaves the input thread to
+/// finish alone.
+const INPUT_JOIN: Duration = Duration::from_secs(2);
+/// How often `stream_start` looks at whether its caller cancelled it.
+const CANCEL_POLL: Duration = Duration::from_millis(25);
 
 pub(crate) fn is_method(method: &str) -> bool {
     METHODS.contains(&method)
@@ -252,6 +263,13 @@ fn lookup(s: &mut Session, p: &Value, screen: bool) -> Result<Target, String> {
 
 static GLOBAL: OnceLock<Arc<Streams>> = OnceLock::new();
 
+/// Stops every stream of this process, each sending its WHIP DELETE: for the server's exit.
+pub(crate) fn stop_all() {
+    if let Some(streams) = GLOBAL.get() {
+        streams.stop_all();
+    }
+}
+
 /// The process's streams, on VideoToolbox, `simee-rtc` and the method table, with the thread that
 /// stops streams whose lease lapsed.
 fn global() -> &'static Arc<Streams> {
@@ -388,6 +406,8 @@ struct Shared {
     progress: Mutex<Progress>,
     controls: Controls,
     clock: Arc<dyn Clock>,
+    /// Set once the stream is ending: the input thread drops queued calls but the releases.
+    stopping: AtomicBool,
 }
 
 impl Shared {
@@ -406,6 +426,7 @@ impl Shared {
     /// Ends the stream for `reason` (unless another reason came first).
     fn stop(&self, reason: impl Into<String>) {
         self.lock().reason.get_or_insert_with(|| reason.into());
+        self.stopping.store(true, Ordering::SeqCst);
         self.controls.stop();
     }
 
@@ -531,7 +552,12 @@ impl Streams {
             (_, screen) => screen,
         };
         let now = self.clock.now();
-        let shared = Arc::new(Shared { progress: Mutex::default(), controls: Controls::default(), clock: self.clock.clone() });
+        let shared = Arc::new(Shared {
+            progress: Mutex::default(),
+            controls: Controls::default(),
+            clock: self.clock.clone(),
+            stopping: AtomicBool::new(false),
+        });
         shared.stage("requested");
         let id = {
             let mut entries = self.entries();
@@ -574,19 +600,30 @@ impl Streams {
         };
         let spawned = std::thread::Builder::new().name("simee-stream".into()).spawn(move || worker.run(ready_tx));
         match spawned {
-            Ok(handle) => match self.entries().get_mut(&id) {
-                Some(e) => e.worker = Some(handle),
-                // Stopped already (by a lapsed lease or a stop that raced the start).
-                None => drop(handle.join()),
-            },
+            Ok(handle) => self.adopt(&id, handle),
             Err(e) => {
                 self.entries().remove(&id);
                 return Err(format!("stream thread: {e}"));
             }
         }
-        let outcome = ready_rx
-            .recv_timeout(self.start_timeout)
-            .unwrap_or_else(|_| Err(format!("no first frame and WHIP connection within {} s", self.start_timeout.as_secs())));
+        let timed_out = || Err(format!("no first frame and WHIP connection within {} s", self.start_timeout.as_secs()));
+        let deadline = Instant::now() + self.start_timeout;
+        let outcome = loop {
+            if crate::methods::call_cancelled() {
+                break Err("cancelled: stream_start was cancelled".to_owned());
+            }
+            let slice = deadline.saturating_duration_since(Instant::now()).min(CANCEL_POLL);
+            match ready_rx.recv_timeout(slice) {
+                Ok(outcome) => break outcome,
+                Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                Err(_) => break timed_out(),
+            }
+        };
+        // Connected, but nobody is waiting for the stream any more: tear it down.
+        let outcome = match outcome {
+            Ok(_) if crate::methods::call_cancelled() => Err("cancelled: stream_start was cancelled".to_owned()),
+            other => other,
+        };
         match outcome {
             Ok(resource) => {
                 if let Some(e) = self.entries().get_mut(&id) {
@@ -606,6 +643,34 @@ impl Streams {
                     let _ = handle.join();
                 }
                 Err(e)
+            }
+        }
+    }
+
+    /// Keeps the worker's handle with its entry. A stop that raced the start already removed the
+    /// entry: then the worker is joined, with the registry unlocked.
+    fn adopt(&self, id: &str, handle: JoinHandle<()>) {
+        let orphan = match self.entries().get_mut(id) {
+            Some(e) => {
+                e.worker = Some(handle);
+                None
+            }
+            None => Some(handle),
+        };
+        if let Some(handle) = orphan {
+            let _ = handle.join();
+        }
+    }
+
+    /// Stops every stream (each sends its WHIP DELETE) and forgets them all.
+    pub(crate) fn stop_all(&self) {
+        let all: Vec<Entry> = self.entries().drain().map(|(_, e)| e).collect();
+        for e in &all {
+            e.shared.stop("the server is exiting");
+        }
+        for mut e in all {
+            if let Some(handle) = e.worker.take() {
+                let _ = handle.join();
             }
         }
     }
@@ -741,15 +806,15 @@ impl Worker {
     fn run(self, ready: SyncSender<Result<String, String>>) {
         let shared = self.shared.clone();
         let config = encoder_config(&self.options.settings);
-        let (mut input, input_thread) = match (self.options.settings.input, self.screen) {
+        let (mut input, input_thread, queue) = match (self.options.settings.input, self.screen) {
             (true, Some((w, h))) => {
                 let map = Arc::new(Mutex::new(DisplayMap::new(w, h)));
-                let (tx, rx) = channel();
-                let thread = spawn_input(rx, self.make_input.clone(), map.clone(), shared.clone(), &self.target);
-                let sink = DeviceSink::new(self.target.platform, map, tx, shared.clock.clone());
-                (Some(InputSession::new(sink, InputConfig::default())), thread)
+                let queue = Arc::new(InputQueue::new(INPUT_QUEUE));
+                let thread = spawn_input(queue.clone(), self.make_input.clone(), map.clone(), shared.clone(), &self.target);
+                let sink = DeviceSink::new(self.target.platform, map, queue.clone(), shared.clock.clone());
+                (Some(InputSession::new(sink, InputConfig::default())), thread, Some(queue))
             }
-            _ => (None, None),
+            _ => (None, None, None),
         };
         let mut ready = Some(ready);
         let mut publication: Option<Box<dyn Publication>> = None;
@@ -782,6 +847,8 @@ impl Worker {
             Err(e) => e.strip_prefix("encoder: ").unwrap_or(&e).to_owned(),
         };
         shared.lock().reason.get_or_insert(ended.clone());
+        // Ending for any reason: queued device calls but the releases are dropped from here on.
+        shared.stopping.store(true, Ordering::SeqCst);
         send_ready(&mut ready, Err(ended));
         if let Some(p) = publication {
             let deleted = p.close().map_err(|e| whip_error(&self.options.whip_url, &e));
@@ -789,8 +856,15 @@ impl Worker {
         }
         // Its release (anything still down) reaches the device before the input thread ends.
         drop(input);
-        if let Some(thread) = input_thread {
-            let _ = thread.join();
+        if let Some(queue) = queue {
+            queue.close();
+        }
+        // The DELETE is sent; a device call still running is waited for only briefly.
+        if let Some((handle, done)) = input_thread {
+            match done.recv_timeout(INPUT_JOIN) {
+                Err(RecvTimeoutError::Timeout) => drop(handle),
+                _ => drop(handle.join()),
+            }
         }
         shared.stage("ended");
         shared.lock().ended = true;
@@ -832,21 +906,110 @@ fn connect(
 /// One call into the device's input methods.
 type Call = (&'static str, Value);
 
+/// A call waiting for the device; a release (a touch lifted, a button let go) is never dropped.
+struct Queued {
+    call: Call,
+    release: bool,
+}
+
+#[derive(Default)]
+struct QueueState {
+    calls: VecDeque<Queued>,
+    closed: bool,
+}
+
+/// The device calls one stream has waiting, bounded so that a viewer can't queue more work than
+/// the device does in a moment (a stop would wait for all of it).
+struct InputQueue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+    cap: usize,
+}
+
+impl InputQueue {
+    fn new(cap: usize) -> InputQueue {
+        InputQueue { state: Mutex::default(), ready: Condvar::new(), cap }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, QueueState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Queues `calls` together, or none: `device busy` when they don't fit. Releases always fit.
+    fn push(&self, calls: Vec<Queued>) -> Result<(), String> {
+        let mut state = self.lock();
+        if state.closed {
+            return Err("the device input has stopped".to_owned());
+        }
+        if !calls.iter().any(|c| c.release) && state.calls.len() + calls.len() > self.cap {
+            return Err(format!("device busy: {} calls are already waiting on the device", state.calls.len()));
+        }
+        state.calls.extend(calls);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    /// No more calls come: the thread ends once it has made those queued.
+    fn close(&self) {
+        self.lock().closed = true;
+        self.ready.notify_all();
+    }
+
+    /// The next call to make, waiting for one; `None` once closed and empty. While `stopping`,
+    /// only releases are returned.
+    fn pop(&self, stopping: &AtomicBool) -> Option<Call> {
+        let mut state = self.lock();
+        loop {
+            while let Some(q) = state.calls.pop_front() {
+                if q.release || !stopping.load(Ordering::SeqCst) {
+                    return Some(q.call);
+                }
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.ready.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
+/// Whether `call` lets go of something the device holds.
+fn is_release(call: &Call) -> bool {
+    match call.0 {
+        "touch" => call.1["phase"] == "up",
+        "button" => call.1.get("hold_ms").is_some(),
+        _ => false,
+    }
+}
+
+/// `text` in pieces a device types in a moment each.
+fn text_chunks(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= INPUT_CHUNK_CHARS {
+        return vec![text.to_owned()];
+    }
+    chars.chunks(INPUT_CHUNK_CHARS).map(|c| c.iter().collect()).collect()
+}
+
+/// The thread of [`spawn_input`] and what tells that it ended.
+type InputThread = (JoinHandle<()>, Receiver<()>);
+
 /// Calls the device for each event the sink queued; after a rotation or a fold, reads the screen
 /// size again so later points map onto the new shape.
 fn spawn_input(
-    rx: Receiver<Call>,
+    queue: Arc<InputQueue>,
     make: MakeInput,
     map: Arc<Mutex<DisplayMap>>,
     shared: Arc<Shared>,
     target: &Target,
-) -> Option<JoinHandle<()>> {
+) -> Option<InputThread> {
     let device = json!({"device": target.udid, "platform": target.platform.as_str()});
-    std::thread::Builder::new()
+    let (done_tx, done_rx) = sync_channel(1);
+    let handle = std::thread::Builder::new()
         .name("simee-stream-input".into())
         .spawn(move || {
             let mut input = make();
-            for (method, mut params) in rx {
+            while let Some((method, mut params)) = queue.pop(&shared.stopping) {
                 params["device"] = device["device"].clone();
                 params["platform"] = device["platform"].clone();
                 let result = input.call(method, &params);
@@ -859,8 +1022,10 @@ fn spawn_input(
                     }
                 }
             }
+            let _ = done_tx.send(());
         })
-        .ok()
+        .ok()?;
+    Some((handle, done_rx))
 }
 
 /// The stream's [`InputSink`]: maps each event onto the device (pixels through the [`DisplayMap`])
@@ -869,7 +1034,7 @@ fn spawn_input(
 struct DeviceSink {
     platform: Platform,
     map: Arc<Mutex<DisplayMap>>,
-    queue: Sender<Call>,
+    queue: Arc<InputQueue>,
     clock: Arc<dyn Clock>,
     /// The pointer that is down on the device, and where it last was.
     pointer: Option<(u32, (f64, f64))>,
@@ -878,7 +1043,7 @@ struct DeviceSink {
 }
 
 impl DeviceSink {
-    fn new(platform: Platform, map: Arc<Mutex<DisplayMap>>, queue: Sender<Call>, clock: Arc<dyn Clock>) -> DeviceSink {
+    fn new(platform: Platform, map: Arc<Mutex<DisplayMap>>, queue: Arc<InputQueue>, clock: Arc<dyn Clock>) -> DeviceSink {
         DeviceSink { platform, map, queue, clock, pointer: None, held: HashMap::new() }
     }
 
@@ -954,10 +1119,23 @@ impl DeviceSink {
 
 impl InputSink for DeviceSink {
     fn input(&mut self, event: &InputEvent) -> Result<(), String> {
-        if let Some(call) = self.translate(event)? {
-            self.queue.send(call).map_err(|_| "the device input has stopped".to_owned())?;
-        }
-        Ok(())
+        let (pointer, held) = (self.pointer, self.held.clone());
+        let Some(call) = self.translate(event)? else { return Ok(()) };
+        let calls: Vec<Call> = match call {
+            ("type", p) => text_chunks(p["text"].as_str().unwrap_or_default()).into_iter().map(|t| ("type", json!({"text": t}))).collect(),
+            other => vec![other],
+        };
+        let queued = calls.into_iter().map(|call| Queued { release: is_release(&call), call }).collect();
+        self.queue.push(queued).inspect_err(|_| {
+            // Refused: the device never saw it, so the touch and buttons are where they were.
+            (self.pointer, self.held) = (pointer, held);
+        })
+    }
+}
+
+impl Drop for DeviceSink {
+    fn drop(&mut self) {
+        self.queue.close();
     }
 }
 
@@ -1063,6 +1241,8 @@ mod tests {
     #[derive(Default)]
     struct FakeMedia {
         unavailable: bool,
+        /// Never produces a frame: a start that never connects.
+        stall: bool,
         configs: Mutex<Vec<(String, EncoderConfig)>>,
     }
 
@@ -1080,6 +1260,12 @@ mod tests {
             sink: &mut dyn FnMut(AccessUnit) -> sim_encode::Result<Flow>,
         ) -> Result<(), String> {
             self.configs.lock().expect("configs").push((target.udid.clone(), config.clone()));
+            while self.stall && !controls.stopped() {
+                std::thread::sleep(ms(5));
+            }
+            if self.stall {
+                return Ok(());
+            }
             let mut source = FakeSource { next: Instant::now(), newest: None };
             sim_encode::stream::run(&mut source, &mut FakeEncoder, pacing, controls, sink).map(drop).map_err(|e| e.to_string())
         }
@@ -1185,8 +1371,10 @@ mod tests {
 
     /// Records every call; `screen` answers the size the test sets.
     struct FakeInput {
-        calls: Sender<(String, Value)>,
+        calls: std::sync::mpsc::Sender<(String, Value)>,
         screen: Arc<Mutex<(u32, u32)>>,
+        /// Milliseconds each device call (but `screen`) takes.
+        slow: Arc<AtomicU64>,
     }
 
     impl DeviceInput for FakeInput {
@@ -1196,6 +1384,7 @@ mod tests {
                 let (w, h) = *self.screen.lock().expect("screen");
                 return Ok(json!({"width": w, "height": h}));
             }
+            std::thread::sleep(ms(self.slow.load(Ordering::Relaxed)));
             Ok(Value::Null)
         }
     }
@@ -1207,18 +1396,21 @@ mod tests {
         media: Arc<FakeMedia>,
         calls: Receiver<(String, Value)>,
         screen: Arc<Mutex<(u32, u32)>>,
+        slow: Arc<AtomicU64>,
     }
 
     fn fixture_with(whip: FakeWhip, media: FakeMedia) -> Fixture {
         let clock = Arc::new(FakeClock(Mutex::new(Instant::now())));
         let whip = Arc::new(FakeWhip { clock: Some(clock.clone()), ..whip });
         let media = Arc::new(media);
-        let (tx, calls) = channel();
+        let (tx, calls) = std::sync::mpsc::channel();
         let screen = Arc::new(Mutex::new((1179, 2556)));
         let size = screen.clone();
-        let make: MakeInput = Arc::new(move || Box::new(FakeInput { calls: tx.clone(), screen: size.clone() }));
+        let slow = Arc::new(AtomicU64::new(0));
+        let pace = slow.clone();
+        let make: MakeInput = Arc::new(move || Box::new(FakeInput { calls: tx.clone(), screen: size.clone(), slow: pace.clone() }));
         let streams = Streams::new(clock.clone(), media.clone(), whip.clone(), make);
-        Fixture { streams, clock, whip, media, calls, screen }
+        Fixture { streams, clock, whip, media, calls, screen, slow }
     }
 
     fn fixture() -> Fixture {
@@ -1507,9 +1699,8 @@ mod tests {
 
     #[test]
     fn a_point_from_a_frame_of_another_shape_is_refused() {
-        let (tx, _rx) = channel();
         let map = Arc::new(Mutex::new(DisplayMap::new(2556, 1179)));
-        let mut sink = DeviceSink::new(Platform::Ios, map, tx, Arc::new(SystemClock));
+        let mut sink = DeviceSink::new(Platform::Ios, map, Arc::new(InputQueue::new(INPUT_QUEUE)), Arc::new(SystemClock));
         let point = Point { x: 0.5, y: 0.5, frame: FrameSize::new(590, 1280) };
         let err = sink.translate(&InputEvent::Touch { pointer: 0, phase: TouchPhase::Down, point }).expect_err("stale");
         assert!(err.contains("590x1280"), "{err}");
@@ -1519,9 +1710,8 @@ mod tests {
 
     #[test]
     fn android_input_maps_what_it_can_and_refuses_the_rest() {
-        let (tx, _rx) = channel();
         let map = Arc::new(Mutex::new(DisplayMap::new(1080, 2400)));
-        let mut sink = DeviceSink::new(Platform::Android, map, tx, Arc::new(SystemClock));
+        let mut sink = DeviceSink::new(Platform::Android, map, Arc::new(InputQueue::new(INPUT_QUEUE)), Arc::new(SystemClock));
         assert!(sink.translate(&InputEvent::Rotate(Orientation::LandscapeLeft)).expect_err("no target orientation").contains("90°"));
         assert!(sink.translate(&InputEvent::Button { button: Button::Assistant, phase: ButtonPhase::Press }).is_err());
         assert_eq!(sink.translate(&InputEvent::Fold(Posture::HalfOpen)).expect("fold"), Some(("fold", json!({"posture": "half-opened"}))));
@@ -1534,6 +1724,142 @@ mod tests {
         let rotated = Point { x: 0.1, y: 0.1, frame: FrameSize::new(1200, 540) };
         let cancel = sink.translate(&InputEvent::Touch { pointer: 3, phase: TouchPhase::Cancel, point: rotated }).expect("cancel");
         assert_eq!(cancel, Some(("touch", json!({"x": 540.0, "y": 1200.0, "phase": "up"}))));
+    }
+
+    fn busy(replies: &[Reply]) -> bool {
+        replies.iter().any(|r| matches!(r, Reply::Error { code: ErrorCode::Sink, message, .. } if message.contains("device busy")))
+    }
+
+    #[test]
+    fn a_viewer_cannot_queue_more_device_calls_than_the_bound_and_stop_does_not_wait_for_them() {
+        let f = fixture();
+        f.slow.store(300, Ordering::Relaxed);
+        f.start(json!({"whip_url": URL, "input": true})).expect("start");
+        let session = f.whip.session(0);
+        let t = Instant::now();
+        let refused = (0..60u64)
+            .filter(|i| busy(&session.viewer(t + ms(*i), &format!(r#"{{"v":1,"kind":"key","phase":"down","usage":{}}}"#, 4 + i))))
+            .count();
+        assert!(refused >= 20, "only {refused} of 60 were refused with `device busy`");
+        // 32 calls of 300 ms would be ten seconds: stop drops what is queued.
+        let began = Instant::now();
+        let stopped = f.call("stream_stop", json!({"stream_id": "stream-1"})).expect("stop");
+        assert!(began.elapsed() < Duration::from_secs(2), "stop took {:?}", began.elapsed());
+        assert_eq!(stopped["deleted"], true, "{stopped}");
+        assert!(stopped["stats"]["input_events"].as_u64() < Some(10), "{stopped}");
+    }
+
+    #[test]
+    fn stop_sends_the_delete_without_waiting_out_a_long_device_call() {
+        let f = fixture();
+        f.slow.store(6_000, Ordering::Relaxed);
+        f.start(json!({"whip_url": URL, "input": true})).expect("start");
+        let session = f.whip.session(0);
+        assert_eq!(session.viewer(Instant::now(), r#"{"v":1,"kind":"button","button":"home"}"#), []);
+        std::thread::sleep(ms(100));
+        let began = Instant::now();
+        let stopped = f.call("stream_stop", json!({"stream_id": "stream-1"})).expect("stop");
+        assert!(began.elapsed() < Duration::from_secs(4), "stop took {:?}", began.elapsed());
+        assert_eq!(stopped["deleted"], true, "{stopped}");
+        assert_eq!(f.whip.log().last().map(String::as_str), Some(format!("DELETE {URL}/session-0").as_str()));
+    }
+
+    #[test]
+    fn a_release_is_never_refused_nor_dropped_by_stop() {
+        let f = fixture();
+        f.slow.store(150, Ordering::Relaxed);
+        f.start(json!({"whip_url": URL, "input": true})).expect("start");
+        let session = f.whip.session(0);
+        let t = Instant::now();
+        let down = r#"{"v":1,"kind":"touch","phase":"down","id":0,"x":0.5,"y":0.5,"w":590,"h":1280}"#;
+        assert_eq!(session.viewer(t, down), []);
+        let refused = (1..=50u64)
+            .filter(|i| busy(&session.viewer(t + ms(*i), &format!(r#"{{"v":1,"kind":"key","phase":"down","usage":{}}}"#, 4 + i))))
+            .count();
+        assert!(refused > 0, "the queue never filled");
+        assert_eq!(session.viewer(t + ms(60), r#"{"v":1,"kind":"touch","phase":"up","id":0}"#), [], "a lift is never `device busy`");
+        f.call("stream_stop", json!({"stream_id": "stream-1"})).expect("stop");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (method, params) =
+                f.calls.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("a lift reaches the device");
+            if method == "touch" && params["phase"] == "up" {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn text_reaches_the_device_in_chunks_a_device_types_in_a_moment() {
+        let f = fixture();
+        f.start(json!({"whip_url": URL, "input": true})).expect("start");
+        let text = "ab".repeat(300);
+        let message = format!(r#"{{"v":1,"kind":"text","text":"{text}"}}"#);
+        assert_eq!(f.whip.session(0).viewer(Instant::now(), &message), []);
+        let got = f.device_calls(3);
+        assert!(
+            got.iter().all(|(m, p)| m == "type" && p["text"].as_str().is_some_and(|t| t.chars().count() <= INPUT_CHUNK_CHARS)),
+            "{got:?}"
+        );
+        let joined: String = got.iter().map(|(_, p)| p["text"].as_str().expect("text")).collect();
+        assert_eq!(joined, text);
+    }
+
+    #[test]
+    fn stop_all_stops_every_stream_with_its_delete() {
+        let f = fixture();
+        f.start(json!({"whip_url": URL})).expect("first");
+        f.start(json!({"whip_url": "http://127.0.0.1:8889/other/whip"})).expect("second");
+        f.streams.stop_all();
+        let deletes = f.whip.log().iter().filter(|l| l.starts_with("DELETE ")).count();
+        assert_eq!(deletes, 2, "{:?}", f.whip.log());
+        assert_eq!(f.call("streams", json!({})).expect("streams"), json!([]));
+    }
+
+    #[test]
+    fn a_worker_orphaned_by_a_racing_stop_is_joined_without_the_registry_lock() {
+        let f = fixture();
+        let streams = Arc::new(f.streams);
+        let got_lock = Arc::new(AtomicBool::new(false));
+        let worker_saw = Arc::new(AtomicBool::new(false));
+        let (flag, saw) = (got_lock.clone(), worker_saw.clone());
+        let worker = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(3);
+            while !flag.load(Ordering::SeqCst) && Instant::now() < until {
+                std::thread::sleep(ms(5));
+            }
+            saw.store(flag.load(Ordering::SeqCst), Ordering::SeqCst);
+        });
+        let other = streams.clone();
+        let flag = got_lock.clone();
+        let taker = std::thread::spawn(move || {
+            std::thread::sleep(ms(100));
+            drop(other.entries());
+            flag.store(true, Ordering::SeqCst);
+        });
+        // No entry `stream-9`: the join happens in `adopt`, and another call must get through it.
+        streams.adopt("stream-9", worker);
+        taker.join().expect("taker");
+        assert!(worker_saw.load(Ordering::SeqCst), "the registry stayed locked while the worker was joined");
+    }
+
+    #[test]
+    fn a_cancelled_start_tears_down_and_returns_cancelled() {
+        let f = fixture_with(FakeWhip::default(), FakeMedia { stall: true, ..FakeMedia::default() });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let timer = std::thread::spawn(move || {
+            std::thread::sleep(ms(150));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let seen = cancel.clone();
+        let hooks = crate::methods::CallHooks { cancelled: Box::new(move || seen.load(Ordering::SeqCst)), progress: Box::new(|_| {}) };
+        let began = Instant::now();
+        let err = crate::methods::with_call_hooks(hooks, || f.start(json!({"whip_url": URL}))).expect_err("cancelled");
+        timer.join().expect("timer");
+        assert!(err.contains("cancelled"), "{err}");
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+        assert_eq!(f.call("streams", json!({})).expect("streams"), json!([]));
     }
 
     #[test]

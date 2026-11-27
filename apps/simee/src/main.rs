@@ -484,18 +484,24 @@ fn main() -> Result<()> {
         Cmd::Serve { socket } => {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
             eprintln!("simee API on {}", path.display());
-            sim_api::serve(&path)?;
+            let served = sim_api::serve(&path);
+            sim_api::stop_streams();
+            served?;
             return Ok(());
         }
         Cmd::Mcp { http: None, .. } => {
             // Methods run in this process, on the server's own threads: nothing but protocol
             // messages may reach stdout.
-            sim_mcp::serve_stdio(std::sync::Arc::new(sim_mcp::ApiBackend::new()))?;
+            let served = sim_mcp::serve_stdio(std::sync::Arc::new(sim_mcp::ApiBackend::new()));
+            sim_api::stop_streams();
+            served?;
             return Ok(());
         }
         Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote } => {
             let config = mcp_http_config(addr, token_file.clone(), *no_auth, *insecure_remote)?;
-            sim_mcp::http::serve(std::sync::Arc::new(sim_mcp::ApiBackend::new()), config)?;
+            let served = sim_mcp::http::serve(std::sync::Arc::new(sim_mcp::ApiBackend::new()), config);
+            sim_api::stop_streams();
+            served?;
             return Ok(());
         }
         Cmd::Call { method, params, socket } => {
