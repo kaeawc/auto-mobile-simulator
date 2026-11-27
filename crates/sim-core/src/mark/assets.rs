@@ -498,8 +498,7 @@ mod tests {
     }
 
     /// macOS's own reader gives back the pixels written, at every size: no noise in the 16 and
-    /// 32 px slots.
-    #[cfg(target_os = "macos")]
+    /// 32 px slots. Hosts without `iconutil` (Linux) skip it.
     #[test]
     fn iconutil_reads_back_every_size() {
         let images: Vec<_> = [16, 32, 64, 128].into_iter().map(|s| (s, icon_rgba(s, &Ground::DARK))).collect();
@@ -508,7 +507,11 @@ mod tests {
         let (file, set) = (dir.join("t.icns"), dir.join("t.iconset"));
         std::fs::write(&file, icns(&images).expect("icns")).expect("write");
         let status = std::process::Command::new("iconutil").arg("-c").arg("iconset").arg(&file).arg("-o").arg(&set).status();
-        let Ok(status) = status else { return }; // No iconutil (no Xcode tools): nothing to compare with.
+        let Ok(status) = status else {
+            // No iconutil (not macOS, or no command line tools): nothing to compare with.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
         assert!(status.success(), "iconutil refused the file");
         for (name, size) in [("icon_16x16", 16), ("icon_32x32", 32), ("icon_16x16@2x", 32), ("icon_32x32@2x", 64), ("icon_128x128", 128)] {
             let (width, got) = decode_rgba(&std::fs::read(set.join(format!("{name}.png"))).expect(name));
