@@ -1,0 +1,14 @@
+# shellcheck for every tracked shell script (scripts/lint.sh lists them).
+# Follow `source`d files, resolving their paths from the sourcing script's directory.
+external-sources=true
+source-path=SCRIPTDIR
+
+# Optional checks worth having here: a `case` with no default branch, `[ $var ]` without -n,
+# an uppercase variable read but never assigned, `which` instead of `command -v`, a negated
+# test that has a positive form, and `cat file | cmd`.
+enable=add-default-case
+enable=avoid-nullary-conditions
+enable=check-unassigned-uppercase
+enable=deprecate-which
+enable=avoid-negated-conditions
+enable=useless-use-of-cat

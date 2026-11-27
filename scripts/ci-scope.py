@@ -781,9 +781,13 @@ def desktop_deps(crates):
 
 REFERENCED = re.compile(r'"(?:\.\./)*((?:docs|scripts)/[A-Za-z0-9_./-]+)"')
 
-# Paths no job here reads: docs, other workflows, local tooling, and scripts nothing below names.
+# Paths no job here reads: docs, other workflows, local tooling, the script and docs linters'
+# configs, and scripts nothing below names.
 NONE = re.compile(r"^(docs/|\.github/workflows/software-mode\.yml$|\.githooks/|\.local/|LICENSE$|\.gitignore$"
-                  r"|Makefile$|bacon\.toml$|rustfmt\.toml$)|\.md$|^scripts/")
+                  r"|Makefile$|bacon\.toml$|rustfmt\.toml$|\.editorconfig$|\.shellcheckrc$|\.yamllint\.yml$"
+                  r"|lychee\.toml$|_typos\.toml$)|\.md$|^scripts/")
+# Scripts only the docs-scripts job runs: it runs on every change, so they reach no scoped job.
+LINT_ONLY = {"scripts/lint.sh"}
 EVERYTHING = re.compile(r"^(\.github/workflows/ci\.yml|\.github/actions/|\.cargo/|rust-toolchain\.toml$|Cargo\.toml$"
                         r"|scripts/ci-scope\.py$)")
 # What runs scripts in these jobs: the workflow and its actions (every job), and cargo's config
@@ -812,6 +816,8 @@ def script_scopes(rust_refs):
                 continue
             for m in SCRIPT_REF.finditer(read(u)):
                 ref = m.group(0).rstrip(".")
+                if ref in LINT_ONLY:
+                    continue
                 if exists(ref):
                     out.setdefault(ref, set()).update(jobs)
                 else:

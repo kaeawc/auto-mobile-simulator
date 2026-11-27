@@ -1,0 +1,55 @@
+# crate-ci/typos over code and docs (`typos` from the repository root). A word here is spelled
+# that way on purpose; fix anything else it reports.
+
+[files]
+extend-exclude = [
+  "Cargo.lock",
+  "*.png",
+  # Captured from real devices and SDK repositories: process names and XML as the tools print them.
+  "crates/sim-debug/fixtures/",
+  "crates/sim-api/tests/fixtures/",
+  "crates/emu-sdk/testdata/",
+  # gfxstream's headers, vendored as they ship.
+  "docs/reference/gfxstream/",
+]
+
+[default]
+extend-ignore-re = [
+  # docs/benchmarks.md's typing benchmark: the string is typed as written, typo included.
+  "Teh quick, Brown FOX",
+]
+
+[default.extend-words]
+# Fragments typos splits out of real tokens: "PNGs" (PN), Linux's KEY_102ND (ND), lsof's `-F pcPnT`
+# field letters (Pn), and two-letter hex/register fragments (BA).
+pn = "pn"
+nd = "nd"
+ba = "ba"
+# A simulator's unique device identifier (simctl, CoreSimulator).
+udid = "udid"
+# Kernel log levels (KERN_CRIT): "emergencies, alerts, criticals".
+criticals = "criticals"
+# Platform and register names from the APIs they come from: Android's `AndroidOs`, PL011's MIS
+# (masked interrupt status), mach_timebase_info's `numer`, msghdr's `msg_controllen`, open(2)'s
+# O_WRONLY, TCP's RTO, ARM's AttrIndx, Intel HDA, CoreAudio's 'inpt' selector, `mke2fs`, the
+# flate2 crate, and QEMU's `ser` chardev id.
+androidos = "androidos"
+mis = "mis"
+numer = "numer"
+controllen = "controllen"
+wronly = "wronly"
+rto = "rto"
+indx = "indx"
+hda = "hda"
+inpt = "inpt"
+mke = "mke"
+flate = "flate"
+ser = "ser"
+# "ANDs the alpha bytes together": AND as a verb.
+ands = "ands"
+# Test data cut from longer strings: "\nnot", the bytes "agai", an "rror" substring match and
+# an environment variable named HOM.
+nnot = "nnot"
+agai = "agai"
+rror = "rror"
+hom = "hom"

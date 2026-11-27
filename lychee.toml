@@ -1,0 +1,7 @@
+# lychee over the repository's Markdown (`lychee .` from the root, which reads this file):
+# links to files in the tree and the headings they point at. Web links are not fetched, so
+# the check is fast, needs no network and can't flake on someone else's server.
+offline = true
+include_fragments = "anchor-only"
+extensions = ["md"]
+no_progress = true

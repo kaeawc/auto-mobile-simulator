@@ -1,0 +1,23 @@
+root = true
+
+# Shell scripts: two-space indents, case branches indented under `case`. shfmt reads these
+# (scripts/lint.sh runs `shfmt -d`), so editors and the check agree.
+[*.sh]
+indent_style = space
+indent_size = 2
+switch_case_indent = true
+binary_next_line = false
+space_redirects = false
+
+[.githooks/*]
+indent_style = space
+indent_size = 2
+switch_case_indent = true
+binary_next_line = false
+space_redirects = false
+
+# Kept out of shfmt and shellcheck until the lane that owns them merges (scripts/lint.sh
+# lists shell files through `shfmt --apply-ignore -f`, so this skips both tools).
+# TODO(benchmarks lane): format and lint these, then drop this section.
+[scripts/{android-bench,android-jank,android-reset-bench,farm-bench-android,farm-bench-ios,net-bench}.sh]
+ignore = true
