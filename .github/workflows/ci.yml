@@ -156,6 +156,35 @@ jobs:
           name: coverage-linux
           path: lcov.info
 
+  # The WebRTC publisher against a real MediaMTX (tests/mediamtx/mediamtx.yml), and the rest of
+  # `simee-rtc`'s end-to-end tests: the `linux` job builds without the `rust-crypto` DTLS backend,
+  # so those skip there. MediaMTX is the release pinned in scripts/mediamtx-fetch.sh, checked
+  # against its SHA-256 on every run (the download is about a second; an Actions cache entry would
+  # cost as much to restore and evict rust-cache targets from the full 10 GB cache). Setting
+  # SIMEE_REQUIRE_MEDIAMTX makes a skipped MediaMTX test a failure, so a broken download or a
+  # missing DTLS backend can't go green by skipping.
+  mediamtx:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SIMEE_REQUIRE_MEDIAMTX: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: mediamtx
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: MediaMTX
+        run: |
+          bin=$(scripts/mediamtx-fetch.sh "$RUNNER_TEMP/mediamtx")
+          "$bin" --version
+          echo "MEDIAMTX_BIN=$bin" >> "$GITHUB_ENV"
+      - run: cargo test --locked --profile ci -p simee-rtc --features rust-crypto
+
   # What the KVM fast paths save, on real KVM (x86_64; GitHub's arm64 runners have no /dev/kvm,
   # see #54): a virtio-style doorbell store that exits to userspace against one completed in the
   # kernel by an ioeventfd. The numbers go to the job summary.
@@ -283,7 +312,7 @@ jobs:
   # cancelled (a failed `changes` fails it too, though the jobs after it show as skipped).
   ci-ok:
     if: always()
-    needs: [changes, fmt, docs-scripts, linux, kvm-x86, lint-test, emu-desktop, desktop-linux]
+    needs: [changes, fmt, docs-scripts, linux, mediamtx, kvm-x86, lint-test, emu-desktop, desktop-linux]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

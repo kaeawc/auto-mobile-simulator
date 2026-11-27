@@ -112,13 +112,15 @@ own (ports 8889, 9997 and 8189); the harness and the script start it on free por
 MediaMTX's `MTX_*` environment overrides instead.
 
 - **Finding MediaMTX.** `$MEDIAMTX_BIN`, else `mediamtx` on PATH. Nothing is downloaded by the
-  tests or the script; with no binary the MediaMTX tests print `SKIP: no MediaMTX ...` and pass.
+  tests or `scripts/mediamtx.sh` (`scripts/mediamtx-fetch.sh` fetches the pinned release, "In CI"
+  below); with no binary the MediaMTX tests print `SKIP: no MediaMTX ...` and pass, unless
+  `SIMEE_REQUIRE_MEDIAMTX` is set.
 - **Rust.** `crates/sim-rtc/tests/common/mod.rs` has `MediaMtx`: it writes the config to a temp dir,
   starts the server on free ports, waits for `GET /v3/config/global/get` (failing with the log when
   the process dies or stalls), exposes `api_get` and `ready_path`, and on drop kills the child by
   the PID it spawned, removes the temp dir and, if the test is panicking, prints the server log.
   `tests/mediamtx.rs` publishes both fixtures (Constrained Baseline and Main) with the publisher
-  and checks through the API that the path is `ready` with an `H264` track.
+  and checks through the API that the path is `ready` with an `H264` track of the fixture's profile.
 - **By hand.** `scripts/mediamtx.sh start` prints `WHIP_URL`, `WHEP_URL`, `API_URL`, the PID and
   the log path; `stop` kills the recorded PID; `status` reports it. `MEDIAMTX_STATE` moves its
   state dir. Like the Rust tests, the script exits 3 with a message when there is no binary.
@@ -126,34 +128,47 @@ MediaMTX's `MTX_*` environment overrides instead.
 Run it: `MEDIAMTX_BIN=/path/to/mediamtx cargo test -p simee-rtc --test mediamtx` (on Linux add
 `--features rust-crypto`, or the publisher tests skip for lack of DTLS; the harness test still runs).
 
-#### CI step to add
+#### In CI
 
-Not wired yet (this change touches no workflow). The step for the macOS and Linux jobs, with the
-binary verified by hash and cached; fill in the SHA-256 of each archive from the release's
-`checksums.sha256` before merging:
+CI's `mediamtx` job (`.github/workflows/ci.yml`) runs all of `simee-rtc`'s tests with
+`--features rust-crypto` against MediaMTX v1.19.2, so the publisher's end-to-end tests (WHIP to
+the fake server, the input channel, MediaMTX) run on Linux; the `linux` job builds without a DTLS
+backend, where they skip. `scripts/mediamtx-fetch.sh` is the one place with the pin: the version
+and the SHA-256 of each release archive, taken from the release's `checksums.sha256`.
 
-```yaml
-env:
-  MEDIAMTX_VERSION: v1.19.2   # pinned; bump with the hashes below
-- name: MediaMTX
-  run: |
-    case "$RUNNER_OS-$RUNNER_ARCH" in
-      Linux-X64)    asset=linux_amd64;  sha=<SHA256_LINUX_AMD64> ;;
-      macOS-ARM64)  asset=darwin_arm64; sha=<SHA256_DARWIN_ARM64> ;;
-      *) echo "no MediaMTX pin for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
-    esac
-    f="mediamtx_${MEDIAMTX_VERSION}_${asset}.tar.gz"
-    dir="$RUNNER_TEMP/mediamtx"
-    mkdir -p "$dir"
-    curl -fsSL -o "$dir/$f" "https://github.com/bluenviron/mediamtx/releases/download/${MEDIAMTX_VERSION}/$f"
-    echo "$sha  $dir/$f" | shasum -a 256 -c -
-    tar -xzf "$dir/$f" -C "$dir" mediamtx
-    echo "MEDIAMTX_BIN=$dir/mediamtx" >> "$GITHUB_ENV"
-```
+| Archive | SHA-256 |
+| --- | --- |
+| `mediamtx_v1.19.2_linux_amd64.tar.gz` | `f9c601cc303ceca8fad2883917b022882672c5bc56311e92dbceb16e5f20c60c` |
+| `mediamtx_v1.19.2_linux_arm64.tar.gz` | `562f419912a8668c18216a9e8c95359ec82fbb754e4a44e2953ef62b98eec688` |
+| `mediamtx_v1.19.2_darwin_arm64.tar.gz` | `c225e46ab65295f95ee9fcda75703129c07add8852483abda09299a78524391f` |
+| `mediamtx_v1.19.2_darwin_amd64.tar.gz` | `b8851bf53d1e0d6d078240d54e78517a3a239b40040b22cddddf5a0ef2712c17` |
 
-Cache `$RUNNER_TEMP/mediamtx` with `actions/cache`, keyed on the version and the asset, restoring
-before the step and re-checking the hash after. The `linux` job needs `--features rust-crypto` for
-the publisher tests to run rather than skip (see "Linux in CI" below).
+The script checks the archive against its pin on every run and unpacks the binary only from a
+verified archive; a mismatch deletes it and fails. By hand: `export
+MEDIAMTX_BIN=$(scripts/mediamtx-fetch.sh)` (cached under `~/.cache/simee`). To bump MediaMTX,
+change the version and the four hashes there, nothing else. The job sets `SIMEE_REQUIRE_MEDIAMTX`,
+which turns a skipped MediaMTX test (no binary, no DTLS backend) into a failure, so a broken
+download can't go green; a `MEDIAMTX_BIN` that names no file always fails.
+
+The archive is not cached with `actions/cache`: the download, check and unpack take about 1.4 s,
+a cache restore costs about that, and the repository's Actions cache is full. The job's build
+(`rust-crypto` compiles aws-lc) is cached by `rust-cache` like the others, saved from `main`.
+macOS jobs don't run MediaMTX; the darwin pins are there for a Mac running the script.
+
+What the first real run (v1.19.2, Linux amd64) settled:
+
+- The harness's guesses held: the `MTX_WEBRTCADDRESS`, `MTX_APIADDRESS`,
+  `MTX_WEBRTCLOCALUDPADDRESS` and `MTX_WEBRTCLOCALTCPADDRESS` overrides move the listeners (the
+  log says so), `GET /v3/config/global/get` answers when the API is up, an unknown path is `404`
+  with `{"status":"error","error":"path not found"}`, and a published path reads
+  `{"name":...,"ready":true,"source":{"type":"webRTCSession",...},"tracks":["H264"],"tracks2":[{"codec":"H264",
+  "codecProps":{"width":96,"height":64,"profile":"Main","level":"3.1"}}],"inboundBytes":1684,...}`.
+- The test now asserts more of that: a WebRTC source, a single H264 track, MediaMTX's own reading
+  of the SPS profile (`Baseline` for the Constrained Baseline fixture, `Main` for the Main one: the
+  profiles `Publisher` negotiated reach the server intact) and bytes received.
+- The start waits for the WebRTC listener as well as the API, and retries on new ports when one
+  was taken between choosing it and MediaMTX binding it.
+- 30 runs of the MediaMTX tests, four at a time, passed with no process or temp dir left behind.
 
 ### Input over a data channel (#271)
 
@@ -166,12 +181,12 @@ publisher's thread, which hands validated events to an `InputSink` (`fn input(&m
 short: it runs where the media is sent. `stream_start {input: true}` wires one to a simee device
 ("Streams from the API" below).
 
-The channel only reaches a viewer whose peer connection ends at the publisher. MediaMTX relays
-tracks between WHIP and WHEP and, as far as its documentation says, not data channels; whether it
-accepts an offer with an `m=application` section at all hasn't been run against it yet (the
-MediaMTX harness publishes with plain `connect`). `stream_start` offers the channel to whatever
-endpoint `whip_url` names; input for a MediaMTX viewer likely still needs a direct peer
-connection or a relay of its own, which isn't built.
+The channel only reaches a viewer whose peer connection ends at the publisher. MediaMTX doesn't
+relay it, and doesn't ignore it either: v1.19.2 refuses an offer with an `m=application` section
+(`406`, `{"status":"error","error":"unsupported media 'application'"}`, run by
+`mediamtx_refuses_the_input_channel_offer`). So `connect_with_input`, and `stream_start {input:
+true}`, fail against a MediaMTX endpoint; start the stream without input there. Input for a
+MediaMTX viewer needs a direct peer connection or a relay of its own, which isn't built.
 
 **Messages** are one compact JSON object per text frame. Every message has `"v":1` (the version)
 and a `kind`; `seq` (an integer) and `t` (the viewer's time in milliseconds, any clock, e.g.
@@ -618,7 +633,7 @@ it. A real stream end to end (Chromium over WHEP) is #268's.
   of RFC 9725 §4.6 (ICE servers) are not read. Trickle ICE is in the client but the publisher
   doesn't need it with host candidates gathered up front.
 - **Linux in CI.** The `linux` job tests without `rust-crypto`, so the publisher's end-to-end
-  tests skip there (macOS runs them).
+  tests skip there; the `mediamtx` job runs them with it (macOS runs them too, without MediaMTX).
 - **Reconnects.** A publisher reports `Disconnected`; publishing again is a new publisher with a
   new WHIP resource. A stream whose peer disconnects ends (`state: "ended"`); starting it again is
   the client's `stream_start`.

@@ -237,6 +237,12 @@ fn run_receiver(mut rtc: Rtc, socket: UdpSocket, local: SocketAddr, frames: &Sen
     }
 }
 
+/// Print why a MediaMTX test is skipped, or fail it when `SIMEE_REQUIRE_MEDIAMTX` is set.
+pub fn skip(reason: &str) {
+    assert!(std::env::var_os("SIMEE_REQUIRE_MEDIAMTX").is_none(), "SIMEE_REQUIRE_MEDIAMTX is set, but: {reason}");
+    eprintln!("SKIP: {reason}");
+}
+
 /// The MediaMTX test config; the harness starts the server on free ports through MTX_* overrides.
 const MEDIAMTX_CONFIG: &str = include_str!("../../../../tests/mediamtx/mediamtx.yml");
 
@@ -253,26 +259,43 @@ pub struct MediaMtx {
 static MEDIAMTX_RUNS: AtomicUsize = AtomicUsize::new(0);
 
 impl MediaMtx {
-    /// The binary to run: `$MEDIAMTX_BIN`, else `mediamtx` on PATH. Nothing is downloaded.
+    /// The binary to run: `$MEDIAMTX_BIN` (which must exist: a path that doesn't is a mistake,
+    /// not a reason to skip), else `mediamtx` on PATH. Nothing is downloaded.
     pub fn find() -> Option<PathBuf> {
         if let Some(bin) = std::env::var_os("MEDIAMTX_BIN") {
             let bin = PathBuf::from(bin);
-            return bin.is_file().then_some(bin);
+            assert!(bin.is_file(), "MEDIAMTX_BIN={} is not a file", bin.display());
+            return Some(bin);
         }
         std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join("mediamtx")).find(|p| p.is_file())
     }
 
-    /// `find`, or print why the test is skipped.
+    /// `find`, or print why the test is skipped. With `SIMEE_REQUIRE_MEDIAMTX` set (CI sets it) a
+    /// missing binary fails the test instead, so a broken download step can't go green.
     pub fn find_or_skip() -> Option<PathBuf> {
         let bin = Self::find();
         if bin.is_none() {
-            eprintln!("SKIP: no MediaMTX (set MEDIAMTX_BIN or put mediamtx on PATH; see docs/streaming.md)");
+            skip("no MediaMTX (set MEDIAMTX_BIN or put mediamtx on PATH; see docs/streaming.md)");
         }
         bin
     }
 
-    /// Start it and wait until its API answers; `Err` carries the log when it dies or stalls.
+    /// Start it and wait until its API answers and its WebRTC listener accepts; `Err` carries the
+    /// log when it dies or stalls. The ports are picked free and released before MediaMTX binds
+    /// them (nextest runs each test in its own process, so another test can take one in between):
+    /// a start that dies on "address already in use" is tried again on new ports.
     pub fn start(bin: &Path) -> Result<MediaMtx, String> {
+        let mut last = String::new();
+        for _ in 0..3 {
+            match Self::start_once(bin) {
+                Err(e) if e.contains("address already in use") => last = e,
+                other => return other,
+            }
+        }
+        Err(last)
+    }
+
+    fn start_once(bin: &Path) -> Result<MediaMtx, String> {
         let dir =
             std::env::temp_dir().join(format!("simee-mediamtx-{}-{}", std::process::id(), MEDIAMTX_RUNS.fetch_add(1, Ordering::SeqCst)));
         std::fs::create_dir_all(&dir).map_err(|e| format!("temp dir: {e}"))?;
@@ -298,7 +321,9 @@ impl MediaMtx {
             if let Ok(Some(status)) = mtx.child.try_wait() {
                 return Err(format!("mediamtx exited during startup ({status}):\n{}", mtx.log()));
             }
-            if matches!(mtx.api_get("/v3/config/global/get"), Some((200, _))) {
+            // MediaMTX starts its WebRTC server before its API, but the tests publish to the
+            // former: check both rather than lean on that order.
+            if matches!(mtx.api_get("/v3/config/global/get"), Some((200, _))) && mtx.webrtc_listening() {
                 return Ok(mtx);
             }
             if Instant::now() > end {
@@ -306,6 +331,11 @@ impl MediaMtx {
             }
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Whether the WebRTC (WHIP/WHEP) HTTP listener accepts connections.
+    fn webrtc_listening(&self) -> bool {
+        TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], self.webrtc_port)), Duration::from_secs(2)).is_ok()
     }
 
     pub fn pid(&self) -> u32 {
@@ -335,8 +365,11 @@ impl MediaMtx {
         Some((status, body.to_owned()))
     }
 
-    /// The API's description of a path, whitespace stripped so `"ready":true` matches, once the
-    /// path exists and is ready (a publisher is connected and its tracks are known).
+    /// The API's description of a path (`GET /v3/paths/get/<name>`, v1.19.2: `name`, `ready`,
+    /// `source {type, id}`, `tracks`, `tracks2 [{codec, codecProps {width, height, profile,
+    /// level}}]`, `inboundBytes`, ...), whitespace stripped so `"ready":true` matches, once the
+    /// path exists and is ready (a publisher is connected and its tracks are known). An unknown
+    /// path is a 404 with `{"status":"error","error":"path not found"}`.
     pub fn ready_path(&self, name: &str) -> Option<String> {
         let (status, body) = self.api_get(&format!("/v3/paths/get/{name}"))?;
         let body: String = body.split_whitespace().collect();
