@@ -410,6 +410,9 @@ fn boot(
 
     let avd = env.load(name)?;
     let inst = instance::Instance::prepare(&avd, opts)?;
+    opts.camera_links(|k| avd.get(k).map(str::to_string))
+        .into_iter()
+        .for_each(|(f, s)| emu_vmm::pipe::camera::Cameras::global().link(f, s));
     {
         // An adb server finds emulators by scanning adb ports 5555..5585 (16 instances, unless
         // started with ADB_LOCAL_TRANSPORT_MAX_PORT), or by being told (`host:emulator:<port>`,

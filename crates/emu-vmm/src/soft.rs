@@ -403,7 +403,7 @@ fn registry(
         r.register("qemud:car", Box::new(pipe::car::CarService { car: car.clone() }));
     }
     r.register("multidisplay", Box::new(pipe::misc::Silent("multidisplay")));
-    r.register("qemud:camera", Box::new(pipe::fingerprint::CameraService));
+    r.register("qemud:camera", Box::new(pipe::camera::CameraService::new(None)));
     r
 }
 

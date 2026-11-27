@@ -1,0 +1,687 @@
+//! `qemud:camera`: the goldfish camera HAL's host service, fed by simee camera sources.
+//!
+//! The guest's camera provider opens `qemud:camera` (the factory) and asks `list`; each linked
+//! camera is a line `name=<n> channel=0 pix=<fourcc> dir=<back|front> framedims=<WxH,...>`. A
+//! camera session is a pipe of its own, `qemud:camera:name=<n>`, taking `connect`, `start
+//! dim=WxH pix=<fourcc>`, `frame ...`, `stop` and `disconnect`. Every query is NUL-terminated;
+//! every reply is an 8-hex-digit length and a payload starting `ok` or `ko` (`ok:<data>`,
+//! `ko:<reason>`, a bare `ok` NUL-terminated).
+//!
+//! Frames come two ways, by the image's HAL:
+//! - `frame video=<bytes> preview=<bytes> ...` (the libhardware HAL, API 30–33): the reply carries
+//!   the frame in the started format, then an RGB32 preview, after `ok:`;
+//! - `frame dim=WxH pix=<fourcc> offset=<n> ...` (both HALs; the only way on API 34+'s AIDL
+//!   provider): the host writes the frame into the gralloc buffer at `offset` in the goldfish
+//!   address-space area and answers `ok`.
+//!
+//! Each camera follows a link ([`Cameras::link`]) to a sim-camera source, set at start from
+//! `-camera-back` / `-camera-front` and changeable while the guest has the camera open: the
+//! session resubscribes at the size it is open at, so a relink never changes what the guest sees
+//! but the pixels. Captures go through one [`Hub`], so two cameras on one source share it.
+//!
+//! The guest's pipe transport serves every pipe on one thread, so each session answers from a
+//! thread of its own: waiting for a source's first frame and converting it never stall adb.
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread;
+use std::time::Duration;
+
+use emu_hvf::GuestRam;
+pub use sim_camera::SourceSpec;
+use sim_camera::{CameraFrame, FrameSpec, HostOpener, Hub, Subscription};
+use sim_core::yuv::{self, CameraFormat};
+
+use super::{HostMsg, PipeCtx, PipeHandler, PipeService};
+
+/// Frame sizes `list` offers for every camera; sources are scaled to whichever the guest starts.
+pub const FRAME_DIMS: &str = "1280x720,640x480,352x288,320x240,176x144";
+
+/// The rate sessions subscribe at; the guest's own requests pace what it gets.
+const FPS: u32 = 30;
+
+/// How long a fresh subscription may take to deliver its first frame before the guest gets black.
+const FIRST_FRAME: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Facing {
+    Back,
+    Front,
+}
+
+impl Facing {
+    pub const ALL: [Facing; 2] = [Facing::Back, Facing::Front];
+
+    /// `dir=` in `list`, and the console's name for it.
+    pub fn dir(self) -> &'static str {
+        match self {
+            Facing::Back => "back",
+            Facing::Front => "front",
+        }
+    }
+
+    /// The device name `list` reports; the HAL opens `qemud:camera:name=<it>`.
+    pub fn device_name(self) -> &'static str {
+        match self {
+            Facing::Back => "simee-back",
+            Facing::Front => "simee-front",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Facing> {
+        Facing::ALL.into_iter().find(|f| f.dir() == s || f.device_name() == s)
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// A stock camera value (`-camera-back`, `-camera-front`, `hw.camera.back` in config.ini) as a
+/// link: `none` (or empty) is no camera; `emulated` and `virtualscene` are the test card (stock
+/// draws its own scene; simee's is `pattern:testcard`); anything else is a simee source id, and
+/// `webcam0`, `webcam1`, ... are the host's cameras by index, as stock numbers them.
+pub fn parse_link(value: &str) -> Result<Option<SourceSpec>, String> {
+    match value.trim() {
+        "" | "none" => Ok(None),
+        "emulated" | "virtualscene" => Ok(Some(SourceSpec::Pattern(sim_camera::Pattern::Testcard))),
+        v => SourceSpec::parse(v).map(Some).map_err(|e| e.to_string()),
+    }
+}
+
+#[derive(Clone, Default)]
+struct Link {
+    source: Option<SourceSpec>,
+    /// Bumped by every [`Cameras::link`], so open sessions notice a relink.
+    generation: u64,
+}
+
+/// The emulator's cameras: what each one is linked to, and the capture hub that feeds them.
+pub struct Cameras {
+    links: Mutex<[Link; 2]>,
+    hub: OnceLock<Hub>,
+}
+
+impl Default for Cameras {
+    fn default() -> Cameras {
+        Cameras { links: Mutex::new(Default::default()), hub: OnceLock::new() }
+    }
+}
+
+impl Cameras {
+    /// The process's cameras (one emulator per process), which the pipe service and the console
+    /// share.
+    pub fn global() -> Arc<Cameras> {
+        static GLOBAL: OnceLock<Arc<Cameras>> = OnceLock::new();
+        GLOBAL.get_or_init(Arc::default).clone()
+    }
+
+    /// Links `facing` to `source` (`None`: no camera). A session the guest has open switches to
+    /// it on its next frame, at the size it is open at.
+    pub fn link(&self, facing: Facing, source: Option<SourceSpec>) {
+        let mut links = self.lock();
+        let link = &mut links[facing.index()];
+        link.source = source;
+        link.generation += 1;
+    }
+
+    pub fn linked(&self, facing: Facing) -> Option<SourceSpec> {
+        self.lock()[facing.index()].source.clone()
+    }
+
+    fn current(&self, facing: Facing) -> Link {
+        self.lock()[facing.index()].clone()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, [Link; 2]> {
+        self.links.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn hub(&self) -> &Hub {
+        self.hub.get_or_init(|| Hub::new(HostOpener::new()))
+    }
+
+    /// The cameras `list` reports, in its order (back first).
+    fn listed(&self) -> Vec<Facing> {
+        let links = self.lock();
+        Facing::ALL.into_iter().filter(|f| links[f.index()].source.is_some()).collect()
+    }
+
+    /// `list`'s reply data: one line per linked camera.
+    fn list(&self) -> String {
+        self.listed()
+            .into_iter()
+            .map(|f| {
+                format!("name={} channel=0 pix={} dir={} framedims={FRAME_DIMS}\n", f.device_name(), CameraFormat::Nv21.fourcc(), f.dir())
+            })
+            .collect()
+    }
+
+    /// The camera a session's pipe parameter names: `name=<device name>` as the HAL sends it, a
+    /// bare name or direction, or an index into `list`.
+    fn session_facing(&self, param: &str) -> Option<Facing> {
+        let name = token(param, "name").unwrap_or(param.trim());
+        Facing::parse(name).or_else(|| name.parse::<usize>().ok().and_then(|i| self.listed().get(i).copied()))
+    }
+}
+
+/// `key=value` from a space-separated query or parameter.
+fn token<'a>(s: &'a str, key: &str) -> Option<&'a str> {
+    s.split_whitespace().find_map(|t| t.strip_prefix(key)?.strip_prefix('='))
+}
+
+fn dims(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
+}
+
+/// A reply: its length in 8 hex digits, then the payload.
+fn reply(payload: &[u8]) -> Vec<u8> {
+    let mut out = format!("{:08x}", payload.len()).into_bytes();
+    out.extend_from_slice(payload);
+    out
+}
+
+fn ok() -> Vec<u8> {
+    reply(b"ok\0")
+}
+
+fn ko(why: &str) -> Vec<u8> {
+    reply(format!("ko:{why}\0").as_bytes())
+}
+
+fn log_frames() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("EMU_CAMERA_LOG").is_some_and(|v| v != "0"))
+}
+
+pub struct CameraService {
+    cameras: Arc<Cameras>,
+    /// The goldfish address-space area, where `offset=` frames go (None without graphics).
+    area: Option<Arc<GuestRam>>,
+}
+
+impl CameraService {
+    /// The service for this process's cameras ([`Cameras::global`]).
+    pub fn new(area: Option<Arc<GuestRam>>) -> CameraService {
+        CameraService::with(Cameras::global(), area)
+    }
+
+    pub fn with(cameras: Arc<Cameras>, area: Option<Arc<GuestRam>>) -> CameraService {
+        CameraService { cameras, area }
+    }
+}
+
+impl PipeService for CameraService {
+    fn open(&self, name: &str, ctx: PipeCtx) -> Option<Box<dyn PipeHandler>> {
+        if name == "qemud:camera" {
+            return Some(Box::new(FactoryPipe { cameras: self.cameras.clone(), buf: Vec::new() }));
+        }
+        let param = name.strip_prefix("qemud:camera:")?;
+        let facing = self.cameras.session_facing(param);
+        eprintln!("emu: camera: the guest opened {name:?} ({})", facing.map_or("no such camera", Facing::dir));
+        let (tx, rx) = mpsc::channel();
+        let session = Session::new(facing, self.cameras.clone(), self.area.clone());
+        let label = facing.map_or("camera", |f| f.dir());
+        thread::Builder::new().name(format!("camera {label}")).spawn(move || serve(session, rx, ctx)).ok()?;
+        Some(Box::new(SessionPipe { tx, buf: Vec::new() }))
+    }
+}
+
+/// Takes the NUL-terminated queries out of `buf`.
+fn queries(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some(nul) = buf.iter().position(|&b| b == 0) {
+        let q: Vec<u8> = buf.drain(..=nul).collect();
+        out.push(String::from_utf8_lossy(&q[..q.len() - 1]).into_owned());
+    }
+    out
+}
+
+/// A query longer than this without its NUL isn't the camera protocol: the pipe closes.
+const MAX_QUERY: usize = 4096;
+
+struct FactoryPipe {
+    cameras: Arc<Cameras>,
+    buf: Vec<u8>,
+}
+
+impl PipeHandler for FactoryPipe {
+    fn guest_data(&mut self, data: &[u8], to_guest: &mut Vec<u8>) -> bool {
+        self.buf.extend_from_slice(data);
+        for q in queries(&mut self.buf) {
+            eprintln!("emu: camera: factory query {q:?}");
+            match q.split_whitespace().next() {
+                Some("list") => {
+                    let list = self.cameras.list();
+                    if list.is_empty() {
+                        to_guest.extend(ok());
+                    } else {
+                        to_guest.extend(reply(format!("ok:{list}\0").as_bytes()));
+                    }
+                }
+                _ => to_guest.extend(ko("unknown query")),
+            }
+        }
+        self.buf.len() < MAX_QUERY
+    }
+
+    fn host_msg(&mut self, msg: HostMsg, _to_guest: &mut Vec<u8>) -> bool {
+        !matches!(msg, HostMsg::Close)
+    }
+}
+
+/// A camera session's pipe: queries go to its thread, replies come back as host messages.
+struct SessionPipe {
+    tx: Sender<String>,
+    buf: Vec<u8>,
+}
+
+impl PipeHandler for SessionPipe {
+    fn guest_data(&mut self, data: &[u8], _to_guest: &mut Vec<u8>) -> bool {
+        self.buf.extend_from_slice(data);
+        for q in queries(&mut self.buf) {
+            if self.tx.send(q).is_err() {
+                return false;
+            }
+        }
+        self.buf.len() < MAX_QUERY
+    }
+
+    fn host_msg(&mut self, msg: HostMsg, to_guest: &mut Vec<u8>) -> bool {
+        match msg {
+            HostMsg::Data(d) => {
+                to_guest.extend_from_slice(&d);
+                true
+            }
+            HostMsg::Close | HostMsg::Attach(_) => false,
+        }
+    }
+}
+
+/// A session's thread: answers queries in order until the pipe closes (its sender drops), which
+/// drops the subscription and so stops the capture if nobody else watches the source.
+fn serve(mut session: Session, rx: Receiver<String>, ctx: PipeCtx) {
+    while let Ok(q) = rx.recv() {
+        if !ctx.send(HostMsg::Data(session.handle(&q))) {
+            break;
+        }
+    }
+}
+
+/// What a started camera is fed by: a subscription at the size the guest opened it at, for one
+/// generation of its link.
+struct Feed {
+    width: u32,
+    height: u32,
+    generation: u64,
+    sub: Option<Subscription>,
+    /// The newest frame: answered again when no newer one has come, and kept across a relink
+    /// until the new source delivers.
+    last: Option<CameraFrame>,
+}
+
+struct Started {
+    width: u32,
+    height: u32,
+    format: CameraFormat,
+}
+
+struct Session {
+    facing: Option<Facing>,
+    cameras: Arc<Cameras>,
+    area: Option<Arc<GuestRam>>,
+    started: Option<Started>,
+    feed: Option<Feed>,
+    /// Frame queries logged since the last start (the first few are, always).
+    frames_logged: u32,
+}
+
+impl Session {
+    fn new(facing: Option<Facing>, cameras: Arc<Cameras>, area: Option<Arc<GuestRam>>) -> Session {
+        Session { facing, cameras, area, started: None, feed: None, frames_logged: 0 }
+    }
+
+    fn label(&self) -> &'static str {
+        self.facing.map_or("?", Facing::dir)
+    }
+
+    /// One query's full reply.
+    fn handle(&mut self, query: &str) -> Vec<u8> {
+        let (verb, param) = query.split_once(' ').unwrap_or((query, ""));
+        if verb != "frame" || self.frames_logged < 3 || log_frames() {
+            eprintln!("emu: camera {}: {query:?}", self.label());
+            self.frames_logged += u32::from(verb == "frame");
+        }
+        let Some(facing) = self.facing else { return ko("no such camera") };
+        match verb {
+            "connect" => {
+                if self.cameras.linked(facing).is_none() {
+                    return ko("the camera has no source linked");
+                }
+                ok()
+            }
+            "disconnect" => {
+                self.started = None;
+                self.feed = None;
+                ok()
+            }
+            // API 34+'s provider starts with no parameters: each `frame` names its own size and
+            // format.
+            "start" if param.trim().is_empty() => ok(),
+            "start" => {
+                let Some((width, height)) = token(param, "dim").and_then(dims) else { return ko("invalid or missing 'dim'") };
+                let Some(pix) = token(param, "pix").and_then(|p| p.parse::<u32>().ok()) else { return ko("invalid or missing 'pix'") };
+                let Some(format) = CameraFormat::from_fourcc(pix) else {
+                    eprintln!("emu: camera {}: pixel format {pix} ({}) isn't supported", self.label(), fourcc_text(pix));
+                    return ko("unsupported pixel format");
+                };
+                if FrameSpec::new(width, height, FPS).is_err() {
+                    return ko("unsupported frame size");
+                }
+                self.started = Some(Started { width, height, format });
+                self.frames_logged = 0;
+                ok()
+            }
+            "stop" => {
+                self.started = None;
+                self.feed = None;
+                ok()
+            }
+            "frame" => self.frame(facing, param),
+            _ => ko("unknown query"),
+        }
+    }
+
+    fn frame(&mut self, facing: Facing, param: &str) -> Vec<u8> {
+        if let Some(offset) = token(param, "offset").and_then(|o| o.parse::<u64>().ok()) {
+            return self.frame_to_buffer(facing, param, offset);
+        }
+        let Some(st) = &self.started else { return ko("camera is not started") };
+        let (width, height, format) = (st.width, st.height, st.format);
+        let size = |key| token(param, key).and_then(|v| v.parse::<usize>().ok());
+        let (Some(video), Some(preview)) = (size("video"), size("preview")) else {
+            return ko("invalid or missing 'video' or 'preview'");
+        };
+        let (w, h) = (width as usize, height as usize);
+        if (video != 0 && video != format.frame_size(w, h)) || (preview != 0 && preview != CameraFormat::Rgb32.frame_size(w, h)) {
+            return ko("frame size mismatch");
+        }
+        if video == 0 && preview == 0 {
+            return ok();
+        }
+        let frame = self.next_frame(facing, width, height);
+        let mut payload = Vec::with_capacity(3 + video + preview);
+        payload.extend_from_slice(b"ok:");
+        for (len, fmt) in [(video, format), (preview, CameraFormat::Rgb32)] {
+            if len > 0 {
+                let at = payload.len();
+                payload.resize(at + len, 0);
+                yuv::from_bgra(&frame, w, h, fmt, &mut payload[at..]);
+            }
+        }
+        reply(&payload)
+    }
+
+    /// `frame dim=WxH pix=<fourcc> offset=<n>`: the frame goes into the guest buffer at `offset`
+    /// in the address-space area (a guest-physical address is accepted too).
+    fn frame_to_buffer(&mut self, facing: Facing, param: &str, offset: u64) -> Vec<u8> {
+        let Some(area) = self.area.clone() else { return ko("no address space for offset frames") };
+        let started = self.started.as_ref().map(|s| (s.width, s.height, s.format.fourcc()));
+        let (width, height) = token(param, "dim").and_then(dims).or(started.map(|s| (s.0, s.1))).unwrap_or((0, 0));
+        let pix = token(param, "pix").and_then(|p| p.parse::<u32>().ok()).or(started.map(|s| s.2)).unwrap_or(0);
+        let Some(format) = CameraFormat::from_fourcc(pix) else {
+            eprintln!("emu: camera {}: pixel format {pix} ({}) isn't supported", self.label(), fourcc_text(pix));
+            return ko("unsupported pixel format");
+        };
+        if FrameSpec::new(width, height, FPS).is_err() {
+            return ko("unsupported frame size");
+        }
+        let frame = self.next_frame(facing, width, height);
+        let Some(bytes) = yuv::convert(&frame, width as usize, height as usize, format) else { return ko("conversion failed") };
+        let addr = if offset >= area.base() { offset } else { area.base() + offset };
+        match area.write(addr, &bytes) {
+            Ok(()) => ok(),
+            Err(e) => {
+                eprintln!("emu: camera {}: frame at offset {offset:#x} ({} bytes): {e:?}", self.label(), bytes.len());
+                ko("offset out of range")
+            }
+        }
+    }
+
+    /// The newest frame of the linked source as BGRA at `width` x `height`: resubscribing when the
+    /// size or the link changed, black when there's no source or it has delivered nothing yet.
+    fn next_frame(&mut self, facing: Facing, width: u32, height: u32) -> Arc<[u8]> {
+        let link = self.cameras.current(facing);
+        let stale = self.feed.as_ref().is_none_or(|f| (f.width, f.height, f.generation) != (width, height, link.generation));
+        if stale {
+            // Keep the old frame across a relink (not a resize) until the new source delivers.
+            let last = self.feed.take().filter(|f| (f.width, f.height) == (width, height)).and_then(|f| f.last);
+            let sub = link.source.as_ref().and_then(|source| {
+                let spec = FrameSpec::new(width, height, FPS).ok()?;
+                match self.cameras.hub().subscribe(source, spec) {
+                    Ok(sub) => {
+                        eprintln!("emu: camera {}: {source} at {width}x{height}", self.label());
+                        Some(sub)
+                    }
+                    Err(e) => {
+                        eprintln!("emu: camera {}: can't open {source}: {e}", self.label());
+                        None
+                    }
+                }
+            });
+            let mut feed = Feed { width, height, generation: link.generation, sub, last };
+            if let Some(sub) = &feed.sub
+                && let Ok(Some(first)) = sub.recv_timeout(FIRST_FRAME)
+            {
+                feed.last = Some(first);
+            }
+            self.feed = Some(feed);
+        }
+        let label = self.label();
+        let feed = self.feed.as_mut().expect("set above");
+        if let Some(sub) = &feed.sub {
+            loop {
+                match sub.try_recv() {
+                    Ok(Some(f)) => feed.last = Some(f),
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("emu: camera {label}: {e}");
+                        feed.sub = None;
+                        break;
+                    }
+                }
+            }
+        }
+        match &feed.last {
+            Some(f) if (f.width, f.height) == (width, height) => f.bgra.clone(),
+            Some(f) => f.fit(width, height).bgra,
+            None => vec![0; width as usize * height as usize * 4].into(),
+        }
+    }
+}
+
+/// A fourcc as its four characters, for logs.
+fn fourcc_text(code: u32) -> String {
+    code.to_le_bytes().iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '?' }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipe::WorkerEvent;
+
+    fn nv21() -> u32 {
+        CameraFormat::Nv21.fourcc()
+    }
+
+    fn cameras(back: Option<&str>, front: Option<&str>) -> Arc<Cameras> {
+        let c = Arc::new(Cameras::default());
+        c.link(Facing::Back, back.map(|s| SourceSpec::parse(s).expect("source")));
+        c.link(Facing::Front, front.map(|s| SourceSpec::parse(s).expect("source")));
+        c
+    }
+
+    /// The payload of one reply, checking its length prefix.
+    fn payload(r: &[u8]) -> &[u8] {
+        let len = usize::from_str_radix(std::str::from_utf8(&r[..8]).expect("hex"), 16).expect("len");
+        assert_eq!(r.len(), 8 + len, "length prefix");
+        &r[8..]
+    }
+
+    #[test]
+    fn stock_values_map_to_links() {
+        assert_eq!(parse_link("none"), Ok(None));
+        assert_eq!(parse_link(""), Ok(None));
+        let card = Some(SourceSpec::parse("pattern:testcard").expect("card"));
+        assert_eq!(parse_link("emulated"), Ok(card.clone()));
+        assert_eq!(parse_link("virtualscene"), Ok(card.clone()));
+        assert_eq!(parse_link("pattern:testcard"), Ok(card));
+        assert_eq!(parse_link("qr:hello"), Ok(Some(SourceSpec::Qr("hello".into()))));
+        assert_eq!(parse_link("webcam0"), Ok(Some(SourceSpec::Webcam("webcam0".into()))), "resolved by index when it opens");
+        assert!(parse_link("bogus:x").is_err());
+    }
+
+    #[test]
+    fn list_without_links_is_empty() {
+        let (tx, _rx) = mpsc::channel();
+        let svc = CameraService::with(cameras(None, None), None);
+        let mut p = svc.open("qemud:camera", PipeCtx { conn: 1, events: tx }).expect("open");
+        let mut out = Vec::new();
+        assert!(p.guest_data(b"li", &mut out));
+        assert!(out.is_empty(), "waits for the NUL");
+        assert!(p.guest_data(b"st\0connect\0", &mut out));
+        assert_eq!(out, [&b"00000003ok\x00"[..], b"00000011ko:unknown query\x00"].concat());
+    }
+
+    #[test]
+    fn list_reports_linked_cameras() {
+        let (tx, _rx) = mpsc::channel();
+        let svc = CameraService::with(cameras(None, Some("qr:hi")), None);
+        let mut p = svc.open("qemud:camera", PipeCtx { conn: 1, events: tx.clone() }).expect("open");
+        let mut out = Vec::new();
+        p.guest_data(b"list\0", &mut out);
+        let want = format!("ok:name=simee-front channel=0 pix=825382478 dir=front framedims={FRAME_DIMS}\n\0");
+        assert_eq!(payload(&out), want.as_bytes());
+
+        let both = cameras(Some("pattern:testcard"), Some("qr:hi"));
+        let list = both.list();
+        let lines: Vec<&str> = list.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("name=simee-back ") && lines[0].contains(" dir=back "), "back first: {list}");
+        assert!(lines[1].contains(" dir=front "));
+        assert_eq!(both.session_facing("name=simee-front"), Some(Facing::Front));
+        assert_eq!(both.session_facing("1"), Some(Facing::Front), "an index into list");
+        assert_eq!(both.session_facing("name=webcam7"), None);
+    }
+
+    #[test]
+    fn session_streams_the_started_format() {
+        let c = cameras(Some("solid:red"), None);
+        let mut s = Session::new(Some(Facing::Back), c, None);
+        assert_eq!(s.handle("connect"), ok());
+        assert_eq!(payload(&s.handle("frame video=4608 preview=0")), b"ko:camera is not started\0");
+        assert_eq!(payload(&s.handle(&format!("start dim=64x48 pix={nv21}", nv21 = nv21()))), b"ok\0");
+        assert_eq!(payload(&s.handle("start dim=64x48 pix=1448695129")), b"ko:unsupported pixel format\0", "YUYV");
+        assert_eq!(payload(&s.handle("start dim=64x48")), b"ko:invalid or missing 'pix'\0");
+        assert_eq!(payload(&s.handle("frame video=100 preview=0 whiteb=1,1,1 expcomp=1 time=0")), b"ko:frame size mismatch\0");
+
+        let r = s.handle("frame video=4608 preview=12288 whiteb=1,1,1 expcomp=1 time=0");
+        let p = payload(&r);
+        assert_eq!(&p[..3], b"ok:");
+        let (video, preview) = p[3..].split_at(4608);
+        assert!(video[..64 * 48].iter().all(|&y| y == 82), "red luma");
+        assert!(video[64 * 48..].chunks(2).all(|vu| vu == [240, 90]), "red V,U");
+        assert!(preview.chunks(4).all(|px| px == [255, 0, 0, 255]), "RGBA preview");
+
+        assert_eq!(payload(&s.handle("stop")), b"ok\0");
+        assert_eq!(payload(&s.handle("disconnect")), b"ok\0");
+    }
+
+    #[test]
+    fn unlinked_and_unknown_cameras_refuse() {
+        let c = cameras(None, None);
+        assert_eq!(payload(&Session::new(Some(Facing::Front), c.clone(), None).handle("connect")), b"ko:the camera has no source linked\0");
+        assert_eq!(payload(&Session::new(None, c, None).handle("connect")), b"ko:no such camera\0");
+    }
+
+    fn luma_after(s: &mut Session, want: u8) -> bool {
+        // A relink shows within a second.
+        let t = std::time::Instant::now();
+        while t.elapsed() < Duration::from_secs(1) {
+            let r = s.handle("frame video=4608 preview=0");
+            if payload(&r)[3] == want {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn relink_keeps_the_open_size() {
+        let c = cameras(Some("solid:red"), Some("solid:blue"));
+        let mut back = Session::new(Some(Facing::Back), c.clone(), None);
+        let mut front = Session::new(Some(Facing::Front), c.clone(), None);
+        for s in [&mut back, &mut front] {
+            s.handle(&format!("start dim=64x48 pix={}", nv21()));
+        }
+        assert!(luma_after(&mut back, 82), "red");
+        assert!(luma_after(&mut front, 41), "blue: independent of the back camera");
+        c.link(Facing::Back, Some(SourceSpec::parse("qr:hello").expect("qr")));
+        let r = back.handle("frame video=4608 preview=0");
+        assert_eq!(payload(&r).len(), 3 + 4608, "same size after the relink");
+        assert!(luma_after(&mut back, 235), "the QR code's white quiet zone");
+        assert!(luma_after(&mut front, 41), "the front camera didn't move");
+        // Unlinked while open: the guest keeps getting frames of the open size (the last one).
+        c.link(Facing::Back, None);
+        assert_eq!(payload(&back.handle("frame video=4608 preview=0")).len(), 3 + 4608);
+    }
+
+    #[test]
+    fn offset_frames_go_into_the_area() {
+        let area = Arc::new(GuestRam::new(0x1_0000_0000, 1 << 20).expect("area"));
+        let c = cameras(Some("solid:blue"), None);
+        let mut s = Session::new(Some(Facing::Back), c.clone(), Some(area.clone()));
+        assert_eq!(payload(&s.handle("connect")), b"ok\0");
+        assert_eq!(payload(&s.handle("start")), b"ok\0", "API 34+: a bare start, sizes come per frame");
+        let rgb32 = CameraFormat::Rgb32.fourcc();
+        let q = format!("frame dim=32x32 pix={rgb32} offset=4096 whiteb=1,1,1 expcomp=1 time=0");
+        assert_eq!(payload(&s.handle(&q)), b"ok\0");
+        let mut px = [0u8; 8];
+        area.read(0x1_0000_0000 + 4096, &mut px).expect("read");
+        assert_eq!(px, [0, 0, 255, 255, 0, 0, 255, 255]);
+        // A guest-physical address works too, and NV21 into it.
+        let q = format!("frame dim=32x32 pix={} offset={} time=0", nv21(), 0x1_0000_0000u64 + 8192);
+        assert_eq!(payload(&s.handle(&q)), b"ok\0");
+        let mut y = [0u8; 2];
+        area.read(0x1_0000_0000 + 8192, &mut y).expect("read");
+        assert_eq!(y, [41, 41]);
+        let q = format!("frame dim=32x32 pix={rgb32} offset={}", 1u64 << 20);
+        assert_eq!(payload(&s.handle(&q)), b"ko:offset out of range\0");
+        let mut none = Session::new(Some(Facing::Back), c, None);
+        assert_eq!(payload(&none.handle(&q)), b"ko:no address space for offset frames\0");
+    }
+
+    #[test]
+    fn session_pipe_answers_from_its_thread() {
+        let (tx, rx) = mpsc::channel();
+        let svc = CameraService::with(cameras(Some("pattern:testcard"), None), None);
+        let mut p = svc.open("qemud:camera:name=simee-back", PipeCtx { conn: 9, events: tx }).expect("open");
+        let mut out = Vec::new();
+        assert!(p.guest_data(format!("connect\0start dim=320x240 pix={}\0frame video=115200 preview=0\0", nv21()).as_bytes(), &mut out));
+        assert!(out.is_empty(), "answered by the session thread");
+        let mut replies = Vec::new();
+        while replies.len() < 3 {
+            let Ok(WorkerEvent::Host { conn: 9, msg: HostMsg::Data(d) }) = rx.recv_timeout(Duration::from_secs(5)) else {
+                panic!("no reply")
+            };
+            assert!(p.host_msg(HostMsg::Data(d.clone()), &mut out));
+            replies.push(d);
+        }
+        assert_eq!(replies[0], ok());
+        assert_eq!(replies[1], ok());
+        assert_eq!(payload(&replies[2]).len(), 3 + 115_200);
+        assert_eq!(out, replies.concat());
+        assert!(!p.host_msg(HostMsg::Close, &mut out));
+    }
+}

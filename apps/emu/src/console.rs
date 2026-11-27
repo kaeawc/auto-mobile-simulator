@@ -505,7 +505,35 @@ const HELP: &[(&str, &str)] = &[
     ("frames", "number of frames presented (simee)"),
     ("xr", "Android XR head pose, room, input mode and pointer (simee)"),
     ("car", "get or set vehicle HAL properties on Automotive images (simee)"),
+    ("camera", "list or relink the back and front cameras' sources (simee)"),
 ];
+
+/// `camera list` (each camera's source) and `camera link <back|front> <source>`: a relink takes
+/// effect on the guest's next frame, at the size its camera is open at.
+fn camera(args: &[&str]) -> String {
+    use emu_vmm::pipe::camera::{Cameras, Facing, parse_link};
+    let cameras = Cameras::global();
+    match args {
+        ["list"] => {
+            let lines: Vec<String> = Facing::ALL
+                .iter()
+                .map(|&f| format!("{}: {}", f.dir(), cameras.linked(f).map_or("none".to_string(), |s| s.to_string())))
+                .collect();
+            format!("{}\r\nOK", lines.join("\r\n"))
+        }
+        ["link", facing, source @ ..] if !source.is_empty() => {
+            let Some(facing) = Facing::parse(facing) else { return "KO: no such camera (back or front)".into() };
+            match parse_link(&source.join(" ")) {
+                Ok(link) => {
+                    cameras.link(facing, link);
+                    "OK".into()
+                }
+                Err(e) => format!("KO: {e}"),
+            }
+        }
+        _ => "KO: usage: camera list | camera link back|front <source id>|emulated|none".into(),
+    }
+}
 
 fn token_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".emulator_console_auth_token"))
@@ -655,6 +683,8 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
             }
             _ => "KO: usage: finger touch <fingerid> | finger remove".into(),
         },
+        // simee extension: `camera list` / `camera link back|front <source id>|emulated|none`.
+        "camera" => camera(&words[1..]),
         // simee extension: `clipboard get` / `clipboard set <text>`.
         "clipboard" => match words.get(1).copied() {
             Some("get") => format!("{}\r\nOK", String::from_utf8_lossy(&info.clipboard.get())),

@@ -75,6 +75,9 @@ pub fn boot(
     }
 
     let inst = instance::Instance::prepare(&avd, opts)?;
+    opts.camera_links(|k| avd.get(k).map(str::to_string))
+        .into_iter()
+        .for_each(|(f, s)| emu_vmm::pipe::camera::Cameras::global().link(f, s));
     let adb_port = inst.console_port + 1;
     let _ = std::thread::Builder::new().name("adb-announce".into()).spawn(move || {
         loop {

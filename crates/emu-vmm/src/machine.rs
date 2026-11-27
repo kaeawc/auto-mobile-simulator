@@ -678,7 +678,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
             registry.register("qemud:car", Box::new(pipe::car::CarService { car: car.clone() }));
         }
         registry.register("multidisplay", Box::new(pipe::misc::Silent("multidisplay")));
-        registry.register("qemud:camera", Box::new(pipe::fingerprint::CameraService));
+        registry.register("qemud:camera", Box::new(pipe::camera::CameraService::new(as_area.clone())));
         // The GLES encoder's pipes on API 29–32 images, each to a render channel of its own.
         let gl_backend = cfg
             .gpu
