@@ -12,8 +12,9 @@ for both is to match the stock tools exactly and then exceed them.
   the features used; crates reference them with `{ workspace = true }`.
 - `unsafe` lives only in `crates/sim-coresim` (the Objective-C / IOSurface / VideoToolbox boundary),
   `crates/emu-hvf` (Hypervisor.framework and guest RAM), `crates/emu-kvm` (Linux KVM), `crates/emu-gfxstream` (the renderer),
-  `apps/emu`'s `shutdown_signals` (signal masks) and `desktop/src/surface.rs` (the zero-copy
-  bridge). Every `unsafe` block carries a `// SAFETY:` comment
+  `apps/emu`'s `shutdown_signals` (signal masks), `desktop/src/surface.rs` (the zero-copy
+  bridge) and `crates/sim-camera`'s `avf.rs` (AVFoundation capture) and `v4l2.rs` (Linux V4L2
+  ioctls). Every `unsafe` block carries a `// SAFETY:` comment
   (`clippy::undocumented_unsafe_blocks` is denied or warned there). Everything else forbids it.
 - Private service APIs are reached by selector/symbol lookup at runtime and checked with
   `respondsToSelector:` / `dlsym` first, so a missing API is an `Error::Unavailable`, never a crash.
