@@ -59,10 +59,14 @@ pub fn warm(lib64: &Path) -> (bool, bool, std::time::Duration) {
     (ok, warmed, t.elapsed())
 }
 
-/// Child side of [`warm`]: the renderer's init exactly as an API 36 boot on MoltenVK makes it.
+/// Child side of [`warm`]: the renderer's init exactly as an API 36 boot on MoltenVK makes it,
+/// host ANGLE included (`instance::host_angle`).
 pub fn warm_child(lib64: &Path) -> bool {
     let Some(emulator_dir) = lib64.parent() else { return false };
     emu_gfxstream::link_beside_exe(lib64);
+    if emu_vmm::runs_without_gl(true, lib64) {
+        emu_gfxstream::prefer_angle_platform("swiftshader");
+    }
     emu_gfxstream::configure_environment(emulator_dir, emu_gfxstream::Icd::MoltenVk);
     emu_vmm::warm_renderer(lib64.to_path_buf(), true, true).is_ok()
 }

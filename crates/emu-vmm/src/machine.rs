@@ -160,6 +160,25 @@ fn renderer_features(virtual_queue: bool, pipe_gles: bool, extra: Option<&str>) 
     features
 }
 
+/// Whether the environment asks for a renderer with GL even for a guest on ANGLE: GL
+/// composition (`EMU_GL_COMPOSITION`) or `EMU_RENDERER_GL=1`.
+fn gl_requested() -> bool {
+    std::env::var_os("EMU_GL_COMPOSITION").is_some()
+        || std::env::var_os("EMU_RENDERER_GL").is_some()
+        // The direct Vulkan readback is turned off, so frames go through GL (see
+        // `emu_gfxstream`'s `VkRead::symbols`): the renderer keeps GL, and host ANGLE must too.
+        || std::env::var("EMU_READBACK").is_ok_and(|v| v == "gl")
+}
+
+/// Whether the renderer in `lib64` will run without GL for a guest on ANGLE (`vulkan_only`, as
+/// [`GpuSpec::vulkan_only`]), known before it loads: what [`init_renderer`] decides, with the
+/// renderer's file read in place of the loaded image ([`emu_gfxstream::has_vulkan_readback`]).
+/// Nothing draws with the host's GLES then, so a launcher can pick its ANGLE backend for init
+/// cost alone while the process is still single-threaded.
+pub fn runs_without_gl(vulkan_only: bool, lib64: &std::path::Path) -> bool {
+    vulkan_only && !gl_requested() && emu_gfxstream::has_vulkan_readback(lib64)
+}
+
 fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     let r = emu_gfxstream::Renderer::load(&spec.lib64).context("loading the gfxstream renderer")?;
     let gl_composition = std::env::var_os("EMU_GL_COMPOSITION").is_some();
@@ -171,7 +190,7 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     // drawer went from 37% janky frames (p90 53 ms) to none (p90 5 ms), and emu from 163% to 62%
     // of a core; see docs/benchmarks.md. Host frames are then read only through the direct
     // Vulkan readback, so a renderer build without it keeps GL. EMU_RENDERER_GL=1 keeps GL anyway.
-    let vulkan_only = spec.vulkan_only && !gl_composition && std::env::var_os("EMU_RENDERER_GL").is_none() && r.can_read_vulkan_directly();
+    let vulkan_only = spec.vulkan_only && !gl_requested() && r.can_read_vulkan_directly();
     let mut flags = emu_gfxstream::flags::USE_EGL | emu_gfxstream::flags::USE_VK;
     if !vulkan_only {
         flags |= emu_gfxstream::flags::USE_GLES;
@@ -934,6 +953,13 @@ mod tests {
         assert!(has(&pipe, "RefCountPipe:enabled") && has(&pipe, "GlDirectMem:enabled"), "{pipe}");
         assert!(!pipe.contains("HasSharedSlots"), "no shared slots for API 29-30 gralloc: {pipe}");
         assert!(!renderer_features(false, false, None).contains("VirtioGpu"), "virtio-gpu guests keep the defaults");
+    }
+
+    #[test]
+    fn only_a_guest_on_angle_with_a_readable_renderer_runs_without_gl() {
+        let nowhere = std::env::temp_dir().join(format!("emu-vmm-no-renderer-{}", std::process::id()));
+        assert!(!runs_without_gl(true, &nowhere), "no renderer file: it keeps GL");
+        assert!(!runs_without_gl(false, &nowhere), "a guest on the GLES encoder keeps GL");
     }
 
     /// Serializes the tests that use the process-wide `RUNNING` slot.
