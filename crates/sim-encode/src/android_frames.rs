@@ -211,8 +211,19 @@ pub(crate) mod tests {
         }
     }
 
+    /// A fresh `/tmp/simee-<pid>-<n>-<name>` directory (not under TMPDIR, which can be long enough
+    /// that a socket path inside it exceeds SUN_LEN). Created 0700; `FakeDisplay` removes it on drop.
+    fn short_dir(name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::path::PathBuf::from("/tmp").join(format!("simee-{}-{n}-{name}", std::process::id()));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).expect("short dir");
+        dir
+    }
+
     pub(crate) fn fake_display(name: &str, size: (u32, u32), frames: u8, gap: Duration) -> FakeDisplay {
-        let dir = std::env::temp_dir().join(format!("simee-encode-{name}-{}", std::process::id()));
+        let dir = short_dir(name);
         let state = emu_avd::state_dir(&dir);
         std::fs::create_dir_all(&state).expect("state dir");
         let listener = UnixListener::bind(state.join("display.sock")).expect("bind");
