@@ -551,6 +551,9 @@ impl Driver {
                 break;
             }
         }
+        if let Some(input) = self.input.as_mut() {
+            input.release_all();
+        }
         self.alive.store(false, Ordering::Release);
         if connected {
             (self.on_event)(PublisherEvent::Disconnected);
@@ -639,7 +642,9 @@ impl Driver {
             }
             // Ours (str0m reports the channels it opened too) or one the peer opened with the label.
             Event::ChannelOpen(id, label) if label == datachannel::LABEL && self.input_channel.is_none() => {
-                if let Some(input) = self.input.as_ref() {
+                if let Some(input) = self.input.as_mut() {
+                    // A new viewer starts clean: lift whatever the last one left down.
+                    input.release_all();
                     self.input_channel = Some(id);
                     self.replies.push(input.hello());
                     self.write_replies();
@@ -651,7 +656,12 @@ impl Driver {
                     self.write_replies();
                 }
             }
-            Event::ChannelClose(id) if Some(id) == self.input_channel => self.input_channel = None,
+            Event::ChannelClose(id) if Some(id) == self.input_channel => {
+                self.input_channel = None;
+                if let Some(input) = self.input.as_mut() {
+                    input.release_all();
+                }
+            }
             _ => {}
         }
     }

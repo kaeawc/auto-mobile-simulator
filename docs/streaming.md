@@ -209,18 +209,25 @@ own refusal: a button the device lacks, a stale frame). Nothing a viewer sends p
 the JSON reader is the crate's own (sim-rtc has no serde), bounded in depth and size.
 
 **Rate limits and coalescing.** Messages pass a token bucket (1000 per second, bursts of 200);
-beyond it they are dropped with one `rate` error per second. At most one move per pointer per
+beyond it they are dropped with one `rate` error per second (carrying the dropped message's `seq`).
+An `up`/`cancel` for a pointer that is down, and a key or button `up` for one that is held, are
+never dropped, whatever the budget. At most one move per pointer per
 `min_move_interval` (8 ms) reaches the sink; moves inside it are replaced by the latest, which is
 delivered when the interval ends or before any other event, so order is kept: a lift always
 follows the last position. A move replaced before delivery is not acked; the one that replaced it
-is. The pointer is freed on `up`/`cancel` even when the sink refuses it, so a finger never sticks.
+is. The pointer is freed on `up`/`cancel` even when the sink refuses it, so a finger never sticks. When the channel closes, is replaced by a new one, or the publisher
+stops (or the session is dropped), `InputSession::release_all` sends `cancel` for every pointer
+still down and `up` for every held key and button, so a viewer that vanishes mid-gesture leaves
+nothing stuck. `text` reaches the sink raw: a sink must never pass it to a shell.
 
 **Coordinates.** A point is normalised to the stream frame and carries the size the viewer saw, so
 the encoder's downscale (the longest side capped, e.g. at 1280: an iPhone's 1179x2556 is streamed
 as 590x1280) and the size the page shows the video at don't matter. `DisplayMap::new(w, h)` (the
 device's framebuffer size) maps it: `to_device(&point)` is the device pixel, clamped inside the
 display, and refuses a point from a frame of another shape (`StaleFrame`: the device rotated while
-the input was in flight) rather than stretching it; `delta_to_device` scales wheel deltas;
+the input was in flight) rather than stretching it, allowing the encoder's rounding (even sides,
+16-pixel minimum: 4000x20 streams as 100x16). A square display looks the same rotated, so its
+rotation can't be detected from the frame's shape; `delta_to_device` scales wheel deltas;
 `stream_size(Some(1280))` predicts the encoder's frame (the rule of `simee-encode`'s
 `output_size`).
 

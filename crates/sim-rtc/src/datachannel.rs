@@ -20,7 +20,7 @@
 //! them onto the device whatever the encoder's downscale, and refuse a point from a frame of a
 //! different shape (the device rotated while the input was in flight).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -668,16 +668,33 @@ impl DisplayMap {
         FrameSize::new(fit(width), fit(height))
     }
 
-    /// Whether a frame the viewer saw has the device's shape, allowing the encoder's rounding to
-    /// even sides (two pixels) and one percent.
+    /// Whether a frame the viewer saw has the device's shape, within the encoder's rounding: each
+    /// side is floored to an even number and raised to at least 16, so the scale the frame implies
+    /// is a range, and the other side must fall in the range that scale allows (plus a pixel and
+    /// half a percent for a browser's rounding). Extreme aspects like 4000x20 streamed as 100x16
+    /// match; a rotated frame does not. A square display looks the same in every rotation, so
+    /// rotating one cannot be detected from the frame's shape.
     pub fn matches(&self, seen: FrameSize) -> bool {
-        let (dw, dh) = (f64::from(self.device.width), f64::from(self.device.height));
-        let (sw, sh) = (f64::from(seen.width), f64::from(seen.height));
-        if dw <= 0.0 || dh <= 0.0 || sw <= 0.0 || sh <= 0.0 {
+        if self.device.width == 0 || self.device.height == 0 || seen.width == 0 || seen.height == 0 {
             return false;
         }
-        let expected_w = sh * dw / dh;
-        (sw - expected_w).abs() <= 2.0 + 0.01 * sw
+        let (dev_long, dev_short, seen_long, seen_short) = if self.device.width >= self.device.height {
+            (self.device.width, self.device.height, seen.width, seen.height)
+        } else {
+            (self.device.height, self.device.width, seen.height, seen.width)
+        };
+        // The unrounded size behind a seen side: [side, side + 2), or anything under 18 at the floor.
+        let range = |side: u32| {
+            let side = f64::from(side);
+            let slack = 1.0 + 0.005 * side;
+            ((if side <= 16.0 { 0.0 } else { side - slack }), side + 2.0 + slack)
+        };
+        let (long_lo, long_hi) = range(seen_long);
+        let (short_lo, short_hi) = range(seen_short);
+        let ratio = f64::from(dev_short) / f64::from(dev_long);
+        // The short side the long side's range implies, against the short side's own range.
+        let (implied_lo, implied_hi) = (long_lo * ratio, long_hi * ratio);
+        implied_lo <= short_hi && short_lo <= implied_hi
     }
 
     /// The device pixel under a stream-frame point, clamped inside the display. A point from a
@@ -703,6 +720,9 @@ impl DisplayMap {
 /// Where a session's input goes: a device's input path. It runs on the publisher's media thread,
 /// so keep it short (queue to the device and return). An `Err` goes back to the viewer as an
 /// `error` reply with code `sink`; the session carries on.
+///
+/// `InputEvent::Text` arrives raw, exactly as the viewer sent it (control characters and newlines
+/// included): a sink must never pass it to a shell or interpolate it into a command line.
 pub trait InputSink: Send {
     fn input(&mut self, event: &InputEvent) -> Result<(), String>;
 }
@@ -760,6 +780,9 @@ pub struct InputSession {
     config: InputConfig,
     /// Each pointer that is down and where it last was.
     pointers: HashMap<u32, Point>,
+    /// Keys (HID usages) and buttons that are held down, to lift on release.
+    keys: HashSet<u16>,
+    buttons: HashSet<Button>,
     /// When each pointer's last move reached the sink.
     last_move: HashMap<u32, Instant>,
     /// At most one per pointer, in arrival order.
@@ -767,6 +790,12 @@ pub struct InputSession {
     tokens: f64,
     refilled: Option<Instant>,
     rate_error: Option<Instant>,
+}
+
+impl Drop for InputSession {
+    fn drop(&mut self) {
+        self.release_all();
+    }
 }
 
 impl fmt::Debug for InputSession {
@@ -785,6 +814,8 @@ impl InputSession {
             sink: Box::new(sink),
             config,
             pointers: HashMap::new(),
+            keys: HashSet::new(),
+            buttons: HashSet::new(),
             last_move: HashMap::new(),
             pending: Vec::new(),
             tokens: f64::from(config.burst),
@@ -801,34 +832,71 @@ impl InputSession {
     /// Handle one channel message received at `now`.
     pub fn receive(&mut self, now: Instant, binary: bool, data: &[u8], out: &mut Vec<Reply>) {
         let rx = wall_ms();
-        if !self.take_token(now) {
-            if self.rate_error.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1)) {
-                self.rate_error = Some(now);
-                out.push(Reply::error(ProtocolError::new(
-                    ErrorCode::Rate,
-                    format!("over {} messages per second: dropped", self.config.max_messages_per_second),
-                )));
-            }
-            return;
+        let admitted = self.take_token(now);
+        // Decoding is cheap (the size cap comes first), so a lift can be recognised over budget.
+        match Self::parse(self.config.max_message_bytes, binary, data) {
+            Ok(message) if admitted || self.is_release(&message) => self.handle(now, rx, message, out),
+            Ok(message) => self.rate_refusal(now, message.seq, out),
+            Err(e) if admitted => out.push(Reply::error(e)),
+            Err(_) => self.rate_refusal(now, None, out),
         }
-        if data.len() > self.config.max_message_bytes {
-            out.push(Reply::error(ProtocolError::new(
-                ErrorCode::Size,
-                format!("{} bytes is over the {}-byte limit", data.len(), self.config.max_message_bytes),
-            )));
-            return;
+    }
+
+    fn parse(max_bytes: usize, binary: bool, data: &[u8]) -> Result<Message, ProtocolError> {
+        if data.len() > max_bytes {
+            return Err(ProtocolError::new(ErrorCode::Size, format!("{} bytes is over the {max_bytes}-byte limit", data.len())));
         }
         if binary {
-            out.push(Reply::error(ProtocolError::new(ErrorCode::Encoding, "binary frames are not part of the protocol: send text")));
-            return;
+            return Err(ProtocolError::new(ErrorCode::Encoding, "binary frames are not part of the protocol: send text"));
         }
-        let Ok(text) = std::str::from_utf8(data) else {
-            out.push(Reply::error(ProtocolError::new(ErrorCode::Encoding, "not UTF-8")));
-            return;
-        };
-        match decode(text) {
-            Ok(message) => self.handle(now, rx, message, out),
-            Err(e) => out.push(Reply::error(e)),
+        let text = std::str::from_utf8(data).map_err(|_| ProtocolError::new(ErrorCode::Encoding, "not UTF-8"))?;
+        decode(text)
+    }
+
+    fn rate_refusal(&mut self, now: Instant, seq: Option<u64>, out: &mut Vec<Reply>) {
+        if self.rate_error.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1)) {
+            self.rate_error = Some(now);
+            out.push(Reply::Error {
+                seq,
+                code: ErrorCode::Rate,
+                message: format!("over {} messages per second: dropped", self.config.max_messages_per_second),
+            });
+        }
+    }
+
+    /// Whether `message` lifts something that is down (a pointer, a key, a button): never dropped
+    /// by the rate limit, so a flood can't leave input stuck.
+    fn is_release(&self, message: &Message) -> bool {
+        let lifts =
+            |phase: TouchPhase, pointer: u32| matches!(phase, TouchPhase::Up | TouchPhase::Cancel) && self.pointers.contains_key(&pointer);
+        match &message.body {
+            Body::Touch { pointer, phase, .. } | Body::Input(InputEvent::Touch { pointer, phase, .. }) => lifts(*phase, *pointer),
+            Body::Input(InputEvent::Key { phase: KeyPhase::Up, usage }) => self.keys.contains(usage),
+            Body::Input(InputEvent::Button { phase: ButtonPhase::Up, button }) => self.buttons.contains(button),
+            _ => false,
+        }
+    }
+
+    /// Lift everything still down: a cancel for each pointer, an up for each held key and button.
+    /// Call it when the channel closes or is replaced and when the session ends (it also runs on
+    /// drop), so a viewer that vanishes mid-gesture never leaves the device with input stuck.
+    /// Moves waiting for their interval are discarded; the cancel carries the last position.
+    pub fn release_all(&mut self) {
+        self.pending.clear();
+        self.last_move.clear();
+        let mut pointers: Vec<(u32, Point)> = self.pointers.drain().collect();
+        pointers.sort_by_key(|(id, _)| *id);
+        for (pointer, point) in pointers {
+            let _ = self.sink.input(&InputEvent::Touch { pointer, phase: TouchPhase::Cancel, point });
+        }
+        let mut keys: Vec<u16> = self.keys.drain().collect();
+        keys.sort_unstable();
+        for usage in keys {
+            let _ = self.sink.input(&InputEvent::Key { phase: KeyPhase::Up, usage });
+        }
+        let buttons: Vec<Button> = self.buttons.drain().collect();
+        for button in buttons {
+            let _ = self.sink.input(&InputEvent::Button { button, phase: ButtonPhase::Up });
         }
     }
 
@@ -881,7 +949,22 @@ impl InputSession {
             Body::Input(InputEvent::Touch { pointer, phase, point }) => (pointer, phase, Some(point)),
             Body::Input(event) => {
                 self.flush_all(now, out);
-                self.deliver(&event, seq, t, rx, out);
+                let delivered = self.deliver(&event, seq, t, rx, out);
+                match event {
+                    InputEvent::Key { phase: KeyPhase::Down, usage } if delivered => {
+                        self.keys.insert(usage);
+                    }
+                    InputEvent::Key { phase: KeyPhase::Up, usage } => {
+                        self.keys.remove(&usage);
+                    }
+                    InputEvent::Button { button, phase: ButtonPhase::Down } if delivered => {
+                        self.buttons.insert(button);
+                    }
+                    InputEvent::Button { button, phase: ButtonPhase::Up } => {
+                        self.buttons.remove(&button);
+                    }
+                    _ => {}
+                }
                 return;
             }
         };
@@ -1189,6 +1272,9 @@ impl Parser<'_> {
             p.i > from
         };
         self.eat(b'-');
+        if self.s.get(self.i) == Some(&b'0') && self.s.get(self.i + 1).is_some_and(u8::is_ascii_digit) {
+            return Err(format!("leading zero in a number at byte {start}"));
+        }
         if !digits(self) {
             return Err(format!("bad number at byte {start}"));
         }
@@ -1209,6 +1295,9 @@ impl Parser<'_> {
 
     fn hex4(&mut self) -> Result<u32, String> {
         let digits = self.s.get(self.i..self.i + 4).ok_or("short \\u escape")?;
+        if !digits.iter().all(u8::is_ascii_hexdigit) {
+            return Err("bad \\u escape".into());
+        }
         let text = std::str::from_utf8(digits).map_err(|_| "bad \\u escape")?;
         let n = u32::from_str_radix(text, 16).map_err(|_| "bad \\u escape")?;
         self.i += 4;
@@ -1662,5 +1751,83 @@ mod tests {
         ));
         assert_eq!(s2.pointers_down(), 0);
         assert!(send(&mut s2, now, &touch_msg(3, 0, TouchPhase::Down, 0.5)).is_empty(), "the pointer can go down again");
+    }
+
+    fn key_msg(phase: KeyPhase, usage: u16) -> Message {
+        Message { seq: None, t: None, body: Body::Input(InputEvent::Key { phase, usage }) }
+    }
+
+    #[test]
+    fn release_all_cancels_pointers_and_lifts_keys_and_buttons() {
+        let (mut s, rec) = session(InputConfig::default());
+        let now = Instant::now();
+        send(&mut s, now, &touch_msg(1, 0, TouchPhase::Down, 0.25));
+        send(&mut s, now, &key_msg(KeyPhase::Down, 0xe1));
+        let power =
+            Message { seq: None, t: None, body: Body::Input(InputEvent::Button { button: Button::Power, phase: ButtonPhase::Down }) };
+        send(&mut s, now, &power);
+        rec.take();
+        s.release_all();
+        assert_eq!(
+            rec.take(),
+            vec![
+                touch(0, TouchPhase::Cancel, 0.25),
+                InputEvent::Key { phase: KeyPhase::Up, usage: 0xe1 },
+                InputEvent::Button { button: Button::Power, phase: ButtonPhase::Up },
+            ]
+        );
+        s.release_all();
+        assert!(rec.take().is_empty(), "nothing left to lift");
+        // A reopened channel's first down is accepted.
+        assert!(send(&mut s, now, &touch_msg(2, 0, TouchPhase::Down, 0.5)).is_empty());
+        assert_eq!(rec.take(), vec![touch(0, TouchPhase::Down, 0.5)]);
+    }
+
+    #[test]
+    fn dropping_a_session_lifts_what_is_down() {
+        let (mut s, rec) = session(InputConfig::default());
+        send(&mut s, Instant::now(), &touch_msg(1, 3, TouchPhase::Down, 0.5));
+        rec.take();
+        drop(s);
+        assert_eq!(rec.take(), vec![touch(3, TouchPhase::Cancel, 0.5)]);
+    }
+
+    #[test]
+    fn the_rate_limit_never_drops_a_lift() {
+        let (mut s, rec) = session(InputConfig { max_messages_per_second: 10, burst: 3, ..InputConfig::default() });
+        let t0 = Instant::now();
+        send(&mut s, t0, &touch_msg(1, 0, TouchPhase::Down, 0.5));
+        send(&mut s, t0, &key_msg(KeyPhase::Down, 4));
+        send(&mut s, t0, &touch_msg(2, 0, TouchPhase::Move, 0.6));
+        rec.take();
+        // Out of tokens: a down is dropped with the seq in the error, the lifts get through.
+        let out = send(&mut s, t0, &touch_msg(9, 1, TouchPhase::Down, 0.5));
+        assert!(matches!(out.as_slice(), [Reply::Error { seq: Some(9), code: ErrorCode::Rate, .. }]), "{out:?}");
+        assert!(send(&mut s, t0, &touch_msg(10, 0, TouchPhase::Up, 0.6)).is_empty());
+        assert!(send(&mut s, t0, &key_msg(KeyPhase::Up, 4)).is_empty());
+        let events = rec.take();
+        assert!(events.contains(&touch(0, TouchPhase::Up, 0.6)), "{events:?}");
+        assert!(events.contains(&InputEvent::Key { phase: KeyPhase::Up, usage: 4 }), "{events:?}");
+        assert_eq!(s.pointers_down(), 0);
+    }
+
+    #[test]
+    fn the_reader_refuses_plus_signed_escapes_and_leading_zeros() {
+        assert!(decode(r#"{"v":1,"kind":"text","text":"\u+041"}"#).is_err());
+        assert!(decode(r#"{"v":01,"kind":"ping"}"#).is_err());
+        assert!(decode(r#"{"v":1,"kind":"ping","seq":007}"#).is_err());
+        assert!(decode(r#"{"v":1,"kind":"ping","seq":0}"#).is_ok());
+    }
+
+    #[test]
+    fn matches_within_the_encoders_rounding_at_extreme_aspects() {
+        for (w, h, max) in [(4000, 20, 100), (20, 4000, 100), (1179, 2556, 1280), (3, 5000, 1000), (1000, 1000, 64)] {
+            let map = DisplayMap::new(w, h);
+            let seen = map.stream_size(Some(max));
+            assert!(map.matches(seen), "{w}x{h} streamed as {seen} should match");
+        }
+        let wide = DisplayMap::new(4000, 20);
+        assert!(!wide.matches(FrameSize::new(16, 100)), "a rotated extreme aspect is stale");
+        assert!(!DisplayMap::new(1179, 2556).matches(FrameSize::new(1280, 590)));
     }
 }
