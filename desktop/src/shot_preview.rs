@@ -114,9 +114,21 @@ impl Opener for System {
         let spawned = std::thread::Builder::new().name("simee-shot-delete".into()).spawn({
             let (path, outbox) = (path.clone(), outbox.clone());
             move || {
-                outbox.post(match std::fs::remove_file(&path) {
-                    Ok(()) => format!("deleted {}", path.display()),
-                    Err(e) => format!("couldn't delete {}: {e}", path.display()),
+                // To the Trash, as macOS's own screenshot preview does, so a mistaken Delete can be
+                // undone; macOS 15+ ships `/usr/bin/trash`. Without it, the file is removed.
+                let trashed = std::process::Command::new("/usr/bin/trash")
+                    .arg(&path)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success());
+                outbox.post(if trashed {
+                    format!("moved {} to the Trash", path.display())
+                } else {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => format!("deleted {}", path.display()),
+                        Err(e) => format!("couldn't delete {}: {e}", path.display()),
+                    }
                 })
             }
         });
