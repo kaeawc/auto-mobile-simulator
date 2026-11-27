@@ -13,6 +13,7 @@
 //! the tool prints while still answering comes back in `warnings`.
 
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -99,11 +100,25 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
     })
 }
 
-/// Runs `program` and waits up to `deadline` for it. Past the deadline the child this started is
-/// killed through its handle (nothing else is signalled) and the call fails.
+/// SIGKILLs the process group `pgid` (the host tools run on macOS only; elsewhere the caller's
+/// handle kill is all there is).
+fn kill_group(pgid: u32) {
+    #[cfg(target_os = "macos")]
+    if let Some(pgid) = i32::try_from(pgid).ok().filter(|p| *p > 1) {
+        let _ = sim_coresim::procs::signal(-pgid, 9);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = pgid;
+}
+
+/// Runs `program` and waits up to `deadline` for it. The tool runs in a process group of its own
+/// (its pid is the pgid), because `leaks` and friends respawn the simulator runtime's copy as a
+/// child. Past the deadline that group, which this created and nothing else, is killed, the
+/// child reaped, and the call fails.
 pub fn run(program: &str, args: &[String], deadline: Duration) -> Result<Output, String> {
     let mut child = Command::new(program)
         .args(args)
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -116,8 +131,13 @@ pub fn run(program: &str, args: &[String], deadline: Duration) -> Result<Output,
             Ok(Some(status)) => break status,
             Ok(None) if start.elapsed() < deadline => std::thread::sleep(Duration::from_millis(10)),
             waited => {
+                // The child is not yet reaped, so its pid is still the pgid this created; a negative
+                // pid signals the whole group (kill(2)).
+                kill_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
+                // The group's death closes the pipes; the readers end.
+                let _ = (out.join(), err.join());
                 return Err(match waited {
                     Err(e) => format!("{program}: {e}"),
                     _ => format!("{program} didn't finish within {} s and was stopped (give a longer timeout_s)", deadline.as_secs_f64()),
@@ -146,7 +166,7 @@ pub fn finish(tool: Tool, pid: i32, out: &Output, raw: bool) -> Result<Value, St
     }
     if tool == Tool::History && lines.iter().any(|l| l.contains("has no stack logs")) {
         return Err(format!(
-            "pid {pid} has no allocation stacks: launch the app with `malloc_stack_logging: true` (MallocStackLogging=1), then ask again"
+            "pid {pid} has no allocation stacks: launch the app with `malloc_stack_logging: true` and `restart: true` (the default; a running app keeps its old environment), then ask again"
         ));
     }
     // leaks exits 1 when it found leaks.
@@ -813,6 +833,23 @@ mod tests {
         assert!(e.contains("didn't finish within 0.2 s"), "{e}");
         assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
         assert!(run("/nonexistent/tool", &[], Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_deadline_kills_the_tools_children_too() {
+        let dir = std::env::temp_dir().join(format!("memtools-grandchild-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let pidfile = dir.join("pid");
+        let script = format!("/bin/sleep 30 & echo $! > {}; wait", pidfile.display());
+        let start = Instant::now();
+        let e = run("/bin/sh", &["-c".into(), script], Duration::from_millis(500)).expect_err("deadline");
+        assert!(e.contains("didn't finish"), "{e}");
+        assert!(start.elapsed() < Duration::from_secs(5), "returned only when the grandchild ended: {:?}", start.elapsed());
+        let pid: i32 = std::fs::read_to_string(&pidfile).expect("pid").trim().parse().expect("number");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(sim_coresim::procs::signal(pid, 0).is_err(), "grandchild {pid} survived");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

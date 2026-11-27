@@ -213,7 +213,11 @@ fn kill_in(tree: &[i32], pid: i64, signal: i64) -> Result<Value, String> {
 /// the running app whose launchd label (`XPC_SERVICE_NAME`, read through `KERN_PROCARGS2`) is
 /// `bundle_id`'s.
 fn app_pid(tree: &[i32], p: &Value) -> Result<i32, String> {
-    match (str_param(p, "bundle_id"), p.get("pid").and_then(Value::as_i64)) {
+    let pid = match p.get("pid") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_i64().ok_or("pid must be an integer")?),
+    };
+    match (str_param(p, "bundle_id"), pid) {
         (Some(_), Some(_)) => Err("give `bundle_id` or `pid`, not both".into()),
         (None, Some(pid)) => {
             i32::try_from(pid).ok().filter(|p| tree.contains(p)).ok_or_else(|| format!("pid {pid} is not a process of this device"))
@@ -3324,5 +3328,16 @@ mod tests {
         assert_eq!(as_typed(missing(), &json!({"device": upper})), missing());
         assert_eq!(as_typed("other".into(), &json!({"device": "booted"})), "other");
         assert_eq!(as_typed(missing(), &json!({})), missing());
+    }
+
+    #[test]
+    fn a_pid_must_be_an_integer_and_excludes_bundle_id() {
+        let tree = [10, 20];
+        assert_eq!(app_pid(&tree, &json!({"pid": 20})), Ok(20));
+        assert_eq!(app_pid(&tree, &json!({"pid": "20"})), Err("pid must be an integer".into()));
+        assert_eq!(app_pid(&tree, &json!({"pid": 2.5})), Err("pid must be an integer".into()));
+        assert_eq!(app_pid(&tree, &json!({"bundle_id": "a.b", "pid": "x"})), Err("pid must be an integer".into()));
+        assert_eq!(app_pid(&tree, &json!({"bundle_id": "a.b", "pid": 20})), Err("give `bundle_id` or `pid`, not both".into()));
+        assert_eq!(app_pid(&tree, &json!({})), Err("give `bundle_id` or `pid`".into()));
     }
 }
