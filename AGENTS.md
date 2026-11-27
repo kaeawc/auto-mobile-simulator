@@ -12,8 +12,9 @@ for both is to match the stock tools exactly and then exceed them.
   the features used; crates reference them with `{ workspace = true }`.
 - `unsafe` lives only in `crates/sim-coresim` (the Objective-C / IOSurface / VideoToolbox boundary),
   `crates/emu-hvf` (Hypervisor.framework and guest RAM), `crates/emu-kvm` (Linux KVM), `crates/emu-gfxstream` (the renderer),
-  `apps/emu`'s `shutdown_signals` (signal masks) and `desktop/src/surface.rs` (the zero-copy
-  bridge). Every `unsafe` block carries a `// SAFETY:` comment
+  `apps/emu`'s `shutdown_signals` (signal masks), `desktop/src/surface.rs` (the zero-copy
+  bridge) and `crates/sim-camera`'s `avf.rs` (AVFoundation capture) and `v4l2.rs` (Linux V4L2
+  ioctls). Every `unsafe` block carries a `// SAFETY:` comment
   (`clippy::undocumented_unsafe_blocks` is denied or warned there). Everything else forbids it.
 - Private service APIs are reached by selector/symbol lookup at runtime and checked with
   `respondsToSelector:` / `dlsym` first, so a missing API is an `Error::Unavailable`, never a crash.
@@ -54,8 +55,8 @@ for both is to match the stock tools exactly and then exceed them.
   `platform`, `form_factor` and `sub_platform`; `help` lists each method's platforms. Validate a
   (platform, form factor) pair with `Kind::new`, which explains unsupported combinations.
 - Doctests are disabled; don't rely on them for coverage.
-- `desktop/` is a separate workspace (Rune is a large git dependency). Bump the Rune `rev` and every
-  `[patch.crates-io]` entry together, and commit `desktop/Cargo.lock`.
+- `desktop/` and `website/` are separate workspaces (Rune is a large git dependency). Bump the Rune
+  `rev` and every `[patch.crates-io]` entry together in both, and commit both `Cargo.lock` files.
 
 ## Benchmarks and public docs
 
@@ -226,6 +227,13 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `cargo run --release --features tooling -- --snap /tmp/x.png --scene demo`. Scenes: demo,
   android, foldable, watch, tv, apple-watch, apple-tv, empty. On Linux it renders with Mesa's
   lavapipe.
+- `website/` — the public site, a Rune app in web document mode and its own workspace (like
+  `desktop/`): `content.rs` (the README sections and `docs/*.md` it publishes, link and anchor
+  rewriting), `home.rs`, `docs.rs`, `devices.rs` (drawn from `sim-core`'s form factor matrix),
+  `demos.rs` (live streams via `public/live.js`); `scripts/build.sh` writes `website/dist` (wasm
+  plus each page's static HTML); deployed to Fly by `.github/workflows/website.yml`. `media/` is
+  the live demo's MediaMTX relay on Fly (`website-media.yml`), fed by `scripts/live-demo.sh`. Its copy carries no number of its own:
+  measured claims come from the README and docs. Docs: `website/README.md`.
 - `scripts/` — `brand.sh` (redraws `assets/brand/` from `sim_core::mark`), `desktop-app.sh` (the
   desktop as `simee.app` with its icon), `parity.sh`, `ios-matrix.sh` (every iOS feature on one device: the
   `docs/ios-versions.md` table), `automobile-harness.sh`, `automobile-farm.sh` (every device through

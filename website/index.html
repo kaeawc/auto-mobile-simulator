@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#ffffff" />
+    <!--robots-->
+    <title>__TITLE__</title>
+    <meta name="description" content="__DESCRIPTION__" />
+    <!--canonical-->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="simee" />
+    <meta property="og:title" content="__TITLE__" />
+    <meta property="og:description" content="__DESCRIPTION__" />
+    <meta property="og:url" content="__URL__" />
+    <meta property="og:image" content="__ORIGIN__/img/desktop.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="alternate" type="text/plain" href="/llms.txt" title="llms.txt" />
+    <!-- The live demo's relay: public/live.js plays its streams on /demos/. -->
+    <meta name="simee-media" content="__MEDIA__" />
+    <!-- Rune loads the same files (App::font_url), so the page and the canvas share one download. -->
+    <link rel="preload" href="/fonts/cmunrm.otf" as="font" type="font/otf" crossorigin />
+    <link rel="preload" href="/fonts/cmunbx.otf" as="font" type="font/otf" crossorigin />
+    <style>
+      @font-face { font-family: "CMU Serif"; src: url("/fonts/cmunrm.otf") format("opentype"); font-weight: 400; font-display: swap; }
+      @font-face { font-family: "CMU Serif"; src: url("/fonts/cmunti.otf") format("opentype"); font-weight: 400; font-style: italic; font-display: swap; }
+      @font-face { font-family: "CMU Serif"; src: url("/fonts/cmunbx.otf") format("opentype"); font-weight: 700; font-display: swap; }
+      :root {
+        --rune-sans: "CMU Serif", "Latin Modern Roman", Georgia, serif;
+        --rune-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+        --rune-selection: oklch(0.82 0.14 165 / 0.35);
+        --rune-focus: oklch(0.46 0.1 165);
+      }
+      html { background: #fff; color: #222; font: 400 17px/26px var(--rune-sans); text-size-adjust: 100%; }
+      body { margin: 0; }
+      :focus-visible { outline: 2px solid var(--rune-focus); outline-offset: 2px; border-radius: 4px; }
+      ::selection { background: var(--rune-selection); }
+    </style>
+    <!-- rune:css -->
+  </head>
+  <body>
+    <!-- rune:body -->
+    <script src="/live.js" defer></script>
+    <script type="module">
+      // The page is already here as static HTML; this hands it to Rune, which draws the same page
+      // on the GPU and hides the static copy once its first frame is up. Without WebGPU, or if
+      // the wasm fails, the static page stays. The wasm loads after the page has painted.
+      const start = () => import("/app/app.js").then(rune => rune.default()).catch(error => console.error(error))
+      function afterFirstPaint(then) {
+        const type = PerformanceObserver.supportedEntryTypes?.includes("largest-contentful-paint") ? "largest-contentful-paint" : "paint"
+        let done = false
+        const go = () => { if (done) return; done = true; observer.disconnect(); setTimeout(then, 0) }
+        const observer = new PerformanceObserver(go)
+        observer.observe({ type, buffered: true })
+        setTimeout(go, 3000)
+      }
+      // Rune keeps the section in view when it takes over, but its layout can differ from the
+      // static page's by a few lines per screen: put a linked heading back at the top.
+      document.addEventListener("runepresent", () => {
+        const target = location.hash && document.getElementById(decodeURIComponent(location.hash.slice(1)))
+        if (target) target.scrollIntoView()
+      }, { once: true })
+      if ("gpu" in navigator) afterFirstPaint(start)
+    </script>
+  </body>
+</html>
