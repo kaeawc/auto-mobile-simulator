@@ -25,6 +25,9 @@ pub struct Usage {
     /// spawned-and-reaped child adds to it, however short its life, so it tells whether a stretch
     /// of code spawned anything.
     pub reaped_children_ns: u64,
+    /// The CPU time (user and system) the children it has reaped used, their own reaped
+    /// descendants included.
+    pub reaped_children_cpu_ns: u64,
     /// When it started, on the [`now_ns`] clock: with the pid, it names one process (a reused pid
     /// starts later).
     pub start_ns: u64,
@@ -128,6 +131,7 @@ fn from_v4(info: &libc::rusage_info_v4) -> Usage {
         cpu_ns: to_ns(info.ri_user_time.saturating_add(info.ri_system_time)),
         background_ns: to_ns(info.ri_cpu_time_qos_maintenance.saturating_add(info.ri_cpu_time_qos_background)),
         reaped_children_ns: to_ns(info.ri_child_elapsed_abstime),
+        reaped_children_cpu_ns: to_ns(info.ri_child_user_time.saturating_add(info.ri_child_system_time)),
         start_ns: to_ns(info.ri_proc_start_abstime),
         resident_bytes: info.ri_resident_size,
         footprint_bytes: info.ri_phys_footprint,

@@ -26,7 +26,12 @@
 //! process, whose counters are never subtracted from the old one's. A process that started since
 //! the last sample counts whole (all its CPU fell in the window); one seen for the first time
 //! that started earlier (the first sample, a process that just joined a tree) is a baseline. A
-//! process that exits between samples takes its last interval with it.
+//! process that exits between samples takes its last interval with it, except for the CPU its
+//! parent reaped: a member's `ri_child_user_time + ri_child_system_time` grows by the whole CPU
+//! time of each child it reaps, so the growth less what the exited members had used when last seen
+//! is added back (children that came and went inside one interval included). Limits: a child
+//! reparented out of the group (its parent exited first) is reaped by `launchd`, outside it, and
+//! its last interval is lost; the recovered time lands in the interval it was reaped in.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -63,6 +68,9 @@ pub struct Proc {
     pub name: String,
     /// argv (argv\[0\] first), read only for the processes [`wants_argv`] names; empty otherwise.
     pub argv: Vec<String>,
+    /// The executable's own path (the `KERN_PROCARGS2` record's, which a bare argv\[0\] doesn't
+    /// show), read with argv.
+    pub exe: String,
 }
 
 /// Whether attribution reads the arguments of a process named `name`: the few that name a device.
@@ -163,7 +171,7 @@ pub fn attribute(procs: &[Proc]) -> Attribution {
         }
         let launchers: Vec<&Proc> = ancestors(p.pid).into_iter().filter(|a| launcher(a)).collect();
         let own = avd_name(&p.argv);
-        let from_sdk = p.argv.iter().any(|a| a.contains("/emulator/qemu/"));
+        let from_sdk = p.exe.contains("/emulator/qemu/") || p.argv.iter().any(|a| a.contains("/emulator/qemu/"));
         if own.is_none() && !from_sdk && launchers.is_empty() {
             continue;
         }
@@ -220,6 +228,13 @@ fn is_uuid(s: &str) -> bool {
     s.len() == 36 && s.bytes().enumerate().all(|(i, b)| if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() })
 }
 
+/// The executable path a `KERN_PROCARGS2` record carries before argv (empty when it has none).
+pub fn exe_from_procargs(b: &[u8]) -> String {
+    let rest = b.get(4..).unwrap_or_default();
+    let end = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
+    String::from_utf8_lossy(&rest[..end]).into_owned()
+}
+
 /// argv from a `KERN_PROCARGS2` record: `argc` (native `i32`), the executable path, NUL padding,
 /// then `argc` NUL-terminated strings (the environment after them is left out).
 pub fn argv_from_procargs(b: &[u8]) -> Vec<String> {
@@ -245,6 +260,10 @@ pub struct Counters {
     /// Start time on the observation's clock (with the pid, it names one process).
     pub start_ns: u64,
     pub cpu_ns: u64,
+    /// CPU time of the children this process has reaped (user and system, their own descendants
+    /// folded in): it grows when a child exits, so it holds the CPU of ones that came and went
+    /// between two samples.
+    pub child_cpu_ns: u64,
     pub resident_bytes: u64,
     pub footprint_bytes: u64,
     pub disk_read_bytes: u64,
@@ -359,6 +378,9 @@ fn per_s(bytes: u64, s: &Step) -> Option<f64> {
 
 #[derive(Clone, Debug, Default)]
 struct Series {
+    id: String,
+    /// The pids counted last sample, to see which exited since.
+    members: Vec<i32>,
     steps: VecDeque<Step>,
     root: Option<i32>,
     pids: usize,
@@ -367,8 +389,16 @@ struct Series {
     energy: bool,
 }
 
-/// Group keys: a device's kind and id, simee's `None`.
-type Key = (Option<Kind>, String);
+/// Group keys: a device's kind, root pid and the root's start time (so several instances of one
+/// AVD are several devices, and a reused pid a new one); simee's is `(None, 0, 0)`.
+type Key = (Option<Kind>, i32, u64);
+
+/// The CPU a group's exited children used since the last sample that the sampled deltas missed:
+/// what its members reaped in the window (`child_delta`) less the CPU the exited members had when
+/// last seen (`gone_seen`), which the previous deltas already counted.
+fn recovered_child_cpu(child_delta: u64, gone_seen: u64) -> u64 {
+    child_delta.saturating_sub(gone_seen)
+}
 
 /// Turns observations into per-device rates: keeps each attributed process's last counters and a
 /// minute of per-group deltas.
@@ -400,8 +430,8 @@ impl Tracker {
     pub fn update(&mut self, o: Observation) {
         let since = self.at_ns;
         let dur = since.map(|t| o.at_ns.saturating_sub(t)).filter(|d| *d > 0);
-        let delta = |pid: i32| -> Step {
-            let Some(c) = o.counters.get(&pid) else { return Step::default() };
+        let delta = |pid: i32| -> (Step, u64) {
+            let Some(c) = o.counters.get(&pid) else { return (Step::default(), 0) };
             let base = match self.prev.get(&pid) {
                 // The same process: what it used since.
                 Some(p) if p.start_ns == c.start_ns => *p,
@@ -410,39 +440,70 @@ impl Tracker {
                 // Seen for the first time, older than the last sample: a baseline.
                 _ => *c,
             };
-            Step {
+            let step = Step {
                 dur_ns: 0,
                 cpu_ns: c.cpu_ns.saturating_sub(base.cpu_ns),
                 read: c.disk_read_bytes.saturating_sub(base.disk_read_bytes),
                 written: c.disk_written_bytes.saturating_sub(base.disk_written_bytes),
                 energy_nj: c.energy_nj.map(|e| e.saturating_sub(base.energy_nj.unwrap_or(e))),
-            }
+            };
+            (step, c.child_cpu_ns.saturating_sub(base.child_cpu_ns))
         };
-        let groups = o.attribution.devices.iter().map(|g| ((Some(g.kind), g.id.clone()), Some(g.root), &g.pids)).chain(std::iter::once((
-            (None, "simee".to_owned()),
-            None,
-            &o.attribution.simee,
-        )));
+        let start_of = |pid: i32| o.counters.get(&pid).map_or(0, |c| c.start_ns);
+        // One AVD run several times is several devices: each shows as `<id> #<n>`, oldest first.
+        let mut same: HashMap<(Kind, &str), Vec<(u64, i32)>> = HashMap::new();
+        for g in &o.attribution.devices {
+            same.entry((g.kind, g.id.as_str())).or_default().push((start_of(g.root), g.root));
+        }
+        for v in same.values_mut() {
+            v.sort_unstable();
+        }
+        let label = |g: &Group| match same.get(&(g.kind, g.id.as_str())) {
+            Some(v) if v.len() > 1 => {
+                let n = v.iter().position(|&(_, r)| r == g.root).map_or(0, |i| i + 1);
+                format!("{} #{n}", g.id)
+            }
+            _ => g.id.clone(),
+        };
+        let groups = o
+            .attribution
+            .devices
+            .iter()
+            .map(|g| ((Some(g.kind), g.root, start_of(g.root)), label(g), Some(g.root), &g.pids))
+            .chain(std::iter::once(((None, 0, 0), "simee".to_owned(), None, &o.attribution.simee)));
         let mut seen = HashSet::new();
-        for (key, root, pids) in groups {
+        for (key, id, root, pids) in groups {
+            if !seen.insert(key) {
+                continue;
+            }
             let mut step = Step { dur_ns: dur.unwrap_or(0), ..Step::default() };
-            let (mut n, mut resident, mut footprint, mut energy) = (0, 0, 0, false);
+            let (mut n, mut resident, mut footprint, mut energy, mut child) = (0, 0, 0, false, 0u64);
+            let mut members = Vec::new();
             for &pid in pids {
                 let Some(c) = o.counters.get(&pid) else { continue };
                 n += 1;
+                members.push(pid);
                 resident += c.resident_bytes;
                 footprint += c.footprint_bytes;
                 energy |= c.energy_nj.is_some();
-                step.add(&delta(pid));
-            }
-            if !seen.insert(key.clone()) {
-                continue; // two devices with one id (an AVD run twice): the first keeps it
+                let (d, cd) = delta(pid);
+                step.add(&d);
+                child += cd;
             }
             let s = self.series.entry(key).or_default();
+            // Members that exited since the last sample took their last interval with them; the
+            // children their parents reaped carry it (a new group has no previous members).
+            let gone_seen: u64 = s
+                .members
+                .iter()
+                .filter_map(|pid| self.prev.get(pid).filter(|p| o.counters.get(pid).is_none_or(|c| c.start_ns != p.start_ns)))
+                .map(|p| p.cpu_ns)
+                .sum();
+            step.cpu_ns += recovered_child_cpu(child, gone_seen);
             if dur.is_some() {
                 push(&mut s.steps, step);
             }
-            *s = Series { steps: std::mem::take(&mut s.steps), root, pids: n, resident, footprint, energy };
+            *s = Series { id, members, steps: std::mem::take(&mut s.steps), root, pids: n, resident, footprint, energy };
         }
         self.series.retain(|k, _| seen.contains(k));
         if let Some(d) = dur {
@@ -464,9 +525,9 @@ impl Tracker {
 
     /// Every device's usage, costliest first, simee's, and the host's totals.
     pub fn report(&self) -> Report {
-        let usage = |(kind, id): &Key, s: &Series| Usage {
+        let usage = |(kind, _, _): &Key, s: &Series| Usage {
             kind: *kind,
-            id: id.clone(),
+            id: s.id.clone(),
             pid: s.root,
             pids: s.pids,
             cpu_pct: Rate::of(&s.steps, cpu_pct),
@@ -481,7 +542,7 @@ impl Tracker {
         devices.sort_by(|a, b| {
             b.cpu_pct.cost().total_cmp(&a.cpu_pct.cost()).then(b.footprint_bytes.cmp(&a.footprint_bytes)).then_with(|| a.id.cmp(&b.id))
         });
-        let simee_key = (None, "simee".to_owned());
+        let simee_key: Key = (None, 0, 0);
         let simee = self
             .series
             .get(&simee_key)
@@ -593,7 +654,7 @@ const UNAVAILABLE: &str = "per-device attribution reads libproc, which only macO
 #[derive(Default)]
 pub struct Reader {
     #[cfg(target_os = "macos")]
-    argv: HashMap<i32, (u64, Vec<String>)>,
+    argv: HashMap<i32, (u64, Vec<String>, String)>,
 }
 
 impl Reader {
@@ -605,6 +666,7 @@ impl Reader {
         let counters_of = |u: procs::Usage| Counters {
             start_ns: u.start_ns,
             cpu_ns: u.cpu_ns,
+            child_cpu_ns: u.reaped_children_cpu_ns,
             resident_bytes: u.resident_bytes,
             footprint_bytes: u.footprint_bytes,
             disk_read_bytes: u.disk_read_bytes,
@@ -616,21 +678,23 @@ impl Reader {
         let mut procs_out = Vec::with_capacity(table.len());
         for row in &table {
             let name = row.name();
-            let mut argv = Vec::new();
+            let (mut argv, mut exe) = (Vec::new(), String::new());
             if wants_argv(name)
                 && let Some(c) = procs::usage(row.pid).map(counters_of)
             {
-                argv = match self.argv.get(&row.pid) {
-                    Some((start, a)) if *start == c.start_ns => a.clone(),
+                (argv, exe) = match self.argv.get(&row.pid) {
+                    Some((start, a, e)) if *start == c.start_ns => (a.clone(), e.clone()),
                     _ => {
-                        let a = procs::procargs(row.pid).map(|b| argv_from_procargs(&b)).unwrap_or_default();
-                        self.argv.insert(row.pid, (c.start_ns, a.clone()));
-                        a
+                        let b = procs::procargs(row.pid);
+                        let a = b.as_deref().map(argv_from_procargs).unwrap_or_default();
+                        let e = b.as_deref().map(exe_from_procargs).unwrap_or_default();
+                        self.argv.insert(row.pid, (c.start_ns, a.clone(), e.clone()));
+                        (a, e)
                     }
                 };
                 read.insert(row.pid, c);
             }
-            procs_out.push(Proc { pid: row.pid, ppid: row.ppid, name: name.to_owned(), argv });
+            procs_out.push(Proc { pid: row.pid, ppid: row.ppid, name: name.to_owned(), argv, exe });
         }
         self.argv.retain(|pid, _| read.contains_key(pid));
         let attribution = attribute(&procs_out);
@@ -655,7 +719,7 @@ mod tests {
     use super::*;
 
     fn p(pid: i32, ppid: i32, name: &str, argv: &[&str]) -> Proc {
-        Proc { pid, ppid, name: name.into(), argv: argv.iter().map(|s| s.to_string()).collect() }
+        Proc { pid, ppid, name: name.into(), argv: argv.iter().map(|s| s.to_string()).collect(), exe: String::new() }
     }
 
     const UDID: &str = "8B529975-BB5F-4ED5-8309-0FF04764BAE6";
@@ -849,6 +913,54 @@ mod tests {
         // A device that stopped leaves the report.
         t.update(obs(2, vec![sim(&[1])], &[(1, c(1, S1 / 10))]));
         assert_eq!(t.report().devices.len(), 1);
+    }
+
+    #[test]
+    fn instances_of_one_avd_are_separate_rows_and_all_count_in_the_totals() {
+        let mut t = Tracker::new(8);
+        let inst = |pid| Group { kind: Kind::Emu, id: "pixel_9".into(), root: pid, pids: vec![pid] };
+        let at = |s: u64, a: u64, b: u64| obs(s, vec![inst(10), inst(20)], &[(10, c(1, a)), (20, c(2, b))]);
+        t.update(at(0, 0, 0));
+        t.update(at(1, S1, S1 / 2));
+        let r = t.report();
+        let rows: Vec<(&str, Option<i32>, Option<f64>)> = r.devices.iter().map(|d| (d.id.as_str(), d.pid, d.cpu_pct.s1)).collect();
+        assert_eq!(rows, [("pixel_9 #1", Some(10), Some(100.0)), ("pixel_9 #2", Some(20), Some(50.0))]);
+        assert_eq!((r.host.devices, r.host.devices_cpu_pct.s1), (2, Some(150.0)));
+        assert_eq!(r.host.devices_footprint_bytes, 40);
+        // The first instance exits: the survivor keeps its own history and its plain name.
+        t.update(obs(2, vec![inst(20)], &[(20, c(2, S1 / 2 + S1))]));
+        let r = t.report();
+        assert_eq!((r.devices.len(), r.devices[0].id.as_str(), r.devices[0].cpu_pct.s1), (1, "pixel_9", Some(100.0)));
+        assert_eq!(r.devices[0].cpu_pct.m1, Some(75.0));
+    }
+
+    #[test]
+    fn a_stock_qemu_is_found_by_its_executable_path_alone() {
+        let mut bare = p(700, 1, "qemu-system-aar", &["qemu-system-aarch64", "-kernel", "k"]);
+        assert!(attribute(&[p(1, 0, "launchd", &[]), bare.clone()]).devices.is_empty(), "a bare qemu is not a device");
+        bare.exe = "/Users/me/Library/Android/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64-headless".into();
+        let a = attribute(&[p(1, 0, "launchd", &[]), bare]);
+        let got: Vec<(&str, i32)> = a.devices.iter().map(|g| (g.id.as_str(), g.root)).collect();
+        assert_eq!(got, [("qemu-system-aar pid 700", 700)]);
+        let mut rec = 2i32.to_ne_bytes().to_vec();
+        rec.extend_from_slice(b"/sdk/emulator/qemu/x/qemu-system-aarch64\0\0\0qemu-system-aarch64\0-m\0");
+        assert_eq!(exe_from_procargs(&rec), "/sdk/emulator/qemu/x/qemu-system-aarch64");
+        assert_eq!(exe_from_procargs(b"\x01"), "");
+    }
+
+    #[test]
+    fn cpu_of_children_that_exited_between_samples_is_recovered() {
+        let mut t = Tracker::new(8);
+        let root = |cpu, child| Counters { child_cpu_ns: child, ..c(1, cpu) };
+        t.update(obs(0, vec![sim(&[1, 2])], &[(1, root(0, 0)), (2, c(2, 3 * S1))]));
+        // Pid 2 (3 s seen) exited with 5 s in all, and a short-lived pid 3 (never seen) used 1 s:
+        // the root reaped 6 s. The root itself used 0.5 s. The 3 s already seen are not counted twice.
+        t.update(obs(1, vec![sim(&[1])], &[(1, root(S1 / 2, 6 * S1))]));
+        assert_eq!(t.report().devices[0].cpu_pct.s1, Some(350.0));
+        // Nothing exited: the same counters add nothing.
+        t.update(obs(2, vec![sim(&[1])], &[(1, root(S1 / 2, 6 * S1))]));
+        assert_eq!(t.report().devices[0].cpu_pct.s1, Some(0.0));
+        assert_eq!((recovered_child_cpu(5, 9), recovered_child_cpu(9, 5)), (0, 4));
     }
 
     #[test]
