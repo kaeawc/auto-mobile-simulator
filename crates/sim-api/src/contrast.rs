@@ -342,4 +342,11 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
         assert_eq!(beside("/a/b/c", Mode::Dark), "/a/b/c-dark");
     }
+
+    #[test]
+    fn appearance_is_current_or_both_in_the_method_table() {
+        let (_, params, doc) = crate::METHODS.iter().find(|(name, ..)| *name == "contrast_check").expect("contrast_check is a method");
+        assert!(params.contains("appearance?(current|both)"), "{params}");
+        assert!(doc.contains("appearance both"), "{doc}");
+    }
 }

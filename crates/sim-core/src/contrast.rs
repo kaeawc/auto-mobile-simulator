@@ -571,9 +571,11 @@ fn near(a: Rgb, b: Rgb, tol: u8) -> bool {
     (0..3).all(|i| a[i].abs_diff(b[i]) <= tol)
 }
 
-/// A hollow box (a field, a card, an outlined button): a uniform line of one colour along all four
-/// sides, different from what is outside, and not the same colour a little way in (that is a
-/// filled shape). Returns the border colour and the colour outside it.
+/// A hollow box (a field, a card, an outlined button, a pill): a uniform line of one colour along
+/// all four sides, different from what is outside, and not the same colour a little way in (that is
+/// a filled shape). The line follows the box's outline, so rounded and capsule corners count; it is
+/// thin next to the box, so a big hollow letter or a ring icon does not. Returns the border colour
+/// and the colour outside it.
 fn thin_frame(img: &Img, r: Rect) -> Option<(Rgb, Rgb)> {
     let (w, h) = (i64::from(r.width), i64::from(r.height));
     if w < 12 || h < 12 {
@@ -598,44 +600,74 @@ fn thin_frame(img: &Img, r: Rect) -> Option<(Rgb, Rgb)> {
     if outside.iter().filter(|&&c| near(c, out, 12)).count() * 10 < outside.len() * 8 {
         return None;
     }
-    // The line `d` pixels in from a side, over its middle: its colour when it is uniform and inked.
-    let line = |side: usize, d: i64| -> Option<Rgb> {
-        let at = |i: i64| match side {
+    // Corners are all box (square: some ink in the three pixels at the corner, a blob's box being a
+    // pixel loose) or all outside (rounded); a letter like a D is half and half.
+    let inked = |cx: i64, cy: i64| {
+        (0..9).any(|k| {
+            px(cx + (k % 3) * (x0 + x1 - 2 * cx).signum(), cy + (k / 3) * (y0 + y1 - 2 * cy).signum())
+                .is_some_and(|c| !near(c, out, INK_STEP as u8))
+        })
+    };
+    let corners = [inked(x0, y0), inked(x1, y0), inked(x0, y1), inked(x1, y1)];
+    if corners.iter().any(|&c| c != corners[0]) {
+        return None;
+    }
+    // A border is thin next to the box (a stroke of a big letter or a filled shape is not), and starts
+    // near its side unless the outline curves away there.
+    let min_side = w.min(h);
+    let thickest = min_side / 10 + 1;
+    let reach = min_side / 6 + 3;
+    // Where the scan `i` along a side crosses the border: how far in it starts, its colour (the more
+    // inked of its first two pixels: an antialiased edge is a blend) and its thickness.
+    let probe = |side: usize, i: i64| -> Option<(i64, Rgb, i64)> {
+        let at = |d: i64| match side {
             0 => px(x0 + i, y0 + d),
             1 => px(x0 + i, y1 - d),
             2 => px(x0 + d, y0 + i),
             _ => px(x1 - d, y0 + i),
         };
-        let span = if side < 2 { xs.clone() } else { ys.clone() };
-        let pixels: Vec<Rgb> = span.map(at).collect::<Option<_>>()?;
-        let c = round(mode_colour(pixels.iter().copied())?);
-        let uniform = pixels.iter().filter(|&&p| near(p, c, 12)).count() * 10 >= pixels.len() * 9;
-        (uniform && !near(c, out, INK_STEP as u8)).then_some(c)
+        let d = (0..=reach).find(|&d| at(d).is_some_and(|c| !near(c, out, INK_STEP as u8)))?;
+        let ink = |c: Rgb| (0..3).map(|k| c[k].abs_diff(out[k])).max().unwrap_or(0);
+        let (start, c) = [d, d + 1].into_iter().filter_map(|d| at(d).map(|c| (d, c))).max_by_key(|&(_, c)| ink(c))?;
+        let run = (start..=start + thickest).take_while(|&d| at(d).is_some_and(|p| near(p, c, 12))).count() as i64;
+        Some((d, c, run))
     };
-    let mut edge = None;
-    let mut deepest = 0;
+    let mut edge: Option<Rgb> = None;
+    let mut thickness = 0;
     for side in 0..4 {
-        let (d, c) = (0..4).find_map(|d| line(side, d).map(|c| (d, c)))?;
-        if edge.is_some_and(|e| !near(e, c, 12)) {
+        let span = if side < 2 { xs.clone() } else { ys.clone() };
+        let probes: Vec<Option<(i64, Rgb, i64)>> = span.map(|i| probe(side, i)).collect();
+        let c = round(mode_colour(probes.iter().flatten().map(|p| p.1))?);
+        let mine = |p: &Option<(i64, Rgb, i64)>| p.is_some_and(|(_, pc, run)| near(pc, c, 12) && run <= thickest);
+        if probes.iter().filter(|p| mine(p)).count() * 10 < probes.len() * 9 || edge.is_some_and(|e| !near(e, c, 12)) {
             return None;
         }
         edge = Some(c);
-        deepest = deepest.max(d);
-    }
-    let edge = edge?;
-    // A border is thin next to the box (a stroke of a big letter or a filled shape is not): the line
-    // a tenth of the way in, and the one just past the border, are both not its colour.
-    let (past, tenth) = (deepest + 4, w.min(h) / 10 + 1);
-    if past.max(tenth) * 2 >= h.min(w) {
-        return None;
-    }
-    for inner in [past, tenth] {
-        let sample: Vec<Rgb> = xs.clone().filter_map(|i| px(x0 + i, y0 + inner)).collect();
-        if sample.is_empty() || sample.iter().filter(|&&p| near(p, edge, 12)).count() * 2 > sample.len() {
+        let mut runs: Vec<i64> = probes.iter().flatten().map(|p| p.2).collect();
+        runs.sort_unstable();
+        thickness = thickness.max(runs[runs.len() / 2]);
+        let depths: Vec<Option<i64>> = probes.iter().map(|p| p.map(|p| p.0)).collect();
+        let nearest = depths.iter().flatten().copied().min()?;
+        if nearest > 3 {
             return None;
         }
+        // The top and bottom run straight over a good part of the width (a circle has no straight
+        // run; a pill has one between its ends); the left and right may curve.
+        if side < 2 {
+            let (mut longest, mut now) = (0, 0);
+            for d in &depths {
+                now = if d.is_some_and(|d| d <= nearest + 1) { now + 1 } else { 0 };
+                longest = longest.max(now);
+            }
+            if longest * 5 < w * 2 {
+                return None;
+            }
+        }
     }
-    Some((edge, out))
+    if thickness > thickest {
+        return None;
+    }
+    Some((edge?, out))
 }
 
 /// What a box of ink is judged as: squarish and tall enough is an icon or control, else text,
