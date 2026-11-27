@@ -345,6 +345,18 @@ fn helper_error(stdout: &str) -> String {
     format!("cfprefsd: {}", line.strip_prefix("error ").unwrap_or(if line.is_empty() { "the helper said nothing" } else { line }))
 }
 
+/// The error for a refused `write`. A refusal after the helper handed the keys to cfprefsd
+/// (the final synchronize) is not "nothing changed": a running app may already see them.
+#[cfg(target_os = "macos")]
+fn write_failure(stdout: &str, ops: &[super::Op]) -> String {
+    let error = helper_error(stdout);
+    if !error.contains("after taking the keys") {
+        return error;
+    }
+    let keys: Vec<&str> = ops.iter().map(super::Op::key).collect();
+    format!("{error}: some of [{}] may already be live in the running app", keys.join(", "))
+}
+
 /// iOS preferences: files on the host, cfprefsd in the device.
 pub struct Ios {
     /// Where devices' directories are (`<root>/<UDID>/data`).
@@ -488,7 +500,7 @@ mod device {
             std::fs::remove_file(&path).ok();
             let out = out?;
             if out.lines().next().map(str::trim) != Some("ok") {
-                return Err(super::helper_error(&out));
+                return Err(super::write_failure(&out, ops));
             }
             // cfprefsd hands the values to every process using the domain: a running app's
             // UserDefaults has them now (its KVO observers fire), one not running reads them at launch.

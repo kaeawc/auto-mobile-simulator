@@ -70,7 +70,9 @@ static int writeDomain(NSString *path) {
         else CFPreferencesSetAppValue((__bridge CFStringRef)key, NULL, d);
     }
     Boolean ok = container ? sync(d, c) : CFPreferencesAppSynchronize(d);
-    if (!ok) return fail([NSString stringWithFormat:@"cfprefsd didn't synchronize %@", domain]);
+    // The values were already handed to cfprefsd: a running app may be reading them. The
+    // caller names the keys; this line is how it tells this failure from one before any were sent.
+    if (!ok) return fail([NSString stringWithFormat:@"cfprefsd didn't synchronize %@ after taking the keys", domain]);
     printf("ok\n");
     return 0;
 }

@@ -214,6 +214,16 @@ fn the_helpers_read_reply_is_decoded_and_its_errors_said() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
+fn a_failed_final_synchronize_names_the_keys_it_sent() {
+    let ops = [Op::Set { key: "a".into(), value: PrefValue::Bool(true) }, Op::Delete { key: "b".into() }];
+    let err = write_failure("error cfprefsd didn't synchronize com.x after taking the keys\n", &ops);
+    assert!(err.contains("[a, b]") && err.contains("already be live"), "{err}");
+    // A refusal before any key was sent says only what the helper said.
+    assert_eq!(write_failure("error the request has no domain\n", &ops), "cfprefsd: the request has no domain");
+}
+
+#[test]
 fn a_device_is_booted_by_its_device_plist() {
     let (root, _) = device_set("booted");
     let dev = root.join(UDID);

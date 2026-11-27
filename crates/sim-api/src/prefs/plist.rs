@@ -58,6 +58,12 @@ const PLIST_EPOCH: i64 = 978_307_200;
 
 /// The most nodes one file may expand to through shared references.
 const MAX_NODES: usize = 1 << 22;
+/// The most bytes one file may decode to: string and data payloads as they are materialised, plus
+/// [`NODE_COST`] per value. A shared reference is decoded once per use, so a small file can ask
+/// for far more than its own size; this stops it before the allocation.
+const MAX_DECODED_BYTES: usize = 64 << 20;
+/// What each decoded value costs against [`MAX_DECODED_BYTES`], on top of its payload.
+const NODE_COST: usize = std::mem::size_of::<Plist>();
 /// The deepest nesting read.
 const MAX_DEPTH: usize = 512;
 
@@ -88,8 +94,16 @@ pub fn decode(bytes: &[u8]) -> Result<Plist, String> {
     {
         return bad("object table");
     }
-    let mut reader =
-        Reader { bytes: &bytes[..body as usize], offset_size, ref_size, count, table: table as usize, nodes: 0, stack: Vec::new() };
+    let mut reader = Reader {
+        bytes: &bytes[..body as usize],
+        offset_size,
+        ref_size,
+        count,
+        table: table as usize,
+        nodes: 0,
+        decoded: 0,
+        stack: Vec::new(),
+    };
     reader.object(top)
 }
 
@@ -104,6 +118,8 @@ struct Reader<'a> {
     count: u64,
     table: usize,
     nodes: usize,
+    /// Bytes decoded so far, against [`MAX_DECODED_BYTES`].
+    decoded: usize,
     /// The objects being read, outermost first: a reference back to one is a cycle.
     stack: Vec<u64>,
 }
@@ -150,6 +166,15 @@ impl Reader<'_> {
             .collect()
     }
 
+    /// Charges `bytes` of decoded value to the budget, before they are allocated.
+    fn charge(&mut self, bytes: usize) -> Result<(), String> {
+        self.decoded = self.decoded.saturating_add(bytes);
+        if self.decoded > MAX_DECODED_BYTES {
+            return Err(format!("binary property list decodes to more than {} MiB", MAX_DECODED_BYTES >> 20));
+        }
+        Ok(())
+    }
+
     fn object(&mut self, object: u64) -> Result<Plist, String> {
         self.nodes += 1;
         if self.nodes > MAX_NODES || self.stack.len() >= MAX_DEPTH {
@@ -158,6 +183,7 @@ impl Reader<'_> {
         if self.stack.contains(&object) {
             return Err("damaged binary property list: a reference cycle".into());
         }
+        self.charge(NODE_COST)?;
         let at = self.offset(object)?;
         let marker = self.bytes[at];
         let low = marker & 0xF;
@@ -184,15 +210,18 @@ impl Reader<'_> {
             0x3 if low == 3 => Plist::Date(f64::from_be_bytes(self.slice(at + 1, 8)?.try_into().map_err(|_| "date")?)),
             0x4 => {
                 let (n, from) = self.length(at, low)?;
+                self.charge(n)?;
                 Plist::Data(self.slice(from, n)?.to_vec())
             }
             0x5 => {
                 let (n, from) = self.length(at, low)?;
+                self.charge(n.saturating_mul(2))?;
                 // ASCII by the format; a byte past it is read as Latin-1 rather than refused.
                 Plist::String(self.slice(from, n)?.iter().map(|b| char::from(*b)).collect())
             }
             0x6 => {
                 let (n, from) = self.length(at, low)?;
+                self.charge(n.saturating_mul(3))?;
                 let units: Vec<u16> =
                     self.slice(from, n.checked_mul(2).ok_or("string")?)?.chunks(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
                 Plist::String(String::from_utf16(&units).map_err(|_| "damaged binary property list: a UTF-16 string")?)
@@ -611,7 +640,42 @@ mod tests {
         b.extend_from_slice(&41u64.to_be_bytes());
         b.extend_from_slice(&0u64.to_be_bytes());
         b.extend_from_slice(&table.to_be_bytes());
-        assert_eq!(decode(&b).expect_err("bomb"), "binary property list too large or too deep");
+        let err = decode(&b).expect_err("bomb");
+        assert!(err.starts_with("binary property list"), "{err}");
+    }
+
+    #[test]
+    fn one_data_object_shared_by_millions_of_references_is_refused_before_it_allocates() {
+        const REFS: u32 = 4_000_000; // under MAX_NODES, so only the byte budget stops it
+        let mut b = b"bplist00".to_vec();
+        let array = b.len() as u32;
+        b.extend_from_slice(&[0xAF, 0x12]);
+        b.extend_from_slice(&REFS.to_be_bytes());
+        b.resize(b.len() + REFS as usize, 1); // every element is object 1
+        let data = b.len() as u32;
+        b.extend_from_slice(&[0x4F, 0x12]);
+        b.extend_from_slice(&(64u32 << 10).to_be_bytes());
+        b.resize(b.len() + (64 << 10), 0xAB);
+        let table = b.len() as u64;
+        b.extend_from_slice(&array.to_be_bytes());
+        b.extend_from_slice(&data.to_be_bytes());
+        b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 4, 1]);
+        b.extend_from_slice(&2u64.to_be_bytes());
+        b.extend_from_slice(&0u64.to_be_bytes());
+        b.extend_from_slice(&table.to_be_bytes());
+        assert!(b.len() < 5 << 20, "small on disk: {}", b.len());
+        let err = decode(&b).expect_err("shared data bomb");
+        assert!(err.contains("decodes to more than"), "{err}");
+    }
+
+    #[test]
+    fn a_large_but_sane_plist_still_reads() {
+        let value = Plist::Dict(vec![
+            ("blob".into(), Plist::Data(vec![7; 8 << 20])),
+            ("items".into(), Plist::Array((0..20_000).map(|i| Plist::String(format!("item-{i}-{}", "x".repeat(100)))).collect())),
+        ]);
+        let back = decode(&encode(&value).expect("encode")).expect("a sane plist reads");
+        assert_eq!(back, value);
     }
 
     #[test]
