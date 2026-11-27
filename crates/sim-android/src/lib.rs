@@ -2198,7 +2198,9 @@ mod tests {
         let slow_done = finished.iter().find(|f| f.0 == 0).expect("slow finished").1;
         // f1, f2 and f3 boot one after another beside `slow`, not after it.
         assert!(at(3) < slow_done, "f3 started as f2 finished, not after slow: {started:?} {finished:?}");
-        assert_eq!((finished.len(), finished.last().map(|f| f.0)), (4, Some(0)), "slow finished last: {finished:?}");
+        // Every device finished. Which one finishes last depends on the fake's polling, not the
+        // window (a loaded CI runner finished `slow` before f3), so the order isn't asserted.
+        assert_eq!(finished.len(), 4, "{finished:?}");
     }
 
     #[test]
