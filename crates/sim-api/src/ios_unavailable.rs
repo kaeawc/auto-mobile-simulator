@@ -11,6 +11,14 @@ pub const REASON: &str = "iOS simulator devices need a macOS host with Xcode";
 #[derive(Default)]
 pub struct Session;
 
+/// No HID input is sent on this host.
+pub fn track_input() {}
+
+/// Nothing is ever pending.
+pub fn flush_input(_timeout: std::time::Duration) -> bool {
+    true
+}
+
 /// No simulators to select from.
 pub fn selection_infos(_: &mut Session) -> Result<Vec<sim_core::device::DeviceInfo>, String> {
     Ok(Vec::new())
