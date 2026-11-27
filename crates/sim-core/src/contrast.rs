@@ -617,7 +617,13 @@ fn thin_frame(img: &Img, r: Rect) -> Option<(Rgb, Rgb)> {
         };
         let d = (0..=reach).find(|&d| at(d).is_some_and(|c| !near(c, out, INK_STEP as u8)))?;
         let ink = |c: Rgb| (0..3).map(|k| c[k].abs_diff(out[k])).max().unwrap_or(0);
-        let (start, c) = [d, d + 1].into_iter().filter_map(|d| at(d).map(|c| (d, c))).max_by_key(|&(_, c)| ink(c))?;
+        // The side of the outside colour a pixel is on: a shadow is darker than the page, a card lighter.
+        let above = |c: Rgb| (0..3).map(|k| i32::from(c[k]) - i32::from(out[k])).sum::<i32>() > 0;
+        let first = at(d)?;
+        let (start, c) = match at(d + 1) {
+            Some(next) if above(next) == above(first) && ink(next) > ink(first) => (d + 1, next),
+            _ => (d, first),
+        };
         // A faint border is told from the inside by less than a bright one: half its own step from outside.
         let tol = (ink(c) / 2).clamp(2, 12);
         let run = (start..=start + 2 * thickest).take_while(|&d| at(d).is_some_and(|p| near(p, c, tol))).count() as i64;
