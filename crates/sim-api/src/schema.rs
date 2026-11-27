@@ -42,6 +42,10 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
     Some(match name {
         "button" if method == "stylus" => Bool,
         "devices" | "args" | "commands" => Strings,
+        // prefs_*
+        "store" | "cursor" => Str,
+        "wait_ms" => Int,
+        "ops" => Objects,
         "device" | "platform" | "form_factor" | "name" | "device_type" | "runtime" | "system_image" | "path" | "url" | "bundle_id"
         | "text" | "base64" | "domain" | "key" | "language" | "uid" | "capture_id" | "program" | "command" | "predicate" | "last"
         | "preset" | "direction" | "gesture" | "button" | "phase" | "action" | "service" | "scope" | "display" | "orientation"

@@ -28,6 +28,7 @@ mod ios;
 mod ios;
 mod methods;
 mod params;
+pub mod prefs;
 mod schema;
 pub mod settle;
 
