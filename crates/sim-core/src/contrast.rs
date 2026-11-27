@@ -600,18 +600,6 @@ fn thin_frame(img: &Img, r: Rect) -> Option<(Rgb, Rgb)> {
     if outside.iter().filter(|&&c| near(c, out, 12)).count() * 10 < outside.len() * 8 {
         return None;
     }
-    // Corners are all box (square: some ink in the three pixels at the corner, a blob's box being a
-    // pixel loose) or all outside (rounded); a letter like a D is half and half.
-    let inked = |cx: i64, cy: i64| {
-        (0..9).any(|k| {
-            px(cx + (k % 3) * (x0 + x1 - 2 * cx).signum(), cy + (k / 3) * (y0 + y1 - 2 * cy).signum())
-                .is_some_and(|c| !near(c, out, INK_STEP as u8))
-        })
-    };
-    let corners = [inked(x0, y0), inked(x1, y0), inked(x0, y1), inked(x1, y1)];
-    if corners.iter().any(|&c| c != corners[0]) {
-        return None;
-    }
     // A border is thin next to the box (a stroke of a big letter or a filled shape is not), and starts
     // near its side unless the outline curves away there.
     let min_side = w.min(h);
@@ -634,6 +622,8 @@ fn thin_frame(img: &Img, r: Rect) -> Option<(Rgb, Rgb)> {
     };
     let mut edge: Option<Rgb> = None;
     let mut thickness = 0;
+    let mut nearest = [0; 4];
+    let mut straight = [0; 2];
     for side in 0..4 {
         let span = if side < 2 { xs.clone() } else { ys.clone() };
         let probes: Vec<Option<(i64, Rgb, i64)>> = span.map(|i| probe(side, i)).collect();
@@ -647,24 +637,36 @@ fn thin_frame(img: &Img, r: Rect) -> Option<(Rgb, Rgb)> {
         runs.sort_unstable();
         thickness = thickness.max(runs[runs.len() / 2]);
         let depths: Vec<Option<i64>> = probes.iter().map(|p| p.map(|p| p.0)).collect();
-        let nearest = depths.iter().flatten().copied().min()?;
-        if nearest > 3 {
+        nearest[side] = depths.iter().flatten().copied().min()?;
+        if nearest[side] > 3 {
             return None;
         }
-        // The top and bottom run straight over a good part of the width (a circle has no straight
-        // run; a pill has one between its ends); the left and right may curve.
+        // The top and bottom: the longest run where the border is as near as it gets, a straight edge.
+        // A pill has one between its ends; a circle has only a short one.
         if side < 2 {
             let (mut longest, mut now) = (0, 0);
             for d in &depths {
-                now = if d.is_some_and(|d| d <= nearest + 1) { now + 1 } else { 0 };
+                now = if *d == Some(nearest[side]) { now + 1 } else { 0 };
                 longest = longest.max(now);
             }
-            if longest * 5 < w * 2 {
-                return None;
-            }
+            straight[side] = longest;
         }
     }
     if thickness > thickest {
+        return None;
+    }
+    // The corners of the border's own box (a blob's box is a pixel loose on some sides): all box
+    // (square) or all outside (rounded); a letter like a D is half and half.
+    let (cx0, cx1, cy0, cy1) = (x0 + nearest[2], x1 - nearest[3], y0 + nearest[0], y1 - nearest[1]);
+    let corners = [(cx0, cy0), (cx1, cy0), (cx0, cy1), (cx1, cy1)].map(|(x, y)| px(x, y).is_some_and(|c| !near(c, out, INK_STEP as u8)));
+    if corners.iter().any(|&c| c != corners[0]) {
+        return None;
+    }
+    // Rounded corners leave a straight run along the top and bottom that is a good part of the width
+    // and not a few pixels: a ring or an O is rounded all the way, its flat is about `2 * sqrt(r)`
+    // wide, and the smaller it is the flatter its curve looks.
+    let wanted = if corners[0] { w * 2 / 5 } else { (w * 2 / 5).max(12) };
+    if straight.iter().any(|&run| run < wanted) {
         return None;
     }
     Some((edge?, out))

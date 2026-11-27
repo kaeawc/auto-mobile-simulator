@@ -613,11 +613,10 @@ fn a_region_drawn_tightly_round_a_label_checks_it() {
 
 // ---- capsule outlines and thick borders (#233) --------------------------------------------------
 
-/// Draws an antialiased outline: a capsule (rounded ends of radius half the shorter side; a circle when
-/// `w == h`) `w` by `h` with a `t` pixel border of `c` round a `fill` inside, over what is there.
-fn capsule(f: &mut Frame, at: Rect, t: f64, c: Rgb, fill: Rgb) {
+/// Draws an antialiased outline: a rounded box `at` with corners of radius `r` and a `t` pixel border
+/// of `c` round a `fill` inside, over what is there.
+fn rounded(f: &mut Frame, at: Rect, r: f64, t: f64, c: Rgb, fill: Rgb) {
     let Rect { x, y, width: w, height: h } = at;
-    let r = f64::from(w.min(h)) / 2.0;
     let (a, b) = ((r, r), (f64::from(w) - r, f64::from(h) - r));
     for yy in 0..h {
         for xx in 0..w {
@@ -629,6 +628,11 @@ fn capsule(f: &mut Frame, at: Rect, t: f64, c: Rgb, fill: Rgb) {
             set(f, x + xx, y + yy, blend(blend(under, c, outer), fill, inner));
         }
     }
+}
+
+/// A capsule: rounded ends of radius half the shorter side (a circle when the box is square).
+fn capsule(f: &mut Frame, at: Rect, t: f64, c: Rgb, fill: Rgb) {
+    rounded(f, at, f64::from(at.width.min(at.height)) / 2.0, t, c, fill);
 }
 
 /// The text the frame rect must not hide: the box `rect` is the inside of the outline.
@@ -678,6 +682,35 @@ fn a_six_pixel_border_does_not_hide_failing_text_inside_it() {
 }
 
 #[test]
+fn a_field_with_small_rounded_corners_does_not_hide_failing_text_inside_it() {
+    // Material's 4 dp corner at 2x, a 1 to 2 px border: neither corner pair may read as square.
+    for (t, r) in [(1.0, 6.0), (2.0, 8.0), (2.0, 9.0)] {
+        let mut f = solid(520, 260, rgb(0xffffff));
+        rounded(&mut f, Rect { x: 60, y: 60, width: 300, height: 90 }, r, t, rgb(0xc6c6c8), rgb(0xffffff));
+        let text = draw_text(&mut f, 90, 90, 3, "Email", rgb(0x8e8e93));
+        let report = failing_text_inside(&f, text, Rect { x: 62, y: 62, width: 296, height: 86 }, 2.0);
+        assert_eq!(boxes(&report, 290).len(), 1, "border {t}, radius {r}: {:?}", report.regions);
+    }
+}
+
+#[test]
+fn a_small_ring_or_o_is_a_letter_not_a_frame() {
+    // A lone grey O or 0 of 20 to 40 px is text of 3.26:1, under 4.5:1; read as a box it would
+    // be a 3:1 component and pass.
+    for d in [20, 28, 40] {
+        for t in [2.0, 3.0] {
+            for (w, h) in [(d, d), (d * 7 / 10, d)] {
+                let mut f = solid(200, 120, rgb(0xffffff));
+                capsule(&mut f, Rect { x: 60, y: 30, width: w, height: h }, t, rgb(0x8e8e93), rgb(0xffffff));
+                let report = check(&f, &Options { region: None, scale: 3.0 });
+                assert!(report.regions.iter().all(|r| r.kind != Kind::Component), "{w}x{h} stroke {t}: {:?}", report.regions);
+                assert_eq!(report.findings().count(), 1, "{w}x{h} stroke {t}: {:?}", report.regions);
+            }
+        }
+    }
+}
+
+#[test]
 fn a_thick_border_stays_thin_next_to_its_box() {
     // The same border on a box too small to call it thin is a filled shape, not a frame.
     let mut f = solid(200, 120, rgb(0xffffff));
@@ -700,9 +733,11 @@ fn what_is_not_a_hollow_box_is_not_a_frame() {
     // An underlined label, and a divider.
     let label = draw_text(&mut f, 60, 250, 3, "Learn more", rgb(0x222222));
     fill_rect(&mut f, label.x, label.y + label.height + 4, label.width, 3, rgb(0x222222));
-    fill_rect(&mut f, 60, 320, 400, 3, rgb(0xc6c6c8));
+    let divider = Rect { x: 60, y: 320, width: 400, height: 3 };
+    fill_rect(&mut f, divider.x, divider.y, divider.width, divider.height, rgb(0xc6c6c8));
     // A progress bar: a track and its fill.
-    fill_rect(&mut f, 60, 350, 300, 16, rgb(0xe0e0e0));
+    let bar = Rect { x: 60, y: 350, width: 300, height: 16 };
+    fill_rect(&mut f, bar.x, bar.y, bar.width, bar.height, rgb(0xe0e0e0));
     fill_rect(&mut f, 60, 350, 120, 16, rgb(0x6750a4));
     // An O glyph and a ring icon (a circle outline): hollow, but not boxes.
     let rings = [(60, 64), (260, 48), (360, 80)];
@@ -713,8 +748,18 @@ fn what_is_not_a_hollow_box_is_not_a_frame() {
     capsule(&mut f, Rect { x: 160, y: 400, width: 44, height: 64 }, 8.0, rgb(0x333333), rgb(0xffffff));
     draw_text(&mut f, 160 + 17, 400 + 25, 2, "I", rgb(0x333333));
     let report = check(&f, &Options { region: None, scale: 3.0 });
-    let above_rings = report.regions.iter().filter(|r| r.rect.y < 380);
-    assert!(above_rings.clone().all(|r| r.rect.width < 290), "a box that is not one: {:?}", above_rings.collect::<Vec<_>>());
+    // A frame is always a component: none of these is one, whatever its width.
+    let underlined = Rect { y: label.y, height: label.height + 8, ..label };
+    for (what, rect) in [
+        ("solid pill", Rect { x: 60, y: 20, width: 300, height: 90 }),
+        ("solid button", Rect { x: 60, y: 130, width: 300, height: 90 }),
+        ("underline", underlined),
+        ("divider", divider),
+        ("progress bar", bar),
+    ] {
+        let found = region_in(&report, rect);
+        assert!(found.iter().all(|r| r.kind != Kind::Component), "{what}: {found:?}");
+    }
     // Whatever is drawn inside a hollow glyph is its counter, not a box's content: a frame would keep
     // it as a region of its own, a glyph's ink drops it.
     for (x, w, h) in [(60, 64, 64), (160, 44, 64), (260, 48, 48), (360, 80, 80)] {
