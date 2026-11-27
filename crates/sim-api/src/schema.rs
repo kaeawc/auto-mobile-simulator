@@ -506,7 +506,8 @@ mod tests {
             }
         }
         assert!(unread.is_empty(), "add a reader to `parsed` for these defaults: {unread:?}");
-        assert!(checked.len() >= 8, "{checked:?}");
+        // Off macOS the iOS readers are skipped, so fewer defaults are reachable.
+        assert!(checked.len() >= if cfg!(target_os = "macos") { 8 } else { 4 }, "{checked:?}");
         // The check can fail: a value that isn't the default parses differently.
         let other = |method: &str, p: Value| {
             let base = parsed(method, Platform::Android, &json!({})).expect("reader");
