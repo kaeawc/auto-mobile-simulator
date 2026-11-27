@@ -253,8 +253,10 @@ seeing the result in the video, with input-to-photon measured) belongs with #268
 
 `crates/sim-encode` (published as `simee-encode`) turns a device's frames into what the publisher
 sends: Annex B access units with presentation times, an IDR with its SPS and PPS in front
-whenever one is due or asked for. It is safe Rust; its FFI is `sim-coresim`'s `videotoolbox.rs`
-(behind that crate's `videotoolbox` feature, so the CLI doesn't load VideoToolbox).
+whenever one is due or asked for. On macOS the encoder is VideoToolbox; on Linux it is OpenH264
+([below](#linux-openh264)). It is safe Rust apart from the FFI: `sim-coresim`'s `videotoolbox.rs`
+(behind that crate's `videotoolbox` feature, so the CLI doesn't load VideoToolbox) and one
+`SetOption` call in `src/linux.rs` (the runtime bitrate change OpenH264's Rust crate lacks).
 
 ```rust
 let context = Context::new()?;
@@ -306,10 +308,89 @@ by at least one 90 kHz tick. `max_size` caps the longest edge (aspect kept, even
 VideoToolbox scales on the way in. On Android, `AndroidSource::connect(dir, max_width)` can also
 have emu shrink frames by a whole factor before they're sent (`hello <max_width>`).
 
-**Linux.** No encoder yet (`simee_encode::available()` is false; the pure parts build and test
-everywhere). The `openh264` crate isn't in the offline registry here, and its build compiles
-OpenH264's C++ (or downloads Cisco's binary), which would also break `scripts/check.sh`'s Linux
-cross-clippy from macOS without a C++ cross toolchain; it's a follow-up behind a feature.
+### Linux: OpenH264
+
+`OpenH264Encoder` implements the same `Encoder` trait, so `stream::run`, the pacer, the keyframe
+re-request after a dropped IDR and `Controls::set_bitrate` work unchanged. It is behind
+`simee-encode`'s `openh264` feature (off by default, Linux only); without the feature
+`simee_encode::available()` is false there, as before, and everything else builds and tests on
+every host. Building with the feature compiles OpenH264's C++ (`g++`; with `nasm` on x86_64 the
+encoder is 2.4x faster, see [Encode cost on Linux](#encode-cost-on-linux)); no system library is
+needed at run time.
+
+```bash
+cargo test -p simee-encode --features openh264
+cargo run --release -p simee-encode --features openh264 --example linux_bench
+```
+
+**What it matches.** Constrained Baseline (`42c0xx`) or Main (`4d4cxx`, CAVLC, no B-frames); real-time, no frame reordering, one access unit per
+picture; an IDR on request (`force_intra_frame`) and every `keyframe_interval`; SPS and PPS in
+front of every IDR (the encoder's own are cached, and `ParameterSets::annex_b_access_unit` puts
+the cached pair in front of an IDR that came without); Annex B out; a new size (a rotation)
+makes a new session that starts with an IDR; `max_size` scales down with even sides and a floor
+of 16; `Hardware::Require` is `Error::Unsupported` and `Prefer` runs the software encoder
+(`hardware()` is `Some(false)`). A picture the rate control skips comes back as no access unit,
+which `stream::run` already treats as a dropped one: a requested IDR that was skipped is asked
+for again.
+
+**Where it differs from VideoToolbox.**
+
+- *Screen content mode.* `UsageType::ScreenContentRealTime`, frame skipping on. In a one-off run
+  with a temporary switch (not in the tree) on the same synthetic screens at 400x800 and
+  1 Mbit/s it gave 41.3 dB luma PSNR with 2 pictures skipped in 4 s; camera mode gave 39.7 dB and
+  skipped half of them (at 500 kbit/s: 39.9 dB against 29.4 dB). The cost is that OpenH264 starts an IDR by itself when most of the screen changes at once (an
+  app launch): such a unit has `keyframe: true`, SPS and PPS in front, and is counted in
+  `Stats::keyframes`. The mode forces scene-change detection on and adaptive quantization and
+  background detection off, so the config asks for exactly that (anything else prints a warning
+  to stderr from inside OpenH264).
+- *Bitrate.* `set_bitrate` is clamped like VideoToolbox's (100 kbit/s to `max_bitrate_bps`) and
+  takes effect on the next picture through `SetOption`: the ceiling on spatial layer 0 first (a
+  target over the layer's ceiling is refused; `SPATIAL_LAYER_ALL` would set another limit), then
+  the target. OpenH264 has no equivalent of `DataRateLimits` (a limit over one second):
+  `max_bitrate_bps` is the ceiling a retarget may reach and the encoder's per-layer maximum.
+- *Colour.* The frames arrive as 32-bit RGBA or BGRA (emu's ring is RGBA) and are converted to
+  I420 in `i420.rs`: BT.709, limited range, each chroma sample the mean of its 2x2 block, and the
+  SPS says so (VUI colour description), which is what a browser assumes for HD video anyway.
+  `max_size` is a box-filter downscale (up to 4x4 taps per output pixel) done on the RGB first; a
+  frame at most one pixel larger than the even output size is cropped instead. The buffers are
+  reused between pictures, so a steady stream allocates nothing per frame.
+- *Size.* OpenH264 stops at 3840x2160 (either way up); a larger picture without `max_size` is
+  `Error::Unsupported`. Scaling up isn't supported.
+- *No hardware.* VA-API, NVENC and V4L2 are not wired (see "Not yet").
+
+**Frame source.** `simee_encode::AndroidSource` exists on Linux too: the same display-socket
+reader as macOS (`android_frames.rs`, shared: a thread keeps the newest frame of emu's ring and
+the capture instant), with the picture being that frame itself, RGBA, no copy. It works against
+a running AVD, including software mode on Linux.
+
+**Choosing it.** Options, from the licence and build requirements (checked 2026-11-27) and, where
+noted, from running them here:
+
+| Option | Licence | Build and run | Verdict |
+| --- | --- | --- | --- |
+| `openh264` crate 0.9.10, `source` feature (OpenH264 as `openh264-sys2` 0.9.10 vendors it) | BSD-2-Clause | `cc` compiles the C++, `nasm` optional; no run-time dependency; builds on x86_64 and aarch64 Linux | **Chosen.** The wrapper has no runtime bitrate API (one `unsafe` call), and building from source means Cisco's patent-licence coverage of its own binaries doesn't apply: see the note below. |
+| `openh264` crate, `libloading` feature | BSD-2-Clause | Loads Cisco's prebuilt `libopenh264.so`, which has to be downloaded at install time; pure Rust build | Keeps Cisco's patent coverage and needs no C++ compiler, but every user and every CI run needs the library. A follow-up, as another feature with the same `OpenH264Encoder`. |
+| `rusty_h264-encoder` 0.17.4 (pure Rust, `forbid(unsafe)`) | BSD-2-Clause | Cargo only | Five months old, rate control is average bitrate with no runtime retarget in its API. One run here, same converted frames through `encode_planes`, 4 Mbit/s, 30 fps: 83 ms per full-size frame on its `Fast` preset and 151 ms on `Balanced`, against 21 ms for OpenH264 (576x1280: 31 and 61 ms against 15). Worth re-checking as it matures; it would remove the C++ build and the `unsafe`. |
+| x264 (`x264` crate or a `dlopen` of `libx264`) | GPL-2.0 | System library | A GPL encoder in an MIT workspace; and it is a system package. Not chosen. |
+| FFmpeg, GStreamer | LGPL/GPL by build | System libraries | System packages again, and a large surface for one encoder. |
+| VA-API, NVENC, V4L2 stateful encoders | n/a | Hardware | Nothing to test on a CI runner or this VM. A follow-up. |
+
+*Patents.* OpenH264's [FAQ](https://www.openh264.org/faq.html) says Cisco covers the AVC/H.264
+royalties only for the binary module it ships, which a product has to download when it is
+installed; a product that builds the source itself is outside that. The `openh264` feature is
+off by default, no release binary of `simee` or `emu` enables it, and nothing links the encoder
+unless a build asks for it. Whether to ship an encoder built from source, or to take the
+`libloading` route, is the owner's call (default: ship neither).
+
+*Why a feature, off by default.* The OpenH264 build needs a C++ compiler for the target, and
+`scripts/check.sh` lints the Linux target from macOS with no C++ cross toolchain: with the
+feature on, `cargo clippy --target x86_64-unknown-linux-gnu` from a Mac stops in `openh264-sys2`'s
+build script (the same reason `simee-rtc`'s `rust-crypto` is opt-in). Checked here by linting
+`aarch64-unknown-linux-gnu` from an x86_64 host: it passes without the feature and fails with
+`failed to find tool "aarch64-linux-gnu-g++"` with it. CI's `linux` job and the pre-push hook
+therefore don't build or run the Linux encoder until they pass `--features openh264` to
+`simee-encode` (`cargo clippy -p simee-encode --all-targets --features openh264` and
+`cargo test -p simee-encode --features openh264`).
 
 ### Encode cost
 
@@ -356,6 +437,52 @@ What the numbers say: at full size a moving iPhone frame takes the hardware enco
 frame emu presents from the ring (about 10 MB each at full size), not because of the encoder.
 The tablet and iPad rows are not measured yet.
 
+### Encode cost on Linux
+
+`scripts/bench/encode-linux.sh` (the `linux_bench` example): no device and no emulator, so it
+runs on any Linux host. A synthetic app drawer (wallpaper gradient, a grid of coloured icons with
+text-like labels, scrolled 24 px per picture and back) is rendered up front at 1080x2400 and
+presented at 60 fps; the real encode loop encodes it at the cap for 10 s; medians of 3 rounds;
+the encoder's defaults (Constrained Baseline, 4 Mbit/s average, 8 Mbit/s ceiling, IDR every
+2 s), OpenH264 built with `nasm`, 2026-11-27. Host: a Linux VM, Intel Xeon @ 2.20 GHz, 4 vCPUs,
+3.8 GB, Ubuntu 22.04, kernel 6.1.189, rustc 1.99.1, load about 0.8 (the encoder runs on one
+thread; its process had 3 other vCPUs to itself). Encode latency is from handing the picture to
+the encoder until the access unit is out, and includes the colour conversion and scaling; PSNR is
+of the luma of the decoded stream against the frame the encoder was given. The screens are
+synthetic: a real device's frames will differ in how much they change, and the bitrate and PSNR
+follow that, though the time per picture mostly doesn't.
+
+| Synthetic phone screen, 1080x2400 | full size, 30 fps | full size, 60 fps | capped at 1280 (576x1280), 30 fps | capped at 1280, 60 fps |
+| --- | --- | --- | --- | --- |
+| Encoded, fps | 28.8 | 28.4 | 29.8 | 58.7 |
+| Encode latency p50 / p95, ms | 26.1 / 40.9 | 36.5 / 41.8 | 22.4 / 25.9 | 14.2 / 15.5 |
+| Colour conversion (and scaling) alone p50, ms | 5.1 | 5.1 | 6.6 | 6.6 |
+| Process CPU, % of a core | 82 | 99 | 68 | 86 |
+| Luma PSNR, dB | 45.2 | 44.9 | 42.6 | 39.5 |
+| Output, kbit/s | 2190 | 1638 | 3830 | 3901 |
+| First IDR / median IDR, KB | 46.1 / 54.1 | 43.0 / 41.9 | 39.2 / 44.5 | 35.6 / 35.6 |
+
+Built without `nasm` (`OPENH264_NO_ASM=1`, what a host without it gets, 30 fps, same method):
+61.8 ms p50 and 118 ms p95 at full size (13.6 fps, 100% of a core) and 35.0 / 57.9 ms capped
+(24.6 fps). With `nasm` the encoder itself is about 2.4 times faster.
+
+```bash
+scripts/bench/encode-linux.sh                                # the table above
+scripts/bench/encode-linux.sh --fps 30 --max-size 0          # full size only
+OPENH264_NO_ASM=1 scripts/bench/encode-linux.sh --fps 30     # without assembly
+```
+
+What the numbers say: one thread encodes a full 1080x2400 screen at about 26 ms, so a full-size
+stream tops out near 30 fps on this CPU and 60 fps needs the 1280 cap (14 ms, 59 fps, 86% of a
+core). Of a full-size picture's 26 ms, 5 ms is the conversion; scaling to 1280 costs 1.6 ms more
+and halves the encode. VideoToolbox's hardware encoder takes 14-17 ms per full-size frame on an
+M3 Max with almost no CPU (above); the software encoder on this VM costs most of a core. The
+process stayed at or under one core in every run (the Rust wrapper always asks for one slice per
+picture; using more threads would mean slicing the picture, which this change doesn't try), so
+the rest of the host's cores stay free for the guest. Not measured: aarch64 speed (the tests ran there under `qemu-user`, which
+says nothing about time), an emu software-mode guest running beside the encoder, and any
+hardware encoder.
+
 ### Tests
 
 `cargo test -p simee-encode`: Annex B and length-prefixed conversion, the SPS/PPS cache and its
@@ -366,6 +493,23 @@ Baseline and Main, forced and periodic IDRs with their parameter sets, scaling, 
 size change, and every access unit decoded with `VTDecompressionSession`. `tests/live.rs` does the
 same on a real device's frames (`SIMEE_E2E_UDID=<udid>` or `SIMEE_E2E_AVD=<avd>`), with the SPS
 read by `simee-rtc`'s parser.
+
+On Linux, `cargo test -p simee-encode` runs the colour conversion and scaling (`src/i420.rs`:
+BT.709 primaries, 2x2 chroma means, odd and padded frames, a downscale, flat colours through
+every tap count, reused buffers), the display-socket reader against a fake display (a frame taken
+once, the newest of several, the count of those it skipped, a closed connection), and the
+Annex B parameter-set cache. With `--features openh264`, `tests/openh264.rs` encodes synthetic
+screens and decodes every access unit with OpenH264's decoder: Constrained Baseline and Main
+(`profile-level-id` read by `simee-rtc`'s parser), forced and periodic IDRs each with SPS and PPS
+in front and none on P frames, `max_size` and odd sizes, a rotation (new session, new SPS, IDR),
+BGRA and RGBA giving identical streams, BT.709 colours after a lossy round trip, `set_bitrate`
+up and down (bytes per picture 1235, 13627 and 413 at 200 kbit/s, 3 Mbit/s and 200 kbit/s again
+on noise; with the `SetOption` call removed the second figure is 822 and the test fails), a
+picture the rate control skips, the refusals (hardware required, over 3840x2160, a short buffer,
+fps 0), and the whole loop on a fake source and clock with the real encoder (the 30 fps cap, an
+IDR requested mid-run answered by the next picture, a retarget). The same tests passed on
+`aarch64-unknown-linux-gnu` under `qemu-user` (OpenH264 built from source with its NEON code)
+and on x86_64 with `OPENH264_NO_ASM=1`.
 
 ## Streams from the API (#266)
 
@@ -458,8 +602,11 @@ it. A real stream end to end (Chromium over WHEP) is #268's.
   `key` presses one key), and a target orientation on Android aren't wired to devices yet.
 - **The CLI's `simee stream` and the desktop's Share control** (the rest of #266) call these
   methods; they aren't built yet.
-- **A Linux encoder** (openh264 or x264 behind a feature) and VA-API; on Linux
-  `simee-encode` has no encoder.
+- **Linux hardware encoders** (VA-API, NVENC, V4L2) and a faster software path: OpenH264 runs one
+  thread (one slice) per encoder, a full-size stream tops out near 30 fps on the VM measured, and
+  the colour conversion is single-threaded. The Linux encoder is behind the `openh264` feature,
+  which CI's `linux` job doesn't enable yet (see "Linux: OpenH264" for the commands), and
+  `libloading` (Cisco's binary, with its patent coverage) isn't offered.
 - **Pipelined encoding.** One picture is in flight at a time, so a full-size iPhone stream can't
   quite reach 60 fps (17 ms per moving frame); submitting the next frame before the previous one
   is out would lift the rate, not the latency.
@@ -471,7 +618,7 @@ it. A real stream end to end (Chromium over WHEP) is #268's.
 
 | Issue | What |
 | --- | --- |
-| #263 | `sim-encode`: VideoToolbox H.264 straight from the IOSurface on macOS (a Linux encoder still to come); it answers `KeyframeRequested` and `BitrateEstimate` |
+| #263 | `sim-encode`: VideoToolbox H.264 straight from the IOSurface on macOS, OpenH264 on Linux behind a feature (hardware encoders on Linux still to come); it answers `KeyframeRequested` and `BitrateEstimate` |
 | #264 | `sim-rtc` |
 | #265 | An Opus audio track |
 | #266 | Start, watch and stop streams from the API, MCP, CLI and desktop |
