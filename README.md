@@ -50,6 +50,13 @@ Guest code runs natively under both. The gap is the emulator itself: an
 in-kernel interrupt controller, zero-copy disk and adb paths, and memory that is committed only
 when the guest touches it.
 
+### Android on Linux with KVM
+
+On an x86_64 Linux host with a usable `/dev/kvm`, software mode runs the guest on KVM. On a GitHub
+`ubuntu-latest` runner, 2026-11-27, the API 36 x86_64 image reached `sys.boot_completed` in **28.8 s**
+cold and **16.6 s** warm, against the SDK emulator's 30.3 s and 19.2 s, with a 2.27 GB peak RSS
+against 3.00 GB cold ([benchmarks](docs/benchmarks.md#android-software-mode-on-kvm-githubs-x86_64-runner)).
+
 ### Android on Linux without KVM
 
 Software mode, for cloud and CI machines with no `/dev/kvm` and no GPU: QEMU's TCG runs the

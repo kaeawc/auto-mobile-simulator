@@ -49,10 +49,14 @@ static RENDERER: std::sync::OnceLock<Arc<emu_gfxstream::Renderer>> = std::sync::
 /// A Vulkan-only renderer's post notices (see `init_renderer`).
 static TICKER: std::sync::OnceLock<Arc<crate::display::PostTicker>> = std::sync::OnceLock::new();
 
-/// Post notices of a Vulkan-only renderer ([`crate::display::PostTicker`]): at most one per
-/// display frame (60 Hz) while the renderer signals fences, and for 50 ms (three frames) after.
+/// Post notices of a Vulkan-only renderer ([`crate::display::PostTicker`]): one per post while
+/// the renderer signals fences, and for 50 ms (three frames) after; at most one per display frame
+/// (60 Hz) while the last post can't be read.
 const POST_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 const POST_NOTICE_TAIL: std::time::Duration = std::time::Duration::from_millis(50);
+/// How often the ticker asks the renderer for a new post while fences come: a notice follows its
+/// post within this, instead of the fence before it (issue #201).
+const POST_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 
 type RendererInit = std::sync::mpsc::Receiver<Result<Arc<emu_gfxstream::Renderer>>>;
 
@@ -209,9 +213,18 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     //   ANGLE) asserts it and aborts without.
     // EMU_RENDERER_FEATURES adds overrides, e.g. "HostComposition:disabled".
     let features = renderer_features(spec.virtual_queue, spec.pipe_gles, std::env::var("EMU_RENDERER_FEATURES").ok().as_deref());
-    // Without GL there's no post callback: fences drive the post notices instead.
-    let ticker = vulkan_only
-        .then(|| crate::display::PostTicker::start(spec.display.clone(), spec.width, spec.height, POST_NOTICE_INTERVAL, POST_NOTICE_TAIL));
+    // Without GL there's no post callback: fences wake the ticker, and it notices each change of
+    // the posted color buffer (a plain load in the renderer). Host composition cycles through
+    // three targets, so each post changes it: on API 36, 888 of 889 frames SurfaceFlinger
+    // composited over swipes were noticed, and a tap's changed frame came after 1.4 unchanged
+    // readbacks with 8.9 ms of host time (median; p90 24.7) before, none and 6.4 ms (p90 7.9)
+    // after (issue #201's tap-to-frame benchmark).
+    let probe: crate::display::PostProbe = Arc::new(|| RENDERER.get().and_then(|r| r.last_posted_color_buffer().ok()));
+    let ticker = vulkan_only.then(|| {
+        let (w, h) = (spec.width, spec.height);
+        let probe = Some((probe, POST_PROBE_INTERVAL));
+        crate::display::PostTicker::start_probed(spec.display.clone(), w, h, POST_NOTICE_INTERVAL, POST_NOTICE_TAIL, probe)
+    });
     let fences = virtio::gpu::fence_handler();
     if let Some(t) = &ticker {
         let _ = TICKER.set(t.clone());

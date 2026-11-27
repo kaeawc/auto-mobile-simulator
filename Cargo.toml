@@ -84,6 +84,12 @@ cpal = { version = "0.18", default-features = false }
 kvm-ioctls = { version = "0.25", default-features = false }
 kvm-bindings = { version = "0.14", default-features = false }
 vmm-sys-util = { version = "0.15", default-features = false }
+# Software H.264 for Linux (sim-encode's `openh264` feature): Cisco's OpenH264 built from its C++
+# source (`source`), which needs a C++ compiler (and `nasm` for the x86 SIMD) and so is opt-in:
+# the Linux cross-clippy from macOS has no C++ cross toolchain. `-sys2` is for the one call the
+# safe crate lacks (a runtime bitrate change).
+openh264 = { version = "0.9", default-features = false, features = ["source"] }
+openh264-sys2 = { version = "0.9", default-features = false }
 # WebRTC for the WHIP publisher (sim-rtc): sans-IO, no async runtime (webrtc-rs needs tokio). No
 # crypto backend here: sim-rtc picks CryptoKit on Apple targets and opts into RustCrypto on Linux
 # (whose certificate generation builds aws-lc's C, which would break cross-target clippy).
@@ -95,7 +101,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 block2 = { version = "0.6", default-features = false, features = ["std"] }
 
 # unsafe is forbidden everywhere except the FFI crates, which set their own lints: sim-coresim
-# (Objective-C), emu-hvf (Hypervisor.framework, guest RAM), emu-kvm (Linux KVM), emu-gfxstream (the renderer) and
+# (Objective-C), emu-hvf (Hypervisor.framework, guest RAM), emu-kvm (Linux KVM), emu-gfxstream (the renderer),
+# sim-encode (one OpenH264 call, `deny` and allowed on that function) and
 # apps/emu (one signal-mask function, so `deny` there instead of `forbid`).
 [workspace.lints.rust]
 unsafe_code = "forbid"

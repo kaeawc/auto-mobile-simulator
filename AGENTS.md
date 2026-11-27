@@ -12,7 +12,8 @@ for both is to match the stock tools exactly and then exceed them.
   the features used; crates reference them with `{ workspace = true }`.
 - `unsafe` lives only in `crates/sim-coresim` (the Objective-C / IOSurface / VideoToolbox boundary),
   `crates/emu-hvf` (Hypervisor.framework and guest RAM), `crates/emu-kvm` (Linux KVM), `crates/emu-gfxstream` (the renderer),
-  `apps/emu`'s `shutdown_signals` (signal masks), `desktop/src/surface.rs` (the zero-copy
+  `apps/emu`'s `shutdown_signals` (signal masks), `crates/sim-encode`'s `src/linux.rs` (one OpenH264
+  `SetOption` call: a runtime bitrate change), `desktop/src/surface.rs` (the zero-copy
   bridge) and `crates/sim-camera`'s `avf.rs` (AVFoundation capture) and `v4l2.rs` (Linux V4L2
   ioctls). Every `unsafe` block carries a `// SAFETY:` comment
   (`clippy::undocumented_unsafe_blocks` is denied or warned there). Everything else forbids it.
@@ -154,12 +155,18 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `profile-level-id`, SPS/PPS before IDRs), `rtp.rs` (RFC 6184, FU-A), `publisher.rs` (str0m in
   RTP mode, one thread per publisher, the encoder callback). Docs: `docs/streaming.md`.
 - `crates/sim-encode` — the H.264 encoder (safe; its FFI is `sim-coresim`'s `videotoolbox.rs`
-  behind the `videotoolbox` feature): `annexb.rs` (length-prefixed to Annex B, SPS/PPS before
+  behind the `videotoolbox` feature, and `linux.rs`'s one call): `annexb.rs` (length-prefixed to Annex B, SPS/PPS before
   every IDR), `pacing.rs` (fps cap, idle heartbeat, strictly increasing PTS), `stream.rs` (the
   loop: `Source`, `Encoder`, `Controls`), `vt.rs` (`VtEncoder`, `Decoder`; macOS), `source.rs`
   (`IosSource` wraps the framebuffer IOSurface, `AndroidSource` copies emu's ring frames into an
   IOSurface pool; macOS); `examples/encode_bench.rs` (scripts/bench/encode.sh),
-  `examples/publish_device.rs` (a device to WHIP). No Linux encoder yet.
+  `examples/publish_device.rs` (a device to WHIP). Linux: `linux.rs` (`OpenH264Encoder`, OpenH264
+  built from source, behind the off-by-default `openh264` feature so the Linux cross-clippy from
+  macOS needs no C++ toolchain), `i420.rs` (BGRA/RGBA to BT.709 I420 and the `max_size` downscale,
+  on reused buffers), `android_frames.rs` (the display-socket reader both platforms' `AndroidSource`
+  use), `linux_source.rs`, `build.rs` (a cargo warning when the feature builds OpenH264 on x86 without
+  `nasm`, 2.4x slower); `examples/linux_bench.rs` (scripts/bench/encode-linux.sh). CI's `linux` job
+  lints and tests the crate with `--features openh264`; `scripts/check.sh` doesn't.
 - `crates/sim-android` — the Android backend's client: AVDs as labelled devices, system images as
   runtimes, AVD creation shaped by form factor, starting `emu` and waiting for boot, the console
   client (`console.rs`) and the display socket client (`display.rs`). No FFI.

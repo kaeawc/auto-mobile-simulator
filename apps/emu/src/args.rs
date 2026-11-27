@@ -46,6 +46,8 @@ options:
                     at 4 MiB)
   -verbose          diagnostics, including vCPU exit counts at shutdown
   -no-boot-anim     skip the boot animation
+  -accel MODE       software mode (x86_64 Linux): auto (default: KVM when /dev/kvm is usable,
+                    else QEMU's TCG), on (KVM or fail), off (TCG); -no-accel is -accel off
   -disk-cache MODE  unsafe (default: guest flushes stay in the host page cache) or fsync
   -gpu MODE         rendering mode, default auto (host GPU through MoltenVK):
                       auto, host     host GPU through MoltenVK, software if that fails
@@ -73,6 +75,10 @@ options:
 Other SDK emulator flags are accepted.
 ";
 
+/// Whether this build boots in software mode, the only one `-accel` chooses for: on a Mac the
+/// hypervisor is the only accelerator, so there `-accel` is listed as not implemented.
+const SOFTWARE_MODE: bool = cfg!(all(target_os = "linux", target_arch = "x86_64"));
+
 /// Flags that take a value and that we don't act on (yet).
 const IGNORED_WITH_VALUE: &[&str] = &[
     "ports",
@@ -92,7 +98,6 @@ const IGNORED_WITH_VALUE: &[&str] = &[
     "partition-size",
     "snapshot",
     "id",
-    "accel",
     "selinux",
     "screen",
     "grpc-use-token",
@@ -119,6 +124,9 @@ pub struct Opts {
     pub version: bool,
     pub help: bool,
     pub accel_check: bool,
+    /// `-accel on|off|auto`, `-no-accel`: None is auto. Software mode only (Linux): on a Mac the
+    /// hypervisor is the only accelerator.
+    pub accel: Option<bool>,
     pub cores: Option<u32>,
     pub memory_mb: Option<u64>,
     pub port: Option<u16>,
@@ -187,6 +195,24 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
             "version" => o.version = true,
             "help" | "h" => o.help = true,
             "accel-check" => o.accel_check = true,
+            "accel" => {
+                let v = value(flag)?;
+                o.accel = match v.as_str() {
+                    "auto" => None,
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    v => bail!("-accel {v}: expected on, off or auto"),
+                };
+                if !SOFTWARE_MODE {
+                    o.ignored.push(format!("-accel {v}"));
+                }
+            }
+            "no-accel" => {
+                o.accel = Some(false);
+                if !SOFTWARE_MODE {
+                    o.ignored.push("-no-accel".into());
+                }
+            }
             "cores" => o.cores = Some(value(flag)?.parse()?),
             "memory" => o.memory_mb = Some(value(flag)?.parse()?),
             "port" => o.port = Some(value(flag)?.parse()?),
@@ -328,6 +354,21 @@ mod tests {
         }
         assert!(parse("-gpu bogus".split_whitespace().map(String::from)).is_err());
         assert_eq!(p("-avd x").gpu, None);
+    }
+
+    #[test]
+    fn accel_modes_are_stocks() {
+        assert_eq!(p("-avd x").accel, None);
+        assert_eq!(p("-avd x -accel auto").accel, None);
+        assert_eq!(p("-avd x -accel on").accel, Some(true));
+        assert_eq!(p("-avd x -accel off").accel, Some(false));
+        assert_eq!(p("-avd x -no-accel -port 5570").accel, Some(false));
+        assert_eq!(p("-avd x -no-accel -port 5570").port, Some(5570), "-no-accel takes no value");
+        // Acted on in software mode; elsewhere `-verbose` lists it as not implemented.
+        let ignored = if SOFTWARE_MODE { vec![] } else { vec!["-accel on".to_string()] };
+        assert_eq!(p("-avd x -accel on").ignored, ignored);
+        assert_eq!(p("-avd x -no-accel").ignored.is_empty(), SOFTWARE_MODE);
+        assert!(parse("-avd x -accel hvf".split_whitespace().map(String::from)).is_err());
     }
 
     #[test]

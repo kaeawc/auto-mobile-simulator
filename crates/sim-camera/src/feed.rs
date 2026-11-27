@@ -742,7 +742,7 @@ mod tests {
     }
 
     fn sock(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("simee-feed-{tag}-{}.sock", std::process::id()))
+        std::path::PathBuf::from("/tmp").join(format!("simee-feed-{tag}-{}.sock", std::process::id()))
     }
 
     fn feed(tag: &str, source: SourceSpec, fps: u32) -> (Feed, Arc<AtomicUsize>) {

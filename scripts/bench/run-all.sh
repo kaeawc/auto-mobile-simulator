@@ -36,6 +36,7 @@ android-steps|android|api-steps.sh --android|Software mode through emu -avd (tap
 android-farm|android|android-farm.sh|Android farm
 android-bundle|android|android-bundle.sh|Android: device bundles
 software-mode|linux|software-mode.sh|Boot to sys.boot_completed with emu's devices
+encode-linux|linux|encode-linux.sh|Video encode (H.264, OpenH264 on Linux)
 ios-boot|ios|ios-boot.sh|iOS: simee against simctl (boots)
 ios-command|ios|ios-command.sh|iOS: simee against simctl (one screenshot as a command)
 ios-steps|ios|api-steps.sh|iOS: simee against simctl (time per automation step)

@@ -333,7 +333,7 @@ mod tests {
         const BURSTS: usize = 40;
         let (w, h) = (1080u32, 2400u32);
         let len = w * h * 4;
-        let dir = std::env::temp_dir().join(format!("sa-burst-{}", std::process::id()));
+        let dir = PathBuf::from("/tmp").join(format!("sa-burst-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("frames.ring");
         let layout = ring::Layout::new(SLOTS, u64::from(len));
@@ -432,7 +432,7 @@ mod tests {
     /// only the newest from the ring, once.
     #[test]
     fn a_backlog_of_notices_reads_only_the_newest_frame() {
-        let dir = std::env::temp_dir().join(format!("sa-backlog-{}", std::process::id()));
+        let dir = PathBuf::from("/tmp").join(format!("sa-backlog-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("frames.ring");
         let layout = ring::Layout::new(3, 8);
@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     fn frames_come_from_the_socket_or_the_ring() {
-        let dir = std::env::temp_dir().join(format!("sa-frames-{}", std::process::id()));
+        let dir = PathBuf::from("/tmp").join(format!("sa-frames-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("frames.ring");
         let layout = ring::Layout::new(3, 8);
@@ -529,7 +529,7 @@ mod tests {
     /// into that same allocation, so a steady stream allocates nothing per frame (#17).
     #[test]
     fn frames_refill_a_recycled_buffer_in_place() {
-        let dir = std::env::temp_dir().join(format!("sa-recycle-{}", std::process::id()));
+        let dir = PathBuf::from("/tmp").join(format!("sa-recycle-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("frames.ring");
         let layout = ring::Layout::new(2, 8);
@@ -563,7 +563,7 @@ mod tests {
 
     #[test]
     fn unwanted_frames_are_passed_over_unread() {
-        let dir = std::env::temp_dir().join(format!("sa-unwanted-{}", std::process::id()));
+        let dir = PathBuf::from("/tmp").join(format!("sa-unwanted-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("frames.ring");
         let layout = ring::Layout::new(2, 8);

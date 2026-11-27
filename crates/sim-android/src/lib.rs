@@ -340,12 +340,27 @@ impl Android {
     /// launch to booted, or why it didn't. A device that fails doesn't stop the others; the next
     /// one starts as soon as any finishes.
     pub fn boot_many(&self, avds: &[String], concurrency: usize, timeout: Duration, first_port: u16) -> Result<Vec<BootOutcome>, String> {
+        self.boot_many_hooked(avds, concurrency, timeout, first_port, &Unhooked)
+    }
+
+    /// [`Android::boot_many`] with `hook` asked before each AVD starts and told as each finishes
+    /// (see [`BootHook`]); the window, ports and timeouts are the same. An AVD the hook stopped
+    /// is in the result with the hook's reason as its error.
+    pub fn boot_many_hooked(
+        &self,
+        avds: &[String],
+        concurrency: usize,
+        timeout: Duration,
+        first_port: u16,
+        hook: &dyn BootHook,
+    ) -> Result<Vec<BootOutcome>, String> {
         let locks = emu_avd::port_lock_dir();
         let free = |p: u16| port_usable(locks.as_deref(), p, port_free);
         // A farm stays silent: N devices would open N host audio streams.
-        self.boot_many_with(avds, concurrency, timeout, first_port, free, |d, port| d.launch_command(Some(port), false))
+        self.boot_window(avds, concurrency, timeout, first_port, free, |d, port| d.launch_command(Some(port), false), hook)
     }
 
+    #[cfg(test)]
     fn boot_many_with(
         &self,
         avds: &[String],
@@ -354,6 +369,20 @@ impl Android {
         first_port: u16,
         free: impl Fn(u16) -> bool + Sync,
         launch: impl Fn(&Device, u16) -> Command + Sync,
+    ) -> Result<Vec<BootOutcome>, String> {
+        self.boot_window(avds, concurrency, timeout, first_port, free, launch, &Unhooked)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn boot_window(
+        &self,
+        avds: &[String],
+        concurrency: usize,
+        timeout: Duration,
+        first_port: u16,
+        free: impl Fn(u16) -> bool + Sync,
+        launch: impl Fn(&Device, u16) -> Command + Sync,
+        hook: &dyn BootHook,
     ) -> Result<Vec<BootOutcome>, String> {
         let running = self.running();
         let devices: Vec<Device> = avds.iter().map(|a| self.device(a)).collect::<Result<_, _>>()?;
@@ -389,10 +418,20 @@ impl Android {
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some((d, port)) = jobs.get(i) else { break };
+                        if let Err(why) = hook.start(i) {
+                            let outcome = BootOutcome { avd: d.info.udid.clone(), console_port: *port, result: Err(why) };
+                            results.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(outcome);
+                            continue;
+                        }
+                        // Live, not the snapshot above: another caller may have started it since,
+                        // and then the window waits on that emulator instead of launching one.
+                        let now = d.live(self);
+                        let d = now.as_ref().unwrap_or(d);
+                        let port = d.running.as_ref().map_or(port, |r| &r.console_port);
                         let (mut port, mut tries) = (*port, 0);
                         let started = Instant::now();
                         let result = loop {
-                            let r = d.boot_with(self, timeout, launch(d, port)).map(|()| started.elapsed());
+                            let r = d.boot_launching(self, timeout, || launch(d, port), &|| hook.launching(i)).map(|()| started.elapsed());
                             match r {
                                 Err(e) if e.contains(emu_avd::PORT_TAKEN) && tries < PORT_RETRIES => {
                                     tries += 1;
@@ -406,6 +445,7 @@ impl Android {
                             }
                         };
                         let outcome = BootOutcome { avd: d.info.udid.clone(), console_port: port, result };
+                        hook.finished(i, &outcome);
                         results.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(outcome);
                     }
                 });
@@ -428,6 +468,36 @@ impl Android {
         let sdk = self.env.sdk_root.as_ref().map(|r| r.join("platform-tools/adb")).filter(|p| p.is_file());
         sdk.or_else(|| Command::new("adb").arg("version").output().ok().filter(|o| o.status.success()).map(|_| PathBuf::from("adb")))
     }
+}
+
+/// What [`Android::boot_many_hooked`]'s window tells and asks its caller about each AVD, from the
+/// window's threads; `i` is the AVD's place in `avds`.
+pub trait BootHook: Sync {
+    /// Asked before AVD `i` starts: `Err(why)` starts no more (each AVD not started fails with
+    /// `why`).
+    fn start(&self, i: usize) -> Result<(), String>;
+    /// Asked just before the window launches an emulator for AVD `i`, which no emulator runs at
+    /// that instant: `Err(why)` launches none (`why` is its error). Never asked for an AVD that
+    /// was running (or starting under another caller) when its turn came: the window only waits
+    /// on that one, so only an AVD this says yes to is the caller's own.
+    fn launching(&self, i: usize) -> Result<(), String>;
+    /// AVD `i` finished, booted or not.
+    fn finished(&self, i: usize, outcome: &BootOutcome);
+}
+
+/// The hook of a plain [`Android::boot_many`]: every AVD starts, nothing is told.
+struct Unhooked;
+
+impl BootHook for Unhooked {
+    fn start(&self, _: usize) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn launching(&self, _: usize) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn finished(&self, _: usize, _: &BootOutcome) {}
 }
 
 /// One device's result in [`Android::boot_many`].
@@ -680,7 +750,30 @@ impl Device {
     /// on the host's default output; without it (what tools and farms want) it is silent
     /// (`-no-audio`) and opens no host audio device.
     pub fn boot(&self, android: &Android, timeout: Duration, audio: bool) -> Result<(), String> {
-        self.boot_with(android, timeout, self.launch_command(None, audio))
+        self.boot_asking(android, timeout, audio, &|| Ok(()))
+    }
+
+    /// [`boot`](Self::boot), with `launching` asked just before it launches an emulator for this
+    /// AVD, which none runs at that instant (read then, not when this `Device` was read): `Err`
+    /// launches none and is the boot's error. An AVD running or starting already (another
+    /// caller's) is waited on without asking, so a yes means this boot started it.
+    pub fn boot_asking(
+        &self,
+        android: &Android,
+        timeout: Duration,
+        audio: bool,
+        launching: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let now = self.live(android);
+        let d = now.as_ref().unwrap_or(self);
+        d.boot_launching(android, timeout, || d.launch_command(None, audio), launching)
+    }
+
+    /// This AVD as it runs now, when this `Device` (read earlier) says it isn't running but an
+    /// emulator, another caller's, has started it since; `None` otherwise.
+    fn live(&self, android: &Android) -> Option<Device> {
+        let r = self.running.is_none().then(|| android.running_of(&self.info.udid)).flatten()?;
+        Some(Device { running: Some(r), ..self.clone() })
     }
 
     /// The command that starts `emu` for this AVD, on console port `port` if given (else emu
@@ -720,13 +813,25 @@ impl Device {
         cmd
     }
 
-    /// [`boot`](Self::boot) with the launch command given (its stdout and stderr are replaced by
-    /// the log). Boot is detected from emu's own `emu: boot completed in X s` line, tailed in the
-    /// log from where this launch began: no process per poll, and the lag is one poll (50 ms).
-    /// adb is the fallback for an emulator that never prints it (the stock one, an older emu),
-    /// consulted every [`ADB_FALLBACK`] and once more to confirm after the line appears. A child
-    /// that exits fails the wait at once instead of at the timeout.
-    fn boot_with(&self, android: &Android, timeout: Duration, mut cmd: Command) -> Result<(), String> {
+    /// [`boot_launching`](Self::boot_launching) asking nothing.
+    #[cfg(test)]
+    fn boot_with(&self, android: &Android, timeout: Duration, cmd: Command) -> Result<(), String> {
+        self.boot_launching(android, timeout, || cmd, &|| Ok(()))
+    }
+
+    /// [`boot_asking`](Self::boot_asking) with the launch command given, built only for a launch
+    /// (its stdout and stderr are replaced by the log). Boot is detected from emu's own `emu: boot
+    /// completed in X s` line, tailed in the log from where this launch began: no process per
+    /// poll, and the lag is one poll (50 ms). adb is the fallback for an emulator that never prints
+    /// it (the stock one, an older emu), consulted every [`ADB_FALLBACK`] and once more to confirm
+    /// after the line appears. A child that exits fails the wait at once instead of at the timeout.
+    fn boot_launching(
+        &self,
+        android: &Android,
+        timeout: Duration,
+        cmd: impl FnOnce() -> Command,
+        launching: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
         let avd = self.avd()?;
         let deadline = Instant::now() + timeout;
         let log_dir = emu_avd::state_dir(&avd.dir);
@@ -734,11 +839,13 @@ impl Device {
         let mut child = None;
         let mut tail = None;
         if self.running.is_none() {
+            launching()?;
             std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
             let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
             // Truncated just now: this launch's output starts at offset 0.
             tail = Some(LogTail::new(&log_path));
             let err = log.try_clone().map_err(|e| e.to_string())?;
+            let mut cmd = cmd();
             let spawned = cmd.stdin(Stdio::null()).stdout(log).stderr(err).spawn();
             child = Some(spawned.map_err(|e| format!("starting {}: {e}", cmd.get_program().to_string_lossy()))?);
         }
@@ -2102,6 +2209,128 @@ mod tests {
         ports.dedup();
         assert_eq!(ports.len(), 4, "one port each");
         assert!(f.android.boot_many(&["nope".to_string()], 1, Duration::from_secs(1), 5600).is_err(), "unknown AVDs fail up front");
+    }
+
+    /// Records when each AVD started and finished; after `stop_after` have finished it starts no more.
+    struct Watch {
+        t0: Instant,
+        stop_after: usize,
+        started: std::sync::Mutex<Vec<(usize, Duration)>>,
+        launched: std::sync::Mutex<Vec<usize>>,
+        finished: std::sync::Mutex<Vec<(usize, Duration, bool)>>,
+    }
+
+    impl BootHook for Watch {
+        fn start(&self, i: usize) -> Result<(), String> {
+            if self.finished.lock().expect("finished").len() >= self.stop_after {
+                return Err("not started: stopped".into());
+            }
+            self.started.lock().expect("started").push((i, self.t0.elapsed()));
+            Ok(())
+        }
+
+        fn launching(&self, i: usize) -> Result<(), String> {
+            self.launched.lock().expect("launched").push(i);
+            Ok(())
+        }
+
+        fn finished(&self, i: usize, outcome: &BootOutcome) {
+            self.finished.lock().expect("finished").push((i, self.t0.elapsed(), outcome.result.is_ok()));
+        }
+    }
+
+    /// `slow`, `f1`, `f2` and `f3` booted two at a time by a fresh fixture `tag` with `hook`:
+    /// `slow` takes 1.5 s, the others 0.2 s each.
+    fn boot_hooked(tag: &str, hook: &Watch) -> Vec<BootOutcome> {
+        let f = fixture(tag);
+        let names: Vec<String> = ["slow", "f1", "f2", "f3"].iter().map(|s| s.to_string()).collect();
+        for n in &names {
+            f.android.create(n, "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        }
+        fake_adb(&f);
+        let _console = fake_emulator(&f.android, "console-only");
+        let me = f.android.running_dir.clone().expect("running").join(format!("pid_{}.ini", std::process::id()));
+        let ad = std::fs::read_to_string(&me).expect("fake ad");
+        let console = Running::parse(&format!("pid_{}.ini", std::process::id()), &ad).expect("parse").console_port;
+        let run = f.android.running_dir.clone().expect("running");
+        let launch = |d: &Device, _port: u16| {
+            let took = if d.info.udid == "slow" { 1.5 } else { 0.2 };
+            sh(&format!(
+                "printf 'port.serial={console}\\navd.name={}\\nemulator=simee\\n' > {}/pid_$$.ini; sleep {took}; \
+                 echo 'emu: boot completed in {took}s'; sleep 3",
+                d.info.udid,
+                run.display()
+            ))
+        };
+        f.android.boot_window(&names, 2, Duration::from_secs(20), 5600, |_| true, launch, hook).expect("boot_many")
+    }
+
+    fn watch(stop_after: usize) -> Watch {
+        Watch { t0: Instant::now(), stop_after, started: Default::default(), launched: Default::default(), finished: Default::default() }
+    }
+
+    #[test]
+    fn a_hooked_boot_many_refills_its_window_as_each_device_finishes() {
+        let all = watch(usize::MAX);
+        let out = boot_hooked("hooked", &all);
+        assert!(out.iter().all(|o| o.result.is_ok()), "{out:?}");
+        let started = all.started.into_inner().expect("started");
+        let finished = all.finished.into_inner().expect("finished");
+        let at = |i: usize| started.iter().find(|s| s.0 == i).expect("started").1;
+        let slow_done = finished.iter().find(|f| f.0 == 0).expect("slow finished").1;
+        // f1, f2 and f3 boot one after another beside `slow`, not after it.
+        assert!(at(3) < slow_done, "f3 started as f2 finished, not after slow: {started:?} {finished:?}");
+        // Every device finished. Which one finishes last depends on the fake's polling, not the
+        // window (a loaded CI runner finished `slow` before f3), so the order isn't asserted.
+        assert_eq!(finished.len(), 4, "{finished:?}");
+    }
+
+    #[test]
+    fn a_hooked_boot_many_waits_on_an_avd_another_caller_started_without_launching_it() {
+        // `a` and `b` are stopped when the window reads them; while `a` boots, another caller
+        // starts `b` (its advertisement, with a live pid). On `b`'s turn the window waits on that
+        // emulator: it launches none and doesn't ask `launching`, so `b` is never the caller's.
+        let f = fixture("hookedtaken");
+        let names: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        for n in &names {
+            f.android.create(n, "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        }
+        fake_adb(&f);
+        let _console = fake_emulator(&f.android, "console-only");
+        let me = f.android.running_dir.clone().expect("running").join(format!("pid_{}.ini", std::process::id()));
+        let ad = std::fs::read_to_string(&me).expect("fake ad");
+        let console = Running::parse(&format!("pid_{}.ini", std::process::id()), &ad).expect("parse").console_port;
+        let run = f.android.running_dir.clone().expect("running");
+        let launches = std::sync::Mutex::new(Vec::new());
+        let launch = |d: &Device, _port: u16| {
+            launches.lock().expect("launches").push(d.info.udid.clone());
+            sh(&format!(
+                "printf 'port.serial={console}\\navd.name={avd}\\nemulator=simee\\n' > {run}/pid_$$.ini; \
+                 sleep 2 & printf 'port.serial={console}\\navd.name=b\\nemulator=simee\\n' > {run}/pid_$!.ini; \
+                 sleep 0.2; echo 'emu: boot completed in 0.2s'; sleep 2",
+                avd = d.info.udid,
+                run = run.display()
+            ))
+        };
+        let hook = watch(usize::MAX);
+        let out = f.android.boot_window(&names, 1, Duration::from_secs(20), 5600, |_| true, launch, &hook).expect("boot_many");
+        assert!(out.iter().all(|o| o.result.is_ok()), "{out:?}");
+        assert_eq!(*launches.lock().expect("launches"), ["a"], "no emulator launched for b");
+        assert_eq!(*hook.launched.lock().expect("launched"), [0], "only a is the caller's");
+        assert_eq!(out[1].console_port, console, "b's port is the one its emulator advertises");
+    }
+
+    #[test]
+    fn a_hooked_boot_many_starts_no_more_once_told_to_stop() {
+        // Stopped once one has finished: f1 is done, `slow` (in flight) finishes, f2 and f3 never start.
+        let one = watch(1);
+        let out = boot_hooked("hookstop", &one);
+        let mut started: Vec<usize> = one.started.into_inner().expect("started").iter().map(|s| s.0).collect();
+        started.sort_unstable();
+        assert_eq!(started, [0, 1]);
+        assert!(out[..2].iter().all(|o| o.result.is_ok()), "{out:?}");
+        assert!(out[2..].iter().all(|o| o.result == Err("not started: stopped".into())), "{out:?}");
+        assert_eq!(one.finished.into_inner().expect("finished").len(), 2, "only the two started are told they finished");
     }
 
     #[test]

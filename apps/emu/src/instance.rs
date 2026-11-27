@@ -370,7 +370,7 @@ impl Instance {
     /// Software mode's config (#55): the plan on QEMU's TCG with emu's devices
     /// (`emu_vmm::soft`). The renderer runs on SwiftShader: the SDK's lavapipe crashed in a render
     /// thread on every booted guest (docs/android.md); `-gpu lavapipe` picks it anyway.
-    pub fn soft_config(&self, opts: &Opts, qemu: PathBuf) -> Result<emu_vmm::soft::Config> {
+    pub fn soft_config(&self, opts: &Opts, qemu: PathBuf, accel: emu_vmm::soft::Accel) -> Result<emu_vmm::soft::Config> {
         let plan = self.plan(opts);
         if !plan.x86 {
             bail!(
@@ -435,6 +435,8 @@ impl Instance {
             console,
             logcat: self.logcat.clone(),
             verbose: opts.verbose,
+            accel,
+            accel_fallback: opts.accel.is_none(),
         })
     }
 }
