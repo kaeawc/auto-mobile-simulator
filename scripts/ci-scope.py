@@ -24,7 +24,10 @@ name a crate it doesn't build.
 `desktop`, `emu` and `macos` (desktop or emu) as true/false: whether the change can affect the
 macOS lint-test job, the desktop workspace (macOS and Linux), or the macOS release build of emu.
 Docs, Linux-only Rust files, scripts no CI job runs and other workflows affect none of them; a
-script counts for the jobs whose config or code names it (and the scripts it names, in turn).
+script counts for the jobs whose config or code names it (and the scripts it names, in turn),
+and any file the code a job builds include_str!s or include_bytes!s counts for that job. A cfg
+is evaluated three-valued: a predicate the target doesn't fix (a feature, `test`,
+`debug_assertions`) is unknown, and code whose gate comes out unknown counts as compiled.
 Each path is judged in this tree and in the --base tree (the diff's other side) and the answers
 are OR-ed, so a deleted, renamed or newly gated file counts by what it was too. Scoping fails
 safe: a path it doesn't know, a path in neither tree, a name a job uses that points at no file,
@@ -93,34 +96,76 @@ def parse_cfg(text):
     return e
 
 
-def ev(e, env, unknown):
+def ev3(e, env):
+    """cfg(e) on env: True, False, or None when it turns on a predicate env doesn't fix (a
+    feature, `test` and `debug_assertions` outside an override: both builds exist)."""
     kind = e[0]
-    if kind == "all":
-        return all(ev(a, env, unknown) for a in e[1])
-    if kind == "any":
-        return any(ev(a, env, unknown) for a in e[1])
+    if kind in ("all", "any"):
+        vals = [ev3(a, env) for a in e[1]]
+        decides = kind == "any"  # any: one True decides it; all: one False does
+        if decides in vals:
+            return decides
+        return None if None in vals else not decides
     if kind == "not":
-        return not ev(e[1][0], env, unknown)
+        v = ev3(e[1][0], env) if len(e[1]) == 1 else None
+        return None if v is None else not v
     if kind == "kv":
-        return env[e[1]] == e[2] if e[1] in env else unknown
+        return env[e[1]] == e[2] if e[1] in env else None
     if kind == "name":
-        return env[e[1]] if e[1] in env else unknown
-    return unknown
+        return env[e[1]] if e[1] in env else None
+    return None
 
 
 def present(e, env, overrides=None):
-    """Whether code under cfg(e) can be compiled for env (unknown predicates may be true)."""
-    env = dict(env, **(overrides or {}))
-    return ev(e, env, True)
+    """Whether code under cfg(e) can be compiled for env: unless it's surely off there."""
+    return ev3(e, dict(env, **(overrides or {}))) is not False
+
+
+def unknowns(e, env, out):
+    """The predicates in e that env doesn't fix, by repr."""
+    if e[0] in ("all", "any", "not"):
+        for a in e[1]:
+            unknowns(a, env, out)
+    elif e[0] not in ("kv", "name") or e[1] not in env:
+        out.add(repr(e))
+    return out
+
+
+def ev(e, env, assign):
+    """cfg(e) on env with the predicates it doesn't fix set by assign ({repr: bool})."""
+    kind = e[0]
+    if kind == "all":
+        return all(ev(a, env, assign) for a in e[1])
+    if kind == "any":
+        return any(ev(a, env, assign) for a in e[1])
+    if kind == "not":
+        return len(e[1]) != 1 or not ev(e[1][0], env, assign)
+    if kind in ("kv", "name") and e[1] in env:
+        return env[e[1]] == e[2] if kind == "kv" else env[e[1]]
+    return assign[repr(e)]
+
+
+def on_mac_vs_linux(e, test):
+    """Whether test(on macOS, on Linux) holds for some value of the predicates neither fixes
+    (the same value on both: a feature or `test` is the same choice there); too many to try
+    counts as yes."""
+    names = sorted(unknowns(e, MAC, unknowns(e, LINUX, set())))
+    if len(names) > 12:
+        return True
+    for bits in range(1 << len(names)):
+        assign = {n: bool(bits >> i & 1) for i, n in enumerate(names)}
+        if test(ev(e, MAC, assign), ev(e, LINUX, assign)):
+            return True
+    return False
 
 
 def differs(e):
-    return any(ev(e, MAC, u) != ev(e, LINUX, u) for u in (True, False))
+    return on_mac_vs_linux(e, lambda m, l: m != l)
 
 
 def mac_only(e):
     """Code under cfg(e) is compiled on macOS and not on Linux, for some value of the unknowns."""
-    return any(ev(e, MAC, u) and not ev(e, LINUX, u) for u in (True, False))
+    return on_mac_vs_linux(e, lambda m, l: m and not l)
 
 
 # --- Rust sources ----------------------------------------------------------------------------
@@ -224,6 +269,17 @@ def scan_rust(path, text=None):
     attrs = attributes(text)
     line = lambda off: text.count("\n", 0, off) + 1
     mods, uses = [], []
+    # The file's own inner attributes are those before its first item; a #![cfg] further down is
+    # inside an inline module or a body, and gates only that.
+    file_attrs, j = set(), 0
+    while True:
+        while j < len(text) and text[j].isspace():
+            j += 1
+        at = next((a for a in attrs if a[0] == j and a[3]), None)
+        if not at:
+            break
+        file_attrs.add(j)
+        j = at[1]
     by_item = {}
     for start, end, inner, is_inner, item in attrs:
         if not is_inner:
@@ -249,7 +305,7 @@ def scan_rust(path, text=None):
                 continue
             uses.append((line(start), "expr", parse_cfg(parts[0])))
         elif is_inner:
-            uses.append((line(start), "file", parse_cfg(body)))
+            uses.append((line(start), "file" if start in file_attrs else "item", parse_cfg(body)))
         elif MOD_DECL.match(text, item):
             continue  # a gated child module: the module walk handles it
         elif USE_DECL.match(text, item):
@@ -624,18 +680,34 @@ def linux_closure(packages):
     return seen
 
 
-def test_spans(text):
-    """[(start, end)] of the items compiled only under cfg(test)."""
+def gated_spans(text, env, overrides=None):
+    """[(start, end)] of the items whose #[cfg] is surely off on env."""
     spans = []
     for start, end, inner, is_inner, item in attributes(text):
         if is_inner or not re.match(r"cfg\s*\(", inner):
             continue
         o = inner.index("(")
-        if present(parse_cfg(inner[o:balanced(inner, o, "(", ")")]), LINUX, {"test": False}):
+        if present(parse_cfg(inner[o:balanced(inner, o, "(", ")")]), env, overrides):
             continue
         brace, semi = text.find("{", item), text.find(";", item)
         spans.append((item, semi if brace < 0 or 0 <= semi < brace else balanced(text, brace, "{", "}")))
     return spans
+
+
+def includes(f, env, overrides=None):
+    """[(path or None, line)] for what f's include_str!/include_bytes! read on env outside the
+    items gated off there; None is a path ci-scope can't read (not a string literal)."""
+    text = scan(f)[2]
+    spans = None
+    out = []
+    for m in INCLUDE.finditer(text):
+        spans = gated_spans(text, env, overrides) if spans is None else spans
+        if any(a <= m.start() < b for a, b in spans):
+            continue
+        lit = m.group(1).rstrip(")").strip()[1:-1] if m.group(1) else None
+        out.append((os.path.normpath(os.path.join(os.path.dirname(f), lit)) if lit else None,
+                    text.count("\n", 0, m.start()) + 1))
+    return out
 
 
 def software_inputs(crates, names):
@@ -654,15 +726,10 @@ def software_inputs(crates, names):
         for f, on in compiled(c, LINUX, **build).items():
             if not on or not f.endswith(".rs"):
                 continue
-            text = scan(f)[2]
-            spans = test_spans(text)
-            for m in INCLUDE.finditer(text):
-                if any(a <= m.start() < b for a, b in spans):
-                    continue
-                if not m.group(1):
-                    raise ValueError("%s:%d includes a path ci-scope can't read" % (f, text.count("\n", 0, m.start()) + 1))
-                lit = m.group(1).rstrip(")").strip()[1:-1]
-                out.add(os.path.normpath(os.path.join(os.path.dirname(f), lit)))
+            for p, ln in includes(f, LINUX, {"test": False}):
+                if not p:
+                    raise ValueError("%s:%d includes a path ci-scope can't read" % (f, ln))
+                out.add(p)
     return out
 
 
@@ -804,13 +871,27 @@ def tree_scopes(paths):
             for m in REFERENCED.finditer(scan(f)[2]):
                 refs.setdefault(m.group(1), set()).add(f)
     used_scripts, unresolved = script_scopes(refs)
-    need = {k: ["(unresolved: %s)" % u for u in unresolved] for k in JOBS}
+    # What the code a job builds include_str!s or include_bytes!s counts for that job, whatever
+    # the file is (a .md included is read like a source); an include it can't resolve, all jobs.
+    included = {}
+    for job, files, envs in (("lint", on_mac, ((MAC, None),)), ("emu", release, ((MAC, {"test": False}),)),
+                             ("desktop", desk_build, ((MAC, {"test": False}), (LINUX, {"test": False})))):
+        for f, on in files.items():
+            if not on or not f.endswith(".rs"):
+                continue
+            for env, overrides in envs:
+                for p, ln in includes(f, env, overrides):
+                    if p and not p.startswith("..") and os.path.isfile(os.path.join(ROOT, p)):
+                        included.setdefault(p, set()).add(job)
+                    else:
+                        unresolved.append("%s:%d includes %s" % (f, ln, p or "a path ci-scope can't read"))
+    need = {k: ["(unresolved: %s)" % u for u in dict.fromkeys(unresolved)] for k in JOBS}
     here = set()
     for p in paths:
         if not os.path.lexists(os.path.join(ROOT, p)):
             continue
         here.add(p)
-        hit = set()
+        hit = set(included.get(p, ()))
         owner = next((n for d, n in by_dir if p.startswith(d)), None)
         if p in refs:
             hit.add("lint")
