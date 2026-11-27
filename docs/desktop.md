@@ -127,3 +127,24 @@ right-hand panel has five debug tabs (Device, Network, Storage, Processes, Logs)
 stream from the emulator's display socket, and the panel shows the device and its live guest
 console.
 
+## Screenshot preview
+
+⌘S, or the toolbar's Screenshot button, saves the device's screen to the Desktop as a PNG, as
+before, on iOS and Android alike. ⌘S works wherever the focus is in the window. A thumbnail of
+the shot then slides up into the window's bottom-right corner, as the macOS screenshot preview
+does (`desktop/src/shot_preview.rs`):
+
+| Do | What happens |
+| --- | --- |
+| Nothing | It stays 5 s, then slides off to the right. The file stays saved |
+| Hover over it | It stays while the pointer is there, and for at least 1.5 s after |
+| Take more shots | They stack leftwards, newest in the corner, up to four. A fifth sends the oldest away |
+| Drag it into Finder, Mail, Slack, a browser upload… | It drops as the PNG file. The drag carries the file and the PNG data (Rune's `drag_out`). A drop the other app accepts dismisses the preview |
+| Click it | Opens the file in its default app (Preview) |
+| Right-click it | Open, Copy (the PNG to the pasteboard), Show in Finder, Delete (removes the file) |
+| Swipe right on it with two fingers | Dismisses it early |
+
+Under the system's reduced motion it appears and leaves without sliding. The window asks for
+frames only while a preview moves, plus one wake when the next one is due to leave. The
+`screenshot` and `android-screenshot` headless scenes show it settled.
+
