@@ -19,6 +19,7 @@ pub mod network;
 pub mod pacing;
 pub mod pixels;
 pub mod platform;
+pub mod plist;
 pub mod pointer;
 pub mod reuse;
 pub mod rotation;
