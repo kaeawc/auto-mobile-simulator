@@ -200,6 +200,17 @@ fn placeholder(s: &State, t: Theme) -> El {
     col().key("placeholder").w_full().grow(1.0).center().child(text(msg).font(type_::BODY).color(t.text_secondary))
 }
 
+/// Keys on the focused screen (or the 3D slot over it): the keystroke or shortcut goes to the
+/// device; what maps to nothing is left to the window.
+fn device_key(s: &mut State, k: &KeyEvent, _: &mut Tx) -> bool {
+    let action = crate::keys::map(k);
+    let handled = action != crate::keys::KeyAction::Ignore;
+    if handled {
+        s.inputs.push(Input::Key(action));
+    }
+    handled
+}
+
 /// The live screen. Pointer positions are local to the element, which has exactly the device's
 /// aspect ratio, so they map to device pixels by scaling alone.
 fn screen(s: &State) -> El {
@@ -248,14 +259,7 @@ fn screen(s: &State) -> El {
                 s.inputs.push(Input::Leave);
             }
         })
-        .on_key(|s: &mut State, k: &KeyEvent, _: &mut Tx| {
-            let action = crate::keys::map(k);
-            let handled = action != crate::keys::KeyAction::Ignore;
-            if handled {
-                s.inputs.push(Input::Key(action));
-            }
-            handled
-        });
+        .on_key(device_key);
     let stage = col().w_full().grow(1.0).min_h(0.0).center();
     // A drag from just outside the screen comes in from its edge (`crate::bezel`).
     let stage = match s.selected_info().and_then(crate::controls::bezel) {
@@ -269,7 +273,9 @@ fn screen(s: &State) -> El {
     let stage = stage.child(device);
     if scene {
         let inset = if s.selected_info().and_then(crate::controls::bezel).is_some() { crate::bezel::BAND } else { 0.0 };
-        stage.child(crate::scene::slot(inset, ratio))
+        // The slot takes the pointer, so it takes focus too (a click on the 3D view must not
+        // blur the screen) and the screen's keys.
+        stage.child(crate::scene::slot(inset, ratio).focusable(true).on_key(device_key))
     } else {
         stage
     }

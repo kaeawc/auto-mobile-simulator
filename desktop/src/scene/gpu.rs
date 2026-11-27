@@ -100,6 +100,10 @@ impl Compositor<State> for Scene {
     fn render(&mut self, f: &mut Frame<'_, State>) {
         let Some(job) = Job::from_state(&f.rt.state) else {
             self.drew = false;
+            // 3D is off: the MSAA, depth and resolve targets (~107 MB at 2x) go until it is on again.
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.targets = None;
+            }
             f.draw_ui();
             return;
         };

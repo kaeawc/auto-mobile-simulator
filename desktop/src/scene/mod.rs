@@ -45,6 +45,8 @@ const MARK: u32 = 152;
 /// What ⌘3 says on a backend that can't draw the scene.
 pub const UNAVAILABLE: &str = "The 3D view needs SIMEE_GPU_BACKEND=wgpu: Rune's native Metal backend can't draw a depth buffer \
                                or MSAA yet (anomalyco/rune#2547)";
+/// What ⌘3 says once the view is on.
+pub const ON: &str = "3D view on: clicks on the device are ignored there until input goes through the 3D projection (#156)";
 /// What ⌘3 says for a device with no body.
 pub const NO_BODY: &str = "The 3D view has bodies for phones, tablets, foldables and watches";
 
@@ -58,10 +60,13 @@ pub fn set_supported(on: bool) {
 
 /// Whether the backend `RUNE_GPU_BACKEND` (which wins) and `SIMEE_GPU_BACKEND` choose can draw
 /// the scene: wgpu's. macOS draws with Rune's native Metal backend when neither says; other
-/// hosts always draw with wgpu.
+/// hosts always draw with wgpu. Rune matches its variable exactly (`wgpu` or `metal`; anything
+/// else is ignored), while simee's is trimmed and lowercased (`crate::gpu_backend`): each is read
+/// the way its owner reads it, so this agrees with the backend Rune draws with.
 pub fn wgpu_backend(rune: Option<&str>, simee: Option<&str>, macos: bool) -> bool {
-    let named = |v: Option<&str>| v.map(|s| s.trim().to_ascii_lowercase()).filter(|s| s == "wgpu" || s == "metal");
-    match named(rune).or_else(|| named(simee)) {
+    let rune = rune.filter(|s| matches!(*s, "wgpu" | "metal"));
+    let simee = simee.map(|s| s.trim().to_ascii_lowercase()).filter(|s| s == "wgpu" || s == "metal");
+    match rune.or(simee.as_deref()) {
         Some(b) => b == "wgpu" || !macos,
         None => !macos,
     }
@@ -238,6 +243,11 @@ mod tests {
         // Rune's own variable wins over simee's.
         assert!(!wgpu_backend(Some("metal"), Some("wgpu"), true));
         assert!(wgpu_backend(Some("wgpu"), Some("metal"), true));
+        // Rune matches its variable exactly: `WGPU` or ` wgpu` is no choice, so Rune draws with
+        // simee's setting (else the default).
+        assert!(!wgpu_backend(Some("WGPU"), None, true));
+        assert!(!wgpu_backend(Some(" wgpu"), Some("metal"), true));
+        assert!(wgpu_backend(Some("WGPU"), Some("wgpu"), true));
         // Elsewhere there's only wgpu.
         assert!(wgpu_backend(None, None, false));
         assert!(wgpu_backend(Some("metal"), None, false));

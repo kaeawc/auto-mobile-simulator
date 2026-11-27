@@ -872,6 +872,8 @@ fn toggle_view3d(s: &mut State) {
     s.status = s.view3d.flip();
     if s.view3d.on && s.showing_screen() && scene::body_for(s).is_none() {
         s.status = Some(scene::NO_BODY.into());
+    } else if s.view3d.on {
+        s.status = Some(scene::ON.into());
     }
 }
 
@@ -1153,6 +1155,19 @@ mod tests {
         assert_eq!(rt.state.actions, vec![Action::Select("B2".into())]);
     }
 
+    /// One click on the 3D view must not blur the device: keys still reach it.
+    #[test]
+    fn keys_still_reach_the_device_after_a_click_on_the_3d_view() {
+        let mut rt = runtime(three_d);
+        press(&mut rt, "scene-3d");
+        rt.state.inputs.clear();
+        rt.key(KeyEvent::from(Key::Text("a".into())));
+        rt.key(KeyEvent::from(Key::Enter));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.inputs.len(), 2, "{:?}", rt.state.inputs);
+        assert!(matches!(&rt.state.inputs[0], Input::Key(KeyAction::Strokes(s)) if s[0].usage == 0x04));
+    }
+
     #[test]
     fn cmd_3_toggles_the_3d_view_where_the_backend_draws_it() {
         let mut rt = polled_runtime(demo);
@@ -1162,11 +1177,12 @@ mod tests {
         rt.frame(1.0 / 60.0);
         assert!(rt.state.view3d.on);
         assert!(rt.find("scene-3d").is_some());
-        assert_eq!(rt.state.status, None);
+        assert_eq!(rt.state.status.as_deref(), Some(scene::ON));
         rt.key(cmd('3'));
         rt.frame(1.0 / 60.0);
         assert!(!rt.state.view3d.on);
         assert!(rt.find("scene-3d").is_none());
+        assert_eq!(rt.state.status, None, "off says nothing");
         // Rune's native Metal backend: the toggle says why it does nothing.
         rt.state.view3d.supported = false;
         rt.key(cmd('3'));

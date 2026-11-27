@@ -35,7 +35,9 @@ cover screen), the camera looks at the back. A turned device rolls the body with
 the screen reads as the flat view shows it. A foldable lies flat while it streams its inner
 screen. When it streams its cover screen, emu has folded it, so the body is shown shut. The
 desktop doesn't know a half-open angle (#154). Clicks on the 3D view don't reach the device yet
-(#156). The toolbar, the keyboard and the panel work as usual.
+(#156): ⌘3 says so in the status line. The toolbar, the keyboard and the panel work as usual,
+and clicking the 3D view keeps the keyboard on the device. `RUNE_GPU_BACKEND` is read as Rune
+reads it (exactly `wgpu` or `metal`). Turning the 3D view off frees its render targets.
 
 The live screen on the body is the flat view's own picture, with no CPU copy. The flat screen
 stays laid out under an effect slot that asks Rune for a backdrop copy, and the compositor
