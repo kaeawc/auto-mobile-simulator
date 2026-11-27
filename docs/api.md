@@ -106,7 +106,7 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `open_url` | Android, iOS | device, url | Open a URL (Android: `am start -a VIEW`) |
 | `install` | Android, iOS | device, path | Install an .app (Android: an .apk with `adb install -r`, an .aab through bundletool when it is on the PATH) |
 | `uninstall` | Android, iOS | device, bundle_id | Uninstall an app (Android: the package name; `pm uninstall`) |
-| `launch` | Android, iOS | device, bundle_id, restart?; iOS: args?, env?, shaped? | Launch (iOS: with arguments and environment, shaped injecting the network shaper; Android: the package's launcher activity); restart: terminate a running instance first, default true (Android: `am start -S`); false brings a running app to the front; returns pid (Android: and the `activity` it started) |
+| `launch` | Android, iOS | device, bundle_id, restart?; iOS: args?, env?, shaped?, malloc_stack_logging? | Launch (iOS: with arguments and environment, shaped injecting the network shaper, malloc_stack_logging setting MallocStackLogging=1 for mem_leaks' stacks and mem_history; Android: the package's launcher activity); restart: terminate a running instance first, default true (Android: `am start -S`); false brings a running app to the front; returns pid (Android: and the `activity` it started) |
 | `terminate` | Android, iOS | device, bundle_id | Terminate an app (Android: `am force-stop`) |
 | `apps` | Android, iOS | device; Android: all? | Installed bundle ids (Android: the third-party packages, with all the system's too) |
 | `appearance` | iOS | device, mode(light\|dark) | Light or dark UI |
@@ -133,6 +133,10 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `kill` | iOS | device, pid, signal? | Signal a device process |
 | `connections` | iOS | device | Open sockets of device processes |
 | `traffic` | iOS | device | Bytes in/out per device process |
+| `mem_leaks` | iOS | device, bundle_id \| pid, raw?, timeout_s?(120) | Leaked memory of a running app (the host's `leaks`): totals, and the leaks grouped by type and allocation stack, most bytes first, each with its instances and stack (innermost frame first; launch with malloc_stack_logging for stacks). raw adds the report as printed. See [Memory tools](#memory-tools-mem_) |
+| `mem_heap` | iOS | device, bundle_id \| pid, raw?, timeout_s?(120) | A running app's heap by class (the host's `heap`): zones, node and byte totals, and every class with its count, bytes and average size, most instances first. raw adds the report as printed |
+| `mem_vmmap` | iOS | device, bundle_id \| pid, raw?, timeout_s?(120) | A running app's memory regions (the host's `vmmap --summary`): each region type's virtual, resident, dirty, swapped, volatile and empty bytes and count, the malloc zones with allocations and fragmentation, and the totals. raw adds the report as printed |
+| `mem_history` | iOS | device, bundle_id \| pid, address, raw?, timeout_s?(120) | The allocation stack of an address in a running app (the host's `malloc_history`), as events with their stacks; needs the app launched with malloc_stack_logging (MallocStackLogging=1 logs live allocations only). raw adds the report as printed |
 | `containers` | iOS | device, sizes? | App data and bundle containers |
 | `ls` | iOS | device, path? | List a directory under the device data dir |
 | `read` | iOS | device, path | Read a file (base64) |
@@ -173,6 +177,45 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `remote_swipe` | iOS | device, direction(up\|down\|left\|right), duration_ms? | Swipe on the Siri Remote's touch surface (Apple TV) |
 | `pointer` | iOS | device, x, y, action?(move\|click\|down\|up), button?(primary\|secondary), hold_ms? \| x, y, to_x, to_y, button? (a drag) | The iPad's pointer (a mouse, as Simulator.app's pointer capture connects): move it to pixels and hover there, click, press or release a button there, or drag to to_x, to_y. Exact on iOS 26.5, within ~20 pt on 27.2. A button held by `down` keeps the pointer's place for the next calls on a server (`simee serve`) until a reboot. Refused: `down` without a server (the process ends with the call: use `click` or a drag), `up` with nothing held, and `move`/`up` after a failed call lost the held button (`click`, `down` or a drag lets go and starts over) |
 | `carplay` | iOS | device, on | Attach (or detach) the CarPlay display to a booted iPhone (iOS 26 runtimes); then tap/swipe/screenshot with display=carplay |
+
+## Memory tools (`mem_*`)
+
+A simulator app is a host process (a child of its device's `launchd_sim`), so the host's own
+`leaks`, `heap`, `vmmap` and `malloc_history` read it (`crates/sim-api/src/memtools.rs`). Each
+method names the app by `bundle_id` (the running process started under the launchd label
+`UIKitApplication:<bundle id>[…]`) or by `pid` (which must be one of the device's processes), runs
+the tool with a deadline (`timeout_s`, default 120; past it the tool simee started is killed and
+the call fails), and answers its report parsed, with `pid`, `warnings` (anything the tool printed
+to stderr while answering) and, with `raw: true`, the report as printed. Android devices answer
+that these aren't available there.
+
+- **Stacks.** `launch {bundle_id, malloc_stack_logging: true}` starts the app with
+  `MallocStackLogging=1`, which is "lite" mode: stacks of live allocations only, kept in memory.
+  `mem_leaks` then gives each leak group its allocation stack (`{address, image, symbol,
+  source?}`, innermost frame first, so frame 0 is the allocator and the app's own frame follows
+  with its `file:line` when the binary has debug info); without it `stacks` is false and a `note`
+  says how to get them. `mem_history` needs it: a process without stack logs is refused with that
+  advice, and an address the log doesn't hold (freed, or never allocated) answers no `events`.
+- **Leaks.** `leaks --list --noContent`: `leak_count`, `leaked_bytes`, `nodes`, `malloced_bytes`,
+  and `leaks`, grouped by type (`type`, `language`, `binary`) and stack, each with `count`,
+  `bytes` and its `instances` (`{address, size, zone}`; an address goes to `mem_history`). A plain
+  `malloc` without stack logging has no type.
+- **What they need.** The host's tools carry `com.apple.system-task-ports.read` and, for a
+  simulator target, run the runtime's own copy (the report's `Analysis Tool`). On macOS 26.6
+  (SIP disabled, Developer Mode on) an app ad-hoc signed without `get-task-allow`, and the
+  device's SpringBoard, were both read as the user, without `sudo`. The tools refuse a process of
+  another user (`leaks 1` as a user: `cannot examine process 1 (launchd) because you do not have
+  appropriate privileges …`); a call whose tool is refused fails with that line
+  (`leaks was refused pid <n>: …`). A host with SIP enabled hasn't
+  been measured; a notice a tool prints while still answering comes back in `warnings`.
+- **Cost** (2026-11-27, Apple M3 Max, 16 CPUs, macOS 26.6.2, iOS 26.5 iPhone 17 simulator; a small
+  test app with 20 leaks, 13 k heap nodes, 1.8 MB malloced, launched with stack logging; median
+  of 3 warm-server calls; wall from `/usr/bin/time` on `simee call`, CPU the server's user+sys
+  including the tool it reaped, minus an idle server's): `mem_leaks` 2.30 s wall, 2.28 s CPU;
+  `mem_heap` 1.75 s, 1.73 s; `mem_vmmap` 0.60 s, 0.58 s; `mem_history` 0.73 s, 0.71 s. The
+  reports name a corpse of the app as their target (`Target Type: corpse`), and the app kept
+  running across every call; their time grows with its heap (the same `leaks` command line on
+  the device's SpringBoard, run directly: 4.9 s wall, one run).
 
 ## App preferences (`prefs_*`)
 

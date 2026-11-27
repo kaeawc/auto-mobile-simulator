@@ -57,6 +57,7 @@ const IOS_LAUNCH_PARAMS: &[(&str, &str)] = &[
     ("args", "an Android app starts from an intent, not a command line"),
     ("env", "an Android app starts from an intent, with the environment its zygote gives it"),
     ("shaped", "the network shaper is injected into a simulator's processes"),
+    ("malloc_stack_logging", "MallocStackLogging is a simulator process's environment"),
 ];
 
 /// Rejects iOS-only boot parameters that ask for something (a `false`, `null`, empty or absent
@@ -482,7 +483,9 @@ mod tests {
     #[test]
     fn launch_refuses_what_only_ios_has() {
         let (mut s, root, adb, _emulator) = session("iosonly");
-        for (key, value) in [("args", json!(["-x"])), ("env", json!({"A": "b"})), ("shaped", json!(true))] {
+        for (key, value) in
+            [("args", json!(["-x"])), ("env", json!({"A": "b"})), ("shaped", json!(true)), ("malloc_stack_logging", json!(true))]
+        {
             let err = run(&mut s, "launch", json!({"bundle_id": "com.example.app", key: value})).expect_err(key);
             assert!(err.starts_with(&format!("`launch` takes `{key}` for iOS devices only")), "{err}");
         }
