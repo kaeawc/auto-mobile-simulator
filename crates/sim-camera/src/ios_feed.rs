@@ -15,15 +15,22 @@
 //!   generation (bumped by every relink), the source's frame number and its time since the capture
 //!   started in nanoseconds; then `width * height * 4` bytes of BGRA, top row first.
 //!
-//! A reader that stops reading for [`WRITE_TIMEOUT`] is dropped; the shim reconnects.
+//! A reader that stops reading for [`WRITE_TIMEOUT`] is dropped; the shim reconnects. A reader
+//! that goes away while its source is failing to open or silent is noticed within [`POLL`].
+//!
+//! Access: the socket is mode 0600 and a fallback path lives in a private (0700, ours) directory,
+//! but any process running as the same user can connect, and so read a linked camera without a
+//! camera permission of its own.
 
-use std::io::{self, Read, Write};
+use std::fs::{DirBuilder, OpenOptions, Permissions};
+use std::io::{self, ErrorKind, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::frame::{CameraFrame, FrameSpec};
@@ -52,18 +59,60 @@ const RETRY: Duration = Duration::from_millis(250);
 const MAX_SOCKET_PATH: usize = 103;
 
 /// Where a device's feed listens: `cam.sock` in its data directory, or, when that path is too long
-/// for a Unix socket (a long home directory), a name derived from it in the host's temp directory.
-pub fn socket_path(data_dir: &Path) -> PathBuf {
+/// for a Unix socket (a long home directory), a name derived from it in a private per-user
+/// directory of the host's temp directory (created 0700; refused if it exists and isn't ours and
+/// 0700, so another user can't plant the socket).
+pub fn socket_path(data_dir: &Path) -> Result<PathBuf> {
     let path = data_dir.join("cam.sock");
     if path.as_os_str().len() <= MAX_SOCKET_PATH {
-        return path;
+        return Ok(path);
     }
     let hash = data_dir
         .as_os_str()
         .as_encoded_bytes()
         .iter()
         .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3));
-    std::env::temp_dir().join(format!("simee-cam-{hash:016x}.sock"))
+    let user: String =
+        std::env::var("USER").unwrap_or_default().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(24).collect();
+    let dir = private_dir_in(&std::env::temp_dir(), &format!("simee-cam-{}", if user.is_empty() { "user" } else { &user }))?;
+    let path = dir.join(format!("{hash:016x}.sock"));
+    if path.as_os_str().len() > MAX_SOCKET_PATH {
+        return Err(Error::Invalid(format!("camera feed: socket path {} is longer than {MAX_SOCKET_PATH} bytes", path.display())));
+    }
+    Ok(path)
+}
+
+/// `base/name` as a directory only this user can use: created 0700, or, if it exists, accepted
+/// only when it is a real directory (not a symlink) owned by this user with mode exactly 0700.
+fn private_dir_in(base: &Path, name: &str) -> Result<PathBuf> {
+    let dir = base.join(name);
+    let io = |what: &str, e: io::Error| Error::Io(format!("camera feed: {what} {}: {e}", dir.display()));
+    match DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => std::fs::set_permissions(&dir, Permissions::from_mode(0o700)).map_err(|e| io("securing", e))?,
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            let meta = std::fs::symlink_metadata(&dir).map_err(|e| io("inspecting", e))?;
+            let mine = own_uid(base).map_err(|e| io("finding the user for", e))?;
+            if !meta.file_type().is_dir() || meta.uid() != mine || meta.mode() & 0o7777 != 0o700 {
+                return Err(Error::Invalid(format!(
+                    "camera feed: {} exists and is not a private (0700) directory of this user; refusing to use it",
+                    dir.display()
+                )));
+            }
+        }
+        Err(e) => return Err(io("creating", e)),
+    }
+    Ok(dir)
+}
+
+/// This process's user id, read off a file created (exclusively) in `dir`.
+fn own_uid(dir: &Path) -> io::Result<u32> {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let probe = dir.join(format!(".simee-uid-{}-{nanos}", std::process::id()));
+    let file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&probe)?;
+    let uid = file.metadata().map(|m| m.uid());
+    drop(file);
+    let _ = std::fs::remove_file(&probe);
+    uid
 }
 
 /// The launch environment that gives an app the camera: the shim inserted, and the feed's socket.
@@ -220,6 +269,12 @@ impl Feed {
             std::fs::remove_file(&path).map_err(|e| Error::Io(format!("camera feed: removing stale {}: {e}", path.display())))?;
         }
         let listener = UnixListener::bind(&path).map_err(|e| Error::Io(format!("camera feed: binding {}: {e}", path.display())))?;
+        // Owner-only before anything can connect; the accept loop polls so a stop never depends on the file.
+        let secured = std::fs::set_permissions(&path, Permissions::from_mode(0o600));
+        if let Err(e) = secured.and_then(|()| listener.set_nonblocking(true)) {
+            let _ = std::fs::remove_file(&path);
+            return Err(Error::Io(format!("camera feed: securing {}: {e}", path.display())));
+        }
         let shared = Arc::new(Shared {
             hub,
             default_spec,
@@ -269,8 +324,7 @@ impl Feed {
 impl Drop for Feed {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        // Wake the accept loop with a connection of our own; it sees the stop and returns.
-        let _ = UnixStream::connect(&self.path);
+        // The accept loop polls `stop`, so this needs neither the socket file nor a connection.
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
         }
@@ -290,11 +344,21 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn accept_loop(shared: &Arc<Shared>, listener: &UnixListener) {
-    for stream in listener.incoming() {
+    loop {
         if shared.stop.load(Ordering::SeqCst) {
             return;
         }
-        let Ok(stream) = stream else { continue };
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(_) => {
+                thread::sleep(POLL);
+                continue;
+            }
+        };
+        // Some platforms hand the accepted socket the listener's nonblocking flag.
+        if stream.set_nonblocking(false).is_err() {
+            continue;
+        }
         let Ok(handle) = stream.try_clone() else { continue };
         let run = shared.clone();
         let spawned = thread::Builder::new().name("camera feed reader".into()).spawn(move || serve_reader(&run, stream));
@@ -331,11 +395,47 @@ fn serve(shared: &Shared, stream: &mut UnixStream) {
             // Relinked: subscribe to the new source.
             Ok(true) => {}
             // The source didn't open, or its capture ended: try again shortly (or on a relink).
-            Ok(false) => thread::sleep(RETRY),
+            Ok(false) => {
+                if !wait_for_retry(shared, stream, generation) {
+                    return;
+                }
+            }
             // The reader went away.
             Err(_) => return,
         }
     }
+}
+
+/// Waits [`RETRY`] before the source is opened again, watching the reader meanwhile: false when it
+/// went away or the feed stopped, so a reader of a source that won't open doesn't leave a thread
+/// behind. A relink ends the wait early.
+fn wait_for_retry(shared: &Shared, stream: &UnixStream, seen: u32) -> bool {
+    let until = Instant::now() + RETRY;
+    while Instant::now() < until {
+        if shared.stop.load(Ordering::SeqCst) || peer_gone(stream) {
+            return false;
+        }
+        if lock(&shared.link).generation != seen {
+            return true;
+        }
+        thread::sleep(POLL.min(until.saturating_duration_since(Instant::now())));
+    }
+    true
+}
+
+/// Whether the reader closed its end: a nonblocking read that finds the end of the stream. (The
+/// reader sends nothing after its hello, so any byte it did send is discarded, not a close.)
+fn peer_gone(stream: &UnixStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let mut byte = [0u8; 1];
+    let gone = match (&*stream).read(&mut byte) {
+        Ok(n) => n == 0,
+        Err(e) => !matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted),
+    };
+    let _ = stream.set_nonblocking(false);
+    gone
 }
 
 /// Streams `source` to the reader until the link changes (`Ok(true)`), the source fails or the
@@ -351,7 +451,11 @@ fn stream_source(shared: &Shared, stream: &mut UnixStream, source: &SourceSpec, 
         }
         match sub.recv_timeout(POLL) {
             Ok(Some(frame)) => write_frame(stream, &frame, generation)?,
-            Ok(None) => {}
+            Ok(None) => {
+                if peer_gone(stream) {
+                    return Err(io::Error::new(ErrorKind::BrokenPipe, "reader went away"));
+                }
+            }
             Err(_) => return Ok(false),
         }
     }
@@ -396,7 +500,7 @@ pub fn read_frame(r: &mut impl Read) -> Result<(FrameHeader, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
-    use std::time::{Instant, SystemTime};
+    use std::time::SystemTime;
 
     use super::*;
     use crate::frame::Tick;
@@ -596,15 +700,66 @@ mod tests {
     #[test]
     fn socket_paths_fit_a_unix_socket() {
         let short = Path::new("/Users/a/Library/Developer/CoreSimulator/Devices/0053A2F9-1FD0-4409-BCF1-6D32F934C172/data");
-        assert_eq!(socket_path(short), short.join("cam.sock"));
+        assert_eq!(socket_path(short).ok(), Some(short.join("cam.sock")));
         let long =
             Path::new("/Users/someone-with-a-long-name/Library/Developer/CoreSimulator/Devices/0053A2F9-1FD0-4409-BCF1-6D32F934C172/data");
-        let fallback = socket_path(long);
+        let fallback = socket_path(long).unwrap_or_else(|e| panic!("{e}"));
         assert!(fallback.as_os_str().len() <= MAX_SOCKET_PATH || std::env::temp_dir().as_os_str().len() > 70, "{}", fallback.display());
-        assert_ne!(fallback, socket_path(short));
-        assert_eq!(fallback, socket_path(long), "stable for one device");
+        assert_ne!(Some(fallback.clone()), socket_path(short).ok());
+        assert_eq!(Some(fallback.clone()), socket_path(long).ok(), "stable for one device");
         let env = launch_env(Path::new("/s/libsimee-camera.dylib"), &fallback);
         assert_eq!(env[0], ("DYLD_INSERT_LIBRARIES".into(), "/s/libsimee-camera.dylib".into()));
         assert_eq!(env[1].0, SOCKET_ENV);
+    }
+
+    #[test]
+    fn a_reader_of_a_source_that_wont_open_is_let_go_when_it_leaves() {
+        let (feed, opened) = feed("leaver", SourceSpec::Solid("red".into()), 30);
+        let r = reader(&feed, DEFAULT);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while opened.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < deadline, "the failing source is retried");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(feed.readers(), 1);
+        drop(r);
+        while feed.readers() != 0 {
+            assert!(Instant::now() < deadline, "the reader's thread outlived its client");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let settled = opened.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(opened.load(Ordering::SeqCst), settled, "no more opens for a reader that left");
+    }
+
+    #[test]
+    fn dropping_the_feed_does_not_need_its_socket_file() {
+        let (feed, _) = feed("unlinked", text("f"), 30);
+        let mut r = reader(&feed, DEFAULT);
+        let _ = next(&mut r);
+        std::fs::remove_file(feed.path()).unwrap_or_else(|e| panic!("{e}"));
+        let started = Instant::now();
+        drop(feed);
+        assert!(started.elapsed() < Duration::from_secs(3), "drop took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn the_socket_is_owner_only_and_the_fallback_directory_is_private() {
+        let (feed, _) = feed("perms", text("g"), 30);
+        let mode = std::fs::metadata(feed.path()).unwrap_or_else(|e| panic!("{e}")).mode();
+        assert_eq!(mode & 0o777, 0o600);
+        drop(feed);
+
+        let base = std::env::temp_dir().join(format!("simee-feed-priv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        DirBuilder::new().mode(0o700).create(&base).unwrap_or_else(|e| panic!("{e}"));
+        let dir = private_dir_in(&base, "d").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(std::fs::metadata(&dir).unwrap_or_else(|e| panic!("{e}")).mode() & 0o7777, 0o700);
+        assert_eq!(private_dir_in(&base, "d").ok(), Some(dir.clone()), "an existing private directory is reused");
+        std::fs::set_permissions(&dir, Permissions::from_mode(0o755)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(private_dir_in(&base, "d").is_err(), "a directory others can enter is refused");
+        std::os::unix::fs::symlink(&base, base.join("link")).unwrap_or_else(|e| panic!("{e}"));
+        assert!(private_dir_in(&base, "link").is_err(), "a symlink is refused");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds simee's iOS camera shim and its fixture app for the iOS simulator (arm64), with the
+# Builds simee's iOS camera shim and its fixture app for the iOS simulator (universal: arm64 and x86_64), with the
 # Xcode toolchain only (xcrun clang; nothing is downloaded), ad-hoc signed:
 #
 #   shims/ios-camera/build.sh [OUT_DIR]     # default: target/ios-camera
@@ -14,18 +14,24 @@ here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 out=${1:-$here/../../target/ios-camera}
 mkdir -p -- "$out/CameraFixture.app"
 out=$(cd -- "$out" && pwd)
-target=arm64-apple-ios17.0-simulator
-cc=(xcrun --sdk iphonesimulator clang -target "$target" -O2 -Wall -Werror)
+tmp=$(mktemp -d)
+trap 'rm -rf -- "$tmp"' EXIT
+frameworks=(-framework Foundation -framework UIKit -framework AVFoundation -framework CoreImage
+  -framework CoreMedia -framework CoreVideo -framework CoreGraphics -framework QuartzCore)
 
-"${cc[@]}" -dynamiclib -install_name @rpath/libsimee-camera.dylib \
-  "$here/loader.c" -o "$out/libsimee-camera.dylib"
-"${cc[@]}" -dynamiclib -fobjc-arc -install_name @rpath/libsimee-camera-hooks.dylib \
-  -framework Foundation -framework UIKit -framework AVFoundation -framework CoreImage \
-  -framework CoreMedia -framework CoreVideo -framework CoreGraphics -framework QuartzCore \
-  "$here/hooks.m" -o "$out/libsimee-camera-hooks.dylib"
-"${cc[@]}" -fobjc-arc -framework Foundation -framework UIKit -framework AVFoundation \
-  -framework CoreMedia -framework CoreVideo -framework QuartzCore \
-  "$here/fixture/main.m" -o "$out/CameraFixture.app/CameraFixture"
+# Each product is built per architecture (arm64 simulators; x86_64 for Rosetta apps, which would
+# refuse an inserted arm64-only dylib) and joined with lipo.
+for arch in arm64 x86_64; do
+  cc=(xcrun --sdk iphonesimulator clang -target "$arch-apple-ios17.0-simulator" -O2 -Wall -Werror)
+  "${cc[@]}" -dynamiclib -install_name @rpath/libsimee-camera.dylib \
+    "$here/loader.c" -o "$tmp/libsimee-camera.$arch.dylib"
+  "${cc[@]}" -dynamiclib -fobjc-arc -install_name @rpath/libsimee-camera-hooks.dylib "${frameworks[@]}" \
+    "$here/hooks.m" -o "$tmp/libsimee-camera-hooks.$arch.dylib"
+  "${cc[@]}" -fobjc-arc "${frameworks[@]}" "$here/fixture/main.m" -o "$tmp/CameraFixture.$arch"
+done
+lipo -create -output "$out/libsimee-camera.dylib" "$tmp"/libsimee-camera.*.dylib
+lipo -create -output "$out/libsimee-camera-hooks.dylib" "$tmp"/libsimee-camera-hooks.*.dylib
+lipo -create -output "$out/CameraFixture.app/CameraFixture" "$tmp"/CameraFixture.*
 cp -- "$here/fixture/Info.plist" "$out/CameraFixture.app/Info.plist"
 
 codesign -f -s - "$out/libsimee-camera.dylib" "$out/libsimee-camera-hooks.dylib" 2>/dev/null

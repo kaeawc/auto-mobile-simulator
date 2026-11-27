@@ -326,7 +326,7 @@ static void SCInstallDiscovery(void) {
                                    class_getInstanceMethod(AVCaptureDeviceInput.class, @selector(sc_initWithDevice:error:)));
     SCReplace(object_getClass(AVCaptureDeviceInput.class), @selector(deviceInputWithDevice:error:),
               ^id(id o, AVCaptureDevice *device, NSError **error) {
-                  return [[AVCaptureDeviceInput alloc] initWithDevice:device error:error];
+                  return [[o alloc] initWithDevice:device error:error]; // the receiver's class, so subclasses keep their behaviour
               });
 }
 
@@ -553,15 +553,28 @@ static int SCConnect(void) {
     return fd;
 }
 
+typedef enum { SCEndedAfterFrames, SCEndedWithoutFrames, SCEndedIdle, SCEndedProtocol } SCEnd;
+
 // One connection's frames, until the feed goes away or no session runs.
-static void SCReadFrames(int fd) {
+static SCEnd SCReadFrames(int fd) {
     CVPixelBufferPoolRef pool = NULL;
     size_t poolW = 0, poolH = 0;
     BOOL logged = NO;
+    SCEnd end = SCEndedWithoutFrames;
     for (;;) {
+        // Checked at every frame, not only on a receive timeout: a live source never lets one fire.
+        if (!SCAnyRunning()) {
+            end = SCEndedIdle;
+            break;
+        }
         uint8_t head[SCHeaderLen];
         if (SCReadFull(fd, head, sizeof head, YES) != SCReadOK) break;
-        if (memcmp(head, "SIMF", 4) != 0) break;
+        if (memcmp(head, "SIMF", 4) != 0) {
+            // Not a frame header: a feed of another protocol version (it refuses version 1 by closing,
+            // so a mismatch seen here is a feed that answers with something else).
+            end = SCEndedProtocol;
+            break;
+        }
         uint32_t w = SCU32(head + 4), h = SCU32(head + 8), generation = SCU32(head + 12);
         uint64_t seq = SCU64(head + 16);
         if (w < 32 || h < 32 || w > SCMaxSide || h > SCMaxSide) break;
@@ -602,29 +615,45 @@ static void SCReadFrames(int fd) {
             SCLog(@"first frame %ux%u seq %llu generation %u", w, h, seq, generation);
             logged = YES;
         }
+        end = SCEndedAfterFrames;
         @autoreleasepool {
             SCDeliver(pixels);
         }
         CVPixelBufferRelease(pixels);
     }
     if (pool) CVPixelBufferPoolRelease(pool);
+    return end;
 }
 
 static void *SCReaderThread(void *arg) {
     pthread_setname_np("simee camera feed");
+    // Backoff between connections that delivered nothing (feed down, refused, broken): 250 ms,
+    // doubling to 5 s; a connection that delivered frames, or an idle disconnect, starts over.
+    useconds_t backoff = 250000;
     for (;;) {
         pthread_mutex_lock(&SCLock);
         while (SCRunning.count == 0) pthread_cond_wait(&SCWake, &SCLock);
         pthread_mutex_unlock(&SCLock);
         int fd = SCConnect();
-        if (fd < 0) {
-            usleep(250000); // the feed isn't up (yet): try again while a session runs
+        SCEnd end = SCEndedWithoutFrames;
+        if (fd >= 0) {
+            @autoreleasepool {
+                end = SCReadFrames(fd);
+            }
+            close(fd);
+        }
+        if (end == SCEndedProtocol) {
+            // The feed speaks another protocol: retrying can't help. Stay down for this process.
+            SCLog(@"the feed's reply is not this shim's protocol (version 1): not reconnecting");
+            for (;;) pause();
+        }
+        if (end == SCEndedAfterFrames || end == SCEndedIdle) {
+            backoff = 250000;
+            if (end == SCEndedAfterFrames) usleep(backoff); // the feed went away: don't spin on a restart
             continue;
         }
-        @autoreleasepool {
-            SCReadFrames(fd);
-        }
-        close(fd);
+        usleep(backoff);
+        if (backoff < 5000000) backoff = backoff * 2 > 5000000 ? 5000000 : backoff * 2;
     }
     return NULL;
 }
@@ -773,7 +802,7 @@ static void SCInstallPreviewAndOutputs(void) {
     method_exchangeImplementations(class_getInstanceMethod(layer, @selector(initWithSession:)),
                                    class_getInstanceMethod(layer, @selector(sc_initWithSession:)));
     SCReplace(object_getClass(layer), @selector(layerWithSession:),
-              ^id(id o, AVCaptureSession *s) { return [[AVCaptureVideoPreviewLayer alloc] initWithSession:s]; });
+              ^id(id o, AVCaptureSession *s) { return [[o alloc] initWithSession:s]; });
     SCReplace(layer, @selector(setSession:), ^(AVCaptureVideoPreviewLayer *o, AVCaptureSession *s) { SCBindLayer(o, s); });
     SCReplace(layer, @selector(session), ^id(id o) { return objc_getAssociatedObject(o, &SCSessionKey); });
     SCReplace(layer, @selector(connection), ^id(id o) { return nil; });

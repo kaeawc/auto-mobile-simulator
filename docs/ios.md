@@ -99,7 +99,7 @@ apps one by injecting a capture shim (`shims/ios-camera`) and feeding it live fr
 
 - The feed (`simee_camera::ios_feed::Feed`) serves one device's linked source on a Unix socket:
   `cam.sock` in the device's data directory, or a name in the host's temp directory when that path
-  is over the 103-byte socket limit (`ios_feed::socket_path`). Each reader says the size and rate it
+  is over the 103-byte socket limit (`ios_feed::socket_path`, which creates and checks a private 0700 per-user directory there; the socket itself is 0600). Each reader says the size and rate it
   wants and is sent BGRA frames, each with its size, the source's frame number and the link's
   generation, as the source produces them. Readers of one source share one capture. Relinking
   (`Feed::set_source`) moves every reader to the new source without a reconnect.
@@ -153,6 +153,11 @@ after the device-wide `setenv`, did not load the hooks.
   `DataScannerViewController`, stay without a camera.
 - ExtensionKit and app extension processes (WebKit's among them) get a sanitized environment or are
   skipped, so `getUserMedia` in a web view and app extensions have no camera.
+- Security: the socket is mode 0600, but any process running as the same user (any app in any
+  simulator on the host) can connect to a linked feed and read its frames, including a host webcam,
+  without a camera permission of its own. The shim stops reading and disconnects as soon as no
+  session runs, reconnects with a 250 ms to 5 s backoff, and the dylibs are universal (arm64 and
+  x86_64, built with `lipo`; not run on an x86_64 simulator here).
 - Already-running processes need a relaunch to pick up a device-wide `setenv`.
 - Frames are BGRA, upright and unmirrored, at the size the app's connection asked for (the feed's
   default, or `SIMEE_CAMERA_SIZE=WxH@FPS`). Orientation, mirroring, zoom, focus, exposure and frame
