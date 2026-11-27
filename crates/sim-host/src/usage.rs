@@ -987,7 +987,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
         t.update(reader.observe().expect("observe"));
         let r = t.report();
-        assert!(r.available && r.samples == 2 && r.host.cpu_pct.s1.is_some(), "{r:?}");
+        // In a macOS VM (GitHub's runners) the host's 100 Hz tick counters may not move within
+        // 300 ms, so host CPU can be unknown there; on real hardware it must be measured.
+        let in_vm = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.hv_vmm_present"])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "1");
+        assert!(r.available && r.samples == 2 && (r.host.cpu_pct.s1.is_some() || in_vm), "{r:?}");
         for d in &r.devices {
             assert!(d.pids >= 1 && d.footprint_bytes > 0 && d.cpu_pct.s1.is_some(), "{d:?}");
             println!(
