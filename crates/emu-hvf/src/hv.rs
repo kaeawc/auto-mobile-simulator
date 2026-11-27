@@ -246,7 +246,7 @@ impl Vm {
         let g = gic_created()?;
         let mut v = 0;
         // SAFETY: plain FFI call on the process-wide GIC; out-pointer references a live local.
-        check("hv_gic_get_distributor_reg", unsafe { (g.get_distributor_reg)(ffi::GICD_IROUTER32 + (intid - 32) * 8, &mut v) })?;
+        check("hv_gic_get_distributor_reg", unsafe { (g.get_distributor_reg)(ffi::GICD_IROUTER32 + ((intid - 32) * 8) as u16, &mut v) })?;
         Ok(v)
     }
 }

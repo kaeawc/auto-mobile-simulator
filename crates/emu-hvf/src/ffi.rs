@@ -26,7 +26,7 @@ pub struct MachTimebaseInfo {
 /// `HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0`.
 pub const GICR_ISPENDR0: u32 = 0x10200;
 /// `HV_GIC_DISTRIBUTOR_REG_GICD_IROUTER32`; IROUTER<n> follows at 8-byte steps (register offsets).
-pub const GICD_IROUTER32: u32 = 0x6100;
+pub const GICD_IROUTER32: u16 = 0x6100;
 /// `HV_IPA_GRANULE_4KB`.
 pub const IPA_GRANULE_4KB: u32 = 0;
 
@@ -84,7 +84,7 @@ pub struct GicFns {
     pub get_redistributor_region_size: unsafe extern "C" fn(*mut usize) -> i32,
     pub get_spi_interrupt_range: unsafe extern "C" fn(*mut u32, *mut u32) -> i32,
     pub set_spi: unsafe extern "C" fn(u32, bool) -> i32,
-    pub get_distributor_reg: unsafe extern "C" fn(u32, *mut u64) -> i32,
+    pub get_distributor_reg: unsafe extern "C" fn(u16, *mut u64) -> i32,
     pub set_redistributor_reg: unsafe extern "C" fn(u64, u32, u64) -> i32,
 }
 
@@ -118,7 +118,7 @@ pub fn late() -> &'static Late {
                 get_redistributor_region_size: sym!(hv_gic_get_redistributor_region_size: fn(*mut usize) -> i32)?,
                 get_spi_interrupt_range: sym!(hv_gic_get_spi_interrupt_range: fn(*mut u32, *mut u32) -> i32)?,
                 set_spi: sym!(hv_gic_set_spi: fn(u32, bool) -> i32)?,
-                get_distributor_reg: sym!(hv_gic_get_distributor_reg: fn(u32, *mut u64) -> i32)?,
+                get_distributor_reg: sym!(hv_gic_get_distributor_reg: fn(u16, *mut u64) -> i32)?,
                 set_redistributor_reg: sym!(hv_gic_set_redistributor_reg: fn(u64, u32, u64) -> i32)?,
             })
         })(),

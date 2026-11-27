@@ -57,7 +57,10 @@ Where each floor comes from:
 - emu-hvf links only the Hypervisor.framework functions every Apple silicon macOS has and looks the
   newer ones up at run time (`crates/emu-hvf/src/ffi.rs`): a linked function the framework lacks
   stops dyld from loading the binary, so emu would exit before `main` on an older macOS instead of
-  naming what it needs.
+  naming what it needs. emu also links CoreAudio weakly (`apps/emu/build.rs`), because cpal imports
+  the macOS 14.2 process tap functions; below macOS 15 emu exits at startup, before any audio code.
+  `scripts/check-imports.sh` (run by `scripts/check.sh` on macOS) fails if a release `emu` or
+  `simee` strongly imports a symbol newer than macOS 11.0.
 
 **Xcode.** simee is tested with Xcode 26 and 27 (the SimulatorKit path change between them is
 under Requirements); `simee doctor` marks an older Xcode "unverified". Apple's

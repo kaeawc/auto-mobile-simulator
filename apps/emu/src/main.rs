@@ -265,7 +265,14 @@ fn real_main() -> Result<ExitCode> {
 fn accel_check() -> (bool, String) {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     return match android_support(host_macos()) {
-        Ok(_) => (true, "Hypervisor.framework (arm64) is usable".into()),
+        Ok(off) => {
+            let mut what = String::from("Hypervisor.framework (arm64) is usable");
+            for why in off {
+                what.push('\n');
+                what.push_str(&why);
+            }
+            (true, what)
+        }
         Err(why) => (false, why),
     };
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
