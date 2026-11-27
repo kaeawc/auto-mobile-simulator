@@ -9,7 +9,7 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{msg_send, sel};
 use objc2_foundation::{NSError, NSString};
 use sim_core::device::{DeviceInfo, DeviceState, DeviceTypeInfo, RuntimeInfo, Selection, select};
-use sim_core::form_factor::{apple_family_form_factor, apple_kind};
+use sim_core::form_factor::{apple_kind, apple_type_form_factor};
 use sim_core::hid::Orientation;
 use sim_core::platform::Platform;
 
@@ -481,8 +481,9 @@ fn device_type_info(t: &AnyObject) -> DeviceTypeInfo {
         0.0
     };
     let product_family = rt::string_prop(t, sel!(productFamily));
+    let identifier = rt::string_prop(t, sel!(identifier));
     DeviceTypeInfo {
-        identifier: rt::string_prop(t, sel!(identifier)),
+        identifier: identifier.clone(),
         name: rt::string_prop(t, sel!(name)),
         model: rt::string_prop(t, sel!(modelIdentifier)),
         product_family: product_family.clone(),
@@ -490,7 +491,7 @@ fn device_type_info(t: &AnyObject) -> DeviceTypeInfo {
         screen_height: size.height,
         screen_scale: f64::from(scale),
         platform: Platform::Ios,
-        form_factor: apple_family_form_factor(&product_family),
+        form_factor: apple_type_form_factor(&identifier, &product_family),
     }
 }
 
@@ -1029,7 +1030,8 @@ impl Device {
     /// CarPlay HID service its touches go to. iOS 26 runtimes and earlier: iOS 27 renders it black.
     pub fn set_carplay(&self, on: bool) -> Result<()> {
         let info = self.info();
-        if info.form_factor != Some(sim_core::form_factor::FormFactor::Phone) {
+        use sim_core::form_factor::FormFactor;
+        if !matches!(info.form_factor, Some(FormFactor::Phone | FormFactor::Foldable)) {
             return Err(Error::Invalid(format!("CarPlay attaches to an iPhone; {} is {}", info.name, info.label())));
         }
         sim_core::carplay::runtime_supports(&info.runtime_id).map_err(Error::Invalid)?;
@@ -1051,7 +1053,7 @@ impl Device {
         use sim_core::form_factor::FormFactor;
         let info = self.info();
         // Only SpringBoard takes the message; elsewhere (Apple TV's PineBoard) it's silently dropped.
-        if !matches!(info.form_factor, Some(FormFactor::Phone | FormFactor::Tablet) | None) {
+        if !matches!(info.form_factor, Some(FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable) | None) {
             return Err(Error::Invalid(format!("only an iPhone or iPad rotates; {} is {}", info.name, info.label())));
         }
         let sel = sel!(lookup:error:);

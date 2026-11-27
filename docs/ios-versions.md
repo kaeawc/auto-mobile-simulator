@@ -45,7 +45,8 @@ device type of the iOS 27.1 and `iOS-27-2-iPhone19-4` runtimes), `simee boot`, w
 
 ## iPhone Duo
 
-The iPhone Duo (`iPhone19,4`) has two built-in screens: the outer one (`LCD`, 1398×2034, the
+The iPhone Duo (`iPhone19,4`) is iOS's foldable: simee lists it as `form_factor: foldable`,
+sub-platform `ios` ([form-factors.md](form-factors.md)). It has two built-in screens: the outer one (`LCD`, 1398×2034, the
 device type's main screen) and the inner one (`LCD-1`, 2007×2853, a landscape panel its
 framebuffer holds a quarter turn from upright). SpringBoard shows the device on one at a time and
 leaves the other black. Neither Xcode 26.6's Simulator.app nor Xcode 27.2 (whose DeviceHub replaces
