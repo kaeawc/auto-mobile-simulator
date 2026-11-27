@@ -2,7 +2,7 @@
 
 Research for [#55](https://github.com/kaeawc/simee/issues/55): `emu -avd` on a Linux host with no
 hardware virtualization and no GPU, profiled phase by phase so the next performance work goes to
-the biggest cost. Status: in progress; sections are added as each step lands (1 environment, 2 reproduction, 3 profile done; 4 ranking in progress).
+the biggest cost. Every run is one AVD on one host over about 6 hours; the tables say how many boots each number has.
 
 ## 1. Environment
 
@@ -12,7 +12,7 @@ One host for every number below, 2026-11-27.
 | --- | --- |
 | Host | Firecracker VM, Ubuntu 22.04, kernel 6.1.189, `/dev/kvm` absent, no GPU (Mesa llvmpipe/lavapipe only) |
 | CPU | 4 vCPUs of an Intel Xeon at 2.2 GHz (`hypervisor`, `sse4_2`, `avx2`, `avx512f`; no `vmx`/`svm`) |
-| Memory / disk | 7.8 GiB RAM, no swap; 9.8 GB root disk, 1.6 GB free after everything below |
+| Memory / disk | 7.8 GiB RAM, no swap; root disk 9.8 GB at the start (1.6 GB free once the image and renderer were fetched), grown to 20 GB part-way through |
 | Toolchain | rustc 1.99.1 (rustup), release build of `emu` and `simee` from main at 5bcc3a8 |
 | QEMU | 11.1.3 built from the release tarball (`--target-list=x86_64-softmmu --enable-slirp`, no docs, no GUI), `-j4` in 191 s, installed to a private prefix and passed as `EMU_QEMU`. Ubuntu 22.04's 6.2 is too old (docs/android.md) |
 | Image | API 36 `default` x86_64, r2: `system.img` 1.9 GB, `vendor.img` 104 MB, kernel 20 MB (1.7 GB on disk) |
@@ -201,12 +201,77 @@ is ±9 s, so a difference under about 10 s is not a result.
 | 540×960 at 240 dpi | 166.2 s / 196.4 s | 0.59 | 194, 150 / 200 ms, 94.3% | boot 3% earlier (noise); 8% more frames and p90 200 ms against 300 |
 | Animations off (window, transition, animator scales 0) | 166.0 s / 191.7 s | 0.59 | 110, 150 / 300 ms, 98.2% | no gain: fewer frames because nothing animates |
 | QEMU rebuilt with a 16× larger jump cache (`TB_JMP_CACHE_BITS` 12 → 16), 2 boots | 187.8 / 178.2 s; launcher 220.0 / 199.3 s | 0.82, 0.57 | 173, 150 / 300 ms, 97.1% and 182, 150 / 300 ms, 98.9% | slower: `tcg_flush_jmp_cache` took 0.13 to 0.17 cores (each flush clears 512 KB), the lookup share didn't fall (0.79 against 0.60 cores in boot) |
+| 6 vCPUs on the 4 host cores, against a baseline boot from the same state (below) | 167.1 s / 176.1 s, against 149.4 s / 156.1 s | 0.59, against 0.64 | 107, 200 / 300 ms, 99.1%, against 113, 150 / 300 ms, 98.2% | boot 12% later |
+| QEMU's translation cache 2 GiB (`tb-size=2048`) instead of the default 1 GiB, against the same state | 144.9 s / 150.8 s, against 143.3 s / 149.2 s | not measured | 12 min of `monkey` instead (below) | no difference |
 | `-gpu lavapipe` (`LP_NUM_THREADS` 0 and 2) | emu exited 138 s and 66 s in | | | no boot, as docs/benchmarks.md records for the SDK's lavapipe |
+
+The 6 vCPU and `tb-size` rows, and the baseline they are compared with, ran after the animation
+scales were set to 0 for the "animations off" row. They persist in the AVD's userdata, so those
+runs, `mon1` above and the `monkey` runs below had the animations off (107 to 113 frames over adb,
+against 173 to 194 with them on), until the next `-wipe-data` reset them. Each of these rows is
+compared with a boot from its own state: 6 vCPUs against 149.4 s / 156.1 s (idle 0.64, 113 frames, 98.2%
+janky), `tb-size` against its own 1 GiB run. A fresh baseline after the reset (a second boot of
+the wiped AVD, animations on) took 156.4 s / 175.6 s, idle 0.59, 181 frames, 97.8% janky, which is
+the pre-reset baseline again. Boot-to-boot spread across the day was 143 to 187 s.
 
 The first two rows say the guest is bound by single-thread speed, not by cores: 4 vCPUs are 54–65%
 busy, and still taking one away costs 16% and two cost 150%. The larger jump cache is the direct
 test of the flush explanation: more entries make each flush dearer and don't reduce the misses,
 because the flushes empty it either way.
+
+### The translation cache: 1 GiB is full after the boot
+
+`info jit` every 30 s through a 12.5 minute `monkey` run (25% app switches, 700 ms throttle)
+that began 2 minutes after boot completed, with QEMU's default 1 GiB cache and with 2 GiB
+(`tb-size=2048` in `-accel`, through the wrapper), the same AVD state.
+
+| | 1 GiB (default) | 2 GiB |
+| --- | --- | --- |
+| Cache in use when `monkey` starts | 500 MB, after 1 flush during the boot | 1,015 MB, 0 flushes |
+| Cache after 30 s / 60 s / 150 s of `monkey` | 726 / 894 / 984 MB | 1,183 / 1,288 / 1,367 MB |
+| Flushes | 2: one in the boot, one about 160 s into `monkey` (984 MB to 262 MB) | 0 (1,469 MB at the end) |
+| Boot / launcher | 143.3 s / 149.2 s | 144.9 s / 150.8 s |
+| vCPU host cores per 30 s, `monkey` period | 2.07 to 2.78 | 1.93 to 2.79 |
+| Events `monkey` injected, app switches | 99, 192 | 98, 191 |
+
+Booting translates about 1 GB of code (1.65 M blocks), so the default cache fills and flushes once
+before the launcher, and once more after about 2.5 minutes of app switching. Neither flush is
+visible: the boot is the same length, the vCPU host cores have no dip or step at the flush, and
+`monkey` is throttled so it can't show a slower guest. A flush throws away about 1 to 1.5 M
+blocks; at the 58 µs of vCPU time a block cost in the swipes (8% of 2.6 vCPU cores over 31 s for
+the 111,000 new blocks `info jit` counted) that is about 60 to 90 vCPU-seconds of translation,
+15 to 25 s of a 4 vCPU guest (an estimate, spread over the minutes after the flush). No result here
+justifies passing `tb-size`.
+
+### The first boot: apexd decompresses 24 APEX files, one at a time
+
+A fresh userdata took 360.2 s to `sys.boot_completed` and 385.8 s to the launcher (median of 4
+first boots, 360.1 to 366.7 s and 380.3 to 386.8 s), against 156 to 179 s for a warm one. The
+guest's own milestones (`logcat -b events`, uptime) on a first and a warm boot:
+
+| Milestone | First boot | Warm boot |
+| --- | --- | --- |
+| zygote starts (`boot_progress_start`) | 177.5 s | 52.2 s |
+| `system_run` | 203.1 s | 77.6 s |
+| `pms_ready` | 233.6 s | 95.3 s |
+| `ams_ready` | 301.2 s | 115.0 s |
+| `enable_screen` | 324.5 s | 128.2 s |
+| boot animation stops | 348.8 s | 144.7 s |
+
+122 of the 126 extra seconds before zygote are one wait: init's `Wait for property
+'apexd.status=activated' took 118366ms`. On a first boot `apexd` decompresses the image's 24
+compressed APEX files (`.capex`, for example `com.android.art`, `conscrypt`, `adservices`) into
+`/data/apex/decompressed`, one after the other (24 `Decompressing` lines from 11:02:48 to
+11:04:40), and finds them already there on every later boot. The host ran one vCPU's worth for
+those 180 s (1.25 to 1.45 cores, against 2.8 in a warm boot). The rest of the extra time is
+`system_server` after `pms_ready` (67 s to `ams_ready` against 20 s; a 110 s `main` handler
+delivery in `UserManagerService`, logcat's "Slow delivery") and the boot animation.
+
+Cloning a settled AVD skips all of it. `emu -clone-avd prof2 -from prof` took 12.8 s here (a plain
+file copy of 2.1 GB of mostly sparse files, since this host's file system has no reflinks) and
+the clone's first boot reached `sys.boot_completed` in 161.1 s and the launcher in 190.4 s (one
+boot), against 360 and 386 s for a fresh AVD. docs/farm-android.md already describes clones for
+the farm.
 
 ### savevm and loadvm
 
