@@ -320,6 +320,25 @@ fn renderer_lookup_preference() {
     let _ = std::fs::remove_dir_all(sdk);
 }
 
+/// Whether every host tool a test shells out to is present (an absolute path, or a name looked up
+/// on `PATH`). A missing tool in CI panics, since CI images have them and a broken image must not
+/// read as a pass; elsewhere it prints a `SKIP` line to stderr and returns false.
+fn have_tools(test: &str, tools: &[&str]) -> bool {
+    let found = |tool: &str| {
+        let path = Path::new(tool);
+        if path.is_absolute() {
+            return path.is_file();
+        }
+        std::env::var_os("PATH").is_some_and(|dirs| std::env::split_paths(&dirs).any(|dir| dir.join(tool).is_file()))
+    };
+    let Some(missing) = tools.iter().find(|tool| !found(tool)) else { return true };
+    let name = Path::new(missing).file_name().and_then(|n| n.to_str()).unwrap_or(missing);
+    let shown = if Path::new(missing).is_absolute() { missing.to_string() } else { name.to_string() };
+    assert!(std::env::var_os("CI").is_none(), "{test}: {shown} missing on a CI host (install {name} in the CI image)");
+    eprintln!("SKIP {test}: {shown} missing (apt-get install {name})");
+    false
+}
+
 /// Zips `<work>/<src>/emulator` with `/usr/bin/zip -y` (symlinks stored as links) and returns its
 /// `Download` for revision `rev`.
 fn zip_emulator(work: &Path, src: &str, rev: &str) -> Download {
@@ -395,7 +414,7 @@ fn tree(dir: &Path) -> Vec<String> {
 /// newer revision replaces the older one.
 #[test]
 fn installs_renderer_from_a_local_archive() {
-    if !Path::new("/usr/bin/zip").is_file() || !Path::new("/usr/bin/curl").is_file() || !Path::new("/usr/bin/unzip").is_file() {
+    if !have_tools("installs_renderer_from_a_local_archive", &["/usr/bin/zip", "curl", "unzip"]) {
         return;
     }
     let work = scratch("renderer");
@@ -523,8 +542,8 @@ fn write_sparse_skips_zero_blocks_and_keeps_contents() {
 /// A system image installs with its disk images sparse and everything else as unzip leaves it.
 #[test]
 fn installs_system_images_with_sparse_disks() {
-    if !Path::new(&Sdk::new(std::env::temp_dir()).expect("sdk").unzip).is_absolute() && Command::new("unzip").arg("-v").output().is_err() {
-        return; // no unzip on this host
+    if !have_tools("installs_system_images_with_sparse_disks", &["unzip"]) {
+        return;
     }
     let work = scratch("sparse-install");
     let mut system = vec![0u8; 2 << 20];
