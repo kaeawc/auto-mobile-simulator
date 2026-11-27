@@ -85,6 +85,16 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          an iPhone Duo's inner screen as its framebuffer holds it, 2007x2853)",
     ),
     (
+        "contrast_check",
+        "device, region?, scale?, appearance?(both), restore?(light|dark), settle_ms?(500), path?, display?(main|outer|inner|carplay)",
+        "Text and controls below WCAG contrast in a screenshot, from pixels alone: finds text-like regions, estimates each one's foreground and \
+         background, and reports those under 4.5:1 (normal text) or 3:1 (large text of about 18 pt, icons and controls) with their box, the \
+         two colours and the ratio, and the screenshot with the findings boxed (`png`, or written to path). Text over a photo or a busy \
+         background has no one background and isn't judged. appearance both (iOS) checks the light and the dark UI (switches, waits settle_ms, \
+         checks) and leaves the device in restore (default light); Android can't switch appearance yet. region is {x, y, width, height} \
+         in pixels; scale is pixels per point (default: the device's, else 1)",
+    ),
+    (
         "tap",
         "device, x, y, hold_ms?, display?(main|outer|inner|carplay)",
         "Tap at pixels, held hold_ms (default: iOS 10, Android 60) (display, iOS only: an iPhone Duo's outer or inner screen, an \
@@ -324,6 +334,7 @@ const ALL_PLATFORMS: &[&str] = &[
     "shutdown",
     "screen",
     "screenshot",
+    "contrast_check",
     "tap",
     "swipe",
     "touch",
