@@ -1,0 +1,380 @@
+//! Device bodies for the desktop's 3D view (#151): what each device type looks like from the
+//! outside, as plain data, and the mesh generated from it ([`mesh`], cached by [`cached_mesh`]).
+//!
+//! A [`Body`] is in millimetres, in a right-handed frame with its origin at the body's centre: x
+//! to the right and y up as the screen faces you in the device's natural orientation (portrait for
+//! phones, a foldable unfolded), z out of the front face. Items on the back (the camera bump, a
+//! foldable's outer screen) are placed by the same x and y, as seen from the front.
+//!
+//! Screens come from simee's own screen model: the pixel size simee reports for the type
+//! ([`Kind::profile`], [`fold::devices`], the iPhone Duo's two screens in [`duo`]) at the panel's
+//! density, so a body's screen rect is the screen simee draws. The table ([`all`]) has one row per
+//! device type with published dimensions and says where each number came from ([`Source`]); a type
+//! it doesn't know gets a generic body derived from the screen it reports ([`for_apple_type`],
+//! [`for_android`]). Dimensions only: no logos, no vendor assets. TVs, car head units and headsets
+//! have no body ([`has_body`]).
+//!
+//! [`Kind::profile`]: crate::form_factor::Kind::profile
+//! [`fold::devices`]: crate::fold::devices
+//! [`duo`]: crate::duo
+
+mod mesh;
+mod table;
+#[cfg(test)]
+mod tests;
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+pub use mesh::{CUTOUT_LIFT, MIN_RADIUS, Mesh, Part, Role, cached_mesh, mesh};
+
+use crate::device::DeviceTypeInfo;
+use crate::form_factor::{Density, FormFactor, Profile, Shape};
+use crate::platform::Platform;
+
+/// Millimetres per inch.
+pub const MM_PER_INCH: f32 = 25.4;
+
+/// Where a body's numbers come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// The maker's published dimensions; the note names the source and what was estimated.
+    Published(&'static str),
+    /// No published dimensions: derived from the screen simee reports, with generic bezels.
+    Generic(&'static str),
+}
+
+impl Source {
+    pub fn note(self) -> &'static str {
+        match self {
+            Self::Published(n) | Self::Generic(n) => n,
+        }
+    }
+}
+
+/// A rounded corner: its radius (mm) and the superellipse exponent of its curve (2 is a circular
+/// arc; higher is squarer, like Apple's continuous corners).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Corner {
+    pub radius: f32,
+    pub exponent: f32,
+}
+
+/// Which of a device's screens this is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Display {
+    /// The only screen.
+    Main,
+    /// A foldable's unfolded screen.
+    Inner,
+    /// A foldable's cover screen, in use folded.
+    Outer,
+}
+
+/// Which face of the body a screen is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Face {
+    Front,
+    Back,
+}
+
+/// A side of the body, as seen from the front.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Side {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// What cuts into the top of a screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CutoutKind {
+    /// A notch from the top edge.
+    Notch,
+    /// A pill below the top edge (the Dynamic Island).
+    Island,
+    /// A round camera hole.
+    PunchHole,
+}
+
+/// A cutout: its kind, its centre relative to the screen's centre and its size, mm.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cutout {
+    pub kind: CutoutKind,
+    pub center: [f32; 2],
+    pub size: [f32; 2],
+}
+
+/// A size the maker publishes for a screen, kept to check the drawn screen against.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Published {
+    /// The diagonal, inches (phones, tablets, foldables).
+    Diagonal(f32),
+    /// The display area, square millimetres (Apple Watch).
+    Area(f32),
+}
+
+/// One screen on the body.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Screen {
+    pub display: Display,
+    pub face: Face,
+    /// The screen in pixels as simee reports it, in the body's natural orientation.
+    pub px: (u32, u32),
+    /// The panel's pixels per inch: the size of the screen on the body.
+    pub ppi: f32,
+    /// The screen's centre, body coordinates (as seen from the front for a back-face screen).
+    pub center: [f32; 2],
+    /// simee's screen outline for the type.
+    pub shape: Shape,
+    /// The corner radius of a [`Shape::Rounded`] screen, mm.
+    pub corner_radius: f32,
+    pub cutout: Option<Cutout>,
+    pub published: Option<Published>,
+}
+
+impl Screen {
+    /// Width and height, mm.
+    pub fn size(&self) -> [f32; 2] {
+        [self.px.0 as f32 * MM_PER_INCH / self.ppi, self.px.1 as f32 * MM_PER_INCH / self.ppi]
+    }
+
+    /// Left, right, bottom and top edges, body coordinates.
+    pub fn rect(&self) -> [f32; 4] {
+        let [w, h] = self.size();
+        [self.center[0] - w / 2.0, self.center[0] + w / 2.0, self.center[1] - h / 2.0, self.center[1] + h / 2.0]
+    }
+
+    /// The diagonal, inches.
+    pub fn diagonal_inches(&self) -> f32 {
+        let [w, h] = self.size();
+        w.hypot(h) / MM_PER_INCH
+    }
+}
+
+/// The camera bump (or a watch's sensor dome) on the back.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bump {
+    /// Its centre, as seen from the front, mm.
+    pub center: [f32; 2],
+    pub size: [f32; 2],
+    pub corner: Corner,
+    /// How far it stands proud of the back, mm.
+    pub height: f32,
+}
+
+/// A side key, drawn as a small rounded box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Button {
+    pub name: &'static str,
+    pub side: Side,
+    /// Its centre along the side: y on the left and right, x on the top and bottom, mm.
+    pub at: f32,
+    /// Along the side, mm.
+    pub length: f32,
+    /// How far it stands proud of the side, mm.
+    pub depth: f32,
+    /// Across the side (along z), mm.
+    pub width: f32,
+}
+
+/// A watch's crown (the Digital Crown, a Wear OS rotary crown), drawn as a short cylinder.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Crown {
+    pub side: Side,
+    pub at: f32,
+    pub diameter: f32,
+    /// How far it stands proud of the side, mm.
+    pub length: f32,
+}
+
+/// One rigid half of a foldable, flat (unfolded) in body coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Panel {
+    pub center: [f32; 2],
+    pub size: [f32; 2],
+    /// Corner radii, top-right, top-left, bottom-left, bottom-right, mm: small at the hinge.
+    pub radii: [f32; 4],
+}
+
+/// A foldable's hinge: the axis panel 1 turns about relative to panel 0, and how far it turns.
+/// Angles follow simee's hinge (`fold::Hinge`, `duo`): 0 closed screen to screen, 180 flat, 360
+/// folded back to back.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HingeAxis {
+    /// The axis runs along y (a book fold, `fold::Hinge::vertical`), else along x (a flip).
+    pub vertical: bool,
+    /// Where the axis crosses x (vertical) or y (horizontal), mm.
+    pub at: f32,
+    /// The angles the hinge turns through, degrees.
+    pub range: (f32, f32),
+    /// The pivot's z while folding in (below 180°): the front face, where the screens meet.
+    pub fold_in_z: f32,
+    /// The pivot's z while folding back (above 180°): the back face.
+    pub fold_out_z: f32,
+}
+
+impl HingeAxis {
+    /// The angle the panels lie flat at, degrees.
+    pub const FLAT: f32 = 180.0;
+
+    /// Panel 1's transform at hinge `angle` (clamped to the range), column-major: panel 0 stays
+    /// put, panel 1's mesh (authored flat) turns about the axis. Normals turn by its upper 3x3.
+    pub fn transform(&self, angle: f32) -> [[f32; 4]; 4] {
+        let angle = angle.clamp(self.range.0, self.range.1);
+        let z = if angle <= Self::FLAT { self.fold_in_z } else { self.fold_out_z };
+        let (s, c) = (Self::FLAT - angle).to_radians().sin_cos();
+        // Folding in brings panel 1's front up and over panel 0: about -y for a book (panel 1 on
+        // the right), about +x for a flip (panel 1 on top).
+        let (cols, pivot) = if self.vertical {
+            ([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], [self.at, 0.0, z])
+        } else {
+            ([[1.0, 0.0, 0.0], [0.0, c, s], [0.0, -s, c]], [0.0, self.at, z])
+        };
+        let rotated = |i: usize| cols[0][i] * pivot[0] + cols[1][i] * pivot[1] + cols[2][i] * pivot[2];
+        let t = [pivot[0] - rotated(0), pivot[1] - rotated(1), pivot[2] - rotated(2)];
+        [
+            [cols[0][0], cols[0][1], cols[0][2], 0.0],
+            [cols[1][0], cols[1][1], cols[1][2], 0.0],
+            [cols[2][0], cols[2][1], cols[2][2], 0.0],
+            [t[0], t[1], t[2], 1.0],
+        ]
+    }
+}
+
+/// A foldable's two panels and the hinge between them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FoldBody {
+    pub panels: [Panel; 2],
+    pub hinge: HingeAxis,
+}
+
+/// A device type's body.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Body {
+    /// The device type: an Apple device type identifier's last segment (`iPhone-17-Pro`), an
+    /// AVD's `hw.device.name` (`pixel_fold`), or a generic body's key.
+    pub id: String,
+    /// Other identifiers the same body answers to.
+    pub aliases: Vec<&'static str>,
+    pub name: String,
+    pub platform: Platform,
+    pub form_factor: FormFactor,
+    pub source: Source,
+    /// Width (x), height (y) and thickness (z), mm; a foldable's unfolded.
+    pub size: [f32; 3],
+    pub corner: Corner,
+    /// The radius the front and back edges are rounded over, mm.
+    pub bevel: f32,
+    pub screens: Vec<Screen>,
+    pub bump: Option<Bump>,
+    pub buttons: Vec<Button>,
+    pub crown: Option<Crown>,
+    pub fold: Option<FoldBody>,
+}
+
+impl Body {
+    /// The rigid parts: a foldable's two panels, else the whole body.
+    pub fn panels(&self) -> Vec<Panel> {
+        match &self.fold {
+            Some(f) => f.panels.to_vec(),
+            None => {
+                let [w, h, _] = self.size;
+                vec![Panel { center: [0.0, 0.0], size: [w, h], radii: [self.corner.radius; 4] }]
+            }
+        }
+    }
+
+    /// The panel a point (body x, y) belongs to: the side of the hinge it is on.
+    pub fn panel_at(&self, [x, y]: [f32; 2]) -> usize {
+        match &self.fold {
+            Some(f) => usize::from(if f.hinge.vertical { x >= f.hinge.at } else { y >= f.hinge.at }),
+            None => 0,
+        }
+    }
+
+    pub fn screen(&self, display: Display) -> Option<&Screen> {
+        self.screens.iter().find(|s| s.display == display)
+    }
+
+    /// Whether one of the body's screens is `px` (either orientation): the screen simee reports.
+    pub fn shows(&self, px: (u32, u32)) -> bool {
+        self.screens.iter().any(|s| s.px == px || s.px == (px.1, px.0))
+    }
+
+    fn answers_to(&self, id: &str) -> bool {
+        self.id == id || self.aliases.contains(&id)
+    }
+}
+
+/// Whether a form factor has a body: phones, tablets, foldables and watches. TVs, car head units
+/// (CarPlay is a display on an iPhone) and headsets don't.
+pub fn has_body(form_factor: FormFactor) -> bool {
+    matches!(form_factor, FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable | FormFactor::Watch)
+}
+
+/// Every body in the table, built once.
+pub fn all() -> &'static [Arc<Body>] {
+    static ALL: OnceLock<Vec<Arc<Body>>> = OnceLock::new();
+    ALL.get_or_init(|| table::rows().into_iter().map(Arc::new).collect())
+}
+
+/// The table's body for a device type id: `iPhone-17-Pro`, a full CoreSimulator identifier
+/// (`com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro`) or an AVD's `pixel_fold`.
+pub fn get(id: &str) -> Option<Arc<Body>> {
+    let id = id.strip_prefix("com.apple.CoreSimulator.SimDeviceType.").unwrap_or(id);
+    all().iter().find(|b| b.answers_to(id)).cloned()
+}
+
+/// The body for an Apple device type as simee lists it: the table's row when it knows the type and
+/// the row's screen is the one the type reports, else a generic body from that screen. None for a
+/// form factor with no body.
+pub fn for_apple_type(info: &DeviceTypeInfo) -> Option<Arc<Body>> {
+    let px = (info.screen_width.round() as u32, info.screen_height.round() as u32);
+    let known = get(&info.identifier).or_else(|| all().iter().find(|b| b.name == info.name).cloned());
+    if let Some(b) = known.filter(|b| b.platform == Platform::Ios && b.shows(px)) {
+        return Some(b);
+    }
+    let form_factor = info.form_factor.filter(|f| has_body(*f))?;
+    let density = Density::Scale(info.screen_scale.round().max(1.0) as u32);
+    let shape = if form_factor == FormFactor::Tv { Shape::Rectangle } else { Shape::Rounded };
+    generic(Platform::Ios, form_factor, px, density, shape, None)
+}
+
+/// The body for an Android virtual device: the table's row for its hardware definition
+/// (`hw.device.name`) when the AVD's screen is that row's, else [`for_profile`].
+pub fn for_android(device_name: &str, profile: &Profile) -> Option<Arc<Body>> {
+    let known = get(device_name).filter(|b| {
+        b.platform == Platform::Android && b.form_factor == profile.kind.form_factor && b.shows((profile.width, profile.height))
+    });
+    known.or_else(|| for_profile(profile))
+}
+
+/// A generic body for a profile's screen (its density, shape and fold), cached by its key; the
+/// reference profiles' bodies are rows of the table.
+pub fn for_profile(profile: &Profile) -> Option<Arc<Body>> {
+    let folded = profile.fold.map(|f| (f.folded_width, f.folded_height));
+    generic(profile.kind.platform, profile.kind.form_factor, (profile.width, profile.height), profile.density, profile.shape, folded)
+}
+
+fn generic(
+    platform: Platform,
+    form_factor: FormFactor,
+    px: (u32, u32),
+    density: Density,
+    shape: Shape,
+    folded: Option<(u32, u32)>,
+) -> Option<Arc<Body>> {
+    if !has_body(form_factor) || px.0 == 0 || px.1 == 0 {
+        return None;
+    }
+    let id = table::generic_id(platform, form_factor, px, density, shape, folded);
+    if let Some(b) = get(&id) {
+        return Some(b);
+    }
+    static GENERIC: OnceLock<Mutex<HashMap<String, Arc<Body>>>> = OnceLock::new();
+    let mut map = GENERIC.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let body = map.entry(id).or_insert_with_key(|id| Arc::new(table::generic(id, platform, form_factor, px, density, shape, folded)));
+    Some(Arc::clone(body))
+}
