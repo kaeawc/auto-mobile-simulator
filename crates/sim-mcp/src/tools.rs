@@ -21,8 +21,21 @@ pub const VIEW_TOOL: &str = "device_view";
 /// Methods that can run for many seconds: a client that declares the Tasks extension gets a task
 /// handle for these, and everything else a progress heartbeat while the call blocks. A method not
 /// listed runs inline. (`provision` and `record` aren't API methods, so they aren't tools.)
-pub const LONG_RUNNING: &[&str] =
-    &["boot", "boot_many", "create", "clone", "install", "settle", "erase", "shutdown", "export", "import", "mem_leaks", "mem_heap"];
+pub const LONG_RUNNING: &[&str] = &[
+    "boot",
+    "boot_many",
+    "create",
+    "clone",
+    "install",
+    "settle",
+    "erase",
+    "shutdown",
+    "export",
+    "import",
+    "mem_leaks",
+    "mem_heap",
+    "stream_start",
+];
 
 /// The environment variable that picks the toolsets: names separated by commas (`core,debug`), or
 /// `all`.
@@ -590,7 +603,17 @@ pub fn parse_call(params: &Value, toolsets: &Toolsets) -> Result<(String, Value)
         ))
         .with_data(json!({"tool": name, "toolset": set, "enabled": toolsets.label()})));
     }
-    Ok((name.to_owned(), arguments(params)?))
+    let args = arguments(params)?;
+    // `input: true` lets the viewer touch, type and press buttons: it needs the input tools served.
+    if name == "stream_start" && args.get("input") == Some(&json!(true)) && !toolsets.contains("touch") {
+        return Err(RpcError::invalid_params(format!(
+            "`stream_start` with `input: true` lets viewers drive the device, which needs the `input` toolset, and this server serves `{}`. \
+             Start it with {TOOLSETS_ENV}={},input (or all), or leave `input` off",
+            toolsets.label(),
+            toolsets.label()
+        )));
+    }
+    Ok((name.to_owned(), args))
 }
 
 /// Whether this call should be a task for this client.

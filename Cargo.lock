@@ -1934,8 +1934,10 @@ dependencies = [
  "simee-coresim",
  "simee-debug",
  "simee-emu-avd",
+ "simee-encode",
  "simee-host",
  "simee-netshape",
+ "simee-rtc",
 ]
 
 [[package]]

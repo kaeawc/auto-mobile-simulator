@@ -143,6 +143,25 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          an iPhone Duo's inner screen as its framebuffer holds it, 2007x2853)",
     ),
     (
+        "stream_start",
+        "device, whip_url, token?, fps?(30), max_size?(1280), bitrate?(2500000), audio?(false), input?(false)",
+        "Stream the screen as H.264 over WebRTC to a WHIP endpoint (plaintext http to a loopback host only, e.g. MediaMTX's \
+         `http://127.0.0.1:8889/<path>/whip`), with token as its bearer token; max_size caps the longest side (0: full size), \
+         bitrate is in bit/s; input offers the `simee-input` data channel, whose touches, keys, text, buttons, rotations, folds \
+         and scrolls reach the device. One stream per device and URL, living in this process (`simee serve`) on a 30 s lease \
+         that stream_status renews: a stream nobody renews is stopped. Returns stream_id, whip_resource and lease_ttl_s. \
+         macOS hosts only for now; audio isn't streamed yet",
+    ),
+    (
+        "stream_status",
+        "stream_id",
+        "A stream's state (starting, running, ended and why), its stages in the order reached (requested, first_encoded_frame, \
+         whip_connected, ended; ms since requested) and stats (encoded, sent, keyframes, bytes, fps, bitrate_bps, the publisher's \
+         bitrate_estimate_bps, the viewers' pli and fir keyframe requests, input events and errors); renews its lease",
+    ),
+    ("stream_stop", "stream_id", "Stop a stream: ends its encode loop and sends the WHIP DELETE; its last status, with deleted"),
+    ("streams", "device?", "This process's streams (or one device's), each as stream_status shows it, without renewing a lease"),
+    (
         "contrast_check",
         "device, region?, scale?, appearance?(current|both), restore?(light|dark), settle_ms?(500), path?, display?(main|outer|inner|carplay)",
         "Text and controls below WCAG contrast in a screenshot, from pixels alone: finds text-like regions, estimates each one's foreground and \
@@ -474,6 +493,10 @@ const ALL_PLATFORMS: &[&str] = &[
     "shutdown",
     "screen",
     "screenshot",
+    "stream_start",
+    "stream_status",
+    "stream_stop",
+    "streams",
     "contrast_check",
     "tap",
     "swipe",
@@ -979,6 +1002,8 @@ fn dispatch(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         }
         // Need no device: resolving the default `booted` would fail with two simulators booted.
         "device_types" | "audio_capture_stop" => crate::ios::call(&mut s.ios, method, p),
+        // Streams outlive the call: the process's own registry, which resolves `device` itself.
+        m if crate::stream::is_method(m) => crate::stream::call(s, m, p),
         // Makes a device from a bundle; the bundle's manifest says whose.
         "import" => match opt_platform(p)? {
             Some(Platform::Ios) => Err("`import` takes Android bundles for now; iOS bundles are the next step of #170".into()),

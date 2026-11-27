@@ -27,6 +27,9 @@ sim-debug.workspace = true
 sim-netshape.workspace = true
 sim-audio.workspace = true
 sim-host.workspace = true
+# Streams (`stream_*`): the encoder and the WHIP publisher.
+sim-encode.workspace = true
+sim-rtc.workspace = true
 
 [dev-dependencies]
 emu-avd.workspace = true
