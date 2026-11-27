@@ -752,6 +752,44 @@ target dir) and after against the same device back to back:
 A 300 ms swipe's motion now takes 300 ms within 1% quiet and loaded (it took 18% and 33% longer);
 the call ends one sample step (17 ms) after the last move, when the finger lifts, as planned.
 
+## Desktop: Rune's native Metal backend against wgpu
+
+What the desktop window costs on wgpu's Metal backend (`SIMEE_GPU_BACKEND=wgpu`), which the 3D
+device view needs (Rune's native Metal backend has no depth attachments or MSAA resolves,
+anomalyco/rune#2547), against Rune's native Metal backend, the default. The flat view is the same in
+both. Apple M3 Max (Mac15,9, 16 CPUs), macOS 26.6.2, Rune `f6f6e04`, 2026-11-27. Each value is the
+median of 5 runs per backend, run alternately (metal then wgpu, then wgpu then metal). The 1-minute
+load average at the start of the runs was 5 to 11 for iOS and 8 to 22 for Android. Two Android
+pairs that started at load 48 to 140 were run again. CPU and GPU are percentages of one core and of
+the GPU. GPU time is the process's `accumulatedGPUTime` from `ioreg -c AGXDeviceUserClient`.
+
+| Measure | iOS: Metal | iOS: wgpu | Android: Metal | Android: wgpu |
+| --- | --- | --- | --- | --- |
+| Launch to first presented frame | 111 ms | 106 ms | 117 ms | 119 ms |
+| Idle CPU (static screen, 20 s) | 1.00% | 1.10% | 0.65% | 0.60% |
+| Idle GPU | 0.63% | 0.66% | 0.00% | 0.00% |
+| CPU during swipes (20 swipes, 20 s) | 10.0% | 11.6% | 20.5% | 18.8% |
+| GPU during swipes | 8.4% | 9.2% | 11.3% | 10.8% |
+| Frames drawn during swipes | 1,277 | 1,265 | 1,363 | 1,364 |
+| Frame time (start to present), p50 / p95 | 1.24 / 1.51 ms | 1.34 / 1.58 ms | 1.45 / 2.47 ms | 1.26 / 1.89 ms |
+| Gap between frames during swipes, p50 / p95 | 9.3 / 18.4 ms | 9.4 / 20.5 ms | 9.8 / 24.0 ms | 9.9 / 23.9 ms |
+| Resident memory after the swipes | 126 MiB | 134 MiB | 164 MiB | 176 MiB |
+
+Devices: an iPhone 17 Pro on iOS 27.2 (simulator), and an API 36 `google_apis` phone at
+1080x2400 on emu. The iOS window draws about 3 frames a second while idle and the Android one
+none, on both backends. In window screenshots (`screencapture -l`), all 10 iOS idle shots are
+byte-identical across backends, and so are the Android shots taken in the same device state. Shots
+after a swipe, Home, Rotate (portrait to landscape and back, Safari and Android Settings) and the
+bezel match byte for byte, except where the device's own content changed between runs (Safari's
+favicons loading, a notification's age). Input through the window works the same on both backends.
+
+The measuring build is `cargo build --release --features tooling,rune/frame-profile` (Rune's
+per-frame log, `RUNE_FRAME_LOG`; `--window-script` replays the swipes as window drags). Each run
+starts the window with `RUNE_GPU_BACKEND=<metal|wgpu> SIMEE_DEVICE=<device>`. Run times are counted
+from the first frame: idle from 10 to 30 s, a screenshot at 31 s, then swipes from 32 to 52 s, one
+drag on `device-screen` a second (iOS left and right, Android up and down). The shipped build
+without `frame-profile` was not measured.
+
 ## MCP server
 
 What the MCP server's protocol layer costs to build, against the official Rust SDK. Linux VM,
