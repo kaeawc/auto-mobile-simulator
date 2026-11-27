@@ -107,9 +107,10 @@ impl Rig {
         }
     }
 
-    /// Waits until the backend has been asked for `method` (a watcher's first read is its baseline).
+    /// Waits until the backend has answered `method` once (a watcher's first read is its baseline),
+    /// so an answer set next is a change the watcher sees, never its baseline.
     fn until_read(&self, method: &str) {
-        while self.fake.called(method).is_empty() {
+        while self.fake.answered(method) == 0 {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
