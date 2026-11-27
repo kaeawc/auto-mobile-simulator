@@ -345,10 +345,53 @@ fn a_client_without_the_extension_waits_and_hears_progress() {
         (response["result"]["resultType"].clone(), response["result"]["structuredContent"]["boot_s"].clone()),
         (json!("complete"), json!(3))
     );
-    // No token, no progress.
+    // However many heartbeats landed while the call ran, they all came before its response.
+    let before = rig.notes.take();
+    assert!(before.iter().all(|n| n["method"] == "notifications/progress" && n["params"]["progressToken"] == "t1"), "{before:?}");
+    // None comes after it; and with no token, no progress.
     rig.fake.gates.lock().expect("gates").clear();
     rig.modern("tools/call", json!({"name": "boot", "arguments": {"device": "phone"}}));
-    assert!(rig.quiet());
+    assert!(rig.quiet(), "{:?}", rig.notes.borrow());
+}
+
+#[test]
+fn no_progress_follows_the_response() {
+    // The heartbeat is stopped at its worst moment: it has decided to send, and the call returns.
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink: Sink = {
+        let lines = lines.clone();
+        Arc::new(move |line| lock(&lines).push(line))
+    };
+    let (paused_tx, paused) = channel();
+    let (go, go_rx) = channel::<()>();
+    let first = AtomicBool::new(true);
+    let beat = heartbeat_with(sink, json!("t1"), "boot".into(), Duration::from_millis(1), move || {
+        if first.swap(false, Ordering::Relaxed) {
+            paused_tx.send(()).ok();
+            go_rx.recv().ok();
+        }
+    });
+    paused.recv_timeout(WAIT).expect("the heartbeat reaches its send");
+    let (done_tx, done) = channel();
+    let answer = {
+        let lines = lines.clone();
+        std::thread::spawn(move || {
+            drop(beat);
+            lock(&lines).push("response".into());
+            done_tx.send(()).ok();
+        })
+    };
+    // Give the response every chance to overtake the progress; stopping waits for the send instead.
+    let _ = done.recv_timeout(Duration::from_millis(500));
+    go.send(()).ok();
+    answer.join().expect("answered");
+    let deadline = Instant::now() + WAIT;
+    while !lock(&lines).iter().any(|l| l.contains("notifications/progress")) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let lines = lock(&lines).clone();
+    assert!(lines.first().is_some_and(|l| l.contains("notifications/progress")), "{lines:?}");
+    assert_eq!(lines.last().map(String::as_str), Some("response"), "no progress after the response: {lines:?}");
 }
 
 #[test]
