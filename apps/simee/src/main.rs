@@ -672,7 +672,8 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
                 params["audio"] = json!(true);
             }
             let timed = call("boot", params)?;
-            if !timed.is_null() {
+            // Without settle or a profile there are no timings, only the admission (#275).
+            if timed.get("device").is_some() {
                 writeln!(out, "{}", boot_line(&timed))?;
                 if timed["settled"] == json!(false) {
                     writeln!(err, "{}", not_settled_line(&timed))?;
