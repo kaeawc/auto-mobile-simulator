@@ -8,7 +8,7 @@ members = ["crates/*", "apps/simee", "apps/emu"]
 exclude = ["desktop"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
@@ -21,25 +21,25 @@ homepage = "https://github.com/kaeawc/simee"
 # The workspace crates, published to crates.io as `simee-*` (scripts/publish.sh), each library
 # named after its package (`simee_core`). The keys keep the old names, so dependents say
 # `sim_core::`; the `=` pins move with the workspace version (scripts/release.sh).
-sim-core = { package = "simee-core", path = "crates/sim-core", version = "=0.1.0" }
-sim-coresim = { package = "simee-coresim", path = "crates/sim-coresim", version = "=0.1.0" }
-sim-debug = { package = "simee-debug", path = "crates/sim-debug", version = "=0.1.0" }
-sim-api = { package = "simee-api", path = "crates/sim-api", version = "=0.1.0" }
-sim-mcp = { package = "simee-mcp", path = "crates/sim-mcp", version = "=0.1.0" }
-sim-netshape = { package = "simee-netshape", path = "crates/sim-netshape", version = "=0.1.0" }
-sim-host = { package = "simee-host", path = "crates/sim-host", version = "=0.1.0" }
-sim-audio = { package = "simee-audio", path = "crates/sim-audio", version = "=0.1.0" }
-sim-android = { package = "simee-android", path = "crates/sim-android", version = "=0.1.0" }
-sim-bundle = { package = "simee-bundle", path = "crates/sim-bundle", version = "=0.1.0" }
-sim-rtc = { package = "simee-rtc", path = "crates/sim-rtc", version = "=0.1.0" }
-emu-avd = { package = "simee-emu-avd", path = "crates/emu-avd", version = "=0.1.0" }
-emu-gfxstream = { package = "simee-emu-gfxstream", path = "crates/emu-gfxstream", version = "=0.1.0" }
-emu-ext4 = { package = "simee-emu-ext4", path = "crates/emu-ext4", version = "=0.1.0" }
-emu-fdt = { package = "simee-emu-fdt", path = "crates/emu-fdt", version = "=0.1.0" }
-emu-hvf = { package = "simee-emu-hvf", path = "crates/emu-hvf", version = "=0.1.0" }
-emu-kvm = { package = "simee-emu-kvm", path = "crates/emu-kvm", version = "=0.1.0" }
-emu-sdk = { package = "simee-emu-sdk", path = "crates/emu-sdk", version = "=0.1.0" }
-emu-vmm = { package = "simee-emu-vmm", path = "crates/emu-vmm", version = "=0.1.0" }
+sim-core = { package = "simee-core", path = "crates/sim-core", version = "=0.2.0" }
+sim-coresim = { package = "simee-coresim", path = "crates/sim-coresim", version = "=0.2.0" }
+sim-debug = { package = "simee-debug", path = "crates/sim-debug", version = "=0.2.0" }
+sim-api = { package = "simee-api", path = "crates/sim-api", version = "=0.2.0" }
+sim-mcp = { package = "simee-mcp", path = "crates/sim-mcp", version = "=0.2.0" }
+sim-netshape = { package = "simee-netshape", path = "crates/sim-netshape", version = "=0.2.0" }
+sim-host = { package = "simee-host", path = "crates/sim-host", version = "=0.2.0" }
+sim-audio = { package = "simee-audio", path = "crates/sim-audio", version = "=0.2.0" }
+sim-android = { package = "simee-android", path = "crates/sim-android", version = "=0.2.0" }
+sim-bundle = { package = "simee-bundle", path = "crates/sim-bundle", version = "=0.2.0" }
+sim-rtc = { package = "simee-rtc", path = "crates/sim-rtc", version = "=0.2.0" }
+emu-avd = { package = "simee-emu-avd", path = "crates/emu-avd", version = "=0.2.0" }
+emu-gfxstream = { package = "simee-emu-gfxstream", path = "crates/emu-gfxstream", version = "=0.2.0" }
+emu-ext4 = { package = "simee-emu-ext4", path = "crates/emu-ext4", version = "=0.2.0" }
+emu-fdt = { package = "simee-emu-fdt", path = "crates/emu-fdt", version = "=0.2.0" }
+emu-hvf = { package = "simee-emu-hvf", path = "crates/emu-hvf", version = "=0.2.0" }
+emu-kvm = { package = "simee-emu-kvm", path = "crates/emu-kvm", version = "=0.2.0" }
+emu-sdk = { package = "simee-emu-sdk", path = "crates/emu-sdk", version = "=0.2.0" }
+emu-vmm = { package = "simee-emu-vmm", path = "crates/emu-vmm", version = "=0.2.0" }
 
 anyhow = "1"
 base64 = "0.23"

@@ -6,6 +6,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-27
+
 ## [0.1.0] - 2026-11-27
 
 The first release: iOS simulator and Android emulator devices from one Rust core, published to
