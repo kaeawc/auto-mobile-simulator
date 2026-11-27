@@ -41,6 +41,15 @@ The front ends drive an Android device the way any tool can: `sim-android` sends
 (input events, sensors, location, rotation, the hinge, screenshots, `kill`) and streams frames and
 touches over the display socket. It never links the VMM.
 
+Inside `emu`, the machine reaches the hypervisor through one seam, `emu-vmm`'s `hv` module, with
+one backend per host selected at build time (Hypervisor.framework today; KVM on Linux is #54).
+The seam sits above the vCPU run loop rather than at the raw vCPU calls, because hypervisors
+differ in what the kernel does for the VMM: Hypervisor.framework hands WFI wakeups, PSCI and raw
+MMIO syndromes to userspace, while KVM handles WFI, the timer, PSCI and interrupt injection
+(irqfd) in the kernel and reports MMIO already decoded. A seam at the HVF calls would force KVM
+through HVF's userspace slow paths. Each backend owns its loop. The device dispatch, exit counters
+and stop protocol they share (`vcpu.rs`) build and test on any host.
+
 ## One device model
 
 `sim_core::device::DeviceInfo` describes devices of both platforms:

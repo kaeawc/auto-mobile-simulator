@@ -64,7 +64,7 @@ ignored for now.
 | Path | What |
 | --- | --- |
 | `crates/emu-hvf` | Safe wrappers over Hypervisor.framework: VM, vCPUs, GIC, guest RAM with zero-copy file I/O. One of the few crates allowed `unsafe` (see AGENTS.md). |
-| `crates/emu-vmm` | The machine: memory map (`layout.rs`), device tree (`board.rs`), vCPU loop and PSCI (`vcpu.rs`), MMIO bus, PL011/PL031, virtio-mmio transport, blk, rng, vsock, snd, host pipe services (adb bridge, `qemud:boot-properties`, `qemud:car`, ...) |
+| `crates/emu-vmm` | The machine: memory map (`layout.rs`), device tree (`board.rs`), the hypervisor seam and its backends' vCPU loops (`hv/`; HVF's PSCI is in `hv/hvf.rs`), what the loops share (`vcpu.rs`), MMIO bus, PL011/PL031, virtio-mmio transport, blk, rng, vsock, snd, host pipe services (adb bridge, `qemud:boot-properties`, `qemud:car`, ...) |
 | `crates/emu-avd` | AVD discovery and config (`~/.android/avd`, `config.ini`, system image), form factor (`Avd::profile`), running-instance advertisements, bootconfig encoding |
 | `crates/emu-sdk` | Java-free SDK provisioning: repository manifests, verified downloads, unpacking, the on-demand renderer (`emu -provision`, `-provision-renderer`) |
 | `crates/emu-ext4` | Native ext4 formatter for first-boot userdata: writes only metadata, so a fresh 10 GiB image takes under 1 MB on disk |
