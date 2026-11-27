@@ -118,7 +118,7 @@ crate:
   `structuredContent`.
 - `contrast_check` is held to the same rule: no `path`, and each annotated PNG (one per appearance
   with `appearance: both`) is an image block, so the findings, a few lines of JSON, are the only
-  text. It is marked as an action, not a read: with `appearance: both` it switches an iOS
+  text (each result's `image` is its place among the image blocks). It is marked as an action, not a read: with `appearance: both` it switches an iOS
   device's appearance and puts it back.
 
 `device_view` is the one tool that is not an API method (see [the app](#the-device-view-app)).

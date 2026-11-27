@@ -400,9 +400,11 @@ mod tests {
             Ok(json!({"failing": 1, "appearances": {"light": {"png": "AAA", "findings": []}, "dark": {"png": "BBB", "findings": []}}})),
             Era::Modern,
         );
-        assert_eq!(check["content"][1], json!({"type": "image", "data": "AAA", "mimeType": "image/png"}));
-        assert_eq!(check["content"][2]["data"], "BBB");
-        assert_eq!(check["structuredContent"]["appearances"]["dark"]["image"], 1);
+        // `image` is a result's place among the image blocks (JSON objects have no order to lean on).
+        let at = |mode: &str| check["structuredContent"]["appearances"][mode]["image"].as_u64().expect("image") as usize + 1;
+        assert_eq!(check["content"][at("light")], json!({"type": "image", "data": "AAA", "mimeType": "image/png"}));
+        assert_eq!(check["content"][at("dark")]["data"], "BBB");
+        assert_ne!(at("light"), at("dark"));
         assert!(!check["content"][0]["text"].as_str().expect("text").contains("AAA"));
         let single = result("contrast_check", Ok(json!({"png": "CCC", "findings": []})), Era::Modern);
         assert_eq!(
