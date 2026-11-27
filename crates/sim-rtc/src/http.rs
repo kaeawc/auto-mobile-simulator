@@ -14,6 +14,9 @@ use crate::{Error, Result};
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// An SDP answer is a few KB; error pages are cut short anyway.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Everything read for one response: heads (interim ones too), chunk framing, extensions and
+/// trailers included, so no mix of them buffers more than this before the deadline.
+const MAX_RESPONSE_BYTES: usize = MAX_BODY_BYTES + 2 * MAX_HEADER_BYTES;
 
 #[derive(Clone, Debug, Default)]
 pub struct Response {
@@ -66,7 +69,7 @@ pub fn request(method: &str, url: &Url, headers: &[(&str, &str)], body: &[u8], t
     stream.write_all(body).map_err(|e| io_or_timeout(e, method, url))?;
     stream.flush().map_err(|e| io_or_timeout(e, method, url))?;
 
-    let mut reader = Reader { stream, buf: Vec::new(), pos: 0, deadline, eof: false };
+    let mut reader = Reader { stream, buf: Vec::new(), pos: 0, deadline, eof: false, total: 0 };
     loop {
         let head = reader.read_head().map_err(|e| e.with_context(method, url))?;
         let mut response = parse_head(&head)?;
@@ -89,7 +92,7 @@ fn valid_token(name: &str) -> bool {
 fn connect(url: &Url, deadline: Instant) -> Result<TcpStream> {
     let addrs: Vec<SocketAddr> = match url.loopback_ip() {
         Some(ip) => vec![SocketAddr::new(ip, url.port())],
-        None => (url.host(), url.port()).to_socket_addrs()?.collect(),
+        None => resolve(url, deadline)?,
     };
     let mut last = None;
     for addr in addrs {
@@ -109,6 +112,24 @@ fn connect(url: &Url, deadline: Instant) -> Result<TcpStream> {
         }
         Some(e) => Err(Error::Io(e)),
         None => Err(Error::InvalidInput(format!("{url}: the host resolves to no address"))),
+    }
+}
+
+/// Resolve the host within the deadline. `getaddrinfo` can't be interrupted, so it runs on a
+/// helper thread that is abandoned (it ends when the resolver answers) if the deadline passes.
+fn resolve(url: &Url, deadline: Instant) -> Result<Vec<SocketAddr>> {
+    let left = remaining(deadline).ok_or_else(|| Error::Timeout(format!("resolving {url}")))?;
+    let (host, port) = (url.host().to_owned(), url.port());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("simee-rtc-resolve".into())
+        .spawn(move || {
+            let _ = tx.send((host.as_str(), port).to_socket_addrs().map(Iterator::collect::<Vec<_>>));
+        })
+        .map_err(Error::Io)?;
+    match rx.recv_timeout(left) {
+        Ok(addrs) => Ok(addrs?),
+        Err(_) => Err(Error::Timeout(format!("resolving {url}"))),
     }
 }
 
@@ -152,6 +173,8 @@ struct Reader {
     pos: usize,
     deadline: Instant,
     eof: bool,
+    /// Bytes read from the socket so far, over every head, chunk line, trailer and body.
+    total: usize,
 }
 
 impl Reader {
@@ -160,8 +183,16 @@ impl Reader {
         if self.eof {
             return Ok(false);
         }
+        if self.total >= MAX_RESPONSE_BYTES {
+            return Err(ReadError::Protocol("response too large".into()));
+        }
         let left = remaining(self.deadline).ok_or(ReadError::Timeout)?;
         self.stream.set_read_timeout(Some(left)).map_err(ReadError::Io)?;
+        // What was consumed is dead weight: drop it so the buffer holds only the unread tail.
+        if self.pos > 0 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
         let mut chunk = [0u8; 8192];
         match self.stream.read(&mut chunk) {
             Ok(0) => {
@@ -169,6 +200,7 @@ impl Reader {
                 Ok(false)
             }
             Ok(n) => {
+                self.total = self.total.saturating_add(n);
                 self.buf.extend_from_slice(&chunk[..n]);
                 Ok(true)
             }
@@ -240,7 +272,7 @@ impl Reader {
                     while !self.line()?.is_empty() {}
                     return Ok(body);
                 }
-                if body.len() + size > MAX_BODY_BYTES {
+                if body.len().checked_add(size).is_none_or(|n| n > MAX_BODY_BYTES) {
                     return Err(ReadError::Protocol("body too large".into()));
                 }
                 body.extend(self.take(size)?);
@@ -349,6 +381,78 @@ mod tests {
         let (url, server) = serve_once(b"HTTP/1.1 204 No Content\r\nETag: \"2\"\r\n\r\n");
         let r = request("DELETE", &url, &[], b"", Duration::from_secs(5)).expect("204");
         assert_eq!((r.status, r.header("etag"), r.body.len()), (204, Some("\"2\""), 0));
+        server.join().expect("server");
+    }
+
+    /// Accept one connection, read the request head, then run `script` on the stream.
+    fn serve_script(script: impl FnOnce(&mut TcpStream) + Send + 'static) -> (Url, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut req = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while find(&req, b"\r\n\r\n").is_none() {
+                let n = s.read(&mut chunk).expect("read");
+                req.extend_from_slice(&chunk[..n]);
+            }
+            script(&mut s);
+        });
+        (Url::parse(&format!("http://127.0.0.1:{port}/")).expect("url"), handle)
+    }
+
+    /// Write `head`, then `piece` over and over until the client hangs up (or 10 s pass).
+    fn flood(s: &mut TcpStream, head: &[u8], piece: &[u8]) {
+        let _ = s.write_all(head);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if s.write_all(piece).is_err() {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn a_huge_chunk_size_after_a_small_one_is_an_error_not_an_overflow() {
+        let (url, server) = serve_script(|s| {
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\nffffffffffffffff\r\n");
+        });
+        let err = request("GET", &url, &[], b"", Duration::from_secs(5)).expect_err("too large");
+        assert!(matches!(err, Error::Protocol(_)), "{err}");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn endless_interim_heads_trailers_and_extensions_hit_the_response_cap() {
+        let cases: [(&[u8], &[u8]); 3] = [
+            (b"", b"HTTP/1.1 100 Continue\r\n\r\n"),
+            (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n", b"X-Trailer: yes\r\n"),
+            (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", b"1;ext=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\na\r\n"),
+        ];
+        for (head, piece) in cases {
+            let (url, server) = serve_script(move |s| flood(s, head, piece));
+            let start = Instant::now();
+            let err = request("GET", &url, &[], b"", Duration::from_secs(8)).expect_err("flood");
+            assert!(matches!(err, Error::Protocol(_)), "{err}");
+            assert!(start.elapsed() < Duration::from_secs(6), "stopped by the cap, not the deadline");
+            server.join().expect("server");
+        }
+    }
+
+    #[test]
+    fn a_body_at_the_cap_in_many_chunks_still_reads() {
+        let (url, server) = serve_script(|s| {
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            let chunk = vec![b'x'; 8192];
+            for _ in 0..(MAX_BODY_BYTES / 8192) {
+                let _ = s.write_all(b"2000\r\n");
+                let _ = s.write_all(&chunk);
+                let _ = s.write_all(b"\r\n");
+            }
+            let _ = s.write_all(b"0\r\n\r\n");
+        });
+        let r = request("GET", &url, &[], b"", Duration::from_secs(10)).expect("a full-size body");
+        assert_eq!(r.body.len(), MAX_BODY_BYTES);
         server.join().expect("server");
     }
 

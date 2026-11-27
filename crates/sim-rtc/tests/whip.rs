@@ -67,6 +67,7 @@ fn a_server_that_does_not_trickle_is_not_an_error() {
 #[test]
 fn refuses_answers_that_are_not_201_with_a_location() {
     let server = FakeServer::start(|req| match req.path.as_str() {
+        "/s" if req.method == "DELETE" => Reply::new(200),
         "/busy" => Reply::new(503).body("no publishers allowed"),
         "/ok-not-created" => Reply::new(200).header("Location", "/s").body(ANSWER),
         "/no-location" => Reply::new(201).body(ANSWER),
@@ -81,6 +82,20 @@ fn refuses_answers_that_are_not_201_with_a_location() {
     assert!(matches!(publish("/ok-not-created"), Err(Error::Status { status: 200, .. })));
     assert!(matches!(publish("/no-location"), Err(Error::Protocol(_))));
     assert!(matches!(publish("/not-sdp"), Err(Error::Protocol(_))));
+    let deletes: Vec<String> = server.requests().into_iter().filter(|r| r.method == "DELETE").map(|r| r.path).collect();
+    assert_eq!(deletes, ["/s"], "the not-SDP 201 created a resource the client must delete, and only that one");
+}
+
+#[test]
+fn debug_output_never_shows_the_bearer_token() {
+    let opts = options(Some("s3cr3t-token"));
+    let client = WhipClient::new("http://127.0.0.1:1/w", opts.clone()).expect("client");
+    let config = simee_rtc::PublisherConfig { whip: opts.clone(), ..simee_rtc::PublisherConfig::new("http://127.0.0.1:1/w") };
+    for text in [format!("{opts:?}"), format!("{opts:#?}"), format!("{client:?}"), format!("{config:?}")] {
+        assert!(!text.contains("s3cr3t-token"), "{text}");
+        assert!(text.contains("redacted"), "{text}");
+    }
+    assert!(format!("{:?}", WhipOptions::default()).contains("None"));
 }
 
 #[test]
@@ -99,7 +114,9 @@ fn follows_redirects_but_never_to_plaintext_elsewhere() {
     assert!(matches!(client("/away").publish("v=0\r\n"), Err(Error::Insecure(_))));
     assert!(matches!(client("/loop").publish("v=0\r\n"), Err(Error::Protocol(_))));
     assert!(matches!(client("/elsewhere").publish("v=0\r\n"), Err(Error::Insecure(_))), "resource off-host");
-    assert!(server.requests().iter().all(|r| r.path != "/whip"), "nothing went to the other host");
+    let paths: Vec<String> = server.requests().into_iter().map(|r| r.path).collect();
+    let expected = ["/old", "/new", "/away", "/loop", "/loop", "/loop", "/loop", "/elsewhere"];
+    assert_eq!(paths, expected, "the client stops at each refusal: no follow-up POST, no DELETE of an off-host resource");
 }
 
 #[test]

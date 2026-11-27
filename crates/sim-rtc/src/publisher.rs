@@ -342,7 +342,9 @@ impl Publisher {
 
 impl Drop for Publisher {
     fn drop(&mut self) {
-        let _ = self.shutdown();
+        // Never unwind out of Drop (that aborts when already panicking): a DELETE that panics
+        // is a failed DELETE.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.shutdown()));
     }
 }
 

@@ -44,8 +44,10 @@ impl Url {
     /// Parse an absolute URL. User info (`user:pass@`) is refused: credentials go in the bearer
     /// token, never in a URL that ends up in logs.
     pub fn parse(s: &str) -> Result<Url> {
-        let bad = |why: &str| Error::InvalidInput(format!("URL {s:?}: {why}"));
         let s = s.trim();
+        // Errors name the URL, never the credentials someone put in it.
+        let shown = redact_userinfo(s);
+        let bad = |why: &str| Error::InvalidInput(format!("URL {shown:?}: {why}"));
         let (scheme, rest) = s.split_once("://").ok_or_else(|| bad("not absolute"))?;
         let scheme = match scheme.to_ascii_lowercase().as_str() {
             "http" => Scheme::Http,
@@ -160,7 +162,8 @@ impl Url {
         }
         match self.ip() {
             Some(ip) if ip.is_loopback() => Some(ip),
-            Some(IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()) => Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            // An IPv4-mapped address means the IPv4 stack: a server on 127.0.0.1 isn't on ::1.
+            Some(IpAddr::V6(v6)) => v6.to_ipv4_mapped().filter(|v4| v4.is_loopback()).map(IpAddr::V4),
             _ => None,
         }
     }
@@ -169,6 +172,16 @@ impl Url {
 impl fmt::Display for Url {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}://{}{}", self.scheme.as_str(), self.authority(), self.path)
+    }
+}
+
+/// `s` with any `user:pass@` in its authority replaced by `<redacted>@`.
+fn redact_userinfo(s: &str) -> String {
+    let Some((scheme, rest)) = s.split_once("://") else { return s.to_owned() };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..end].rfind('@') {
+        Some(at) => format!("{scheme}://<redacted>@{}", &rest[at + 1..]),
+        None => s.to_owned(),
     }
 }
 
@@ -293,6 +306,12 @@ mod tests {
         ] {
             assert!(url(host).is_loopback(), "{host}");
             assert!(url(host).loopback_ip().is_some(), "{host}");
+        }
+        assert_eq!(url("http://[::ffff:127.0.0.1]/").loopback_ip(), Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), "mapped stays IPv4");
+        assert_eq!(url("http://[::1]/").loopback_ip(), Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        for creds in ["http://user:pw@h/x", "ftp://user:pw@h/x", "http://user:pw@/x"] {
+            let err = Url::parse(creds).expect_err(creds).to_string();
+            assert!(!err.contains("pw"), "{err}");
         }
         for host in [
             "http://192.168.1.2/",

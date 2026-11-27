@@ -21,7 +21,7 @@ use crate::{Error, Result};
 /// RFC 9725 §4.5: follow a few redirects on the POST, no more.
 const MAX_REDIRECTS: usize = 3;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WhipOptions {
     /// Sent as `Authorization: Bearer <token>` on every request.
     pub bearer_token: Option<String>,
@@ -29,6 +29,17 @@ pub struct WhipOptions {
     pub allow_insecure_http: bool,
     /// The deadline for each request, from connect to the end of the body.
     pub timeout: Duration,
+}
+
+/// Debug that never prints the bearer token.
+impl std::fmt::Debug for WhipOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WhipOptions")
+            .field("bearer_token", &self.bearer_token.as_ref().map(|_| "<redacted>"))
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl Default for WhipOptions {
@@ -101,6 +112,8 @@ impl WhipClient {
             check_transport(&resource, &self.options)?;
             let answer = r.text();
             if !answer.trim_start().starts_with("v=0") {
+                // The server made a session: don't leave it behind.
+                let _ = self.delete(&resource);
                 return Err(Error::Protocol("the 201 Created body is not an SDP answer".into()));
             }
             return Ok(WhipSession { answer, resource, etag: r.header("etag").map(str::to_owned) });
