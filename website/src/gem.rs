@@ -111,6 +111,8 @@ pub fn mark(size: f32, angle: f32) -> El {
 
 const FIG_W: f32 = 440.0;
 const FIG_H: f32 = 300.0;
+/// "girdle Ø 1.00" in 12 pt mono, with a little room.
+const DIA_W: f32 = 98.0;
 
 fn dashed(mut shape: Shape, y: f32, x0: f32, x1: f32, color: Color) -> Shape {
     let mut x = x0;
@@ -174,5 +176,7 @@ pub fn figure(angle: f32, width: f32) -> El {
                 .child(text("1.00").font(MONO_12).color(ink)),
         )
         .child(label("l-h", "h 1.50", bar + 12.0, culet, ink))
-        .child(label("l-dia", "girdle Ø 1.00", bar + 12.0, dy, ink))
+        // Scaled down (a phone), the figure is the column's width and this label, which doesn't
+        // scale, would stick out past it: it moves left, under the bar, instead.
+        .child(label("l-dia", "girdle Ø 1.00", if k < 1.0 { (bar + 12.0).min(FIG_W - DIA_W / k) } else { bar + 12.0 }, dy, ink))
 }

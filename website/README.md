@@ -19,9 +19,12 @@ column (680 pt); tables and figures use half again that width where the browser 
 - `/debugging/`: `docs/debugging.md`'s iOS debug surface.
 - `/limitations/`: the README's "Not yet".
 - `/docs/` and `/docs/{slug}/`: the Markdown in `docs/`, the list in `src/content.rs` (`DOCS`).
-  Links to another published doc become its page, `docs/*.png` become `/img/`, anything else in
-  the repository its GitHub page, and so does a code span that is a repository path
-  (`scripts/bench/android-boot.sh`). Headings keep GitHub's anchors.
+  Links to another published doc become its page, `docs/*.png` become `/img/` (an image a doc
+  shows is listed in `IMAGES`, which the build copies), anything else in the repository its
+  GitHub page, and so does a code span that is a repository path
+  (`scripts/bench/android-boot.sh`). Headings keep GitHub's anchors, but one that starts with a
+  digit gets `h-` (`#h-3d-device-view`): Rune's export drops such an id. Wide tables scroll
+  sideways on a phone.
 - `/devices/`: device concepts from `sim-core`'s support matrix and reference profiles, so the
   page changes when `form_factor.rs` does.
 - `/demos/`: the desktop window, as figures. The live demo (emu and the SDK's emulator side by

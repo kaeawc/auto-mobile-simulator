@@ -90,7 +90,13 @@ pub fn readme_lede() -> String {
 /// [`readme_lede`] with its inline code still in backticks, for text that sets code in mono.
 pub fn readme_lede_code() -> String {
     let start = README.find('\n').map_or(0, |i| i + 1);
-    README[start..].trim_start().split("\n\n").next().unwrap_or("").replace('\n', " ")
+    // Skip HTML blocks (the README's `<img>` mark) and images: the lede is the first prose paragraph.
+    README[start..]
+        .split("\n\n")
+        .map(str::trim)
+        .find(|p| !p.is_empty() && !p.starts_with('<') && !p.starts_with("!["))
+        .unwrap_or("")
+        .replace('\n', " ")
 }
 
 fn section(md: &str, heading: &str) -> String {
@@ -178,11 +184,15 @@ fn resolve_line(line: &str, dir: &str) -> String {
 }
 
 /// The top-level directories whose files a code span may name (`scripts/bench/android-boot.sh`).
+/// `build.rs` keeps a copy.
 const REPO_DIRS: [&str; 7] = ["scripts/", "crates/", "apps/", "desktop/", "website/", "tests/", "docs/"];
+
+include!(concat!(env!("OUT_DIR"), "/missing_paths.rs"));
 
 /// `line` with each code span that is a path in the repository (and nothing else) made a link
 /// to it: on GitHub, or its page here for a published doc. A span already inside a link's text
-/// stays as it is.
+/// stays as it is, and so does one naming a path that isn't there (`MISSING_PATHS`, from
+/// `build.rs`): a removed script, or a path relative to a crate (`tests/publish.rs`).
 fn link_code_paths(line: &str, dir: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
@@ -194,7 +204,8 @@ fn link_code_paths(line: &str, dir: &str) -> String {
         let in_link = out.ends_with('[');
         let is_path = REPO_DIRS.iter().any(|d| code.starts_with(d))
             && code.len() > 4
-            && code.chars().all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c));
+            && code.chars().all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c))
+            && !MISSING_PATHS.contains(&code);
         if is_path && !in_link {
             let rel = if dir.is_empty() { code.to_owned() } else { format!("{}/{code}", "../".repeat(dir.split('/').count())) };
             out.push_str(&format!("[`{code}`]({})", site_url(&rel, dir)));
@@ -226,13 +237,15 @@ pub fn without_tables(md: &str) -> String {
 /// Where a link to `target`, written in a file under `dir`, goes on the site.
 pub fn site_url(target: &str, dir: &str) -> String {
     let target = target.trim();
-    if target.is_empty() || target.starts_with('#') || target.contains("://") || target.starts_with("mailto:") || target.starts_with('/') {
+    if let Some(anchor) = target.strip_prefix('#').filter(|a| !a.is_empty()) {
+        return format!("#{}", site_anchor(anchor));
+    }
+    if target.is_empty() || target.contains("://") || target.starts_with("mailto:") || target.starts_with('/') {
         return target.to_owned();
     }
-    let (path, fragment) = match target.split_once('#') {
-        Some((p, f)) => (p, format!("#{f}")),
-        None => (target, String::new()),
-    };
+    let (path, anchor) = target.split_once('#').unwrap_or((target, ""));
+    // The site's pages key headings by `site_anchor`; GitHub keeps its own.
+    let fragment = if anchor.is_empty() { String::new() } else { format!("#{}", site_anchor(anchor)) };
     let path = normalize(dir, path);
     if path == "README.md" {
         return format!("/{fragment}");
@@ -247,7 +260,17 @@ pub fn site_url(target: &str, dir: &str) -> String {
             return format!("/img/{name}");
         }
     }
+    let fragment = if anchor.is_empty() { String::new() } else { format!("#{anchor}") };
     format!("{REPO}/blob/main/{path}{fragment}")
+}
+
+/// A heading's anchor on the site: GitHub's, made an id the static page keeps. Rune's HTML export
+/// drops an element id that doesn't start with an ASCII letter or has other than ASCII letters,
+/// digits, `-` and `_` (`3d-device-view`, `1-boot-to-adb--done`), which left those headings with
+/// no id and their contents entries with nowhere to go; such an anchor gets an `h-` prefix.
+pub fn site_anchor(anchor: &str) -> String {
+    let id: String = anchor.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    if id.starts_with(|c: char| c.is_ascii_alphabetic()) { id } else { format!("h-{id}") }
 }
 
 /// `path` relative to `dir`, as a path from the repository root.
@@ -282,8 +305,8 @@ fn options() -> Options {
     Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH
 }
 
-/// One top-level heading of `md`: where its line starts, its level, its text and its GitHub
-/// anchor (`-1`, `-2` on repeats, as GitHub does).
+/// One top-level heading of `md`: where its line starts, its level, its text and its anchor:
+/// GitHub's (`-1`, `-2` on repeats, as GitHub does), as [`site_anchor`] keeps it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Heading {
     pub at: usize,
@@ -316,7 +339,7 @@ pub fn headings(md: &str) -> Vec<Heading> {
                     let base = slug(&h.text);
                     let n = seen.iter().filter(|s| **s == base).count();
                     seen.push(base.clone());
-                    h.anchor = if n == 0 { base } else { format!("{base}-{n}") };
+                    h.anchor = site_anchor(&if n == 0 { base } else { format!("{base}-{n}") });
                     out.push(h);
                 }
             }
@@ -331,8 +354,8 @@ pub fn headings(md: &str) -> Vec<Heading> {
     out
 }
 
-/// Keys for `Markdown::block_keys`: each heading keyed by its GitHub anchor, so
-/// `#performance-notes` lands on it as it does on GitHub.
+/// Keys for `Markdown::block_keys`: each heading keyed by its anchor, so `#performance-notes`
+/// lands on it as it does on GitHub.
 pub fn block_keys(md: &str) -> Vec<(usize, String)> {
     headings(md).into_iter().map(|h| (h.at, h.anchor)).collect()
 }
