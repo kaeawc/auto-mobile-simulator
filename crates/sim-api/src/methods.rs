@@ -1620,7 +1620,7 @@ mod tests {
 
     #[test]
     fn booted_resolves_among_android_devices_by_what_runs() {
-        let (mut s, root) = android_session("booted");
+        let (mut s, root) = short_android_session("booted");
         let mobile = "system-images;android-36;google_apis;arm64-v8a";
         for name in ["a", "b", "c"] {
             call(&mut s, "create", &json!({"platform": "android", "name": name, "system_image": mobile})).expect("create");
