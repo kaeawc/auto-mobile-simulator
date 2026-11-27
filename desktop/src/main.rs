@@ -18,7 +18,7 @@
 //! `cargo run` opens the window (`SIMEE_DEVICE=<udid|name|booted>` preselects a device);
 //! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
 //! folded, tablet, ipad, watch, tv, apple-watch, apple-tv, turned, turned-tablet, empty,
-//! sidebar-hidden, inspector-hidden, panes-hidden, panes-wide); a release build needs
+//! sidebar-hidden, inspector-hidden, panes-hidden, panes-wide, resources, resources-memory); a release build needs
 //! `--features tooling` for it.
 
 mod android;
@@ -32,6 +32,7 @@ mod ios;
 mod keys;
 mod mark;
 mod panes;
+mod resources;
 mod scan;
 mod scene;
 mod settings;
@@ -175,6 +176,8 @@ pub struct State {
     /// The saved settings ([`settings`]) and the panes' own state ([`panes`]).
     pub prefs: settings::Store,
     pub panes: panes::Panes,
+    /// The resource panel's samples and its line to the API ([`resources`]).
+    pub resources: resources::Resources,
 }
 
 /// An Android screen switched away from, with what the window showed it with.
@@ -439,6 +442,7 @@ fn init() -> State {
         previews: shot_preview::Previews::default(),
         prefs: settings::Store::default(),
         panes: panes::Panes::default(),
+        resources: resources::Resources::default(),
     }
 }
 
@@ -660,7 +664,8 @@ fn setup(s: &mut State, waker: Waker) {
         }
     }
     if let Some(w) = s.waker.clone() {
-        s.debug.start(w);
+        s.debug.start(w.clone());
+        s.resources.connect(w);
     }
     // The window also serves the API, so scripts can drive the device it shows.
     let socket = std::env::var_os("SIMEE_SOCKET").map_or_else(|| std::env::temp_dir().join("simee-desktop.sock"), std::path::PathBuf::from);
@@ -926,6 +931,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     if let Some(secs) = s.previews.wake_in(t) {
         tx.wake_after(Duration::from_secs_f64(secs));
     }
+    changed |= resources::poll(s, t, tx);
     changed |= panes::poll(s, t, tx);
     changed
 }
@@ -943,7 +949,8 @@ fn toggle_view3d(s: &mut State) {
 
 /// Window shortcuts the focused control left alone: ⌘3 toggles the 3D view; while it shows, ⌘0,
 /// ⌘1 ⌘2 ⌘4 ⌘5, ⌘F and ⌘[ ⌘] move it ([`scene::Command::for_key`]). ⌘S saves a screenshot
-/// wherever the focus is. ⌘⌥S and ⌘⌥I hide and show the sidebar and the inspector ([`panes`]).
+/// wherever the focus is. ⌘⌥S and ⌘⌥I hide and show the sidebar and the inspector ([`panes`]),
+/// ⌘⌥R the resource panel ([`resources`]).
 fn on_key(s: &mut State, k: &rune::KeyEvent, tx: &mut Tx) -> bool {
     if panes::on_key(s, k, tx) {
         return true;
@@ -1133,6 +1140,8 @@ fn main() {
             ("inspector-hidden", panes::inspector_hidden_scene),
             ("panes-hidden", panes::panes_hidden_scene),
             ("panes-wide", panes::panes_wide_scene),
+            ("resources", resources::scene),
+            ("resources-memory", resources::memory_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),

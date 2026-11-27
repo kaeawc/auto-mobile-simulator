@@ -8,7 +8,7 @@ One window for iOS and Android devices.
 cd desktop
 cargo run --release                     # SIMEE_DEVICE=<udid|name|booted> preselects a device
 cargo run -- --snap shot.png --scene demo   # headless render; scenes: demo, android, foldable,
-                                            # folded, tablet, ipad, watch, tv, apple-watch, apple-tv, empty
+                                            # folded, tablet, ipad, watch, tv, apple-watch, apple-tv, empty, resources
 cargo run --release --features tooling -- --snap shot.png --scene demo   # the same, optimized
 ```
 
@@ -132,7 +132,7 @@ console.
 The device list (left) and the panel (right) each have a drag handle on their inner edge:
 drag it to resize (180–420 points for the list, 280–600 for the panel, always leaving the
 screen at least 420), double-click it for the default width. ⌘⌥S hides and shows the list,
-⌘⌥I the panel. The headless scenes `sidebar-hidden`, `inspector-hidden`, `panes-hidden` and
+⌘⌥I the panel, ⌘⌥R the [resource panel](#resource-panel). The headless scenes `sidebar-hidden`, `inspector-hidden`, `panes-hidden` and
 `panes-wide` show them.
 
 The window keeps its layout in a small versioned JSON file (`desktop/src/settings.rs`):
@@ -147,6 +147,25 @@ A file that can't be read, isn't valid, or comes from a newer version falls back
 defaults with one line in the status bar. It is copied aside first
 (`desktop.json.<why>-<secs>.bak`) and never deleted; if even the copy fails, nothing is saved
 that session. Headless runs never read or write it.
+
+## Resource panel
+
+⌘⌥R, or the gauge button in the panel's top-right corner, swaps the panel for the resource panel
+(`desktop/src/resources.rs`, #276), and shows the panel first if it was hidden. It shows what the
+host has left and what each running device costs. Host gauges come from the API's `host`: busy
+CPU, load per core, memory pressure and free memory, swap, free disk, the thermal state and the
+admit / hold / backoff verdict. The device list comes from `devices_usage`: CPU, memory, disk I/O
+and (where the host reports it) energy per device, sorted by CPU or memory, with a sparkline of the
+last minute. Each device the window lists has quick actions: show it in the window, stop its
+stream (when one runs through the stream API in this window's process), and shut it down. The
+device on screen shuts down as the toolbar's button does; any other device goes through the API's
+`shutdown`, and the gauges and the device list follow at once. A device the window doesn't list
+(a stock emulator started without an AVD) has no actions.
+
+The panel samples at most once a second, on a thread of its own, and only while it shows: with
+the panel, the inspector or the window hidden it asks for nothing and schedules no wake. A sample
+that changes nothing shown draws no frame. Its visibility and sort persist in the settings file
+(`resources`). The headless scenes `resources` and `resources-memory` show it with fixed data.
 
 ## Screenshot preview
 
