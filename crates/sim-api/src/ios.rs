@@ -242,7 +242,7 @@ fn mem_tool(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     let tool = Tool::for_method(method).ok_or_else(|| format!("`{method}` isn't a memory tool"))?;
     let address = if tool == Tool::History { Some(memtools::address(need_str(p, "address")?)?) } else { None };
     let raw = opt_bool(p, "raw")?.unwrap_or(false);
-    let deadline = opt_u64(p, "timeout_s").map_or(memtools::DEFAULT_TIMEOUT, Duration::from_secs);
+    let deadline = mem_deadline(p);
     let pid = app_pid(&device_tree(&s.device(p)?.info().udid)?, p)?;
     let out = memtools::run(&tool.program(), &tool.args(pid, address.as_deref()), deadline)?;
     let mut result = memtools::finish(tool, pid, &out, raw)?;
@@ -1162,6 +1162,29 @@ fn boot_plan(
     })
 }
 
+/// What `boot` (settle off unless asked) or `boot_many` (`many`: settle on unless asked) plans for
+/// `p`, as text: what the schema's defaults are checked against.
+#[cfg(test)]
+pub(crate) fn boot_plan_text(p: &Value, many: bool) -> Result<String, String> {
+    boot_plan(p, 1, many, || Ok(Vec::new())).map(|plan| format!("{plan:?}"))
+}
+
+/// `settle`'s rule and how long it waits (`timeout_s`, default 600 s).
+pub(crate) fn settle_options(p: &Value) -> Result<(crate::settle::Rule, Duration), String> {
+    let rule = settle_rule(p, "")?;
+    Ok((rule, opt_u64(p, "timeout_s").map_or_else(|| crate::settle::default_settle_timeout(1), Duration::from_secs)))
+}
+
+/// `logs`' window, predicate and whether it answers from the device's stream (`stream`, default false).
+pub(crate) fn log_options(p: &Value) -> Result<(&str, Option<&str>, bool), String> {
+    Ok((str_param(p, "last").unwrap_or("1m"), str_param(p, "predicate"), opt_bool(p, "stream")?.unwrap_or(false)))
+}
+
+/// How long a memory tool may run (`timeout_s`, default [`crate::memtools::DEFAULT_TIMEOUT`]).
+pub(crate) fn mem_deadline(p: &Value) -> Duration {
+    opt_u64(p, "timeout_s").map_or(crate::memtools::DEFAULT_TIMEOUT, Duration::from_secs)
+}
+
 /// Boots `device` by `plan`: the boot, then the profile, then the settle wait, each timed. Only
 /// a failed boot is an error: a profile or settle wait that fails after it is reported in the
 /// timings (`profile.error`; `settled: false` with `settle_error`), the device left booted.
@@ -1652,8 +1675,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             if d.state() != DeviceState::Booted {
                 return Err(format!("{} isn't booted", d.info().name));
             }
-            let rule = settle_rule(p, "")?;
-            let timeout = opt_u64(p, "timeout_s").map_or_else(|| crate::settle::default_settle_timeout(1), Duration::from_secs);
+            let (rule, timeout) = settle_options(p)?;
             let Settled { at, settler } = wait_settled(&d.info().udid, rule, timeout, false);
             let settle_s = at.ok_or_else(|| not_settled(&settler, rule, timeout))?;
             let mut result = json!({"settle_s": round(settle_s)});
@@ -2027,11 +2049,10 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
 /// lines (with launchd_sim's, 195 of 18,476 lines, 1%, in 12 s of a just-booted device); and its
 /// timestamps are often 1 ms later (within ±1 ms on 99% of lines).
 fn logs(s: &mut Session, p: &Value) -> Result<Value, String> {
-    let last = str_param(p, "last").unwrap_or("1m");
-    let predicate = str_param(p, "predicate");
+    let (last, predicate, stream) = log_options(p)?;
     let device = s.device(p)?;
     let source = DeviceLog(&device);
-    let streamed = if opt_bool(p, "stream")?.unwrap_or(false) {
+    let streamed = if stream {
         let key = BootKey::of(device.state() == DeviceState::Booted, None, device.last_booted_at());
         let udid = device.udid();
         with_log_streams(|streams| streams.window(&udid, key, last, predicate, &source))

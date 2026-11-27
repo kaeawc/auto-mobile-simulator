@@ -346,7 +346,11 @@ fn the_watch_feed_reports_changes_in_order_with_old_and_new() {
 
     // The device stopping closes the feed: what was sent is still read, then `ended`; a call
     // without a cursor starts a new feed.
-    let before = ok(&mut s, "prefs_watch", all.clone())["cursor"].as_str().expect("cursor").to_owned();
+    // The feed's thread takes changes as the backend sends them, so a fresh cursor can sit before
+    // writes already made: follow to the head (the `launches` and `x` writes above) first.
+    let (caught_up, head) = follow(&mut s, &all, &next, 2);
+    assert_eq!(caught_up.len(), 2, "the writes since `next`");
+    let before = head["cursor"].as_str().expect("cursor").to_owned();
     set(&mut s, &store_id, "launches", "int", json!(6));
     fake.close_feeds();
     let (late, ended) = follow(&mut s, &all, &before, 2);

@@ -17,7 +17,7 @@ use crate::backend::{Backend, Executor};
 use crate::resources;
 use crate::rpc::{self, Ctx, EXT_TASKS, Era, INTERNAL_ERROR, Incoming, LEGACY, MODERN, RpcError};
 use crate::tasks::{Sink, Tasks};
-use crate::tools;
+use crate::tools::{self, Pages, Toolsets};
 use crate::watch::{self, Emit, Spec, Watcher};
 
 /// What the server tells a client about using it.
@@ -25,7 +25,9 @@ const INSTRUCTIONS: &str = "simee drives iOS simulators and Android emulators. C
 (a UDID, a name, or `booted`). Every tool says which platforms it works on. `screenshot` returns the screen as an image; \
 `tap`, `swipe`, `type` and `button` take device pixels. `boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase` and \
 `shutdown` can take a while: with the tasks extension they return a task to poll with tasks/get (cancel with tasks/cancel). \
-Resources under simee://devices carry each device's info and screenshot; `device_view` opens a live, clickable view of a device.";
+Resources under simee://devices carry each device's info and screenshot; `device_view` opens a live, clickable view of a device. \
+The tools listed are the toolsets this server was started with (SIMEE_MCP_TOOLSETS, default `core`); calling one that isn't listed \
+says which toolset has it. `processes`, `logs`, `connections` and `devices_usage` page with `limit` and `cursor`.";
 
 /// How often a call that blocks reports that it is still running, to a client that gave a progress token.
 const HEARTBEAT: Duration = Duration::from_secs(2);
@@ -62,8 +64,12 @@ struct Inner {
     executor: Executor,
     tasks: Tasks,
     timing: Timing,
-    /// The capabilities a legacy client sent in `initialize`, once one has.
-    legacy: Mutex<Option<Value>>,
+    /// The tools this server serves.
+    toolsets: Toolsets,
+    /// Snapshots of long lists, for their next pages.
+    pages: Arc<Pages>,
+    /// The capabilities a legacy client sent in `initialize` and the revision agreed, once one has.
+    legacy: Mutex<Option<(Value, &'static str)>>,
     /// Requests being worked on, by id: set to true to say the client no longer wants the answer.
     inflight: Mutex<HashMap<String, Arc<AtomicBool>>>,
     running: Mutex<usize>,
@@ -85,11 +91,12 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(backend: Arc<dyn Backend>, sink: Sink) -> Server {
-        Server::with_timing(backend, sink, Timing::default())
+    /// A server of `toolsets` (the default, [`Toolsets::default`], is `core`).
+    pub fn new(backend: Arc<dyn Backend>, sink: Sink, toolsets: Toolsets) -> Server {
+        Server::with_timing(backend, sink, Timing::default(), toolsets)
     }
 
-    pub fn with_timing(backend: Arc<dyn Backend>, sink: Sink, timing: Timing) -> Server {
+    pub fn with_timing(backend: Arc<dyn Backend>, sink: Sink, timing: Timing, toolsets: Toolsets) -> Server {
         Server {
             inner: Arc::new(Inner {
                 backend,
@@ -97,6 +104,8 @@ impl Server {
                 executor: Executor::new(),
                 tasks: Tasks::default(),
                 timing,
+                toolsets,
+                pages: Arc::default(),
                 legacy: Mutex::new(None),
                 inflight: Mutex::default(),
                 running: Mutex::new(0),
@@ -221,12 +230,12 @@ impl Inner {
         match rpc::requested_version(params) {
             Some(MODERN) => {
                 let caps = rpc::meta(params).get(rpc::META_CLIENT_CAPS).cloned().unwrap_or(Value::Null);
-                Ok(Ctx { era: Era::Modern, caps, progress_token })
+                Ok(Ctx { era: Era::Modern, version: MODERN, caps, progress_token })
             }
             Some(other) => Err(rpc::unsupported_version(other)),
-            None if method == "server/discover" => Ok(Ctx { era: Era::Modern, caps: Value::Null, progress_token }),
+            None if method == "server/discover" => Ok(Ctx { era: Era::Modern, version: MODERN, caps: Value::Null, progress_token }),
             None => match &*lock(&self.legacy) {
-                Some(caps) => Ok(Ctx { era: Era::Legacy, caps: caps.clone(), progress_token }),
+                Some((caps, version)) => Ok(Ctx { era: Era::Legacy, version, caps: caps.clone(), progress_token }),
                 None => Err(RpcError::invalid_params(format!(
                     "`{method}` needs `_meta[\"{}\"]` (\"{MODERN}\"); or open with `initialize`, or probe with `server/discover`",
                     rpc::META_VERSION
@@ -251,7 +260,7 @@ impl Inner {
     fn initialize(&self, params: &Value) -> Value {
         let requested = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
         let version = LEGACY.iter().find(|v| **v == requested).unwrap_or(&LEGACY[0]);
-        *lock(&self.legacy) = Some(params.get("capabilities").cloned().unwrap_or(Value::Null));
+        *lock(&self.legacy) = Some((params.get("capabilities").cloned().unwrap_or(Value::Null), version));
         json!({"protocolVersion": version,
             "capabilities": {"tools": {}, "resources": {"subscribe": true}},
             "serverInfo": server_info(), "instructions": INSTRUCTIONS})
@@ -284,7 +293,7 @@ impl Inner {
         let reply = |outcome: Result<Value, RpcError>| self.reply(&id, outcome, Some(&ctx));
         match method {
             "server/discover" => reply(Ok(self.discover())),
-            "tools/list" => reply(Ok(cacheable(json!({"tools": tools::list()}), STATIC_TTL_MS, "public"))),
+            "tools/list" => reply(Ok(cacheable(json!({"tools": tools::list(&self.toolsets, &ctx)}), STATIC_TTL_MS, "public"))),
             "resources/templates/list" => {
                 reply(Ok(cacheable(json!({"resourceTemplates": resources::templates()}), STATIC_TTL_MS, "public")));
             }
@@ -336,13 +345,13 @@ impl Inner {
     }
 
     fn tools_call(self: &Arc<Self>, id: Value, params: &Value, ctx: &Ctx) {
-        let (name, args) = match tools::parse_call(params) {
+        let (name, args) = match tools::parse_call(params, &self.toolsets) {
             Ok(call) => call,
             Err(error) => return self.reply(&id, Err(error), Some(ctx)),
         };
         if tools::as_task(&name, ctx) {
-            let (backend, tool) = (self.backend.clone(), name.clone());
-            let created = self.tasks.create(&name, move || tools::result(&tool, tools::run(&*backend, &tool, &args), Era::Modern));
+            let (backend, pages, tool) = (self.backend.clone(), self.pages.clone(), name.clone());
+            let created = self.tasks.create(&name, move || tools::result(&tool, tools::run(&*backend, &pages, &tool, &args), Era::Modern));
             let result = match created {
                 Ok(mut handle) => {
                     handle["resultType"] = "task".into();
@@ -356,7 +365,7 @@ impl Inner {
         let era = ctx.era;
         self.offload(id, ctx.clone(), move |inner| {
             let _beat = progress.map(|token| heartbeat(inner.sink.clone(), token, name.clone(), inner.timing.heartbeat));
-            Ok(tools::result(&name, tools::run(&*inner.backend, &name, &args), era))
+            Ok(tools::result(&name, tools::run(&*inner.backend, &inner.pages, &name, &args), era))
         });
     }
 

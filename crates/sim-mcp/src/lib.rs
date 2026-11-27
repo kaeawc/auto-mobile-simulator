@@ -1,7 +1,7 @@
 //! simee's MCP server: an agent can do everything simee can, over stdio (`simee mcp`).
 //!
 //! - **Tools**: one per method in `sim-api`'s table, generated from it ([`tools`]), plus
-//!   `device_view`.
+//!   `device_view`, in toolsets a client picks (`SIMEE_MCP_TOOLSETS`; `core` by default).
 //! - **Resources**: devices, runtimes and form factors, each device's info, screenshot and (iOS)
 //!   logs and apps ([`resources`]), with change notifications ([`watch`]).
 //! - **Tasks**: boot, create, install and the other long methods as pollable, cancellable tasks
@@ -27,6 +27,7 @@ use std::time::Duration;
 
 pub use backend::{ApiBackend, Backend};
 pub use server::Server;
+pub use tools::Toolsets;
 
 /// A sink that writes each line to stdout, whole, under the stream's lock.
 pub fn stdout_sink() -> tasks::Sink {
@@ -40,14 +41,16 @@ pub fn stdout_sink() -> tasks::Sink {
 /// How long to wait for requests in flight once the client closes its end.
 const DRAIN: Duration = Duration::from_secs(10);
 
-/// Serves one client on stdin and stdout until stdin closes. Nothing else may be written to stdout.
+/// Serves one client on stdin and stdout until stdin closes, with the toolsets
+/// `SIMEE_MCP_TOOLSETS` names (default `core`). Nothing else may be written to stdout.
 pub fn serve_stdio(backend: Arc<dyn Backend>) -> std::io::Result<()> {
-    serve(backend, std::io::stdin().lock(), stdout_sink())
+    let toolsets = Toolsets::from_env().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    serve(backend, std::io::stdin().lock(), stdout_sink(), toolsets)
 }
 
 /// Serves the lines of `input` to completion, answering through `sink`.
-pub fn serve(backend: Arc<dyn Backend>, mut input: impl BufRead, sink: tasks::Sink) -> std::io::Result<()> {
-    let server = Server::new(backend, sink);
+pub fn serve(backend: Arc<dyn Backend>, mut input: impl BufRead, sink: tasks::Sink, toolsets: Toolsets) -> std::io::Result<()> {
+    let server = Server::new(backend, sink, toolsets);
     let mut line = Vec::new();
     loop {
         line.clear();

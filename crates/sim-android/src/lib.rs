@@ -17,6 +17,7 @@ pub mod testing;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -149,6 +150,17 @@ impl Android {
     pub fn devices(&self) -> Vec<DeviceInfo> {
         let running = self.running();
         self.env.list_avds().into_iter().map(|name| self.describe(&name, &running).info).collect()
+    }
+
+    /// AVD `name` as a booted device, from its config alone (no emulator lookup: the caller saw
+    /// its process); `None` when no AVD has that name.
+    pub fn running_info(&self, name: &str) -> Option<DeviceInfo> {
+        if !self.env.has_avd(name) {
+            return None;
+        }
+        let mut info = self.describe(name, &[]).info;
+        info.state = DeviceState::Booted;
+        Some(info)
     }
 
     /// Whether an AVD is named exactly `name` (its UDID), without loading or listing any: one
@@ -788,10 +800,19 @@ impl Device {
     /// The current screen as the emulator encodes it: width, height and PNG bytes, with no
     /// decode and re-encode on the way.
     pub fn screenshot_png(&self) -> Result<(u32, u32, Vec<u8>), String> {
-        let path = std::env::temp_dir().join(format!("sim-android-{}-{}.png", std::process::id(), self.info.udid));
-        let size = self.screenshot_png_to(&path);
-        let png = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()));
-        let _ = std::fs::remove_file(&path);
+        // Removes the file on every path out, a panic included.
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        // Unique per call: calls can run at once on one device.
+        static SHOTS: AtomicU64 = AtomicU64::new(0);
+        let n = SHOTS.fetch_add(1, Ordering::Relaxed);
+        let scratch = Scratch(std::env::temp_dir().join(format!("sim-android-{}-{}-{n}.png", std::process::id(), self.info.udid)));
+        let size = self.screenshot_png_to(&scratch.0);
+        let png = std::fs::read(&scratch.0).map_err(|e| format!("{}: {e}", scratch.0.display()));
         let (w, h) = size?;
         Ok((w, h, png?))
     }
@@ -1474,6 +1495,22 @@ mod tests {
         assert!(f.android.delete(&d).expect_err("running").contains("is running"));
     }
 
+    #[test]
+    fn concurrent_screenshots_of_one_device_each_get_their_own_file() {
+        let f = fixture("shots");
+        f.android.create("shots", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let _fake = fake_emulator(&f.android, "shots");
+        let d = f.android.device("booted").expect("running");
+        let results: Vec<_> = std::thread::scope(|s| {
+            let jobs: Vec<_> = (0..2).map(|_| s.spawn(|| d.screenshot_png())).collect();
+            jobs.into_iter().map(|j| j.join().expect("thread")).collect()
+        });
+        for r in results {
+            let (w, h, png) = r.expect("each screenshot succeeds");
+            assert_eq!((w, h, sim_core::frame::png_size(&png)), (2, 1, Some((2, 1))));
+        }
+    }
+
     /// Adds an installed system image under the fixture's SDK.
     fn add_image(f: &Fixture, dir: &str, image_tag: &str) {
         let d = f.root.join("sdk/system-images").join(dir);
@@ -1932,6 +1969,15 @@ mod tests {
         assert_eq!(f.android.device("pixel").expect("exact").info.udid, "pixel");
         assert!(!f.android.has_avd("Pixel"), "exact case, whatever the filesystem");
         assert_eq!(f.android.device("Pixel").map(|d| d.info.udid), Ok("pixel".into()), "the scan still matches names loosely");
+    }
+
+    #[test]
+    fn a_running_avds_info_comes_from_its_config_alone() {
+        let f = fixture("runinfo");
+        f.android.create("pixel", "system-images;android-36;google_apis;arm64-v8a", Some(FormFactor::Phone)).expect("create");
+        let info = f.android.running_info("pixel").expect("info");
+        assert_eq!((info.state, info.platform, info.form_factor), (DeviceState::Booted, Platform::Android, Some(FormFactor::Phone)));
+        assert_eq!(f.android.running_info("no-such-avd"), None);
     }
 
     #[test]

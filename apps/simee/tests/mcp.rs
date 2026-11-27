@@ -42,8 +42,19 @@ impl Env {
         a
     }
 
+    /// `simee mcp` serving every tool.
     fn mcp(&self) -> Mcp {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_simee"))
+        self.mcp_with(Some("all"))
+    }
+
+    /// `simee mcp` with `SIMEE_MCP_TOOLSETS` set to `toolsets` (unset: the default, `core`).
+    fn mcp_with(&self, toolsets: Option<&str>) -> Mcp {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_simee"));
+        match toolsets {
+            Some(t) => command.env("SIMEE_MCP_TOOLSETS", t),
+            None => command.env_remove("SIMEE_MCP_TOOLSETS"),
+        };
+        let mut child = command
             .arg("mcp")
             .env("HOME", self.root.join("home"))
             .env("ANDROID_HOME", self.root.join("sdk"))
@@ -195,4 +206,18 @@ fn a_client_of_an_older_revision_opens_with_initialize() {
     assert_eq!(result["id"], 2);
     assert!(result["result"]["content"][0]["text"].as_str().is_some_and(|t| t.contains("Wear OS")), "{result}");
     assert!(mcp.close().success());
+}
+
+#[test]
+fn the_default_server_serves_core_and_says_where_the_rest_is() {
+    let e = Env::new("core");
+    let mut mcp = e.mcp_with(None);
+    let tools = mcp.request("tools/list", json!({}), false)["result"]["tools"].clone();
+    let names: Vec<&str> = tools.as_array().expect("tools").iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.len() <= 25 && names.contains(&"tap") && names.contains(&"device_view") && !names.contains(&"create"), "{names:?}");
+    let hidden = mcp.request("tools/call", json!({"name": "create", "arguments": {"name": "x"}}), false);
+    assert!(hidden["error"]["message"].as_str().is_some_and(|m| m.contains("SIMEE_MCP_TOOLSETS=core,lifecycle")), "{hidden}");
+    assert!(mcp.close().success());
+    // An unknown toolset stops the server before it serves anything.
+    assert!(!e.mcp_with(Some("core,nope")).close().success());
 }

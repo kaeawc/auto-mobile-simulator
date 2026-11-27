@@ -23,7 +23,12 @@ struct Rig {
 }
 
 impl Rig {
+    /// A server of every tool.
     fn new() -> Rig {
+        Rig::serving(Toolsets::all())
+    }
+
+    fn serving(toolsets: Toolsets) -> Rig {
         let fake = Arc::new(Fake::with_devices());
         let timing = Timing { watch: Duration::from_millis(20), heartbeat: Duration::from_millis(40) };
         let (tx, rx) = channel::<String>();
@@ -39,7 +44,7 @@ impl Rig {
             });
             vrx
         };
-        Rig { server: Server::with_timing(fake.clone(), sink, timing), fake, rx, notes: RefCell::default(), next: Cell::new(1) }
+        Rig { server: Server::with_timing(fake.clone(), sink, timing, toolsets), fake, rx, notes: RefCell::default(), next: Cell::new(1) }
     }
 
     fn meta(tasks: bool) -> Value {
@@ -169,6 +174,34 @@ fn tools_list_has_a_tool_for_every_method() {
     assert_eq!(response["result"]["cacheScope"], "public");
     let again = rig.modern("tools/list", json!({}));
     assert_eq!(again["result"]["tools"], response["result"]["tools"], "a deterministic order");
+}
+
+#[test]
+fn the_default_server_lists_its_toolsets_and_refuses_the_rest() {
+    let rig = Rig::serving(Toolsets::default());
+    let tools = rig.modern("tools/list", json!({}))["result"]["tools"].clone();
+    let names: Vec<&str> = tools.as_array().expect("tools").iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.len() <= 25 && names.contains(&"tap") && names.contains(&"device_view") && !names.contains(&"exec"), "{names:?}");
+    assert!(tools.as_array().expect("tools").iter().all(|t| t["outputSchema"].is_object() && t["annotations"].is_object()));
+    let hidden = rig.modern("tools/call", json!({"name": "exec", "arguments": {"device": "phone", "program": "/bin/ls"}}));
+    assert_eq!(hidden["error"]["code"], rpc::INVALID_PARAMS);
+    assert!(hidden["error"]["message"].as_str().is_some_and(|m| m.contains("`debug` toolset")), "{hidden}");
+    assert!(rig.fake.called("exec").is_empty(), "never reaches the API");
+    assert_eq!(
+        rig.modern("tools/call", json!({"name": "tap", "arguments": {"device": "phone", "x": 1, "y": 2}}))["result"]["content"][0]["text"],
+        "ok"
+    );
+    // An older client sees the same tools, with object output schemas; 2025-03-26 has none.
+    let id = rig.send_raw("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    rig.response(id);
+    let id = rig.send_raw("tools/list", json!({}));
+    let old = rig.response(id)["result"]["tools"].clone();
+    assert_eq!(old.as_array().map(Vec::len), Some(names.len()));
+    assert!(old.as_array().expect("tools").iter().all(|t| t["outputSchema"]["type"] == "object"));
+    let id = rig.send_raw("initialize", json!({"protocolVersion": "2025-03-26", "capabilities": {}}));
+    rig.response(id);
+    let id = rig.send_raw("tools/list", json!({}));
+    assert!(rig.response(id)["result"]["tools"].as_array().expect("tools").iter().all(|t| t.get("outputSchema").is_none()));
 }
 
 #[test]
@@ -490,7 +523,7 @@ fn serving_lines_answers_each_and_drains_before_returning() {
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "devices", "_meta": meta}}),
         "not json",
     );
-    crate::serve(fake, std::io::Cursor::new(input), sink).expect("served");
+    crate::serve(fake, std::io::Cursor::new(input), sink, Toolsets::all()).expect("served");
     let lines: Vec<Value> = rx.try_iter().map(|l| serde_json::from_str(&l).expect("json")).collect();
     // Input ended; everything it asked was answered first.
     assert_eq!(lines.len(), 3);
@@ -516,7 +549,7 @@ fn response_lines_are_pinned_byte_for_byte() {
         "not json".to_owned(),
     ]
     .join("\n");
-    crate::serve(fake, std::io::Cursor::new(input), sink).expect("served");
+    crate::serve(fake, std::io::Cursor::new(input), sink, Toolsets::all()).expect("served");
     let mut lines: Vec<String> = rx.try_iter().collect();
     lines.sort();
     let info = format!(r#""_meta":{{"{META_SERVER_INFO}":{{"name":"simee","version":"{}"}}}}"#, env!("CARGO_PKG_VERSION"));
@@ -529,7 +562,10 @@ fn response_lines_are_pinned_byte_for_byte() {
         format!(
             r#"{{"id":1,"jsonrpc":"2.0","result":{{{info},"content":[{{"text":"{{\"height\":1,\"width\":2}}","type":"text"}}],"resultType":"complete","structuredContent":{{"height":1,"width":2}}}}}}"#
         ),
-        format!(r#"{{"id":3,"jsonrpc":"2.0","result":{{{info},"content":[{{"text":"ok","type":"text"}}],"resultType":"complete"}}}}"#),
+        // Nothing to report is `ok`, and `{}` as its structure (what the tool's output schema says).
+        format!(
+            r#"{{"id":3,"jsonrpc":"2.0","result":{{{info},"content":[{{"text":"ok","type":"text"}}],"resultType":"complete","structuredContent":{{}}}}}}"#
+        ),
         r#"{"id":4,"jsonrpc":"2.0","result":{}}"#.to_owned(),
     ];
     expected.sort();
@@ -565,7 +601,7 @@ fn tool_call_overhead() {
     let (tx, rx) = channel::<String>();
     let tx = Mutex::new(tx);
     let sink: Sink = Arc::new(move |line| drop(tx.lock().expect("tx").send(line)));
-    let server = Server::new(backend.clone(), sink);
+    let server = Server::new(backend.clone(), sink, Toolsets::all());
     let meta = Rig::meta(false);
     println!("{:<13} {:>8} {:>8} {:>8} {:>8} {:>8}  µs per call", "tool", "parse", "method", "result", "write", "server");
     for tool in ["identity", "help", "form_factors"] {

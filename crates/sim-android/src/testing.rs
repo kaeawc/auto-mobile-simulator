@@ -41,48 +41,65 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
     let status = fold_status.clone();
     let rotation = Arc::new(Mutex::new(0));
     let turned = rotation.clone();
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("console");
+    // The advertised adb port is the console's plus one, so the console must not be on 65535 (an
+    // ephemeral port the OS hands out now and then): bind again, keeping the unusable one held so
+    // the next bind gets another.
+    let mut skipped = Vec::new();
+    let listener = loop {
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("console");
+        if l.local_addr().expect("addr").port() < u16::MAX {
+            break l;
+        }
+        skipped.push(l);
+    };
+    drop(skipped);
     let port = listener.local_addr().expect("addr").port();
     let log = console.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let mut out = stream.try_clone().expect("clone");
-            let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
-            for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                let line = line.trim().to_owned();
-                if line == "quit" {
-                    break;
-                }
-                let reply = match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-                    // Authentication is the session's, not a command: answered, never recorded
-                    // (clients send it whenever `~/.emulator_console_auth_token` exists).
-                    ["auth", ..] => {
-                        let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
-                        continue;
+            // A thread per connection, so concurrent clients are served concurrently.
+            let (log, status, turned) = (log.clone(), status.clone(), turned.clone());
+            std::thread::spawn(move || {
+                let mut out = stream.try_clone().expect("clone");
+                let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    let line = line.trim().to_owned();
+                    if line == "quit" {
+                        break;
                     }
-                    ["ping"] => "I am alive!\r\nOK".to_owned(),
-                    ["frames"] => "3\r\nOK".to_owned(),
-                    ["rotation"] if stock => "KO: unknown command, try 'help'".to_owned(),
-                    ["rotation"] => format!("rotation: {}\r\nOK", turned.lock().expect("rotation")),
-                    ["fold", "status"] if stock => "KO: Usage: \"fold\"".to_owned(),
-                    ["fold", "status"] => match status.lock().expect("status").as_deref() {
-                        Some(lines) => format!("{lines}\r\nOK"),
-                        None => "OK".to_owned(),
-                    },
-                    ["car", "get", ..] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\nOK".to_owned(),
-                    ["car", "list"] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\n\
+                    let reply = match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+                        // Authentication is the session's, not a command: answered, never recorded
+                        // (clients send it whenever `~/.emulator_console_auth_token` exists).
+                        ["auth", ..] => {
+                            let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
+                            continue;
+                        }
+                        ["ping"] => "I am alive!\r\nOK".to_owned(),
+                        ["frames"] => "3\r\nOK".to_owned(),
+                        ["rotation"] if stock => "KO: unknown command, try 'help'".to_owned(),
+                        ["rotation"] => format!("rotation: {}\r\nOK", turned.lock().expect("rotation")),
+                        ["fold", "status"] if stock => "KO: Usage: \"fold\"".to_owned(),
+                        ["fold", "status"] => match status.lock().expect("status").as_deref() {
+                            Some(lines) => format!("{lines}\r\nOK"),
+                            None => "OK".to_owned(),
+                        },
+                        ["car", "get", ..] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\nOK".to_owned(),
+                        ["car", "list"] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\n\
                                         property=INFO_MAKE id=0x11100101 area=0 status=available value=Toy Car\r\nOK"
-                        .to_owned(),
-                    ["screenshot", path] => {
-                        let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };
-                        std::fs::write(path, sim_core::frame::encode_png(&frame).expect("png")).expect("write png");
-                        format!("{path} (2x1, frame 3)\r\nOK")
-                    }
-                    _ => "OK".to_owned(),
-                };
-                log.lock().expect("log").push(line);
-                let _ = out.write_all(format!("{reply}\r\n").as_bytes());
-            }
+                            .to_owned(),
+                        ["screenshot", path] => {
+                            let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };
+                            std::fs::write(path, sim_core::frame::encode_png(&frame).expect("png")).expect("write png");
+                            // The emulator takes a moment to encode, so overlapping screenshots overlap here.
+                            sleep(Duration::from_millis(150));
+                            format!("{path} (2x1, frame 3)\r\nOK")
+                        }
+                        _ => "OK".to_owned(),
+                    };
+                    log.lock().expect("log").push(line);
+                    let _ = out.write_all(format!("{reply}\r\n").as_bytes());
+                }
+            });
         }
     });
     let display = Arc::new(Mutex::new(Vec::new()));

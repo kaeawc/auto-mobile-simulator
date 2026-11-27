@@ -1,6 +1,7 @@
 //! Host health for a simulator farm: load, memory pressure, swap, disk, thermal state and power,
 //! sampled without forking, kept in a 15-minute ring, and judged by an admit / hold / backoff
 //! verdict. The thresholds and rules are ported from spectra (MIT, same author); see `verdict`.
+//! The same sampler attributes the host's load to each running device (`usage`).
 //!
 //! macOS reads sysctls, `NSProcessInfo` and IOKit through `sim-coresim` (this crate forbids
 //! `unsafe`); Linux reads `/proc` and `/sys`; `statvfs` comes from rustix. Each reading is
@@ -15,6 +16,7 @@ use serde::Serialize;
 pub mod parse;
 pub mod ring;
 pub mod sysfs;
+pub mod usage;
 pub mod verdict;
 
 pub use ring::{Average, Point, Ring, ThermalTime, Trend};
@@ -240,6 +242,33 @@ impl Snapshot {
     }
 }
 
+/// What the machine is, for `simee doctor`: the chip, the model, the macOS release and whether
+/// it can run Hypervisor.framework guests. `None` fields are unavailable on this host.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Machine {
+    /// `machdep.cpu.brand_string` (`Apple M3 Max`, `Intel(R) Core(TM) i9-9980HK ...`).
+    pub cpu: Option<String>,
+    pub chip: Option<sim_core::support::Chip>,
+    /// `hw.model` (`Mac15,9`).
+    pub model: Option<String>,
+    /// `sysctl.proc_translated`: this process runs under Rosetta (an x86_64 build on Apple silicon).
+    pub translated: Option<bool>,
+    pub macos: Option<sim_core::support::Version>,
+    pub macos_build: Option<String>,
+    /// `kern.hv_support`.
+    pub hv_support: Option<bool>,
+}
+
+/// Reads [`Machine`]: a few sysctls and `SystemVersion.plist`, no process spawned.
+pub fn machine() -> Machine {
+    let (macos, macos_build) = std::fs::read_to_string(sim_core::support::SYSTEM_VERSION_PLIST)
+        .ok()
+        .and_then(|t| sim_core::support::Version::from_system_version(&t))
+        .map_or((None, None), |(v, b)| (Some(v), b));
+    let m = platform::machine();
+    Machine { macos, macos_build, ..m }
+}
+
 /// The data volume: macOS keeps user data on its own volume under the sealed system volume.
 pub const DATA_VOLUME: &str = if cfg!(target_os = "macos") { "/System/Volumes/Data" } else { "/" };
 
@@ -294,6 +323,36 @@ mod platform {
         sysfs::mac_thermal(thermal_state())
     }
 
+    fn text(name: &str) -> Option<String> {
+        let b = sysctl(name)?;
+        let s = String::from_utf8_lossy(&b).trim_end_matches('\0').trim().to_owned();
+        (!s.is_empty()).then_some(s)
+    }
+
+    fn flag(name: &str) -> Option<bool> {
+        int::<4>(name).map(|b| u32::from_ne_bytes(b) != 0)
+    }
+
+    pub fn machine() -> Machine {
+        let cpu = text("machdep.cpu.brand_string");
+        // `hw.optional.arm64` is 1 on Apple silicon even for a translated (x86_64) process, whose
+        // brand string reads as the emulated Intel CPU's.
+        let chip = match flag("hw.optional.arm64") {
+            Some(true) => Some(sim_core::support::Chip::AppleSilicon),
+            _ if cpu.as_deref().is_some_and(|c| c.contains("Intel")) => Some(sim_core::support::Chip::Intel),
+            _ => None,
+        };
+        Machine {
+            cpu,
+            chip,
+            model: text("hw.model"),
+            translated: Some(flag("sysctl.proc_translated").unwrap_or(false)),
+            macos: None,
+            macos_build: None,
+            hv_support: flag("kern.hv_support"),
+        }
+    }
+
     pub fn power() -> Power {
         let p = power_sources();
         sysfs::mac_power(p.providing.as_deref(), p.has_battery, p.percent, p.charging, p.minutes_remaining, low_power_mode())
@@ -333,6 +392,11 @@ mod platform {
 
     pub fn power() -> Power {
         sysfs::power(Path::new("/sys"))
+    }
+
+    /// Not a Mac: no chip in the matrix, no Hypervisor.framework.
+    pub fn machine() -> Machine {
+        Machine { cpu: None, chip: None, model: None, translated: None, macos: None, macos_build: None, hv_support: None }
     }
 }
 
@@ -407,17 +471,22 @@ fn point(t: f64, s: &Snapshot) -> Point {
 struct Shared {
     state: Mutex<State>,
     stop: Condvar,
+    /// Notified after each sample.
+    tick: Condvar,
 }
 
 struct State {
     ring: Ring,
     latest: Option<Snapshot>,
+    usage: usage::Tracker,
     stopped: bool,
 }
 
-/// A background sampler: one snapshot per interval into the ring. Dropping it stops the thread.
+/// A background sampler: one snapshot per interval into the ring, and one pass over the host's
+/// processes into the per-device usage tracker. Dropping it stops the thread.
 pub struct Sampler {
     shared: Arc<Shared>,
+    interval: Duration,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -429,7 +498,13 @@ impl Sampler {
         let first = sample();
         let mut ring = Ring::default();
         ring.push(point(0.0, &first));
-        let shared = Arc::new(Shared { state: Mutex::new(State { ring, latest: Some(first), stopped: false }), stop: Condvar::new() });
+        let mut reader = usage::Reader::default();
+        let mut tracker = usage::Tracker::new(first.cpus);
+        if let Some(o) = reader.observe() {
+            tracker.update(o);
+        }
+        let state = State { ring, latest: Some(first), usage: tracker, stopped: false };
+        let shared = Arc::new(Shared { state: Mutex::new(state), stop: Condvar::new(), tick: Condvar::new() });
         let worker = Arc::clone(&shared);
         let handle = std::thread::Builder::new()
             .name("simee-host".into())
@@ -442,13 +517,32 @@ impl Sampler {
                     }
                     drop(guard);
                     let s = sample();
+                    let o = reader.observe();
                     let Ok(mut st) = worker.state.lock() else { return };
                     st.ring.push(point(began.elapsed().as_secs_f64(), &s));
                     st.latest = Some(s);
+                    if let Some(o) = o {
+                        st.usage.update(o);
+                    }
+                    drop(st);
+                    worker.tick.notify_all();
                 }
             })
             .ok();
-        Sampler { shared, handle }
+        Sampler { shared, interval, handle }
+    }
+
+    /// Every running device's usage, simee's and the host's totals (`devices_usage`). Right after
+    /// the sampler started there is no interval to rate yet: this waits for the second sample
+    /// (at most a few intervals); after that it never waits.
+    pub fn usage(&self) -> usage::Report {
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let wait = if usage::AVAILABLE && self.handle.is_some() { self.interval * 3 } else { Duration::ZERO };
+        let (st, _) =
+            self.shared.tick.wait_timeout_while(st, wait, |s| s.usage.samples() < 2 && !s.stopped).unwrap_or_else(|e| e.into_inner());
+        let mut r = st.usage.report();
+        r.host.memory_total_bytes = st.latest.as_ref().and_then(|s| s.memory.as_ref()).map(|m| m.total_bytes);
+        r
     }
 
     /// The newest snapshot and the report on it.
@@ -543,6 +637,10 @@ mod tests {
         assert!(ring.len() >= 3, "{}", ring.len());
         let r = s.report(Thresholds::default());
         assert!(r.averages[0].samples >= 3);
+        let u = s.usage();
+        assert_eq!(u.available, usage::AVAILABLE);
+        assert!(!u.available || (u.samples >= 3 && u.host.cpu_pct.s1.is_some()), "{u:?}");
+        assert!(u.host.memory_total_bytes.is_some());
         drop(s);
     }
 
@@ -568,6 +666,24 @@ mod tests {
         println!("thermal: {:?} ({:?}); power: {}; memory: {}", s.thermal.state, s.thermal.reason, s.power.summary, mem.level_reason);
         let r = report(s, &Ring::default(), Thresholds::default());
         assert!(!r.reasons.is_empty());
+    }
+
+    #[test]
+    fn the_machine_names_its_chip_and_release() {
+        let m = machine();
+        println!("{m:?}");
+        if cfg!(target_os = "macos") {
+            assert!(m.cpu.is_some() && m.model.is_some() && m.hv_support.is_some(), "{m:?}");
+            assert!(m.macos.is_some_and(|v| v.major >= 11) && m.macos_build.is_some(), "{m:?}");
+            let want = if cfg!(target_arch = "aarch64") || m.translated == Some(true) {
+                sim_core::support::Chip::AppleSilicon
+            } else {
+                sim_core::support::Chip::Intel
+            };
+            assert_eq!(m.chip, Some(want));
+        } else {
+            assert_eq!((m.chip, m.hv_support), (None, None));
+        }
     }
 
     /// `cargo test -p simee-host --release sample_cost -- --ignored --nocapture`

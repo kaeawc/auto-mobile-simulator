@@ -27,6 +27,14 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          1 s ring (with time spent in each thermal state), the load trend, and an admit/hold/backoff verdict with every reason",
     ),
     (
+        "devices_usage",
+        "",
+        "Which running devices load the host, sampled without forking: per device (iOS simulator: its launchd_sim tree; Android: \
+         simee's emu or the stock emulator's qemu, with their children) id, name, platform, form factor, CPU % of a core over 1 s and \
+         1 min, resident memory and footprint, disk read/write bytes/s, energy (W) where the kernel reports it, and process count, \
+         costliest first; simee's own processes; and host totals (busy CPU, the devices' and simee's share of it)",
+    ),
+    (
         "form_factors",
         "platform?, form_factor?",
         "Every form factor on every platform: sub-platform, inputs and reference profile, or why it's unsupported",
@@ -42,7 +50,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("delete", "device", "Delete a device"),
     (
         "boot",
-        "device, timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, settle_foreground?(true), settle_timeout_s?, profile?(slim); \
+        "device, timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, settle_foreground?(true), settle_timeout_s?, profile?(\"slim\"); \
          Android: audio?(false)",
         "Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; settle also waits \
          up to settle_timeout_s (600) until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s \
@@ -54,7 +62,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     (
         "boot_many",
         "devices, concurrency?, timeout_s?; iOS: env?, shaped?, settle?(default true), settle_cpu_pct?, settle_window_s?, \
-         settle_foreground?(true), settle_timeout_s?, profile?; Android: first_port?(5554)",
+         settle_foreground?(true), settle_timeout_s?, profile?(\"slim\"); Android: first_port?(5554)",
         "Boot several devices of one platform, at most `concurrency` at once (default: a quarter of the host's CPUs, at least 2), each as \
          `boot` does (iOS: a slot is held until the device settles, unless settle is false); returns each device's timings or error, \
          failed and unsettled counts, and the time until all were done. Android: each on its own console port from first_port up",
@@ -385,6 +393,7 @@ const ALL_PLATFORMS: &[&str] = &[
     "help",
     "identity",
     "host",
+    "devices_usage",
     "form_factors",
     "devices",
     "runtimes",
@@ -497,6 +506,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             .collect()),
         "identity" => Ok(crate::identity().clone()),
         "host" => serde_json::to_value(sim_host::global().report(sim_host::Thresholds::default())).map_err(|e| e.to_string()),
+        "devices_usage" => crate::usage::devices_usage(s),
         "form_factors" => {
             let (platform, form_factor) = (opt_platform(p)?, opt_form_factor(p)?);
             Ok(matrix()
@@ -630,6 +640,27 @@ mod tests {
         assert!(h["reasons"].as_array().is_some_and(|r| !r.is_empty()));
         let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
         assert!(help.as_array().is_some_and(|a| a.iter().any(|m| m["method"] == "host" && m["platforms"] == json!(["android", "ios"]))));
+    }
+
+    #[test]
+    fn devices_usage_lists_the_running_devices_without_touching_them() {
+        let u = call(&mut Session::default(), "devices_usage", &Value::Null).expect("devices_usage");
+        assert_eq!(u["available"], cfg!(target_os = "macos"));
+        assert!(u["host"]["cpus"].as_u64().is_some_and(|c| c >= 1) && u["simee"]["id"] == "simee");
+        let rows = u["devices"].as_array().expect("devices");
+        for d in rows {
+            assert!(matches!(d["platform"].as_str(), Some("ios" | "android")) && d["name"].is_string(), "{d}");
+            assert!(d["pids"].as_u64().is_some_and(|n| n >= 1), "{d}");
+            println!("{} {} {}: {} % cpu (1 s), {} bytes", d["platform"], d["kind"], d["name"], d["cpu_pct"]["1s"], d["footprint_bytes"]);
+        }
+        if cfg!(target_os = "macos") {
+            assert!(u["samples"].as_u64().is_some_and(|n| n >= 2), "the call waits for a rate: {u}");
+        }
+        let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
+        assert!(
+            help.as_array()
+                .is_some_and(|a| a.iter().any(|m| m["method"] == "devices_usage" && m["platforms"] == json!(["android", "ios"])))
+        );
     }
 
     #[test]
@@ -1006,6 +1037,101 @@ mod tests {
         assert_eq!(d["serial"], json!(format!("emulator-{port}")));
         assert!(d["boot_s"].as_f64().is_some_and(|s| s < 20.0), "{d}");
         assert!(d.get("error").is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Whether `v` fits `schema`, as far as [`crate::output_schema`] writes them (type, enum,
+    /// properties, required, items, additionalProperties, anyOf): the path to the first misfit.
+    fn misfit(schema: &Value, v: &Value, at: &str) -> Option<String> {
+        if let Some(alts) = schema["anyOf"].as_array() {
+            return if alts.iter().any(|a| misfit(a, v, at).is_none()) { None } else { Some(format!("{at}: none of anyOf fits {v}")) };
+        }
+        let kind = match v {
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        };
+        let types: Vec<&str> = match &schema["type"] {
+            Value::String(t) => vec![t.as_str()],
+            Value::Array(ts) => ts.iter().filter_map(Value::as_str).collect(),
+            _ => vec![],
+        };
+        if !types.is_empty() && !types.contains(&kind) {
+            return Some(format!("{at}: {kind} isn't {types:?}"));
+        }
+        if schema["enum"].as_array().is_some_and(|e| !e.contains(v)) {
+            return Some(format!("{at}: {v} isn't one of {}", schema["enum"]));
+        }
+        match v {
+            Value::Array(items) => items.iter().enumerate().find_map(|(i, item)| misfit(&schema["items"], item, &format!("{at}[{i}]"))),
+            Value::Object(fields) => {
+                let missing =
+                    schema["required"].as_array().into_iter().flatten().filter_map(Value::as_str).find(|k| !fields.contains_key(*k));
+                if let Some(k) = missing {
+                    return Some(format!("{at}: no `{k}`"));
+                }
+                fields.iter().find_map(|(k, field)| {
+                    let sub = schema["properties"].get(k).or_else(|| schema.get("additionalProperties"))?;
+                    misfit(sub, field, &format!("{at}.{k}"))
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// What the methods return fits what their output schemas say, on fake Android devices and for
+    /// the listings every host answers.
+    #[test]
+    fn results_fit_their_output_schemas() {
+        use sim_android::testing::fake_emulator;
+        let (mut s, root) = short_android_session("outputs");
+        fake_adb(&root);
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        let created = call(&mut s, "create", &json!({"platform": "android", "name": "pixel", "system_image": mobile})).expect("pixel");
+        let mut checked = vec![("create", created)];
+        let _fake = fake_emulator(s.android.backend(), "pixel");
+        let d = "pixel";
+        for (method, p) in [
+            ("help", json!({})),
+            ("identity", json!({})),
+            ("host", json!({})),
+            ("devices_usage", json!({})),
+            ("form_factors", json!({})),
+            ("devices", json!({})),
+            ("runtimes", json!({"platform": "android"})),
+            ("screen", json!({"device": d})),
+            ("screenshot", json!({"device": d})),
+            ("contrast_check", json!({"device": d})),
+            ("info", json!({"device": d})),
+            ("apps", json!({"device": d})),
+            ("launch", json!({"device": d, "bundle_id": "com.example.app"})),
+            ("tap", json!({"device": d, "x": 1, "y": 2})),
+            ("swipe", json!({"device": d, "x1": 1, "y1": 2, "x2": 3, "y2": 4, "duration_ms": 1})),
+            ("type", json!({"device": d, "text": "a"})),
+            ("button", json!({"device": d, "button": "back"})),
+            ("location", json!({"device": d, "latitude": 1.0, "longitude": 2.0})),
+            ("rotate", json!({"device": d})),
+            ("console", json!({"device": d, "command": "help"})),
+            ("boot_many", json!({"devices": [d], "timeout_s": 20})),
+        ] {
+            if let Ok(v) = call(&mut s, method, &p) {
+                checked.push((method, v));
+            }
+        }
+        for (method, v) in &checked {
+            let schema = crate::output_schema(method).expect(method);
+            assert_eq!(misfit(&schema, v, method), None, "{method} returned {v}");
+        }
+        let names: Vec<&str> = checked.iter().map(|(m, _)| *m).collect();
+        for method in ["help", "identity", "host", "devices_usage", "form_factors", "devices", "create", "screen", "info", "tap"] {
+            assert!(names.contains(&method), "{method} wasn't checked: {names:?}");
+        }
+        // The check can fail.
+        assert!(misfit(&crate::output_schema("screen").expect("screen"), &json!({"width": "1"}), "screen").is_some());
+        assert!(misfit(&crate::output_schema("tap").expect("tap"), &json!([]), "tap").is_some());
         std::fs::remove_dir_all(root).ok();
     }
 

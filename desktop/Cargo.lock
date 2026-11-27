@@ -3287,7 +3287,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "simee-android"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "png 0.18.1",
  "simee-core",
@@ -3296,7 +3296,7 @@ dependencies = [
 
 [[package]]
 name = "simee-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "serde",
@@ -3312,7 +3312,7 @@ dependencies = [
 
 [[package]]
 name = "simee-audio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3321,7 +3321,7 @@ dependencies = [
 
 [[package]]
 name = "simee-bundle"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "lz4_flex",
@@ -3333,7 +3333,7 @@ dependencies = [
 
 [[package]]
 name = "simee-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "png 0.18.1",
  "serde",
@@ -3341,7 +3341,7 @@ dependencies = [
 
 [[package]]
 name = "simee-coresim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "block2 0.6.2",
  "libc",
@@ -3353,7 +3353,7 @@ dependencies = [
 
 [[package]]
 name = "simee-debug"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
@@ -3376,7 +3376,7 @@ dependencies = [
 
 [[package]]
 name = "simee-emu-avd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rustix 1.1.6",
  "simee-bundle",
@@ -3386,16 +3386,17 @@ dependencies = [
 
 [[package]]
 name = "simee-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rustix 1.1.6",
  "serde",
+ "simee-core",
  "simee-coresim",
 ]
 
 [[package]]
 name = "simee-netshape"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]

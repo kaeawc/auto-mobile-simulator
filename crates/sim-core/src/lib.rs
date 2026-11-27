@@ -28,6 +28,7 @@ pub mod reuse;
 pub mod rotation;
 pub mod stream;
 pub mod stylus;
+pub mod support;
 pub mod vhal;
 pub mod worker;
 pub mod xr;

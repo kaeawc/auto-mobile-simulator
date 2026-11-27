@@ -1,0 +1,33 @@
+[package]
+name = "simee-encode"
+description = "Real-time H.264 from simee's frame sources: VideoToolbox straight from an iOS device's IOSurface or an Android emulator's frame ring, paced by the device's own frame callbacks, as Annex B access units with capture timestamps."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["h264", "videotoolbox", "encoder", "streaming", "simulator"]
+categories = ["multimedia::video", "multimedia::encoding"]
+include = ["/Cargo.toml", "/LICENSE", "/examples", "/src"]
+
+[lib]
+doctest = false
+
+[dependencies]
+sim-core.workspace = true
+
+# The encoder is VideoToolbox's; the frame sources hand it IOSurface-backed pixel buffers.
+[target.'cfg(target_os = "macos")'.dependencies]
+sim-android.workspace = true
+sim-coresim = { workspace = true, features = ["videotoolbox"] }
+
+# The tests read SPSes with the publisher's parser; `examples/publish_device.rs` publishes over
+# WHIP; the examples find an AVD's directory by name.
+[dev-dependencies]
+emu-avd.workspace = true
+sim-rtc.workspace = true
+
+[lints]
+workspace = true
