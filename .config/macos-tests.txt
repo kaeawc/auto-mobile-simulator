@@ -19,3 +19,4 @@ simee-emu-vmm
 simee-host
 simee-mcp
 simee-netshape
+simee-rtc

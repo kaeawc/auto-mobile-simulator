@@ -147,6 +147,10 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   proxy), `Profile`/`Rule` (the live profile file format).
 - `crates/sim-audio` — driverless per-device audio: `native/simaudio.swift` (process-tap helper,
   built on demand), capture/mute sessions, route and volume via the device's `audiosettings.plist`.
+- `crates/sim-rtc` — the WHIP publisher (no async runtime): `whip.rs` (RFC 9725 client),
+  `http.rs`/`url.rs` (blocking HTTP/1.1 on `std::net`), `h264.rs` (Annex B, access units, SPS
+  `profile-level-id`, SPS/PPS before IDRs), `rtp.rs` (RFC 6184, FU-A), `publisher.rs` (str0m in
+  RTP mode, one thread per publisher, the encoder callback). Docs: `docs/streaming.md`.
 - `crates/sim-android` — the Android backend's client: AVDs as labelled devices, system images as
   runtimes, AVD creation shaped by form factor, starting `emu` and waiting for boot, the console
   client (`console.rs`) and the display socket client (`display.rs`). No FFI.
