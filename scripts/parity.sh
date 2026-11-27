@@ -27,9 +27,21 @@ check "screenshot size" "$(size "$tmp/ours.png")" "$(size "$tmp/theirs.png")"
 diff=$(python3 - "$tmp/ours.png" "$tmp/theirs.png" <<'PY'
 import subprocess, sys
 def raw(p):
-    out = p + ".rgba"
+    # The colour bytes only (BGR per pixel, no row padding), whatever the BMP's layout: simee
+    # writes opaque screenshots as RGB PNGs (24 bpp BMP), simctl as RGBA (32 bpp).
+    out = p + ".bmp"
     subprocess.run(["sips", "-s", "format", "bmp", p, "--out", out], capture_output=True, check=True)
-    return open(out, "rb").read()[138:]
+    d = open(out, "rb").read()
+    off, w, h = int.from_bytes(d[10:14], "little"), int.from_bytes(d[18:22], "little", signed=True), int.from_bytes(d[22:26], "little", signed=True)
+    px = int.from_bytes(d[28:30], "little") // 8
+    stride = (w * px + 3) // 4 * 4
+    def bgr(row):
+        if px == 3:
+            return row
+        out = bytearray(w * 3)
+        out[0::3], out[1::3], out[2::3] = row[0::4], row[1::4], row[2::4]
+        return bytes(out)
+    return b"".join(bgr(d[off + r * stride: off + r * stride + w * px]) for r in range(abs(h)))
 a, b = raw(sys.argv[1]), raw(sys.argv[2])
 n = min(len(a), len(b))
 print(f"{sum(1 for i in range(0, n, 97) if abs(a[i]-b[i]) > 8) / max(1, len(range(0, n, 97))):.3f}")
