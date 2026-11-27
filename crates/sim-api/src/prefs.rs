@@ -548,10 +548,15 @@ impl Feeds {
             let state = feed.state();
             !state.ended || state.used.elapsed() < idle
         });
-        if let Some(feed) = self.feeds.get(&key)
-            && (!feed.state().ended || id == Some(feed.id))
-        {
-            return Ok(feed.clone());
+        if let Some(feed) = self.feeds.get(&key) {
+            let mut state = feed.state();
+            if !state.ended || id == Some(feed.id) {
+                // Used now, under its lock: the idle stop can't end it between this lookup and
+                // the caller's poll (a first call would otherwise get `ended` and retry).
+                state.used = Instant::now();
+                drop(state);
+                return Ok(feed.clone());
+            }
         }
         let feed = Feed::start(start()?, self.capacity, self.idle)?;
         self.feeds.insert(key, feed.clone());
