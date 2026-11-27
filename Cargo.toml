@@ -90,6 +90,9 @@ unwrap_used = "warn"
 
 [profile.dev]
 debug = "line-tables-only"
+# 16 codegen units instead of the dev default 256: fewer, larger units cut incremental relink and
+# per-unit bookkeeping (docs/build.md: sim-core one-line change 2.2 s to 1.3 s).
+codegen-units = 16
 
 [profile.dev.package."*"]
 debug = false
