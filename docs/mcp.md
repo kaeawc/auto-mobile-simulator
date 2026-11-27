@@ -264,8 +264,9 @@ context.
 - The prompts are a table in `crates/sim-mcp/src/prompts.rs`, each with the tools its text may
   name. Tests check that each is a tool (a renamed tool fails them), that the text names nothing
   else in backticks and every one of them in some set of arguments, and that each named tool is
-  either served or named with the toolset and setting that serve it. The eval suite (#296), which
-  will run the prompts against an agent, is not built yet.
+  either served or named with the toolset and setting that serve it. The eval suite
+  ([mcp-evals.md](mcp-evals.md)) plays each prompt's reference plan against the server and checks
+  its end state.
 
 ## Tasks
 
