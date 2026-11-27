@@ -27,7 +27,8 @@ backends: Rune's native Metal backend, the default, has had depth attachments an
 since anomalyco/rune#2563 (#193), and wgpu's (`SIMEE_GPU_BACKEND=wgpu`) remains an option.
 Headless renders of every scene (demo, android, foldable, folded, tablet, watch, turned) in the 3/4,
 side, back and face-on views, and flat, are byte-identical on the two backends. A TV, head unit or
-headset has no body and stays flat. With the 3D view off, the window is exactly the flat one:
+headset has no body and stays flat. Under live Rust editing (the `hot` feature) there is no
+compositor, so ⌘3 says it is unavailable there. With the 3D view off, the window is exactly the flat one:
 screenshots are byte-identical to the build without it on both backends.
 
 It starts in a 3/4 view from the right and above. `SIMEE_SCENE_CAMERA` starts it in another
