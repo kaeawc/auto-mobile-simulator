@@ -14,10 +14,21 @@
 //! {"type": "data", "value": "AAEC"}                bytes, standard base64 with padding
 //! {"type": "array", "value": [{"type": "string", "value": "a"}]}
 //! {"type": "dictionary", "value": {"k": {"type": "bool", "value": true}}}
+//! {"type": "unsupported", "value": {"native": "integer", "raw": "18446744073709551615"}}
 //! ```
 //!
 //! Reading a value refuses anything that isn't exactly its type: a fraction for an `int`, a number
 //! past its range, a string for a `bool`, an untyped element in an `array`.
+//!
+//! `unsupported` is what a backend reads that no other type holds exactly (a plist integer past 64
+//! bits, Swift's `UInt64.max`; a SharedPreferences `<double>` or `<null>` element another tool
+//! wrote): the platform's name for it and its text as stored. It is read-only: a write naming it
+//! is refused.
+//!
+//! iOS keeps no width: a plist has one `integer` and one `real`, so an iOS store reads every
+//! integer as a `long` ([`PrefValue::ios_integer`]) and every real as a `double`
+//! ([`PrefValue::ios_real`]), whatever type wrote it (`int` and `long` write an integer, `float`
+//! and `double` a real).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,6 +38,7 @@ use serde_json::{Map, Value, json};
 
 /// The type of a preference value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Type {
     String,
     Int,
@@ -39,9 +51,12 @@ pub enum Type {
     Data,
     Array,
     Dictionary,
+    /// Read-only: a value no other type holds exactly ([`PrefValue::Unsupported`]).
+    Unsupported,
 }
 
 impl Type {
+    /// Every type a value can be written as ([`Type::Unsupported`] is only read).
     pub const ALL: [Type; 11] = [
         Type::String,
         Type::Int,
@@ -70,10 +85,15 @@ impl Type {
             Type::Data => "data",
             Type::Array => "array",
             Type::Dictionary => "dictionary",
+            Type::Unsupported => "unsupported",
         }
     }
 
+    /// A type a value can be written as.
     pub fn parse(name: &str) -> Result<Type, String> {
+        if name == Type::Unsupported.as_str() {
+            return Err("`unsupported` values are read-only: they are what a store held that no type here holds exactly".into());
+        }
         Type::ALL.into_iter().find(|t| t.as_str() == name).ok_or_else(|| {
             let names: Vec<&str> = Type::ALL.iter().map(|t| t.as_str()).collect();
             format!("unknown type `{name}` ({})", names.join(", "))
@@ -94,12 +114,14 @@ impl Type {
             Type::Data => "a standard base64 string",
             Type::Array => "an array of typed values ({type, value})",
             Type::Dictionary => "an object whose values are typed values ({type, value})",
+            Type::Unsupported => "nothing: unsupported values are read-only",
         }
     }
 }
 
 /// A preference value of one [`Type`].
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum PrefValue {
     String(String),
     Int(i32),
@@ -112,9 +134,39 @@ pub enum PrefValue {
     Data(Vec<u8>),
     Array(Vec<PrefValue>),
     Dictionary(BTreeMap<String, PrefValue>),
+    /// What a store held that no other type holds exactly: the platform's name for its type
+    /// (`integer`, `double`, `null`) and its text as stored. Read-only.
+    Unsupported {
+        native: String,
+        raw: String,
+    },
 }
 
 impl PrefValue {
+    /// A plist integer as an iOS store reads it: a `long`, or `unsupported` past 64 bits (a plist
+    /// integer is up to 128: Swift's `UInt64.max` is one).
+    pub fn ios_integer(n: i128) -> PrefValue {
+        i64::try_from(n).map_or_else(|_| PrefValue::Unsupported { native: "integer".into(), raw: n.to_string() }, PrefValue::Long)
+    }
+
+    /// A plist real as an iOS store reads it: a `double`.
+    pub fn ios_real(f: f64) -> PrefValue {
+        PrefValue::Double(f)
+    }
+
+    /// About how many bytes this value takes, for a feed's budget.
+    pub fn size(&self) -> usize {
+        16 + match self {
+            PrefValue::String(s) => s.len(),
+            PrefValue::StringSet(set) => set.iter().map(|s| s.len() + 16).sum(),
+            PrefValue::Data(bytes) => bytes.len(),
+            PrefValue::Array(items) => items.iter().map(PrefValue::size).sum(),
+            PrefValue::Dictionary(map) => map.iter().map(|(k, v)| k.len() + v.size()).sum(),
+            PrefValue::Unsupported { native, raw } => native.len() + raw.len(),
+            _ => 0,
+        }
+    }
+
     pub fn ty(&self) -> Type {
         match self {
             PrefValue::String(_) => Type::String,
@@ -128,6 +180,7 @@ impl PrefValue {
             PrefValue::Data(_) => Type::Data,
             PrefValue::Array(_) => Type::Array,
             PrefValue::Dictionary(_) => Type::Dictionary,
+            PrefValue::Unsupported { .. } => Type::Unsupported,
         }
     }
 
@@ -151,6 +204,7 @@ impl PrefValue {
             PrefValue::Data(bytes) => Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
             PrefValue::Array(items) => items.iter().map(PrefValue::to_json).collect(),
             PrefValue::Dictionary(map) => Value::Object(map.iter().map(|(k, v)| (k.clone(), v.to_json())).collect()),
+            PrefValue::Unsupported { native, raw } => json!({"native": native, "raw": raw}),
         }
     }
 
@@ -224,6 +278,7 @@ impl PrefValue {
                         .collect::<Result<_, String>>()?,
                 )
             }
+            Type::Unsupported => return Err(format!("`{at}`: {}", Type::parse("unsupported").err().unwrap_or_default())),
         })
     }
 
@@ -540,5 +595,36 @@ mod tests {
             let (y, m, d) = civil_from_days(days);
             assert_eq!(days_from_civil(y, m, d), days, "{y}-{m}-{d}");
         }
+    }
+
+    #[test]
+    fn values_no_type_holds_read_as_unsupported_and_are_never_written() {
+        // Swift's UInt64.max in a plist: past a long, so `unsupported` with its digits.
+        let big = PrefValue::ios_integer(i128::from(u64::MAX));
+        assert_eq!(big.to_json(), json!({"type": "unsupported", "value": {"native": "integer", "raw": "18446744073709551615"}}));
+        // A SharedPreferences `<double>` or `<null>` element (Android's own API writes neither).
+        let double = PrefValue::Unsupported { native: "double".into(), raw: "1.5".into() };
+        let null = PrefValue::Unsupported { native: "null".into(), raw: String::new() };
+        assert_eq!(double.to_json(), json!({"type": "unsupported", "value": {"native": "double", "raw": "1.5"}}));
+        assert_eq!(null.ty(), Type::Unsupported);
+        // Nested in an array (an iOS array holding a 128-bit integer) it says the same.
+        assert_eq!(PrefValue::Array(vec![big.clone()]).to_json()["value"][0]["type"], "unsupported");
+        // Read-only: neither a top-level write nor a nested element can name it.
+        let refused = Type::parse("unsupported").expect_err("read-only");
+        assert!(refused.starts_with("`unsupported` values are read-only"), "{refused}");
+        let nested = PrefValue::from_typed(&json!({"type": "array", "value": [big.to_json()]}), "value").expect_err("nested");
+        assert!(nested.starts_with("`value.value[0]`: `unsupported` values are read-only"), "{nested}");
+        assert!(PrefValue::from_json(Type::Unsupported, &json!({}), "value").is_err());
+        assert!(!Type::ALL.contains(&Type::Unsupported), "never offered as a write type");
+    }
+
+    #[test]
+    fn ios_reads_integers_as_long_and_reals_as_double() {
+        // A plist keeps no width: whatever `int` or `float` wrote comes back as `long` or `double`.
+        assert_eq!(PrefValue::ios_integer(3), PrefValue::Long(3));
+        assert_eq!(PrefValue::ios_integer(i128::from(i64::MIN)), PrefValue::Long(i64::MIN));
+        assert_eq!(PrefValue::ios_integer(i128::from(i64::MAX) + 1).ty(), Type::Unsupported);
+        assert_eq!(PrefValue::ios_real(f64::from(0.5f32)), PrefValue::Double(0.5));
+        assert_eq!(PrefValue::ios_integer(7).to_json(), json!({"type": "long", "value": 7}));
     }
 }

@@ -9,12 +9,18 @@
 //!
 //! - A **batch** (`prefs_batch`) is all or nothing: every op is checked first, and the backend
 //!   applies them as one write of the store or none at all. Its result has one visibility.
-//! - A **write** says when the running app sees it ([`Visibility`]): now, or after a relaunch (a
-//!   platform that can't reach a running app's in-memory copy says so instead of a silent no-op).
+//! - A **write** says when the running app sees it ([`Visibility`]) and what was done to the app to
+//!   get it there ([`AppState`]): a platform that can't reach a running app's in-memory copy says
+//!   so instead of a silent no-op. On Android a running app writes its whole in-memory copy back on
+//!   its next `apply`/`commit` (SharedPreferences) or update (single-process DataStore), over a
+//!   write made under it, so a backend there stops the app, writes, and says whether it relaunched
+//!   it, rather than promising `after_relaunch`.
 //! - **`prefs_watch`** follows `logs`' `stream`: the first call starts one feed for the device, app
 //!   and store in this (long-running) process and answers with a cursor; later calls with that
-//!   cursor answer the changes since, waiting up to `wait_ms` for one. A feed nobody reads for 5
-//!   minutes stops.
+//!   cursor answer the changes since, waiting up to `wait_ms` for one. A feed's thread takes the
+//!   backend's changes into a ring of at most 16 MiB as they come, waiting callers sleep on a
+//!   condition variable (never holding the feed's lock, so callers don't hold each other up), and
+//!   a feed nobody reads for 5 minutes stops on its own.
 
 mod value;
 
@@ -23,8 +29,8 @@ pub(crate) mod fake;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -36,6 +42,7 @@ use crate::params::need_str;
 
 /// The kinds of preference store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum StoreKind {
     /// Android `shared_prefs/<name>.xml`.
     SharedPreferences,
@@ -75,12 +82,13 @@ impl StoreKind {
         }
     }
 
-    /// The types a store of this kind holds, at the top level and (iOS) nested.
+    /// The types a store of this kind holds, at the top level and (iOS) nested. DataStore's
+    /// `data` is `byteArrayPreferencesKey` (DataStore 1.1's `bytes`).
     pub fn types(self) -> &'static [Type] {
         use Type::*;
         match self {
             StoreKind::SharedPreferences => &[String, Int, Long, Float, Bool, StringSet],
-            StoreKind::DataStore => &[String, Int, Long, Float, Double, Bool, StringSet],
+            StoreKind::DataStore => &[String, Int, Long, Float, Double, Bool, StringSet, Data],
             StoreKind::AppDomain | StoreKind::AppGroup | StoreKind::Domain => {
                 &[String, Int, Long, Float, Double, Bool, Date, Data, Array, Dictionary]
             }
@@ -106,7 +114,7 @@ impl StoreKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Store {
     pub kind: StoreKind,
-    /// The app's package name or bundle id.
+    /// The app's package name or bundle id (`bundle_id` on the wire).
     pub app: String,
     /// Android: the file's name without its directory and extension; iOS: the domain.
     pub name: String,
@@ -152,7 +160,7 @@ impl Store {
     }
 
     pub fn to_json(&self) -> Value {
-        json!({"id": self.id(), "kind": self.kind.as_str(), "name": self.name, "app": self.app, "platform": self.kind.platform().as_str()})
+        json!({"id": self.id(), "kind": self.kind.as_str(), "name": self.name, "bundle_id": self.app, "platform": self.kind.platform().as_str()})
     }
 }
 
@@ -165,6 +173,7 @@ pub fn entries_json(entries: &Entries) -> Value {
 
 /// One change a write makes.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Op {
     Set { key: String, value: PrefValue },
     Delete { key: String },
@@ -178,12 +187,16 @@ impl Op {
     }
 }
 
-/// When the running app sees a write.
+/// When the app sees a write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Visibility {
-    /// The running app (and an app that isn't running, when it starts) sees it now.
+    /// The app sees it now: it reached a running app, or the app wasn't running (or was stopped
+    /// for the write, [`AppState`]) and reads it when it starts.
     Now,
-    /// The app sees it once it is relaunched; a running copy keeps its old values in memory.
+    /// The app sees it once it is relaunched; until then a running copy keeps its old values in
+    /// memory. Only for a platform whose running app never writes that copy back over the store
+    /// (not Android: see [`AppState`]).
     AfterRelaunch,
 }
 
@@ -196,11 +209,35 @@ impl Visibility {
     }
 }
 
+/// What a write did to the app.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AppState {
+    /// Nothing: it wasn't running, or the write reached it where it runs.
+    Untouched,
+    /// It was running and was stopped for the write (a running Android app would write its old
+    /// values back over it); it stays stopped.
+    Stopped,
+    /// It was stopped for the write and launched again afterwards.
+    Relaunched,
+}
+
+impl AppState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AppState::Untouched => "untouched",
+            AppState::Stopped => "stopped",
+            AppState::Relaunched => "relaunched",
+        }
+    }
+}
+
 /// What a write (or a batch) did.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WriteResult {
     pub visible: Visibility,
-    /// Why, when the app sees it only after a relaunch, and what to do about it.
+    pub app: AppState,
+    /// Why, when the app sees it only after a relaunch or was stopped for it, and what to do.
     pub note: Option<String>,
 }
 
@@ -217,6 +254,15 @@ pub struct Change {
 }
 
 impl Change {
+    /// About how many bytes it takes, for a feed's budget.
+    pub fn size(&self) -> usize {
+        64 + self.store.name.len()
+            + self.store.app.len()
+            + self.key.len()
+            + self.old.as_ref().map_or(0, PrefValue::size)
+            + self.new.as_ref().map_or(0, PrefValue::size)
+    }
+
     pub fn to_json(&self) -> Value {
         let typed = |v: &Option<PrefValue>| v.as_ref().map_or(Value::Null, PrefValue::to_json);
         json!({"store": self.store.id(), "key": self.key, "old": typed(&self.old), "new": typed(&self.new), "at": self.at.to_iso8601()})
@@ -336,7 +382,7 @@ fn typed_value(store: &Store, ty: &str, value: &Value, at: &str) -> Result<PrefV
 }
 
 fn write_json(store: &Store, keys: Value, done: &WriteResult) -> Value {
-    let mut out = json!({"store": store.id(), "visible": done.visible.as_str()});
+    let mut out = json!({"store": store.id(), "visible": done.visible.as_str(), "app": done.app.as_str()});
     match keys {
         Value::String(key) => out["key"] = Value::String(key),
         keys => out["keys"] = keys,
@@ -386,21 +432,26 @@ fn batch_ops(store: &Store, ops: &[Value]) -> Result<Vec<Op>, String> {
 
 /// Runs one preference method on the `platform` device `device` (resolved by the dispatcher).
 pub(crate) fn call(backend: &mut dyn Backend, platform: Platform, device: &str, method: &str, p: &Value) -> Result<Value, String> {
-    let app = need_str(p, "app")?;
+    let app = need_str(p, "bundle_id")?;
     // Every parameter's presence is checked before any is read, so a call missing one says so.
     match method {
         "prefs_stores" => Ok(backend.stores(device, app)?.iter().map(Store::to_json).collect()),
         "prefs_read" => {
-            let stores = match opt_string(p, "store")? {
-                Some(id) => vec![Store::parse(platform, app, id)?],
-                None => backend.stores(device, app)?,
-            };
-            let mut out = Vec::with_capacity(stores.len());
-            for store in stores {
+            // One store: its values or the call's error. Every store: each one's values or its own
+            // error, so one unreadable store doesn't hide the rest.
+            if let Some(id) = opt_string(p, "store")? {
+                let store = Store::parse(platform, app, id)?;
                 let entries = backend.read(device, &store)?;
-                out.push(json!({"store": store.to_json(), "values": entries_json(&entries)}));
+                return Ok(json!([{"store": store.to_json(), "values": entries_json(&entries)}]));
             }
-            Ok(Value::Array(out))
+            let stores = backend.stores(device, app)?;
+            Ok(stores
+                .iter()
+                .map(|store| match backend.read(device, store) {
+                    Ok(entries) => json!({"store": store.to_json(), "values": entries_json(&entries)}),
+                    Err(error) => json!({"store": store.to_json(), "error": error}),
+                })
+                .collect())
         }
         "prefs_write" => {
             let (id, key, ty) = (need_str(p, "store")?, need_str(p, "key")?, need_str(p, "type")?);
@@ -431,6 +482,7 @@ pub(crate) fn call(backend: &mut dyn Backend, platform: Platform, device: &str, 
         "prefs_watch" => {
             let store = opt_string(p, "store")?.map(|id| Store::parse(platform, app, id)).transpose()?;
             let cursor = opt_string(p, "cursor")?;
+            let feed_id = cursor.and_then(parse_cursor).map(|(id, _)| id);
             let wait = match p.get("wait_ms") {
                 None | Some(Value::Null) => Duration::ZERO,
                 Some(v) => {
@@ -438,8 +490,8 @@ pub(crate) fn call(backend: &mut dyn Backend, platform: Platform, device: &str, 
                 }
             };
             let key = FeedKey { platform, device: device.to_owned(), app: app.to_owned(), store: store.as_ref().map(Store::id) };
-            let feed = with_feeds(|feeds| feeds.get(key, || backend.watch(device, app, store.as_ref())))?;
-            Ok(lock(&feed).poll(cursor, wait.min(MAX_WAIT)))
+            let feed = with_feeds(|feeds| feeds.get(key, feed_id, || backend.watch(device, app, store.as_ref())))?;
+            Ok(feed.poll(cursor, wait.min(MAX_WAIT)))
         }
         other => Err(format!("`{other}` isn't a preferences method")),
     }
@@ -448,21 +500,16 @@ pub(crate) fn call(backend: &mut dyn Backend, platform: Platform, device: &str, 
 /// How long a feed nobody reads keeps running.
 const FEED_IDLE: Duration = Duration::from_secs(300);
 
-/// The changes a feed keeps for callers that are behind; older ones are dropped (and counted).
-const FEED_EVENTS: usize = 4096;
+/// The bytes of changes a feed keeps for callers that are behind (about [`Change::size`] each,
+/// as `logs` keeps 16 MiB of lines); the oldest go first and are counted as `missed`.
+const FEED_BYTES: usize = 16 << 20;
 
 static FEEDS: Mutex<Option<Feeds>> = Mutex::new(None);
 static NEXT_FEED: AtomicU64 = AtomicU64::new(1);
 
 fn with_feeds<T>(f: impl FnOnce(&mut Feeds) -> T) -> T {
     let mut guard = FEEDS.lock().unwrap_or_else(PoisonError::into_inner);
-    f(guard.get_or_insert_with(|| Feeds::new(FEED_IDLE)))
-}
-
-type SharedFeed = Arc<Mutex<Feed>>;
-
-fn lock(feed: &SharedFeed) -> MutexGuard<'_, Feed> {
-    feed.lock().unwrap_or_else(PoisonError::into_inner)
+    f(guard.get_or_insert_with(|| Feeds::new(FEED_BYTES, FEED_IDLE)))
 }
 
 /// What a feed follows.
@@ -475,74 +522,127 @@ struct FeedKey {
     store: Option<String>,
 }
 
-/// The running feeds of this process, one per [`FeedKey`].
+/// The feeds of this process, one per [`FeedKey`].
 struct Feeds {
-    feeds: HashMap<FeedKey, SharedFeed>,
+    feeds: HashMap<FeedKey, Arc<Feed>>,
+    capacity: usize,
     idle: Duration,
 }
 
 impl Feeds {
-    fn new(idle: Duration) -> Feeds {
-        Feeds { feeds: HashMap::new(), idle }
+    fn new(capacity: usize, idle: Duration) -> Feeds {
+        Feeds { feeds: HashMap::new(), capacity, idle }
     }
 
-    /// The running feed for `key`, started with `start` when there is none (or it ended). Feeds
-    /// nobody has read for `idle` stop first (one being read now is busy, so kept).
-    fn get(&mut self, key: FeedKey, start: impl FnOnce() -> Result<Receiver<Change>, String>) -> Result<SharedFeed, String> {
+    /// The feed for `key`, started with `start` when there is none. An ended feed is kept for a
+    /// caller holding its cursor (`id`), who reads what it had and that it ended; a call without
+    /// one starts a new feed. Ended feeds nobody has read for `idle` are let go.
+    fn get(
+        &mut self,
+        key: FeedKey,
+        id: Option<u64>,
+        start: impl FnOnce() -> Result<Receiver<Change>, String>,
+    ) -> Result<Arc<Feed>, String> {
         let idle = self.idle;
-        self.feeds.retain(|_, feed| feed.try_lock().map_or(true, |f| !f.ended && f.used.elapsed() < idle));
-        if let Some(feed) = self.feeds.get(&key) {
+        self.feeds.retain(|_, feed| {
+            let state = feed.state();
+            !state.ended || state.used.elapsed() < idle
+        });
+        if let Some(feed) = self.feeds.get(&key)
+            && (!feed.state().ended || id == Some(feed.id))
+        {
             return Ok(feed.clone());
         }
-        let feed = Arc::new(Mutex::new(Feed::new(start()?)));
+        let feed = Feed::start(start()?, self.capacity, self.idle)?;
         self.feeds.insert(key, feed.clone());
         Ok(feed)
     }
 }
 
-/// One feed: the backend's receiver, read only when a caller asks (no thread of its own), and the
-/// changes kept for callers.
+/// One feed: its thread takes the backend's changes into `state` as they come; callers read
+/// them from there, and wait on `changed`, which never holds the lock while it waits.
 struct Feed {
     id: u64,
-    rx: Receiver<Change>,
-    /// Each kept change with its sequence number (1, 2, ...), oldest first.
-    events: VecDeque<(u64, Change)>,
+    state: Mutex<FeedState>,
+    changed: Condvar,
+}
+
+struct FeedState {
+    /// Each kept change with its sequence number (1, 2, ...) and size, oldest first.
+    events: VecDeque<(u64, usize, Change)>,
+    bytes: usize,
+    capacity: usize,
     /// The sequence number of the last change received.
     head: u64,
     used: Instant,
-    /// The backend closed it (the device stopped, or the backend gave up).
+    /// Callers waiting for a change: a feed being waited on isn't idle.
+    waiting: usize,
+    /// The backend closed it (the device stopped) or nobody read it for the idle time.
     ended: bool,
 }
 
-impl Feed {
-    fn new(rx: Receiver<Change>) -> Feed {
-        Feed { id: NEXT_FEED.fetch_add(1, Ordering::Relaxed), rx, events: VecDeque::new(), head: 0, used: Instant::now(), ended: false }
-    }
-
+impl FeedState {
     fn push(&mut self, change: Change) {
+        let size = change.size();
         self.head += 1;
-        self.events.push_back((self.head, change));
-        if self.events.len() > FEED_EVENTS {
-            self.events.pop_front();
+        self.bytes += size;
+        self.events.push_back((self.head, size, change));
+        while self.bytes > self.capacity {
+            let Some((_, size, _)) = self.events.pop_front() else { break };
+            self.bytes -= size;
         }
     }
+}
 
-    /// Takes what the backend has sent.
-    fn drain(&mut self) {
+impl Feed {
+    fn start(rx: Receiver<Change>, capacity: usize, idle: Duration) -> Result<Arc<Feed>, String> {
+        let state = FeedState { events: VecDeque::new(), bytes: 0, capacity, head: 0, used: Instant::now(), waiting: 0, ended: false };
+        let feed = Arc::new(Feed { id: NEXT_FEED.fetch_add(1, Ordering::Relaxed), state: Mutex::new(state), changed: Condvar::new() });
+        let reading = feed.clone();
+        std::thread::Builder::new()
+            .name("simee-prefs-feed".into())
+            .spawn(move || reading.run(&rx, idle))
+            .map_err(|e| format!("can't start a preferences feed: {e}"))?;
+        Ok(feed)
+    }
+
+    fn state(&self) -> MutexGuard<'_, FeedState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The feed's thread: takes each change as the backend sends it, and ends the feed when the
+    /// backend closes it or nobody has read (or waited on) it for `idle`. It wakes at least every
+    /// `tick` for that, and returning drops the receiver, which tells the backend to stop.
+    fn run(&self, rx: &Receiver<Change>, idle: Duration) {
+        let tick = (idle / 4).clamp(Duration::from_millis(5), Duration::from_secs(1));
         loop {
-            match self.rx.try_recv() {
-                Ok(change) => self.push(change),
-                Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Disconnected) => {
-                    self.ended = true;
-                    return;
-                }
+            let got = rx.recv_timeout(tick);
+            let mut state = self.state();
+            if state.ended {
+                return;
+            }
+            let mut wake = true;
+            match got {
+                Ok(change) => state.push(change),
+                Err(RecvTimeoutError::Disconnected) => state.ended = true,
+                Err(RecvTimeoutError::Timeout) => wake = false,
+            }
+            if !state.ended && state.waiting == 0 && state.used.elapsed() >= idle {
+                // Nobody is reading: what it kept goes too, as an idle `logs` stream's lines do.
+                state.ended = true;
+                state.events.clear();
+                state.bytes = 0;
+                wake = true;
+            }
+            let ended = state.ended;
+            drop(state);
+            if wake {
+                self.changed.notify_all();
+            }
+            if ended {
+                return;
             }
         }
-    }
-
-    fn cursor(&self) -> String {
-        format!("{}:{}", self.id, self.head)
     }
 
     /// The answer to one `prefs_watch` call.
@@ -550,50 +650,48 @@ impl Feed {
     /// - No cursor: the changes from now on are this caller's; `{cursor, events: []}`.
     /// - A cursor of this feed: the changes after it, waiting up to `wait` for one;
     ///   `{cursor, events, missed?}`, `missed` counting changes dropped before they were read.
-    /// - A cursor of an earlier feed (stopped when idle or when its device stopped): `reset: true`
-    ///   and a new cursor; changes in between may be lost, so re-read the store.
+    /// - A cursor of another feed (one that has gone): `reset: true` and a new cursor; changes in
+    ///   between may be lost, so re-read the store.
     ///
-    /// `ended: true` says the backend closed the feed: the next call starts a new one.
-    fn poll(&mut self, cursor: Option<&str>, wait: Duration) -> Value {
-        self.used = Instant::now();
-        self.drain();
+    /// `ended: true` says the feed has ended (the device stopped, or nobody read it for 5
+    /// minutes): a call without a cursor starts a new one.
+    fn poll(&self, cursor: Option<&str>, wait: Duration) -> Value {
+        let mut state = self.state();
+        state.used = Instant::now();
+        let answer = |state: &FeedState, events: Vec<Value>| {
+            let mut out = json!({"cursor": format!("{}:{}", self.id, state.head), "events": events});
+            if state.ended {
+                out["ended"] = true.into();
+            }
+            out
+        };
         let after = match cursor.map(parse_cursor) {
-            None => None,
-            Some(Some((id, seq))) if id == self.id && seq <= self.head => Some(seq),
+            None => return answer(&state, Vec::new()),
+            Some(Some((id, seq))) if id == self.id && seq <= state.head => seq,
             Some(_) => {
-                let mut out = json!({"cursor": self.cursor(), "events": [], "reset": true});
-                if self.ended {
-                    out["ended"] = true.into();
-                }
+                let mut out = answer(&state, Vec::new());
+                out["reset"] = true.into();
                 return out;
             }
         };
-        let Some(after) = after else {
-            let mut out = json!({"cursor": self.cursor(), "events": []});
-            if self.ended {
-                out["ended"] = true.into();
-            }
-            return out;
-        };
-        if self.head == after && !self.ended && !wait.is_zero() {
-            match self.rx.recv_timeout(wait) {
-                Ok(change) => {
-                    self.push(change);
-                    self.drain();
+        if state.head == after && !state.ended && !wait.is_zero() {
+            let deadline = Instant::now() + wait;
+            state.waiting += 1;
+            while state.head == after && !state.ended {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => self.ended = true,
+                state = self.changed.wait_timeout(state, left).unwrap_or_else(PoisonError::into_inner).0;
             }
-            self.used = Instant::now();
+            state.waiting -= 1;
+            state.used = Instant::now();
         }
-        let oldest = self.events.front().map_or(self.head + 1, |(seq, _)| *seq);
-        let events: Vec<Value> = self.events.iter().filter(|(seq, _)| *seq > after).map(|(_, c)| c.to_json()).collect();
-        let mut out = json!({"cursor": self.cursor(), "events": events});
+        let oldest = state.events.front().map_or(state.head + 1, |(seq, ..)| *seq);
+        let events = state.events.iter().filter(|(seq, ..)| *seq > after).map(|(.., c)| c.to_json()).collect();
+        let mut out = answer(&state, events);
         if oldest > after + 1 {
             out["missed"] = (oldest - after - 1).into();
-        }
-        if self.ended {
-            out["ended"] = true.into();
         }
         out
     }

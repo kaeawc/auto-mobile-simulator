@@ -4,7 +4,7 @@
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use super::{Backend, Change, Date, Entries, Op, Store, Visibility, WriteResult};
+use super::{AppState, Backend, Change, Date, Entries, Op, Store, Visibility, WriteResult};
 
 /// Clones share one state, so a test keeps a handle on what the session's copy does.
 #[derive(Clone, Default)]
@@ -18,6 +18,8 @@ struct State {
     visible: Option<WriteResult>,
     /// A key whose write fails (a backend error part-way, as a full disk would be).
     fail_on: Option<String>,
+    /// A store whose read fails (a file it can't parse).
+    unreadable: Option<Store>,
     /// Each feed: the app, the store it follows (`None`: every one of the app's), its sender.
     watchers: Vec<(String, Option<Store>, Sender<Change>)>,
     /// Seconds after 2027-01-15T08:00:00Z of the next change, so `at` is known and increasing.
@@ -46,6 +48,10 @@ impl Fake {
         self.state().fail_on = Some(key.to_owned());
     }
 
+    pub fn unreadable(&self, store: &Store) {
+        self.state().unreadable = Some(store.clone());
+    }
+
     /// Feeds still open, as of the last write (a write finds the ones whose receiver is gone).
     pub fn watchers(&self) -> usize {
         self.state().watchers.len()
@@ -63,6 +69,9 @@ impl Backend for Fake {
     }
 
     fn read(&mut self, _: &str, store: &Store) -> Result<Entries, String> {
+        if self.state().unreadable.as_ref() == Some(store) {
+            return Err(format!("the fake can't read `{}`", store.id()));
+        }
         self.entries(store).ok_or_else(|| format!("{} has no store `{}`", store.app, store.id()))
     }
 
@@ -108,7 +117,7 @@ impl Backend for Fake {
         state.watchers.retain(|(app, only, tx)| {
             *app != store.app || only.as_ref().is_some_and(|s| s != store) || sent.iter().all(|change| tx.send(change.clone()).is_ok())
         });
-        Ok(state.visible.clone().unwrap_or(WriteResult { visible: Visibility::Now, note: None }))
+        Ok(state.visible.clone().unwrap_or(WriteResult { visible: Visibility::Now, app: AppState::Untouched, note: None }))
     }
 
     fn watch(&mut self, _: &str, app: &str, store: Option<&Store>) -> Result<std::sync::mpsc::Receiver<Change>, String> {

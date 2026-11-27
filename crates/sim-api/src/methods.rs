@@ -170,37 +170,40 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("defaults_write", "device, domain, key, value, type?", "Write a preference (type: string|int|float|bool)"),
     (
         "prefs_stores",
-        "device, app",
+        "device, bundle_id",
         "An app's preference stores, each with the id the other prefs_* methods take: Android `shared_prefs/<name>.xml` and DataStore \
          `datastore/<name>.preferences_pb`, iOS the app's domain (its bundle id) and its app-group suites; any other iOS domain is \
          reachable by its name",
     ),
     (
         "prefs_read",
-        "device, app, store?",
+        "device, bundle_id, store?",
         "Every key of an app's preference stores (or one) with its typed value, {type, value}: string, int, long, float, double, \
-         bool, string_set (Android), date (ISO 8601), data (base64), array and dictionary (iOS; of typed values)",
+         bool, string_set (Android), date (ISO 8601), data (base64), array and dictionary (iOS; of typed values), and the \
+         read-only unsupported {native, raw} for what no type holds exactly. iOS reads integers as long and reals as double. \
+         Without store, each store answers {store, values} or {store, error}",
     ),
     (
         "prefs_write",
-        "device, app, store, key, value, type(string|int|long|float|double|bool|string_set|date|data|array|dictionary)",
+        "device, bundle_id, store, key, value, type(string|int|long|float|double|bool|string_set|date|data|array|dictionary)",
         "Set one key to a typed value (refused when the value isn't of its type or the store can't hold the type); visible says \
-         whether the running app sees it now or after_relaunch, with a note on why",
+         whether the app sees it now or after_relaunch, app what was done to the app for it (untouched, stopped, relaunched: \
+         a running Android app writes its old values back over the file), with a note on why",
     ),
-    ("prefs_delete", "device, app, store, key", "Remove one key; visible as prefs_write's"),
+    ("prefs_delete", "device, bundle_id, store, key", "Remove one key; visible and app as prefs_write's"),
     (
         "prefs_batch",
-        "device, app, store, ops([{key, type, value} | {key, delete: true}])",
+        "device, bundle_id, store, ops([{key, type, value} | {key, delete: true}])",
         "Set and remove several keys of one store, all or nothing: every op is checked first (each key once), then the store \
          is written once or not at all",
     ),
     (
         "prefs_watch",
-        "device, app, store?, cursor?, wait_ms?",
+        "device, bundle_id, store?, cursor?, wait_ms?",
         "Changes to an app's preference stores (or one), as `logs` stream does: the first call starts a feed in this process and \
          returns a cursor; a call with it returns the changes since, {store, key, old, new, at}, oldest first, waiting up to \
-         wait_ms (at most 60000) for one, and the next cursor (reset: the feed restarted, re-read; missed: changes dropped unread; \
-         ended: the device stopped). A feed nobody reads for 5 minutes stops",
+         wait_ms (at most 60000) for one, and the next cursor (reset: the feed restarted, re-read; missed: changes dropped unread \
+         past its 16 MiB; ended: the device stopped or nobody read it for 5 minutes, and a call without a cursor starts anew)",
     ),
     ("crash_reports", "device", "Host crash reports for this device"),
     ("info", "device", "Paths and identity"),

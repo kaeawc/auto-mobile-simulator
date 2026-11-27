@@ -43,7 +43,7 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         "button" if method == "stylus" => Bool,
         "devices" | "args" | "commands" => Strings,
         // prefs_*
-        "app" | "store" | "cursor" => Str,
+        "store" | "cursor" => Str,
         "wait_ms" => Int,
         "ops" => Objects,
         "device" | "platform" | "form_factor" | "name" | "device_type" | "runtime" | "system_image" | "path" | "url" | "bundle_id"
