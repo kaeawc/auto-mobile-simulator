@@ -20,6 +20,11 @@ extend-ignore-re = [
 ]
 
 [default.extend-words]
+# Fragments typos splits out of real tokens: "PNGs" (PN), Linux's KEY_102ND (ND), lsof's `-F pcPnT`
+# field letters (Pn), and two-letter hex/register fragments (BA).
+pn = "pn"
+nd = "nd"
+ba = "ba"
 # A simulator's unique device identifier (simctl, CoreSimulator).
 udid = "udid"
 # Kernel log levels (KERN_CRIT): "emergencies, alerts, criticals".
