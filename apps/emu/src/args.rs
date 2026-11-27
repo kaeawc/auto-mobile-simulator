@@ -1,5 +1,6 @@
 //! The SDK emulator's command line: single-dash long flags, some taking a value.
 use anyhow::{Result, bail};
+use emu_vmm::pipe::camera::{Facing, SourceSpec};
 
 pub const USAGE: &str = "\
 usage: emu -avd NAME [options]
@@ -65,6 +66,10 @@ options:
                     isn't shaped yet
   -netdelay D       initial network latency: gsm, gprs, edge, umts, ..., none (default), <ms> or
                     <min>:<max>; reported the same way
+  -camera-back S    the back camera's source: emulated (the test card), webcam0 (the host's first
+                    camera; webcam1, ...), none, or a simee source id (pattern:testcard, qr:TEXT,
+                    text:TEXT, image:PATH, solid:COLOUR, webcam:NAME); default hw.camera.back
+  -camera-front S   the same for the front camera (default hw.camera.front)
 Other SDK emulator flags are accepted.
 ";
 
@@ -72,8 +77,6 @@ Other SDK emulator flags are accepted.
 const IGNORED_WITH_VALUE: &[&str] = &[
     "ports",
     "grpc",
-    "camera-back",
-    "camera-front",
     "packet-streamer-endpoint",
     "feature",
     "virtualscene-poster",
@@ -159,6 +162,9 @@ pub struct Opts {
     pub tag: Option<String>,
     pub abi: Option<String>,
     pub dry_run: bool,
+    /// `-camera-back`, `-camera-front`: the stock camera value or a simee source id, checked.
+    pub camera_back: Option<String>,
+    pub camera_front: Option<String>,
     /// Flags accepted for compatibility but not implemented.
     pub ignored: Vec<String>,
 }
@@ -235,6 +241,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
             "tag" => o.tag = Some(value(flag)?),
             "abi" => o.abi = Some(value(flag)?),
             "dry-run" => o.dry_run = true,
+            "camera-back" | "camera-front" => {
+                let v = value(flag)?;
+                if let Err(e) = emu_vmm::pipe::camera::parse_link(&v) {
+                    bail!("invalid -{flag} value '{v}': {e}");
+                }
+                *if flag == "camera-back" { &mut o.camera_back } else { &mut o.camera_front } = Some(v);
+            }
             // Everything after -qemu belongs to QEMU, which we aren't.
             "qemu" => {
                 let rest: Vec<String> = it.by_ref().collect();
@@ -248,6 +261,50 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
         }
     }
     Ok(o)
+}
+
+impl Opts {
+    /// What each camera links to at start: its flag, else `hw.camera.back` / `hw.camera.front`
+    /// from config.ini (`config`), else none. A config value that isn't a source is reported and
+    /// skipped; flags were checked when parsed.
+    pub fn camera_links(&self, config: impl Fn(&str) -> Option<String>) -> Vec<(Facing, Option<SourceSpec>)> {
+        [(Facing::Back, &self.camera_back), (Facing::Front, &self.camera_front)]
+            .into_iter()
+            .map(|(facing, flag)| {
+                let key = format!("hw.camera.{}", facing.dir());
+                let parsed = match flag {
+                    Some(value) => (value.clone(), emu_vmm::pipe::camera::parse_link(value)),
+                    None => {
+                        let value = config(&key).unwrap_or_default();
+                        let link = config_link(&key, &value);
+                        (value, link)
+                    }
+                };
+                let (value, link) = parsed;
+                let link = link.unwrap_or_else(|e| {
+                    eprintln!("emu: {key}={value} isn't a camera source ({e}); the {} camera is off", facing.dir());
+                    None
+                });
+                (facing, link)
+            })
+            .collect()
+    }
+}
+
+/// A `hw.camera.*` value from an AVD's config.ini as a link. A real host camera is never opened
+/// implicitly from a config file (that triggers the camera permission and light): `emulated`,
+/// `virtualscene`, `videoplayback`, `webcam0`, `webcamN` and any other bare word are the test
+/// card, and only an explicit choice (a `-camera-*` flag, the console's `camera link`, or a simee
+/// source id such as `webcam:obs` in the file) links a host camera.
+fn config_link(key: &str, value: &str) -> Result<Option<SourceSpec>, String> {
+    let v = value.trim();
+    if matches!(v, "" | "none" | "emulated" | "virtualscene") || v.contains(':') {
+        return emu_vmm::pipe::camera::parse_link(v);
+    }
+    eprintln!(
+        "emu: {key}={v} in config.ini isn't opened implicitly; using the test card (use -camera-back/-camera-front {v} or `camera link` for a host camera)"
+    );
+    emu_vmm::pipe::camera::parse_link("pattern:testcard")
 }
 
 fn parse_lcd(v: &str) -> Result<(u32, u32, u32)> {
@@ -348,6 +405,43 @@ mod tests {
         assert!(!p("-avd pixel").network.is_shaped());
         assert!(parse(["-netspeed".to_string(), "warp".to_string()]).is_err());
         assert!(parse(["-netdelay".to_string(), "slow".to_string()]).is_err());
+    }
+
+    #[test]
+    fn camera_flags_link_sources() {
+        let o = p("-avd pixel -camera-back emulated -camera-front qr:hello -port 5570");
+        assert_eq!((o.camera_back.as_deref(), o.camera_front.as_deref()), (Some("emulated"), Some("qr:hello")));
+        assert!(o.ignored.is_empty() && o.port == Some(5570));
+        let config = |k: &str| (k == "hw.camera.front").then(|| "none".to_string());
+        let links = o.camera_links(config);
+        assert_eq!(links[0], (Facing::Back, Some(SourceSpec::parse("pattern:testcard").expect("card"))));
+        assert_eq!(links[1], (Facing::Front, Some(SourceSpec::Qr("hello".into()))), "the flag wins over config.ini");
+
+        // No flags: config.ini's stock values; one that isn't a source is off.
+        let config = |k: &str| Some(if k == "hw.camera.back" { "virtualscene" } else { "bogus:x" }.to_string());
+        let links = p("-avd pixel").camera_links(config);
+        assert!(links[0].1.is_some() && links[1].1.is_none());
+        assert_eq!(p("-avd pixel").camera_links(|_| None), vec![(Facing::Back, None), (Facing::Front, None)]);
+        assert!(p("-camera-back webcam0").camera_back.is_some(), "a host camera, resolved when the guest opens it");
+        assert!(parse(["-camera-back".to_string(), "bogus:x".to_string()]).is_err());
+    }
+
+    #[test]
+    fn config_ini_never_opens_a_host_camera() {
+        let card = Some(SourceSpec::parse("pattern:testcard").expect("card"));
+        let cfg = |v: &'static str| move |_: &str| Some(v.to_string());
+        for v in ["emulated", "virtualscene", "webcam0", "webcam3", "videoplayback", "somename"] {
+            let links = p("-avd pixel").camera_links(cfg(v));
+            assert_eq!((links[0].1.clone(), links[1].1.clone()), (card.clone(), card.clone()), "{v}");
+        }
+        assert_eq!(p("-avd pixel").camera_links(cfg("none")), vec![(Facing::Back, None), (Facing::Front, None)]);
+        // A simee source id in config.ini is explicit.
+        let links = p("-avd pixel").camera_links(cfg("webcam:obs"));
+        assert_eq!(links[0].1, Some(SourceSpec::Webcam("obs".into())));
+        // So is a flag, for its own camera only.
+        let links = p("-avd pixel -camera-back webcam0").camera_links(cfg("webcam1"));
+        assert_eq!(links[0].1, Some(SourceSpec::Webcam("webcam0".into())));
+        assert_eq!(links[1].1, card, "the front camera's config.ini value stays the test card");
     }
 
     #[test]

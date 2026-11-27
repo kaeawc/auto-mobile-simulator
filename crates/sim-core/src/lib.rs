@@ -31,3 +31,4 @@ pub mod support;
 pub mod vhal;
 pub mod worker;
 pub mod xr;
+pub mod yuv;

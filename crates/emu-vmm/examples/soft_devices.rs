@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     registry.register("qemud:gps", Box::new(simee_emu_vmm::pipe::gps::GpsService { gps: Arc::default() }));
     registry.register("multidisplay", Box::new(simee_emu_vmm::pipe::misc::Silent("multidisplay")));
-    registry.register("qemud:camera", Box::new(simee_emu_vmm::pipe::fingerprint::CameraService));
+    registry.register("qemud:camera", Box::new(simee_emu_vmm::pipe::camera::CameraService::new(None)));
     registry.register("GLProcessPipe", Box::new(GlProcess::default()));
     let on_last_ref = gpu.as_ref().map(|(_, _, _, r)| -> simee_emu_vmm::devices::goldfish_pipe::OnLastRef {
         let r = r.clone();

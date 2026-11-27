@@ -2091,6 +2091,7 @@ dependencies = [
  "flate2",
  "libc",
  "rustix",
+ "simee-camera",
  "simee-core",
  "simee-emu-fdt",
  "simee-emu-gfxstream",

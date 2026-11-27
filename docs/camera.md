@@ -2,10 +2,10 @@
 
 `crates/sim-camera` (`simee-camera`) is the host side of device cameras: a catalog of the host's
 cameras and the synthetic sources, one source id scheme for all of them, and a capture hub that
-feeds any number of consumers from one capture per source. Nothing links it yet: the API methods
-and CLI (`camera_sources`, `camera_link`, #323), the Android camera HAL (#321) and the iOS capture
-shim (#322) build on it. The plan is epic #319; the iOS background is
-[research/audio-camera.md](research/audio-camera.md) §3.
+feeds any number of consumers from one capture per source. `emu`'s Android camera HAL service
+([below](#android-the-goldfish-camera-hal)) links it; the API methods and CLI (`camera_sources`,
+`camera_link`, #323) and the iOS capture shim (#322) build on it next. The plan is epic #319; the
+iOS background is [research/audio-camera.md](research/audio-camera.md) §3.
 
 ## What exists
 
@@ -89,6 +89,107 @@ first and fails with an error that names the fix instead:
 Only `tcc::request_access` can show the prompt, and nothing calls it implicitly; the tests read
 the status and never prompt. Synthetic sources need no permission. The permission errors are
 tested with a fake status (`tcc::Authorizer`).
+
+## Android: the goldfish camera HAL
+
+`emu` serves the goldfish camera protocol on `qemud:camera` (`crates/emu-vmm/src/pipe/camera.rs`),
+so an unmodified system image's camera HAL sees the cameras linked to it.
+
+### Linking
+
+| Flag | config.ini | Values |
+|---|---|---|
+| `-camera-back S` | `hw.camera.back` | `emulated` or `virtualscene` (the test card, `pattern:testcard`), `webcam0`, `webcam1`, ... (the host's cameras by index), `none`, or any source id above (`qr:hello`, `webcam:obs`, ...) |
+| `-camera-front S` | `hw.camera.front` | the same |
+
+A flag wins over config.ini; neither means no camera. A bad flag fails the launch; a bad
+config.ini value is reported and that camera is off. A webcam id is resolved, and its permission
+checked, when the guest opens the camera, not at launch.
+
+A host camera is never opened implicitly from an AVD's config.ini (opening it triggers the macOS
+camera permission and the camera light). From config.ini, `emulated`, `virtualscene`,
+`videoplayback`, `webcam0`, `webcamN` and any other bare word mean `pattern:testcard`, `none` means
+no camera, and `emu` logs one line when it substitutes the test card for a webcam or another
+non-test-card value. A host camera needs an explicit choice: a `-camera-back` / `-camera-front`
+flag (`-camera-back webcam0`), the console's `camera link`, or a simee source id in the file
+(`hw.camera.back=webcam:obs`). Stock semantics are kept for `emulated`, `virtualscene` and `none`.
+
+### Limits
+
+Each camera allows 4 open sessions; opens of a name that matches no camera, or beyond the cap, are
+answered `ko` on the spot without a thread. The guest may start only the frame sizes `list`
+offered (up to 1280x720) and gets `ko` for others, including in `offset=` frames. One query is in
+flight per session: a query sent before the guest has read the previous reply is answered
+`ko:busy` without producing a frame, and a guest that keeps doing so has its pipe closed, so host
+memory per session is bounded by one frame. A source that fails to open or dies mid-stream shows
+the test card ("source missing" in the log) and is retried every 0.5 s, doubling to 8 s, instead
+of freezing on its last frame. A frame whose size doesn't match is `ko:conversion failed`, never
+zeros.
+
+The console relinks while the guest runs, and while it has the camera open:
+
+```bash
+adb -s emulator-5554 emu camera list                 # back: pattern:testcard / front: none
+adb -s emulator-5554 emu camera link back qr:hello   # shows on the guest's next frame
+adb -s emulator-5554 emu camera link front none
+```
+
+A relink keeps the size the guest opened the camera at: the new source is drawn (a synthetic one)
+or fitted (a camera) to it. Unlinking an open camera keeps its last frame until the guest closes
+it. The guest's provider reads `list` once, when it starts, so a camera linked after boot that
+wasn't linked at boot appears only after the provider restarts (a reboot); one linked at boot can
+be relinked freely.
+
+### Protocol
+
+Queries are NUL-terminated; replies are an 8-hex-digit length and a payload: `ok\0`,
+`ok:<data>`, or `ko:<reason>\0`.
+
+| Pipe | Query | Reply |
+|---|---|---|
+| `qemud:camera` | `list` | one line per linked camera: `name=simee-back channel=0 pix=<NV21> dir=back framedims=1280x720,640x480,352x288,320x240,176x144` (back first); `ok\0` when none |
+| `qemud:camera:name=<name>` | `connect`, `disconnect`, `stop` | `ok` |
+| | `start dim=WxH pix=<fourcc>` (API 30–33) or `start` (API 34+) | `ok`; NV21, NV12, YV12, YU12 (I420) and RGB32 are accepted |
+| | `frame video=<n> preview=<n> whiteb=.. expcomp=.. time=..` (API 30–33) | `ok:` then the frame in the started format, then an RGB32 preview, each when its size is non-zero (and must match the started size) |
+| | `frame dim=WxH pix=<fourcc> offset=<n> ...` (both HALs; the only one API 34+ sends) | the frame is written into the guest's gralloc buffer at `offset` in the goldfish address-space area; `ok` |
+
+Pixel formats are V4L2 fourccs as decimals. RGB32 is R, G, B, A bytes, as the HAL reads it into
+RGBA_8888 buffers; YUV is BT.601 limited range with 2x2-averaged chroma, as stock's converters
+make it (`sim_core::yuv`). `whiteb` and `expcomp` are ignored (sources are drawn as they are), and
+no frame timestamp is returned, so the HAL stamps frames with its own clock. Each session answers
+from a thread of its own, so a source's first frame (up to 500 ms) or a conversion never stalls
+the pipe transport that also carries adb. `EMU_CAMERA_LOG=1` logs every query; without it emu logs
+the session queries and the first three frames after each start.
+
+The offset path needs the address-space device, which emu has with graphics; without it (`-gpu
+off`, the software device path) offset frames answer `ko`, so API 34+ guests get no camera frames
+there.
+
+Orientation isn't part of `list`: the guest HAL fixes it (the API 34+ provider reports 90° for the
+back camera and 270° for the front, which it also mirrors), so a portrait app shows a landscape
+source turned, as stock does with `webcam0`.
+
+### System images
+
+From the images' vendor partitions (`strings` on `vendor.img`) and boots under emu:
+
+| API | Camera HAL | Frame path | Properties it reads |
+|---|---|---|---|
+| 30 | libhardware `camera.ranchu` (EmulatedQemuCamera3) | `video=`/`preview=`, or `offset=` | `ro.kernel.qemu.camera_protocol_ver`, `ro.kernel.qemu.camera_hq_edge_processing`, `ro.kernel.qemu.legacy_fake_camera`, `qemu.sf.fake_camera`, `qemu.camera.webcam.orientation`, `qemu.camera.fake.orientation` |
+| 31–33 | the same | the same | as API 30 with `ro.boot.qemu.*` for `ro.kernel.qemu.*`, and `vendor.qemu.sf.fake_camera` |
+| 34–36 (and 37) | AIDL `android.hardware.camera.provider.ranchu` | `offset=` only, RGB32 buffers (it converts to YUV and JPEG itself) | `ro.boot.qemu.camera_hq_edge_processing`, `ro.boot.qemu.legacy_fake_camera`, `vendor.qemu.sf.fake_camera` |
+
+None of the properties is needed for the qemud cameras: emu sets none, the provider waits a
+moment for `vendor.qemu.sf.fake_camera` and goes on, and `qemu.sf.fake_camera` unset means none
+of the HAL's own fake cameras, so every camera is one of simee's.
+
+Verified on an API 36 google_apis AVD booted by emu (`-camera-back emulated -camera-front
+solid:orange`): the stock Camera app (`am start -a android.media.action.STILL_IMAGE_CAMERA`) shows
+the test card with its counter advancing at 30 fps (frame 178 to 755 in 19 s), `camera link back
+qr:hello` shows the QR code within a second, and the front camera shows its own source throughout.
+On an API 33 google_apis AVD the libhardware HAL starts the back camera with `start dim=1280x720
+pix=<YU12>` and reads `frame video=1382400 preview=0 ... time=1`: the same app shows the test card
+and the relink to `qr:hello`.
 
 ## Not yet
 
