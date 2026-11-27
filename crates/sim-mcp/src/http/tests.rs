@@ -938,7 +938,7 @@ fn hosts_origins_and_tokens_parse() {
     assert_eq!(bearer("Bearer abc"), Some("abc"));
     assert_eq!(bearer("bearer  abc "), Some("abc"));
     assert_eq!(bearer("Basic abc"), None);
-    assert!(same(b"abc", b"abc") && !same(b"abc", b"abd") && !same(b"abc", b"ab"));
+    assert!(same(b"abc", b"abc") && !same(b"abc", b"abx") && !same(b"abc", b"ab"));
 }
 
 fn discover_request(addr: SocketAddr, framing: &str, body: &str) -> String {
