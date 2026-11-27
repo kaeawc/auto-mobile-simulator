@@ -37,12 +37,12 @@ You move the camera with the pointer (#155):
 |---|---|
 | Drag beside the device (anywhere the pointer is an open hand) | Orbit: the body turns with the pointer; the tilt stops 80° above or below |
 | ⇧-drag, or a two-finger trackpad drag | Pan: the body follows the fingers, up to half the stage off centre |
-| Mouse wheel, ⌘-scroll, or pinch | Zoom, up to 4x in or out |
-| Two-finger trackpad rotation | Spins the device with the fingers, settling on the nearest quarter turn |
+| Mouse wheel, ⌘-scroll, or pinch | Zoom, up to 4x in or out, though never so close that the camera enters the body |
+| Two-finger trackpad rotation | Spins the device with the fingers (from the front or from behind), settling on the nearest quarter turn |
 | ⌘0, or the toolbar's Face on | Face on: the screen at 1:1, exactly where the flat view draws it, with the device turned back upright and to the front |
 | ⌘1, ⌘2, ⌘4, ⌘5 | Saved views: 3/4, front, side, back (⌘3 is the toggle) |
 | ⌘F, or the toolbar's Flip | Turns the device over to its back, and again to its front |
-| ⌘[ / ⌘] | Turns the device a quarter counter-clockwise / clockwise in the scene. This is the body only: the toolbar's Rotate still turns the guest |
+| ⌘[ / ⌘] | Turns the device a quarter counter-clockwise / clockwise as seen on screen, from any side. This is the body only: the toolbar's Rotate still turns the guest |
 
 A drag that starts on the drawn screen belongs to the device. Touches through the projection
 come with #156; until then such a drag only says so in the status line. Hold ⌥ to orbit from
@@ -53,10 +53,12 @@ keys above are ⌘ shortcuts the device doesn't use.
 Face on is the "2D" view of #253. The fitted views frame the whole body. Face on frames the
 live screen at one backdrop pixel per window pixel instead, at any window size: in the demo
 scene its screen is pixel-identical to the flat view's. Every change (a key, a button, the end of
-a rotation) moves through one eased, interruptible transition of about 250 ms (`scene::Motion`
-of a `scene::Camera` or `scene::Turn`, read at the window's clock). A new change sets off from
-wherever the last one had reached, and a drag stops it there. Scripted timelines (#254) reuse
-it. Nothing redraws while nothing moves: `poll` asks for frames only while a transition runs,
+a rotation) moves through one eased, interruptible transition of about 250 ms (`scene::Motion`,
+read at the window's clock). The camera, the flip and the spin are separate tracks, so a spin
+during a flip leaves the flip to land. A new change sets off from wherever the last one on its
+track had reached, and a drag stops the camera there; scroll momentum carries on only a scroll
+nothing has taken over from. Scripted timelines (#254) reuse it, with `Motion::go_with` to pick
+each step's easing. Nothing redraws while nothing moves: `poll` asks for frames only while a transition runs,
 plus one to land it. This view moves one device; arranging several in one scene is #155's part 3.
 
 When a screen is on the back of the device (a folded book's cover screen), every view looks at

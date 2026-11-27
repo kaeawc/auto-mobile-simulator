@@ -88,6 +88,10 @@ pub const FOVY: f32 = 24.0 * PI / 180.0;
 /// the body's box inside it from wherever the camera looks, so an orbit keeps the body whole
 /// (the distance follows the angle continuously; it never jumps).
 const FILL: f32 = 0.88;
+/// How far outside the body's bounding sphere the eye always stays, as a fraction of its radius:
+/// however far a zoom brings the camera in (face on at 1:1 it is close) and wherever an orbit
+/// takes it, the eye is never inside the body and the near plane never cuts it.
+const CLEARANCE: f32 = 0.05;
 /// How far the camera may tilt above or below the body.
 pub const PITCH_LIMIT: f32 = 80.0 * PI / 180.0;
 /// Zoom, stops (powers of two) either side of the framing.
@@ -237,7 +241,6 @@ impl Camera {
         let exact = f.screen_h.max(0.01) * h / (2.0 * t * f.flat[2].max(1.0));
         let blend = self.one_to_one.clamp(0.0, 1.0);
         let base = (fit.ln() * (1.0 - blend) + exact.ln() * blend).exp();
-        let d = base / self.zoom.exp2();
         // Pans and the flat screen's offset from the slot's centre, as world mm at the target.
         let per_height = 2.0 * base * t;
         let px = (self.pan[0] + blend * f.flat[0] / h) * per_height;
@@ -245,12 +248,27 @@ impl Camera {
         let right = self.world([1.0, 0.0, 0.0], back);
         let up = self.world([0.0, 1.0, 0.0], back);
         let target = add(add(lerp3(f.center, f.screen, blend), scale(right, -px)), scale(up, py));
+        let d = (base / self.zoom.exp2()).max(outside(f, target, self.world([0.0, 0.0, 1.0], back)));
         let reach = (length(f.half) + length(add(target, scale(f.center, -1.0)))) * 1.05;
         let (near, far) = ((d - reach).max(d * 0.02).max(0.1), d + reach.max(1.0));
         let view = mul(&mul(&translate([0.0, 0.0, -d]), &self.rotation(back)), &translate(target.map(|c| -c)));
         let eye = add(target, self.world([0.0, 0.0, d], back));
         (mul(&perspective(FOVY, aspect, near, far), &view), eye)
     }
+}
+
+/// The least distance back from `target` along `toward_eye` (a unit vector) that keeps the eye
+/// outside the body's bounding sphere, [`CLEARANCE`] beyond it: the far side of where that ray
+/// crosses the sphere, and where it misses no nearer than the foot of the perpendicular from the
+/// centre (a few mm at most: the target is near the body). The two meet at a tangent ray, so it
+/// follows the angle and the target continuously: a zoom or an orbit that meets it slides along
+/// the sphere instead of jumping.
+fn outside(f: &Framing, target: [f32; 3], toward_eye: [f32; 3]) -> f32 {
+    let r = length(f.half) * (1.0 + CLEARANCE);
+    let o = add(target, scale(f.center, -1.0));
+    let along: f32 = (0..3).map(|k| o[k] * toward_eye[k]).sum();
+    let gap = along * along - (length(o).powi(2) - r * r);
+    (gap.max(0.0).sqrt() - along).max(0.0)
 }
 
 /// What a frame's camera frames, world mm (the body as its placement lays it, under its

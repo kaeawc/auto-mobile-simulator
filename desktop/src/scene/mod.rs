@@ -168,12 +168,15 @@ enum Grab {
 }
 
 /// The 3D view's camera and device transform, and the input that moves them (see the module
-/// docs). Both are [`Motion`]s read at `clock`, the window's clock at the last `poll`, so the
-/// compositor draws what `poll` last saw.
+/// docs). Each is its own [`Motion`] track (the camera, the flip, the spin), read at `clock`, the
+/// window's clock at the last `poll`, so the compositor draws what `poll` last saw; a change on
+/// one track never stops or re-times another.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct View {
     pub camera: Motion<Camera>,
-    pub turn: Motion<Turn>,
+    /// The device's [`Turn`], a track each: turned over, and rolled about the view axis.
+    pub flip: Motion<f32>,
+    pub spin: Motion<f32>,
     pub clock: f64,
     /// A motion was on its way at the last step, so the next one draws its end.
     moving: bool,
@@ -185,6 +188,12 @@ pub struct View {
     pub screen_quad: Option<[[f32; 2]; 4]>,
     /// The pointer is over the drawn screen (no open hand there).
     pub over_screen: bool,
+    /// The screen shown faces -z, so the camera looks from behind at every yaw (a folded book's
+    /// cover screen): set from the state before a spin, which turns the way it looks.
+    pub back: bool,
+    /// The user's own scroll is under way: macOS momentum after it carries the camera on, but
+    /// stops counting once a change of view or a grab takes over.
+    scrolling: bool,
 }
 
 /// Zoom per point of a precise scroll, as Rune's Ctrl + wheel zoom: `1 + dy / 200`.
@@ -201,20 +210,44 @@ impl View {
     }
 
     pub fn turn_now(&self) -> Turn {
-        self.turn.at(self.clock)
+        self.turn_at(self.clock)
+    }
+
+    /// The device's turn at clock `now`.
+    pub fn turn_at(&self, now: f64) -> Turn {
+        Turn { flip: self.flip.at(now), spin: self.spin.at(now) }
+    }
+
+    /// Where the turn is going.
+    fn turn_target(&self) -> Turn {
+        Turn { flip: self.flip.target(), spin: self.spin.target() }
+    }
+
+    /// 1 when the camera looks at the device's front at `now`, -1 from behind (past a quarter
+    /// orbit, the back view, a back-face screen): a spin about the scene's z looks the other way
+    /// round from there, so a spin asked for as seen on screen turns by this sign.
+    fn spin_sign(&self, now: f64) -> f32 {
+        if self.camera.at(now).world([0.0, 0.0, 1.0], self.back)[2] < 0.0 { -1.0 } else { 1.0 }
     }
 
     /// Starts `c` at clock `now`.
     pub fn command(&mut self, c: Command, now: f64) {
-        let turn = self.turn.at(now);
+        // A change of view takes over from a scroll still coasting.
+        self.scrolling = false;
         match c {
             Command::FaceOn => {
+                let home = self.turn_at(now).home();
                 self.camera.go(Camera::preset(Preset::Face), now, DURATION);
-                self.turn.go(turn.home(), now, DURATION);
+                self.flip.go(home.flip, now, DURATION);
+                self.spin.go(home.spin, now, DURATION);
             }
             Command::View(p) => self.camera.go(Camera::preset(p), now, DURATION),
-            Command::Flip => self.turn.go(self.turn.target().flip(), now, DURATION),
-            Command::Spin(q) => self.turn.go(self.turn.target().spin_by(q), now, DURATION),
+            Command::Flip => self.flip.go(self.turn_target().flip().flip, now, DURATION),
+            Command::Spin(q) => {
+                // Clockwise as seen on screen, from whichever side the camera is on.
+                let q = if self.spin_sign(now) < 0.0 { -q } else { q };
+                self.spin.go(self.turn_target().spin_by(q).spin, now, DURATION);
+            }
         }
     }
 
@@ -229,7 +262,7 @@ impl View {
 
     /// A motion is still on its way at the last step: `poll` asks for the next frame.
     pub fn moving(&self) -> bool {
-        self.camera.moving(self.clock) || self.turn.moving(self.clock)
+        self.camera.moving(self.clock) || self.flip.moving(self.clock) || self.spin.moving(self.clock)
     }
 
     /// A press on the drawn screen, at slot point `p`.
@@ -253,8 +286,10 @@ impl View {
             if grab == Grab::Screen {
                 return Some(SCREEN_DRAG);
             }
-            // A grab holds the camera where it is: a running change stops there.
+            // A grab holds the camera where it is: a running change stops there, and so does a
+            // scroll's momentum.
             self.camera.set(self.camera.at(now));
+            self.scrolling = false;
             return None;
         }
         let camera = self.camera.at(now);
@@ -281,8 +316,14 @@ impl View {
     }
 
     /// A wheel or two-finger scroll: a trackpad's (point-precise) pans, a mouse wheel's notches
-    /// or a ⌘-scroll zoom.
+    /// or a ⌘-scroll zoom. Momentum (macOS coasting after the fingers lift) only carries on a
+    /// scroll of the user's that nothing has taken over from since: after a change of view or a
+    /// grab it is dropped, so it can't stop a transition partway.
     pub fn wheel(&mut self, e: &WheelEvent, now: f64) {
+        if e.momentum && !self.scrolling {
+            return;
+        }
+        self.scrolling = true;
         let camera = self.camera.at(now);
         let next = if e.mods.cmd || !e.precise {
             camera.zoom_by((1.0 + e.dy * ZOOM_PER_POINT).max(0.1).log2())
@@ -298,14 +339,15 @@ impl View {
         self.camera.set(camera.zoom_by((1.0 + e.delta).max(0.1).log2()));
     }
 
-    /// A two-finger rotation spins the device with the fingers, and settles on the nearest
-    /// quarter turn when they lift.
+    /// A two-finger rotation spins the device with the fingers as seen on screen, from either
+    /// side, and settles on the nearest quarter turn when they lift. Only the spin: a flip still
+    /// on its way lands as it would have.
     pub fn rotate(&mut self, e: &RotateEvent, now: f64) {
-        let turn = self.turn.at(now);
+        let spin = self.spin.at(now);
         match e.phase {
             GesturePhase::Began => {}
-            GesturePhase::Moved => self.turn.set(Turn { spin: turn.spin + e.degrees.to_radians(), ..turn }),
-            GesturePhase::Ended => self.turn.go(turn.spin_by(0), now, DURATION),
+            GesturePhase::Moved => self.spin.set(spin + self.spin_sign(now) * e.degrees.to_radians()),
+            GesturePhase::Ended => self.spin.go(Turn { spin, flip: 0.0 }.spin_by(0).spin, now, DURATION),
         }
     }
 }
@@ -330,6 +372,12 @@ pub fn body_for(s: &State) -> Option<Arc<Body>> {
 /// The body to draw when the 3D view is on and the screen is showing.
 pub fn active(s: &State) -> Option<Arc<Body>> {
     (s.view3d.on && s.showing_screen()).then(|| body_for(s)).flatten()
+}
+
+/// Whether the screen the 3D view shows faces -z, so its camera looks from behind (a folded
+/// book's cover screen): what [`View::back`] is set from before a spin.
+pub fn shows_back(s: &State) -> bool {
+    active(s).and_then(|b| place(&b, s.screen_size(), s.screen_rotation()).map(|p| gpu::facing_back(&b, &p))).unwrap_or(false)
 }
 
 /// The slot laid over the stage while the 3D view is on: it covers the flat screen (still laid
@@ -383,6 +431,7 @@ pub fn slot(inset: f32, aspect: f32, view: &View) -> El {
             true
         })
         .on_rotate(|s: &mut State, e: RotateEvent, tx: &mut Tx| {
+            s.view3d.view.back = shows_back(s);
             s.view3d.view.rotate(&e, tx.clock());
             true
         })
@@ -766,5 +815,117 @@ mod tests {
         v.rotate(&RotateEvent::new(0.0).phase(GesturePhase::Ended), 0.0);
         v.step(1.0);
         assert!((v.turn_now().spin - std::f32::consts::FRAC_PI_2).abs() < 1e-5, "{:?}", v.turn_now());
+    }
+
+    /// The on-screen angle (radians, counter-clockwise from the right) of the device's top as
+    /// `v`'s camera sees it at its last step.
+    fn top_on_screen(v: &View, back: bool) -> f32 {
+        let f = camera::Framing {
+            center: [0.0; 3],
+            half: [36.0, 75.0, 4.0],
+            screen: [0.0, 0.0, 4.0],
+            screen_h: 140.0,
+            flat: [0.0, 0.0, 1000.0],
+        };
+        let (vp, _) = v.camera_now().solve(&f, (1200, 1200), back);
+        let m = v.turn_now().matrix([0.0; 3]);
+        let c = camera::apply(&vp, camera::apply(&m, [0.0; 3]));
+        let top = camera::apply(&vp, camera::apply(&m, [0.0, 75.0, 0.0]));
+        (top[1] - c[1]).atan2(top[0] - c[0])
+    }
+
+    /// How far it turned from `a` to `b` on screen, counter-clockwise positive, the short way.
+    fn turned(a: f32, b: f32) -> f32 {
+        use std::f32::consts::{PI, TAU};
+        (b - a + PI).rem_euclid(TAU) - PI
+    }
+
+    /// The views a spin is checked from: (name, camera, the screen shown faces the back).
+    fn spin_views() -> [(&'static str, Camera, bool); 4] {
+        [
+            ("front", Camera::preset(Preset::Front), false),
+            ("⌘5 back", Camera::preset(Preset::Back), false),
+            ("orbited 135°", Camera { yaw: 135f32.to_radians(), ..Camera::preset(Preset::Front) }, false),
+            ("a folded book's cover screen", Camera::preset(Preset::Front), true),
+        ]
+    }
+
+    #[test]
+    fn spin_keys_turn_the_way_they_say_on_screen_from_any_side() {
+        for (name, cam, back) in spin_views() {
+            let mut v = View::new(Preset::Front);
+            v.camera.set(cam);
+            v.back = back;
+            let before = top_on_screen(&v, back);
+            v.command(Command::Spin(1), 0.0);
+            v.step(1.0);
+            let after = top_on_screen(&v, back);
+            assert!(turned(before, after) < -0.5, "{name}: ⌘] turns clockwise: {before} -> {after}");
+            v.command(Command::Spin(-1), 1.0);
+            v.command(Command::Spin(-1), 1.05);
+            v.step(2.0);
+            let ccw = top_on_screen(&v, back);
+            assert!(turned(before, ccw) > 0.5, "{name}: ⌘[ ⌘[ ends counter-clockwise of the start: {before} -> {ccw}");
+        }
+    }
+
+    #[test]
+    fn a_trackpad_rotation_turns_the_device_with_the_fingers_from_any_side() {
+        for (name, cam, back) in spin_views() {
+            let mut v = View::new(Preset::Front);
+            v.camera.set(cam);
+            v.back = back;
+            let before = top_on_screen(&v, back);
+            // Counter-clockwise fingers (RotateEvent's degrees are positive counter-clockwise).
+            v.rotate(&RotateEvent::new(0.0).phase(GesturePhase::Began), 0.0);
+            v.rotate(&RotateEvent::new(30.0).phase(GesturePhase::Moved), 0.0);
+            let after = top_on_screen(&v, back);
+            assert!(turned(before, after) > 0.1, "{name}: the device follows the fingers: {before} -> {after}");
+        }
+    }
+
+    #[test]
+    fn a_rotation_during_a_flip_leaves_the_flip_to_land() {
+        let mut v = View::new(Preset::Front);
+        v.command(Command::Flip, 0.0);
+        // Two fingers turn 20° and lift while it's still turning over.
+        v.rotate(&RotateEvent::new(0.0).phase(GesturePhase::Began), 0.05);
+        v.rotate(&RotateEvent::new(20.0).phase(GesturePhase::Moved), 0.1);
+        v.rotate(&RotateEvent::new(0.0).phase(GesturePhase::Ended), 0.15);
+        v.step(1.0);
+        let t = v.turn_now();
+        assert!((t.flip - std::f32::consts::PI).abs() < 1e-5, "turned all the way over, not left edge on: {t:?}");
+        assert!(t.spin.abs() < 1e-5, "20° settles back on the nearest quarter: {t:?}");
+        // And a ⌘] mid-flip doesn't re-time the flip: each lands on its own schedule.
+        let mut v = View::new(Preset::Front);
+        v.command(Command::Flip, 0.0);
+        let mid = v.turn_at(0.2);
+        v.command(Command::Spin(1), 0.1);
+        assert_eq!(v.turn_at(0.2).flip, mid.flip, "the flip runs on as it was");
+    }
+
+    #[test]
+    fn scroll_momentum_continues_a_pan_but_never_freezes_a_view_change() {
+        let mut v = View::new(Preset::ThreeQuarter);
+        v.slot = SLOT;
+        let coast = || {
+            let mut e = WheelEvent::new(20.0, 0.0).precise(true);
+            e.momentum = true;
+            e
+        };
+        // A flick: the fingers pan, then the pan coasts on.
+        v.wheel(&WheelEvent::new(40.0, 0.0).precise(true), 0.0);
+        v.wheel(&coast(), 0.02);
+        assert!((v.camera_now().pan[0] - 60.0 / 800.0).abs() < 1e-6, "momentum carries the user's pan on: {:?}", v.camera_now());
+        // ⌘0 while it's still coasting: the rest of the coast leaves the change alone.
+        v.command(Command::FaceOn, 0.05);
+        v.wheel(&coast(), 0.1);
+        v.wheel(&coast(), 0.15);
+        v.step(1.0);
+        assert_eq!(v.camera_now(), Camera::preset(Preset::Face));
+        // Momentum with no gesture of the user's behind it does nothing either.
+        let mut still = View::new(Preset::Front);
+        still.wheel(&coast(), 0.0);
+        assert_eq!(still.camera_now(), Camera::preset(Preset::Front));
     }
 }

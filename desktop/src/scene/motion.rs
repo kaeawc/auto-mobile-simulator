@@ -1,13 +1,28 @@
 //! Eased, interruptible motion between two values on the window's clock: the one transition the
-//! 3D view's camera ([`super::camera::Camera`]) and device transform ([`super::camera::Turn`])
-//! move by, and what a face-on 2D view (#253) and scripted timelines (#254) reuse.
+//! 3D view's camera ([`super::camera::Camera`]) and the device's flip and spin
+//! ([`super::camera::Turn`]) move by, and what a face-on 2D view (#253) and scripted timelines
+//! (#254) reuse.
 //!
-//! A [`Motion`] holds where a value started, where it is going, when it set off and how long it
-//! takes. [`Motion::at`] reads it at any clock time, so whoever draws (the compositor) and
-//! whoever wakes the window (`poll`) agree on it without stepping state per frame, and a
-//! headless run lands on the same frame every time. [`Motion::go`] sets off from wherever the
-//! value is now, so a new target interrupts a running one without a jump; [`Motion::set`] is
-//! direct manipulation (a drag, a pinch): the value is there at once and nothing runs.
+//! A [`Motion`] is one track: where a value started, where it is going, when it set off, how
+//! long it takes and how it eases. [`Motion::at`] reads it at any clock time, so whoever draws
+//! (the compositor) and whoever wakes the window (`poll`) agree on it without stepping state per
+//! frame, and a headless run lands on the same frame every time.
+//!
+//! - [`Motion::go_with`] sets off toward a target at a clock time, over a duration, with a chosen
+//!   [`Ease`], from wherever the value is then: a new target interrupts a running one without a
+//!   jump. A timeline's step is one call, and it moves the same way whenever it is issued.
+//! - [`Motion::go`] is `go_with` for interactive changes: it picks the ease itself, leaving at
+//!   speed ([`Ease::OutCubic`]) when it interrupts a running motion and easing out of rest
+//!   ([`Ease::InOutCubic`]) otherwise.
+//! - [`Motion::set`] is direct manipulation (a drag, a pinch): the value is there at once and
+//!   nothing runs.
+//! - [`Motion::moving`] says whether it is still on its way (what `poll` and a timeline wait on),
+//!   and [`Motion::target`] where it will rest.
+//!
+//! Each property that moves on its own is its own track (the view keeps the camera, the flip and
+//! the spin apart), so steps on different tracks overlap freely: a spin issued mid-flip runs on
+//! its own clock and leaves the flip's arc, timing and ease alone. Only a step on the same track
+//! interrupts.
 //!
 //! A value only needs [`Lerp`]: a straight blend, and optionally [`Lerp::near`] to pick the
 //! equivalent target closest to the start (an angle the short way round).
@@ -103,8 +118,15 @@ impl<T: Lerp> Motion<T> {
     /// motion still running is interrupted there, with no jump, and the new one leaves at speed
     /// ([`Ease::OutCubic`]); one from rest eases out of it ([`Ease::InOutCubic`]).
     pub fn go(&mut self, to: T, now: f64, duration: f64) {
-        let from = self.at(now);
         let ease = if self.moving(now) { Ease::OutCubic } else { Ease::InOutCubic };
+        self.go_with(to, now, duration, ease);
+    }
+
+    /// Sets off toward `to` at `now`, over `duration` seconds, eased by `ease`, from wherever it
+    /// is at `now` (interrupting a running motion there, with no jump). The same call moves the
+    /// same way whenever it is issued: a scripted step's timing and easing are its own.
+    pub fn go_with(&mut self, to: T, now: f64, duration: f64, ease: Ease) {
+        let from = self.at(now);
         *self = Motion { from, to: to.near(from), start: now, duration: duration.max(0.0), ease };
     }
 
@@ -173,6 +195,35 @@ mod tests {
         m.set(3.0);
         assert_eq!(m.at(0.2), 3.0);
         assert!(!m.moving(0.2));
+    }
+
+    #[test]
+    fn go_with_eases_as_asked_wherever_it_is_issued() {
+        // A step issued as the last one ends and one issued a moment earlier ease the same way.
+        let mut at_end = Motion::still(0.0f32);
+        at_end.go(10.0, 0.0, 0.25);
+        at_end.go_with(20.0, 0.25, 1.0, Ease::Linear);
+        let mut early = Motion::still(0.0f32);
+        early.go(10.0, 0.0, 0.25);
+        early.go_with(20.0, 0.249, 1.0, Ease::Linear);
+        assert!((at_end.at(0.75) - 15.0).abs() < 1e-4, "linear: halfway at half time");
+        assert!((early.at(0.749) - at_end.at(0.75)).abs() < 0.05, "{} {}", early.at(0.749), at_end.at(0.75));
+        for ease in [Ease::Linear, Ease::InOutCubic, Ease::OutCubic] {
+            let mut m = Motion::still(0.0f32);
+            m.go_with(1.0, 2.0, 0.5, ease);
+            assert!((m.at(2.1) - ease.apply(0.2)).abs() < 1e-6, "{ease:?}");
+            assert_eq!(m.at(2.5), 1.0);
+        }
+    }
+
+    #[test]
+    fn separate_tracks_overlap_without_retiming_each_other() {
+        let (mut a, mut b) = (Motion::still(0.0f32), Motion::still(0.0f32));
+        a.go_with(1.0, 0.0, 1.0, Ease::Linear);
+        let alone = a;
+        b.go_with(5.0, 0.4, 0.2, Ease::OutCubic);
+        assert_eq!(a, alone, "a step on another track leaves this one alone");
+        assert!((a.at(0.5) - 0.5).abs() < 1e-6 && b.moving(0.5) && !b.moving(0.61) && a.moving(0.61));
     }
 
     #[test]

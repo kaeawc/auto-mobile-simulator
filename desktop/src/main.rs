@@ -728,6 +728,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             continue;
         }
         if let Action::View3d(c) = action {
+            s.view3d.view.back = scene::shows_back(s);
             s.view3d.view.command(c, t);
             continue;
         }

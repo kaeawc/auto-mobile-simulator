@@ -127,7 +127,7 @@ impl Job {
 
 /// Whether the screen `placement` shows faces -z with the hinge where it puts it: its face's
 /// normal turned by its panel's transform.
-fn facing_back(body: &Body, placement: &Placement) -> bool {
+pub fn facing_back(body: &Body, placement: &Placement) -> bool {
     let Some(screen) = body.screen(placement.display) else { return false };
     let z = if screen.face == Face::Front { 1.0 } else { -1.0 };
     let m = match &body.fold {
@@ -674,5 +674,80 @@ mod tests {
         let spun = phone(Camera::preset(super::super::Preset::Front), Turn::default().spin_by(1)).solve(SLOT, flat);
         let q = spun.screen.unwrap();
         assert!(q[0][0] > SLOT.0 as f32 / 2.0 && q[1][0] > SLOT.0 as f32 / 2.0, "{q:?}");
+    }
+
+    /// `id`'s body showing a `shown` frame turned `turn`, and the flat screen the view lays out
+    /// for it in `slot` (centre offset and height, device pixels).
+    fn shown(id: &str, shown: (u32, u32), turn: sim_core::rotation::Rotation, slot: (u32, u32)) -> (Job, [f32; 3]) {
+        let body = sim_core::body::get(id).unwrap();
+        let placement = super::super::place(&body, shown, turn).unwrap();
+        let mesh = sim_core::body::cached_mesh(&body);
+        let job = Job { back: facing_back(&body, &placement), body, mesh, placement, camera: Camera::default(), turn: Turn::default() };
+        let aspect = shown.0 as f32 / shown.1 as f32;
+        let [x, y, w, h] = super::super::screen_rect([0.0, 0.0, slot.0 as f32, slot.1 as f32], 2.0, [24.0, aspect, 0.0, 0.0]);
+        (job, [x + w / 2.0 - slot.0 as f32 / 2.0, y + h / 2.0 - slot.1 as f32 / 2.0, h])
+    }
+
+    #[test]
+    fn zoomed_in_and_orbited_the_eye_stays_outside_the_body() {
+        use sim_core::rotation::Rotation;
+        let fold = sim_core::body::get("pixel_fold").unwrap();
+        let (inner, outer) =
+            (fold.screen(sim_core::body::Display::Inner).unwrap().px, fold.screen(sim_core::body::Display::Outer).unwrap().px);
+        // A landscape iPhone in a window refitted to it (the flat screen height-limited, 1404 of
+        // 1500 px), and a foldable open and folded shut.
+        let cases = [
+            ("landscape iPhone", (2622, 1206), Rotation::Deg90, (3200, 1500)),
+            ("open fold", inner, Rotation::Deg0, (1700, 1500)),
+            ("folded fold", outer, Rotation::Deg0, (1700, 1500)),
+        ];
+        for (name, px, turn, slot) in cases {
+            let id = if name == "landscape iPhone" { "iPhone-17" } else { "pixel_fold" };
+            let (mut job, flat) = shown(id, px, turn, slot);
+            let (center, half) = job.bounds(&job.root());
+            let radius = (half[0].hypot(half[1])).hypot(half[2]);
+            let dist = |eye: [f32; 3]| ((eye[0] - center[0]).hypot(eye[1] - center[1])).hypot(eye[2] - center[2]);
+            // ⌘0, pinched in all the way, then orbited round and tilted, panned or not.
+            for pan in [[0.0, 0.0], [0.5, -0.5]] {
+                for pitch in [-1.2f32, -0.5, 0.0, 0.6, 1.39] {
+                    let mut last: Option<f32> = None;
+                    for step in -90..=90 {
+                        let yaw = step as f32 * 2f32.to_radians();
+                        job.camera = Camera { yaw, pitch, pan, ..Camera::preset(super::super::Preset::Face).zoom_by(2.0) };
+                        let eye = job.solve(slot, flat).eye;
+                        let d = dist(eye);
+                        assert!(
+                            d > radius * 1.01,
+                            "{name}: the eye is {d} mm from the centre, inside the {radius} mm sphere ({:?})",
+                            job.camera
+                        );
+                        // Smoothly: a 2° step moves the eye a little, never a jump.
+                        if let Some(l) = last {
+                            assert!((d - l).abs() < 0.06 * l, "{name}: {l} -> {d} at yaw {yaw}, pitch {pitch}");
+                        }
+                        last = Some(d);
+                    }
+                }
+            }
+            // Zooming in face on and orbited 100°: the eye comes in, then stops outside.
+            let mut last = f32::MAX;
+            for z in 0..=40 {
+                job.camera = Camera { yaw: 100f32.to_radians(), ..Camera::preset(super::super::Preset::Face).zoom_by(z as f32 / 20.0) };
+                let d = dist(job.solve(slot, flat).eye);
+                assert!(d > radius * 1.01 && d <= last + 1e-3, "{name}: zoom {z}: {last} -> {d}");
+                last = d;
+            }
+        }
+    }
+
+    #[test]
+    fn face_on_at_zoom_zero_is_still_one_to_one_on_a_landscape_phone() {
+        // The pin beside the clamp: the eye is outside the body already, so 1:1 is untouched.
+        let slot = (3200, 1500);
+        let (mut job, flat) = shown("iPhone-17", (2622, 1206), sim_core::rotation::Rotation::Deg90, slot);
+        job.camera = Camera::preset(super::super::Preset::Face);
+        let q = job.solve(slot, flat).screen.expect("face on, the screen faces the camera");
+        let h = (q[3][1] - q[0][1]).abs().max((q[1][1] - q[0][1]).abs());
+        assert!((h - flat[2]).abs() < 0.05, "{q:?} vs {flat:?}");
     }
 }
