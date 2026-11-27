@@ -911,7 +911,7 @@ mod tests {
 
     /// Round trips through the real console server, as `adb emu` and simee make them: one TCP
     /// session per call, pipelined commands, then `quit`.
-    ///     cargo test --release -p emu console_latency -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu console_latency -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn console_latency() {

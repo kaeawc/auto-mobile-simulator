@@ -261,7 +261,7 @@ mod tests {
     }
 
     /// `geo fix` -> sentences on the pipe, median of 21.
-    ///     cargo test --release -p emu-vmm gps_fix_latency -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-vmm gps_fix_latency -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn gps_fix_latency() {

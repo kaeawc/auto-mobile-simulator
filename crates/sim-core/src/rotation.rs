@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(dst, [7; 8]);
     }
 
-    /// Times a turn of a phone-sized frame: `cargo test -p sim-core --release rotate_cost --
+    /// Times a turn of a phone-sized frame: `cargo test -p simee-core --release rotate_cost --
     /// --ignored --nocapture`.
     #[test]
     #[ignore]

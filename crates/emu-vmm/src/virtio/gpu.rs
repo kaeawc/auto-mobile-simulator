@@ -1372,7 +1372,7 @@ mod tests {
     /// One control command through the queue as the worker runs it (pop, read, parse, reply,
     /// write, used), its reply built in a fresh Vec per command (before) vs a header on the
     /// stack and a reused body buffer (now). Interleaved, median of 7.
-    ///     cargo test --release -p emu-vmm gpu_command_cost -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-vmm gpu_command_cost -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn gpu_command_cost() {

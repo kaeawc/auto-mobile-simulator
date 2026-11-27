@@ -24,7 +24,7 @@ case "$shim" in
   *) ;;
 esac
 
-cargo build --release -p emu --manifest-path "$repo/Cargo.toml"
+cargo build --release -p simee-emu --manifest-path "$repo/Cargo.toml"
 mkdir -p "$shim/emulator"
 for entry in "$real"/*; do
   name="$(basename "$entry")"

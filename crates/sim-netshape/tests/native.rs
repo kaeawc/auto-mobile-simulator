@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use sim_netshape::{Profile, Rule};
+use simee_netshape::{Profile, Rule};
 
 /// Builds `native/netshape_test.c` as `name` in this test's scratch directory.
 fn build(name: &str) -> PathBuf {

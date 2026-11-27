@@ -557,7 +557,7 @@ fn per_call_us(mut f: impl FnMut()) -> f64 {
 /// Where a `tools/call`'s time goes in this process, with `sim-api`'s real methods: parsing the
 /// line, the method, shaping its `CallToolResult`, writing the response line; then the whole
 /// request through the server (dispatch to a worker, reply through the sink).
-///     cargo test --release -p sim-mcp tool_call_overhead -- --ignored --nocapture
+///     cargo test --release -p simee-mcp tool_call_overhead -- --ignored --nocapture
 #[test]
 #[ignore = "benchmark"]
 fn tool_call_overhead() {

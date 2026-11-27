@@ -1,11 +1,16 @@
 [package]
-name = "emu-hvf"
+name = "simee-emu-hvf"
 description = "Safe wrappers over Hypervisor.framework (arm64): VM, vCPUs, in-kernel GICv3, guest RAM. The only crate with unsafe code."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["hypervisor", "hvf", "arm64", "macos", "virtualization"]
+categories = ["virtualization", "os::macos-apis"]
+include = ["/Cargo.toml", "/LICENSE", "/src", "/tests"]
 
 [lib]
 doctest = false

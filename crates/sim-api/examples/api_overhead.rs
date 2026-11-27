@@ -6,7 +6,7 @@
 //! and executable, so those are masked first).
 //!
 //!     cargo build --release -p simee
-//!     cargo run --release -p sim-api --example api_overhead -- \
+//!     cargo run --release -p simee-api --example api_overhead -- \
 //!         [--rounds 5] [--socket-dir DIR] before=/path/to/old/simee after=target/release/simee
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;

@@ -5,7 +5,7 @@
 #   scripts/bench/mcp-build.sh [--rmcp VERSION] [--rounds N] [--quick] [--out DIR]
 #
 #   sim-mcp  sim-mcp's direct dependencies that aren't this workspace's own crates
-#            (`cargo tree -p sim-mcp -e normal --depth 1`), and the packages in Cargo.lock
+#            (`cargo tree -p simee-mcp -e normal --depth 1`), and the packages in Cargo.lock
 #   rmcp     a scratch package in the run's work directory (the repo's rust-toolchain.toml, an
 #            empty main) depending on rmcp VERSION (3.11) with default-features = false,
 #            features ["server", "transport-io"], and tokio with rt, macros and io-std: the crates
@@ -34,7 +34,7 @@ bench_start mcp-build
 BENCH_ROUND=1
 cd "$BENCH_REPO" || exit 2
 members=$(cargo metadata --no-deps --format-version 1 | python3 -I -c 'import json, sys; print("\n".join(p["name"] for p in json.load(sys.stdin)["packages"]))')
-deps=$(cargo tree -p sim-mcp -e normal --depth 1 --prefix none 2>/dev/null | awk '{ print $1 }' | sort -u | grep -vxF -f <(printf '%s\n' "$members"))
+deps=$(cargo tree -p simee-mcp -e normal --depth 1 --prefix none 2>/dev/null | awk '{ print $1 }' | sort -u | grep -vxF -f <(printf '%s\n' "$members"))
 bench_log "sim-mcp's direct dependencies outside the workspace: $(printf '%s' "$deps" | tr '\n' ' ')"
 bench_sample sim-mcp "direct dependencies outside the workspace" "$(printf '%s\n' "$deps" | grep -c .)"
 bench_sample sim-mcp "packages in Cargo.lock" "$(grep -c '^\[\[package\]\]' Cargo.lock)"

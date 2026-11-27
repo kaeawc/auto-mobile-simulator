@@ -866,7 +866,7 @@ mod tests {
     }
 
     /// Per-call cost of a device method among many AVDs (the API resolves `device` on every call).
-    ///     cargo test --release -p sim-api api_call_latency -- --ignored --nocapture
+    ///     cargo test --release -p simee-api api_call_latency -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn api_call_latency() {

@@ -7,7 +7,7 @@
 # after the build), then:
 #   workspace  cargo test --no-run                 (the workspace's test build)
 #   desktop    (cd desktop && cargo test --no-run)  (the desktop workspace: Rune's GPU stack)
-#   emu        cargo build --release -p emu         (the release emulator)
+#   emu        cargo build --release -p simee-emu         (the release emulator)
 # Per build: CPU-seconds (user + system of cargo and every child, from getrusage), which load
 # doesn't inflate, and wall seconds, which it does: read wall times with the load the JSON
 # records. The dependencies must already be downloaded (cargo fetch); nothing is fetched here
@@ -50,7 +50,7 @@ for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
         ;;
       emu)
         dir=$BENCH_REPO
-        cmd=(cargo build --release --quiet -p emu)
+        cmd=(cargo build --release --quiet -p simee-emu)
         ;;
       *) bench_die "unknown build $b" ;;
     esac
@@ -65,4 +65,4 @@ for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
     bench_sample "$b" "clean build, wall s" "$wall"
   done
 done
-bench_finish "" "Clean builds into an empty CARGO_TARGET_DIR: workspace = cargo test --no-run, desktop = cd desktop && cargo test --no-run, emu = cargo build --release -p emu."
+bench_finish "" "Clean builds into an empty CARGO_TARGET_DIR: workspace = cargo test --no-run, desktop = cd desktop && cargo test --no-run, emu = cargo build --release -p simee-emu."

@@ -1,7 +1,7 @@
 //! Measures how host memory mapped into a Hypervisor.framework VM can be given back to the host
 //! (`phys_footprint`) and what the guest reads afterwards. Needs Apple silicon and the hypervisor
 //! entitlement (cargo's runner signs test binaries). One VM per process, so run each test on its
-//! own: `cargo test -p emu-hvf --test discard_probe -- --ignored --nocapture --exact <name>` (or
+//! own: `cargo test -p simee-emu-hvf --test discard_probe -- --ignored --nocapture --exact <name>` (or
 //! `cargo nextest run --run-ignored only`, a process per test).
 //!
 //! 64 MiB, half written by the host and half by the guest, M-series, macOS 26 (2026-11-24):
@@ -20,14 +20,14 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #![allow(clippy::undocumented_unsafe_blocks, clippy::unwrap_used)]
 
-use emu_hvf::{Exit, GuestRam, Reg, SysReg, Vcpu, Vm};
+use simee_emu_hvf::{Exit, GuestRam, Reg, SysReg, Vcpu, Vm};
 
 const DATA: u64 = 0x4000_0000;
 const LEN: u64 = 64 << 20;
 const CODE: u64 = 0x8000_0000;
 
 fn footprint() -> u64 {
-    emu_hvf::phys_footprint().unwrap()
+    simee_emu_hvf::phys_footprint().unwrap()
 }
 
 fn mib(b: u64) -> f64 {

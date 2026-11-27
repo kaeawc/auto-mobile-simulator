@@ -1,11 +1,16 @@
 [package]
-name = "sim-core"
+name = "simee-core"
 description = "Pure simee building blocks: device models, platforms and form factors, geometry, frames and pixel conversion, HID usages, gestures."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["ios", "android", "simulator", "emulator", "mobile"]
+categories = ["development-tools::testing", "simulation"]
+include = ["/Cargo.toml", "/LICENSE", "/examples", "/src", "/testdata"]
 
 [lib]
 doctest = false

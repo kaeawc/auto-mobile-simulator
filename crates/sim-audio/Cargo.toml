@@ -1,11 +1,16 @@
 [package]
-name = "sim-audio"
+name = "simee-audio"
 description = "Per-device simulator audio without a driver: process-tap capture and mute, route and volume."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["ios", "simulator", "audio", "macos"]
+categories = ["development-tools::testing", "os::macos-apis", "multimedia::audio"]
+include = ["/Cargo.toml", "/LICENSE", "/fixtures", "/native", "/src"]
 
 [lib]
 doctest = false

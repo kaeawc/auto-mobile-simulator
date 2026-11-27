@@ -11,7 +11,7 @@ A connection may send any number of requests, each answered before the next is r
 rather than connecting per call. Large results (a base64 `screenshot`) are written as one line
 straight from the result, so read up to the newline before parsing.
 
-**Per-call overhead** (#202). Measured with `cargo run --release -p sim-api --example api_overhead --
+**Per-call overhead** (#202). Measured with `cargo run --release -p simee-api --example api_overhead --
 before=<old simee> after=target/release/simee`: a private `simee serve` and `simee mcp` per binary,
 rounds interleaved, the median of 5 (Apple M3 Max, 16 cores, 2026-11-27, host load 19 to 22):
 
@@ -24,11 +24,11 @@ rounds interleaved, the median of 5 (Apple M3 Max, 16 cores, 2026-11-27, host lo
 
 - On a kept connection the server spends under 1 µs on a no-op (parse, dispatch, response line);
   the rest is the socket round trip. A larger result costs building it and writing it
-  (`cargo test --release -p sim-api call_overhead -- --ignored --nocapture` splits it up).
+  (`cargo test --release -p simee-api call_overhead -- --ignored --nocapture` splits it up).
 - A new connection costs about 15 µs more: the connection thread is reused (a thread whose client
   disconnected waits 30 s for the next, at most 8 wait), and its session is still made new for it.
 - MCP adds JSON-RPC framing, the tool result's text and `structuredContent`, and handing each call
-  to a worker thread (`cargo test --release -p sim-mcp tool_call_overhead -- --ignored --nocapture`).
+  to a worker thread (`cargo test --release -p simee-mcp tool_call_overhead -- --ignored --nocapture`).
 - `devices` on a host with Android AVDs is the Android listing, not the API: it probes the stock
   emulators running with `ps` and `lsof`. `device: "booted"` (or a name) resolves through it too.
 

@@ -1,11 +1,16 @@
 [package]
-name = "sim-mcp"
+name = "simee-mcp"
 description = "simee's MCP server: every API method as a tool, devices as resources, long operations as tasks, and a device view as an MCP App, over stdio."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["mcp", "ios", "android", "simulator", "emulator"]
+categories = ["development-tools::testing", "simulation"]
+include = ["/Cargo.toml", "/LICENSE", "/src"]
 
 [lib]
 doctest = false

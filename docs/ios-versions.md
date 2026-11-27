@@ -9,7 +9,7 @@ How: `simee create` an iPhone 16 (iOS 18), iPhone 17 (iOS 26 and 27) or iPhone D
 device type of the iOS 27.1 and `iOS-27-2-iPhone19-4` runtimes), `simee boot`, wait a minute, then
 `scripts/ios-matrix.sh <udid>`, `scripts/parity.sh <udid>` and
 `SIMEE_E2E_UDID=<udid> cargo test -p simee --test e2e`; frame callbacks with
-`cargo run -p sim-coresim --example frame_watch -- <udid>`. The AutoMobile harness
+`cargo run -p simee-coresim --example frame_watch -- <udid>`. The AutoMobile harness
 (`scripts/automobile-harness.sh`) ran on the oldest and newest runtimes.
 
 ## iPhone

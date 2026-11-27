@@ -42,8 +42,8 @@ to use fewer resources.
 ## Quick start
 
 ```bash
-cargo run -p emu -- -list-avds
-cargo run -p emu -- -avd <name> -show-kernel -verbose   # first boot formats and encrypts /data
+cargo run -p simee-emu -- -list-avds
+cargo run -p simee-emu -- -avd <name> -show-kernel -verbose   # first boot formats and encrypts /data
 adb -s emulator-5554 shell                              # once adbd is up
 adb -s emulator-5554 emu kill
 make shim && export ANDROID_HOME=~/.simee/sdk          # make tools launch simee as "emulator"
@@ -82,7 +82,7 @@ boots several times slower. In order: `$SIMEE_EMU` (or `$EMU_BIN`) as given; an 
 running executable unless that is a debug build's; this checkout's `target/release/emu`; an `emu`
 beside the executable or `target/debug/emu` only when no release build exists; `emu` on the PATH.
 A release `emu` older than the sources (`apps/emu`, `crates/emu-*`, `crates/sim-core`) is still
-used, with a note on stderr; simee never builds it for you (`cargo build --release -p emu`, then
+used, with a note on stderr; simee never builds it for you (`cargo build --release -p simee-emu`, then
 `codesign -s - -f --entitlements scripts/hypervisor.entitlements target/release/emu`).
 
 An AVD that `emu -create-avd` makes runs under the stock emulator too. Its `config.ini` has no
@@ -202,7 +202,7 @@ it finds no EGL). The Linux backend's symbol table is stripped, so the direct Vu
 macOS uses isn't there; without a GL backend the exported `FrameBuffer::readColorBuffer` reads
 the Vulkan image instead (byte-exact, 1.3 ms for 720×1280 on lavapipe; with GL it returned
 wrong pixels and took 7 ms), so Linux runs the Vulkan-only renderer too. To check an install
-without a VM: `cargo run -p emu-gfxstream --example renderer_caps -- [-vulkan-only] <lib64>
+without a VM: `cargo run -p simee-emu-gfxstream --example renderer_caps -- [-vulkan-only] <lib64>
 [moltenvk|lavapipe|swiftshader]` prints capsets 3, 8, 9 and checks a 720×1280 readback.
 
 AVD defaults favour cheap, fast boots: 720×1280 screen, 2 GB RAM, 4 vCPU, 4 GB data.
@@ -570,7 +570,7 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   Now a request is one `preadv`/`pwritev` (guest-adjacent pages merged, at most 1024 iovecs a
   call), an ephemeral disk checks its overlay once per request, and a whole-chunk write to an
   ephemeral disk no longer reads the base chunk it replaces. In-process A/B medians on a loaded
-  Mac (`cargo test --release -p emu-vmm disk_vectored_vs_per_segment -- --ignored`), per
+  Mac (`cargo test --release -p simee-emu-vmm disk_vectored_vs_per_segment -- --ignored`), per
   request: persistent read 20 → 7.2 µs, persistent write 62 → 9.9 µs, ephemeral read 20 → 7.5
   µs; the skipped base read takes ephemeral writes to fresh chunks from 16 to 10.5 µs. The
   worker turns notifications off while it drains and back on with a recheck (QEMU's
@@ -591,7 +591,7 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   zeroes it writes land as ciphertext. So discard is the only way to free space, and a fresh
   first boot (about 610 MB allocated) has only about 2 MB left to trim.
 - **Screenshots: fast PNG, no re-encode, no needless copies.** Automation takes a screenshot
-  after nearly every step. On a 2480×1740 screen (`cargo run --release -p sim-core --example
+  after nearly every step. On a 2480×1740 screen (`cargo run --release -p simee-core --example
   frame_bench`), PNG encoding at the `png` crate's default level took 74 ms and BGRA→RGBA
   conversion 11 ms; `Fast` (fdeflate) encodes in 11.5 ms for a file 1.7× larger, and a conversion
   loop per pixel format (no per-pixel `match`) takes 7.8 ms: 86 → 19 ms. The API passes the
@@ -607,12 +607,12 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
 
   | Stage | Before | After | Benchmark (`--ignored --nocapture`) |
   | --- | --- | --- | --- |
-  | Post callback (renderer thread) | 3.9 / 1.6 ms copy | 0.0002 ms (size only) | `cargo test --release -p emu-vmm present_cost` |
+  | Post callback (renderer thread) | 3.9 / 1.6 ms copy | 0.0002 ms (size only) | `cargo test --release -p simee-emu-vmm present_cost` |
   | Readback | per stream and per screenshot: Vulkan → CPU → GL → CPU under the FrameBuffer lock | once per frame, shared by streams and screenshots (a full-size ring stream reads straight into its slot): Vulkan → CPU | needs a Mac (below) |
-  | Scale (/3 / /1) | 8.0 ms / 1.8 ms copy | 2.0 ms (2.8 on one thread) / none | `cargo test --release -p sim-core downscale_cost` |
-  | Emulator → socket (1.9 / 10.4 MB) | 0.86 / 3.7 ms of writes | a 32-byte notice | `cargo test --release -p emu transport_cost` |
+  | Scale (/3 / /1) | 8.0 ms / 1.8 ms copy | 2.0 ms (2.8 on one thread) / none | `cargo test --release -p simee-core downscale_cost` |
+  | Emulator → socket (1.9 / 10.4 MB) | 0.86 / 3.7 ms of writes | a 32-byte notice | `cargo test --release -p simee-emu transport_cost` |
   | Emulator CPU per frame besides the readback | ≈12.8 / ≈7.1 ms | ≈2.0 / ≈0 ms | sum of the above |
-  | Post → client holds the pixels | — | 8.1–9.0 / 8.0–8.8 ms (ring), 7.8–10.3 / 8.5–9.3 ms (socket), across runs | `CASE=2480,1080,true cargo test --release -p emu frame_path_latency` |
+  | Post → client holds the pixels | — | 8.1–9.0 / 8.0–8.8 ms (ring), 7.8–10.3 / 8.5–9.3 ms (socket), across runs | `CASE=2480,1080,true cargo test --release -p simee-emu frame_path_latency` |
 
   End to end the ring and the socket tie on this VM: the latency is mostly two memory-bound
   copies, the stand-in readback (a memcpy of the frame) and the client's copy into the buffer it
@@ -679,7 +679,7 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   to turn them, and Rune turns the picture as it draws (a GPU transform; no CPU turn anywhere);
   screenshots and other stream clients get the frame turned upright, from a turned copy the
   store makes once per frame and shares (1.2–1.4 ms for 1080×2400, 1.6–1.9 ms for 2560×1600 on
-  this Mac, 32-pixel tiles: `cargo test --release -p sim-core rotate_cost -- --ignored
+  this Mac, 32-pixel tiles: `cargo test --release -p simee-core rotate_cost -- --ignored
   --nocapture`), which goes with the other buffers when nobody reads. Upright, readers get the
   capture itself and a full-size ring stream still reads straight into its slot; a unit test
   pins that no turned buffer is made. Touches on the display socket and the console's `touch`
@@ -717,7 +717,7 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   buffer; now the adb forwarder hands its buffer over, the worker takes it over when nothing is
   queued, and packets are written straight from the queue into the guest's descriptors
   (`Chain::write_parts`). Host→guest through one pipe with the guest posting Linux's 4 KiB
-  receive buffers (`cargo test --release -p emu-vmm vsock_throughput -- --ignored`): median of 5,
+  receive buffers (`cargo test --release -p simee-emu-vmm vsock_throughput -- --ignored`): median of 5,
   284 → 512 MiB/s on a 4-core Linux VM. Guest→host (`vsock_throughput_to_host`, 64 KiB
   packets) runs at about 4 GiB/s, so host→guest's limit is the guest's small receive buffers.
 - **vsock backpressure: a stalled client stalls only itself.** One worker thread serves every
@@ -737,7 +737,7 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   `adb_throughput_to_guest` (TCP client → guest, end to end) 498 → 870 MiB/s,
   `adb_throughput_to_host` 1382 → 1433 MiB/s.
 - **Renderer init and Metal's shader cache.** A cold renderer init is about 4.3 s of Metal shader
-  compiles and a warm one under 0.1 s (`cargo run --release -p emu-gfxstream --example
+  compiles and a warm one under 0.1 s (`cargo run --release -p simee-emu-gfxstream --example
   renderer_caps -- -emu <lib64>`, which inits as an API 36 boot does: cold 4.31, 4.36, 4.39 s,
   warm 70 to 96 ms, M3 Max, 2026-11-26). `sample` of a cold init: the time is ANGLE's Metal
   backend compiling its built-in shader library (`DisplayMtl::getDefaultShadersLib`, waited on
@@ -816,7 +816,7 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   hit must be exactly ISIZE bytes long: a short entry would read as zeros past its end. Older
   versions of the same path, and temp files over a minute old (a launch killed mid-write), are
   removed. Later launches `pread` that file into guest RAM, as they do a raw `Image`. Medians of
-  7 interleaved runs on an M3 Max under CI load (`cargo test --release -p emu-vmm kernel_load --
+  7 interleaved runs on an M3 Max under CI load (`cargo test --release -p simee-emu-vmm kernel_load --
   --ignored --nocapture`): 115 ms before (miniz_oxide), 71–76 ms to inflate with zlib-rs, 86–95
   ms on a miss (the synced cache write adds 15–20 ms), 3.5–3.9 ms on a hit. The gfxstream
   renderer's load and init (about 400 ms, `renderer_init_off_thread`) now starts on its own
@@ -841,7 +841,7 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   `mmap(MAP_FIXED)`, then `hv_vm_map` on whole 16 KiB pages. It is the only method measured that
   both lowers `phys_footprint` and reads back as zeroes. Measured with a VM in a test (64 MiB,
   half written by the host, half by the guest; Apple M3 Max, macOS 26.6.2, 2026-11-24; run each
-  with `cargo test -p emu-hvf --test discard_probe -- --ignored --nocapture --exact <name>`):
+  with `cargo test -p simee-emu-hvf --test discard_probe -- --ignored --nocapture --exact <name>`):
 
   | Method | Footprint | Guest reads after | Host reads after | Host and guest share pages after |
   |---|---|---|---|---|
@@ -856,7 +856,7 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
     reading the guest-written half raised it from 66 to 98 MiB, with nothing discarded.
   - The goldfish address space's clearing thread now discards freed runs of 1 MiB or more. In a
     model of the device (no guest), freeing 64 MiB of buffers left 64 MiB resident before this
-    change and 0 MiB after (`cargo test -p emu-vmm --lib clear_cost -- --ignored --nocapture`).
+    change and 0 MiB after (`cargo test -p simee-emu-vmm --lib clear_cost -- --ignored --nocapture`).
     Not yet measured with real gralloc traffic.
   - A virtio-balloon or free-page reporting would have to use the same unmap and remap path.
     `madvise` alone either keeps the old data or doesn't lower the footprint of pages the guest

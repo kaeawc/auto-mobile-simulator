@@ -437,7 +437,7 @@ mod tests {
     /// A 128 KiB request in 32 scattered 4 KiB pages: one call per page (what virtio-blk did
     /// before vectored requests) against one vectored call, in alternating rounds in one process
     /// so host noise hits both alike. Prints the median round of each.
-    ///     cargo test --release -p emu-vmm disk_vectored_vs_per_segment -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-vmm disk_vectored_vs_per_segment -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn disk_vectored_vs_per_segment() {

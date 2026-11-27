@@ -16,12 +16,12 @@ name = "simee-desktop"
 path = "src/main.rs"
 
 [dependencies]
-sim-core = { path = "../crates/sim-core" }
-sim-coresim = { path = "../crates/sim-coresim" }
-sim-debug = { path = "../crates/sim-debug" }
-sim-api = { path = "../crates/sim-api" }
-sim-android = { path = "../crates/sim-android" }
-sim-netshape = { path = "../crates/sim-netshape" }
+sim-core = { package = "simee-core", path = "../crates/sim-core" }
+sim-coresim = { package = "simee-coresim", path = "../crates/sim-coresim" }
+sim-debug = { package = "simee-debug", path = "../crates/sim-debug" }
+sim-api = { package = "simee-api", path = "../crates/sim-api" }
+sim-android = { package = "simee-android", path = "../crates/sim-android" }
+sim-netshape = { package = "simee-netshape", path = "../crates/sim-netshape" }
 serde = "1"
 serde_json = "1"
 # The 3D view's own pipeline (`src/scene/`) in a Rune compositor, which hands it Rune's wgpu

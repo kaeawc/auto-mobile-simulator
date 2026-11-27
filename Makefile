@@ -38,12 +38,12 @@ harness:          ## make harness UDID=<udid>
 	scripts/automobile-harness.sh $(UDID)
 
 # Android (simee): boot an AVD with the guest console on stdout. make emu-run AVD=<name>
-AVD ?= $(shell cargo run -q -p emu -- -list-avds 2>/dev/null | head -1)
+AVD ?= $(shell cargo run -q -p simee-emu -- -list-avds 2>/dev/null | head -1)
 emu-run:
-	cargo run -p emu -- -avd $(AVD) -show-kernel -verbose
+	cargo run -p simee-emu -- -avd $(AVD) -show-kernel -verbose
 
 emu-dist:         ## smallest, fastest emulator binary (thin LTO, 1 CGU), signed
-	cargo build --profile dist -p emu
+	cargo build --profile dist -p simee-emu
 	codesign --sign - --force --entitlements scripts/hypervisor.entitlements target/dist/emu
 
 shim:             ## SDK overlay whose emulator is simee (for auto-mobile and other tools)

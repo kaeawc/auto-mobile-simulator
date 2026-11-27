@@ -1,11 +1,16 @@
 [package]
-name = "emu-gfxstream"
+name = "simee-emu-gfxstream"
 description = "Loads the SDK's gfxstream renderer (stream_renderer C API) at runtime: host GLES/Vulkan for virtio-gpu."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["android", "emulator", "gfxstream", "gpu", "virtio"]
+categories = ["emulators", "graphics"]
+include = ["/Cargo.toml", "/LICENSE", "/build.rs", "/examples", "/src"]
 
 [lib]
 doctest = false

@@ -1,7 +1,7 @@
 //! Tests against a real `/dev/kvm` on an x86_64 host (CI's `kvm` job; GitHub's x86_64 runners
 //! expose KVM, its arm64 runners don't). They drive tiny real-mode guests through the
 //! architecture-neutral half of the crate: opening KVM, memory slots, exits, ioeventfd, irqfd
-//! and kicks. Run with `cargo test -p emu-kvm -- --ignored --nocapture` where `/dev/kvm` is
+//! and kicks. Run with `cargo test -p simee-emu-kvm -- --ignored --nocapture` where `/dev/kvm` is
 //! accessible.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,7 +93,7 @@ fn ioeventfd_stores_never_leave_the_kernel_and_other_values_still_exit() {
 
 /// What a virtio QueueNotify costs the vCPU: a store that exits to userspace (emu's path on
 /// Hypervisor.framework) against one ioeventfd completes in the kernel.
-/// `cargo test --release -p emu-kvm notify_cost -- --ignored --nocapture`
+/// `cargo test --release -p simee-emu-kvm notify_cost -- --ignored --nocapture`
 #[test]
 #[ignore = "needs /dev/kvm (x86_64); benchmark"]
 fn notify_cost() {

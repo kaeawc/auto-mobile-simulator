@@ -194,7 +194,7 @@ android_env() {
 emu_ready() {
   if [ -z "${BENCH_EMU:-}" ]; then
     bench_log "building target/release/emu"
-    (cd "$BENCH_REPO" && cargo build -q --release -p emu) || bench_die "cargo build --release -p emu failed"
+    (cd "$BENCH_REPO" && cargo build -q --release -p simee-emu) || bench_die "cargo build --release -p simee-emu failed"
     BENCH_EMU="$BENCH_REPO/target/release/emu"
   fi
   if [ "$(uname -s)" = Darwin ]; then

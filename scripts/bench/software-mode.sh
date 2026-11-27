@@ -87,7 +87,7 @@ fi
 case " $arms " in *" stock "*) stock_ready ;; *) ;; esac
 bench_start software-mode
 emu_ready
-(cd "$BENCH_REPO" && cargo build -q --release -p emu-vmm --example soft_devices) || bench_die "building soft_devices failed"
+(cd "$BENCH_REPO" && cargo build -q --release -p simee-emu-vmm --example soft_devices) || bench_die "building soft_devices failed"
 soft="$BENCH_REPO/target/release/examples/soft_devices"
 avd=""
 case " $arms " in *" stock "*)

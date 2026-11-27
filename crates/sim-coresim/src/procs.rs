@@ -683,7 +683,7 @@ mod tests {
     /// Host CPU of one settle poll: the host-wide `ps -Ao pid=,ppid=,time=,args=` the settle wait
     /// used to spawn, against what it does now (the process table, then the CPU of a device's
     /// processes; here the CPU of every process this user can read, an upper bound).
-    /// `cargo test -p sim-coresim --release poll_cost -- --ignored --nocapture --test-threads=1`
+    /// `cargo test -p simee-coresim --release poll_cost -- --ignored --nocapture --test-threads=1`
     #[test]
     #[ignore = "a benchmark: spawns ps 20 times"]
     fn poll_cost() {

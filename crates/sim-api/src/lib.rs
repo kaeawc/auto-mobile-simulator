@@ -746,7 +746,7 @@ mod tests {
     /// A 4.4 MB PNG through the socket on a kept connection, median of 50 each, interleaved: base64
     /// in the line against a binary reply, and the server writing `path` against a binary reply
     /// the client writes to the same file.
-    ///     cargo test --release -p sim-api binary_reply_round_trip -- --ignored --nocapture
+    ///     cargo test --release -p simee-api binary_reply_round_trip -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn binary_reply_round_trip() {
@@ -808,7 +808,7 @@ mod tests {
     /// Where a cheap call's time goes, in this process: parsing the request line, the method
     /// (dropping its result included), writing the response line; then the whole of
     /// `handle_line_into`, a round trip on a kept connection, and one on a new connection per call.
-    ///     cargo test --release -p sim-api call_overhead -- --ignored --nocapture
+    ///     cargo test --release -p simee-api call_overhead -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn call_overhead() {
@@ -844,7 +844,7 @@ mod tests {
 
     /// A 3 MB screenshot response's round trip over the socket, old path against new (server
     /// response building and client parsing), the median of 15 runs each, interleaved.
-    ///     cargo test --release -p sim-api large_response_round_trip -- --ignored --nocapture
+    ///     cargo test --release -p simee-api large_response_round_trip -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn large_response_round_trip() {

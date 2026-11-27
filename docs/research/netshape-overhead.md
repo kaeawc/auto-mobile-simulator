@@ -128,7 +128,7 @@ cc -std=gnu11 -O2 -pthread -o /tmp/netshape_test crates/sim-netshape/native/nets
 
 ## Verification
 
-- `cargo nextest run -p sim-netshape` builds `native/netshape_test.c` with the host C compiler and
+- `cargo nextest run -p simee-netshape` builds `native/netshape_test.c` with the host C compiler and
   runs it on real host sockets. It covers:
   - parsing, including fgets-style line cutting and the rule limit;
   - reload, latch publication and the no-file case;
@@ -157,7 +157,7 @@ cc -std=gnu11 -O2 -pthread -o /tmp/netshape_test crates/sim-netshape/native/nets
 
 ### On a Mac (not verified here)
 
-1. `cargo nextest run -p sim-netshape`, which runs the C tests with Apple clang, then the benchmark
+1. `cargo nextest run -p simee-netshape`, which runs the C tests with Apple clang, then the benchmark
    above, both on the host.
 2. Build and boot-inject: `simee serve &`, then
    `simee call network_shape '{"device":"<udid>","inject":"boot","preset":"none"}'`. This builds the

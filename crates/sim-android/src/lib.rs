@@ -483,7 +483,7 @@ fn sysdir_path(image: &str) -> Result<String, String> {
 /// a debug `emu` only when there is no release one (a debug guest boots several times slower, so
 /// a debug simee or desktop must not pick it up just because it sits beside them), else the PATH.
 /// A release `emu` in this checkout older than the sources is used, with a note on stderr that
-/// it is stale: simee never builds it behind your back (`cargo build --release -p emu`).
+/// it is stale: simee never builds it behind your back (`cargo build --release -p simee-emu`).
 pub fn emu_binary() -> PathBuf {
     let var = |n: &str| std::env::var_os(n).map(PathBuf::from);
     let exe = std::env::current_exe().ok();
@@ -553,7 +553,7 @@ fn stale_note(emu: &Path, checkout: &Path) -> Option<String> {
     }
     (newest? > built).then(|| {
         format!(
-            "simee: {} is older than its sources; rebuild it with `cargo build --release -p emu` (SIMEE_EMU picks another binary)",
+            "simee: {} is older than its sources; rebuild it with `cargo build --release -p simee-emu` (SIMEE_EMU picks another binary)",
             emu.display()
         )
     })
@@ -1301,7 +1301,7 @@ mod tests {
         assert_eq!(stale_note(&emu, &root), None, "no sources newer");
         std::fs::write(src.join("main.rs"), b"fn main() {}").expect("source");
         let note = stale_note(&emu, &root).expect("stale");
-        assert!(note.contains("cargo build --release -p emu") && note.contains("SIMEE_EMU"), "{note}");
+        assert!(note.contains("cargo build --release -p simee-emu") && note.contains("SIMEE_EMU"), "{note}");
         std::fs::remove_dir_all(&root).ok();
     }
 

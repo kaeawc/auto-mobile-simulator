@@ -1,11 +1,16 @@
 [package]
-name = "emu"
+name = "simee-emu"
 description = "simee CLI: a drop-in for the Android SDK `emulator` binary."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["android", "emulator", "avd", "hypervisor", "mobile"]
+categories = ["emulators", "command-line-utilities", "development-tools::testing"]
+include = ["/Cargo.toml", "/LICENSE", "/build.rs", "/src", "/tests"]
 
 [[bin]]
 name = "emu"

@@ -264,7 +264,7 @@ mod tests {
         assert!(has(&[0x89, 0x06, 0x00, 0x09, 0x01]));
     }
 
-    /// Writes the table for a disassembler: `EMU_ACPI_DUMP=<path> cargo test -p emu-vmm dump_for_iasl -- --ignored`.
+    /// Writes the table for a disassembler: `EMU_ACPI_DUMP=<path> cargo test -p simee-emu-vmm dump_for_iasl -- --ignored`.
     #[test]
     #[ignore = "writes a file"]
     fn dump_for_iasl() {

@@ -902,16 +902,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
-name = "emu-avd"
-version = "0.1.0"
-dependencies = [
- "rustix 1.1.6",
- "sim-bundle",
- "sim-core",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "encoding_rs"
 version = "0.8.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3274,85 +3264,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sim-android"
-version = "0.1.0"
-dependencies = [
- "emu-avd",
- "png 0.18.1",
- "sim-core",
-]
-
-[[package]]
-name = "sim-api"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "serde",
- "serde_json",
- "sim-android",
- "sim-audio",
- "sim-core",
- "sim-coresim",
- "sim-debug",
- "sim-netshape",
-]
-
-[[package]]
-name = "sim-audio"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sim-core",
-]
-
-[[package]]
-name = "sim-bundle"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "lz4_flex",
- "serde",
- "serde_json",
- "sim-core",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "sim-core"
-version = "0.1.0"
-dependencies = [
- "png 0.18.1",
- "serde",
-]
-
-[[package]]
-name = "sim-coresim"
-version = "0.1.0"
-dependencies = [
- "block2 0.6.2",
- "libc",
- "objc2 0.6.5",
- "objc2-foundation 0.3.2",
- "sim-core",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "sim-debug"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "sim-netshape"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3375,19 +3286,108 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "simee-android"
+version = "0.1.0"
+dependencies = [
+ "png 0.18.1",
+ "simee-core",
+ "simee-emu-avd",
+]
+
+[[package]]
+name = "simee-api"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "serde",
+ "serde_json",
+ "simee-android",
+ "simee-audio",
+ "simee-core",
+ "simee-coresim",
+ "simee-debug",
+ "simee-netshape",
+]
+
+[[package]]
+name = "simee-audio"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "simee-core",
+]
+
+[[package]]
+name = "simee-bundle"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "lz4_flex",
+ "serde",
+ "serde_json",
+ "simee-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "simee-core"
+version = "0.1.0"
+dependencies = [
+ "png 0.18.1",
+ "serde",
+]
+
+[[package]]
+name = "simee-coresim"
+version = "0.1.0"
+dependencies = [
+ "block2 0.6.2",
+ "libc",
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
+ "simee-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "simee-debug"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "simee-desktop"
 version = "0.1.0"
 dependencies = [
  "rune",
  "serde",
  "serde_json",
- "sim-android",
- "sim-api",
- "sim-core",
- "sim-coresim",
- "sim-debug",
- "sim-netshape",
+ "simee-android",
+ "simee-api",
+ "simee-core",
+ "simee-coresim",
+ "simee-debug",
+ "simee-netshape",
  "wgpu",
+]
+
+[[package]]
+name = "simee-emu-avd"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.6",
+ "simee-bundle",
+ "simee-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "simee-netshape"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

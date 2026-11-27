@@ -448,7 +448,7 @@ mod tests {
 
     /// A device thread raising and the driver acknowledging (as a worker and a vCPU do) while
     /// another vCPU reads the interrupt status: what each costs when they meet on the transport.
-    /// `cargo test --release -p emu-vmm isr_under_interrupt_traffic -- --ignored --nocapture`
+    /// `cargo test --release -p simee-emu-vmm isr_under_interrupt_traffic -- --ignored --nocapture`
     #[test]
     #[ignore = "benchmark"]
     fn isr_under_interrupt_traffic() {

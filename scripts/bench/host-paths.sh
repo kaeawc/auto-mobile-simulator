@@ -6,17 +6,17 @@
 #                               [--rounds N] [--quick] [--out DIR]
 #
 # Each round runs, in release builds of this checkout:
-#   frame       cargo run -p sim-core --example frame_bench: pixel conversion, downscales and PNG
+#   frame       cargo run -p simee-core --example frame_bench: pixel conversion, downscales and PNG
 #               encoding (the shipping encoder and the alternatives) of docs/desktop-android.png
 #               (2480x1740) and a synthetic iOS home screen (1206x2622)
-#   vsock       cargo test -p emu-vmm vsock_throughput -- --ignored: the vsock device's guest-to-host
+#   vsock       cargo test -p simee-emu-vmm vsock_throughput -- --ignored: the vsock device's guest-to-host
 #               and host-to-guest throughput, in process
-#   adb         cargo test -p emu-vmm adb_throughput_to_guest -- --ignored: an adb client to the guest
-#   present     cargo test -p emu-vmm present_cost -- --ignored: posting a frame into the store at a
+#   adb         cargo test -p simee-emu-vmm adb_throughput_to_guest -- --ignored: an adb client to the guest
+#   present     cargo test -p simee-emu-vmm present_cost -- --ignored: posting a frame into the store at a
 #               tablet's and a phone's size
-#   frame-path  CASE=2480,1080,true cargo test -p emu frame_path_latency -- --ignored: a post until a
+#   frame-path  CASE=2480,1080,true cargo test -p simee-emu frame_path_latency -- --ignored: a post until a
 #               display-socket client has the pixels
-#   renderer    cargo run -p emu-gfxstream --example renderer_caps -- -emu <lib64> (macOS) or
+#   renderer    cargo run -p simee-emu-gfxstream --example renderer_caps -- -emu <lib64> (macOS) or
 #               -vulkan-only <lib64> (Linux): the renderer's init as emu runs it, with Metal's shader
 #               cache warm after the first round, and a 720x1280 readback; only when a renderer is
 #               installed (emu -provision-renderer; --lib64 overrides)
@@ -90,20 +90,20 @@ for line in sys.stdin:
 }
 run() {
   case $1 in
-    frame) cargo run -q --release -p sim-core --example frame_bench ;;
-    vsock) cargo test -q --release -p emu-vmm vsock_throughput -- --ignored --nocapture --test-threads=1 ;;
-    adb) cargo test -q --release -p emu-vmm adb_throughput_to_guest -- --ignored --nocapture --test-threads=1 ;;
-    present) cargo test -q --release -p emu-vmm present_cost -- --ignored --nocapture --test-threads=1 ;;
-    frame-path) CASE=2480,1080,true cargo test -q --release -p emu frame_path_latency -- --ignored --nocapture --test-threads=1 ;;
+    frame) cargo run -q --release -p simee-core --example frame_bench ;;
+    vsock) cargo test -q --release -p simee-emu-vmm vsock_throughput -- --ignored --nocapture --test-threads=1 ;;
+    adb) cargo test -q --release -p simee-emu-vmm adb_throughput_to_guest -- --ignored --nocapture --test-threads=1 ;;
+    present) cargo test -q --release -p simee-emu-vmm present_cost -- --ignored --nocapture --test-threads=1 ;;
+    frame-path) CASE=2480,1080,true cargo test -q --release -p simee-emu frame_path_latency -- --ignored --nocapture --test-threads=1 ;;
     renderer)
       if [ -z "$lib64" ] || [ ! -d "$lib64" ]; then
         bench_log "renderer: no lib64 (emu -provision-renderer); skipped"
         return 0
       fi
       if [ "$(uname -s)" = Darwin ]; then
-        cargo run -q --release -p emu-gfxstream --example renderer_caps -- -emu "$lib64"
+        cargo run -q --release -p simee-emu-gfxstream --example renderer_caps -- -emu "$lib64"
       else
-        cargo run -q --release -p emu-gfxstream --example renderer_caps -- -vulkan-only "$lib64"
+        cargo run -q --release -p simee-emu-gfxstream --example renderer_caps -- -vulkan-only "$lib64"
       fi
       ;;
     *) bench_die "unknown item $1" ;;

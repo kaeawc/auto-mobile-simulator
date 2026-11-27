@@ -12,28 +12,32 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
-publish = false
+repository = "https://github.com/kaeawc/simee"
+homepage = "https://github.com/kaeawc/simee"
 
 # Every crate inherits deps from here, so each dependency is built with one feature set no matter
 # which `-p` subset you build.
 [workspace.dependencies]
-sim-core = { path = "crates/sim-core" }
-sim-coresim = { path = "crates/sim-coresim" }
-sim-debug = { path = "crates/sim-debug" }
-sim-api = { path = "crates/sim-api" }
-sim-mcp = { path = "crates/sim-mcp" }
-sim-netshape = { path = "crates/sim-netshape" }
-sim-audio = { path = "crates/sim-audio" }
-sim-android = { path = "crates/sim-android" }
-sim-bundle = { path = "crates/sim-bundle" }
-emu-avd = { path = "crates/emu-avd" }
-emu-gfxstream = { path = "crates/emu-gfxstream" }
-emu-ext4 = { path = "crates/emu-ext4" }
-emu-fdt = { path = "crates/emu-fdt" }
-emu-hvf = { path = "crates/emu-hvf" }
-emu-kvm = { path = "crates/emu-kvm" }
-emu-sdk = { path = "crates/emu-sdk" }
-emu-vmm = { path = "crates/emu-vmm" }
+# The workspace crates, published to crates.io as `simee-*` (scripts/publish.sh), each library
+# named after its package (`simee_core`). The keys keep the old names, so dependents say
+# `sim_core::`; the `=` pins move with the workspace version (scripts/release.sh).
+sim-core = { package = "simee-core", path = "crates/sim-core", version = "=0.1.0" }
+sim-coresim = { package = "simee-coresim", path = "crates/sim-coresim", version = "=0.1.0" }
+sim-debug = { package = "simee-debug", path = "crates/sim-debug", version = "=0.1.0" }
+sim-api = { package = "simee-api", path = "crates/sim-api", version = "=0.1.0" }
+sim-mcp = { package = "simee-mcp", path = "crates/sim-mcp", version = "=0.1.0" }
+sim-netshape = { package = "simee-netshape", path = "crates/sim-netshape", version = "=0.1.0" }
+sim-audio = { package = "simee-audio", path = "crates/sim-audio", version = "=0.1.0" }
+sim-android = { package = "simee-android", path = "crates/sim-android", version = "=0.1.0" }
+sim-bundle = { package = "simee-bundle", path = "crates/sim-bundle", version = "=0.1.0" }
+emu-avd = { package = "simee-emu-avd", path = "crates/emu-avd", version = "=0.1.0" }
+emu-gfxstream = { package = "simee-emu-gfxstream", path = "crates/emu-gfxstream", version = "=0.1.0" }
+emu-ext4 = { package = "simee-emu-ext4", path = "crates/emu-ext4", version = "=0.1.0" }
+emu-fdt = { package = "simee-emu-fdt", path = "crates/emu-fdt", version = "=0.1.0" }
+emu-hvf = { package = "simee-emu-hvf", path = "crates/emu-hvf", version = "=0.1.0" }
+emu-kvm = { package = "simee-emu-kvm", path = "crates/emu-kvm", version = "=0.1.0" }
+emu-sdk = { package = "simee-emu-sdk", path = "crates/emu-sdk", version = "=0.1.0" }
+emu-vmm = { package = "simee-emu-vmm", path = "crates/emu-vmm", version = "=0.1.0" }
 
 anyhow = "1"
 base64 = "0.23"
@@ -122,22 +126,22 @@ opt-level = 2
 
 # The Android VMM sits on the guest's hot path (every MMIO exit, every block request); unoptimized
 # it boots the guest several times slower.
-[profile.dev.package.emu-vmm]
+[profile.dev.package.simee-emu-vmm]
 opt-level = 1
-[profile.dev.package.emu-hvf]
+[profile.dev.package.simee-emu-hvf]
 opt-level = 1
-[profile.dev.package.emu-gfxstream]
+[profile.dev.package.simee-emu-gfxstream]
 opt-level = 1
-[profile.dev.package.emu]
+[profile.dev.package.simee-emu]
 opt-level = 1
 
 # Tests don't run guests: build the VMM crates unoptimized there, which takes the incremental
 # test build after a sim-core change from ~17 s to ~10 s (opt-level 1 is for running `emu`).
-[profile.test.package.emu-vmm]
+[profile.test.package.simee-emu-vmm]
 opt-level = 0
-[profile.test.package.emu-hvf]
+[profile.test.package.simee-emu-hvf]
 opt-level = 0
-[profile.test.package.emu]
+[profile.test.package.simee-emu]
 opt-level = 0
 
 # PNG encoding of full-resolution framebuffers is the hot path of `screenshot` in debug builds.

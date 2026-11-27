@@ -2355,7 +2355,7 @@ mod tests {
     /// A session that stays open (as `simee serve`'s does) finds a device by UDID and name, then
     /// misses it under its old name once another process renames it and under its UDID once that
     /// deletes it: the lookup reads the service's live device set, never a copy of its own.
-    /// `SIMEE_E2E_CREATE=1 cargo test -p sim-api renamed_or_deleted -- --ignored --nocapture`.
+    /// `SIMEE_E2E_CREATE=1 cargo test -p simee-api renamed_or_deleted -- --ignored --nocapture`.
     #[test]
     #[ignore = "creates, renames and deletes a simulator (SIMEE_E2E_CREATE=1)"]
     fn a_renamed_or_deleted_device_misses_the_session_lookup() {
@@ -2504,7 +2504,7 @@ mod tests {
     /// Records sim-debug's libproc fixtures from a booted device: its tree read through libproc
     /// with `ps` (processes), and its sockets with `lsof` (connections), each between two reads
     /// that agree. The user's home and every non-loopback address are rewritten.
-    /// `SIMEE_FIXTURE_UDID=<udid> SIMEE_FIXTURE_DIR=crates/sim-debug/fixtures cargo test -p sim-api
+    /// `SIMEE_FIXTURE_UDID=<udid> SIMEE_FIXTURE_DIR=crates/sim-debug/fixtures cargo test -p simee-api
     /// record_libproc_fixtures -- --ignored`; with `SIMEE_FIXTURE_INJECTED=1`, SpringBoard's
     /// `KERN_PROCARGS2` record too (on a device booted with `network_shape {inject:"boot"}`).
     #[test]

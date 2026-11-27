@@ -3,9 +3,9 @@
 //! `<sdk>/simee/renderer/<revision>/lib64` from `emu -provision-renderer`):
 //!
 //! ```text
-//! cargo run -p emu-gfxstream --example renderer_caps -- <lib64> [moltenvk|swiftshader|lavapipe]
-//! cargo run -p emu-gfxstream --example renderer_caps -- -load-only <lib64>
-//! cargo run -p emu-gfxstream --example renderer_caps -- -emu <lib64>
+//! cargo run -p simee-emu-gfxstream --example renderer_caps -- <lib64> [moltenvk|swiftshader|lavapipe]
+//! cargo run -p simee-emu-gfxstream --example renderer_caps -- -load-only <lib64>
+//! cargo run -p simee-emu-gfxstream --example renderer_caps -- -emu <lib64>
 //! ```
 //!
 //! Like `emu`, it links `lib64` beside itself and sets the launcher directory to its parent.
@@ -30,30 +30,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let lib64 = PathBuf::from(args.first().ok_or(USAGE)?);
     let icd = match args.get(1).map(String::as_str) {
-        Some("lavapipe") => emu_gfxstream::Icd::Lavapipe,
-        Some("swiftshader") => emu_gfxstream::Icd::SwiftShader,
-        Some("moltenvk") => emu_gfxstream::Icd::MoltenVk,
-        _ if cfg!(target_os = "linux") => emu_gfxstream::Icd::Lavapipe,
-        _ => emu_gfxstream::Icd::MoltenVk,
+        Some("lavapipe") => simee_emu_gfxstream::Icd::Lavapipe,
+        Some("swiftshader") => simee_emu_gfxstream::Icd::SwiftShader,
+        Some("moltenvk") => simee_emu_gfxstream::Icd::MoltenVk,
+        _ if cfg!(target_os = "linux") => simee_emu_gfxstream::Icd::Lavapipe,
+        _ => simee_emu_gfxstream::Icd::MoltenVk,
     };
     let launcher = lib64.parent().ok_or("lib64 has no parent")?;
     if !load_only {
-        let link = emu_gfxstream::link_beside_exe(&lib64);
+        let link = simee_emu_gfxstream::link_beside_exe(&lib64);
         println!("link     {}", link.map_or_else(|| "(none)".to_string(), |l| l.display().to_string()));
     }
-    emu_gfxstream::configure_environment(launcher, icd);
+    simee_emu_gfxstream::configure_environment(launcher, icd);
     println!("lib64    {}", lib64.display());
     println!("launcher {}", std::env::var("ANDROID_EMULATOR_LAUNCHER_DIR").unwrap_or_default());
-    let deps = emu_gfxstream::preloads(&lib64);
+    let deps = simee_emu_gfxstream::preloads(&lib64);
     let names: Vec<String> = deps.iter().filter_map(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
     println!("preload  {}", names.join(" "));
 
-    let r = emu_gfxstream::Renderer::load(&lib64)?;
+    let r = simee_emu_gfxstream::Renderer::load(&lib64)?;
     println!("loaded");
     if load_only {
         return Ok(());
     }
-    use emu_gfxstream::flags;
+    use simee_emu_gfxstream::flags;
     let t = std::time::Instant::now();
     if as_emu {
         let features = "RefCountPipe:enabled,GlDirectMem:enabled,HasSharedSlotsHostMemoryAllocator:enabled,VulkanVirtualQueue:enabled";
@@ -66,9 +66,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "initialized in {:.0} ms (Vulkan {})",
         t.elapsed().as_secs_f64() * 1e3,
-        if emu_gfxstream::vulkan_ok() { "up" } else { "failed" }
+        if simee_emu_gfxstream::vulkan_ok() { "up" } else { "failed" }
     );
-    for id in emu_gfxstream::capset::ALL {
+    for id in simee_emu_gfxstream::capset::ALL {
         match r.capset_info(id) {
             Some((version, size)) => println!("capset {id}: version {version}, {size} bytes"),
             None => println!("capset {id}: unsupported"),
@@ -81,13 +81,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Uploads a pattern into a 2D color buffer and reads it back the way frames are read
 /// (`Renderer::read_color_buffer`), checking the bytes and timing a full-screen-sized read.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn readback(r: &emu_gfxstream::Renderer) -> Result<(), Box<dyn std::error::Error>> {
+fn readback(r: &simee_emu_gfxstream::Renderer) -> Result<(), Box<dyn std::error::Error>> {
     let (w, h) = (720u32, 1280u32);
     let mut src: Vec<u8> = (0..w * h * 4).map(|i| (i * 7 % 251) as u8).collect();
     // SAFETY: `src` outlives the resource's use below (it is unreffed before `src` drops).
-    let backing = unsafe { emu_gfxstream::HostRange::from_raw(src.as_mut_ptr(), src.len()) };
+    let backing = unsafe { simee_emu_gfxstream::HostRange::from_raw(src.as_mut_ptr(), src.len()) };
     // PIPE_TEXTURE_2D, R8G8B8A8 (virgl format 67), render target | sampler view.
-    let args = emu_gfxstream::ResourceCreateArgs {
+    let args = simee_emu_gfxstream::ResourceCreateArgs {
         handle: 1,
         target: 2,
         format: 67,
@@ -99,7 +99,7 @@ fn readback(r: &emu_gfxstream::Renderer) -> Result<(), Box<dyn std::error::Error
         ..Default::default()
     };
     r.resource_create(args, &[backing])?;
-    r.transfer_write(1, 0, 0, w * 4, 0, emu_gfxstream::Box3 { x: 0, y: 0, z: 0, w, h, d: 1 }, 0)?;
+    r.transfer_write(1, 0, 0, w * 4, 0, simee_emu_gfxstream::Box3 { x: 0, y: 0, z: 0, w, h, d: 1 }, 0)?;
     let mut out = vec![0u8; src.len()];
     let mut times = Vec::new();
     for _ in 0..9 {

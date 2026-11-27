@@ -1215,7 +1215,7 @@ mod tests {
     }
 
     /// Posts at a tablet's and a phone's size.
-    ///     cargo test --release -p emu-vmm present_cost -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-vmm present_cost -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn present_cost() {

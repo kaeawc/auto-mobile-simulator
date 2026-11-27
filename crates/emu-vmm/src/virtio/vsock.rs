@@ -1067,7 +1067,7 @@ mod tests {
 
     /// Host → guest throughput through one pipe, as `adb push`/`install` stream: the guest posts
     /// 4 KiB receive buffers (Linux's default) and returns credit as it reads.
-    ///     cargo test --release -p emu-vmm vsock_throughput -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-vmm vsock_throughput -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn vsock_throughput() {
@@ -1187,7 +1187,7 @@ mod tests {
 
     /// Guest → host throughput through one pipe, as `adb pull`/`exec-out` stream: the guest
     /// sends 64 KiB packets (Linux's largest) into a sink.
-    ///     cargo test --release -p emu-vmm vsock_throughput_to_host -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-vmm vsock_throughput_to_host -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn vsock_throughput_to_host() {
@@ -1345,7 +1345,7 @@ mod tests {
 
     /// `adb push` end to end: a host client writes into the bridge, the guest reads 4 KiB
     /// buffers and returns credit every 64 KiB.
-    ///     cargo test --release -p emu-vmm adb_throughput -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-vmm adb_throughput -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn adb_throughput_to_guest() {
@@ -1380,7 +1380,7 @@ mod tests {
 
     /// `adb pull` end to end: the guest sends 64 KiB packets as its credit allows, a host client
     /// reads them off the bridge.
-    ///     cargo test --release -p emu-vmm adb_throughput -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-vmm adb_throughput -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn adb_throughput_to_host() {
@@ -1417,7 +1417,7 @@ mod tests {
     /// Request/response through one pipe, as a qemud service or `adb shell` round trip: the guest
     /// sends 64 bytes and waits (spinning, as a busy guest would be in its interrupt handler) for
     /// the echo. Kicks and interrupts per packet are what each round costs vCPU0.
-    ///     cargo test --release -p emu-vmm vsock_ping_pong -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-vmm vsock_ping_pong -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn vsock_ping_pong() {

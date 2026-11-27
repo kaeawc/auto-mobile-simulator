@@ -769,7 +769,7 @@ fn what_is_not_a_hollow_box_is_not_a_frame() {
     }
 }
 
-/// Timing of the check on a 1206x2622 frame: `cargo test --release -p sim-core contrast_cost -- --ignored --nocapture`.
+/// Timing of the check on a 1206x2622 frame: `cargo test --release -p simee-core contrast_cost -- --ignored --nocapture`.
 #[test]
 #[ignore = "benchmark"]
 fn contrast_cost() {

@@ -342,7 +342,14 @@ mod tests {
 
     #[test]
     fn the_docs_name_every_tool_and_resource() {
-        let docs = include_str!("../../../docs/mcp.md");
+        // docs/mcp.md lives at the repository root, outside the published crate: in the
+        // workspace a missing doc fails, from an unpacked .crate the test has nothing to check.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        if !root.join("crates/sim-mcp/Cargo.toml").is_file() {
+            eprintln!("skipped: not in the simee workspace, so docs/mcp.md isn't here");
+            return;
+        }
+        let docs = std::fs::read_to_string(root.join("docs/mcp.md")).expect("docs/mcp.md");
         for tool in list() {
             let name = tool["name"].as_str().expect("name");
             assert!(docs.contains(&format!("`{name}`")), "docs/mcp.md doesn't name the tool `{name}`: add it to the tool table");

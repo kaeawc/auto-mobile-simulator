@@ -1469,7 +1469,7 @@ mod tests {
     /// Building a 16K-entry backing list (a 64 MiB resource in 4 KiB pages): host ranges, then
     /// an iovec copy of them, leaked per call (before) vs the iovec array built in place and
     /// kept by the renderer until unref (now). Median of 9 runs.
-    ///     cargo test --release -p emu-gfxstream backing_cost -- --ignored --nocapture
+    ///     cargo test --release -p simee-emu-gfxstream backing_cost -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark"]
     fn backing_cost() {

@@ -835,7 +835,7 @@ mod tests {
     /// The per-exit cost of publishing where a vCPU is: N vCPU threads each looping
     /// `enter`/`leave` on their own slot, no interrupt sources. Neighbouring slots sharing a
     /// cache line show up as a per-exit cost that grows with N.
-    /// `cargo test --release -p emu-vmm exit_publish_cost -- --ignored --nocapture`
+    /// `cargo test --release -p simee-emu-vmm exit_publish_cost -- --ignored --nocapture`
     #[test]
     #[ignore = "benchmark"]
     fn exit_publish_cost() {

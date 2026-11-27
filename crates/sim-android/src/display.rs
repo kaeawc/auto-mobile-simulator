@@ -325,7 +325,7 @@ mod tests {
 
     /// A client that fell behind: the server announces 8 phone-sized frames in one burst before
     /// the client reads any. Prints the time to catch up per burst and the frames read.
-    /// `cargo test --release -p sim-android display_burst_bench -- --ignored --nocapture`
+    /// `cargo test --release -p simee-android display_burst_bench -- --ignored --nocapture`
     #[test]
     #[ignore = "bench"]
     fn display_burst_bench() {

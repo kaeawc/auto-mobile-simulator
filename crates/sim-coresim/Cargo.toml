@@ -1,11 +1,16 @@
 [package]
-name = "sim-coresim"
+name = "simee-coresim"
 description = "Safe API over the host simulator service: device lifecycle, apps, framebuffers and HID input."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["ios", "simulator", "coresimulator", "macos", "mobile"]
+categories = ["development-tools::testing", "os::macos-apis", "simulation"]
+include = ["/Cargo.toml", "/LICENSE", "/examples", "/src"]
 
 [lib]
 doctest = false

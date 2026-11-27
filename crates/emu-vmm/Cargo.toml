@@ -1,11 +1,16 @@
 [package]
-name = "emu-vmm"
+name = "simee-emu-vmm"
 description = "The virtual machine: memory map, device tree, kernel loader, PSCI, vCPU loop, UART, RTC, virtio-mmio devices."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["android", "emulator", "vmm", "virtio", "hypervisor"]
+categories = ["emulators", "virtualization"]
+include = ["/Cargo.toml", "/LICENSE", "/examples", "/src"]
 
 [lib]
 doctest = false
