@@ -22,7 +22,7 @@ pub const VIEW_TOOL: &str = "device_view";
 /// handle for these, and everything else a progress heartbeat while the call blocks. A method not
 /// listed runs inline. (`provision` and `record` aren't API methods, so they aren't tools.)
 pub const LONG_RUNNING: &[&str] =
-    &["boot", "boot_many", "create", "clone", "install", "settle", "erase", "shutdown", "export", "import", "mem_leaks", "mem_heap"];
+    &["boot", "boot_many", "create", "clone", "install", "settle", "erase", "shutdown", "export", "import", "mem_leaks", "mem_heap", "stream_start"];
 
 /// The environment variable that picks the toolsets: names separated by commas (`core,debug`), or
 /// `all`.
