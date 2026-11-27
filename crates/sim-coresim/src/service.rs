@@ -780,22 +780,7 @@ impl Device {
     pub fn exec(&self, path: &str, args: &[String], env: &[(String, String)]) -> Result<ExecOutput> {
         use std::io::Read;
         use std::os::fd::AsRawFd;
-        // Spawned programs resolve paths on the host: prefix the runtime root, as the device sees it.
-        let root = self.runtime_root()?;
-        let inside: Vec<String> = if path.starts_with('/') {
-            vec![path.to_owned()]
-        } else {
-            ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/libexec"].iter().map(|d| format!("{d}/{path}")).collect()
-        };
-        let mut candidates: Vec<String> =
-            inside.iter().map(|p| format!("{root}{p}")).filter(|p| std::path::Path::new(p).exists()).collect();
-        // A simulator binary built on the host (e.g. a test tool) runs from its host path.
-        if candidates.is_empty() && path.starts_with('/') && std::path::Path::new(path).is_file() {
-            candidates.push(path.to_owned());
-        }
-        if candidates.is_empty() {
-            return Err(Error::NotFound(format!("{path} in the device runtime")));
-        }
+        let candidates = self.program(path)?;
         let (mut out_r, out_w) = std::io::pipe().map_err(|e| Error::Invalid(format!("pipe: {e}")))?;
         let (mut err_r, err_w) = std::io::pipe().map_err(|e| Error::Invalid(format!("pipe: {e}")))?;
         let mut result = Err(Error::NotFound(path.to_owned()));
@@ -816,6 +801,47 @@ impl Device {
         out_r.read_to_end(&mut stdout).map_err(|e| Error::Invalid(format!("read: {e}")))?;
         let stderr = err_thread.join().unwrap_or_default();
         Ok(ExecOutput { pid, stdout: String::from_utf8_lossy(&stdout).into_owned(), stderr: String::from_utf8_lossy(&stderr).into_owned() })
+    }
+
+    /// Starts `path` inside the device, resolved as [`Device::exec`] does, and returns its pid and
+    /// the read end of its stdout (its stderr isn't kept). The program runs until it exits or is
+    /// signalled; the reader sees EOF then.
+    pub fn exec_stream(&self, path: &str, args: &[String], env: &[(String, String)]) -> Result<(i32, std::io::PipeReader)> {
+        use std::os::fd::AsRawFd;
+        let candidates = self.program(path)?;
+        let (out_r, out_w) = std::io::pipe().map_err(|e| Error::Invalid(format!("pipe: {e}")))?;
+        let mut result = Err(Error::NotFound(path.to_owned()));
+        for candidate in &candidates {
+            result = self.spawn(candidate, args, env, Some(out_w.as_raw_fd()), None);
+            if result.is_ok() {
+                break;
+            }
+        }
+        drop(out_w);
+        Ok((result?, out_r))
+    }
+
+    /// The host paths `path` may run from, best first: under the runtime root (bare names resolve
+    /// against the runtime's `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin` and `/usr/libexec`), or a
+    /// simulator binary built on the host from its own path.
+    fn program(&self, path: &str) -> Result<Vec<String>> {
+        // Spawned programs resolve paths on the host: prefix the runtime root, as the device sees it.
+        let root = self.runtime_root()?;
+        let inside: Vec<String> = if path.starts_with('/') {
+            vec![path.to_owned()]
+        } else {
+            ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/libexec"].iter().map(|d| format!("{d}/{path}")).collect()
+        };
+        let mut candidates: Vec<String> =
+            inside.iter().map(|p| format!("{root}{p}")).filter(|p| std::path::Path::new(p).exists()).collect();
+        // A simulator binary built on the host (e.g. a test tool) runs from its host path.
+        if candidates.is_empty() && path.starts_with('/') && std::path::Path::new(path).is_file() {
+            candidates.push(path.to_owned());
+        }
+        if candidates.is_empty() {
+            return Err(Error::NotFound(format!("{path} in the device runtime")));
+        }
+        Ok(candidates)
     }
 
     /// Launches an app with launch arguments and environment variables. Returns its pid.
