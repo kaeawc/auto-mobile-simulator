@@ -534,8 +534,20 @@ pub fn result(name: &str, outcome: Result<Value, String>, era: Era) -> Value {
     if name == "contrast_check" {
         return contrast_result(value);
     }
-    let text = if value.is_null() { "ok".to_owned() } else { value.to_string() };
+    let text = if value.is_null() { "ok".to_owned() } else { lifecycle_text(name, &value) };
     json!({"content": [{"type": "text", "text": text}], "structuredContent": structured(value, era)})
+}
+
+/// A result's JSON as text. A lifecycle call's `admission` and `pacing` are in `structuredContent`
+/// already, so the text keeps the rest and the verdict in a few words (`ok (admit)`): the same
+/// numbers twice would double what every boot costs the agent's context.
+fn lifecycle_text(name: &str, value: &Value) -> String {
+    let verdict = value.get("admission").and_then(|a| a["verdict"].as_str());
+    let (true, Some(verdict), Some(fields)) = (name != "admission_check", verdict, value.as_object()) else { return value.to_string() };
+    let mut rest = fields.clone();
+    rest.remove("admission");
+    rest.remove("pacing");
+    if rest.is_empty() { format!("ok ({verdict})") } else { format!("{} ({verdict})", Value::Object(rest)) }
 }
 
 /// `contrast_check`'s outcome: each annotated PNG (one, or one per appearance) becomes an image block

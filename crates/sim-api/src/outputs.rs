@@ -25,11 +25,19 @@ use crate::METHODS;
 
 /// Shared types, by name.
 const DEFS: &[(&str, &str)] = &[
+    ("device", "{...@device_fields}"),
     (
-        "device",
-        r#"{udid: string, name: string, state: string, runtime_id: string, device_type_id: string, available: boolean,
-            platform: "ios"|"android", form_factor: string|null, sub_platform: string|null}"#,
+        "device_fields",
+        r#"udid: string, name: string, state: string, runtime_id: string, device_type_id: string, available: boolean,
+            platform: "ios"|"android", form_factor: string|null, sub_platform: string|null"#,
     ),
+    (
+        "admission",
+        r#"{verdict: "admit"|"hold"|"backoff", reasons: [string], predicted: {subject: string, devices: number, admissible: number,
+            costs: [object], boot_cpu_pct: number, idle_cpu_pct: number, boot_memory_bytes: number, idle_memory_bytes: number,
+            memory_used_pct: object|null, memory_available_bytes: object|null, load: object|null}}"#,
+    ),
+    ("pacing", "{waited_s: number, timed_out: boolean, cancelled: boolean, steps: [object]}"),
     ("rate", r#"{"1s": number|null, "1m": number|null}"#),
     (
         "usage",
@@ -95,22 +103,23 @@ pub const OUTPUTS: &[(&str, &str)] = &[
         "[{identifier: string, name: string, model: string, product_family: string, screen_width: number, screen_height: number,
             screen_scale: number, platform: string, form_factor: string|null}]",
     ),
-    ("create", "@device"),
+    ("create", "{...@device_fields, admission?: @admission}"),
     ("delete", "null"),
     (
         "boot",
-        "null|{device: string, boot_s: number, was_booted: boolean, profile?: object, settled?: boolean, settle_s?: number,
-            settle_error?: string, waited_s?: number, ...@load}",
+        "{device?: string, boot_s?: number, was_booted?: boolean, profile?: object, settled?: boolean, settle_s?: number,
+            settle_error?: string, waited_s?: number, ...@load, admission?: @admission, pacing?: @pacing}",
     ),
     (
         "boot_many",
         "{concurrency: number, all_s: number, failed: number, unsettled: number,
             devices: [{device: string, error?: string, boot_s?: number, started_s?: number, done_s?: number, console_port?: number,
-            serial?: string, settled?: boolean, settle_s?: number, settle_error?: string}]}",
+            serial?: string, settled?: boolean, settle_s?: number, settle_error?: string}], admission?: @admission, pacing?: @pacing}",
     ),
+    ("admission_check", "@admission"),
     ("settle", "{settle_s: number, ...@load}"),
     ("profile", "{name: string, failed: [string], disabled?: number, already?: number, not_loaded?: [string], enabled?: number}"),
-    ("clone", "@device"),
+    ("clone", "{...@device_fields, admission?: @admission}"),
     (
         "export",
         "{device: string, to: string, summary: object, identity: object, captures: {disks: boolean, ram: boolean}, resume: string,
@@ -439,6 +448,22 @@ mod tests {
             assert!(METHODS.iter().any(|(name, ..)| name == m), "{m} is not a method");
         }
         assert_eq!(output_schema("nope"), None);
+    }
+
+    #[test]
+    fn admission_and_pacing_are_described_once_and_boots_schema_stays_small() {
+        // Schemas are inlined (no $ref), and `boot` is in every client's tool list (#292): its
+        // output is one object, with the admission and pacing written out once and kept shallow.
+        let boot = output_schema("boot").expect("boot").to_string();
+        assert!(boot.len() < 2000, "boot's output schema is {} bytes", boot.len());
+        for shared in ["\"verdict\":{", "\"admissible\":{", "\"steps\":{"] {
+            assert_eq!(boot.matches(shared).count(), 1, "{shared} twice in boot's schema: {boot}");
+        }
+        for m in ["boot_many", "create", "clone"] {
+            let s = output_schema(m).expect(m).to_string();
+            assert_eq!(s.matches("\"admissible\":{").count(), 1, "{m}");
+        }
+        assert!(output_schema("admission_check").is_some_and(|s| s.to_string().contains("\"costs\"")));
     }
 
     #[test]

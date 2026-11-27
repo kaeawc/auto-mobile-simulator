@@ -2,10 +2,14 @@
 //! with `platform`), then the method runs on that device's backend: `ios.rs` (macOS hosts only) or
 //! `android.rs`. A method a platform doesn't offer fails with the platforms it does work on.
 
+use std::time::Duration;
+
 use serde_json::{Value, json};
-use sim_core::device::{DeviceInfo, RuntimeInfo, Selection, select};
-use sim_core::form_factor::{Kind, matrix};
+use sim_core::device::{DeviceInfo, DeviceState, RuntimeInfo, Selection, select};
+use sim_core::form_factor::{FormFactor, Kind, matrix};
 use sim_core::platform::Platform;
+use sim_host::Verdict;
+use sim_host::admission::{Admission, Clock, HostState, Item, Limits, Paced, Step, SystemClock, Wait, admit, pace, verdict_name};
 
 use crate::params::{need_str, opt_form_factor, opt_platform, str_param};
 
@@ -44,28 +48,47 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("device_types", "", "List device types"),
     (
         "create",
-        "name, platform?(ios|android), form_factor?; iOS: device_type, runtime; Android: system_image, device?(pixel_fold|surface_duo)",
-        "Create a device. form_factor is checked against the device type (iOS) or the system image (Android) and shapes a new AVD",
+        "name, platform?(ios|android), form_factor?, admission?(ignore|refuse); iOS: device_type, runtime; Android: system_image, device?(pixel_fold|surface_duo)",
+        "Create a device. form_factor is checked against the device type (iOS) or the system image (Android) and shapes a new AVD. \
+         Returns the device with `admission`, what booting it would do to the host (as `admission_check`); admission refuse fails \
+         fast, creating nothing, unless the verdict is admit",
     ),
     ("delete", "device", "Delete a device"),
     (
         "boot",
-        "device, timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, settle_foreground?(true), settle_timeout_s?, profile?(\"slim\"); \
-         Android: audio?(false)",
+        "device, timeout_s?, admission?(ignore|refuse|wait), admission_timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, \
+         settle_foreground?(true), settle_timeout_s?, profile?(\"slim\"); Android: audio?(false)",
         "Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; settle also waits \
          up to settle_timeout_s (600) until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s \
          (settle_foreground, the default: counting only foreground-QoS CPU) and returns the timings with cpu_pct, foreground_cpu_pct, \
          background_cpu_pct and cpu_s (CPU-seconds the tree used since the boot; for a device already booted, since the first sample), settled false if it ran out of time; profile turns off a named set \
          of daemons (written before the boot of a shut-down device, so they never start); Android: starts emu and \
-         waits for sys.boot_completed, silent unless audio, which plays the device on the host's default output)",
+         waits for sys.boot_completed, silent unless audio, which plays the device on the host's default output). Returns `admission`, \
+         what the device would do to the host (as `admission_check`; nothing for one already booted): admission ignore, the default, \
+         only reports it; refuse fails fast unless the verdict is admit; wait waits until it is (at most admission_timeout_s, 600) \
+         and returns `pacing`",
     ),
     (
         "boot_many",
-        "devices, concurrency?, timeout_s?; iOS: env?, shaped?, settle?(default true), settle_cpu_pct?, settle_window_s?, \
-         settle_foreground?(true), settle_timeout_s?, profile?(\"slim\"); Android: first_port?(5554)",
+        "devices, concurrency?, timeout_s?, admission?(ignore|refuse|wait), admission_timeout_s?; iOS: env?, shaped?, settle?(default true), \
+         settle_cpu_pct?, settle_window_s?, settle_foreground?(true), settle_timeout_s?, profile?(\"slim\"); Android: first_port?(5554)",
         "Boot several devices of one platform, at most `concurrency` at once (default: a quarter of the host's CPUs, at least 2), each as \
          `boot` does (iOS: a slot is held until the device settles, unless settle is false); returns each device's timings or error, \
-         failed and unsettled counts, and the time until all were done. Android: each on its own console port from first_port up",
+         failed and unsettled counts, and the time until all were done. Android: each on its own console port from first_port up. \
+         Returns `admission` for the devices not running yet (as `admission_check`): admission ignore, the default, only reports it; \
+         refuse fails fast unless the verdict is admit; wait paces the boots, starting as many as the host admits and asking again \
+         every 5 s, and returns `pacing` (each start and wait); devices not admitted within admission_timeout_s (600) are not \
+         started and fail with the reason",
+    ),
+    (
+        "admission_check",
+        "platform(ios|android), form_factor?(phone), count?(1)",
+        "Whether the host can take `count` more devices of a platform and form factor now: each one's predicted cost while booting \
+         and idle (CPU % of a core and memory: docs/benchmarks.md's numbers until this process has seen idle devices of the kind \
+         running, then this host's), what they would do to memory used and the 1-minute load, and an admit/hold/backoff verdict \
+         (the `host` verdict, which still applies, and the prediction: hold at 85% memory used or the host's load limit, back off \
+         at 95%) with every reason and how many of them are admissible now. `boot`, `boot_many`, `create` and `clone` return the \
+         same as `admission`",
     ),
     (
         "settle",
@@ -81,10 +104,10 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "clone",
-        "device, name",
+        "device, name, admission?(ignore|refuse)",
         "Create a device as a copy of a shut-down one. iOS: a simulator (data, settings, apps; APFS clones of its files); Android: an AVD \
          from a golden that has booted under simee (copy-on-write clones of its disks). A booted-once template's copies skip the \
-         first-boot work",
+         first-boot work. Returns the copy with `admission`, as `create` does",
     ),
     (
         "export",
@@ -379,6 +402,9 @@ pub struct Session {
     pub(crate) ios: crate::ios::Session,
     pub(crate) android: crate::android::Session,
     pub(crate) prefs: crate::prefs::Session,
+    /// A host state admission judges by instead of this host's (and the seed costs).
+    #[cfg(test)]
+    pub(crate) fake_host: Option<sim_host::admission::HostState>,
 }
 
 impl Session {
@@ -401,6 +427,7 @@ const ALL_PLATFORMS: &[&str] = &[
     "delete",
     "boot",
     "boot_many",
+    "admission_check",
     "clone",
     "shutdown",
     "screen",
@@ -493,9 +520,349 @@ fn ios_list<T: serde::de::DeserializeOwned>(s: &mut Session, method: &str) -> Re
     serde_json::from_value(crate::ios::call(&mut s.ios, method, &json!({}))?).map_err(|e| e.to_string())
 }
 
-/// Dispatches one method.
+/// Dispatches one method. `boot`, `boot_many`, `create` and `clone` go through admission first.
 pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     let p = if p.is_null() { &Value::Object(Default::default()) } else { p };
+    match method {
+        "boot" | "boot_many" | "create" | "clone" => admitted(s, method, p),
+        "admission_check" => {
+            let (platform, form_factor, count) = check_params(p)?;
+            let items = vec![Item { platform, form_factor: Some(form_factor) }; count];
+            // Nothing says how many boot at once: all of them, the worst case.
+            serde_json::to_value(judge_now(s, &items, count)).map_err(|e| e.to_string())
+        }
+        _ => dispatch(s, method, p),
+    }
+}
+
+/// How a lifecycle call heeds the admission verdict (#275).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Report it with the result (the default: never blocks).
+    Ignore,
+    /// Fail fast, doing nothing, unless the verdict is admit.
+    Refuse,
+    /// Wait until the host admits the devices (`boot`, `boot_many`).
+    Wait,
+}
+
+fn admission_mode(method: &str, p: &Value) -> Result<Mode, String> {
+    match p.get("admission") {
+        None | Some(Value::Null) => Ok(Mode::Ignore),
+        Some(Value::String(m)) => match m.as_str() {
+            "ignore" => Ok(Mode::Ignore),
+            "refuse" => Ok(Mode::Refuse),
+            "wait" if matches!(method, "boot" | "boot_many") => Ok(Mode::Wait),
+            "wait" => Err(format!("`{method}` takes admission ignore or refuse; wait paces boots (`boot`, `boot_many`)")),
+            other => Err(format!("unknown admission `{other}` (ignore, refuse or wait)")),
+        },
+        Some(other) => Err(format!("admission must be ignore, refuse or wait, not {other}")),
+    }
+}
+
+/// `admission_check`'s platform, form factor (default phone) and count (default 1).
+pub(crate) fn check_params(p: &Value) -> Result<(Platform, FormFactor, usize), String> {
+    let platform = opt_platform(p)?.ok_or("give `platform`: ios or android")?;
+    let form_factor = opt_form_factor(p)?.unwrap_or(FormFactor::Phone);
+    Kind::new(platform, form_factor).map_err(|e| e.to_string())?;
+    let count = match p.get("count") {
+        None | Some(Value::Null) => 1,
+        Some(v) => v.as_u64().filter(|n| (1..=1000).contains(n)).ok_or("count must be a whole number from 1 to 1000")? as usize,
+    };
+    Ok((platform, form_factor, count))
+}
+
+/// How long `admission: "wait"` waits (`admission_timeout_s`, default 600 s).
+fn wait_options(p: &Value) -> Result<Wait, String> {
+    let timeout = match p.get("admission_timeout_s") {
+        None | Some(Value::Null) => Wait::DEFAULT_TIMEOUT,
+        Some(v) => Duration::from_secs(v.as_u64().ok_or("admission_timeout_s must be a whole number of seconds")?),
+    };
+    Ok(Wait { timeout, poll: Wait::POLL })
+}
+
+/// The refusal `admission: "refuse"` fails with: the verdict and every reason.
+fn gate(mode: Mode, a: &Admission) -> Result<(), String> {
+    if mode == Mode::Refuse && a.verdict != Verdict::Admit {
+        return Err(format!(
+            "admission {}: {} (nothing was done; admission \"ignore\" goes ahead anyway)",
+            verdict_name(a.verdict),
+            a.reasons.join("; ")
+        ));
+    }
+    Ok(())
+}
+
+/// The admission verdict on starting `items` on this host now. Each call first lets the
+/// estimate learn from the idle devices running.
+/// At most `concurrency` of them boot at once.
+fn judge_now(s: &mut Session, items: &[Item], concurrency: usize) -> Admission {
+    #[cfg(test)]
+    if let Some(h) = &s.fake_host {
+        return admit(h, items, concurrency, sim_host::admission::seed, &Limits::default());
+    }
+    observe_running(s);
+    let host = HostState::from_report(&sim_host::global().report(sim_host::Thresholds::default()));
+    let est = sim_host::admission::estimator().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    admit(&host, items, concurrency, |p, f| est.cost(p, f), &Limits::default())
+}
+
+/// Feeds the running devices' CPU and footprint (labelled with their platform and form factor
+/// as `devices_usage` does) to the process's estimate, without waiting for a rate.
+fn observe_running(s: &mut Session) {
+    let report = sim_host::global().usage_now();
+    if !report.devices.iter().any(|d| d.cpu_pct.m1.is_some()) {
+        return;
+    }
+    let ios: Vec<DeviceInfo> = if report.devices.iter().any(|d| d.kind == Some(sim_host::usage::Kind::Simulator)) {
+        crate::ios::call(&mut s.ios, "devices", &json!({"booted": true}))
+            .ok()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let android = s.android.backend();
+    let Ok(rows) = crate::usage::rows(&report, &ios, |avd| android.running_info(avd)) else { return };
+    let mut est = sim_host::admission::estimator().lock().unwrap_or_else(|e| e.into_inner());
+    for row in rows["devices"].as_array().into_iter().flatten() {
+        let platform = row["platform"].as_str().and_then(Platform::parse);
+        let form_factor = row["form_factor"].as_str().and_then(FormFactor::parse);
+        if let (Some(platform), Some(form_factor)) = (platform, form_factor) {
+            est.observe(platform, form_factor, row["cpu_pct"]["1m"].as_f64(), row["footprint_bytes"].as_u64().unwrap_or(0));
+        }
+    }
+}
+
+/// A device a lifecycle call names: its exact id, platform, form factor and whether it runs.
+struct Target {
+    udid: String,
+    item: Item,
+    running: bool,
+}
+
+fn target(s: &mut Session, query: &str, platform: Option<&Value>) -> Result<Target, String> {
+    let info = dispatch(s, "info", &json!({"device": query, "platform": platform}))?;
+    let d: DeviceInfo = serde_json::from_value(info["device"].clone()).map_err(|e| e.to_string())?;
+    let running = matches!(d.state, DeviceState::Booted | DeviceState::Booting);
+    Ok(Target { udid: d.udid, item: Item { platform: d.platform, form_factor: d.form_factor }, running })
+}
+
+/// `result` with `admission` (and `pacing`) in it; a `null` result becomes an object of them.
+fn with_admission(result: Value, a: &Admission, pacing: Option<Value>) -> Value {
+    let mut r = match result {
+        Value::Null => json!({}),
+        Value::Object(_) => result,
+        other => return other,
+    };
+    r["admission"] = serde_json::to_value(a).unwrap_or_default();
+    if let Some(p) = pacing {
+        r["pacing"] = p;
+    }
+    r
+}
+
+fn pacing_json<R>(p: &Paced<R>) -> Value {
+    json!({"waited_s": p.waited_s, "timed_out": p.timed_out, "cancelled": p.cancelled, "steps": p.steps})
+}
+
+/// What the caller of a call on this thread hands it: a cancel flag the call polls while it
+/// waits, and where it says what it waits on (MCP's progress and task status).
+pub struct CallHooks {
+    pub cancelled: Box<dyn Fn() -> bool>,
+    pub progress: Box<dyn Fn(&str)>,
+}
+
+thread_local! {
+    static HOOKS: std::cell::RefCell<Option<CallHooks>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` (calls on this thread) with `hooks` in place; the previous ones come back after.
+pub fn with_call_hooks<R>(hooks: CallHooks, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<CallHooks>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HOOKS.with(|h| *h.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(HOOKS.with(|h| h.borrow_mut().replace(hooks)));
+    f()
+}
+
+/// Whether the caller of the call on this thread cancelled it.
+pub fn call_cancelled() -> bool {
+    HOOKS.with(|h| h.borrow().as_ref().is_some_and(|h| (h.cancelled)()))
+}
+
+/// What a waiting call says while it waits: a line on stderr (stdout is `simee mcp`'s protocol)
+/// and the caller's progress hook.
+fn progress(method: &str, step: &Step) {
+    if step.started == 0 {
+        let line =
+            format!("{method}: {} waiting at {} s, admission {}: {}", step.waiting, step.at_s, verdict_name(step.verdict), step.reason);
+        eprintln!("simee: {line}");
+        call_progress(&line);
+    }
+}
+
+/// Tells the caller of the call on this thread what it is waiting on.
+pub fn call_progress(message: &str) {
+    HOOKS.with(|h| {
+        if let Some(h) = h.borrow().as_ref() {
+            (h.progress)(message);
+        }
+    });
+}
+
+/// `boot`, `create` and `clone` with their admission: judged before the call (a device already
+/// running costs nothing), refused or waited on as `admission` says, and returned with the result.
+/// A device that doesn't resolve goes straight to the method, which says why.
+fn admitted(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
+    let mode = admission_mode(method, p)?;
+    if method == "boot_many" {
+        return boot_many_admitted(s, p, mode);
+    }
+    let items = match method {
+        "create" => {
+            let platform = opt_platform(p)?.unwrap_or(Platform::Ios);
+            let form_factor = opt_form_factor(p)?;
+            if let Some(f) = form_factor {
+                Kind::new(platform, f).map_err(|e| e.to_string())?;
+            }
+            vec![Item { platform, form_factor }]
+        }
+        _ => match target(s, str_param(p, "device").unwrap_or("booted"), p.get("platform")) {
+            Ok(t) if method == "boot" && t.running => Vec::new(),
+            Ok(t) => vec![t.item],
+            Err(_) => return dispatch(s, method, p),
+        },
+    };
+    let mut a = judge_now(s, &items, 1);
+    gate(mode, &a)?;
+    let mut pacing = None;
+    if mode == Mode::Wait && !items.is_empty() {
+        let wait = wait_options(p)?;
+        let paced = pace(
+            &items,
+            |_| true,
+            &SystemClock::start(),
+            wait,
+            call_cancelled,
+            |rest| judge_now(s, rest, 1),
+            |_| (),
+            |step| progress(method, step),
+        );
+        if paced.timed_out || paced.cancelled {
+            let last = paced.last.as_ref().unwrap_or(&a);
+            let what = if paced.cancelled { "cancelled after waiting" } else { "the host didn't admit the boot within" };
+            return Err(format!(
+                "admission: {what} {} s ({}: {}); nothing was booted",
+                paced.waited_s,
+                verdict_name(last.verdict),
+                last.reasons.join("; ")
+            ));
+        }
+        pacing = Some(pacing_json(&paced));
+        a = paced.last.unwrap_or(a);
+    }
+    let result = dispatch(s, method, p)?;
+    // A new device's form factor, where the call didn't name it, is known now.
+    if method == "create" {
+        let made = result["form_factor"].as_str().and_then(FormFactor::parse);
+        if made.is_some() && items.first().is_some_and(|i| i.form_factor != made) {
+            a = judge_now(s, &[Item { platform: items[0].platform, form_factor: made }], 1);
+        }
+    }
+    Ok(with_admission(result, &a, pacing))
+}
+
+/// `boot_many` with its admission. `wait` boots the devices in chunks as the host admits them,
+/// each chunk as `boot_many` boots its devices, and reports the ones it never started.
+fn boot_many_admitted(s: &mut Session, p: &Value, mode: Mode) -> Result<Value, String> {
+    let queries = crate::params::strings(p, "devices");
+    let targets: Result<Vec<Target>, String> = queries.iter().map(|q| target(s, q, p.get("platform"))).collect();
+    // Unknown devices, none, or several platforms: the method says why.
+    let targets = match targets {
+        Ok(t) if !t.is_empty() && t.iter().all(|x| x.item.platform == t[0].item.platform) => t,
+        _ => return dispatch(s, "boot_many", p),
+    };
+    let new = |ts: &[Target]| -> Vec<Item> { ts.iter().filter(|t| !t.running).map(|t| t.item).collect() };
+    let concurrency = crate::params::concurrency(p)?;
+    let a = judge_now(s, &new(&targets), concurrency);
+    gate(mode, &a)?;
+    if mode != Mode::Wait {
+        return Ok(with_admission(dispatch(s, "boot_many", p)?, &a, None));
+    }
+    let wait = wait_options(p)?;
+    let clock = SystemClock::start();
+    let platform = targets[0].item.platform.as_str();
+    let session = std::cell::RefCell::new(s);
+    let chunks = std::cell::RefCell::new(Vec::<Vec<String>>::new());
+    let paced = pace(
+        &targets,
+        |t| !t.running,
+        &clock,
+        wait,
+        call_cancelled,
+        |rest| judge_now(&mut session.borrow_mut(), &new(rest), concurrency),
+        |chunk| {
+            let ids: Vec<String> = chunk.iter().map(|t| t.udid.clone()).collect();
+            let mut q = p.clone();
+            q["devices"] = ids.iter().cloned().map(Value::String).collect();
+            q["platform"] = json!(platform);
+            chunks.borrow_mut().push(ids);
+            dispatch(&mut session.borrow_mut(), "boot_many", &q)
+        },
+        |step| progress("boot_many", step),
+    );
+    let (mut devices, mut failed, unsettled) = merge_chunks(&paced.results, &chunks.borrow())?;
+    let last = paced.last.as_ref().unwrap_or(&a);
+    for t in &targets[targets.len() - paced.not_started..] {
+        let why = last.reasons.first().map_or("", String::as_str);
+        let error = if paced.cancelled {
+            format!(
+                "not started: cancelled while waiting for the host to admit it, after {} s ({}: {why})",
+                paced.waited_s,
+                verdict_name(last.verdict)
+            )
+        } else {
+            format!("not started: the host didn't admit it within {} s of waiting ({}: {why})", paced.waited_s, verdict_name(last.verdict))
+        };
+        devices.push(json!({"device": t.udid, "error": error}));
+        failed += 1;
+    }
+    let all_s = (clock.elapsed().as_secs_f64() * 10.0).round() / 10.0;
+    let result = json!({"concurrency": concurrency, "all_s": all_s, "failed": failed, "unsettled": unsettled, "devices": devices});
+    Ok(with_admission(result, &a, Some(pacing_json(&paced))))
+}
+
+/// The devices, failed and unsettled counts of the chunks `boot_many` booted one after another
+/// (`ids` are each chunk's devices). A chunk that fails as a whole (no ports left, a plan error)
+/// fails its own devices and the chunks before it stay in the result, running; only when every
+/// chunk failed is it the call's error.
+fn merge_chunks(results: &[Result<Value, String>], ids: &[Vec<String>]) -> Result<(Vec<Value>, u64, u64), String> {
+    if let Some(Err(e)) = results.first().filter(|_| results.iter().all(Result::is_err)) {
+        return Err(e.clone());
+    }
+    let (mut devices, mut failed, mut unsettled) = (Vec::new(), 0, 0);
+    for (r, ids) in results.iter().zip(ids) {
+        match r {
+            Ok(r) => {
+                devices.extend(r["devices"].as_array().cloned().unwrap_or_default());
+                failed += r["failed"].as_u64().unwrap_or(0);
+                unsettled += r["unsettled"].as_u64().unwrap_or(0);
+            }
+            Err(e) => {
+                devices.extend(ids.iter().map(|id| json!({"device": id, "error": format!("boot_many failed for its chunk: {e}")})));
+                failed += ids.len() as u64;
+            }
+        }
+    }
+    Ok((devices, failed, unsettled))
+}
+
+/// Dispatches one method, past admission.
+fn dispatch(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     match method {
         "help" => Ok(METHODS
             .iter()
@@ -1040,6 +1407,220 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// A host with `total_gib` of memory, 59% free, 16 CPUs at load 2, and its verdict (thermal
+    /// `serious` holds it).
+    fn fake_host(total_gib: u64, thermal: Option<sim_host::ThermalState>) -> HostState {
+        use sim_host::{Level, MemReading, Reading, Thresholds, decide};
+        let reading = Reading {
+            load1: Some(2.0),
+            cpus: 16,
+            mem: Some(MemReading { available_bytes: None, level: Level::Normal }),
+            thermal,
+            power: None,
+        };
+        HostState {
+            cpus: 16,
+            load1: Some(2.0),
+            memory_total_bytes: Some(total_gib << 30),
+            memory_available_bytes: None,
+            memory_free_pct: Some(59.0),
+            now: decide(&reading, &Thresholds::default()),
+        }
+    }
+
+    const SERIOUS: Option<sim_host::ThermalState> = Some(sim_host::ThermalState::Serious);
+
+    #[test]
+    fn admission_check_predicts_what_new_devices_cost() {
+        let mut s = Session { fake_host: Some(fake_host(64, None)), ..Session::default() };
+        let a = call(&mut s, "admission_check", &json!({"platform": "android", "count": 3})).expect("check");
+        assert_eq!(a["verdict"], "admit", "{a}");
+        let p = &a["predicted"];
+        assert_eq!(
+            (p["subject"].as_str(), p["devices"].as_u64(), p["admissible"].as_u64()),
+            (Some("3 more Android phone devices"), Some(3), Some(3))
+        );
+        assert_eq!(p["costs"][0]["count"], 3);
+        assert_eq!(p["boot_memory_bytes"], 3 * 3_764_000_000u64);
+        assert_eq!(p["memory_used_pct"], json!({"now": 41.0, "after": 57.4}));
+        assert!(
+            a["reasons"][0].as_str().is_some_and(|r| r.starts_with("3 more Android phone devices would take memory used from 41% to 57%"))
+        );
+        // Twelve phones overfill a 64 GiB host (107% used, a load of 32 against 24): the first 8 fit.
+        let full = call(&mut s, "admission_check", &json!({"platform": "android", "count": 12})).expect("check");
+        assert_eq!((full["verdict"].as_str(), full["predicted"]["admissible"].as_u64()), (Some("backoff"), Some(8)), "{full}");
+        let watch = call(&mut s, "admission_check", &json!({"platform": "ios", "form_factor": "watch"})).expect("watch");
+        assert!(watch["predicted"]["costs"][0]["source"].as_str().is_some_and(|x| x.contains("a watch isn't measured yet")), "{watch}");
+        // The parameters are checked.
+        let mut refused = |p: Value| call(&mut s, "admission_check", &p).expect_err("refused");
+        assert_eq!(refused(json!({})), "give `platform`: ios or android");
+        assert_eq!(refused(json!({"platform": "android", "count": 0})), "count must be a whole number from 1 to 1000");
+        assert!(refused(json!({"platform": "android", "form_factor": "toaster"})).starts_with("unknown form factor `toaster`"));
+        if let Some((f, pl, _)) = matrix().into_iter().find(|(_, _, k)| k.is_err()) {
+            assert!(!refused(json!({"platform": pl, "form_factor": f})).is_empty());
+        }
+        // On the real host: a verdict and its reasons, whatever the host's state.
+        let real = call(&mut Session::default(), "admission_check", &json!({"platform": "ios"})).expect("real host");
+        assert!(matches!(real["verdict"].as_str(), Some("admit" | "hold" | "backoff")) && real["reasons"][0].is_string(), "{real}");
+    }
+
+    #[test]
+    fn the_admission_modes() {
+        use sim_host::admission::seed;
+        let judged = |total_gib, thermal| {
+            admit(&fake_host(total_gib, thermal), &[Item { platform: Platform::Android, form_factor: None }], 1, seed, &Limits::default())
+        };
+        let (admits, holds) = (judged(64, None), judged(64, SERIOUS));
+        assert_eq!((admits.verdict, holds.verdict), (Verdict::Admit, Verdict::Hold));
+        for mode in [Mode::Ignore, Mode::Wait] {
+            assert_eq!((gate(mode, &admits), gate(mode, &holds)), (Ok(()), Ok(())), "{mode:?} never refuses");
+        }
+        assert_eq!(gate(Mode::Refuse, &admits), Ok(()));
+        let err = gate(Mode::Refuse, &holds).expect_err("refused");
+        assert!(
+            err.starts_with("admission hold: thermal: ") && err.ends_with("(nothing was done; admission \"ignore\" goes ahead anyway)"),
+            "{err}"
+        );
+        let mode = |m: &str, p: Value| admission_mode(m, &p);
+        assert_eq!(mode("boot", json!({})), Ok(Mode::Ignore));
+        assert_eq!(mode("boot_many", json!({"admission": "wait"})), Ok(Mode::Wait));
+        assert_eq!(mode("clone", json!({"admission": "refuse"})), Ok(Mode::Refuse));
+        assert_eq!(
+            mode("create", json!({"admission": "wait"})),
+            Err("`create` takes admission ignore or refuse; wait paces boots (`boot`, `boot_many`)".into())
+        );
+        assert_eq!(mode("boot", json!({"admission": "later"})), Err("unknown admission `later` (ignore, refuse or wait)".into()));
+        assert_eq!(mode("boot", json!({"admission": true})), Err("admission must be ignore, refuse or wait, not true".into()));
+        assert_eq!(wait_options(&json!({})).map(|w| w.timeout), Ok(Wait::DEFAULT_TIMEOUT));
+        assert_eq!(wait_options(&json!({"admission_timeout_s": 7})).map(|w| w.timeout), Ok(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn create_and_clone_return_admission_and_refuse_creates_nothing() {
+        let (mut s, root) = short_android_session("adm-create");
+        s.fake_host = Some(fake_host(64, SERIOUS));
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        let create = |extra: Value| {
+            let mut p = json!({"platform": "android", "name": "fold", "system_image": mobile, "form_factor": "foldable"});
+            p.as_object_mut().expect("object").extend(extra.as_object().cloned().unwrap_or_default());
+            p
+        };
+        let err = call(&mut s, "create", &create(json!({"admission": "refuse"}))).expect_err("refused");
+        assert!(err.starts_with("admission hold: thermal: "), "{err}");
+        assert!(s.android.devices().is_empty(), "a refusal creates nothing");
+        assert!(call(&mut s, "create", &create(json!({"admission": "wait"}))).is_err());
+        // Ignore (the default) creates it and says what booting it would do.
+        let d = call(&mut s, "create", &create(json!({}))).expect("created");
+        assert_eq!((d["udid"].as_str(), d["form_factor"].as_str()), (Some("fold"), Some("foldable")));
+        let a = &d["admission"];
+        assert_eq!((a["verdict"].as_str(), a["predicted"]["costs"][0]["form_factor"].as_str()), (Some("hold"), Some("foldable")), "{a}");
+        assert!(a["reasons"][0].as_str().is_some_and(|r| r.starts_with("thermal: ")), "{a}");
+        // Clone judges the template's kind before it copies anything.
+        let err = call(&mut s, "clone", &json!({"device": "fold", "name": "copy", "admission": "refuse"})).expect_err("refused");
+        assert!(err.starts_with("admission hold: "), "{err}");
+        s.fake_host = Some(fake_host(64, None));
+        let err = call(&mut s, "clone", &json!({"device": "fold", "name": "copy", "admission": "refuse"})).expect_err("never booted");
+        assert_eq!(err, "fold has no simee user data yet (boot it once with emu, then stop it)", "admitted: the clone itself answers");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn boot_and_boot_many_refuse_or_wait_on_a_busy_host() {
+        use sim_android::testing::fake_emulator;
+        let (mut s, root) = short_android_session("adm-boot");
+        fake_adb(&root);
+        s.fake_host = Some(fake_host(64, SERIOUS));
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        call(&mut s, "create", &json!({"platform": "android", "name": "pixel", "system_image": mobile})).expect("pixel");
+        let many = |extra: Value| {
+            let mut p = json!({"devices": ["pixel"], "timeout_s": 20});
+            p.as_object_mut().expect("object").extend(extra.as_object().cloned().unwrap_or_default());
+            p
+        };
+        let err = call(&mut s, "boot_many", &many(json!({"admission": "refuse"}))).expect_err("refused");
+        assert!(err.starts_with("admission hold: thermal: "), "{err}");
+        let err = call(&mut s, "boot", &json!({"device": "pixel", "admission": "refuse"})).expect_err("refused");
+        assert!(err.starts_with("admission hold: "), "{err}");
+        let err = call(&mut s, "boot", &json!({"device": "pixel", "admission": "wait", "admission_timeout_s": 0})).expect_err("timed out");
+        assert!(err.starts_with("admission: the host didn't admit the boot within 0 s (hold: thermal: "), "{err}");
+        // Waiting past the timeout starts nothing and says so per device.
+        let r = call(&mut s, "boot_many", &many(json!({"admission": "wait", "admission_timeout_s": 0}))).expect("paced");
+        assert_eq!((r["failed"].as_u64(), r["pacing"]["timed_out"].as_bool()), (Some(1), Some(true)), "{r}");
+        let e = r["devices"][0]["error"].as_str().expect("error");
+        assert!(e.starts_with("not started: the host didn't admit it within 0 s of waiting (hold: thermal: "), "{e}");
+        assert_eq!(r["pacing"]["steps"][0]["started"], 0);
+        assert!(s.android.backend().device("pixel").expect("pixel").running.is_none(), "nothing was started");
+        // A device that runs already costs nothing: admitted on the same busy host, at once.
+        let _fake = fake_emulator(s.android.backend(), "pixel");
+        let r = call(&mut s, "boot_many", &many(json!({"admission": "wait"}))).expect("running");
+        assert_eq!((r["failed"].as_u64(), r["admission"]["verdict"].as_str()), (Some(0), Some("admit")), "{r}");
+        assert_eq!((r["pacing"]["steps"][0]["started"].as_u64(), r["pacing"]["waited_s"].as_f64()), (Some(1), Some(0.0)), "{r}");
+        assert_eq!(r["devices"][0]["device"], "pixel");
+        let b = call(&mut s, "boot", &json!({"device": "pixel", "timeout_s": 20, "admission": "refuse"})).expect("running");
+        assert_eq!((b["admission"]["verdict"].as_str(), b["admission"]["predicted"]["devices"].as_u64()), (Some("admit"), Some(0)), "{b}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_cancelled_wait_stops_promptly_boots_nothing_and_says_what_it_waited_on() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (mut s, root) = short_android_session("adm-cancel");
+        fake_adb(&root);
+        s.fake_host = Some(fake_host(64, SERIOUS));
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        call(&mut s, "create", &json!({"platform": "android", "name": "pixel", "system_image": mobile})).expect("pixel");
+        let heard = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        // The caller cancels as soon as it hears what the call waits on.
+        let hooks = || {
+            let (flag, heard) = (Arc::new(AtomicBool::new(false)), heard.clone());
+            let seen = flag.clone();
+            CallHooks {
+                cancelled: Box::new(move || seen.load(Ordering::Relaxed)),
+                progress: Box::new(move |m| {
+                    heard.lock().expect("heard").push(m.to_owned());
+                    flag.store(true, Ordering::Relaxed);
+                }),
+            }
+        };
+        let t = std::time::Instant::now();
+        let err =
+            with_call_hooks(hooks(), || call(&mut s, "boot", &json!({"device": "pixel", "admission": "wait"}))).expect_err("cancelled");
+        assert!(err.starts_with("admission: cancelled after waiting 0.") && err.ends_with("nothing was booted"), "{err}");
+        let r =
+            with_call_hooks(hooks(), || call(&mut s, "boot_many", &json!({"devices": ["pixel"], "timeout_s": 20, "admission": "wait"})))
+                .expect("a result");
+        assert!(t.elapsed() < Duration::from_secs(3), "stopped between polls, not at the 5 s poll or the 600 s timeout: {:?}", t.elapsed());
+        let e = r["devices"][0]["error"].as_str().expect("error");
+        assert!(e.starts_with("not started: cancelled while waiting"), "{e}");
+        assert_eq!((r["failed"].as_u64(), r["pacing"]["timed_out"].as_bool()), (Some(1), Some(false)), "{r}");
+        assert!(s.android.backend().device("pixel").expect("pixel").running.is_none(), "nothing was booted");
+        let heard = heard.lock().expect("heard");
+        assert!(heard.len() >= 2 && heard.iter().all(|m| m.contains("waiting at") && m.contains("hold: thermal: ")), "{heard:?}");
+        // The hooks are gone after the call: a later call on this thread is not cancelled.
+        assert!(!call_cancelled());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_failed_chunk_fails_its_devices_and_keeps_the_ones_already_booted() {
+        let ok = json!({"devices": [{"device": "a", "boot_s": 1.0}], "failed": 0, "unsettled": 1});
+        let ids = vec![vec!["a".to_owned()], vec!["b".to_owned(), "c".to_owned()]];
+        let (devices, failed, unsettled) = merge_chunks(&[Ok(ok.clone()), Err("no console ports left".into())], &ids).expect("partial");
+        assert_eq!((failed, unsettled), (2, 1));
+        assert_eq!(devices[0]["device"], "a");
+        assert_eq!(
+            devices[1..]
+                .iter()
+                .map(|d| (d["device"].as_str(), d["error"].as_str().is_some_and(|e| e.contains("no console ports left"))))
+                .collect::<Vec<_>>(),
+            [(Some("b"), true), (Some("c"), true)]
+        );
+        // Every chunk failing is still the call's error; none started is an empty result.
+        assert_eq!(merge_chunks(&[Err("plan".into()), Err("later".into())], &ids), Err("plan".into()));
+        assert_eq!(merge_chunks(&[], &[]), Ok((vec![], 0, 0)));
+    }
+
     /// Whether `v` fits `schema`, as far as [`crate::output_schema`] writes them (type, enum,
     /// properties, required, items, additionalProperties, anyOf): the path to the first misfit.
     fn misfit(schema: &Value, v: &Value, at: &str) -> Option<String> {
@@ -1116,6 +1697,9 @@ mod tests {
             ("rotate", json!({"device": d})),
             ("console", json!({"device": d, "command": "help"})),
             ("boot_many", json!({"devices": [d], "timeout_s": 20})),
+            ("boot_many", json!({"devices": [d], "timeout_s": 20, "admission": "wait"})),
+            ("boot", json!({"device": d, "timeout_s": 20})),
+            ("admission_check", json!({"platform": "android", "count": 2})),
         ] {
             if let Ok(v) = call(&mut s, method, &p) {
                 checked.push((method, v));
@@ -1126,7 +1710,20 @@ mod tests {
             assert_eq!(misfit(&schema, v, method), None, "{method} returned {v}");
         }
         let names: Vec<&str> = checked.iter().map(|(m, _)| *m).collect();
-        for method in ["help", "identity", "host", "devices_usage", "form_factors", "devices", "create", "screen", "info", "tap"] {
+        for method in [
+            "help",
+            "identity",
+            "host",
+            "devices_usage",
+            "form_factors",
+            "devices",
+            "create",
+            "screen",
+            "info",
+            "tap",
+            "admission_check",
+            "boot",
+        ] {
             assert!(names.contains(&method), "{method} wasn't checked: {names:?}");
         }
         // The check can fail.

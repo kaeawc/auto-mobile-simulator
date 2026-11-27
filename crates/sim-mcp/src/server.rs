@@ -16,7 +16,7 @@ use serde_json::{Map, Value, json};
 use crate::backend::{Backend, Executor};
 use crate::resources;
 use crate::rpc::{self, Ctx, EXT_TASKS, Era, INTERNAL_ERROR, Incoming, LEGACY, MODERN, RpcError};
-use crate::tasks::{Sink, Tasks};
+use crate::tasks::{Ctl, Sink, Tasks};
 use crate::tools::{self, Pages, Toolsets};
 use crate::watch::{self, Emit, Spec, Watcher};
 
@@ -169,12 +169,25 @@ impl Drop for Heartbeat {
     }
 }
 
-fn heartbeat(sink: Sink, token: Value, tool: String, every: Duration) -> Heartbeat {
-    heartbeat_with(sink, token, tool, every, || {})
+fn heartbeat(sink: Sink, token: Value, tool: String, every: Duration, ctl: Ctl) -> Heartbeat {
+    heartbeat_noting(sink, token, tool, every, ctl, || {})
 }
 
 /// [`heartbeat`], calling `before_send` just before each progress goes out (tests pause there).
+#[cfg(test)]
 fn heartbeat_with(sink: Sink, token: Value, tool: String, every: Duration, before_send: impl Fn() + Send + 'static) -> Heartbeat {
+    heartbeat_noting(sink, token, tool, every, Ctl::default(), before_send)
+}
+
+/// [`heartbeat_with`], saying what the call waits on (its note in `ctl`) after the time.
+fn heartbeat_noting(
+    sink: Sink,
+    token: Value,
+    tool: String,
+    every: Duration,
+    ctl: Ctl,
+    before_send: impl Fn() + Send + 'static,
+) -> Heartbeat {
     let stopped = Arc::new(Mutex::new(false));
     let flag = stopped.clone();
     let spawned = std::thread::Builder::new().name("simee-mcp-progress".into()).spawn(move || {
@@ -187,7 +200,8 @@ fn heartbeat_with(sink: Sink, token: Value, tool: String, every: Duration, befor
             }
             next += every;
             let secs = start.elapsed().as_secs_f64();
-            let message = format!("{tool} is still running ({} s)", secs.round());
+            let note = ctl.say().map(|n| format!(": {n}")).unwrap_or_default();
+            let message = format!("{tool} is still running ({} s){note}", secs.round());
             // Checked and sent under the one lock the drop takes, so a stop can't fall in between.
             let stopped = lock(&flag);
             if *stopped {
@@ -338,13 +352,20 @@ impl Inner {
     /// Runs `work` on a worker thread and answers with its outcome, unless the client cancelled the
     /// request meanwhile (then nothing more is sent for it).
     fn offload(self: &Arc<Self>, id: Value, ctx: Ctx, work: impl FnOnce(&Inner) -> Result<Value, RpcError> + Send + 'static) {
+        self.offload_with(id, ctx, |inner, _| work(inner));
+    }
+
+    /// [`Server::offload`], with the request's [`Ctl`] for the work: its cancel flag is the one
+    /// `notifications/cancelled` sets.
+    fn offload_with(self: &Arc<Self>, id: Value, ctx: Ctx, work: impl FnOnce(&Inner, &Ctl) -> Result<Value, RpcError> + Send + 'static) {
         let key = rpc::id_key(&id);
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let ctl = Ctl::default();
+        let cancelled = ctl.cancelled.clone();
         lock(&self.inflight).insert(key.clone(), cancelled.clone());
         *lock(&self.running) += 1;
         let inner = self.clone();
         self.executor.submit(move || {
-            let outcome = catch_unwind(AssertUnwindSafe(|| work(&inner)))
+            let outcome = catch_unwind(AssertUnwindSafe(|| work(&inner, &ctl)))
                 .unwrap_or_else(|_| Err(RpcError::new(INTERNAL_ERROR, "the request's thread panicked")));
             lock(&inner.inflight).remove(&key);
             if !cancelled.load(Ordering::Relaxed) {
@@ -362,7 +383,9 @@ impl Inner {
         };
         if tools::as_task(&name, ctx) {
             let (backend, pages, tool) = (self.backend.clone(), self.pages.clone(), name.clone());
-            let created = self.tasks.create(&name, move || tools::result(&tool, tools::run(&*backend, &pages, &tool, &args), Era::Modern));
+            let created = self.tasks.create_with(&name, move |ctl| {
+                sim_api::with_call_hooks(ctl.hooks(), || tools::result(&tool, tools::run(&*backend, &pages, &tool, &args), Era::Modern))
+            });
             let result = match created {
                 Ok(mut handle) => {
                     handle["resultType"] = "task".into();
@@ -374,9 +397,10 @@ impl Inner {
         }
         let progress = ctx.progress_token.clone().filter(|_| tools::LONG_RUNNING.contains(&name.as_str()));
         let era = ctx.era;
-        self.offload(id, ctx.clone(), move |inner| {
-            let _beat = progress.map(|token| heartbeat(inner.sink.clone(), token, name.clone(), inner.timing.heartbeat));
-            Ok(tools::result(&name, tools::run(&*inner.backend, &inner.pages, &name, &args), era))
+        self.offload_with(id, ctx.clone(), move |inner, ctl| {
+            let _beat = progress.map(|token| heartbeat(inner.sink.clone(), token, name.clone(), inner.timing.heartbeat, ctl.clone()));
+            let ran = sim_api::with_call_hooks(ctl.hooks(), || tools::run(&*inner.backend, &inner.pages, &name, &args));
+            Ok(tools::result(&name, ran, era))
         });
     }
 
