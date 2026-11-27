@@ -1,7 +1,7 @@
 # MCP server
 
 `simee mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server on stdin and
-stdout, so an agent can do everything simee can do: create, boot and drive iOS and Android devices,
+stdout (or, with `--http`, on MCP's Streamable HTTP transport), so an agent can do everything simee can do: create, boot and drive iOS and Android devices,
 look at their screens, read their logs, and watch them change.
 
 | MCP feature | What simee gives it |
@@ -12,8 +12,9 @@ look at their screens, read their logs, and watch them change.
 | Tasks | `boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase`, `shutdown`, `export`, `import`, `mem_leaks`, `mem_heap` as pollable, cancellable tasks |
 | App | `device_view`: a device's screen with tap, swipe, type and button controls, in the conversation |
 
-Transport is stdio only: there is no HTTP or SSE listener, so nothing on the network can reach it.
-The server runs in the agent's user account, with the same reach as `simee` itself.
+The default transport is stdio: nothing on the network can reach it. `simee mcp --http` serves the
+same server over HTTP for agents in other processes, containers or machines ([Over HTTP](#over-http)).
+The server runs in its user account, with the same reach as `simee` itself.
 
 ## Set it up
 
@@ -271,12 +272,84 @@ theme variables where it is given them. A host without app support sees the tool
 one that returns the screen size. The frame rate is one screenshot a second; a live stream would
 need a push channel the API doesn't have.
 
+## Over HTTP
+
+```bash
+simee mcp --http                       # http://127.0.0.1:8377/mcp, loopback only, no token
+simee mcp --http 127.0.0.1:9000 --token-file ~/.config/simee/mcp-token   # loopback, token required
+simee mcp --http 0.0.0.0:8377 --insecure-remote   # every interface; token required, plain HTTP
+```
+
+This is the Streamable HTTP transport: one endpoint, `/mcp`.
+
+- `POST` carries one JSON-RPC message. A notification or a response is accepted with 202. A request
+  is answered with `application/json`, or with a `text/event-stream` when something about it comes
+  before its response (`notifications/progress` for a long call with a progress token, a
+  `subscriptions/listen`'s acknowledgement and notifications); that stream ends with the response.
+  A client that accepts only JSON gets the response alone.
+- A client of the current revision (2026-07-28) is stateless: it needs no session, and its requests
+  share one server (tasks are found by their unguessable ids). It cancels a request by closing its
+  response.
+- A client of an earlier revision opens with `initialize`, whose response carries an
+  `Mcp-Session-Id`. Every request after it must name that session (400 without one, 404 for one
+  that ended or expired); each session is its own server, as each stdio connection is, with its
+  own negotiated revision, requests and subscriptions. `GET` opens the session's stream for what
+  belongs to no request (`notifications/resources/updated`); `DELETE` ends the session.
+  `notifications/cancelled` names one of the session's own requests.
+- `MCP-Protocol-Version`, when sent, must be a revision the server speaks (400 otherwise) and agree
+  with the request's `_meta` version.
+- Request ids and progress tokens are replaced by ones unique to the process on the way in and put
+  back on the way out, so clients that reuse ids don't see each other's answers. Every message goes
+  through the same server code as stdio: the transport only carries it.
+- Streams carry no event ids, so a dropped stream can't be resumed with `Last-Event-ID`; a long call
+  is better made a task (Tasks extension) and polled.
+
+Security:
+
+- The bind is loopback unless an address says otherwise. A non-loopback address is refused unless
+  `--insecure-remote` acknowledges that there is no TLS (the token crosses the network in the
+  clear): use it on a trusted network, or behind a TLS-terminating proxy. TLS isn't built in
+  because no TLS crate is in the workspace's dependency tree.
+- Off loopback a bearer token is always required (`Authorization: Bearer <token>`, 401 otherwise).
+  Tokens are read from `--token-file` (default: `mcp-token` in simee's state directory,
+  `$SIMEE_STATE_DIR`, else `~/Library/Application Support/simee` on macOS and
+  `$XDG_STATE_HOME/simee` or `~/.local/state/simee` elsewhere). A missing file is created with one
+  random 256-bit token and mode 0600; a file other users can read is refused. One token per line
+  (one per client, say); `#` lines are comments. Rotate by rewriting the file: it is re-read when it
+  changes, and a removed token is refused on the next request. On loopback, `--token-file` turns
+  the same check on.
+- A request with an `Origin` header (a browser page) is refused with 403 unless the origin is a
+  loopback one, and on a loopback bind a `Host` that isn't a loopback name is refused too: a page on
+  another site can't reach the server through DNS rebinding.
+- Bounds: a body is at most 8 MiB (413 past it, before it is read), a request head 16 KiB (431),
+  and both must arrive within 10 s; an idle kept-alive connection closes after 15 s; at most 64
+  connections are served at once (503 past it), each on its own thread (no async runtime), and 32
+  sessions (the idlest is closed to make room). A waiting response checks every 15 s that its
+  client is still there (a stream sends a comment), and a client that has gone cancels its request.
+
+Per-call overhead, a `tools/call` of `identity` (`sim-api`'s real method) in a loop: each run is the
+median of 5 rounds, and the table gives the median of 3 runs, µs per call. Apple M3 Max,
+2026-11-27, release build, with other builds running (load average 20 to 30):
+
+| Path | µs per call |
+| --- | --- |
+| stdio (the server reading from one OS pipe and writing to another, as `simee mcp` does) | 19.5 |
+| HTTP on loopback, one kept-alive connection | 44.9 |
+| HTTP, kept-alive, with a bearer token | 45.6 |
+| HTTP, a new connection per call | 106.4 |
+
+So HTTP adds about 25 µs per call on a kept-alive connection (checking a token adds about 1 µs)
+and about 85 µs with a connection per call: small next to a device method (a `tap` or `screenshot`
+takes milliseconds). Reproduce: `cargo test --release -p simee-mcp http_call_overhead -- --ignored --nocapture`.
+
 ## Limits and what is not here
 
 - Prompts, completions, logging, sampling and elicitation are not offered; the specification
   deprecates three of them.
 - Cancelling a task doesn't stop a running device call (above).
 - The change notifications are polled, once a second, and only for what a client subscribed to.
+- Over HTTP: no TLS, no OAuth (a bearer token from a file is the only authentication), no
+  resumable streams, and an `Origin` allowlist beyond loopback isn't configurable.
 - Tool calls run in the server's process, on its own threads, with a session per thread; they don't
   go through a running `simee serve`, so a long-lived MCP server holds its own simulator connection.
 - A tool is as powerful as the method: `exec` runs programs inside an iOS device, `write` and `rm`
@@ -288,6 +361,9 @@ need a push channel the API doesn't have.
 - [Specification 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) and its
   [changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog): stateless
   requests, `server/discover`, `subscriptions/listen`, error codes, the stdio transport.
+- Transports: [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports)
+  and [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
+  (Streamable HTTP: one endpoint, `Mcp-Session-Id`, `MCP-Protocol-Version`, `Origin` validation).
 - [Tasks extension](https://github.com/modelcontextprotocol/ext-tasks) (`io.modelcontextprotocol/tasks`).
 - [MCP Apps](https://github.com/modelcontextprotocol/ext-apps) (`io.modelcontextprotocol/ui`,
   specification 2026-01-26): `ui://` resources, `_meta.ui.resourceUri`, the postMessage protocol.
