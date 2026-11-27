@@ -71,6 +71,36 @@ fn misfit(schema: &Value, v: &Value, at: &str) -> Option<String> {
     }
 }
 
+fn admission() -> Value {
+    json!({"verdict": "admit", "reasons": ["1 more iOS phone device would take memory used from 30% to 33%"],
+        "predicted": {"subject": "1 more iOS phone device", "devices": 1, "admissible": 1, "costs": [{"platform": "ios", "count": 1}],
+        "boot_cpu_pct": 280.0, "idle_cpu_pct": 10.0, "boot_memory_bytes": 2176000000u64, "idle_memory_bytes": 2176000000u64,
+        "memory_used_pct": {"now": 30.0, "after": 33.0}, "memory_available_bytes": null, "load": {"now": 1.0, "after": 3.8, "limit": 24.0}}})
+}
+
+#[test]
+fn a_lifecycle_result_carries_its_admission_in_structured_content_and_one_line_of_text() {
+    let text = |name: &str, value: Value| result(name, Ok(value), Era::Modern)["content"][0]["text"].as_str().expect("text").to_owned();
+    // The verdict once as data, a few words as text: not the whole JSON twice (#292).
+    let out = result("boot", Ok(json!({"admission": admission()})), Era::Modern);
+    assert_eq!(out["content"][0]["text"], "ok (admit)");
+    assert_eq!(out["structuredContent"]["admission"]["verdict"], "admit");
+    // Timings stay in the text, without the admission and pacing.
+    let timed = json!({"device": "d", "boot_s": 1.5, "was_booted": false, "admission": admission(), "pacing": {"steps": []}});
+    let t = text("boot", timed.clone());
+    assert_eq!(t, r#"{"boot_s":1.5,"device":"d","was_booted":false} (admit)"#);
+    assert_eq!(result("boot", Ok(timed.clone()), Era::Modern)["structuredContent"], timed);
+    let held = admission().as_object().cloned().map(|mut a| {
+        a.insert("verdict".into(), json!("hold"));
+        Value::Object(a)
+    });
+    assert_eq!(text("create", json!({"udid": "u", "admission": held})), r#"{"udid":"u"} (hold)"#);
+    // What isn't a lifecycle result is as it was; admission_check's text is its answer.
+    assert_eq!(text("boot", Value::Null), "ok");
+    assert_eq!(text("devices", json!([])), "[]");
+    assert!(text("admission_check", admission()).contains("\"reasons\""));
+}
+
 #[test]
 fn there_is_a_tool_for_every_method_in_the_table() {
     let tools = all();
@@ -240,6 +270,14 @@ fn every_tool_has_an_output_schema_its_results_fit() {
         ("vehicle", json!([{"property": "GEAR_SELECTION", "id": "0x11400400", "area_id": 0, "status": "available", "value": 4}])),
         ("boot", Value::Null),
         ("boot", json!({"device": "d", "boot_s": 1.0, "was_booted": false})),
+        ("boot", json!({"admission": admission(), "pacing": {"waited_s": 5.0, "timed_out": false, "cancelled": false, "steps": []}})),
+        ("boot", json!({"device": "d", "boot_s": 1.0, "was_booted": false, "admission": admission()})),
+        (
+            "create",
+            json!({"udid": "u", "name": "n", "state": "Shutdown", "runtime_id": "r", "device_type_id": "t", "available": true,
+            "platform": "ios", "form_factor": "phone", "sub_platform": null, "admission": admission()}),
+        ),
+        ("admission_check", admission()),
         ("screen", json!({"width": 2, "height": 1})),
         ("screenshot", json!({"width": 2, "height": 1, "png": "iVBOR"})),
         (

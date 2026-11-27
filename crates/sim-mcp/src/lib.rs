@@ -1,4 +1,5 @@
-//! simee's MCP server: an agent can do everything simee can, over stdio (`simee mcp`).
+//! simee's MCP server: an agent can do everything simee can, over stdio (`simee mcp`) or MCP's
+//! Streamable HTTP transport (`simee mcp --http`, [`http`]).
 //!
 //! - **Tools**: one per method in `sim-api`'s table, generated from it ([`tools`]), plus
 //!   `device_view`, in toolsets a client picks (`SIMEE_MCP_TOOLSETS`; `core` by default).
@@ -10,10 +11,12 @@
 //!
 //! It speaks the current revision (2026-07-28: stateless, `server/discover`, per-request `_meta`)
 //! and answers `initialize` for clients of the revisions before it ([`rpc`], [`server`]). The
-//! protocol layer is hand-written, over `serde_json`: see docs/mcp.md for why.
+//! protocol layer is hand-written, over `serde_json`: see docs/mcp.md for why. Both transports feed
+//! the same [`Server`].
 
 pub mod app;
 pub mod backend;
+pub mod http;
 pub mod resources;
 pub mod rpc;
 pub mod server;

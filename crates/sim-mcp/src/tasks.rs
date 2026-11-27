@@ -3,11 +3,13 @@
 //!
 //! Cancellation is cooperative, as the extension allows: a cancelled task is `cancelled` at once and
 //! its result is thrown away, but a device call already in flight (a boot, an install) can't be
-//! interrupted through the API, so the call itself runs to its end in the background.
+//! interrupted through the API, so the call itself runs to its end in the background. What can
+//! stop is a call that is only waiting (a boot held back by admission): it sees the flag ([`Ctl`])
+//! between polls and starts nothing more.
 
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -33,7 +35,32 @@ enum State {
     Cancelled,
 }
 
+/// What a running call sees of its caller: whether the caller cancelled it, and a note it leaves
+/// on what it is waiting for (shown in the task's status and in progress messages).
+#[derive(Clone, Default)]
+pub struct Ctl {
+    pub cancelled: Arc<AtomicBool>,
+    pub note: Arc<Mutex<String>>,
+}
+
+impl Ctl {
+    /// The hooks that hand this to `sim-api`'s calls on the thread that runs them.
+    pub fn hooks(&self) -> sim_api::CallHooks {
+        let (cancelled, note) = (self.cancelled.clone(), self.note.clone());
+        sim_api::CallHooks {
+            cancelled: Box::new(move || cancelled.load(Ordering::Relaxed)),
+            progress: Box::new(move |message| *note.lock().unwrap_or_else(|e| e.into_inner()) = message.to_owned()),
+        }
+    }
+
+    /// What the call last said it waits on, if it does.
+    pub fn say(&self) -> Option<String> {
+        Some(self.note.lock().unwrap_or_else(|e| e.into_inner()).clone()).filter(|n| !n.is_empty())
+    }
+}
+
 struct Entry {
+    ctl: Ctl,
     method: String,
     created: SystemTime,
     updated: SystemTime,
@@ -132,7 +159,10 @@ impl Tasks {
             "pollIntervalMs": POLL_MS,
         });
         let (status, message) = match &e.state {
-            State::Working => ("working", format!("{} has been running for {secs} s", e.method)),
+            State::Working => {
+                let note = e.ctl.say().map(|n| format!(": {n}")).unwrap_or_default();
+                ("working", format!("{} has been running for {secs} s{note}", e.method))
+            }
             State::Completed(result) => {
                 task["result"] = result.clone();
                 if result["isError"] == true {
@@ -149,7 +179,7 @@ impl Tasks {
             State::Cancelled => (
                 "cancelled",
                 format!(
-                    "cancelled by the client; a running {} call can't be interrupted, so it finishes in the background and its result is discarded",
+                    "cancelled by the client; a running {} call can't be interrupted, so it finishes in the background and its result is discarded (a call only waiting for the host to admit its devices stops waiting and starts nothing)",
                     e.method
                 ),
             ),
@@ -169,6 +199,13 @@ impl Tasks {
     /// result (a `CallToolResult`). The handle (a `CreateTaskResult`'s fields) is returned at once;
     /// with [`MAX_RUNNING`] calls running (cancelled tasks' too), it fails instead.
     pub fn create(&self, method: &str, work: impl FnOnce() -> Value + Send + 'static) -> Result<Value, String> {
+        self.create_with(method, |_| work())
+    }
+
+    /// [`Tasks::create`], with the task's [`Ctl`] for the work: the flag `tasks/cancel` sets, and
+    /// the note its status shows.
+    pub fn create_with(&self, method: &str, work: impl FnOnce(Ctl) -> Value + Send + 'static) -> Result<Value, String> {
+        let ctl = Ctl::default();
         let id = new_id();
         let now = SystemTime::now();
         let (handle, running) = {
@@ -182,6 +219,7 @@ impl Tasks {
             }
             self.running.fetch_add(1, Ordering::SeqCst);
             let entry = Entry {
+                ctl: ctl.clone(),
                 method: method.to_owned(),
                 created: now,
                 updated: now,
@@ -196,7 +234,7 @@ impl Tasks {
         let (tasks, task_id) = (self.clone(), id.clone());
         let spawned = std::thread::Builder::new().name(format!("simee-task-{}", &id[..8])).spawn(move || {
             let _running = running;
-            let outcome = catch_unwind(AssertUnwindSafe(work));
+            let outcome = catch_unwind(AssertUnwindSafe(|| work(ctl)));
             tasks.finish(&task_id, outcome.map_err(|_| RpcError::new(INTERNAL_ERROR, "the task's thread panicked").to_json()));
         });
         if let Err(e) = spawned {
@@ -245,6 +283,7 @@ impl Tasks {
         let mut table = self.lock();
         let Some(entry) = table.entries.get_mut(id) else { return false };
         if matches!(entry.state, State::Working) {
+            entry.ctl.cancelled.store(true, Ordering::Relaxed);
             entry.state = State::Cancelled;
             entry.updated = SystemTime::now();
             entry.finished = Some(Instant::now());

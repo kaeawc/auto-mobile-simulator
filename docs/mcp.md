@@ -1,7 +1,7 @@
 # MCP server
 
 `simee mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server on stdin and
-stdout, so an agent can do everything simee can do: create, boot and drive iOS and Android devices,
+stdout (or, with `--http`, on MCP's Streamable HTTP transport), so an agent can do everything simee can do: create, boot and drive iOS and Android devices,
 look at their screens, read their logs, and watch them change.
 
 | MCP feature | What simee gives it |
@@ -12,8 +12,9 @@ look at their screens, read their logs, and watch them change.
 | Tasks | `boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase`, `shutdown`, `export`, `import`, `mem_leaks`, `mem_heap` as pollable, cancellable tasks |
 | App | `device_view`: a device's screen with tap, swipe, type and button controls, in the conversation |
 
-Transport is stdio only: there is no HTTP or SSE listener, so nothing on the network can reach it.
-The server runs in the agent's user account, with the same reach as `simee` itself.
+The default transport is stdio: nothing on the network can reach it. `simee mcp --http` serves the
+same server over HTTP for agents in other processes, containers or machines ([Over HTTP](#over-http)).
+The server runs in its user account, with the same reach as `simee` itself.
 
 ## Set it up
 
@@ -155,7 +156,7 @@ in `SIMEE_MCP_TOOLSETS` (commas between names; `all` for every tool). Unset, it 
 | Toolset | Tools |
 | --- | --- |
 | `core` (the default) | `devices`, `boot`, `shutdown`, `info`, `screen`, `screenshot`, `tap`, `swipe`, `type`, `key`, `button`, `rotate`, `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `logs`, `appearance`, `location`, `device_view` |
-| `lifecycle` | Devices: `form_factors`, `devices`, `runtimes`, `device_types`, `create`, `delete`, `boot`, `boot_many`, `settle`, `profile`, `clone`, `export`, `import`, `shutdown`, `erase`, `info` |
+| `lifecycle` | Devices: `form_factors`, `devices`, `runtimes`, `device_types`, `create`, `delete`, `boot`, `boot_many`, `admission_check`, `settle`, `profile`, `clone`, `export`, `import`, `shutdown`, `erase`, `info` |
 | `apps` | `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `privacy`, `push` |
 | `input` | `tap`, `swipe`, `touch`, `button`, `type`, `key`, `rotate`, `fold`, `xr`, `touchpad`, `stylus`, `rotary`, `watch_gesture`, `remote_swipe`, `pointer`, `biometric` |
 | `observe` | `screen`, `screenshot`, `contrast_check`, `logs`, `device_view` |
@@ -188,7 +189,7 @@ reverse):
 
 | Tools | Platforms |
 | --- | --- |
-| `help`, `identity`, `host`, `devices_usage`, `form_factors`, `devices`, `runtimes`, `create`, `delete`, `boot`, `boot_many`, `clone`, `shutdown`, `screen`, `screenshot`, `contrast_check`, `tap`, `swipe`, `touch`, `button`, `type`, `key`, `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `location`, `info`, `rotate`, `rotary`, `stylus`, `device_view` | Android, iOS |
+| `help`, `identity`, `host`, `devices_usage`, `form_factors`, `devices`, `runtimes`, `create`, `delete`, `boot`, `boot_many`, `admission_check`, `clone`, `shutdown`, `screen`, `screenshot`, `contrast_check`, `tap`, `swipe`, `touch`, `button`, `type`, `key`, `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `location`, `info`, `rotate`, `rotary`, `stylus`, `device_view` | Android, iOS |
 | `console`, `fold`, `xr`, `vehicle`, `touchpad`, `export`, `import` | Android (iOS bundles: the next step of #170) |
 | `prefs_stores`, `prefs_read`, `prefs_write`, `prefs_delete`, `prefs_batch`, `prefs_watch` | Android, iOS (iOS is implemented; Android answers "not yet available") |
 | `device_types`, `settle`, `profile`, `erase`, `appearance`, `privacy`, `push`, `status_bar`, `clear_status_bar`, `content_size`, `increase_contrast`, `dynamic_island`, `backlight`, `keyboard_language`, `hardware_keyboard`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `memory_warning`, `notify`, `biometric`, `exec`, `logs`, `processes`, `kill`, `connections`, `traffic`, `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container`, `defaults_read`, `defaults_write`, `crash_reports`, `network_shape`, `network_state`, `network_flows`, `network_clear`, `network_env`, `audio_state`, `audio_volume`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `audio_mute`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
@@ -243,7 +244,11 @@ a list in `crates/sim-mcp/src/tools.rs`; every other tool answers inline.
 - `tasks/cancel` is cooperative, as the extension allows. The task is `cancelled` at once and its
   result is discarded, but the API can't interrupt a device call that is already running, so a
   cancelled `boot` still finishes booting the device in the background. The status message says
-  so.
+  so. A call that is only waiting for the host to admit its devices (`admission: "wait"`) does
+  stop: it sees the cancel within a second and starts nothing. While it waits, the task's status
+  message (and a progress message, for a client without tasks) says what it waits on.
+- A `boot`, `boot_many`, `create` or `clone` result carries `admission` (and `pacing`) in
+  `structuredContent` only; the text is one line, such as `ok (admit)`, so it doesn't repeat them.
 - At most 8 task calls run at once; a ninth is refused with a tool error until one ends. A
   cancelled task's call keeps running, so it still counts: cancelling doesn't make room. Finished
   tasks are kept for an hour.
@@ -271,12 +276,113 @@ theme variables where it is given them. A host without app support sees the tool
 one that returns the screen size. The frame rate is one screenshot a second; a live stream would
 need a push channel the API doesn't have.
 
+## Over HTTP
+
+```bash
+simee mcp --http                       # http://127.0.0.1:8377/mcp, loopback; token from the state directory
+simee mcp --http 127.0.0.1:9000 --token-file ~/.config/simee/mcp-token   # loopback, a token file of your choice
+simee mcp --http 0.0.0.0:8377 --insecure-remote   # every interface, plain HTTP (see Security)
+simee mcp --http --no-auth             # loopback, no token: any local user or process can connect
+```
+
+Every request carries `Authorization: Bearer <token>`. On its first run the server writes a random
+token to its default token file and prints the file's path (never the token); later runs reuse it.
+
+This is the Streamable HTTP transport: one endpoint, `/mcp`.
+
+- `POST` carries one JSON-RPC message. A notification or a response is accepted with 202. A request
+  is answered with `application/json`, or with a `text/event-stream` when something about it comes
+  before its response (`notifications/progress` for a long call with a progress token, a
+  `subscriptions/listen`'s acknowledgement and notifications); that stream ends with the response.
+  A client that accepts only JSON gets the response alone.
+- A client of the current revision (2026-07-28) is stateless: it needs no session, and its requests
+  share one server (tasks are found by their unguessable ids). It cancels a request by closing its
+  response.
+- A client of an earlier revision opens with `initialize`, whose response carries an
+  `Mcp-Session-Id`. Every request after it must name that session (400 without one, 404 for one
+  that ended or expired); each session is its own server, as each stdio connection is, with its
+  own negotiated revision, requests and subscriptions. `GET` opens the session's stream for what
+  belongs to no request (`notifications/resources/updated`); `DELETE` ends the session.
+  `notifications/cancelled` names one of the session's own requests.
+- `MCP-Protocol-Version`, when sent, must be a revision the server speaks (400 otherwise) and agree
+  with the request's `_meta` version.
+- Request ids and progress tokens are replaced by ones unique to the process on the way in and put
+  back on the way out, so clients that reuse ids don't see each other's answers. Every message goes
+  through the same server code as stdio: the transport only carries it.
+- Streams carry no event ids, so a dropped stream can't be resumed with `Last-Event-ID`; a long call
+  is better made a task (Tasks extension) and polled.
+
+### Security
+
+- TLS and OAuth are not built in (a follow-up issue tracks them). For access from another machine,
+  put the server behind a TLS-terminating reverse proxy (nginx, Caddy) on the same host, keep it
+  bound to loopback, and keep the token on. A non-loopback bind serves plain HTTP, where the token
+  crosses the network in the clear, so it is refused unless `--insecure-remote` acknowledges that
+  (a trusted network only).
+- Authentication is on by default, on every bind, loopback included: a request without a valid
+  `Authorization: Bearer <token>` gets 401. Tokens come from `--token-file` (default: `mcp-token`
+  in simee's state directory, `$SIMEE_STATE_DIR`, else `~/Library/Application Support/simee` on
+  macOS and `$XDG_STATE_HOME/simee` or `~/.local/state/simee` elsewhere). A missing file is created
+  with one random 256-bit token, mode 0600, in a directory created 0700. The file must be a regular
+  file (a symbolic link is refused), owned by the user running the server and readable by them
+  only, and its directory must not be writable by group or others (or owned by another user):
+  these are checked on the open file, so it can't be swapped in between. One token per line (one
+  per client, say); `#` lines are comments. Rotate by rewriting the file: it is re-read when it
+  changes, and a removed token is refused on the next request.
+- `--no-auth` turns the token off, and is refused on a non-loopback bind. Loopback is not private:
+  without a token, every other user and process on the host can drive the devices (another account
+  on a shared Mac, a CI job on a shared runner, a container on the host network), and so can anyone
+  who reaches a reverse proxy on this host, since the proxy connects from loopback (nginx's default
+  `proxy_pass` even sends a loopback `Host`). Use it only on a single-user machine with no proxy.
+- A session belongs to the token that opened it: a request, `GET` stream or `DELETE` naming another
+  token's session gets 404, as for a session that doesn't exist, and a full session table makes
+  room only from the caller's own sessions. (Without a token every client is the same caller.)
+- A request with an `Origin` header (a browser page) is refused with 403 unless the origin is a
+  loopback one, and on a loopback bind a `Host` that isn't a loopback name is refused too: a page on
+  another site can't reach the server through DNS rebinding.
+- Framing is strict, so a proxy and this server can't read one request two ways: `Content-Length`
+  is ASCII digits only, chunk sizes hex digits only, `Transfer-Encoding` at most once and exactly
+  `chunked`, never both; a `GET`, `DELETE` or other non-`POST` with a body is refused. Any 4xx or 5xx
+  answer closes the connection (`Connection: close`), so nothing after an error is read as a request.
+- Bounds: a body is at most 8 MiB (413 past it, before it is read) and a request head 16 KiB (431).
+  A connection's first request head must be in within 10 s of the connection opening, and a later
+  one within 10 s of its first byte (at most 8 blank lines may come before a request line); the
+  deadline is never extended by what arrives. A body then has 10 s of its own. An idle kept-alive
+  connection closes after 15 s. At most 64 connections are served at once, and 8 from one address that
+  have not yet authenticated (a connection gives its address slot back with its first request that
+  carries a valid token, or at once with `--no-auth`); 503 past either, each on its own thread
+  (no async runtime), and 32 sessions. A session with no request for an hour is closed, its `GET`
+  stream with it (the stream's pings don't count as use).
+- A waiting response checks every 15 s that its client is still there (an event stream sends a
+  comment), and a client that has gone (a write to it fails, or the connection is reset) cancels its
+  request. A client that only shut down its sending side is still served: if it accepts
+  `text/event-stream` its response becomes a stream whose pings tell whether it is still reading;
+  otherwise its call runs to the end.
+
+Per-call overhead, a `tools/call` of `identity` (`sim-api`'s real method) in a loop: each run is the
+median of 5 rounds, and the table gives the median of 3 runs, µs per call. Apple M3 Max,
+2026-11-27, release build, with other builds running (load average 20 to 30):
+
+| Path | µs per call |
+| --- | --- |
+| stdio (the server reading from one OS pipe and writing to another, as `simee mcp` does) | 19.5 |
+| HTTP on loopback, one kept-alive connection | 44.9 |
+| HTTP, kept-alive, with a bearer token | 45.6 |
+| HTTP, a new connection per call | 106.4 |
+
+So HTTP adds about 25 µs per call on a kept-alive connection (checking a token adds about 1 µs)
+and about 85 µs with a connection per call: small next to a device method (a `tap` or `screenshot`
+takes milliseconds). Reproduce: `cargo test --release -p simee-mcp http_call_overhead -- --ignored --nocapture`.
+
 ## Limits and what is not here
 
 - Prompts, completions, logging, sampling and elicitation are not offered; the specification
   deprecates three of them.
 - Cancelling a task doesn't stop a running device call (above).
 - The change notifications are polled, once a second, and only for what a client subscribed to.
+- Over HTTP: no TLS, no OAuth (a bearer token from a file is the only authentication; both are
+  tracked in a follow-up issue), no resumable streams, and an `Origin` allowlist beyond loopback
+  and the connection limits aren't configurable.
 - Tool calls run in the server's process, on its own threads, with a session per thread; they don't
   go through a running `simee serve`, so a long-lived MCP server holds its own simulator connection.
 - A tool is as powerful as the method: `exec` runs programs inside an iOS device, `write` and `rm`
@@ -288,6 +394,9 @@ need a push channel the API doesn't have.
 - [Specification 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) and its
   [changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog): stateless
   requests, `server/discover`, `subscriptions/listen`, error codes, the stdio transport.
+- Transports: [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports)
+  and [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
+  (Streamable HTTP: one endpoint, `Mcp-Session-Id`, `MCP-Protocol-Version`, `Origin` validation).
 - [Tasks extension](https://github.com/modelcontextprotocol/ext-tasks) (`io.modelcontextprotocol/tasks`).
 - [MCP Apps](https://github.com/modelcontextprotocol/ext-apps) (`io.modelcontextprotocol/ui`,
   specification 2026-01-26): `ui://` resources, `_meta.ui.resourceUri`, the postMessage protocol.

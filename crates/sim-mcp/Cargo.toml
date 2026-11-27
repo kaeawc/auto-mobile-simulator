@@ -1,6 +1,6 @@
 [package]
 name = "simee-mcp"
-description = "simee's MCP server: every API method as a tool, devices as resources, long operations as tasks, and a device view as an MCP App, over stdio."
+description = "simee's MCP server: every API method as a tool, devices as resources, long operations as tasks, and a device view as an MCP App, over stdio or Streamable HTTP."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,6 +18,11 @@ doctest = false
 [dependencies]
 serde_json.workspace = true
 sim-api.workspace = true
+
+# The HTTP transport's token file: opened without following links, its owner checked against the
+# effective user.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 [dev-dependencies]
 emu-avd.workspace = true
