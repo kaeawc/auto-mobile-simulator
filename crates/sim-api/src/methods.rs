@@ -114,8 +114,9 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("uninstall", "device, bundle_id", "Uninstall an app"),
     (
         "launch",
-        "device, bundle_id, args?, env?, shaped?",
-        "Launch with arguments and environment (shaped: inject the network shaper); returns pid",
+        "device, bundle_id, args?, env?, shaped?, restart?",
+        "Launch with arguments and environment (shaped: inject the network shaper; restart: terminate a running instance \
+         first, default true; false brings a running app to the front); returns pid",
     ),
     ("terminate", "device, bundle_id", "Terminate an app"),
     ("apps", "device", "Installed bundle ids"),
