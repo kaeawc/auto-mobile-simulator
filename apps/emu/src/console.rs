@@ -872,6 +872,26 @@ mod tests {
         command(info, &line.split_whitespace().collect::<Vec<_>>())
     }
 
+    /// The golden build stops its child through the console like `adb emu kill` does: greeting,
+    /// `auth`, `kill`, and the instance's stop flag is set.
+    #[test]
+    fn the_golden_builds_console_stop_authenticates_and_kills() {
+        use std::sync::atomic::Ordering;
+        let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("free port").local_addr().expect("addr").port();
+        let info = console(FormFactor::Phone);
+        let stop = info.stop.clone();
+        serve(port, info).expect("serve");
+        let token = auth_token().expect("token");
+        assert!(crate::golden::console_kill_with(port, Some("wrong")).is_err(), "a wrong token is refused");
+        assert!(!stop.load(Ordering::SeqCst));
+        crate::golden::console_kill_with(port, Some(&token)).expect("kill");
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(stop.load(Ordering::SeqCst), "the console's kill requested a stop");
+    }
+
     /// The token exists, as stock's does, before a client reads it: a missing file gets one (16 hex
     /// digits), an existing one is kept, and an empty one turns authentication off.
     #[test]

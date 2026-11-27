@@ -145,7 +145,8 @@ jobs:
         if: steps.sdk-cache.outputs.cache-hit != 'true'
         run: |
           target/release/emu -provision 36 -tag default -abi x86_64
-      - run: target/release/emu -create-avd ci -sysdir system-images/android-36/default/x86_64
+      # -no-golden: the next steps test a first boot, and a golden is another full boot of this job.
+      - run: target/release/emu -create-avd ci -sysdir system-images/android-36/default/x86_64 -no-golden
       - run: target/release/emu -avd ci -dry-run
       # Every run checks `sys.boot_completed`, a screenshot of the display's size that isn't one
       # solid colour (polled, 40 tries: right after boot the capture can still fail or come back
