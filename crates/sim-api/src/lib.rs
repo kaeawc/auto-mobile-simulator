@@ -18,6 +18,7 @@
 //! macOS hosts; elsewhere they fail with a clear reason.
 
 mod android;
+pub mod catalog;
 mod contrast;
 #[cfg(target_os = "macos")]
 mod duo;
@@ -30,6 +31,7 @@ mod ios;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod memtools;
 mod methods;
+mod outputs;
 mod params;
 pub mod prefs;
 mod schema;
@@ -50,6 +52,7 @@ use serde_json::Value;
 pub use forward::{HANDSHAKE_TIMEOUT, IN_CALLER, forwards, identity};
 pub use ios::{flush_input, track_input};
 pub use methods::{METHODS, Session, call as call_method, platforms};
+pub use outputs::output_schema;
 pub use schema::input_schema;
 pub use sim_core::frame::encode_png;
 
