@@ -74,6 +74,8 @@ pub enum Action {
     ToggleStylus,
     /// ⌘3: the 3D device view on or off ([`scene`]).
     ToggleView3d,
+    /// A change of the 3D view: face on, a saved view, flip, spin ([`scene::Command`]).
+    View3d(scene::Command),
     Debug(debug::DebugAction),
 }
 
@@ -725,6 +727,10 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             toggle_view3d(s);
             continue;
         }
+        if let Action::View3d(c) = action {
+            s.view3d.view.command(c, t);
+            continue;
+        }
         if s.offline {
             if let Action::Select(udid) = action {
                 s.selected = Some(udid);
@@ -801,7 +807,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             }
             Action::Xr(command) => android_action(s, move |d| d.xr(&command).map(drop)),
             Action::ToggleStylus => toggle_stylus(s),
-            Action::ToggleView3d => {}
+            Action::ToggleView3d | Action::View3d(_) => {}
             Action::Debug(a) => {
                 if let Some(udid) = s.live.as_ref().map(|l| l.udid.clone())
                     && let Some(msg) = s.debug.perform(&udid, a)
@@ -863,6 +869,14 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
         tx.resize_window(fit_window(size, form_factor, bezel));
         changed = true;
     }
+    // The 3D view's camera and turn: a frame for every step of a running change and one to land
+    // it, then nothing.
+    if s.view3d.view.step(t) {
+        changed = true;
+        if s.view3d.view.moving() {
+            tx.wake_after(Duration::ZERO);
+        }
+    }
     changed
 }
 
@@ -877,14 +891,21 @@ fn toggle_view3d(s: &mut State) {
     }
 }
 
-/// Window shortcuts the focused control left alone: ⌘3 toggles the 3D view.
+/// Window shortcuts the focused control left alone: ⌘3 toggles the 3D view; while it shows, ⌘0,
+/// ⌘1 ⌘2 ⌘4 ⌘5, ⌘F and ⌘[ ⌘] move it ([`scene::Command::for_key`]).
 fn on_key(s: &mut State, k: &rune::KeyEvent, tx: &mut Tx) -> bool {
-    if k.key == rune::Key::Command('3') && !k.mods.shift {
-        s.actions.push(Action::ToggleView3d);
-        tx.request_poll();
-        return true;
-    }
-    false
+    let action = if k.key == rune::Key::Command('3') && !k.mods.shift {
+        Action::ToggleView3d
+    } else if let Some(c) = scene::Command::for_key(k)
+        && scene::active(s).is_some()
+    {
+        Action::View3d(c)
+    } else {
+        return false;
+    };
+    s.actions.push(action);
+    tx.request_poll();
+    true
 }
 
 /// The toolbar's Stylus button (Android tablets): the pointer becomes a pen (what stock's gRPC
@@ -1190,6 +1211,77 @@ mod tests {
         assert!(!rt.state.view3d.on);
         assert_eq!(rt.state.status.as_deref(), Some(scene::UNAVAILABLE));
         assert!(rt.find("scene-3d").is_none());
+    }
+
+    /// Runs frames at 60 Hz for `secs`.
+    fn run_for(rt: &mut Runtime<State>, secs: f64) {
+        for _ in 0..(secs * 60.0).round() as usize {
+            rt.frame(1.0 / 60.0);
+        }
+    }
+
+    /// ⌘0 animates the 3D camera to face on: the window asks for frames only while it moves,
+    /// then sleeps again. With the 3D view off the view keys are nobody's.
+    #[test]
+    fn view_keys_animate_the_3d_camera_and_then_the_window_sleeps() {
+        let mut rt = polled_runtime(three_d);
+        rt.on_key = Some(on_key);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.wake_deadline(), None, "a still 3D view sleeps");
+        rt.key(cmd('0'));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.view3d.view.moving(), "face on animates");
+        assert!(rt.wake_deadline().is_some(), "a running change asks for the next frame");
+        run_for(&mut rt, 0.4);
+        assert!(!rt.state.view3d.view.moving());
+        assert_eq!(rt.wake_deadline(), None, "landed: the window sleeps again");
+        assert_eq!(rt.state.view3d.view.camera_now(), scene::Camera::preset(scene::Preset::Face));
+        // ⌘F turns the device over, ⌘2 moves the camera to the front view.
+        rt.key(cmd('f'));
+        rt.key(cmd('2'));
+        run_for(&mut rt, 0.4);
+        assert!(rt.state.view3d.view.turn_now().flipped());
+        assert_eq!(rt.state.view3d.view.camera_now(), scene::Camera::preset(scene::Preset::Front));
+        assert_eq!(rt.wake_deadline(), None);
+        // Off, ⌘0 does nothing.
+        rt.state.view3d.on = false;
+        rt.frame(1.0 / 60.0);
+        rt.key(cmd('0'));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.actions.is_empty() && !rt.state.view3d.view.moving());
+    }
+
+    /// The toolbar has Face on and Flip while the 3D view shows, and a drag on the 3D view
+    /// orbits the camera without touching the device.
+    #[test]
+    fn the_3d_toolbar_and_a_drag_move_the_view() {
+        let mut rt = polled_runtime(three_d);
+        assert!(rt.find("face-on-button").is_some() && rt.find("flip-button").is_some());
+        press(&mut rt, "flip-button");
+        run_for(&mut rt, 0.4);
+        assert!(rt.state.view3d.view.turn_now().flipped());
+        press(&mut rt, "face-on-button");
+        run_for(&mut rt, 0.4);
+        assert!(!rt.state.view3d.view.turn_now().flipped());
+        let before = rt.state.view3d.view.camera_now();
+        let ([x, y, w, h], _) = rt.presented("scene-3d").expect("the 3D slot is drawn");
+        let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+        rt.pointer_down(cx, cy);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_move(cx + 60.0, cy);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_move(cx + 120.0, cy + 20.0);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_up(cx + 120.0, cy + 20.0);
+        rt.frame(1.0 / 60.0);
+        let after = rt.state.view3d.view.camera_now();
+        assert!(after.yaw < before.yaw && after.pitch > before.pitch, "{before:?} -> {after:?}");
+        assert!(rt.state.inputs.is_empty(), "no touch: {:?}", rt.state.inputs);
+        assert_eq!(rt.wake_deadline(), None, "a drag asks for no wake");
+        // A pinch over it zooms in.
+        rt.magnify_event(rune::MagnifyEvent::new(0.5).at(cx, cy));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.view3d.view.camera_now().zoom > 0.5);
     }
 
     #[test]

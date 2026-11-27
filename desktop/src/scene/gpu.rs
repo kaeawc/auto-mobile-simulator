@@ -13,9 +13,9 @@ use rune::compose::{Compositor, DeviceKey, Frame};
 use rune::render::{EffectPhase, EffectSite};
 use sim_core::body::{Body, Face, Mesh};
 
-use super::camera::{self, Camera, Mat4};
+use super::camera::{self, Camera, Framing, Mat4, Turn};
 use super::layout::{self, STRIDE};
-use super::{MARK, Placement, Preset};
+use super::{MARK, Placement};
 use crate::State;
 
 const SAMPLES: u32 = 4;
@@ -33,10 +33,21 @@ struct Job {
     body: Arc<Body>,
     mesh: Arc<Mesh>,
     placement: Placement,
-    preset: Preset,
+    camera: Camera,
+    turn: Turn,
     /// The screen shown faces away from the front once the hinge is set (a book's cover screen
     /// folded shut, any back-face screen); a flip's cover screen on its lid faces the front shut.
     back: bool,
+}
+
+/// One frame's camera and the body's turn, solved for its slot.
+struct Solved {
+    view_proj: Mat4,
+    eye: [f32; 3],
+    /// The device's [`Turn`] about the body's centre, applied after its placement.
+    turn: Mat4,
+    /// Where the live screen's corners land, slot device pixels, when it faces the camera.
+    screen: Option<[[f32; 2]; 4]>,
 }
 
 impl Job {
@@ -45,7 +56,45 @@ impl Job {
         let placement = super::place(&body, s.screen_size(), s.screen_rotation())?;
         let mesh = sim_core::body::cached_mesh(&body);
         let back = facing_back(&body, &placement);
-        Some(Job { body, mesh, placement, preset: s.view3d.preset, back })
+        let view = &s.view3d.view;
+        Some(Job { body, mesh, placement, camera: view.camera_now(), turn: view.turn_now(), back })
+    }
+
+    /// The box the live screen's face fills, placed (without the turn).
+    fn screen_box(&self, root: &Mat4) -> ([f32; 3], [f32; 3]) {
+        let models = [self.panel(root, 0), self.panel(root, 1)];
+        let mesh = &self.mesh;
+        let live = sim_core::body::Role::Screen(self.placement.display);
+        let points = mesh.parts.iter().filter(|p| p.role == live).flat_map(move |part| {
+            let m = models[part.panel.min(1)];
+            mesh.part_indices(part).iter().map(move |&i| camera::apply(&m, mesh.positions[i as usize]))
+        });
+        camera::bounds(points)
+    }
+
+    /// The camera and turn for a slot of `size` device pixels whose flat screen is `flat` (its
+    /// centre off the slot's centre and its height, device pixels).
+    fn solve(&self, size: (u32, u32), flat: [f32; 3]) -> Solved {
+        let root = self.root();
+        let (center, placed) = self.bounds(&root);
+        let (screen, screen_half) = self.screen_box(&root);
+        let turn = self.turn.matrix(center);
+        // The fit is the turned body's box: a spun phone lies across the slot and fits that way.
+        let half = if self.turn == Turn::default() { placed } else { self.bounds(&camera::mul(&turn, &root)).1 };
+        let framing = Framing { center, half, screen: camera::apply(&turn, screen), screen_h: 2.0 * screen_half[1], flat };
+        let (view_proj, eye) = self.camera.solve(&framing, size, self.back);
+        // The screen's corners on its face's plane, and whether that face looks at the eye.
+        let normal = camera::turn(&turn, [0.0, 0.0, if self.back { -1.0 } else { 1.0 }]);
+        let to_eye: [f32; 3] = std::array::from_fn(|k| eye[k] - framing.screen[k]);
+        let facing = (0..3).map(|k| normal[k] * to_eye[k]).sum::<f32>() > 0.0;
+        let (w, h) = (size.0 as f32, size.1 as f32);
+        let corners = [[-1.0, 1.0], [1.0, 1.0], [1.0, -1.0], [-1.0, -1.0]].map(|[sx, sy]: [f32; 2]| {
+            let p = camera::apply(&turn, [screen[0] + sx * screen_half[0], screen[1] + sy * screen_half[1], screen[2]]);
+            camera::apply(&view_proj, p)
+        });
+        let in_front = corners.iter().all(|c| (0.0..=1.0).contains(&c[2]));
+        let screen = (facing && in_front).then(|| corners.map(|[x, y, _]| [(x + 1.0) / 2.0 * w, (1.0 - y) / 2.0 * h]));
+        Solved { view_proj, eye, turn, screen }
     }
 
     /// The body's roll about z: clockwise as its screen is seen (from the back for a back-face
@@ -117,16 +166,20 @@ impl Compositor<State> for Scene {
         f.ui.prepare(device, queue, &mut f.rt.text.atlas, &f.rt.instances, f.size);
         let Some(gpu) = self.gpu.as_mut() else { return };
         gpu.ready = false;
+        let mut screen = None;
         f.ui.draw_with_backdrop(f.encoder, f.target, clear, &mut |phase, site| {
             if site.mark != MARK {
                 return;
             }
             match phase {
-                EffectPhase::Backdrop(encoder) => gpu.draw_scene(device, queue, encoder, site, &job),
+                EffectPhase::Backdrop(encoder) => screen = gpu.draw_scene(device, queue, encoder, site, &job),
                 EffectPhase::Draw(pass) => gpu.blit(device, queue, pass, site),
             }
         });
         self.drew = gpu.ready;
+        // Where the screen was drawn, for the next press to tell the camera's drags from the
+        // device's.
+        f.rt.state.view3d.view.screen_quad = screen;
     }
 
     fn draws_own(&self) -> bool {
@@ -386,7 +439,8 @@ impl Gpu {
     }
 
     /// Renders the body into the MSAA targets and resolves it, with the screen sampled from
-    /// `site.backdrop` (the frame up to the slot, the flat screen included).
+    /// `site.backdrop` (the frame up to the slot, the flat screen included). Returns where the
+    /// live screen was drawn (slot points), when it faces the camera.
     fn draw_scene(
         &mut self,
         device: &wgpu::Device,
@@ -394,22 +448,22 @@ impl Gpu {
         encoder: &mut wgpu::CommandEncoder,
         site: &EffectSite<'_>,
         job: &Job,
-    ) {
-        let Some(backdrop) = site.backdrop else { return };
+    ) -> Option<[[f32; 2]; 4]> {
+        let backdrop = site.backdrop?;
         let r = site.instance.rect;
         let size = ((r[2].round() as u32).max(1), (r[3].round() as u32).max(1));
         self.targets(device, size);
         self.mesh(device, job);
         self.draws(device, job.mesh.parts.len());
-        let (Some(t), Some(mesh), Some((_, draw_u, draw_group))) = (&self.targets, &self.mesh, &self.draws) else { return };
+        let (Some(t), Some(mesh), Some((_, draw_u, draw_group))) = (&self.targets, &self.mesh, &self.draws) else { return None };
 
         let root = job.root();
-        let camera = Camera::new(job.preset, job.back);
-        let (view_proj, eye) = camera.view_proj(job.bounds(&root), size.0 as f32 / size.1 as f32);
-        let light = camera.world(LIGHT);
+        let [x, y, w, h] = super::screen_rect(r, site.scale, site.data);
+        let flat_screen = [x + w / 2.0 - (r[0] + r[2] / 2.0), y + h / 2.0 - (r[1] + r[3] / 2.0), h];
+        let Solved { view_proj, eye, turn, screen } = job.solve(size, flat_screen);
+        let light = job.camera.world(LIGHT, job.back);
         let bd = backdrop.texture();
         let (bw, bh) = (bd.width().max(1) as f32, bd.height().max(1) as f32);
-        let [x, y, w, h] = super::screen_rect(r, site.scale, site.data);
         let (x, y) = (x - site.origin[0], y - site.origin[1]);
         let mut frame: Vec<f32> = flat(&view_proj).collect();
         frame.extend([eye[0], eye[1], eye[2], 1.0, light[0], light[1], light[2], AMBIENT]);
@@ -418,7 +472,7 @@ impl Gpu {
         let mut draws = vec![0u8; job.mesh.parts.len() * self.draw_stride as usize];
         for (i, part) in job.mesh.parts.iter().enumerate() {
             let m = layout::material(part.role, job.placement.display);
-            let mut d: Vec<f32> = flat(&job.panel(&root, part.panel)).collect();
+            let mut d: Vec<f32> = flat(&camera::mul(&turn, &job.panel(&root, part.panel))).collect();
             d.extend([m.base[0], m.base[1], m.base[2], if m.live { 1.0 } else { 0.0 }, m.specular, m.shininess, 0.0, 0.0]);
             let at = i * self.draw_stride as usize;
             draws[at..at + DRAW_BYTES as usize].copy_from_slice(&bytes(&d));
@@ -465,6 +519,8 @@ impl Gpu {
         }
         drop(pass);
         self.ready = true;
+        let scale = site.scale.max(f32::EPSILON);
+        screen.map(|q| q.map(|[x, y]| [x / scale, y / scale]))
     }
 
     /// Draws the resolved scene over the slot's rect.
@@ -569,5 +625,54 @@ mod tests {
         assert_eq!(DRAW_BYTES, 64 + 2 * 16);
         assert_eq!(bytes(&[1.0, -2.0]).len(), 8);
         assert_eq!(flat(&IDENTITY).count(), 16);
+    }
+
+    /// An iPhone 17 showing its frame upright, with `camera` and `turn`.
+    fn phone(camera: Camera, turn: Turn) -> Job {
+        let body = sim_core::body::get("iPhone-17").unwrap();
+        let placement = super::super::place(&body, (1206, 2622), sim_core::rotation::Rotation::Deg0).unwrap();
+        let mesh = sim_core::body::cached_mesh(&body);
+        Job { back: facing_back(&body, &placement), body, mesh, placement, camera, turn }
+    }
+
+    /// A 1700x1500 px slot (850x750 points at 2x) whose flat screen is the one the view lays out
+    /// there: 1404 px high (the stage's 48-point bezel band each side), centred.
+    const SLOT: (u32, u32) = (1700, 1500);
+    fn flat_rect() -> [f32; 4] {
+        super::super::screen_rect([0.0, 0.0, SLOT.0 as f32, SLOT.1 as f32], 2.0, [24.0, 1206.0 / 2622.0, 0.0, 0.0])
+    }
+
+    #[test]
+    fn face_on_draws_the_real_screen_over_the_flat_one_pixel_for_pixel() {
+        let [x, y, w, h] = flat_rect();
+        let job = phone(Camera::preset(super::super::Preset::Face), Turn::default());
+        let flat = [x + w / 2.0 - SLOT.0 as f32 / 2.0, y + h / 2.0 - SLOT.1 as f32 / 2.0, h];
+        let q = job.solve(SLOT, flat).screen.expect("face on, the screen faces the camera");
+        // Its corners are the flat screen's, to a hundredth of a pixel: one backdrop pixel per
+        // window pixel, so it samples the flat view's picture exactly.
+        let want = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+        for (got, want) in q.iter().zip(want) {
+            assert!((got[0] - want[0]).abs() < 0.01 && (got[1] - want[1]).abs() < 0.01, "{q:?} vs {want:?}");
+        }
+    }
+
+    #[test]
+    fn the_drawn_screen_follows_the_camera_and_is_gone_when_flipped() {
+        let [x, y, w, h] = flat_rect();
+        let flat = [x + w / 2.0 - SLOT.0 as f32 / 2.0, y + h / 2.0 - SLOT.1 as f32 / 2.0, h];
+        let three = phone(Camera::preset(super::super::Preset::ThreeQuarter), Turn::default()).solve(SLOT, flat);
+        let q = three.screen.expect("the 3/4 view sees the screen");
+        // Fitted, the screen is smaller than the flat one and inside the slot.
+        assert!(q.iter().all(|p| p[0] > 0.0 && p[0] < SLOT.0 as f32 && p[1] > 0.0 && p[1] < SLOT.1 as f32), "{q:?}");
+        assert!(q[3][1] - q[0][1] < h);
+        let flipped = Turn::default().flip();
+        assert_eq!(phone(Camera::preset(super::super::Preset::Face), flipped).solve(SLOT, flat).screen, None, "its back faces us");
+        assert_eq!(phone(Camera::preset(super::super::Preset::Back), Turn::default()).solve(SLOT, flat).screen, None);
+        // Flipped and seen from behind, it faces us again.
+        assert!(phone(Camera::preset(super::super::Preset::Back), flipped).solve(SLOT, flat).screen.is_some());
+        // Spun a quarter clockwise, the screen's top edge is on the right.
+        let spun = phone(Camera::preset(super::super::Preset::Front), Turn::default().spin_by(1)).solve(SLOT, flat);
+        let q = spun.screen.unwrap();
+        assert!(q[0][0] > SLOT.0 as f32 / 2.0 && q[1][0] > SLOT.0 as f32 / 2.0, "{q:?}");
     }
 }
