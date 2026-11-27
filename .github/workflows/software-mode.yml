@@ -234,17 +234,27 @@ jobs:
       # emu against the stock emulator on the same runner and KVM (scripts/bench/android-boot.sh):
       # each round a new AVD, both cold and warm boots to `sys.boot_completed`, peak RSS and the
       # guest microbenchmarks, the order alternating. A pull request runs one round (--quick, a
-      # smoke test); main and manual runs three, the medians docs/benchmarks.md quotes. The
-      # runner's sdkmanager installs the emulator package into the cached SDK.
+      # smoke test); main and manual runs three, the medians docs/benchmarks.md quotes. The stock
+      # emulator is a pinned release, checked against its SHA-256, in an SDK of its own that links
+      # the cached SDK's image, platform-tools and renderer, so it never enters the SDK cache.
       - name: emu against the stock emulator on KVM
         if: matrix.accel == 'kvm'
         env:
           ROUNDS: ${{ github.event_name == 'pull_request' && '--quick' || '--rounds 3' }}
+          # 37.3.10, the stable channel's emulator on 2026-11-27.
+          STOCK_ZIP: emulator-linux_x64-16970787.zip
+          STOCK_SHA256: a4405349d8a9c52136ab7861e5331dc40e85574bd91cb8889a298a2ff4c52e26
         run: |
-          yes 2>/dev/null | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager --sdk_root="$ANDROID_HOME" emulator > /dev/null
-          "$ANDROID_HOME/emulator/emulator" -version | head -1
+          stock_sdk="$RUNNER_TEMP/stock-sdk"
+          mkdir -p "$stock_sdk"
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/$STOCK_ZIP" "https://dl.google.com/android/repository/$STOCK_ZIP"
+          echo "$STOCK_SHA256  $RUNNER_TEMP/$STOCK_ZIP" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/$STOCK_ZIP" -d "$stock_sdk"
+          for d in platform-tools system-images simee; do ln -s "$ANDROID_HOME/$d" "$stock_sdk/$d"; done
+          "$stock_sdk/emulator/emulator" -version | head -1
           # shellcheck disable=SC2086 # ROUNDS is one or two words.
-          scripts/bench/android-boot.sh --image system-images/android-36/default/x86_64 --lcd 720x1280@320 --port 5580 \
+          ANDROID_HOME="$stock_sdk" ANDROID_SDK_ROOT="$stock_sdk" \
+            scripts/bench/android-boot.sh --image system-images/android-36/default/x86_64 --lcd 720x1280@320 --port 5580 \
             --out bench/results $ROUNDS | tee bench-table.md
           {
             echo "### emu against the stock emulator on KVM ($(nproc) vCPUs, $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs))"

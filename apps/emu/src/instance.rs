@@ -436,6 +436,7 @@ impl Instance {
             logcat: self.logcat.clone(),
             verbose: opts.verbose,
             accel,
+            accel_fallback: opts.accel.is_none(),
         })
     }
 }

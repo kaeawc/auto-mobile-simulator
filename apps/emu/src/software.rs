@@ -21,12 +21,34 @@ pub fn accel_check() -> (bool, String) {
     let qemu = emu_vmm::soft::find_qemu(std::env::var("EMU_QEMU").ok().as_deref(), &std::env::var("PATH").unwrap_or_default())
         .ok_or_else(|| NEED_QEMU.to_string())
         .and_then(|q| emu_vmm::soft::check_qemu(&q).map(|v| (q, v)).map_err(|e| e.to_string()));
-    accel_line(qemu, kvm())
+    let kvm = match &qemu {
+        Ok((q, _)) => kvm(q),
+        Err(_) => kvm_device(),
+    };
+    accel_line(qemu, kvm)
 }
 
-/// Whether this process can run guests on KVM; the error says why not and how to fix it.
-fn kvm() -> std::result::Result<(), String> {
-    emu_kvm::open().map(drop).map_err(|e| e.to_string())
+/// Whether this process can run guests on KVM: `/dev/kvm` opens, has what QEMU needs, and makes
+/// a VM (which fails with EBUSY while another hypervisor holds VT-x on kernels before 6.12). The
+/// error says why not and how to fix it.
+fn kvm_device() -> std::result::Result<(), String> {
+    emu_kvm::open().and_then(|k| k.create_vm(0)).map(drop).map_err(|e| e.to_string())
+}
+
+/// [`kvm_device`], and `qemu` was built with KVM (`-accel help` lists it).
+fn kvm(qemu: &std::path::Path) -> std::result::Result<(), String> {
+    kvm_device()?;
+    let out = std::process::Command::new(qemu).args(["-accel", "help"]).output().map_err(|e| format!("running {}: {e}", qemu.display()))?;
+    if lists_kvm(&String::from_utf8_lossy(&out.stdout)) {
+        Ok(())
+    } else {
+        Err(format!("{} was built without KVM (its -accel help doesn't list kvm)", qemu.display()))
+    }
+}
+
+/// Whether QEMU's `-accel help` output names KVM.
+fn lists_kvm(help: &str) -> bool {
+    help.lines().skip(1).any(|l| l.trim() == "kvm")
 }
 
 /// [`accel_check`]'s verdict from what it found.
@@ -74,7 +96,7 @@ pub fn boot(
     let qemu = emu_vmm::soft::find_qemu(std::env::var("EMU_QEMU").ok().as_deref(), &std::env::var("PATH").unwrap_or_default())
         .context(NEED_QEMU)?;
     let (major, minor) = emu_vmm::soft::check_qemu(&qemu)?;
-    let (accel, why_tcg) = pick_accel(opts.accel, kvm())?;
+    let (accel, why_tcg) = pick_accel(opts.accel, if opts.accel == Some(false) { Ok(()) } else { kvm(&qemu) })?;
     if opts.verbose {
         let on = match (accel, why_tcg) {
             (Accel::Kvm, _) => "KVM".to_string(),
@@ -162,6 +184,13 @@ mod tests {
         assert_eq!(accel_line(found, Ok(())), (true, "software mode: QEMU 11.1 on KVM at /q/qemu-system-x86_64 with emu's devices".into()));
         let (ok, line) = accel_line(Err(NEED_QEMU.to_string()), Ok(()));
         assert!(!ok && line.contains("QEMU 11.1 or newer"), "{line}");
+    }
+
+    #[test]
+    fn qemus_accelerator_list_says_whether_it_has_kvm() {
+        assert!(lists_kvm("Accelerators supported in QEMU binary:\ntcg\nkvm\n"));
+        assert!(!lists_kvm("Accelerators supported in QEMU binary:\ntcg\n"));
+        assert!(!lists_kvm("kvm\n"), "the heading line isn't an accelerator");
     }
 
     #[test]
