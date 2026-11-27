@@ -368,7 +368,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          (obs finds OBS Virtual Camera; an ambiguous one fails listing the matches), saved by its stable id. Saved with the device: \
          it comes back on every boot and survives a server restart. Android: a running device is relinked live through emu's console \
          (`camera link`), a shut-down one gets it at boot (-camera-back, -camera-front); a camera that was off at boot appears only \
-         after a reboot (the guest lists its cameras once). iOS: not yet (#322)",
+         after a reboot (the guest lists its cameras once). iOS: injects the camera shim device-wide and serves the source from the running server (needs `simee serve`; one feed per device, so back and front share it; apps already running need a relaunch)",
     ),
     (
         "camera_unlink",
@@ -524,9 +524,13 @@ const ALL_PLATFORMS: &[&str] = &[
     "prefs_watch",
     // Needs no device: the host's camera sources.
     "camera_sources",
+    // Camera links: Android through emu, iOS through the device-wide camera shim.
+    "camera_link",
+    "camera_unlink",
+    "camera_links",
 ];
-/// Methods only Android devices have (camera links: iOS comes with #322's camera feed).
-const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad", "export", "import", "camera_link", "camera_unlink", "camera_links"];
+/// Methods only Android devices have.
+const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad", "export", "import"];
 
 /// The platforms whose devices `method` works on.
 pub fn platforms(method: &str) -> &'static [Platform] {
