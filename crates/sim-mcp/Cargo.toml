@@ -19,6 +19,11 @@ doctest = false
 serde_json.workspace = true
 sim-api.workspace = true
 
+# The HTTP transport's token file: opened without following links, its owner checked against the
+# effective user.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 emu-avd.workspace = true
 sim-android = { workspace = true, features = ["testing"] }

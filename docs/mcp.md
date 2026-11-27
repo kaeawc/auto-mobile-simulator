@@ -275,10 +275,14 @@ need a push channel the API doesn't have.
 ## Over HTTP
 
 ```bash
-simee mcp --http                       # http://127.0.0.1:8377/mcp, loopback only, no token
-simee mcp --http 127.0.0.1:9000 --token-file ~/.config/simee/mcp-token   # loopback, token required
-simee mcp --http 0.0.0.0:8377 --insecure-remote   # every interface; token required, plain HTTP
+simee mcp --http                       # http://127.0.0.1:8377/mcp, loopback; token from the state directory
+simee mcp --http 127.0.0.1:9000 --token-file ~/.config/simee/mcp-token   # loopback, a token file of your choice
+simee mcp --http 0.0.0.0:8377 --insecure-remote   # every interface, plain HTTP (see Security)
+simee mcp --http --no-auth             # loopback, no token: any local user or process can connect
 ```
+
+Every request carries `Authorization: Bearer <token>`. On its first run the server writes a random
+token to its default token file and prints the file's path (never the token); later runs reuse it.
 
 This is the Streamable HTTP transport: one endpoint, `/mcp`.
 
@@ -304,28 +308,51 @@ This is the Streamable HTTP transport: one endpoint, `/mcp`.
 - Streams carry no event ids, so a dropped stream can't be resumed with `Last-Event-ID`; a long call
   is better made a task (Tasks extension) and polled.
 
-Security:
+### Security
 
-- The bind is loopback unless an address says otherwise. A non-loopback address is refused unless
-  `--insecure-remote` acknowledges that there is no TLS (the token crosses the network in the
-  clear): use it on a trusted network, or behind a TLS-terminating proxy. TLS isn't built in
-  because no TLS crate is in the workspace's dependency tree.
-- Off loopback a bearer token is always required (`Authorization: Bearer <token>`, 401 otherwise).
-  Tokens are read from `--token-file` (default: `mcp-token` in simee's state directory,
-  `$SIMEE_STATE_DIR`, else `~/Library/Application Support/simee` on macOS and
-  `$XDG_STATE_HOME/simee` or `~/.local/state/simee` elsewhere). A missing file is created with one
-  random 256-bit token and mode 0600; a file other users can read is refused. One token per line
-  (one per client, say); `#` lines are comments. Rotate by rewriting the file: it is re-read when it
-  changes, and a removed token is refused on the next request. On loopback, `--token-file` turns
-  the same check on.
+- TLS and OAuth are not built in (a follow-up issue tracks them). For access from another machine,
+  put the server behind a TLS-terminating reverse proxy (nginx, Caddy) on the same host, keep it
+  bound to loopback, and keep the token on. A non-loopback bind serves plain HTTP, where the token
+  crosses the network in the clear, so it is refused unless `--insecure-remote` acknowledges that
+  (a trusted network only).
+- Authentication is on by default, on every bind, loopback included: a request without a valid
+  `Authorization: Bearer <token>` gets 401. Tokens come from `--token-file` (default: `mcp-token`
+  in simee's state directory, `$SIMEE_STATE_DIR`, else `~/Library/Application Support/simee` on
+  macOS and `$XDG_STATE_HOME/simee` or `~/.local/state/simee` elsewhere). A missing file is created
+  with one random 256-bit token, mode 0600, in a directory created 0700. The file must be a regular
+  file (a symbolic link is refused), owned by the user running the server and readable by them
+  only, and its directory must not be writable by group or others (or owned by another user):
+  these are checked on the open file, so it can't be swapped in between. One token per line (one
+  per client, say); `#` lines are comments. Rotate by rewriting the file: it is re-read when it
+  changes, and a removed token is refused on the next request.
+- `--no-auth` turns the token off, and is refused on a non-loopback bind. Loopback is not private:
+  without a token, every other user and process on the host can drive the devices (another account
+  on a shared Mac, a CI job on a shared runner, a container on the host network), and so can anyone
+  who reaches a reverse proxy on this host, since the proxy connects from loopback (nginx's default
+  `proxy_pass` even sends a loopback `Host`). Use it only on a single-user machine with no proxy.
+- A session belongs to the token that opened it: a request, `GET` stream or `DELETE` naming another
+  token's session gets 404, as for a session that doesn't exist, and a full session table makes
+  room only from the caller's own sessions. (Without a token every client is the same caller.)
 - A request with an `Origin` header (a browser page) is refused with 403 unless the origin is a
   loopback one, and on a loopback bind a `Host` that isn't a loopback name is refused too: a page on
   another site can't reach the server through DNS rebinding.
-- Bounds: a body is at most 8 MiB (413 past it, before it is read), a request head 16 KiB (431),
-  and both must arrive within 10 s; an idle kept-alive connection closes after 15 s; at most 64
-  connections are served at once (503 past it), each on its own thread (no async runtime), and 32
-  sessions (the idlest is closed to make room). A waiting response checks every 15 s that its
-  client is still there (a stream sends a comment), and a client that has gone cancels its request.
+- Framing is strict, so a proxy and this server can't read one request two ways: `Content-Length`
+  is ASCII digits only, chunk sizes hex digits only, `Transfer-Encoding` at most once and exactly
+  `chunked`, never both; a `GET`, `DELETE` or other non-`POST` with a body is refused. Any 4xx or 5xx
+  answer closes the connection (`Connection: close`), so nothing after an error is read as a request.
+- Bounds: a body is at most 8 MiB (413 past it, before it is read) and a request head 16 KiB (431).
+  A connection's first request head must be in within 10 s of the connection opening, and a later
+  one within 10 s of its first byte (at most 8 blank lines may come before a request line); the
+  deadline is never extended by what arrives. A body then has 10 s of its own. An idle kept-alive
+  connection closes after 15 s. At most 64 connections are served at once and 8 from one address
+  (503 past either; behind a proxy every client shares the proxy's address), each on its own thread
+  (no async runtime), and 32 sessions. A session with no request for an hour is closed, its `GET`
+  stream with it (the stream's pings don't count as use).
+- A waiting response checks every 15 s that its client is still there (an event stream sends a
+  comment), and a client that has gone (a write to it fails, or the connection is reset) cancels its
+  request. A client that only shut down its sending side is still served: if it accepts
+  `text/event-stream` its response becomes a stream whose pings tell whether it is still reading;
+  otherwise its call runs to the end.
 
 Per-call overhead, a `tools/call` of `identity` (`sim-api`'s real method) in a loop: each run is the
 median of 5 rounds, and the table gives the median of 3 runs, µs per call. Apple M3 Max,
@@ -348,8 +375,9 @@ takes milliseconds). Reproduce: `cargo test --release -p simee-mcp http_call_ove
   deprecates three of them.
 - Cancelling a task doesn't stop a running device call (above).
 - The change notifications are polled, once a second, and only for what a client subscribed to.
-- Over HTTP: no TLS, no OAuth (a bearer token from a file is the only authentication), no
-  resumable streams, and an `Origin` allowlist beyond loopback isn't configurable.
+- Over HTTP: no TLS, no OAuth (a bearer token from a file is the only authentication; both are
+  tracked in a follow-up issue), no resumable streams, and an `Origin` allowlist beyond loopback
+  and the connection limits aren't configurable.
 - Tool calls run in the server's process, on its own threads, with a session per thread; they don't
   go through a running `simee serve`, so a long-lived MCP server holds its own simulator connection.
 - A tool is as powerful as the method: `exec` runs programs inside an iOS device, `write` and `rm`

@@ -2094,6 +2094,7 @@ dependencies = [
 name = "simee-mcp"
 version = "0.2.0"
 dependencies = [
+ "rustix",
  "serde_json",
  "simee-android",
  "simee-api",

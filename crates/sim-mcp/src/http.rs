@@ -15,11 +15,14 @@
 //! progress tokens are swapped for ones unique to this process on the way in and back on the way
 //! out, so two clients that both send id 1 each get their own answer.
 //!
-//! Security: the bind is loopback unless the caller asks otherwise; a non-loopback bind needs
-//! [`Config::insecure_remote`] (there is no TLS here) and always requires a bearer token from a
-//! token file only its owner can read. A browser's `Origin` must be a loopback one, and on a
-//! loopback bind so must `Host` (DNS rebinding). Request heads and bodies are bounded in size and
-//! time. SSE streams carry no event ids, so a dropped stream can't be resumed.
+//! Security: every bind requires a bearer token from a token file only its owner can read (created
+//! in simee's state directory when none is named); [`Config::no_auth`] turns that off, on a
+//! loopback bind only. A non-loopback bind needs [`Config::insecure_remote`] (there is no TLS
+//! here). A browser's `Origin` must be a loopback one, and on a loopback bind so must `Host` (DNS
+//! rebinding). A request head has one deadline from its first byte, bodies are bounded in size and
+//! time, connections are capped per peer address and in all, and an error closes the connection
+//! (so a body nobody read is never taken for the next request). A session belongs to the token
+//! that opened it. SSE streams carry no event ids, so a dropped stream can't be resumed.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -50,6 +53,11 @@ const SESSION_HEADER: &str = "mcp-session-id";
 const VERSION_HEADER: &str = "mcp-protocol-version";
 /// A token shorter than this is refused: it could be guessed.
 const MIN_TOKEN: usize = 16;
+/// CR and LF bytes allowed before a request line (RFC 9112 asks a server to skip at least one
+/// empty line); more is refused, so blank lines can't stand in for a request.
+const MAX_LEADING_BLANK: usize = 8;
+/// The largest token file read.
+const MAX_TOKEN_FILE: u64 = 1 << 20;
 
 /// Bounds on what one client can make the server hold.
 #[derive(Clone, Copy, Debug)]
@@ -60,9 +68,14 @@ pub struct Limits {
     pub max_head: usize,
     /// Connections served at once (each on its own thread); more are answered 503.
     pub max_connections: usize,
+    /// Connections served at once from one peer address (503 past it). Behind a proxy every
+    /// client shares the proxy's address.
+    pub max_connections_per_peer: usize,
     /// Sessions open at once; past it, idle ones are closed first, then `initialize` gets 503.
     pub max_sessions: usize,
-    /// How long a request's head and body may take to arrive once it starts.
+    /// How long a request's head may take to arrive: from the connection's opening for its first
+    /// request, from the head's first byte for later ones; never extended. Its body has as long
+    /// again from the end of the head.
     pub request_timeout: Duration,
     /// How long a kept-alive connection may sit idle between requests.
     pub keep_alive: Duration,
@@ -71,7 +84,8 @@ pub struct Limits {
     /// How often a waiting response checks that its client is still there (and an event stream
     /// sends a comment to keep proxies from closing it).
     pub ping: Duration,
-    /// A session nobody has used for this long is closed when room is needed.
+    /// A session with no request for this long is closed, its `GET` stream with it (the stream's
+    /// pings are not activity).
     pub session_idle: Duration,
 }
 
@@ -81,6 +95,7 @@ impl Default for Limits {
             max_body: 8 << 20,
             max_head: 16 << 10,
             max_connections: 64,
+            max_connections_per_peer: 8,
             max_sessions: 32,
             request_timeout: Duration::from_secs(10),
             keep_alive: Duration::from_secs(15),
@@ -95,9 +110,12 @@ impl Default for Limits {
 #[derive(Clone)]
 pub struct Config {
     pub addr: SocketAddr,
-    /// Bearer tokens, one per line. Required off loopback (default: [`default_token_file`]);
-    /// optional on loopback, where giving one turns authentication on.
+    /// Bearer tokens, one per line (default: [`default_token_file`], created if missing). Every
+    /// request must carry one unless [`Config::no_auth`].
     pub token_file: Option<PathBuf>,
+    /// Serve without authentication: refused unless the bind is loopback. Any local user or
+    /// process (and anything a reverse proxy on this host forwards) can then drive the devices.
+    pub no_auth: bool,
     /// Acknowledges that a non-loopback bind serves plain HTTP: the token crosses the network in
     /// the clear.
     pub insecure_remote: bool,
@@ -111,6 +129,7 @@ impl Config {
         Config {
             addr,
             token_file: None,
+            no_auth: false,
             insecure_remote: false,
             toolsets: Toolsets::default(),
             limits: Limits::default(),
@@ -136,7 +155,7 @@ pub fn state_dir() -> Option<PathBuf> {
         .map(|d| d.join("simee"))
 }
 
-/// The token file a non-loopback bind uses when given none.
+/// The token file used when given none.
 pub fn default_token_file() -> io::Result<PathBuf> {
     state_dir()
         .map(|d| d.join(TOKEN_FILE))
@@ -147,13 +166,17 @@ pub fn default_token_file() -> io::Result<PathBuf> {
 pub fn serve(backend: Arc<dyn Backend>, config: Config) -> io::Result<()> {
     let running = start(backend, config)?;
     eprintln!("simee mcp: Streamable HTTP on http://{}{ENDPOINT}", running.addr());
+    match running.token_file() {
+        Some(path) => eprintln!("simee mcp: bearer tokens from {} (send `Authorization: Bearer <token>`)", path.display()),
+        None => eprintln!("simee mcp: no authentication (--no-auth): any local user or process can drive the devices"),
+    }
     running.wait();
     Ok(())
 }
 
 /// Binds and starts serving on a thread of its own.
 pub fn start(backend: Arc<dyn Backend>, config: Config) -> io::Result<Running> {
-    let tokens = prepare_auth(&config)?;
+    let tokens = prepare_auth(&config, default_token_file)?;
     let listener = TcpListener::bind(config.addr)?;
     let addr = listener.local_addr()?;
     let router = Arc::new(Router::default());
@@ -167,6 +190,7 @@ pub fn start(backend: Arc<dyn Backend>, config: Config) -> io::Result<Running> {
         stateless,
         sessions: Mutex::default(),
         connections: AtomicUsize::new(0),
+        peers: Mutex::default(),
         stopping: AtomicBool::new(false),
     });
     let accepting = shared.clone();
@@ -198,6 +222,11 @@ impl Running {
     pub fn sessions(&self) -> usize {
         lock(&self.shared.sessions).len()
     }
+
+    /// The token file requests are checked against (`None` with [`Config::no_auth`]).
+    pub fn token_file(&self) -> Option<&Path> {
+        self.shared.tokens.as_ref().map(|t| t.path.as_path())
+    }
 }
 
 impl Drop for Running {
@@ -221,8 +250,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 // ---- Authentication ----
 
-/// Checks the bind against the policy and loads the token file it needs.
-fn prepare_auth(config: &Config) -> io::Result<Option<Tokens>> {
+/// Checks the bind against the policy and loads the token file (`default` when none is named).
+fn prepare_auth(config: &Config, default: impl FnOnce() -> io::Result<PathBuf>) -> io::Result<Option<Tokens>> {
     let loopback = config.addr.ip().is_loopback();
     if !loopback && !config.insecure_remote {
         return Err(io::Error::new(
@@ -234,10 +263,21 @@ fn prepare_auth(config: &Config) -> io::Result<Option<Tokens>> {
             ),
         ));
     }
-    let path = match (&config.token_file, loopback) {
-        (Some(path), _) => path.clone(),
-        (None, false) => default_token_file()?,
-        (None, true) => return Ok(None),
+    if config.no_auth {
+        if !loopback {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--no-auth is accepted only on a loopback bind, and {} is not one", config.addr),
+            ));
+        }
+        if config.token_file.is_some() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "--no-auth and --token-file contradict each other"));
+        }
+        return Ok(None);
+    }
+    let path = match &config.token_file {
+        Some(path) => path.clone(),
+        None => default()?,
     };
     ensure_token_file(&path)?;
     let tokens = Tokens::new(path);
@@ -254,19 +294,62 @@ fn random_hex(n: usize) -> io::Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Makes `path` hold a token, readable only by its owner: an existing file is checked (and
-/// refused if others can read it); a missing one is written with a new random token.
-pub fn ensure_token_file(path: &Path) -> io::Result<()> {
-    if path.exists() {
-        return read_tokens(path).map(drop);
-    }
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+/// The effective user, who must own the token file.
+#[cfg(unix)]
+fn euid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+/// Makes the token file's directory if it is missing (0700), and refuses one that another user
+/// owns or that others can write: they could plant a token file of their own, or a link.
+fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    if !dir.exists() {
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
         builder.create(dir)?;
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(dir)?;
+        if !meta.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} is not a directory", dir.display())));
+        }
+        if meta.uid() != euid() && meta.uid() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} belongs to another user (uid {}): keep the token file in a directory of your own", dir.display(), meta.uid()),
+            ));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "other users can write {} (mode {:o}): `chmod go-w` it, or keep the token file elsewhere",
+                    dir.display(),
+                    meta.mode() & 0o7777
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Makes `path` hold a token, readable only by its owner: an existing file is checked (and
+/// refused if others can read it, if it is a link, or if its directory is not private); a missing
+/// one is written with a new random token.
+pub fn ensure_token_file(path: &Path) -> io::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        ensure_private_dir(dir)?;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return read_tokens(path).map(drop),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    // `create_new` refuses anything already there, a link included.
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -277,21 +360,56 @@ pub fn ensure_token_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// The tokens in a file: one per line, blank lines and `#` comments skipped. The file must be
-/// readable by its owner only.
+/// Opens a token file without following a link (and without waiting on a FIFO).
+#[cfg(unix)]
+fn open_token_file(path: &Path) -> io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => Ok(std::fs::File::from(fd)),
+        Err(_) if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is a symbolic link: name the token file itself", path.display()),
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn open_token_file(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+/// The tokens in a file: one per line, blank lines and `#` comments skipped. The file must be a
+/// regular file (not a link), owned by this user and readable by them only; those are checked on
+/// the open file, so it can't be swapped between the check and the read.
 fn read_tokens(path: &Path) -> io::Result<Vec<String>> {
+    let file = open_token_file(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} is not a regular file", path.display())));
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)?.permissions().mode();
-        if mode & 0o077 != 0 {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != euid() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("{} can be read by other users (mode {:o}): `chmod 600` it", path.display(), mode & 0o777),
+                format!("{} belongs to another user (uid {}): a token file must be your own", path.display(), meta.uid()),
+            ));
+        }
+        if meta.mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} can be read by other users (mode {:o}): `chmod 600` it", path.display(), meta.mode() & 0o777),
             ));
         }
     }
-    let text = std::fs::read_to_string(path)?;
+    if meta.len() > MAX_TOKEN_FILE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{} is larger than a token file", path.display())));
+    }
+    let mut text = String::new();
+    file.take(MAX_TOKEN_FILE).read_to_string(&mut text)?;
     let tokens: Vec<String> = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_owned).collect();
     if let Some(short) = tokens.iter().find(|t| t.len() < MIN_TOKEN) {
         return Err(io::Error::new(
@@ -341,7 +459,7 @@ impl Tokens {
     }
 
     fn refresh(&self, state: &mut TokenState) {
-        let stamp = std::fs::metadata(&self.path).ok().map(|m| Stamp::of(&m));
+        let stamp = std::fs::symlink_metadata(&self.path).ok().map(|m| Stamp::of(&m));
         if stamp.is_some() && stamp == state.stamp {
             return;
         }
@@ -362,13 +480,14 @@ impl Tokens {
         state.stamp = stamp;
     }
 
-    /// Whether an `Authorization` header carries one of the tokens.
-    fn allows(&self, authorization: Option<&str>) -> bool {
-        let Some(presented) = authorization.and_then(bearer) else { return false };
+    /// The token an `Authorization` header carries, if it is one of the file's.
+    fn check(&self, authorization: Option<&str>) -> Option<String> {
+        let presented = authorization.and_then(bearer)?;
         let mut state = lock(&self.state);
         self.refresh(&mut state);
         // Every token is compared, each in time that depends only on its length.
-        state.tokens.iter().fold(false, |found, t| same(t.as_bytes(), presented.as_bytes()) | found)
+        let found = state.tokens.iter().fold(false, |found, t| same(t.as_bytes(), presented.as_bytes()) | found);
+        found.then(|| presented.to_owned())
     }
 }
 
@@ -522,34 +641,55 @@ fn sink(router: Arc<Router>, standalone: Option<Arc<Standalone>>) -> Sink {
 struct Session {
     server: Server,
     standalone: Arc<Standalone>,
+    /// When a request last named it. A `GET` stream's pings don't count.
     last_used: Mutex<Instant>,
-    /// Requests and streams open on it.
-    busy: AtomicUsize,
+    /// Requests running on it (not its `GET` stream).
+    requests: AtomicUsize,
     /// The client's request ids in flight, to the internal ones, for `notifications/cancelled`.
     cancels: Mutex<HashMap<String, String>>,
+    /// The token that opened it (`None` without authentication): only that token can use it.
+    owner: Option<String>,
 }
 
 impl Session {
     fn touch(&self) {
         *lock(&self.last_used) = Instant::now();
     }
-}
 
-/// Counts a request or stream against a session while it lives.
-struct Busy(Arc<Session>);
+    /// No request running, and none for `idle`.
+    fn expired(&self, idle: Duration) -> bool {
+        self.requests.load(Ordering::SeqCst) == 0 && lock(&self.last_used).elapsed() >= idle
+    }
 
-impl Busy {
-    fn new(session: &Arc<Session>) -> Busy {
-        session.busy.fetch_add(1, Ordering::SeqCst);
-        session.touch();
-        Busy(session.clone())
+    fn owned_by(&self, principal: Option<&str>) -> bool {
+        match (self.owner.as_deref(), principal) {
+            (None, None) => true,
+            (Some(a), Some(b)) => same(a.as_bytes(), b.as_bytes()),
+            _ => false,
+        }
+    }
+
+    /// Ends its `GET` stream.
+    fn end(&self) {
+        *lock(&self.standalone) = None;
     }
 }
 
-impl Drop for Busy {
+/// Counts a request against a session while it runs.
+struct InFlight(Arc<Session>);
+
+impl InFlight {
+    fn new(session: &Arc<Session>) -> InFlight {
+        session.requests.fetch_add(1, Ordering::SeqCst);
+        session.touch();
+        InFlight(session.clone())
+    }
+}
+
+impl Drop for InFlight {
     fn drop(&mut self) {
         self.0.touch();
-        self.0.busy.fetch_sub(1, Ordering::SeqCst);
+        self.0.requests.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -564,29 +704,60 @@ struct Shared {
     stateless: Server,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     connections: AtomicUsize,
+    /// Connections open per peer address.
+    peers: Mutex<HashMap<IpAddr, usize>>,
     stopping: AtomicBool,
 }
 
 impl Shared {
-    fn session(&self, id: &str) -> Option<Arc<Session>> {
-        lock(&self.sessions).get(id).cloned()
+    /// The session `id` names, if it is open, unexpired and `principal`'s (another token's session
+    /// is as unknown as a closed one). Using it counts as activity.
+    fn session(&self, id: &str, principal: Option<&str>) -> Option<Arc<Session>> {
+        let mut sessions = lock(&self.sessions);
+        let session = sessions.get(id)?.clone();
+        if session.expired(self.config.limits.session_idle) {
+            sessions.remove(id);
+            session.end();
+            return None;
+        }
+        if !session.owned_by(principal) {
+            return None;
+        }
+        session.touch();
+        Some(session)
     }
 
-    /// A new session, if there is room (made by closing idle ones if need be).
-    fn open_session(&self) -> io::Result<Option<(String, Arc<Session>)>> {
+    /// Closes `session` if `id` still names it.
+    fn close_session(&self, id: &str, session: &Arc<Session>) {
+        let mut sessions = lock(&self.sessions);
+        if sessions.get(id).is_some_and(|s| Arc::ptr_eq(s, session)) {
+            sessions.remove(id);
+        }
+        session.end();
+    }
+
+    /// A new session for `principal`, if there is room: expired sessions are closed, then, if the
+    /// table is still full, `principal`'s own least recently used one with no request running.
+    /// Another token's sessions are never closed to make room.
+    fn open_session(&self, principal: Option<&str>) -> io::Result<Option<(String, Arc<Session>)>> {
         let id = random_hex(16)?;
         let limits = &self.config.limits;
         let mut sessions = lock(&self.sessions);
-        sessions.retain(|_, s| s.busy.load(Ordering::SeqCst) > 0 || lock(&s.last_used).elapsed() < limits.session_idle);
+        sessions.retain(|_, s| {
+            let keep = !s.expired(limits.session_idle);
+            if !keep {
+                s.end();
+            }
+            keep
+        });
         if sessions.len() >= limits.max_sessions {
-            // Room for a new client: the least recently used idle session goes.
             let idle = sessions
                 .iter()
-                .filter(|(_, s)| s.busy.load(Ordering::SeqCst) == 0)
+                .filter(|(_, s)| s.requests.load(Ordering::SeqCst) == 0 && s.owned_by(principal))
                 .min_by_key(|(_, s)| *lock(&s.last_used))
                 .map(|(k, _)| k.clone());
-            match idle {
-                Some(k) => drop(sessions.remove(&k)),
+            match idle.and_then(|k| sessions.remove(&k)) {
+                Some(evicted) => evicted.end(),
                 None => return Ok(None),
             }
         }
@@ -601,8 +772,9 @@ impl Shared {
             server,
             standalone,
             last_used: Mutex::new(Instant::now()),
-            busy: AtomicUsize::new(0),
+            requests: AtomicUsize::new(0),
             cancels: Mutex::default(),
+            owner: principal.map(str::to_owned),
         });
         sessions.insert(id.clone(), session.clone());
         Ok(Some((id, session)))
@@ -611,19 +783,37 @@ impl Shared {
 
 // ---- Connections ----
 
-/// Holds one of the connection slots.
-struct Slot(Arc<Shared>);
+/// Holds one of the connection slots, and one of its peer's.
+struct Slot(Arc<Shared>, IpAddr);
 
 impl Slot {
-    fn take(shared: &Arc<Shared>) -> Option<Slot> {
-        let max = shared.config.limits.max_connections;
-        shared.connections.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < max).then_some(n + 1)).ok()?;
-        Some(Slot(shared.clone()))
+    /// A slot, or why there is none.
+    fn take(shared: &Arc<Shared>, peer: IpAddr) -> Result<Slot, &'static str> {
+        let limits = shared.config.limits;
+        let mut peers = lock(&shared.peers);
+        let open = peers.get(&peer).copied().unwrap_or(0);
+        if open >= limits.max_connections_per_peer {
+            return Err("too many connections from this address; retry shortly");
+        }
+        let max = limits.max_connections;
+        shared
+            .connections
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < max).then_some(n + 1))
+            .map_err(|_| "too many connections; retry shortly")?;
+        peers.insert(peer, open + 1);
+        Ok(Slot(shared.clone(), peer))
     }
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
+        let mut peers = lock(&self.0.peers);
+        if let Some(open) = peers.get_mut(&self.1) {
+            *open -= 1;
+            if *open == 0 {
+                peers.remove(&self.1);
+            }
+        }
         self.0.connections.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -642,16 +832,21 @@ fn accept_loop(shared: &Arc<Shared>, listener: &TcpListener) {
                 continue;
             }
         };
-        let Some(slot) = Slot::take(shared) else {
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-            let body = error_body(INVALID_REQUEST, "too many connections; retry shortly");
-            let _ = write_response(&stream, 503, &[("Retry-After", "1".into())], body.as_bytes(), true);
-            let _ = stream.shutdown(Shutdown::Both);
-            continue;
+        let accepted = Instant::now();
+        let peer = stream.peer_addr().map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |a| a.ip().to_canonical());
+        let slot = match Slot::take(shared, peer) {
+            Ok(slot) => slot,
+            Err(why) => {
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                let body = error_body(INVALID_REQUEST, why);
+                let _ = write_response(&stream, 503, &[("Retry-After", "1".into())], body.as_bytes(), true);
+                let _ = stream.shutdown(Shutdown::Both);
+                continue;
+            }
         };
         let spawned = std::thread::Builder::new().name("simee-mcp-conn".into()).spawn(move || {
             let shared = slot.0.clone();
-            connection(&shared, stream);
+            connection(&shared, stream, accepted);
             drop(slot);
         });
         if let Err(e) = spawned {
@@ -709,9 +904,23 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "the request took too long"))
 }
 
-fn read_head(reader: &mut BufReader<TcpStream>, idle: Duration, limits: &Limits) -> Result<Head, HeadError> {
+/// When a request head must be in by.
+#[derive(Clone, Copy)]
+enum HeadDeadline {
+    /// This instant, whenever its first byte comes (a connection's first request: from the accept).
+    Fixed(Instant),
+    /// `request_timeout` after its first byte, which must come by this instant (a kept-alive
+    /// connection waiting for its next request).
+    FirstByteBy(Instant),
+}
+
+fn read_head(reader: &mut BufReader<TcpStream>, when: HeadDeadline, limits: &Limits) -> Result<Head, HeadError> {
     let mut raw: Vec<u8> = Vec::with_capacity(512);
-    let mut deadline = Instant::now() + idle;
+    let (mut deadline, mut started) = match when {
+        HeadDeadline::Fixed(at) => (at, true),
+        HeadDeadline::FirstByteBy(at) => (at, false),
+    };
+    let mut blank = 0;
     loop {
         let left = remaining(deadline).map_err(|_| HeadError::Gone)?;
         reader.get_ref().set_read_timeout(Some(left)).map_err(|_| HeadError::Gone)?;
@@ -723,16 +932,23 @@ fn read_head(reader: &mut BufReader<TcpStream>, idle: Duration, limits: &Limits)
         if buf.is_empty() {
             return Err(HeadError::Gone);
         }
-        if raw.is_empty() {
-            // The request has started: it must arrive in time.
+        if !started {
+            // The request has started, blank lines included: one deadline for all of its head,
+            // never moved again.
+            started = true;
             deadline = Instant::now() + limits.request_timeout;
         }
         let mut used = 0;
         let mut done = false;
         for &b in buf {
             used += 1;
-            // Blank lines before a request line are allowed and skipped.
+            // A few blank lines before a request line are allowed and skipped.
             if raw.is_empty() && (b == b'\r' || b == b'\n') {
+                blank += 1;
+                if blank > MAX_LEADING_BLANK {
+                    reader.consume(used);
+                    return Err(HeadError::Malformed("too many blank lines before the request line"));
+                }
                 continue;
             }
             raw.push(b);
@@ -876,29 +1092,41 @@ impl<'a> Sse<'a> {
     }
 }
 
-/// Whether the client closed its end (checked without blocking or consuming anything).
-fn peer_closed(stream: &TcpStream) -> bool {
-    if stream.set_nonblocking(true).is_err() {
-        return false;
-    }
-    let mut byte = [0u8; 1];
-    let closed = match stream.peek(&mut byte) {
-        Ok(0) => true,
-        Ok(_) => false,
-        Err(e) => e.kind() != io::ErrorKind::WouldBlock && e.kind() != io::ErrorKind::Interrupted,
-    };
-    let _ = stream.set_nonblocking(false);
-    closed
+/// What the client's side of a connection looks like while its response is pending.
+#[derive(PartialEq, Eq)]
+enum Peer {
+    Open,
+    /// It sent FIN: done sending, maybe still reading (a half-close), maybe gone. Only a write
+    /// can tell which.
+    Finished,
+    /// The connection is broken (reset).
+    Broken,
 }
 
-fn connection(shared: &Arc<Shared>, stream: TcpStream) {
+/// Looks at the client's side without blocking or consuming anything.
+fn peer_state(stream: &TcpStream) -> Peer {
+    if stream.set_nonblocking(true).is_err() {
+        return Peer::Open;
+    }
+    let mut byte = [0u8; 1];
+    let state = match stream.peek(&mut byte) {
+        Ok(0) => Peer::Finished,
+        Ok(_) => Peer::Open,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted => Peer::Open,
+        Err(_) => Peer::Broken,
+    };
+    let _ = stream.set_nonblocking(false);
+    state
+}
+
+fn connection(shared: &Arc<Shared>, stream: TcpStream, accepted: Instant) {
     let limits = shared.config.limits;
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(limits.write_timeout));
     let mut reader = BufReader::new(stream);
-    let mut idle = limits.request_timeout;
+    let mut when = HeadDeadline::Fixed(accepted + limits.request_timeout);
     loop {
-        let head = match read_head(&mut reader, idle, &limits) {
+        let head = match read_head(&mut reader, when, &limits) {
             Ok(head) => head,
             Err(HeadError::Gone) => break,
             Err(HeadError::TooLarge) => {
@@ -916,11 +1144,11 @@ fn connection(shared: &Arc<Shared>, stream: TcpStream) {
                 break;
             }
         };
-        let keep = Exchange { shared, reader: &mut reader, head: &head }.serve() && head.keep_alive();
+        let keep = Exchange { shared, reader: &mut reader, head: &head, principal: None }.serve() && head.keep_alive();
         if !keep || shared.stopping.load(Ordering::SeqCst) {
             break;
         }
-        idle = limits.keep_alive;
+        when = HeadDeadline::FirstByteBy(Instant::now() + limits.keep_alive);
     }
     linger(reader.get_ref());
 }
@@ -947,6 +1175,44 @@ struct Exchange<'a> {
     shared: &'a Arc<Shared>,
     reader: &'a mut BufReader<TcpStream>,
     head: &'a Head,
+    /// The token the request carried (`None` without authentication).
+    principal: Option<String>,
+}
+
+/// How a request says its body is framed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Framing {
+    /// No `Content-Length` or `Transfer-Encoding`.
+    Unframed,
+    Length(usize),
+    Chunked,
+}
+
+/// A request's framing, strictly: `Content-Length` is ASCII digits only (repeats must agree),
+/// `Transfer-Encoding` appears at most once and is exactly `chunked`, and never both. Anything
+/// looser is how a request is smuggled past a proxy that reads it differently.
+fn framing(head: &Head) -> Result<Framing, &'static str> {
+    let mut codings = head.headers.iter().filter(|(n, _)| n == "transfer-encoding").map(|(_, v)| v.as_str());
+    let chunked = match (codings.next(), codings.next()) {
+        (None, _) => false,
+        (Some(_), Some(_)) => return Err("more than one Transfer-Encoding header"),
+        (Some(te), None) if te.eq_ignore_ascii_case("chunked") => true,
+        (Some(_), None) => return Err("the only transfer coding understood is `chunked`, alone"),
+    };
+    let mut lengths = head.headers.iter().filter(|(n, _)| n == "content-length").map(|(_, v)| v.as_str());
+    let Some(first) = lengths.next() else {
+        return Ok(if chunked { Framing::Chunked } else { Framing::Unframed });
+    };
+    if chunked {
+        return Err("conflicting Content-Length and Transfer-Encoding");
+    }
+    if lengths.any(|v| v != first) {
+        return Err("conflicting Content-Length headers");
+    }
+    if first.is_empty() || !first.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("a Content-Length is ASCII digits");
+    }
+    first.parse().map(Framing::Length).map_err(|_| "the Content-Length is too large")
 }
 
 impl Exchange<'_> {
@@ -954,78 +1220,66 @@ impl Exchange<'_> {
         self.reader.get_ref()
     }
 
-    /// Answers with an error and closes the connection unless `keep` (the body, if any, was read).
-    fn fail(&self, status: u16, code: i64, message: &str, headers: &[(&str, String)], keep: bool) -> bool {
-        write_response(self.stream(), status, headers, error_body(code, message).as_bytes(), !keep).is_ok() && keep
+    /// Answers with an error and closes the connection: after an error nothing that follows on it
+    /// is trusted to start a request (an unread or half-read body, a framing a proxy may read
+    /// differently).
+    fn fail(&self, status: u16, code: i64, message: &str, headers: &[(&str, String)]) -> bool {
+        let _ = write_response(self.stream(), status, headers, error_body(code, message).as_bytes(), true);
+        false
     }
 
-    fn serve(self) -> bool {
+    fn serve(mut self) -> bool {
         let head = self.head;
+        let framing = match framing(head) {
+            Ok(framing) => framing,
+            Err(why) => return self.fail(400, INVALID_REQUEST, why, &[]),
+        };
+        if head.method != "POST" && !matches!(framing, Framing::Unframed | Framing::Length(0)) {
+            // A body no method here reads: never let it be taken for the next request.
+            return self.fail(400, INVALID_REQUEST, &format!("a {} request carries no body here", head.method), &[]);
+        }
         if head.path != ENDPOINT {
-            return self.fail(404, INVALID_REQUEST, &format!("the MCP endpoint is {ENDPOINT}"), &[], false);
+            return self.fail(404, INVALID_REQUEST, &format!("the MCP endpoint is {ENDPOINT}"), &[]);
         }
         if self.shared.loopback && head.header("host").is_some_and(|h| !loopback_host(host_of(h))) {
-            return self.fail(403, INVALID_REQUEST, "this server is bound to loopback and answers only loopback host names", &[], false);
+            return self.fail(403, INVALID_REQUEST, "this server is bound to loopback and answers only loopback host names", &[]);
         }
         if head.header("origin").is_some_and(|o| !origin_allowed(o)) {
-            return self.fail(403, INVALID_REQUEST, "requests from this origin are refused (only loopback origins are served)", &[], false);
+            return self.fail(403, INVALID_REQUEST, "requests from this origin are refused (only loopback origins are served)", &[]);
         }
-        if let Some(tokens) = &self.shared.tokens
-            && !tokens.allows(head.header("authorization"))
-        {
-            let challenge = [("WWW-Authenticate", "Bearer realm=\"simee\"".to_owned())];
-            return self.fail(401, INVALID_REQUEST, "a valid bearer token is required", &challenge, false);
+        if let Some(tokens) = &self.shared.tokens {
+            match tokens.check(head.header("authorization")) {
+                Some(token) => self.principal = Some(token),
+                None => {
+                    let challenge = [("WWW-Authenticate", "Bearer realm=\"simee\"".to_owned())];
+                    return self.fail(401, INVALID_REQUEST, "a valid bearer token is required", &challenge);
+                }
+            }
         }
         match head.method.as_str() {
-            "POST" => self.post(),
+            "POST" => self.post(framing),
             "GET" => self.get(),
             "DELETE" => self.delete(),
-            _ => self.fail(
-                405,
-                INVALID_REQUEST,
-                "the MCP endpoint takes POST, GET and DELETE",
-                &[("Allow", "GET, POST, DELETE".into())],
-                false,
-            ),
+            _ => self.fail(405, INVALID_REQUEST, "the MCP endpoint takes POST, GET and DELETE", &[("Allow", "GET, POST, DELETE".into())]),
         }
     }
 
-    /// Reads the body, within the size and time limits. `Err` holds whether the error was answered
-    /// such that the connection survives (never: an unread body can't be skipped safely).
-    fn body(&mut self) -> Result<Vec<u8>, ()> {
+    /// Reads the body, within the size and time limits. `Err` once the error is answered (the
+    /// connection is then closed: an unread body can't be skipped safely).
+    fn body(&mut self, framing: Framing) -> Result<Vec<u8>, ()> {
         let limits = self.shared.config.limits;
         let deadline = Instant::now() + limits.request_timeout;
-        let chunked = match self.head.header("transfer-encoding") {
-            None => false,
-            Some(te) if te.eq_ignore_ascii_case("chunked") => true,
-            Some(_) => {
-                self.fail(501, INVALID_REQUEST, "only chunked transfer encoding is understood", &[], false);
+        let too_large = format!("the body is larger than {} bytes", limits.max_body);
+        let length = match framing {
+            Framing::Unframed => {
+                self.fail(411, INVALID_REQUEST, "a POST needs a Content-Length", &[]);
                 return Err(());
             }
-        };
-        let mut lengths = self.head.headers.iter().filter(|(n, _)| n == "content-length").map(|(_, v)| v);
-        if (chunked && self.head.header("content-length").is_some()) || lengths.next().is_some_and(|first| lengths.any(|v| v != first)) {
-            // Two framings at once is how requests are smuggled past proxies.
-            self.fail(400, INVALID_REQUEST, "conflicting Content-Length and Transfer-Encoding", &[], false);
-            return Err(());
-        }
-        let length = if chunked {
-            None
-        } else {
-            match self.head.header("content-length").map(|l| l.parse::<usize>()) {
-                Some(Ok(n)) => Some(n),
-                Some(Err(_)) => {
-                    self.fail(400, INVALID_REQUEST, "bad Content-Length", &[], false);
-                    return Err(());
-                }
-                None => {
-                    self.fail(411, INVALID_REQUEST, "a POST needs a Content-Length", &[], false);
-                    return Err(());
-                }
-            }
+            Framing::Length(n) => Some(n),
+            Framing::Chunked => None,
         };
         if length.is_some_and(|n| n > limits.max_body) {
-            self.fail(413, INVALID_REQUEST, &format!("the body is larger than {} bytes", limits.max_body), &[], false);
+            self.fail(413, INVALID_REQUEST, &too_large, &[]);
             return Err(());
         }
         if self.head.header("expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue")) {
@@ -1041,25 +1295,31 @@ impl Exchange<'_> {
         match read {
             Ok(body) => Ok(body),
             Err(e) if e.kind() == io::ErrorKind::FileTooLarge => {
-                self.fail(413, INVALID_REQUEST, &format!("the body is larger than {} bytes", limits.max_body), &[], false);
+                self.fail(413, INVALID_REQUEST, &too_large, &[]);
                 Err(())
             }
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                self.fail(400, INVALID_REQUEST, &format!("a malformed chunked body: {e}"), &[]);
+                Err(())
+            }
+            // Too slow, or gone.
             Err(_) => Err(()),
         }
     }
 
-    fn post(mut self) -> bool {
+    fn post(mut self, framing: Framing) -> bool {
         let head = self.head;
         if !head.accepts("application/json") && !head.accepts("text/event-stream") {
-            return self.fail(406, INVALID_REQUEST, "the client must accept application/json or text/event-stream", &[], false);
+            return self.fail(406, INVALID_REQUEST, "the client must accept application/json or text/event-stream", &[]);
         }
         if head.header("content-type").is_some_and(|t| !t.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json")) {
-            return self.fail(415, INVALID_REQUEST, "the body is application/json", &[], false);
+            return self.fail(415, INVALID_REQUEST, "the body is application/json", &[]);
         }
-        let Ok(body) = self.body() else { return false };
+        let Ok(body) = self.body(framing) else { return false };
         let Ok(text) = std::str::from_utf8(&body) else {
-            return self.fail(400, PARSE_ERROR, "the body is not UTF-8", &[], true);
+            return self.fail(400, PARSE_ERROR, "the body is not UTF-8", &[]);
         };
+        let principal = self.principal.as_deref();
         let incoming = match rpc::parse(text) {
             Ok(incoming) => incoming,
             Err(error) => {
@@ -1071,7 +1331,8 @@ impl Exchange<'_> {
                     return write_response(self.stream(), 202, &[], b"", false).is_ok();
                 }
                 let body = json!({"jsonrpc": "2.0", "id": null, "error": error.to_json()}).to_string();
-                return write_response(self.stream(), 400, &[], body.as_bytes(), false).is_ok();
+                let _ = write_response(self.stream(), 400, &[], body.as_bytes(), true);
+                return false;
             }
         };
         let (method, params) = match &incoming {
@@ -1080,35 +1341,30 @@ impl Exchange<'_> {
         if let Some(version) = head.header(VERSION_HEADER) {
             if version != MODERN && !LEGACY.contains(&version) {
                 let body = json!({"jsonrpc": "2.0", "id": null, "error": rpc::unsupported_version(version).to_json()}).to_string();
-                return write_response(self.stream(), 400, &[], body.as_bytes(), false).is_ok();
+                let _ = write_response(self.stream(), 400, &[], body.as_bytes(), true);
+                return false;
             }
             if let Some(named) = rpc::requested_version(params).filter(|v| *v != version) {
                 let message = format!("MCP-Protocol-Version is {version} but the request's _meta names {named}");
-                return self.fail(400, INVALID_REQUEST, &message, &[], true);
+                return self.fail(400, INVALID_REQUEST, &message, &[]);
             }
         }
         let is_request = matches!(incoming, Incoming::Request { .. });
         let mut created = None;
         let session = match head.header(SESSION_HEADER) {
-            Some(id) => match self.shared.session(id) {
+            Some(id) => match self.shared.session(id, principal) {
                 Some(session) => Some(session),
                 None => {
-                    return self.fail(
-                        404,
-                        INVALID_REQUEST,
-                        "no such session (it ended or expired): open a new one with initialize",
-                        &[],
-                        true,
-                    );
+                    return self.fail(404, INVALID_REQUEST, "no such session (it ended or expired): open a new one with initialize", &[]);
                 }
             },
-            None if is_request && method == "initialize" => match self.shared.open_session() {
+            None if is_request && method == "initialize" => match self.shared.open_session(principal) {
                 Ok(Some((id, session))) => {
                     created = Some(id);
                     Some(session)
                 }
-                Ok(None) => return self.fail(503, INVALID_REQUEST, "too many sessions are open", &[("Retry-After", "5".into())], true),
-                Err(e) => return self.fail(500, rpc::INTERNAL_ERROR, &format!("cannot make a session id: {e}"), &[], true),
+                Ok(None) => return self.fail(503, INVALID_REQUEST, "too many sessions are open", &[("Retry-After", "5".into())]),
+                Err(e) => return self.fail(500, rpc::INTERNAL_ERROR, &format!("cannot make a session id: {e}"), &[]),
             },
             None if !is_request || method == "server/discover" || method == "ping" || rpc::requested_version(params).is_some() => None,
             None => {
@@ -1117,7 +1373,7 @@ impl Exchange<'_> {
                      _meta[\"{}\"] (\"{MODERN}\") to be served without one",
                     rpc::META_VERSION
                 );
-                return self.fail(400, INVALID_REQUEST, &message, &[], true);
+                return self.fail(400, INVALID_REQUEST, &message, &[]);
             }
         };
         let server = session.as_ref().map_or(&self.shared.stateless, |s| &s.server).clone();
@@ -1137,7 +1393,7 @@ impl Exchange<'_> {
                 write_response(self.stream(), 202, &[], b"", false).is_ok()
             }
             Incoming::Request { id, method, mut params } => {
-                let _busy = session.as_ref().map(Busy::new);
+                let _running = session.as_ref().map(InFlight::new);
                 let key = self.shared.router.key();
                 let token =
                     params.get_mut("_meta").and_then(|m| m.get_mut("progressToken")).map(|t| std::mem::replace(t, key.clone().into()));
@@ -1163,7 +1419,9 @@ impl Exchange<'_> {
     }
 
     /// Waits for a request's response and writes it: as JSON, or as an event stream once a
-    /// notification for it comes first. A client that goes away cancels the request.
+    /// notification for it comes first. A client that has gone (a write to it fails) cancels the
+    /// request. One that only finished sending (a half-close) is still reading: if it takes an
+    /// event stream, the response becomes one so its pings can tell; if not, it waits.
     fn answer(&self, rx: &Receiver<Out>, server: &Server, key: &str, headers: &[(&str, String)]) -> bool {
         let stream = self.stream();
         let streams = self.head.accepts("text/event-stream");
@@ -1198,37 +1456,53 @@ impl Exchange<'_> {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    let gone = match &sse {
-                        Some(sse) => sse.ping().is_err(),
-                        None => peer_closed(stream),
-                    };
-                    if gone {
+                    if sse.is_none() {
+                        match peer_state(stream) {
+                            Peer::Open => continue,
+                            Peer::Broken => {
+                                cancel();
+                                return false;
+                            }
+                            Peer::Finished if !streams => continue,
+                            Peer::Finished => match Sse::start(stream, self.head.http11, headers) {
+                                Ok(started) => sse = Some(started),
+                                Err(_) => {
+                                    cancel();
+                                    return false;
+                                }
+                            },
+                        }
+                    }
+                    if sse.as_ref().is_some_and(|s| s.ping().is_err()) {
                         cancel();
                         return false;
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    return sse.is_none() && self.fail(500, rpc::INTERNAL_ERROR, "the request was dropped", &[], false);
+                    if sse.is_none() {
+                        self.fail(500, rpc::INTERNAL_ERROR, "the request was dropped", &[]);
+                    }
+                    return false;
                 }
             }
         }
     }
 
     /// A session's stream of what belongs to no request, until the client closes it, the session
-    /// ends, or another `GET` takes its place.
+    /// ends or expires (the stream's own pings are not activity), or another `GET` takes its place.
     fn get(self) -> bool {
         if !self.head.accepts("text/event-stream") {
-            return self.fail(406, INVALID_REQUEST, "a GET stream is text/event-stream", &[], true);
+            return self.fail(406, INVALID_REQUEST, "a GET stream is text/event-stream", &[]);
         }
         let Some(id) = self.head.header(SESSION_HEADER) else {
             let message = "a GET stream belongs to a session (open one with initialize); the current revision's \
                            notifications come on the POST of their subscriptions/listen";
-            return self.fail(405, INVALID_REQUEST, message, &[("Allow", "POST, DELETE".into())], true);
+            return self.fail(405, INVALID_REQUEST, message, &[("Allow", "POST, DELETE".into())]);
         };
-        let Some(session) = self.shared.session(id) else {
-            return self.fail(404, INVALID_REQUEST, "no such session (it ended or expired)", &[], true);
+        let Some(session) = self.shared.session(id, self.principal.as_deref()) else {
+            return self.fail(404, INVALID_REQUEST, "no such session (it ended or expired)", &[]);
         };
-        let _busy = Busy::new(&session);
+        let idle = self.shared.config.limits.session_idle;
         let (tx, rx) = channel();
         let generation = self.shared.router.next.fetch_add(1, Ordering::Relaxed);
         *lock(&session.standalone) = Some((generation, tx));
@@ -1241,6 +1515,10 @@ impl Exchange<'_> {
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
+                        if session.expired(idle) {
+                            self.shared.close_session(id, &session);
+                            break sse.end().is_ok() && sse.chunked;
+                        }
                         if sse.ping().is_err() {
                             break false;
                         }
@@ -1259,14 +1537,14 @@ impl Exchange<'_> {
 
     fn delete(self) -> bool {
         let Some(id) = self.head.header(SESSION_HEADER) else {
-            return self.fail(400, INVALID_REQUEST, "DELETE ends the session its Mcp-Session-Id names", &[], true);
+            return self.fail(400, INVALID_REQUEST, "DELETE ends the session its Mcp-Session-Id names", &[]);
         };
-        let removed = lock(&self.shared.sessions).remove(id);
-        let Some(session) = removed else {
-            return self.fail(404, INVALID_REQUEST, "no such session (it ended or expired)", &[], true);
+        // Only the token that opened a session can end it.
+        let Some(session) = self.shared.session(id, self.principal.as_deref()) else {
+            return self.fail(404, INVALID_REQUEST, "no such session (it ended or expired)", &[]);
         };
         // Its GET stream ends; requests still running finish on their own.
-        *lock(&session.standalone) = None;
+        self.shared.close_session(id, &session);
         write_response(self.stream(), 204, &[], b"", false).is_ok()
     }
 }
@@ -1314,8 +1592,13 @@ fn read_chunked(reader: &mut BufReader<TcpStream>, max: usize, deadline: Instant
     let mut body = Vec::new();
     loop {
         let line = read_line(reader, 1024, deadline)?;
-        let size = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "a bad chunk size"))?;
+        // Hex digits only: no sign, no `0x`, no spaces (then any `;extension`).
+        let digits = line.split(';').next().unwrap_or("");
+        let bad = || io::Error::new(io::ErrorKind::InvalidData, "a chunk size is hex digits");
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(bad());
+        }
+        let size = usize::from_str_radix(digits, 16).map_err(|_| bad())?;
         if size == 0 {
             // Trailers, up to the blank line.
             while !read_line(reader, 8 << 10, deadline)?.is_empty() {}

@@ -11,7 +11,7 @@ use crate::rpc::{EXT_TASKS, META_CLIENT_CAPS, META_VERSION};
 const WAIT: Duration = Duration::from_secs(10);
 
 fn limits() -> Limits {
-    Limits { max_body: 64 << 10, max_connections: 16, ping: Duration::from_millis(100), ..Limits::default() }
+    Limits { max_body: 64 << 10, max_connections: 16, max_connections_per_peer: 16, ping: Duration::from_millis(100), ..Limits::default() }
 }
 
 fn timing() -> Timing {
@@ -51,6 +51,9 @@ impl Rig {
         let mut config = Config::new("127.0.0.1:0".parse().expect("addr"));
         config.toolsets = Toolsets::all();
         config.limits = limits();
+        // Authentication is on by default, from a file in the state directory: tests that want it
+        // name a file of their own.
+        config.no_auth = true;
         config.timing = timing();
         adjust(&mut config);
         let running = start(fake.clone(), config).expect("the server starts");
@@ -87,7 +90,25 @@ fn events_of(text: &str) -> Vec<Value> {
         .collect()
 }
 
-/// A client on one kept-alive connection, with the headers it sends on every request.
+/// Sends raw bytes on a new connection and returns everything the server writes until it closes
+/// the connection (or stays silent for `quiet`).
+fn raw_exchange(addr: SocketAddr, bytes: &[u8], quiet: Duration) -> String {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream.write_all(bytes).expect("write");
+    stream.set_read_timeout(Some(quiet)).expect("timeout");
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = stream.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A client on one kept-alive connection, with the headers it sends on every request. A response
+/// that closes the connection makes the next request open a new one.
 struct Client {
     addr: SocketAddr,
     reader: BufReader<TcpStream>,
@@ -95,6 +116,7 @@ struct Client {
     token: Option<String>,
     headers: Vec<(String, String)>,
     next: u64,
+    closed: bool,
 }
 
 impl Client {
@@ -102,16 +124,20 @@ impl Client {
         let stream = TcpStream::connect(addr).expect("connect");
         stream.set_read_timeout(Some(WAIT)).expect("timeout");
         stream.set_nodelay(true).expect("nodelay");
-        Client { addr, reader: BufReader::new(stream), session: None, token: None, headers: Vec::new(), next: 1 }
+        Client { addr, reader: BufReader::new(stream), session: None, token: None, headers: Vec::new(), next: 1, closed: false }
     }
 
     fn reconnect(&mut self) {
         let stream = TcpStream::connect(self.addr).expect("connect");
         stream.set_read_timeout(Some(WAIT)).expect("timeout");
         self.reader = BufReader::new(stream);
+        self.closed = false;
     }
 
     fn write_request(&mut self, method: &str, extra: &[(&str, &str)], body: &[u8]) {
+        if self.closed {
+            self.reconnect();
+        }
         let mut head = format!("{method} {ENDPOINT} HTTP/1.1\r\nHost: {}\r\n", self.addr);
         if !extra.iter().any(|(n, _)| n.eq_ignore_ascii_case("accept")) {
             head.push_str("Accept: application/json, text/event-stream\r\n");
@@ -190,6 +216,7 @@ impl Client {
             self.reader.read_to_string(&mut body).expect("body");
             body
         };
+        self.closed = find("connection").is_some_and(|c| c.eq_ignore_ascii_case("close"));
         Reply { status, headers, body }
     }
 
@@ -387,7 +414,10 @@ fn subscriptions_listen_streams_on_its_post_until_the_client_closes_it() {
 fn a_missing_or_wrong_token_is_refused_and_rotating_is_rewriting_the_file() {
     let scratch = Scratch::new("token");
     let path = scratch.0.join("state/mcp-token");
-    let rig = Rig::with(|c| c.token_file = Some(path.clone()));
+    let rig = Rig::with(|c| {
+        c.no_auth = false;
+        c.token_file = Some(path.clone());
+    });
     // The file was made, for its owner only, with a long random token.
     let token = std::fs::read_to_string(&path).expect("token").trim().to_owned();
     assert_eq!(token.len(), 64);
@@ -435,18 +465,159 @@ fn a_token_file_others_can_read_or_a_short_token_is_refused() {
 }
 
 #[test]
-fn only_loopback_binds_are_served_without_an_acknowledgement_and_a_token() {
-    let mut config = Config::new("192.0.2.1:0".parse().expect("addr"));
-    let e = prepare_auth(&config).err().expect("refused");
-    assert!(e.to_string().contains("--insecure-remote"), "{e}");
+fn every_bind_requires_a_token_unless_no_auth_on_loopback() {
     let scratch = Scratch::new("remote");
+    let default = scratch.0.join("state/mcp-token");
+    let from_state_dir = || Ok(default.clone());
+    let mut config = Config::new("192.0.2.1:0".parse().expect("addr"));
+    let e = prepare_auth(&config, from_state_dir).err().expect("refused");
+    assert!(e.to_string().contains("--insecure-remote"), "{e}");
     config.insecure_remote = true;
     config.token_file = Some(scratch.0.join("t"));
-    let tokens = prepare_auth(&config).expect("acknowledged").expect("a token is required off loopback");
+    let tokens = prepare_auth(&config, from_state_dir).expect("acknowledged").expect("a token is required off loopback");
     assert_eq!(lock(&tokens.state).tokens.len(), 1);
-    // Loopback: no token unless one is asked for.
-    assert!(prepare_auth(&Config::new("127.0.0.1:0".parse().expect("addr"))).expect("loopback").is_none());
-    assert!(prepare_auth(&Config::new("[::1]:0".parse().expect("addr"))).expect("loopback").is_none());
+    // Off loopback, --no-auth is refused.
+    config.token_file = None;
+    config.no_auth = true;
+    let e = prepare_auth(&config, from_state_dir).err().expect("--no-auth off loopback");
+    assert!(e.to_string().contains("loopback"), "{e}");
+    // Loopback too: with no file named, the state directory's is made (and reused next time).
+    for addr in ["127.0.0.1:0", "[::1]:0"] {
+        let tokens = prepare_auth(&Config::new(addr.parse().expect("addr")), from_state_dir).expect("loopback").expect("a token");
+        assert_eq!(tokens.path, default);
+        assert_eq!(lock(&tokens.state).tokens.len(), 1);
+    }
+    let token = std::fs::read_to_string(&default).expect("token").trim().to_owned();
+    assert_eq!(token.len(), 64);
+    let again = prepare_auth(&Config::new("127.0.0.1:0".parse().expect("addr")), from_state_dir).expect("reused").expect("a token");
+    assert_eq!(lock(&again.state).tokens, [token]);
+    // --no-auth on loopback turns it off; with a token file too it is a contradiction.
+    let mut config = Config::new("127.0.0.1:0".parse().expect("addr"));
+    config.no_auth = true;
+    assert!(prepare_auth(&config, from_state_dir).expect("loopback").is_none());
+    config.token_file = Some(scratch.0.join("t"));
+    assert!(prepare_auth(&config, from_state_dir).is_err());
+}
+
+#[test]
+fn connections_past_the_per_peer_limit_get_503() {
+    let rig = Rig::with(|c| c.limits.max_connections_per_peer = 2);
+    let held: Vec<Client> = (0..2).map(|_| rig.client()).collect();
+    let deadline = Instant::now() + WAIT;
+    while rig.running.shared.connections.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut third = rig.client();
+    let reply = third.read_reply();
+    assert_eq!(reply.status, 503, "{reply:?}");
+    assert!(reply.body.contains("from this address"), "{reply:?}");
+    drop(held);
+    let deadline = Instant::now() + WAIT;
+    while !lock(&rig.running.shared.peers).is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(lock(&rig.running.shared.peers).is_empty(), "every slot was given back");
+    assert_eq!(rig.client().call("server/discover", json!({}))["id"], 1);
+}
+
+/// Two tokens in one file: two principals.
+fn two_tokens(scratch: &Scratch) -> (PathBuf, String, String) {
+    let (a, b) = ("token-a-0123456789abcdef0123456789".to_owned(), "token-b-0123456789abcdef0123456789".to_owned());
+    let path = scratch.0.join("tokens");
+    std::fs::write(&path, format!("{a}\n{b}\n")).expect("write");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+    (path, a, b)
+}
+
+#[test]
+fn a_session_belongs_to_the_token_that_opened_it() {
+    let scratch = Scratch::new("owners");
+    let (path, a, b) = two_tokens(&scratch);
+    let rig = Rig::with(|c| {
+        c.no_auth = false;
+        c.token_file = Some(path);
+    });
+    let mut alice = rig.client();
+    alice.token = Some(a);
+    alice.initialize("2025-11-25");
+    // Bob, with a valid token of his own and Alice's session id: it is not his to use, watch or end.
+    let mut bob = rig.client();
+    bob.token = Some(b);
+    bob.session = alice.session.clone();
+    let (reply, _) = bob.request("ping", json!({}));
+    assert_eq!(reply.status, 404, "{reply:?}");
+    bob.write_request("GET", &[], b"");
+    assert_eq!(bob.read_reply().status, 404);
+    bob.write_request("DELETE", &[], b"");
+    assert_eq!(bob.read_reply().status, 404);
+    assert_eq!(rig.running.sessions(), 1);
+    assert_eq!(alice.call("ping", json!({}))["result"], json!({}));
+    alice.write_request("DELETE", &[], b"");
+    assert_eq!(alice.read_reply().status, 204);
+    assert_eq!(rig.running.sessions(), 0);
+}
+
+#[test]
+fn a_full_session_table_closes_only_the_callers_own_sessions() {
+    let scratch = Scratch::new("evict");
+    let (path, a, b) = two_tokens(&scratch);
+    let rig = Rig::with(|c| {
+        c.no_auth = false;
+        c.token_file = Some(path);
+        c.limits.max_sessions = 2;
+    });
+    let mut alices: Vec<Client> = (0..2).map(|_| rig.client()).collect();
+    for c in &mut alices {
+        c.token = Some(a.clone());
+        c.initialize("2025-11-25");
+    }
+    // Bob can't push Alice's idle sessions out.
+    let mut bob = rig.client();
+    bob.token = Some(b);
+    let (reply, _) = bob.request("initialize", json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t"}}));
+    assert_eq!(reply.status, 503, "{reply:?}");
+    for c in &mut alices {
+        assert_eq!(c.call("ping", json!({}))["result"], json!({}));
+    }
+    // Alice can: her own idlest goes.
+    let mut third = rig.client();
+    third.token = Some(a);
+    third.initialize("2025-11-25");
+    let (reply, _) = alices[0].request("ping", json!({}));
+    assert_eq!(reply.status, 404, "{reply:?}");
+    assert_eq!(alices[1].call("ping", json!({}))["result"], json!({}));
+}
+
+#[test]
+fn an_idle_session_expires_even_while_a_get_stream_holds_it() {
+    let rig = Rig::with(|c| c.limits.session_idle = Duration::from_millis(400));
+    let mut client = rig.client();
+    client.initialize("2025-11-25");
+    let mut stream = Client::connect(rig.running.addr());
+    stream.session = client.session.clone();
+    stream.write_request("GET", &[], b"");
+    assert_eq!(stream.read_head().0, 200);
+    // Only pings come; then, with no request for the idle time, the stream ends and the session goes.
+    let start = Instant::now();
+    while stream.chunk().is_some() {
+        assert!(start.elapsed() < Duration::from_secs(5), "the stream outlived its session");
+    }
+    assert!(start.elapsed() >= Duration::from_millis(300), "{:?}", start.elapsed());
+    assert_eq!(rig.running.sessions(), 0);
+    let (reply, _) = client.request("ping", json!({}));
+    assert_eq!(reply.status, 404, "{reply:?}");
+    // A session in use stays: requests keep it alive.
+    client.session = None;
+    client.initialize("2025-11-25");
+    for _ in 0..6 {
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(client.call("ping", json!({}))["result"], json!({}));
+    }
+    assert_eq!(rig.running.sessions(), 1);
 }
 
 #[test]
@@ -724,6 +895,207 @@ fn hosts_origins_and_tokens_parse() {
     assert!(same(b"abc", b"abc") && !same(b"abc", b"abd") && !same(b"abc", b"ab"));
 }
 
+fn discover_request(addr: SocketAddr, framing: &str, body: &str) -> String {
+    format!("POST {ENDPOINT} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n{framing}\r\n\r\n{body}")
+}
+
+fn discover_body() -> String {
+    json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {}}).to_string()
+}
+
+#[test]
+fn blank_lines_cannot_hold_a_connection_open() {
+    let rig = Rig::with(|c| c.limits.request_timeout = Duration::from_millis(500));
+    let mut stream = TcpStream::connect(rig.running.addr()).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_millis(50))).expect("timeout");
+    let start = Instant::now();
+    // A CR every 50 ms, which is never a request line: the server ends it well within 3 s.
+    let ended = loop {
+        if start.elapsed() > Duration::from_secs(3) {
+            break false;
+        }
+        if stream.write_all(b"\r").is_err() {
+            break true;
+        }
+        let mut buf = [0u8; 256];
+        match stream.read(&mut buf) {
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            _ => break true,
+        }
+    };
+    assert!(ended, "a trickle of blank lines held the connection for {:?}", start.elapsed());
+    // Many blank lines before a request at once: refused, not skipped.
+    let addr = rig.running.addr();
+    let flood =
+        format!("{}{}", "\r\n".repeat(32), discover_request(addr, &format!("Content-Length: {}", discover_body().len()), &discover_body()));
+    let reply = raw_exchange(addr, flood.as_bytes(), Duration::from_secs(2));
+    assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+    // One blank line is allowed (RFC 9112).
+    let one = format!(
+        "\r\n{}",
+        discover_request(addr, &format!("Content-Length: {}\r\nConnection: close", discover_body().len()), &discover_body())
+    );
+    assert!(raw_exchange(addr, one.as_bytes(), Duration::from_secs(2)).starts_with("HTTP/1.1 200"));
+}
+
+#[test]
+fn the_first_request_head_has_one_deadline_from_the_connection() {
+    let rig = Rig::with(|c| c.limits.request_timeout = Duration::from_millis(600));
+    let addr = rig.running.addr();
+    let request = discover_request(addr, &format!("Content-Length: {}\r\nConnection: close", discover_body().len()), &discover_body());
+    // Silent for 400 ms, then a head sent over 400 ms more: 800 ms after the connection opened.
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    std::thread::sleep(Duration::from_millis(400));
+    let (a, b) = request.split_at(20);
+    let _ = stream.write_all(a.as_bytes());
+    std::thread::sleep(Duration::from_millis(400));
+    let _ = stream.write_all(b.as_bytes());
+    stream.set_read_timeout(Some(Duration::from_secs(2))).expect("timeout");
+    let mut reply = String::new();
+    let _ = stream.read_to_string(&mut reply);
+    assert!(!reply.contains("200 OK"), "a head that arrived after its deadline was served: {reply}");
+    // The same head in time is served.
+    assert!(raw_exchange(addr, request.as_bytes(), Duration::from_secs(2)).starts_with("HTTP/1.1 200"));
+}
+
+#[test]
+fn a_body_on_a_get_or_delete_closes_the_connection_and_is_never_a_request() {
+    let rig = Rig::new();
+    let addr = rig.running.addr();
+    let inner = discover_request(addr, &format!("Content-Length: {}", discover_body().len()), &discover_body());
+    let session = "Mcp-Session-Id: 0123456789abcdef0123456789abcdef";
+    for (method, framing, body) in [
+        ("DELETE", format!("Content-Length: {}", inner.len()), inner.clone()),
+        ("GET", "Transfer-Encoding: chunked".to_owned(), format!("{:x}\r\n{inner}\r\n0\r\n\r\n", inner.len())),
+        ("OPTIONS", format!("Content-Length: {}", inner.len()), inner.clone()),
+    ] {
+        let request =
+            format!("{method} {ENDPOINT} HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\n{session}\r\n{framing}\r\n\r\n{body}");
+        let reply = raw_exchange(addr, request.as_bytes(), Duration::from_secs(2));
+        assert!(reply.starts_with("HTTP/1.1 400"), "{method}: {reply}");
+        assert!(reply.contains("Connection: close"), "{method}: {reply}");
+        assert_eq!(reply.matches("HTTP/1.1 ").count(), 1, "{method}: the body was read as a request: {reply}");
+    }
+    // An empty body (`Content-Length: 0`) is no body: the DELETE is answered as one (no such
+    // session), not refused for its framing.
+    let request = format!(
+        "DELETE {ENDPOINT} HTTP/1.1\r\nHost: {addr}\r\n{session}\r\nContent-Length: 0\r\n\r\n{}",
+        discover_request(addr, &format!("Content-Length: {}\r\nConnection: close", discover_body().len()), &discover_body())
+    );
+    let reply = raw_exchange(addr, request.as_bytes(), Duration::from_secs(2));
+    assert!(reply.starts_with("HTTP/1.1 404"), "{reply}");
+}
+
+#[test]
+fn an_error_closes_the_connection() {
+    let rig = Rig::new();
+    let mut client = rig.client();
+    for older in [false, true] {
+        // A body that isn't JSON; an older revision's request with no session.
+        let reply = if older { client.request("tools/list", json!({})).0 } else { client.post_raw(b"{not json", &[]) };
+        assert_eq!((reply.status, reply.header("connection")), (400, Some("close")), "{reply:?}");
+        let mut rest = Vec::new();
+        let _ = client.reader.read_to_end(&mut rest);
+        assert!(rest.is_empty(), "nothing follows: {rest:?}");
+        client.reconnect();
+    }
+    // A success keeps it.
+    let reply = client.post(&json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {}}));
+    assert_eq!((reply.status, reply.header("connection")), (200, None));
+}
+
+#[test]
+fn framing_is_parsed_strictly() {
+    let rig = Rig::new();
+    let addr = rig.running.addr();
+    let body = discover_body();
+    let chunked = |size: &str| format!("{size}\r\n{body}\r\n0\r\n\r\n");
+    let hex = format!("{:x}", body.len());
+    for (framing, sent) in [
+        (format!("Content-Length: +{}", body.len()), body.clone()),
+        ("Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip".to_owned(), chunked(&hex)),
+        ("Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked".to_owned(), chunked(&hex)),
+        ("Transfer-Encoding: gzip, chunked".to_owned(), chunked(&hex)),
+        ("Transfer-Encoding: chunked".to_owned(), chunked(&format!("+{hex}"))),
+        ("Transfer-Encoding: chunked".to_owned(), chunked(&format!(" {hex}"))),
+        ("Transfer-Encoding: chunked".to_owned(), chunked(&format!("0x{hex}"))),
+    ] {
+        let reply = raw_exchange(addr, discover_request(addr, &framing, &sent).as_bytes(), Duration::from_secs(2));
+        assert!(reply.starts_with("HTTP/1.1 400"), "{framing:?} {sent:?}: {reply}");
+        assert!(reply.contains("Connection: close"), "{framing:?}: {reply}");
+    }
+    // The strict forms are served.
+    for (framing, sent) in [
+        (format!("Content-Length: {}\r\nConnection: close", body.len()), body.clone()),
+        ("Transfer-Encoding: Chunked\r\nConnection: close".to_owned(), chunked(&format!("{hex};ext=1"))),
+    ] {
+        let reply = raw_exchange(addr, discover_request(addr, &framing, &sent).as_bytes(), Duration::from_secs(2));
+        assert!(reply.starts_with("HTTP/1.1 200"), "{framing:?}: {reply}");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_linked_token_file_or_a_directory_others_can_write_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("files");
+    let private = |path: &Path| {
+        std::fs::write(path, "0123456789abcdef0123\n").expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    };
+    let real = scratch.0.join("real");
+    private(&real);
+    ensure_token_file(&real).expect("a private file in a private directory");
+    let link = scratch.0.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    let e = ensure_token_file(&link).expect_err("a link is not followed");
+    assert!(e.to_string().contains("symbolic link"), "{e}");
+    assert!(read_tokens(&link).is_err());
+    let dir = scratch.0.join("dir");
+    std::fs::create_dir(&dir).expect("mkdir");
+    assert!(ensure_token_file(&dir).expect_err("a directory").to_string().contains("regular file"));
+    // A directory others can write: someone else could have planted the file.
+    let shared = scratch.0.join("shared");
+    std::fs::create_dir(&shared).expect("mkdir");
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+    private(&shared.join("t"));
+    let e = ensure_token_file(&shared.join("t")).expect_err("a shared directory");
+    assert!(e.to_string().contains("other users can write"), "{e}");
+    assert!(ensure_token_file(&shared.join("new")).is_err(), "nor is a new token made there");
+    // A state directory that is made is its owner's alone.
+    let made = scratch.0.join("made/state/t");
+    ensure_token_file(&made).expect("made");
+    let mode = std::fs::metadata(scratch.0.join("made/state")).expect("meta").permissions().mode();
+    assert_eq!(mode & 0o777, 0o700);
+}
+
+#[test]
+fn a_client_that_half_closes_still_gets_its_response() {
+    let rig = Rig::new();
+    let addr = rig.running.addr();
+    for accept in ["application/json", "application/json, text/event-stream"] {
+        let gate = rig.fake.gate("boot");
+        rig.fake.answer("boot", Ok(json!({"boot_s": 1})));
+        let body = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": modern(json!({"name": "boot", "arguments": {"device": "phone"}}), false)})
+            .to_string();
+        let mut client = Client::connect(addr);
+        client.write_request("POST", &[("Accept", accept)], body.as_bytes());
+        // Done sending (`nc -N`, HTTP/1.0-style clients); still reading.
+        client.reader.get_ref().shutdown(Shutdown::Write).expect("half-close");
+        std::thread::sleep(limits().ping * 5);
+        gate.release();
+        let reply = client.read_reply();
+        assert_eq!(reply.status, 200, "{accept}: {reply:?}");
+        let response = if reply.header("content-type") == Some("text/event-stream") {
+            events_of(&reply.body).pop().expect("the response ends the stream")
+        } else {
+            reply.json()
+        };
+        assert_eq!(response["result"]["structuredContent"]["boot_s"], 1, "{accept}: {response}");
+        rig.fake.gates.lock().expect("gates").clear();
+    }
+}
+
 /// Per-call cost of a `tools/call` of `identity` with `sim-api`'s real method: over stdio (the
 /// server reading lines from one OS pipe and writing to another, as `simee mcp` does) and over
 /// HTTP on loopback, on one kept-alive connection and on a new connection per call.
@@ -784,6 +1156,9 @@ fn http_call_overhead() {
 
     let mut config = Config::new("127.0.0.1:0".parse().expect("addr"));
     config.toolsets = Toolsets::all();
+    config.no_auth = true;
+    // A connection per call, faster than closed ones are counted out.
+    config.limits.max_connections_per_peer = config.limits.max_connections;
     let running = start(backend, config).expect("start");
     let mut client = Client::connect(running.addr());
     let kept_us = median_us(|| {
