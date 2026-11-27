@@ -10,7 +10,7 @@ for both is to match the stock tools exactly and then exceed them.
 
 - New dependencies go in root `[workspace.dependencies]` with `default-features = false` and only
   the features used; crates reference them with `{ workspace = true }`.
-- `unsafe` lives only in `crates/sim-coresim` (the Objective-C / IOSurface boundary),
+- `unsafe` lives only in `crates/sim-coresim` (the Objective-C / IOSurface / VideoToolbox boundary),
   `crates/emu-hvf` (Hypervisor.framework and guest RAM), `crates/emu-kvm` (Linux KVM), `crates/emu-gfxstream` (the renderer),
   `apps/emu`'s `shutdown_signals` (signal masks) and `desktop/src/surface.rs` (the zero-copy
   bridge). Every `unsafe` block carries a `// SAFETY:` comment
@@ -151,6 +151,13 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `http.rs`/`url.rs` (blocking HTTP/1.1 on `std::net`), `h264.rs` (Annex B, access units, SPS
   `profile-level-id`, SPS/PPS before IDRs), `rtp.rs` (RFC 6184, FU-A), `publisher.rs` (str0m in
   RTP mode, one thread per publisher, the encoder callback). Docs: `docs/streaming.md`.
+- `crates/sim-encode` — the H.264 encoder (safe; its FFI is `sim-coresim`'s `videotoolbox.rs`
+  behind the `videotoolbox` feature): `annexb.rs` (length-prefixed to Annex B, SPS/PPS before
+  every IDR), `pacing.rs` (fps cap, idle heartbeat, strictly increasing PTS), `stream.rs` (the
+  loop: `Source`, `Encoder`, `Controls`), `vt.rs` (`VtEncoder`, `Decoder`; macOS), `source.rs`
+  (`IosSource` wraps the framebuffer IOSurface, `AndroidSource` copies emu's ring frames into an
+  IOSurface pool; macOS); `examples/encode_bench.rs` (scripts/bench/encode.sh),
+  `examples/publish_device.rs` (a device to WHIP). No Linux encoder yet.
 - `crates/sim-android` — the Android backend's client: AVDs as labelled devices, system images as
   runtimes, AVD creation shaped by form factor, starting `emu` and waiting for boot, the console
   client (`console.rs`) and the display socket client (`display.rs`). No FFI.

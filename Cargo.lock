@@ -2070,6 +2070,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "simee-encode"
+version = "0.1.0"
+dependencies = [
+ "simee-android",
+ "simee-core",
+ "simee-coresim",
+ "simee-emu-avd",
+ "simee-rtc",
+]
+
+[[package]]
 name = "simee-host"
 version = "0.1.0"
 dependencies = [
