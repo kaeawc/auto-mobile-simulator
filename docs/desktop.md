@@ -12,6 +12,12 @@ cargo run -- --snap shot.png --scene demo   # headless render; scenes: demo, and
 cargo run --release --features tooling -- --snap shot.png --scene demo   # the same, optimized
 ```
 
+The window draws with Rune's native Metal backend. `SIMEE_GPU_BACKEND=wgpu` switches it to wgpu's
+Metal backend, which the 3D device view needs, and `metal` chooses the default. The window looks
+and behaves the same on both, but wgpu costs a little more:
+[benchmarks.md](benchmarks.md#desktop-runes-native-metal-backend-against-wgpu). Rune's own
+`RUNE_GPU_BACKEND` overrides it.
+
 Rune's headless flags (`--snap`, `--tree`, `--script`, `--video`) are always in debug builds; a
 release build has them only with the `tooling` feature. The shipped release build leaves it off:
 it adds 1,338,496 B to the stripped binary (32,950,904 → 34,289,400 B, Linux x86_64, 2026-11-26)
