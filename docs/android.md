@@ -243,9 +243,12 @@ EMU_QEMU=/path/to/qemu-system-x86_64 emu -avd phone   # QEMU 11.1 or newer; with
   produced its first frame, so the muxer never started (`MediaMuxer: stop() is called in invalid
   state 1`) and the file stayed empty, in 2 of 2 full runs.
 - **Idle cost.** Settled, a software-mode device takes about 0.7 of a host core. A quiet
-  Perfetto trace of the guest puts about a third of that on vsync: the ranchu composer marks its
-  present fences unreliable, so SurfaceFlinger keeps hardware vsync on and handles 60 composer
-  callbacks a second while nothing draws. The sensors HAL and logd/logcat are the next largest.
+  Perfetto trace of a clean guest (2026-11-27) puts about a third of that on vsync: the ranchu
+  composer marks its present fences unreliable, so SurfaceFlinger keeps hardware vsync on and
+  handles 60 composer callbacks a second while nothing draws (SurfaceFlinger and the composer: 2.4
+  s of 8.2 s busy). Next come system_server (1.9 s) and the sensors HAL (0.9 s): system_server's
+  rotation listener keeps the accelerometer at 15 Hz. An AutoMobile session adds its own sensor
+  listeners and log readers on top.
   `hw.lcd.vsync=30` in the AVD's `config.ini` (emu honours it as stock does) settles 0.12 cores
   lower, with no frames lost at software mode's rate
   ([benchmarks](benchmarks.md#software-mode-through-emu--avd)).
