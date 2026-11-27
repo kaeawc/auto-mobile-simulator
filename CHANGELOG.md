@@ -21,6 +21,12 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   report `form_factor: foldable`, and `create --form-factor foldable` takes an iPhone Duo. Rotation,
   CarPlay's form factor check and the desktop's edge gestures treat it as the iPhone it is.
 
+### Fixed
+
+- `simee-rtc` on macOS: a WHIP server that replies and then resets the connection (an early
+  error, or a request body it didn't read) no longer fails the request with "Invalid argument";
+  its reply is read.
+
 ## [0.2.0] - 2026-11-27
 
 ### Added
