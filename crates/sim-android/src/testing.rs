@@ -41,7 +41,18 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
     let status = fold_status.clone();
     let rotation = Arc::new(Mutex::new(0));
     let turned = rotation.clone();
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("console");
+    // The advertised adb port is the console's plus one, so the console must not be on 65535 (an
+    // ephemeral port the OS hands out now and then): bind again, keeping the unusable one held so
+    // the next bind gets another.
+    let mut skipped = Vec::new();
+    let listener = loop {
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("console");
+        if l.local_addr().expect("addr").port() < u16::MAX {
+            break l;
+        }
+        skipped.push(l);
+    };
+    drop(skipped);
     let port = listener.local_addr().expect("addr").port();
     let log = console.clone();
     std::thread::spawn(move || {
