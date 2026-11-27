@@ -2018,6 +2018,7 @@ dependencies = [
  "simee-emu-ext4",
  "simee-emu-gfxstream",
  "simee-emu-hvf",
+ "simee-emu-kvm",
  "simee-emu-sdk",
  "simee-emu-vmm",
 ]

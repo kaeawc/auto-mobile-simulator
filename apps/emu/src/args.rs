@@ -46,6 +46,8 @@ options:
                     at 4 MiB)
   -verbose          diagnostics, including vCPU exit counts at shutdown
   -no-boot-anim     skip the boot animation
+  -accel MODE       software mode (x86_64 Linux): auto (default: KVM when /dev/kvm is usable,
+                    else QEMU's TCG), on (KVM or fail), off (TCG); -no-accel is -accel off
   -disk-cache MODE  unsafe (default: guest flushes stay in the host page cache) or fsync
   -gpu MODE         rendering mode, default auto (host GPU through MoltenVK):
                       auto, host     host GPU through MoltenVK, software if that fails
@@ -92,7 +94,6 @@ const IGNORED_WITH_VALUE: &[&str] = &[
     "partition-size",
     "snapshot",
     "id",
-    "accel",
     "selinux",
     "screen",
     "grpc-use-token",
@@ -119,6 +120,9 @@ pub struct Opts {
     pub version: bool,
     pub help: bool,
     pub accel_check: bool,
+    /// `-accel on|off|auto`, `-no-accel`: None is auto. Software mode only (Linux): on a Mac the
+    /// hypervisor is the only accelerator.
+    pub accel: Option<bool>,
     pub cores: Option<u32>,
     pub memory_mb: Option<u64>,
     pub port: Option<u16>,
@@ -187,6 +191,15 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
             "version" => o.version = true,
             "help" | "h" => o.help = true,
             "accel-check" => o.accel_check = true,
+            "accel" => {
+                o.accel = match value(flag)?.as_str() {
+                    "auto" => None,
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    v => bail!("-accel {v}: expected on, off or auto"),
+                }
+            }
+            "no-accel" => o.accel = Some(false),
             "cores" => o.cores = Some(value(flag)?.parse()?),
             "memory" => o.memory_mb = Some(value(flag)?.parse()?),
             "port" => o.port = Some(value(flag)?.parse()?),
@@ -328,6 +341,18 @@ mod tests {
         }
         assert!(parse("-gpu bogus".split_whitespace().map(String::from)).is_err());
         assert_eq!(p("-avd x").gpu, None);
+    }
+
+    #[test]
+    fn accel_modes_are_stocks() {
+        assert_eq!(p("-avd x").accel, None);
+        assert_eq!(p("-avd x -accel auto").accel, None);
+        assert_eq!(p("-avd x -accel on").accel, Some(true));
+        assert_eq!(p("-avd x -accel off").accel, Some(false));
+        assert_eq!(p("-avd x -no-accel -port 5570").accel, Some(false));
+        assert_eq!(p("-avd x -no-accel -port 5570").port, Some(5570), "-no-accel takes no value");
+        assert!(p("-avd x -accel on").ignored.is_empty());
+        assert!(parse("-avd x -accel hvf".split_whitespace().map(String::from)).is_err());
     }
 
     #[test]

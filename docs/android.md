@@ -221,14 +221,25 @@ kill` work as on a Mac. What follows records what was decided and why. The numbe
 ```bash
 emu -provision 36 -tag default -abi x86_64 -create-avd phone
 emu -provision-renderer
-emu -accel-check    # which QEMU would run the guest, or what's missing (Ubuntu 22.04's 6.2 is too old)
+emu -accel-check    # which QEMU would run the guest and on what (KVM or TCG), or what's missing
 EMU_QEMU=/path/to/qemu-system-x86_64 emu -avd phone   # QEMU 11.1 or newer; without it, PATH's
+emu -avd phone -accel off   # TCG even where /dev/kvm is usable (-accel on: KVM or fail)
 ```
+
+- **KVM when the host has it.** When this user can open `/dev/kvm` (`emu_kvm::open`, which also
+  says how to fix a missing or denied device), QEMU runs the guest with `-accel kvm -cpu host`
+  and keeps everything else: the board, emu's devices over vhost-user and vfio-user, the shared
+  memfd RAM. `-accel` and `-no-accel` mean what they mean to stock (`auto` by default).
+  GitHub's x86_64 hosted runners expose `/dev/kvm`, as root:kvm 0660;
+  `.github/actions/enable-kvm` opens it to the runner user, and the `Software mode` workflow
+  boots once on KVM and once with `-accel off`. The KVM run then first-boots the same image in
+  the stock emulator on the same runner and writes both times to the job summary. GitHub's arm64
+  hosted runners have no `/dev/kvm` (probed in #56), so the arm64 KVM backend can't run natively
+  there.
 
 - **Host:** x86_64 Linux with QEMU 11.1 or newer and the SDK's Linux renderer
   (`emu -provision-renderer`); no GPU. The smallest host it has run on is 4 cores and 8 GiB.
-  QEMU's peak RSS is about 3 GB for a 2 GB guest, and emu's about 0.25 GB. When the host has `/dev/kvm`, use the KVM backend
-  ([#54](https://github.com/kaeawc/simee/issues/54)) instead: the guest runs natively there.
+  QEMU's peak RSS is about 3 GB for a 2 GB guest, and emu's about 0.25 GB (measured under TCG).
 - **What runs where:** `emu_vmm::soft` builds QEMU's command line for stock's x86 board, serves
   every device but the disks, and supervises QEMU. QEMU resets the machine itself when the guest
   reboots. `apps/emu/src/software.rs` is the boot. AVDs from arm64 images are refused with the
@@ -343,8 +354,7 @@ EMU_QEMU=/path/to/qemu-system-x86_64 emu -avd phone   # QEMU 11.1 or newer; with
   into a boot (a SIGSEGV inside `libvulkan_lvp.so` under `RenderThread::main`, every lavapipe
   boot); SwiftShader ran without one and booted faster.
 
-When the host has KVM, use it ([#54](https://github.com/kaeawc/simee/issues/54)): the guest runs
-natively there, and software mode is the fallback.
+When the host has KVM, software mode runs the guest on it (above); TCG is the fallback.
 
 ## Automotive
 

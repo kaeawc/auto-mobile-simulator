@@ -1,5 +1,6 @@
-//! Software mode (#55): an x86_64 guest whose CPU runs in QEMU's TCG, on a host with no hardware
-//! virtualization, with every device but the disks served by emu.
+//! Software mode (#55): an x86_64 guest whose CPU runs in QEMU, with every device but the disks
+//! served by emu. QEMU runs the CPU on the host's KVM when `/dev/kvm` is usable ([`Accel::Kvm`]),
+//! and in its TCG otherwise.
 //!
 //! QEMU gets stock's x86 board (`pc`, virtio-blk-pci at 00:03.0–00:07.0, virtio-rng at 00:08.0)
 //! and attaches emu's devices: vsock, console, net, input and the GPU over vhost-user (QEMU's
@@ -23,6 +24,15 @@ use crate::{devices, pipe, vfio_user, vhost_user, virtio};
 /// kernel's memcpy to `rep movsb`, a byte loop under TCG (md5 51% slower, zygote 10% later;
 /// docs/benchmarks.md).
 pub const CPU: &str = "max,-erms,-fsrm,-fzrm,-fsrs,-fsrc";
+
+/// What runs the guest's CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Accel {
+    /// QEMU's multi-threaded TCG with [`CPU`]: any host.
+    Tcg,
+    /// The host's KVM with the host's CPU model: an x86_64 Linux host with a usable `/dev/kvm`.
+    Kvm,
+}
 
 /// The oldest QEMU software mode accepts: 11.1, the release it was built and measured on (vhost-user
 /// `SHMEM_MAP` for GPU blobs, vfio-user, memory slots). 6.2's multi-threaded TCG panics these
@@ -88,12 +98,17 @@ pub struct Board<'a> {
     pub served: &'a [Served],
     /// The goldfish pipe's SSDT, with graphics.
     pub acpi_table: Option<&'a Path>,
+    pub accel: Accel,
 }
 
 /// QEMU's command line (after the binary) for `board`.
 pub fn qemu_args(b: &Board) -> Vec<String> {
+    let (accel, cpu) = match b.accel {
+        Accel::Tcg => ("tcg,thread=multi", CPU),
+        Accel::Kvm => ("kvm", "host"),
+    };
     let mut a: Vec<String> =
-        ["-nodefaults", "-no-user-config", "-display", "none", "-M", "pc,memory-backend=mem", "-accel", "tcg,thread=multi", "-cpu", CPU]
+        ["-nodefaults", "-no-user-config", "-display", "none", "-M", "pc,memory-backend=mem", "-accel", accel, "-cpu", cpu]
             .map(String::from)
             .to_vec();
     a.extend(["-smp".into(), b.cpus.to_string(), "-m".into(), format!("{}M", b.ram_mb)]);
@@ -200,6 +215,7 @@ pub struct Config {
     pub console: Box<dyn Write + Send>,
     pub logcat: Option<virtio::console::Spool>,
     pub verbose: bool,
+    pub accel: Accel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,6 +303,7 @@ pub fn run(cfg: Config, stop: Arc<AtomicBool>) -> anyhow::Result<Exit> {
         dir: &cfg.dir,
         served: &served,
         acpi_table: acpi_table.as_deref(),
+        accel: cfg.accel,
     });
     if cfg.verbose {
         eprintln!("emu: {} {}", cfg.qemu.display(), args.join(" "));
@@ -529,6 +546,7 @@ mod tests {
             dir: Path::new("/r"),
             served: &[],
             acpi_table: None,
+            accel: Accel::Tcg,
         });
         let line = joined(&args);
         // Stock's slots: system 3, cache 4, userdata 5, metadata 6, vendor 7, rng 8.
@@ -564,6 +582,7 @@ mod tests {
             dir: Path::new("/r"),
             served: &served,
             acpi_table: Some(Path::new("/r/goldfish-pipe.aml")),
+            accel: Accel::Kvm,
         }));
         assert!(line.contains("-chardev socket,id=vsock,path=/r/vsock.sock -device vhost-user-vsock-pci,chardev=vsock"));
         assert!(line.contains(
@@ -572,6 +591,9 @@ mod tests {
         assert!(line.contains(r#""path":"/r/goldfish-pipe.sock""#) && line.contains(r#""addr":"1e""#));
         assert!(line.contains("-acpitable file=/r/goldfish-pipe.aml -global i440FX-pcihost.pci-hole64-size=64G"));
         assert!(line.contains("cache=writeback"), "-disk-cache fsync honours guest flushes");
+        // KVM runs the host's CPU model: the fast-string features only cost under TCG.
+        assert!(line.contains("-accel kvm -cpu host -smp 2 -m 1024M"), "{line}");
+        assert!(line.contains("-M pc,memory-backend=mem"), "KVM keeps the shared RAM backend");
     }
 
     #[test]
