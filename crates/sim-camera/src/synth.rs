@@ -48,6 +48,7 @@ pub fn open(source: &SourceSpec) -> Result<Box<dyn Source>> {
             )));
         }
         SourceSpec::Webcam(_) => return Err(Error::Invalid("a webcam is not a synthetic source".into())),
+        SourceSpec::Device(_) => return Err(Error::Invalid("a device's screen is not a synthetic source".into())),
     })
 }
 

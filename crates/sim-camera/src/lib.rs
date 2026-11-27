@@ -12,6 +12,8 @@
 //!   (YUYV and Motion JPEG to BGRA) on Linux.
 //! - [`hotplug`]: [`Hub::events`] streams cameras added and removed (host notifications, debounced)
 //!   and captures whose source went missing.
+//! - [`device`]: another simee device's live screen as a camera (`device:<udid or name>`,
+//!   optionally cropped), paced by that device's frames.
 //! - [`ios_feed`] serves one iOS simulator's linked source to the capture shim injected into its
 //!   apps (`shims/ios-camera`): BGRA frames with their size and number over a Unix socket.
 //! - [`tcc`] reads the host camera permission (never prompting) and turns a missing grant into an
@@ -26,6 +28,7 @@ mod avf;
 pub mod catalog;
 #[cfg(any(target_os = "linux", test))]
 mod convert;
+pub mod device;
 pub mod draw;
 mod error;
 pub mod frame;
@@ -45,6 +48,7 @@ pub mod tcc;
 mod v4l2;
 
 pub use catalog::{CameraKind, Change, Format, HostCamera, host_cameras};
+pub use device::{DeviceSpec, Region};
 pub use error::{Error, Result};
 pub use frame::{CameraFrame, FrameSpec, Tick};
 pub use hotplug::{Event, HostHotPlug, HotPlug, Signals};

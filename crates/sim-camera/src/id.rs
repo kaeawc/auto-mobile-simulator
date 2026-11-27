@@ -1,11 +1,12 @@
 //! Source ids: `webcam:<id or part of the name>`, `pattern:testcard`, `qr:<text>`, `text:<text>`,
-//! `image:<path>`, `video:<path>`, `solid:<colour>`. A string with no known prefix and no `:` is a
+//! `image:<path>`, `video:<path>`, `solid:<colour>`, `device:<udid or name>[:x,y,w,h]`. A string with no known prefix and no `:` is a
 //! webcam name, so `obs` finds "OBS Virtual Camera".
 
 use std::fmt;
 use std::path::PathBuf;
 
 use crate::catalog::HostCamera;
+use crate::device::DeviceSpec;
 use crate::draw::Colour;
 use crate::error::{Error, Result};
 
@@ -39,9 +40,11 @@ pub enum SourceSpec {
     /// The colour as written, so the id round-trips; parsed when the source opens (and checked
     /// when the id is parsed).
     Solid(String),
+    /// Another device's screen, optionally cropped ([`crate::device`]).
+    Device(DeviceSpec),
 }
 
-const KINDS: &[&str] = &["webcam", "pattern", "qr", "text", "image", "video", "solid"];
+const KINDS: &[&str] = &["webcam", "pattern", "qr", "text", "image", "video", "solid", "device"];
 
 impl SourceSpec {
     pub fn parse(id: &str) -> Result<SourceSpec> {
@@ -88,6 +91,7 @@ impl SourceSpec {
                 Colour::parse(rest)?;
                 SourceSpec::Solid(rest.to_string())
             }
+            "device" => SourceSpec::Device(DeviceSpec::parse(rest)?),
             _ => {
                 return Err(Error::Invalid(format!(
                     "unknown source kind {kind:?}; use one of {} (a camera named with a colon: webcam:<name>)",
@@ -108,6 +112,7 @@ impl SourceSpec {
             SourceSpec::Image(_) => "image",
             SourceSpec::Video(_) => "video",
             SourceSpec::Solid(_) => "solid",
+            SourceSpec::Device(_) => "device",
         }
     }
 }
@@ -129,11 +134,15 @@ impl fmt::Display for SourceSpec {
             SourceSpec::Image(p) => write!(f, "image:{}", p.display()),
             SourceSpec::Video(p) => write!(f, "video:{}", p.display()),
             SourceSpec::Solid(c) => write!(f, "solid:{c}"),
+            SourceSpec::Device(d) => write!(f, "device:{d}"),
         }
     }
 }
 
 fn example(kind: &str) -> &'static str {
+    if kind == "device" {
+        return "<udid or name>";
+    }
     crate::catalog::SYNTHETIC
         .iter()
         .find(|k| k.prefix == kind)

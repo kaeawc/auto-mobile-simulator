@@ -21,6 +21,7 @@ The iOS feed (`ios_feed`, #322) serves a linked source to the simulator shim ove
 | Capture from a host camera | `AVCaptureSession` with a BGRA video data output, in the format nearest the request, scaled to each request | V4L2 streaming (4 mmap buffers), YUYV and Motion JPEG to BGRA ([details](#capture-details)) |
 | Camera permission (`tcc::status`) | `authorizationStatusForMediaType:`, never prompts | none needed (`not-required`) |
 | Synthetic sources | all but `video:` | all but `video:` |
+| Another device's screen (`device:`) | AVDs and simulators | AVDs |
 | Hot-plug (`Hub::events`) | `AVCaptureDeviceWasConnected` / `WasDisconnected`, debounced, then a fresh listing diffed against the last | inotify on `/dev` for `video*` nodes, the same way |
 
 Each host camera has a stable id: AVFoundation's `uniqueID` on macOS and the V4L2 bus info on
@@ -47,8 +48,43 @@ cargo test -p simee-camera lists_host_cameras -- --nocapture
 | `image:<path>` | a PNG or JPEG still, filling the frame (aspect kept, overflow cropped) |
 | `solid:<colour>` | one colour: a name (`red`, `grey`, `orange`, …) or hex (`#336699`, `#369`) |
 | `video:<path>` | not yet: returns `Unsupported` until the VideoToolbox decoder is wired up |
+| `device:<udid or name>[:x,y,w,h]` | another simee device's live screen, optionally cropped to a region in that device's pixels: an AVD name, or a simulator's UDID or name (macOS). [Below](#another-devices-screen). |
 
-Everything after the first `:` belongs to the source, so `qr:https://example.com/a:b` works.
+Everything after the first `:` belongs to the source, so `qr:https://example.com/a:b` works. In a
+`device:` id, a last `:x,y,w,h` (four numbers) is the region; any other `:` is part of the name.
+
+### Another device's screen
+
+`device:<A>` makes device A's screen another device's camera feed, so B's app can scan a QR code
+or a document that A shows (pairing and login flows, two-device tests). `crates/sim-camera/src/device.rs`.
+
+- **Frames:** an Android device's through emu's display socket and shared frame ring at full size
+  (one `pread` per device frame, as the desktop window reads them); a simulator's through its
+  framebuffer `IOSurface`'s frame callback, copied out once when the surface's seed says it
+  changed. Each subscriber size is then drawn in one pass: the region cropped, scaled to fill the
+  size (aspect kept, overflow cropped from both sides, nearest neighbour), swizzled to BGRA.
+- **Pacing follows A:** a capture tick takes the frame A presented since the last tick, waiting up
+  to one tick for it, so B gets A's frames as they come up to its own rate; while A's screen is
+  still, its last frame repeats at B's rate (shared, not redrawn).
+- **Region:** `x,y,w,h` in A's own screen pixels (what `simee screenshot` gives); a region past
+  the screen's edge is clamped to it, one outside it fails.
+- **Lookup:** an AVD of that name first (the AVD home `emu` and `simee` use), else a simulator by
+  UDID or name. Only the API refuses a self-link; emu's console `camera link` doesn't check.
+- **Errors:** a device's camera linked to its own screen is refused (`camera_link` compares the
+  source with the target's UDID or AVD name and its name, ignoring case: a feedback loop). A
+  source device that isn't running (no display socket) or isn't booted fails the open with
+  `Missing`; one with no AVD and no simulator of that name is `Invalid`; a simulator source on
+  Linux is `Unsupported`. No first frame within 5 s is a capture error. A source device that shuts
+  down mid-capture (its display socket closes; the simulator leaves the booted state) ends the
+  capture with `Missing`, reported as `SourceMissing`.
+- **Who captures:** on an Android target, emu opens the source in its own process (linking it, as
+  any source); on an iOS target, the simee server does.
+
+```bash
+simee open-url <A> https://example.com/qr                  # iOS; on Android: adb -s <serial> shell am start -a android.intent.action.VIEW -d <url>
+simee camera link <B> --back device:<A>                    # Android: live through emu's console; iOS: both cameras
+simee camera link <B> --back device:<A>:0,600,1080,1080    # just the code
+```
 
 ## Frames and capture
 
@@ -339,6 +375,9 @@ Tracked in #335:
   the tests never ask for. The live macOS check of the nearest format and of hot-plug, and
   confirming that the device notifications arrive without a main run loop, are still to do.
 - NV12 frames and IOSurface-backed output: frames are BGRA bytes.
+- `device:`: the optional `:warp` (a mild perspective and noise, like a camera pointed at a phone)
+  isn't done. Not yet run on devices: the checks (a QR code on A, B's back camera linked to
+  `device:<A>`, B's scanner fixture decodes it, Android to Android and iOS to iOS) are to do.
 
 Camera links (#323):
 

@@ -1,5 +1,6 @@
 //! The `Source` trait every camera source implements, and the opener that turns a source id into
-//! one: synthetic kinds directly, webcams after resolving the id and checking the permission.
+//! one: synthetic kinds directly, another device's screen through its reader, webcams after
+//! resolving the id and checking the permission.
 
 use std::sync::Arc;
 
@@ -41,7 +42,8 @@ pub trait Opener: Send + Sync {
 
 type CameraList = dyn Fn() -> Result<Vec<HostCamera>> + Send + Sync;
 
-/// The opener for real use: synthetic sources, and the host's cameras behind the permission check.
+/// The opener for real use: synthetic sources, other devices' screens, and the host's cameras
+/// behind the permission check.
 pub struct HostOpener {
     authorizer: Arc<dyn Authorizer>,
     cameras: Box<CameraList>,
@@ -76,7 +78,12 @@ impl Opener for HostOpener {
     }
 
     fn open(&self, source: &SourceSpec, spec: FrameSpec) -> Result<Box<dyn Source>> {
-        let SourceSpec::Webcam(query) = source else { return synth::open(source) };
+        let query = match source {
+            SourceSpec::Webcam(query) => query,
+            // A device's screen needs no camera permission.
+            SourceSpec::Device(device) => return crate::device::open(device),
+            other => return synth::open(other),
+        };
         // The permission first: a capture without it would deliver black frames, or none.
         tcc::require(&*self.authorizer)?;
         let cameras = (self.cameras)()?;

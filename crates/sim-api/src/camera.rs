@@ -256,9 +256,10 @@ struct Resolved {
 }
 
 /// Resolves `source` to what `camera_link` saves: a host camera found by id, name, index or part
-/// of its name (and the permission to capture it checked), a synthetic source checked, `none`
-/// (camera off), or `emulated` (the test card, as the stock emulator says).
-fn resolve_source(host: &dyn Host, source: &str) -> Result<Resolved, String> {
+/// of its name (and the permission to capture it checked), a synthetic source checked, another
+/// device's screen (never the `target` device's own, which goes by those names), `none` (camera
+/// off), or `emulated` (the test card, as the stock emulator says).
+fn resolve_source(host: &dyn Host, source: &str, target: &[&str]) -> Result<Resolved, String> {
     let source = source.trim();
     if source.contains(['\n', '\r']) {
         return Err("a source id is one line".into());
@@ -279,6 +280,7 @@ fn resolve_source(host: &dyn Host, source: &str) -> Result<Resolved, String> {
         _ => {}
     }
     let spec = SourceSpec::parse(source).map_err(|e| e.to_string())?;
+    sim_camera::device::refuse_feedback(&spec, target).map_err(|e| e.to_string())?;
     match &spec {
         SourceSpec::Video(_) => {
             Err("video: sources aren't supported yet (they need the VideoToolbox decoder, #335); use image:<path> for a still".into())
@@ -355,7 +357,7 @@ fn simee_or_off(d: &Device) -> Result<bool, String> {
 
 /// `camera_link`: checks the source, relinks a running device live, then saves the link.
 fn link(host: &dyn Host, d: &Device, facings: &[&str], source: &str) -> Result<Value, String> {
-    let resolved = resolve_source(host, source)?;
+    let resolved = resolve_source(host, source, &[&d.info.udid, &d.info.name])?;
     let (dir, links) = saved(d)?;
     let running = simee_or_off(d)?;
     let mut note = None;
@@ -994,7 +996,7 @@ fn ios_link(
     let t = ios.target(query)?;
     let lock = env.feeds.device(&t.udid);
     let _one_at_a_time = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let resolved = resolve_source(host, source)?;
+    let resolved = resolve_source(host, source, &[&t.udid, &t.name])?;
     let on = resolved.id != "none";
     if on {
         (env.shim)()?;
@@ -1386,6 +1388,24 @@ mod tests {
         assert_eq!(r["now"], json!([{"facing": "front", "source": "emulated"}]));
         assert_eq!(r["links"].as_array().map(Vec::len), Some(1), "only the console-linked back camera: {}", r["links"]);
         assert_eq!(r["links"][0]["facing"], "back");
+    }
+
+    #[test]
+    fn a_device_camera_links_another_devices_screen_but_never_its_own() {
+        let f = Fixture::new("device-source");
+        let emulator = f.running();
+        let mut s = f.session();
+        for source in ["device:phone", "device:PHONE:0,0,540,960"] {
+            let err = run(&mut s, "camera_link", json!({"device": "phone", "facing": "back", "source": source})).expect_err(source);
+            assert!(err.contains("feedback loop"), "{source}: {err}");
+        }
+        assert_eq!(f.saved(), "");
+        assert!(emulator.console.lock().expect("console").iter().all(|c| !c.starts_with("camera link")), "nothing reached the console");
+        // Another device's screen, cropped: linked live (emu opens it) and saved as written.
+        let r = run(&mut s, "camera_link", json!({"device": "phone", "facing": "back", "source": "device:tablet:0,0,540,960"}))
+            .expect("another device");
+        assert_eq!(r["applied"], "live");
+        assert_eq!(f.saved(), "back=device:tablet:0,0,540,960\n");
     }
 
     #[test]

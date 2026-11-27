@@ -1,6 +1,6 @@
 [package]
 name = "simee-camera"
-description = "Host camera sources for simulator and emulator devices: webcams, virtual cameras, files and synthetic patterns."
+description = "Host camera sources for simulator and emulator devices: webcams, virtual cameras, files, synthetic patterns and other devices' screens."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -24,13 +24,19 @@ sim-core.workspace = true
 thiserror.workspace = true
 zune-jpeg.workspace = true
 
+# `device:` sources: an Android device's screen through emu's display socket and frame ring.
+[target.'cfg(unix)'.dependencies]
+sim-android.workspace = true
+
 # Host camera enumeration and capture: AVFoundation through the Objective-C runtime (loaded on
 # first use, so a binary that links this crate doesn't load AVFoundation until it asks for a camera).
+# `device:` sources: a simulator's screen through the simulator service (also loaded on first use).
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true
 libc.workspace = true
 objc2.workspace = true
 objc2-foundation.workspace = true
+sim-coresim.workspace = true
 
 # V4L2 enumeration: `open` and `ioctl` on /dev/video*.
 [target.'cfg(target_os = "linux")'.dependencies]
