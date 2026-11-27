@@ -43,6 +43,7 @@ recoverable from what was recorded, or they need something the repository doesn'
 | [Idle host CPU, the NAT](#idle-host-cpu) | 5.9% of a core | not measured | M3 Max, 2026-11-25 | `scripts/bench/android-net.sh --mode idle` |
 | [NAT throughput](#idle-host-cpu) | 610 MB/s up, 2.1 GB/s down | not measured | M3 Max, 2026-11-25 | `scripts/bench/android-net.sh --mode throughput` |
 | [Frame pacing](#frame-pacing) | 0% / 0.25% janky | SDK emulator 5.6% / 6.2% | M3 Max, 2026-11-25 | `scripts/bench/android-frames.sh --device tablet\|phone` |
+| [Software mode on KVM, API 36 x86_64](#android-software-mode-on-kvm-githubs-x86_64-runner) | 28.8 s cold, 16.6 s warm, 2.27 GB | SDK emulator 37.3.10 30.3 s, 19.2 s, 3.00 GB | GitHub `ubuntu-latest` VM (4-vCPU Xeon 8573C), 2026-11-27 | `scripts/bench/android-boot.sh --image system-images/android-36/default/x86_64 --lcd 720x1280@320` |
 | [Software mode, CPU model](#android-software-mode-linux-without-kvm) | zygote 49.4 s | | 4-vCPU Xeon VM, 2026-11-26 | `scripts/bench/software-mode.sh --arms "tcg:…"` |
 | [Software mode, boot](#boot-to-sysboot_completed-with-emus-devices) | 168 s, 0.75 cores idle | SDK emulator `-accel off` 2302 s, 1.09 cores | 4-vCPU Xeon VM, 2026-11-26 | `scripts/bench/software-mode.sh --arms "emu stock"` |
 | [Software mode, `emu -avd`](#software-mode-through-emu--avd) | 161 s, tap 60.8 ms, screenshot 36.9 ms | SDK emulator unusable | 4-vCPU Xeon VM, 2026-11-26 | `android-frames.sh`, `api-steps.sh --android` |
@@ -270,6 +271,41 @@ need a build from before the Vulkan-only renderer (2026-11-25) as the emu arm.
 Both display at 60 Hz. The stock emulator's tablet rendered about 1350 frames over the swipes and
 emu's about 530; emu with the guest on stock's GLES driver (`EMU_GUEST_EGL=emulation`) rendered
 1254, so the count follows the guest's driver. On the phone both render about 790.
+
+## Android: software mode on KVM (GitHub's x86_64 runner)
+
+Software mode with QEMU on the host's KVM (`-accel kvm -cpu host`, chosen automatically when
+`/dev/kvm` is usable) against the SDK emulator 37.3.10 on the same KVM, on a GitHub-hosted
+`ubuntu-latest` runner: a VM with 4 vCPUs of a Xeon Platinum 8573C and 15.6 GB, Ubuntu 26.04
+(kernel 7.0, Azure), 2026-11-27, simee 4605415. API 36 `default` x86_64 image, 720x1280@320, 4
+vCPUs and 2 GB per AVD, a new AVD each round (`-no-golden`), the arms' order alternating, medians
+of 3 rounds ([run 46070750188](https://github.com/kaeawc/simee/actions/runs/46070750188), the
+`Software mode` workflow's kvm leg; a manual or main run repeats it):
+
+```bash
+scripts/bench/android-boot.sh --image system-images/android-36/default/x86_64 --lcd 720x1280@320
+```
+
+| Measure | emu | SDK emulator 37.3.10 |
+| --- | --- | --- |
+| cold: launch until sys.boot_completed, s | **28.8** (28.8, 29.3, 28.3) | 30.3 (30.7, 30.3, 28.9) |
+| cold: launch until adb lists the device, s | **16.7** (16.7, 17.1, 16.7) | 19.2 (19.9, 19.2, 18.7) |
+| cold: peak RSS of the process tree, MB | **2270** | 2999 |
+| warm: launch until sys.boot_completed, s | **16.6** (16.6, 16.4, 16.7) | 19.2 (19.5, 19.2, 19.1) |
+| warm: launch until adb lists the device, s | **6.8** (6.1, 6.8, 7.1) | 10.8 (10.8, 10.8, 10.7) |
+| warm: peak RSS of the process tree, MB | **1858** | 1954 |
+| warm: guest 4x md5 of 64 MiB, s | 0.35 | 0.52 |
+| warm: guest 100k shell loop, s | 0.74 | 0.77 |
+| warm: adb shell echo, s | 0.04 | 0.04 |
+
+Three of the twelve boots (emu cold in round 3, both warm boots in round 2) saw a 1-minute load
+just above the 4 CPUs at a sample (`starved=yes`); each is inside the other rounds' spread, and
+without them the medians are emu 29.1 s cold and 16.7 s warm, the SDK emulator 30.3 s and 19.3 s.
+Both use the renderer from the same emulator package. emu uses it on SwiftShader Vulkan. The SDK emulator's
+default for `-no-window` on a host with no GPU is lavapipe Vulkan with SwANGLE GLES (`emuglConfig_init:
+vulkan_mode_selected:lavapipe gles_mode_selected:swangle` in its log). `cold` includes each one
+formatting its own userdata. The runner is a shared cloud
+VM, so absolute times move between runs; the comparison is within one run.
 
 ## Android: software mode (Linux without KVM)
 

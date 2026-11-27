@@ -1,5 +1,6 @@
-//! Software mode (#55): an x86_64 guest whose CPU runs in QEMU's TCG, on a host with no hardware
-//! virtualization, with every device but the disks served by emu.
+//! Software mode (#55): an x86_64 guest whose CPU runs in QEMU, with every device but the disks
+//! served by emu. QEMU runs the CPU on the host's KVM when `/dev/kvm` is usable ([`Accel::Kvm`]),
+//! and in its TCG otherwise.
 //!
 //! QEMU gets stock's x86 board (`pc`, virtio-blk-pci at 00:03.0–00:07.0, virtio-rng at 00:08.0)
 //! and attaches emu's devices: vsock, console, net, input and the GPU over vhost-user (QEMU's
@@ -23,6 +24,15 @@ use crate::{devices, pipe, vfio_user, vhost_user, virtio};
 /// kernel's memcpy to `rep movsb`, a byte loop under TCG (md5 51% slower, zygote 10% later;
 /// docs/benchmarks.md).
 pub const CPU: &str = "max,-erms,-fsrm,-fzrm,-fsrs,-fsrc";
+
+/// What runs the guest's CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Accel {
+    /// QEMU's multi-threaded TCG with [`CPU`]: any host.
+    Tcg,
+    /// The host's KVM with the host's CPU model: an x86_64 Linux host with a usable `/dev/kvm`.
+    Kvm,
+}
 
 /// The oldest QEMU software mode accepts: 11.1, the release it was built and measured on (vhost-user
 /// `SHMEM_MAP` for GPU blobs, vfio-user, memory slots). 6.2's multi-threaded TCG panics these
@@ -88,12 +98,17 @@ pub struct Board<'a> {
     pub served: &'a [Served],
     /// The goldfish pipe's SSDT, with graphics.
     pub acpi_table: Option<&'a Path>,
+    pub accel: Accel,
 }
 
 /// QEMU's command line (after the binary) for `board`.
 pub fn qemu_args(b: &Board) -> Vec<String> {
+    let (accel, cpu) = match b.accel {
+        Accel::Tcg => ("tcg,thread=multi", CPU),
+        Accel::Kvm => ("kvm", "host"),
+    };
     let mut a: Vec<String> =
-        ["-nodefaults", "-no-user-config", "-display", "none", "-M", "pc,memory-backend=mem", "-accel", "tcg,thread=multi", "-cpu", CPU]
+        ["-nodefaults", "-no-user-config", "-display", "none", "-M", "pc,memory-backend=mem", "-accel", accel, "-cpu", cpu]
             .map(String::from)
             .to_vec();
     a.extend(["-smp".into(), b.cpus.to_string(), "-m".into(), format!("{}M", b.ram_mb)]);
@@ -200,6 +215,10 @@ pub struct Config {
     pub console: Box<dyn Write + Send>,
     pub logcat: Option<virtio::console::Spool>,
     pub verbose: bool,
+    pub accel: Accel,
+    /// `accel` was chosen automatically: a QEMU that fails early on KVM is started again on TCG
+    /// ([`retry_on_tcg`]).
+    pub accel_fallback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,41 +295,67 @@ pub fn run(cfg: Config, stop: Arc<AtomicBool>) -> anyhow::Result<Exit> {
         served.push(Served::Generic(name, id, queues, config));
     }
 
-    let args = qemu_args(&Board {
-        cpus: cfg.cpus,
-        ram_mb: cfg.ram_bytes >> 20,
-        kernel: &cfg.kernel,
-        initrd: &initrd,
-        cmdline: &cfg.cmdline,
-        disks: &cfg.disks,
-        disk_fsync: cfg.disk_fsync,
-        dir: &cfg.dir,
-        served: &served,
-        acpi_table: acpi_table.as_deref(),
-    });
-    if cfg.verbose {
-        eprintln!("emu: {} {}", cfg.qemu.display(), args.join(" "));
+    // Shared by every QEMU this run starts (a TCG retry after KVM fails).
+    let console = Arc::new(Mutex::new(cfg.console));
+    let mut accel = cfg.accel;
+    loop {
+        let args = qemu_args(&Board {
+            cpus: cfg.cpus,
+            ram_mb: cfg.ram_bytes >> 20,
+            kernel: &cfg.kernel,
+            initrd: &initrd,
+            cmdline: &cfg.cmdline,
+            disks: &cfg.disks,
+            disk_fsync: cfg.disk_fsync,
+            dir: &cfg.dir,
+            served: &served,
+            acpi_table: acpi_table.as_deref(),
+            accel,
+        });
+        if cfg.verbose {
+            eprintln!("emu: {} {}", cfg.qemu.display(), args.join(" "));
+        }
+        let started = Instant::now();
+        let mut child = Command::new(&cfg.qemu)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("starting {}", cfg.qemu.display()))?;
+        pipe::adb::AdbService::announce_port(cfg.adb.port);
+        let console_out = copy_console(child.stdout.take(), console.clone());
+        let last_err = forward_stderr(child.stderr.take(), cfg.verbose);
+        let exit = supervise(&mut child, &stop);
+        let _ = console_out.map(std::thread::JoinHandle::join);
+        let last = last_err.and_then(|t| t.join().ok()).flatten();
+        let exit = match exit? {
+            Some(status) if status.success() => Exit::PowerOff,
+            Some(_) if stop.load(Ordering::SeqCst) => Exit::Stopped,
+            None => Exit::Stopped,
+            Some(status) => Exit::Failed(format!("QEMU {status}{}", last.map(|l| format!(": {l}")).unwrap_or_default())),
+        };
+        if retry_on_tcg(cfg.accel_fallback, accel, &exit, started.elapsed()) {
+            if let Exit::Failed(why) = &exit {
+                eprintln!("emu: {why} on KVM; starting again on TCG (-accel off skips KVM)");
+            }
+            accel = Accel::Tcg;
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+        return Ok(exit);
     }
-    let mut child = Command::new(&cfg.qemu)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("starting {}", cfg.qemu.display()))?;
-    pipe::adb::AdbService::announce_port(cfg.adb.port);
-    let console_out = copy_console(child.stdout.take(), cfg.console);
-    let last_err = forward_stderr(child.stderr.take(), cfg.verbose);
-    let exit = supervise(&mut child, &stop);
-    let _ = console_out.map(std::thread::JoinHandle::join);
-    let last = last_err.and_then(|t| t.join().ok()).flatten();
-    let _ = std::fs::remove_dir_all(&cfg.dir);
-    Ok(match exit? {
-        Some(status) if status.success() => Exit::PowerOff,
-        Some(_) if stop.load(Ordering::SeqCst) => Exit::Stopped,
-        None => Exit::Stopped,
-        Some(status) => Exit::Failed(format!("QEMU {status}{}", last.map(|l| format!(": {l}")).unwrap_or_default())),
-    })
+}
+
+/// How long QEMU may have run on KVM and still be retried on TCG when it fails: failing to set up
+/// KVM (another hypervisor holding VT-x, a QEMU built without KVM) ends it before the guest runs.
+pub const KVM_EARLY_FAILURE: Duration = Duration::from_secs(10);
+
+/// Whether a QEMU that ended with `exit` after `ran` on `accel` is started again on TCG: only
+/// when the accelerator was chosen automatically (`fallback`), it was KVM, and QEMU failed within
+/// [`KVM_EARLY_FAILURE`]. A guest that ran and then failed is not retried, nor is a stop.
+pub fn retry_on_tcg(fallback: bool, accel: Accel, exit: &Exit, ran: Duration) -> bool {
+    fallback && accel == Accel::Kvm && matches!(exit, Exit::Failed(_)) && ran < KVM_EARLY_FAILURE
 }
 
 /// Waits for QEMU; once `stop` is set, asks it to quit (SIGTERM, which QEMU handles by shutting
@@ -339,13 +384,14 @@ fn supervise(child: &mut Child, stop: &AtomicBool) -> std::io::Result<Option<std
     }
 }
 
-fn copy_console(from: Option<std::process::ChildStdout>, mut to: Box<dyn Write + Send>) -> Option<std::thread::JoinHandle<()>> {
+fn copy_console(from: Option<std::process::ChildStdout>, to: Arc<Mutex<Box<dyn Write + Send>>>) -> Option<std::thread::JoinHandle<()>> {
     let mut from = from?;
     std::thread::Builder::new()
         .name("qemu-console".into())
         .spawn(move || {
             let mut buf = [0u8; 4096];
             while let Ok(n) = from.read(&mut buf) {
+                let Ok(mut to) = to.lock() else { break };
                 if n == 0 || to.write_all(&buf[..n]).is_err() {
                     break;
                 }
@@ -529,6 +575,7 @@ mod tests {
             dir: Path::new("/r"),
             served: &[],
             acpi_table: None,
+            accel: Accel::Tcg,
         });
         let line = joined(&args);
         // Stock's slots: system 3, cache 4, userdata 5, metadata 6, vendor 7, rng 8.
@@ -564,6 +611,7 @@ mod tests {
             dir: Path::new("/r"),
             served: &served,
             acpi_table: Some(Path::new("/r/goldfish-pipe.aml")),
+            accel: Accel::Kvm,
         }));
         assert!(line.contains("-chardev socket,id=vsock,path=/r/vsock.sock -device vhost-user-vsock-pci,chardev=vsock"));
         assert!(line.contains(
@@ -572,6 +620,9 @@ mod tests {
         assert!(line.contains(r#""path":"/r/goldfish-pipe.sock""#) && line.contains(r#""addr":"1e""#));
         assert!(line.contains("-acpitable file=/r/goldfish-pipe.aml -global i440FX-pcihost.pci-hole64-size=64G"));
         assert!(line.contains("cache=writeback"), "-disk-cache fsync honours guest flushes");
+        // KVM runs the host's CPU model: the fast-string features only cost under TCG.
+        assert!(line.contains("-accel kvm -cpu host -smp 2 -m 1024M"), "{line}");
+        assert!(line.contains("-M pc,memory-backend=mem"), "KVM keeps the shared RAM backend");
     }
 
     #[test]
@@ -589,6 +640,18 @@ mod tests {
         assert_eq!(find_qemu(Some("/opt/q"), &path), Some(PathBuf::from("/opt/q")), "EMU_QEMU wins");
         assert_eq!(find_qemu(None, "/nonexistent"), None);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn an_early_kvm_failure_in_auto_mode_is_retried_on_tcg() {
+        let failed = Exit::Failed("QEMU exit status: 1: invalid accelerator kvm".into());
+        let early = Duration::from_millis(300);
+        assert!(retry_on_tcg(true, Accel::Kvm, &failed, early));
+        assert!(!retry_on_tcg(false, Accel::Kvm, &failed, early), "-accel on: KVM or fail");
+        assert!(!retry_on_tcg(true, Accel::Tcg, &failed, early), "TCG failing has nowhere to fall back to");
+        assert!(!retry_on_tcg(true, Accel::Kvm, &failed, KVM_EARLY_FAILURE), "the guest ran: a real failure");
+        assert!(!retry_on_tcg(true, Accel::Kvm, &Exit::Stopped, early));
+        assert!(!retry_on_tcg(true, Accel::Kvm, &Exit::PowerOff, early));
     }
 
     #[test]
