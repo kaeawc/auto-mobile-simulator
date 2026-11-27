@@ -300,6 +300,10 @@ fn bind(path: &Path) -> std::io::Result<UnixListener> {
     // Fix this server's identity now, before its executable can be rebuilt under it.
     identity();
     SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Start the host sampler now, off this thread, so its history exists at the first `host` call.
+    let _ = std::thread::Builder::new().name("simee-host-start".into()).spawn(|| {
+        sim_host::global();
+    });
     if path.exists() && UnixStream::connect(path).is_err() {
         std::fs::remove_file(path)?;
     }

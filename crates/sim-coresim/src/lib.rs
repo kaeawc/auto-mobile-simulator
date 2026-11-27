@@ -13,6 +13,7 @@ mod carplay;
 mod display;
 mod error;
 mod hid;
+pub mod host;
 pub mod procs;
 mod rt;
 mod service;

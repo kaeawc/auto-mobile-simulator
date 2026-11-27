@@ -25,6 +25,7 @@ sim-coresim.workspace = true
 sim-debug.workspace = true
 sim-netshape.workspace = true
 sim-audio.workspace = true
+sim-host.workspace = true
 
 [dev-dependencies]
 emu-avd.workspace = true

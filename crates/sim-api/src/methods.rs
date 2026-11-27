@@ -19,6 +19,14 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "This process's build, executable and environment (hashed): the CLI forwards a command to a server only when they match its own",
     ),
     (
+        "host",
+        "",
+        "Host health, sampled without forking: load averages and CPU count, memory pressure (macOS: the kernel's level; Linux: available \
+         memory and PSI), swap, free disk on the data volume, thermal state (macOS: the system thermal state; Linux: thermal zones, \
+         frequency caps, throttle events), power (source, battery, Low Power Mode or platform profile), 1/5/15-minute averages from a \
+         1 s ring (with time spent in each thermal state), the load trend, and an admit/hold/backoff verdict with every reason",
+    ),
+    (
         "form_factors",
         "platform?, form_factor?",
         "Every form factor on every platform: sub-platform, inputs and reference profile, or why it's unsupported",
@@ -376,6 +384,7 @@ impl Session {
 const ALL_PLATFORMS: &[&str] = &[
     "help",
     "identity",
+    "host",
     "form_factors",
     "devices",
     "runtimes",
@@ -487,6 +496,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             })
             .collect()),
         "identity" => Ok(crate::identity().clone()),
+        "host" => serde_json::to_value(sim_host::global().report(sim_host::Thresholds::default())).map_err(|e| e.to_string()),
         "form_factors" => {
             let (platform, form_factor) = (opt_platform(p)?, opt_form_factor(p)?);
             Ok(matrix()
@@ -606,6 +616,21 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_returns_the_snapshot_averages_and_verdict() {
+        let h = call(&mut Session::default(), "host", &Value::Null).expect("host");
+        assert!(h["snapshot"]["cpus"].as_u64().is_some_and(|c| c >= 1));
+        assert!(h["snapshot"]["load"]["one"].as_f64().is_some_and(|l| l >= 0.0));
+        assert!(h["snapshot"]["disk"]["free_bytes"].as_u64().is_some_and(|b| b > 0));
+        assert!(h["snapshot"]["memory"]["level"].is_string() && h["snapshot"]["power"]["summary"].is_string());
+        assert!(h["snapshot"]["thermal"]["available"].is_boolean());
+        assert_eq!(h["averages"].as_array().map(Vec::len), Some(3));
+        assert!(matches!(h["verdict"]["verdict"].as_str(), Some("admit" | "hold" | "backoff")));
+        assert!(h["reasons"].as_array().is_some_and(|r| !r.is_empty()));
+        let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
+        assert!(help.as_array().is_some_and(|a| a.iter().any(|m| m["method"] == "host" && m["platforms"] == json!(["android", "ios"]))));
+    }
 
     #[test]
     fn help_labels_every_method_with_platforms() {

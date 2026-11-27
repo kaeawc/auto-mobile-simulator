@@ -35,6 +35,7 @@ on:
       - "crates/sim-core/**"
       - "crates/sim-coresim/**"
       - "crates/sim-debug/**"
+      - "crates/sim-host/**"
       - "crates/sim-mcp/**"
       - "crates/sim-netshape/**"
       - "Cargo.lock"

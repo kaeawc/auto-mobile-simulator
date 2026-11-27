@@ -16,5 +16,6 @@ simee-emu-gfxstream
 simee-emu-hvf
 simee-emu-sdk
 simee-emu-vmm
+simee-host
 simee-mcp
 simee-netshape
