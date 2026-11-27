@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use rune::{AppSpec, Cx, El, Image, ImageCache, SurfaceFit, Tx, col, el};
@@ -133,7 +135,8 @@ fn current_route() -> Route {
 
 pub struct State {
     route: Route,
-    images: Option<ImageCache>,
+    /// The images, once Rune hands the app its waker.
+    gallery: Option<Rc<Gallery>>,
     /// The frame clock, in seconds: what turns the gem.
     t: f64,
     /// Light, dark or the system's.
@@ -142,12 +145,25 @@ pub struct State {
 
 impl State {
     fn new() -> State {
-        State { route: current_route(), images: None, t: 0.0, theme: theme::load() }
+        State { route: current_route(), gallery: None, t: 0.0, theme: theme::load() }
     }
 
     #[cfg(test)]
     fn at(route: Route) -> State {
-        State { route, images: None, t: 0.0, theme: Theme::System }
+        State { route, gallery: None, t: 0.0, theme: Theme::System }
+    }
+
+    /// [`State::at`] with images read from the repository's `docs/`, as a page draws its
+    /// pictures once they load.
+    #[cfg(test)]
+    fn with_images(route: Route) -> State {
+        let cache = ImageCache::new(std::sync::Arc::new(|| {}));
+        State { gallery: Some(Rc::new(Gallery::new(cache, concat!(env!("CARGO_MANIFEST_DIR"), "/../docs")))), ..State::at(route) }
+    }
+
+    /// The pictures this page can draw, at the window's `scale`.
+    fn pictures(&self, scale: f32) -> Pictures {
+        Pictures { gallery: self.gallery.clone(), scale }
     }
 
     /// The toggle in the running head: the next theme, kept for the next page.
@@ -155,16 +171,65 @@ impl State {
         self.theme = self.theme.next();
         theme::store(self.theme);
     }
+}
 
-    /// The image `docs/{name}` the site serves at `/img/{name}`. On the web it is fetched from
-    /// the site's root, whatever page this is; exporting, it is read from the output folder
-    /// (the build runs there) and the build makes the exported `src` absolute.
-    fn image(&self, name: &str, pt: f32, scale: f32) -> Option<Image> {
-        let cache = self.images.as_ref()?;
+/// The images under `docs/` the site serves at `/img/{name}` (`content::IMAGES`).
+struct Gallery {
+    cache: ImageCache,
+    /// Where the native build reads them: `img` beside the export (the build runs in the output
+    /// folder), the repository's `docs` in tests.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    dir: &'static str,
+    /// The handles Markdown images draw from. A handle no element holds lets its image go, and
+    /// an image that hasn't loaded yet shows its alt text, which holds nothing: without these,
+    /// each frame asked for it again and it never loaded.
+    held: RefCell<Vec<(&'static str, Image)>>,
+}
+
+impl Gallery {
+    fn new(cache: ImageCache, dir: &'static str) -> Gallery {
+        Gallery { cache, dir, held: RefCell::new(Vec::new()) }
+    }
+}
+
+/// What draws [`Gallery`]'s images: a figure ([`shot`]) or a Markdown image, which
+/// [`content::site_url`] points at `/img/{name}`. A cheap handle: Markdown keeps one to ask for
+/// each image it shows.
+#[derive(Clone)]
+pub(crate) struct Pictures {
+    gallery: Option<Rc<Gallery>>,
+    scale: f32,
+}
+
+impl Pictures {
+    /// The image `docs/{name}`, drawn `pt` wide. On the web it is fetched from the site's root,
+    /// whatever page this is; exporting, it is read from the output folder (the build runs
+    /// there) and the build makes the exported `src` absolute.
+    pub(crate) fn named(&self, name: &str, pt: f32) -> Option<Image> {
+        let g = self.gallery.as_ref()?;
         #[cfg(target_arch = "wasm32")]
-        return Some(cache.url(&format!("/img/{name}"), pt, scale));
+        return Some(g.cache.url(&format!("/img/{name}"), pt, self.scale));
         #[cfg(not(target_arch = "wasm32"))]
-        return Some(cache.file(format!("img/{name}"), pt, scale));
+        return Some(g.cache.file(format!("{}/{name}", g.dir), pt, self.scale));
+    }
+
+    /// The picture for a Markdown image's source as the site resolved it (`/img/{name}`); none
+    /// for any other source, which shows its alt text. The gallery keeps it from the first ask,
+    /// so it loads while the page shows its alt text.
+    pub(crate) fn src(&self, src: &str) -> Option<Image> {
+        let name = src.strip_prefix("/img/").and_then(|n| content::IMAGES.iter().copied().find(|i| *i == n))?;
+        let g = self.gallery.as_ref()?;
+        if let Some((_, image)) = g.held.borrow().iter().find(|(n, _)| *n == name) {
+            return Some(image.clone());
+        }
+        // A PNG decodes at its own size whatever the size asked for: one handle serves every width.
+        let image = self.named(name, PAGE)?;
+        // Natively the page is exported from its first frames, before a wake would draw the
+        // picture: wait for it here (a file read and decode), so the static page carries it.
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = image.wait();
+        g.held.borrow_mut().push((name, image.clone()));
+        Some(image)
     }
 }
 
@@ -192,12 +257,23 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
 pub(crate) fn shot(s: &State, cx: &Cx<State>, name: &str, alt: &str, aspect: f32) -> El {
     let key = format!("shot-{name}");
     let shown = cx.layout_size(&key).map_or(PAGE, |sz| sz[0]);
-    let scale = cx.env().scale.max(1.0);
     let mut e = el().key(key).role("image").label(alt).w_full().aspect_ratio(aspect).border(1.0, rule_faint());
-    if let Some(img) = s.image(name, shown, scale) {
+    if let Some(img) = pictures(s, cx).named(name, shown) {
         e = e.pixels_fit(img.pixels(), SurfaceFit::Fit);
     }
     e
+}
+
+/// The pictures this page can draw, at the window's scale.
+pub(crate) fn pictures(s: &State, cx: &Cx<State>) -> Pictures {
+    s.pictures(cx.env().scale.max(1.0))
+}
+
+/// What this page's Markdown needs from the view: its pictures and the text column's width
+/// (the page's frame inside its gutters), which its tables are sized in.
+pub(crate) fn md_cx(s: &State, cx: &Cx<State>, bp: Bp) -> ui::MdCx {
+    let column = cx.layout_size("main").map_or(PAGE, |sz| sz[0] - 2.0 * bp.gutter()).clamp(1.0, PAGE);
+    ui::MdCx { pictures: pictures(s, cx), column }
 }
 
 fn view(s: &State, cx: &mut Cx<State>) -> El {
@@ -205,13 +281,14 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
     let bp = cx.layout_with("page", |r| Bp::of(r[2])).unwrap_or(Bp { at: 1000 });
     let gutter = bp.gutter();
     let framed = |e: El| e.w_full().max_w(PAGE + 2.0 * gutter).px(gutter);
+    let mc = md_cx(s, cx, bp);
     let main = match s.route {
         Route::Home => home::page(s, cx, bp),
-        Route::Benchmarks => pages::benchmarks(bp),
-        Route::Debugging => pages::debugging(bp),
-        Route::Limitations => pages::limitations(bp),
+        Route::Benchmarks => pages::benchmarks(&mc, bp),
+        Route::Debugging => pages::debugging(&mc, bp),
+        Route::Limitations => pages::limitations(&mc, bp),
         Route::Docs => docs::index(bp),
-        Route::Doc(doc) => docs::page(doc, bp),
+        Route::Doc(doc) => docs::page(doc, &mc, bp),
         Route::Devices => devices::page(bp),
         Route::Demos => demos::page(s, cx, bp),
         Route::NotFound => not_found(bp),
@@ -247,7 +324,7 @@ pub fn spec() -> AppSpec<State> {
     let title: &'static str = Box::leak(current_route().title().into_boxed_str());
     AppSpec {
         families: (SERIF, MONO),
-        setup: Some(|s, waker| s.images = Some(ImageCache::new(waker))),
+        setup: Some(|s, waker| s.gallery = Some(Rc::new(Gallery::new(ImageCache::new(waker), "img")))),
         poll: Some(poll),
         ..AppSpec::new(title, (1000.0, 900.0), State::new, view)
     }

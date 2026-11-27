@@ -7,8 +7,8 @@ use rune::{Cx, El, col, el, memo, row, text};
 use crate::content::{self, REPO};
 use crate::gem;
 use crate::tokens::*;
-use crate::ui::{caption, centered, link_text, markdown, prose, section};
-use crate::{State, angle};
+use crate::ui::{MdCx, caption, centered, link_text, markdown, prose, section};
+use crate::{State, angle, md_cx};
 
 /// The line under the title (owner's words, 2026-11-27).
 pub const SUBTITLE: &str = "Rust iOS sim and Android emu - Fast & Feature Rich";
@@ -18,7 +18,11 @@ pub const README_SECTIONS: [&str; 2] = ["Performance", "Quick start"];
 
 pub fn page(s: &State, cx: &Cx<State>, bp: Bp) -> El {
     let width = cx.layout_size("main").map_or(MEASURE, |sz| sz[0]).min(MEASURE);
-    col().key("home").w_full().child(title_block(angle(s, cx), width, bp)).child(memo("body", (bp, dark()), || body(bp)))
+    // The quoted sections have no images (a test checks): the memo rebuilds for the column's
+    // width, which sizes Table 1, not for a picture arriving.
+    let mc = md_cx(s, cx, bp);
+    let version = (bp, dark(), mc.column.to_bits());
+    col().key("home").w_full().child(title_block(angle(s, cx), width, bp)).child(memo("body", version, || body(&mc, bp)))
 }
 
 fn title_block(angle: f32, width: f32, bp: Bp) -> El {
@@ -41,7 +45,7 @@ fn title_block(angle: f32, width: f32, bp: Bp) -> El {
         )
 }
 
-fn body(bp: Bp) -> El {
+fn body(mc: &MdCx, bp: Bp) -> El {
     let performance = strip_heading(&content::readme_section(README_SECTIONS[0]));
     let quick = content::without_tables(&strip_heading(&content::readme_section(README_SECTIONS[1])));
     col()
@@ -51,9 +55,9 @@ fn body(bp: Bp) -> El {
         .child(
             section("performance", "1", "Performance", bp)
                 .child(caption("t1-cap", "Table 1", "simee against the stock tools: Android against the SDK emulator, iOS against simctl."))
-                .child(markdown("t1-md", &performance)),
+                .child(markdown("t1-md", &performance, mc)),
         )
-        .child(section("quick-start", "2", "Quick start", bp).child(markdown("qs-md", &quick)))
+        .child(section("quick-start", "2", "Quick start", bp).child(markdown("qs-md", &quick, mc)))
         .child(further(bp))
 }
 

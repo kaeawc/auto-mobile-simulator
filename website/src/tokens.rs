@@ -78,8 +78,9 @@ pub struct Bp {
 impl Bp {
     pub const STEPS: [u16; 3] = [0, 480, 760];
     /// The widths the static page is exported at (`scripts/build.sh`): every breakpoint, with
-    /// the narrowest phone for the base.
-    pub const EXPORT: &str = "360,480,760";
+    /// the narrowest phone for the base, and the page's whole frame (`PAGE` in its gutters),
+    /// where Markdown tables, sized in the column they have, reach the frame's width.
+    pub const EXPORT: &str = "360,480,760,1084";
 
     pub fn of(width: f32) -> Bp {
         let at = Self::STEPS.iter().rev().copied().find(|&s| width >= f32::from(s)).unwrap_or(0);

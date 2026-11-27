@@ -50,15 +50,16 @@ fi
 RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-zstack-size=2097152" bash "$rune/scripts/web-build.sh" simee-website "${web[@]}"
 
 cp -R public/. "$out/"
-for image in desktop.png desktop-android.png; do
-  cp "$repo/docs/$image" "$out/img/"
-done
 
 # The static pages: the native app lays each route out at every width and fills the template,
 # in the light theme (index.html's CSS inverts it for dark).
 cargo build --locked -q --bin simee-website
 bin=$site/target/debug/simee-website
 widths=$("$bin" --widths)
+# Every image a page shows (content::IMAGES), before the export, which reads them from img/.
+while IFS= read -r image; do
+  cp "$repo/docs/$image" "$out/img/"
+done < <("$bin" --images)
 page() { # page PATH TITLE DESCRIPTION FILE CANONICAL
   local path=$1 title=$2 description=$3 file=$4 canonical=$5
   mkdir -p "$(dirname "$file")"

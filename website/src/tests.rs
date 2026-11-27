@@ -1,3 +1,4 @@
+use pulldown_cmark::{Event, Options, Parser, Tag};
 use rune::{Env, Runtime};
 
 use crate::content::{self, DOCS, Doc, block_keys, outline, resolve_links, site_url, slug};
@@ -153,4 +154,153 @@ fn quick_start_drops_its_table() {
     let quick = content::without_tables(&content::readme_section("Quick start"));
     assert!(!quick.lines().any(|l| l.starts_with('|')), "{quick}");
     assert!(quick.contains("simee doctor"), "{quick}");
+}
+
+/// Every page's Markdown, as (where, Markdown): the published docs, the README sections the
+/// pages quote and the debugging page's section of its doc.
+fn page_markdown() -> Vec<(String, String)> {
+    let mut all: Vec<(String, String)> = DOCS.iter().map(|d| (d.href(), d.body())).collect();
+    for heading in crate::home::README_SECTIONS.into_iter().chain(["Compared with the stock tools", "Not yet"]) {
+        all.push((format!("README ## {heading}"), content::readme_section(heading)));
+    }
+    all.push(("/debugging/".to_owned(), content::doc_section("debugging", "iOS debug surface")));
+    all
+}
+
+#[test]
+fn every_image_a_page_shows_is_served() {
+    // The desktop doc's `desktop.png` showed its alt text: the site resolved it but the Markdown
+    // had no picture for it. Every image is one the build copies to /img/ and the app draws.
+    let docs = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs");
+    for name in content::IMAGES {
+        assert!(std::path::Path::new(&format!("{docs}/{name}")).is_file(), "docs/{name} is missing");
+    }
+    let mut seen = 0;
+    for (page, md) in page_markdown() {
+        for event in Parser::new_ext(&md, Options::ENABLE_TABLES) {
+            match event {
+                Event::Start(Tag::Image { dest_url, .. }) => {
+                    let name = dest_url.strip_prefix("/img/").unwrap_or_else(|| panic!("{page}: image {dest_url} isn't served from /img/"));
+                    assert!(content::IMAGES.contains(&name), "{page}: {name} isn't in content::IMAGES, so the build doesn't copy it");
+                    seen += 1;
+                }
+                Event::Html(h) | Event::InlineHtml(h) if h.contains("<img") => panic!("{page}: an HTML <img> shows as text: {h}"),
+                _ => {}
+            }
+        }
+    }
+    assert!(seen > 0, "no page shows an image: the check found nothing to check");
+    // The home page memoizes its quoted sections without the pictures' state: they have none.
+    for heading in crate::home::README_SECTIONS {
+        assert!(!content::readme_section(heading).contains("!["), "README ## {heading} has an image");
+    }
+}
+
+#[test]
+fn a_docs_image_draws_its_picture() {
+    let doc = Doc::find("desktop").unwrap();
+    let alt = "The desktop window with iOS and Android devices";
+    assert!(doc.source.contains(&format!("![{alt}](desktop.png)")), "docs/desktop.md's image changed: update this test");
+    let mut rt = Runtime::new(State::with_images(Route::Doc(doc)), view, (760.0, 900.0), Env::new(true, 2.0));
+    let shows_alt_text = |rt: &Runtime<State>| rt.elements().iter().any(|e| !e.exiting && e.text.as_deref() == Some(alt));
+    let mut drawn = false;
+    for i in 0..200 {
+        // The cache's waker does nothing here: build the view again each frame, as a wake would.
+        rt.invalidate();
+        rt.frame(f64::from(i) / 60.0);
+        drawn = !shows_alt_text(&rt) && rt.elements().iter().any(|e| e.role == "image" && e.label.as_deref() == Some(alt));
+        if drawn {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(drawn, "the image still shows its alt text in place of the picture");
+}
+
+#[test]
+fn no_page_shows_markdown_or_html_as_text() {
+    for (path, route) in Route::all().into_iter().chain([("/404".to_owned(), Route::NotFound)]) {
+        for e in page(route, 760.0).elements() {
+            let Some(text) = e.text.as_deref() else { continue };
+            for raw in ["<img", "](", "![", "<br", "<details", "<a href"] {
+                assert!(!text.contains(raw), "{path}: {raw} shows as text in {}: {text:.120}", e.path);
+            }
+        }
+    }
+}
+
+#[test]
+fn every_in_site_anchor_lands_on_a_heading() {
+    // `#3d-device-view` and the roadmap's `#1-boot-to-adb--done` went nowhere: Rune's export
+    // drops an id that starts with a digit, so the heading had none.
+    let anchors = |md: &str| content::headings(md).into_iter().map(|h| h.anchor).collect::<Vec<_>>();
+    for doc in DOCS {
+        let body = doc.body();
+        for a in anchors(&body) {
+            let id =
+                a.starts_with(|c: char| c.is_ascii_alphabetic()) && a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            assert!(id, "{}: heading anchor {a} isn't an id the static page keeps", doc.slug);
+        }
+        for event in Parser::new_ext(&body, Options::ENABLE_TABLES) {
+            let Event::Start(Tag::Link { dest_url, .. }) = event else { continue };
+            let (target, anchor) = match dest_url.split_once('#') {
+                Some(("", a)) => (doc.slug, a),
+                Some((p, a)) if p.starts_with("/docs/") => (p.trim_start_matches("/docs/").trim_end_matches('/'), a),
+                _ => continue,
+            };
+            let Some(to) = Doc::find(target) else { continue };
+            assert!(anchors(&to.body()).iter().any(|x| x == anchor), "{}: {dest_url} lands on no heading of {target}", doc.slug);
+        }
+    }
+    assert_eq!(content::site_anchor("3d-device-view"), "h-3d-device-view");
+    assert_eq!(content::site_anchor("performance-notes"), "performance-notes");
+    assert_eq!(site_url("#3d-device-view", "docs"), "#h-3d-device-view");
+    assert_eq!(site_url("roadmap-android.md#1-boot-to-adb--done", "docs"), "/docs/roadmap-android/#h-1-boot-to-adb--done");
+    // GitHub keeps its own anchors.
+    assert_eq!(site_url("research/x.md#1-a", "docs"), "https://github.com/kaeawc/simee/blob/main/docs/research/x.md#1-a");
+}
+
+#[test]
+fn every_github_link_names_a_path_in_the_repository() {
+    // Code spans such as the streaming doc's `tests/publish.rs` (its crate's) and a removed
+    // `scripts/ios/xcode-build.sh` became links to 404s.
+    let repo = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let mut checked = 0;
+    for (page, md) in page_markdown() {
+        for event in Parser::new_ext(&md, Options::ENABLE_TABLES) {
+            let Event::Start(Tag::Link { dest_url, .. }) = event else { continue };
+            let Some(path) = dest_url.strip_prefix(&format!("{}/blob/main/", content::REPO)) else { continue };
+            let path = path.split('#').next().unwrap_or(path).trim_end_matches('/');
+            assert!(std::path::Path::new(&format!("{repo}/{path}")).exists(), "{page}: {dest_url} names no file in the repository");
+            checked += 1;
+        }
+    }
+    assert!(checked > 0);
+    assert!(!resolve_links("`tests/publish.rs`", "docs").contains("]("), "a crate-relative path linked");
+}
+
+#[test]
+fn the_static_page_keeps_links_and_long_code_in_the_line() {
+    // Rune's export makes every element flex and only a text's own children inline: a link in a
+    // paragraph stood on a line of its own, and a long code span widened a phone's page.
+    let template = include_str!("../index.html");
+    assert!(template.contains("[data-rune-static] .t a span { display: inline; position: static; }"));
+    assert!(template.contains("[data-rune-static] .t { overflow-wrap: break-word; }"));
+}
+
+#[test]
+fn every_page_fits_a_phone() {
+    // At phone width the running head's links didn't wrap, long link labels and tables ran past
+    // the column and Figure 1's last label past the page: every page scrolled sideways. Only
+    // what is inside a sideways-scrolling viewport (a wide table's rows) may be wider.
+    let width = 360.0;
+    for (path, route) in Route::all().into_iter().chain([("/404".to_owned(), Route::NotFound)]) {
+        let wide: Vec<String> = page(route, width)
+            .elements()
+            .into_iter()
+            .filter(|e| !e.exiting && e.rect[2] > 0.0 && e.rect[0] + e.rect[2] > width + 0.5 && !e.path.contains("/scroll/"))
+            .map(|e| format!("{} {:?}", e.path, e.rect))
+            .collect();
+        assert!(wide.is_empty(), "{path} is wider than {width}: {:#?}", &wide[..wide.len().min(8)]);
+    }
 }

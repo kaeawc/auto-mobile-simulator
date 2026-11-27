@@ -5,7 +5,7 @@ use rune::{El, col, row, text};
 
 use crate::content::{DOCS, Doc, GROUPS, REPO, outline};
 use crate::tokens::*;
-use crate::ui::{link_text, markdown, section};
+use crate::ui::{MdCx, link_text, markdown, section};
 
 pub fn index(bp: Bp) -> El {
     let mut page = col()
@@ -39,7 +39,7 @@ fn first_sentence(s: &str) -> String {
     }
 }
 
-pub fn page(doc: &Doc, bp: Bp) -> El {
+pub fn page(doc: &Doc, mc: &MdCx, bp: Bp) -> El {
     let body = doc.body();
     let toc = outline(&body);
     let source = format!("{REPO}/blob/main/docs/{}.md", doc.slug);
@@ -69,5 +69,5 @@ pub fn page(doc: &Doc, bp: Bp) -> El {
             SMALL,
         )))
         .child(contents)
-        .child(col().key("doc-body").w_full().mt(24.0).child(markdown("doc-md", &body)))
+        .child(col().key("doc-body").w_full().mt(24.0).child(markdown("doc-md", &body, mc)))
 }
