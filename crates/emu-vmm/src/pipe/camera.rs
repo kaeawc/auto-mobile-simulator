@@ -25,7 +25,10 @@
 //! says who serves it). A linked source that fails, to open or before its first frame, shows the
 //! test card and is tried again after [`RETRY_MIN`], doubling to [`RETRY_MAX`]: a feed that isn't
 //! served yet (the server starts it as the device boots) or a source that can't work is never
-//! reopened on every guest frame.
+//! reopened on every guest frame. A feed that is served but sends nothing (the other device isn't
+//! booted yet, or shut down mid-stream) shows the test card too, after [`sim_camera::feed::STALL`]
+//! without a frame, never black or the other device's last frame; it stays connected, so the
+//! other device's frames replace the card as soon as they come again.
 //!
 //! The guest's pipe transport serves every pipe on one thread, so each session answers from a
 //! thread of its own: waiting for a source's first frame and converting it never stall adb.
@@ -666,6 +669,8 @@ fn fourcc_text(code: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
     use crate::pipe::WorkerEvent;
 
@@ -1055,6 +1060,112 @@ mod tests {
         assert!(luma_after(&mut s, 82), "red from the feed");
         assert_eq!(feed.readers(), 1, "one connection, at the camera's size");
         drop(feed);
+    }
+
+    /// Whether a 176x144 frame's luma isn't flat: the test card (black, red or blue is flat).
+    fn card(r: &[u8]) -> bool {
+        let luma = &payload(r)[3..3 + 176 * 144];
+        luma.iter().any(|&y| y != luma[0])
+    }
+
+    /// The server's side of a feed whose source device A is red until the flag says it shut down:
+    /// then its capture ends and it doesn't open. Any other source opens as usual.
+    struct ShutsDown(Arc<AtomicBool>);
+
+    struct Red(Box<dyn sim_camera::Source>, Arc<AtomicBool>);
+
+    impl sim_camera::Source for Red {
+        fn synthetic(&self) -> bool {
+            true
+        }
+
+        fn frame(&mut self, spec: FrameSpec, tick: sim_camera::Tick) -> sim_camera::Result<CameraFrame> {
+            if self.1.load(Ordering::SeqCst) {
+                return Err(sim_camera::Error::Missing("A shut down".into()));
+            }
+            self.0.frame(spec, tick)
+        }
+    }
+
+    impl sim_camera::Opener for ShutsDown {
+        fn open(&self, source: &SourceSpec, _spec: FrameSpec) -> sim_camera::Result<Box<dyn sim_camera::Source>> {
+            let SourceSpec::Webcam(_) = source else { return sim_camera::synth::open(source) };
+            if self.0.load(Ordering::SeqCst) {
+                return Err(sim_camera::Error::Missing("A isn't running".into()));
+            }
+            Ok(Box::new(Red(sim_camera::synth::open(&SourceSpec::parse("solid:red").expect("red"))?, self.0.clone())))
+        }
+    }
+
+    fn feed_session(tag: &str) -> (std::path::PathBuf, Session) {
+        let path = std::path::PathBuf::from("/tmp").join(format!("emu-cam-{tag}-{}.sock", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        let c = Arc::new(Cameras::with_opener(HostOpener::new(), Duration::from_millis(40)));
+        c.link(Facing::Back, parse_link(&format!("feed:{}", path.display())).expect("feed link"));
+        let mut s = Session::new(Some(Facing::Back), c, None);
+        assert_eq!(payload(&s.handle(&format!("start dim=176x144 pix={}", nv21()))), b"ok\0");
+        (path, s)
+    }
+
+    /// B booted before A: the server serves B's feed, but A isn't there to fill it. The camera
+    /// shows the test card within a second, not black, and A's frames once it is up.
+    #[test]
+    fn a_feed_that_is_served_but_sends_nothing_shows_the_test_card_until_it_does() {
+        let (path, mut s) = feed_session("unfed");
+        let hub = Arc::new(Hub::new(HostOpener::new()));
+        // `device:` never opens in emu's opener: a feed that is up and silent, as with A shut down.
+        let feed =
+            sim_camera::feed::Feed::serve(hub, &path, SourceSpec::parse("device:A").expect("A"), FrameSpec::default()).expect("serve");
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(1500) && !card(&s.handle("frame video=38016 preview=0")) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(t.elapsed() < Duration::from_millis(1500), "the test card within a second, not black");
+        for _ in 0..50 {
+            assert!(card(&s.handle("frame video=38016 preview=0")), "the test card stays");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // A comes up: its frames replace the test card.
+        feed.set_source(SourceSpec::parse("solid:red").expect("red"));
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(3) && payload(&s.handle("frame video=38016 preview=0"))[3] != 82 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(luma_after(&mut s, 82), "red once the feed sends it");
+    }
+
+    /// A shuts down mid-stream: the server's feed stays up but goes silent. The camera shows the
+    /// test card within a second (not A's last frame), and A's frames again when they resume.
+    #[test]
+    fn a_feed_that_goes_silent_mid_stream_shows_the_test_card_then_the_frames_again() {
+        let (path, mut s) = feed_session("silent");
+        let down = Arc::new(AtomicBool::new(false));
+        let hub = Arc::new(Hub::new(ShutsDown(down.clone())));
+        let feed = sim_camera::feed::Feed::serve(hub, &path, SourceSpec::Webcam("A".into()), FrameSpec::default()).expect("serve");
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(3) && payload(&s.handle("frame video=38016 preview=0"))[3] != 82 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(luma_after(&mut s, 82), "A's red");
+        // A shuts down.
+        down.store(true, Ordering::SeqCst);
+        let stopped = Instant::now();
+        while stopped.elapsed() < Duration::from_millis(1500) && !card(&s.handle("frame video=38016 preview=0")) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(stopped.elapsed() < Duration::from_millis(1500), "the test card within a second of A's last frame, not A's frame");
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(3) {
+            assert!(card(&s.handle("frame video=38016 preview=0")), "the test card, never A's last frame, while A is down");
+            thread::sleep(Duration::from_millis(20));
+        }
+        // A is back (here: the feed relinked to blue): its frames replace the test card.
+        feed.set_source(SourceSpec::parse("solid:blue").expect("blue"));
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(3) && payload(&s.handle("frame video=38016 preview=0"))[3] != 41 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(luma_after(&mut s, 41), "blue once frames resume");
     }
 
     #[test]

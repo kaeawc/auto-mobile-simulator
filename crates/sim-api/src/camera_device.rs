@@ -5,7 +5,9 @@
 //! - **Android** (an AVD name): emu's display socket and shared frame ring
 //!   (`sim_android::display`), asked for only what the camera needs: `fps <camera rate>`, and
 //!   `hello <width>` with the smallest whole downscale of the screen that keeps the region at the
-//!   camera's resolution ([`sim_camera::device::needed_width`]), asked again when the device turns.
+//!   camera's resolution ([`sim_camera::device::needed_width`]), asked again when the device turns
+//!   or a larger (or faster) camera joins the capture: one capture serves the largest subscriber,
+//!   scaled down for the others.
 //! - **iOS** (a simulator's UDID or name, macOS only): the framebuffer `IOSurface`'s frame
 //!   callback, then one copy out of the locked surface (`sim_coresim::Display::capture`) when its
 //!   seed says the contents changed, at most at the camera's rate.
@@ -138,7 +140,7 @@ mod android {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
     use std::time::Duration;
 
@@ -155,10 +157,37 @@ mod android {
         pub lcd: Option<(u32, u32)>,
     }
 
-    impl Want {
-        /// The `hello` width for a `screen`-sized display (full size while the size is unknown).
-        fn width(&self, screen: Option<(u32, u32)>) -> u32 {
-            screen.map_or(u32::MAX, |s| needed_width(self.region, s, self.spec))
+    /// What the display has been asked for, shared by the reader thread (which learns the device's
+    /// size from its frames) and the screen's asker (which learns what the capture needs as
+    /// subscribers join): either one asks again when what it knows changes the answer.
+    struct Asking {
+        control: UnixStream,
+        region: Option<Region>,
+        /// The device's screen size: the configured one until a frame says.
+        device: Option<(u32, u32)>,
+        /// The capture's subscriber specs: the first one's, then every one the screen says.
+        specs: Vec<FrameSpec>,
+        width: u32,
+        fps: u32,
+    }
+
+    impl Asking {
+        /// The `hello` width the largest need takes (full size while the device's size is unknown).
+        fn needed(&self) -> u32 {
+            let Some(device) = self.device else { return u32::MAX };
+            self.specs.iter().map(|s| needed_width(self.region, device, *s)).max().unwrap_or(u32::MAX)
+        }
+
+        /// Asks the display again for what changed: a higher rate (`fps`), another width (`hello`).
+        fn ask(&mut self) {
+            let fps = self.specs.iter().map(|s| s.fps).max().unwrap_or(self.fps);
+            if fps > self.fps && writeln!(self.control, "fps {fps}").is_ok() {
+                self.fps = fps;
+            }
+            let needed = self.needed();
+            if needed != self.width && writeln!(self.control, "{}", Input::Hello { max_width: needed }.to_line()).is_ok() {
+                self.width = needed;
+            }
         }
     }
 
@@ -170,7 +199,9 @@ mod android {
 
     impl Reader {
         /// Connects to the AVD in `avd_dir`, asks for frames at the camera's rate and the size it
-        /// needs, and posts them to `screen`.
+        /// needs, and posts them to `screen`. A larger or faster subscriber joining the capture
+        /// later ([`Screen::want`]) asks again for its size and rate, at once: one capture serves
+        /// the largest, scaled down for the others.
         pub(super) fn start(avd_dir: &Path, name: &str, screen: Arc<Screen>, want: Want) -> Result<Reader> {
             let io = |e: String| Error::Io(format!("device:{name}: {e}"));
             let mut display = Display::connect(avd_dir).map_err(|e| Error::Missing(format!("{name} isn't running under emu: {e}")))?;
@@ -178,8 +209,20 @@ mod android {
             let mut control = display.try_clone().map_err(io)?;
             // The display server's rate cap: without it, a 60 Hz stream whatever the camera takes.
             writeln!(control, "fps {}", want.spec.fps).map_err(|e| io(e.to_string()))?;
-            let mut asked = want.width(want.lcd);
-            display.send(&Input::Hello { max_width: asked }).map_err(io)?;
+            let mut asking =
+                Asking { control, region: want.region, device: want.lcd, specs: vec![want.spec], width: 0, fps: want.spec.fps };
+            asking.width = asking.needed();
+            display.send(&Input::Hello { max_width: asking.width }).map_err(io)?;
+            let asking = Arc::new(Mutex::new(asking));
+            let (first, on_want) = (want.spec, asking.clone());
+            screen.on_want(move |specs| {
+                let mut asking = on_want.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                asking.specs = specs.to_vec();
+                if !asking.specs.iter().any(|s| (s.width, s.height) == (first.width, first.height)) {
+                    asking.specs.push(first);
+                }
+                asking.ask();
+            });
             let mut frames = Frames::new(display.try_clone().map_err(io)?).with_fallback(display.try_clone().map_err(io)?);
             let link = display.try_clone().map_err(io)?;
             let name = name.to_string();
@@ -192,9 +235,12 @@ mod android {
                             Ok(h) => {
                                 let device = (h.device_width, h.device_height);
                                 // A turned device (or a first guess that was off): ask again.
-                                let needed = want.width(Some(device));
-                                if needed != asked && writeln!(control, "{}", Input::Hello { max_width: needed }.to_line()).is_ok() {
-                                    asked = needed;
+                                {
+                                    let mut asking = asking.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    if asking.device != Some(device) {
+                                        asking.device = Some(device);
+                                        asking.ask();
+                                    }
                                 }
                                 buf = screen.post(h.width, h.height, device, std::mem::take(&mut buf));
                             }
@@ -448,6 +494,42 @@ mod tests {
         )
         .err();
         assert!(matches!(&err, Some(Error::Missing(m)) if m.contains("B isn't running")), "{err:?}");
+    }
+
+    /// Two cameras on one capture of A at different sizes: the reader started for the first (small)
+    /// one asks again, for the larger one's size and rate, as soon as the larger one subscribes,
+    /// so its frames are drawn from A's screen at its own resolution and not upscaled.
+    #[test]
+    fn the_android_reader_asks_for_the_largest_subscribers_size_when_one_joins() {
+        let fake = FakeDisplay::new("grow");
+        let listener = fake.listener.try_clone().expect("listener");
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            conn.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+            let mut lines = BufReader::new(conn.try_clone().expect("clone")).lines();
+            let mut got: Vec<String> = (0..3).filter_map(|_| lines.next()?.ok()).collect();
+            // A portrait 1080x2400 device, sent at a sixth for the small camera.
+            frame(&mut conn, 180, 400, (1080, 2400), 1);
+            // The larger camera joins: asked for again (its rate, then its size), without a frame.
+            got.extend((0..2).filter_map(|_| lines.next()?.ok()));
+            // The display stays up until the test is done with it.
+            let _ = finished.recv_timeout(Duration::from_secs(5));
+            got
+        });
+        let screen = Arc::new(Screen::default());
+        let small = FrameSpec::new(320, 240, 15).expect("small");
+        let want = android::Want { region: None, spec: small, lcd: Some((1080, 2400)) };
+        let reader = android::Reader::start(&fake.dir, "A", screen.clone(), want).expect("start");
+        let mut source = sim_camera::device::DeviceSource::new("A", None, screen.clone());
+        let tick = |seq| sim_camera::Tick { seq, ..sim_camera::Tick::start() };
+        assert!(sim_camera::Source::frame(&mut source, small, tick(0)).is_ok(), "the small camera's frame");
+        let large = FrameSpec::new(1280, 720, 30).expect("large");
+        assert!(sim_camera::Source::frame(&mut source, large, tick(1)).is_ok(), "the large camera's frame");
+        done.send(()).expect("done");
+        // 320x240 from 1080 wide: a third (360); 1280x720: the whole width.
+        assert_eq!(server.join().expect("server"), ["shm", "fps 15", "hello 360", "fps 30", "hello 1080"]);
+        drop(reader);
     }
 
     #[test]

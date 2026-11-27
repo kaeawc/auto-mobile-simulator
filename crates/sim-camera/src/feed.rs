@@ -65,10 +65,11 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 pub const RETRY_MIN: Duration = Duration::from_millis(500);
 pub const RETRY_MAX: Duration = Duration::from_secs(8);
 
-/// How long a `feed:` source waits for its feed's first frame, and how long a feed that has sent
-/// frames may go silent (its source failing on the serving side) before the source counts as
-/// missing. A live feed sends at its rate even while the picture is still.
-const SILENCE: Duration = Duration::from_secs(2);
+/// How long a `feed:` source goes without a frame from its feed (none yet, or none since the last)
+/// before it shows the test card in their place: the feed is up but its source isn't delivering
+/// (the source device isn't booted yet, or shut down). A live feed sends at its rate even while
+/// the picture is still, so a second of nothing is a source that is gone, not a still screen.
+pub const STALL: Duration = Duration::from_secs(1);
 
 /// The longest socket path `bind` takes (`sun_path` is 104 bytes on macOS, NUL included).
 const MAX_SOCKET_PATH: usize = 103;
@@ -79,11 +80,13 @@ pub fn socket_path(data_dir: &Path) -> Result<PathBuf> {
 }
 
 /// Where a feed named `name` of the device whose directory is `dir` listens: `dir/name`, or, when
-/// that path is too long for a Unix socket (a long home directory), a name derived from `dir` in a
-/// private per-user directory of the host's temp directory (`<hash of dir>.sock` for `cam.sock`,
-/// `<hash of dir>-<name>` otherwise; created 0700; refused if it exists and isn't ours and 0700, so
-/// another user can't plant the socket). `sim_android::camera_feed_socket` computes the same path
-/// for an AVD's `device:` cameras, so a boot hands emu the socket this side serves.
+/// that path is too long for a Unix socket (a long home directory), a name derived from `dir` in
+/// `/tmp/simee-<uid>` (`<hash of dir>.sock` for `cam.sock`, `<hash of dir>-<name>` otherwise). That
+/// directory is named by the user id, not `$USER` or `$TMPDIR`, so the server and a boot run with
+/// another environment agree on it, and it is short enough for any `name` (about 50 bytes in all).
+/// It is created 0700, and refused if it exists and isn't ours and 0700, so another user can't
+/// plant the socket. `sim_android::camera_feed_socket` computes the same path for an AVD's
+/// `device:` cameras, so a boot hands emu the socket this side serves.
 pub fn socket_path_in(dir: &Path, name: &str) -> Result<PathBuf> {
     let path = dir.join(name);
     if path.as_os_str().len() <= MAX_SOCKET_PATH {
@@ -94,9 +97,9 @@ pub fn socket_path_in(dir: &Path, name: &str) -> Result<PathBuf> {
         .as_encoded_bytes()
         .iter()
         .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3));
-    let user: String =
-        std::env::var("USER").unwrap_or_default().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(24).collect();
-    let dir = private_dir_in(&std::env::temp_dir(), &format!("simee-cam-{}", if user.is_empty() { "user" } else { &user }))?;
+    let base = Path::new(FALLBACK_BASE);
+    let uid = own_uid(base).map_err(|e| Error::Io(format!("camera feed: finding the user id in {FALLBACK_BASE}: {e}")))?;
+    let dir = private_dir_in(base, &format!("simee-{uid}"))?;
     let file = if name == "cam.sock" { format!("{hash:016x}.sock") } else { format!("{hash:016x}-{name}") };
     let path = dir.join(file);
     if path.as_os_str().len() > MAX_SOCKET_PATH {
@@ -104,6 +107,10 @@ pub fn socket_path_in(dir: &Path, name: &str) -> Result<PathBuf> {
     }
     Ok(path)
 }
+
+/// Where the fallback directory is made: `/tmp`, whatever `$TMPDIR` says (a macOS one is ~50 bytes
+/// already, a sandboxed one longer).
+const FALLBACK_BASE: &str = "/tmp";
 
 /// `base/name` as a directory only this user can use: created 0700, or, if it exists, accepted
 /// only when it is a real directory (not a symlink) owned by this user with mode exactly 0700.
@@ -575,12 +582,21 @@ struct Slot {
 /// A feed read as a camera source: emu's camera HAL reads another device's screen this way, from
 /// the feed the simee server serves it on (`feed:<socket path>`). A thread reads the feed's frames,
 /// which come at the size and rate the source was opened at, paced by the serving side; each
-/// capture tick takes the newest, waiting up to a tick for one. The feed closing, or going silent
-/// for [`SILENCE`] (its source failing on the serving side), is [`Error::Missing`].
+/// capture tick takes the newest, waiting up to a tick for one. While the feed is up but sends
+/// nothing for [`STALL`] (none yet, or none since the last: its source isn't delivering on the
+/// serving side), the source draws the test card instead, said once on stderr as the source
+/// missing, and stays connected, so the feed's frames show again the moment they resume. The feed
+/// closing (the server stopped) is [`Error::Missing`].
 pub struct FeedSource {
     path: PathBuf,
     newest: Arc<Newest>,
     seen: u64,
+    /// When the source connected: the first frame is waited for until [`STALL`] after it.
+    connected: Instant,
+    /// The test card, drawn while the feed is stalled.
+    card: Box<dyn Source>,
+    /// The feed is stalled now, and that was said.
+    stalled: bool,
     stream: UnixStream,
     thread: Option<JoinHandle<()>>,
 }
@@ -593,6 +609,7 @@ impl FeedSource {
                 path.display()
             ))
         };
+        let card = crate::synth::open(&SourceSpec::Pattern(crate::Pattern::Testcard))?;
         let mut stream = UnixStream::connect(path).map_err(missing)?;
         stream.write_all(&Hello { width: spec.width, height: spec.height, fps: spec.fps }.to_bytes()).map_err(missing)?;
         let newest = Arc::new(Newest::default());
@@ -622,7 +639,16 @@ impl FeedSource {
                 }
             })
             .map_err(|e| Error::Capture(format!("camera feed: can't start the reader thread: {e}")))?;
-        Ok(FeedSource { path: path.to_owned(), newest, seen: 0, stream, thread: Some(thread) })
+        Ok(FeedSource {
+            path: path.to_owned(),
+            newest,
+            seen: 0,
+            connected: Instant::now(),
+            card,
+            stalled: false,
+            stream,
+            thread: Some(thread),
+        })
     }
 }
 
@@ -638,8 +664,9 @@ impl Drop for FeedSource {
 
 impl Source for FeedSource {
     fn frame(&mut self, spec: FrameSpec, tick: Tick) -> Result<CameraFrame> {
-        let wait = if self.seen == 0 { SILENCE } else { spec.interval() };
-        let deadline = Instant::now() + wait;
+        // The first frame is waited for (a capture's first tick), up to the stall; then a tick.
+        let now = Instant::now();
+        let deadline = if self.seen == 0 && !self.stalled { (self.connected + STALL).max(now) } else { now + spec.interval() };
         let mut slot = lock(&self.newest.slot);
         while slot.count == self.seen && slot.gone.is_none() {
             let now = Instant::now();
@@ -651,12 +678,24 @@ impl Source for FeedSource {
         if let Some(why) = &slot.gone {
             return Err(Error::Missing(why.clone()));
         }
-        let silent = slot.at.is_none_or(|at| at.elapsed() >= SILENCE);
-        let Some((header, bgra)) = slot.frame.clone().filter(|_| !silent) else {
-            return Err(Error::Missing(format!("the camera feed at {} sent no frame in {} s", self.path.display(), SILENCE.as_secs())));
-        };
-        self.seen = slot.count;
-        Ok(CameraFrame { width: header.width, height: header.height, bgra, tick })
+        let fresh = slot.at.is_some_and(|at| at.elapsed() < STALL);
+        if let Some((header, bgra)) = slot.frame.clone().filter(|_| fresh) {
+            self.seen = slot.count;
+            drop(slot);
+            if std::mem::replace(&mut self.stalled, false) {
+                eprintln!("camera feed {}: frames again", self.path.display());
+            }
+            return Ok(CameraFrame { width: header.width, height: header.height, bgra, tick });
+        }
+        drop(slot);
+        if !std::mem::replace(&mut self.stalled, true) {
+            eprintln!(
+                "camera feed {}: source missing: no frame in {} s (the device it serves isn't delivering); the test card stands in",
+                self.path.display(),
+                STALL.as_secs()
+            );
+        }
+        self.card.frame(spec, tick)
     }
 }
 
@@ -867,7 +906,7 @@ mod tests {
         let long =
             Path::new("/Users/someone-with-a-long-name/Library/Developer/CoreSimulator/Devices/0053A2F9-1FD0-4409-BCF1-6D32F934C172/data");
         let fallback = socket_path(long).unwrap_or_else(|e| panic!("{e}"));
-        assert!(fallback.as_os_str().len() <= MAX_SOCKET_PATH || std::env::temp_dir().as_os_str().len() > 70, "{}", fallback.display());
+        assert!(fallback.as_os_str().len() <= MAX_SOCKET_PATH, "{}", fallback.display());
         assert_ne!(Some(fallback.clone()), socket_path(short).ok());
         assert_eq!(Some(fallback.clone()), socket_path(long).ok(), "stable for one device");
         let env = launch_env(Path::new("/s/libsimee-camera.dylib"), &fallback);
@@ -940,10 +979,6 @@ mod tests {
     fn socket_paths_in_a_device_directory_fit_and_keep_the_ios_name() {
         let short = Path::new("/Users/a/.android/avd/Pixel_9.avd/simee");
         assert_eq!(socket_path_in(short, "cam-back.sock").ok(), Some(short.join("cam-back.sock")));
-        if std::env::temp_dir().as_os_str().len() > 50 {
-            eprintln!("skipped the fallback paths: this temp directory is too long for them");
-            return;
-        }
         let long = Path::new("/Users/someone-with-a-long-name/some/deeply/nested/avd/home/that/goes/on/Pixel_9_API_36.avd/simee");
         let (back, front) = (socket_path_in(long, "cam-back.sock"), socket_path_in(long, "cam-front.sock"));
         let (back, front) = (back.unwrap_or_else(|e| panic!("{e}")), front.unwrap_or_else(|e| panic!("{e}")));
@@ -952,6 +987,23 @@ mod tests {
         let data = Path::new("/Users/someone-with-a-long-name/Library/Developer/CoreSimulator/Devices/0053A2F9-1FD0/data/x/y/zz");
         assert_eq!(socket_path(data).ok(), socket_path_in(data, "cam.sock").ok(), "the iOS feed's path is unchanged");
         assert!(socket_path(data).is_ok_and(|p| p.file_name().is_some_and(|n| !n.to_string_lossy().contains('-'))));
+    }
+
+    /// The fallback is in `/tmp/simee-<uid>`, whatever TMPDIR or USER say: short enough for any
+    /// device directory, and the same for the server and a boot run with another environment.
+    #[test]
+    fn the_fallback_directory_is_short_and_named_by_the_uid_not_the_environment() {
+        let long = Path::new("/Users/someone-with-a-long-name/some/deeply/nested/avd/home/that/goes/on/Pixel_9_API_36.avd/simee");
+        let back = socket_path_in(long, "cam-back.sock").unwrap_or_else(|e| panic!("{e}"));
+        let probe = Path::new("/tmp").join(format!("simee-feed-uid-{}", std::process::id()));
+        std::fs::write(&probe, b"").unwrap_or_else(|e| panic!("{e}"));
+        let uid = std::fs::metadata(&probe).unwrap_or_else(|e| panic!("{e}")).uid();
+        let _ = std::fs::remove_file(&probe);
+        let dir = PathBuf::from(format!("/tmp/simee-{uid}"));
+        assert_eq!(back.parent(), Some(dir.as_path()), "{}", back.display());
+        assert!(back.as_os_str().len() <= 60, "{}", back.display());
+        let meta = std::fs::symlink_metadata(&dir).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((meta.uid(), meta.mode() & 0o7777), (uid, 0o700), "private and ours");
     }
 
     /// A feed's opener that records the spec each capture was opened at.

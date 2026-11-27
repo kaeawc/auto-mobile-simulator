@@ -158,10 +158,26 @@ pub struct Shot {
 
 /// The newest frame of a device's screen: what a backend's reader thread (or a test) posts, and a
 /// [`DeviceSource`] reads.
+///
+/// It also carries what the capture needs of the device ([`Screen::want`]): every camera size and
+/// the highest rate its subscribers asked for, so a reader started for the first subscriber asks
+/// the device again when a larger one joins (one capture serves the largest, scaled down for the
+/// others).
 #[derive(Default)]
 pub struct Screen {
     latest: Mutex<Latest>,
     arrived: Condvar,
+    wanted: Mutex<Wanted>,
+}
+
+/// Called with what the capture needs now, each time that grows.
+type Asker = Arc<dyn Fn(&[FrameSpec]) + Send + Sync>;
+
+#[derive(Default)]
+struct Wanted {
+    /// The sizes asked for (each at the highest rate asked), at most [`SIZES`] of them.
+    specs: Vec<FrameSpec>,
+    asker: Option<Asker>,
 }
 
 #[derive(Default)]
@@ -188,6 +204,42 @@ impl Screen {
         let mut spare = old.and_then(|s| Arc::try_unwrap(s.rgba).ok()).unwrap_or_default();
         spare.clear();
         spare
+    }
+
+    /// Adds `spec` to what the capture needs: a size not asked for yet, or a higher rate (every
+    /// size is asked at the highest). When that grows, the reader's asker ([`Screen::on_want`]) is
+    /// called with all of it, outside the lock.
+    pub fn want(&self, spec: FrameSpec) {
+        let (specs, asker) = {
+            let mut wanted = self.wanted.lock().unwrap_or_else(|p| p.into_inner());
+            let fps = wanted.specs.iter().map(|s| s.fps).max().unwrap_or(0).max(spec.fps);
+            let known = wanted.specs.iter().any(|s| (s.width, s.height) == (spec.width, spec.height));
+            let added = !known && wanted.specs.len() < SIZES;
+            if !added && wanted.specs.first().is_none_or(|s| s.fps >= fps) {
+                return;
+            }
+            if added {
+                wanted.specs.push(spec);
+            }
+            for s in &mut wanted.specs {
+                s.fps = fps;
+            }
+            (wanted.specs.clone(), wanted.asker.clone())
+        };
+        if let Some(ask) = asker {
+            ask(&specs);
+        }
+    }
+
+    /// What the capture needs now: each size asked for, at the highest rate asked.
+    pub fn wanted(&self) -> Vec<FrameSpec> {
+        self.wanted.lock().unwrap_or_else(|p| p.into_inner()).specs.clone()
+    }
+
+    /// Sets what a reader does when the capture needs more ([`Screen::want`]): ask the device for
+    /// a larger or faster stream.
+    pub fn on_want(&self, ask: impl Fn(&[FrameSpec]) + Send + Sync + 'static) {
+        self.wanted.lock().unwrap_or_else(|p| p.into_inner()).asker = Some(Arc::new(ask));
     }
 
     /// The device went away: every read from now on is [`Error::Missing`] with `why`.
@@ -243,6 +295,8 @@ pub struct DeviceSource {
     drawn: Vec<Drawn>,
     /// The region is off the screen now, and that was said.
     off_screen: bool,
+    /// The subscriber specs passed on to the screen ([`Screen::want`]).
+    asked: Vec<FrameSpec>,
     _reader: Option<Reader>,
 }
 
@@ -259,6 +313,7 @@ impl DeviceSource {
             waited: None,
             drawn: Vec::new(),
             off_screen: false,
+            asked: Vec::new(),
             _reader: None,
         }
     }
@@ -290,6 +345,14 @@ impl DeviceSource {
 
 impl Source for DeviceSource {
     fn frame(&mut self, spec: FrameSpec, tick: Tick) -> Result<CameraFrame> {
+        // A subscriber size (or rate) not seen yet: the reader may need to ask the device for more.
+        if !self.asked.contains(&spec) {
+            if self.asked.len() >= SIZES * 4 {
+                self.asked.clear();
+            }
+            self.asked.push(spec);
+            self.screen.want(spec);
+        }
         if self.waited != Some(tick.seq) {
             self.waited = Some(tick.seq);
             let timeout = if self.shot.is_some() { spec.interval() } else { self.first_frame };

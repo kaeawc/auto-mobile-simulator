@@ -1206,8 +1206,9 @@ const MAX_SOCKET_PATH: usize = 103;
 
 /// The socket the simee server serves camera `facing` of the AVD in `avd_dir` on when it is linked
 /// to another device's screen: `cam-<facing>.sock` in the AVD's state directory, or, when that is
-/// too long for a Unix socket, `<hash of the state directory>-cam-<facing>.sock` in the per-user
-/// `simee-cam-<user>` directory of the host's temp directory. The same path as
+/// too long for a Unix socket, `<hash of the state directory>-cam-<facing>.sock` in
+/// `/tmp/simee-<uid>` (named by the user id, never `$USER` or `$TMPDIR`, so a boot run with another
+/// environment than the server's agrees with it; short enough for any AVD home). The same path as
 /// `sim_camera::feed::socket_path_in` gives (which also makes that directory private): the server
 /// serves it, the boot hands it to emu.
 pub fn camera_feed_socket(avd_dir: &Path, facing: &str) -> PathBuf {
@@ -1222,9 +1223,32 @@ pub fn camera_feed_socket(avd_dir: &Path, facing: &str) -> PathBuf {
         .as_encoded_bytes()
         .iter()
         .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3));
-    let user: String =
-        std::env::var("USER").unwrap_or_default().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(24).collect();
-    std::env::temp_dir().join(format!("simee-cam-{}", if user.is_empty() { "user" } else { &user })).join(format!("{hash:016x}-{name}"))
+    // No user id (no writable /tmp): a directory nothing serves, so the camera shows the test card;
+    // the server can't serve there either, and its link says why.
+    let uid = own_uid().map_or_else(|| "unknown".to_owned(), |u| u.to_string());
+    Path::new("/tmp").join(format!("simee-{uid}")).join(format!("{hash:016x}-{name}"))
+}
+
+/// This process's user id, read once off a file it creates (exclusively) in `/tmp`, as
+/// `sim_camera::feed` does: no `libc` call (unsafe) and no environment variable.
+#[cfg(unix)]
+fn own_uid() -> Option<u32> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    static UID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *UID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let probe = Path::new("/tmp").join(format!(".simee-uid-{}-{nanos}", std::process::id()));
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&probe).ok()?;
+        let uid = file.metadata().map(|m| m.uid()).ok();
+        drop(file);
+        let _ = std::fs::remove_file(&probe);
+        uid
+    })
+}
+
+#[cfg(not(unix))]
+fn own_uid() -> Option<u32> {
+    None
 }
 
 /// Whether `v` is a camera source emu takes (`-camera-back`): none, a stock value, `webcamN`, or

@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use serde_json::{Value, json};
@@ -140,6 +141,7 @@ impl Session {
 
 /// Dispatches one camera method.
 pub fn call(s: &mut Calls, method: &str, p: &Value) -> Result<Value, String> {
+    resume_feeds(s);
     match method {
         "camera_sources" => sources(s.camera.host(), str_param(p, "kind")),
         "camera_links" => match str_param(p, "device") {
@@ -188,6 +190,7 @@ pub fn call(s: &mut Calls, method: &str, p: &Value) -> Result<Value, String> {
 /// passes them to emu (Android) or reapplies them ([`ios_booted`]). Then, on Android, the feeds of
 /// the saved `device:` links are served before emu needs them ([`serve_saved_feeds`]).
 pub fn before_boot(s: &mut Calls, p: &Value) -> Result<(), String> {
+    resume_feeds(s);
     let asked: Vec<(&str, &str)> =
         [("back", "camera_back"), ("front", "camera_front")].into_iter().filter_map(|(f, k)| Some((f, str_param(p, k)?))).collect();
     if asked.is_empty() {
@@ -206,6 +209,53 @@ pub fn before_boot(s: &mut Calls, p: &Value) -> Result<(), String> {
             Ok(())
         }),
         Target::Ios(q) => with_ios(s, |host, ios, env| ios_before_boot(host, ios, env, &q, &asked)),
+    }
+}
+
+/// `boot_many`'s Android devices (`udids`): the feeds of their saved `device:` links served before
+/// emu needs them, by the helper `boot` uses ([`serve_saved_feeds`]); a device that can't be read
+/// is left to the boot to report.
+pub fn before_boot_many(s: &mut Calls, udids: &[String]) {
+    resume_feeds(s);
+    let android = s.android.backend().clone();
+    for udid in udids {
+        if let Ok(d) = android.device(udid) {
+            with_env(s, |_, env| serve_saved_feeds(env, &d));
+        }
+    }
+}
+
+/// Once per server, on its first camera call or boot (lazily, not at start: a server that never
+/// touches a camera pays nothing, and any call that shows or changes a link comes through here
+/// first): serves again the feeds that running devices' emus read for their saved `device:` links.
+/// A server that starts while such a device runs (the last server stopped or was upgraded, or
+/// `boot_many` booted it elsewhere) would otherwise leave that camera on the test card. Only a
+/// camera emu reads from its feed socket now (`camera list`) is served.
+fn resume_feeds(s: &mut Calls) {
+    if !with_env(s, |_, env| env.serving && !env.feeds.resumed.swap(true, Ordering::SeqCst)) {
+        return;
+    }
+    let android = s.android.backend().clone();
+    for info in android.devices() {
+        let Ok(d) = android.device(&info.udid) else { continue };
+        if d.running.as_ref().is_some_and(|r| r.simee) {
+            with_env(s, |_, env| serve_read_feeds(env, &d));
+        }
+    }
+}
+
+/// Serves the saved `device:` links of running `d` whose camera its emu reads from the feed socket.
+fn serve_read_feeds(env: &Env, d: &Device) {
+    let (Some(avd), Some(live)) = (&d.avd, live(d)) else { return };
+    for (facing, source) in saved_cameras(&avd.dir).into_iter().filter(|(_, s)| is_device(s)) {
+        let socket = sim_android::camera_feed_socket(&avd.dir, &facing);
+        let reads = live.iter().any(|(f, l)| *f == facing && l.strip_prefix("feed:").is_some_and(|p| Path::new(p) == socket));
+        if !reads || env.feeds.source(&feed_key(d, &facing)).as_deref() == Some(source.as_str()) {
+            continue;
+        }
+        if let Err(e) = serve_android(env, d, &facing, &source) {
+            eprintln!("simee: {}'s {facing} camera ({source}) shows the test card: {e}", d.info.name);
+        }
     }
 }
 
@@ -332,6 +382,13 @@ fn resolve_source(host: &dyn Host, source: &str, target: &[&str]) -> Result<Reso
         resolve_device(host, device, target)?;
     }
     match &spec {
+        // What a boot hands emu in a `device:` link's place, and the server serves: never linked by
+        // hand (a boot would drop it, so the link would say applied and then vanish).
+        SourceSpec::Feed(_) => {
+            Err("feed: is simee's own plumbing (the socket the server serves another device's screen on), not a source to link: \
+             link device:<udid or name>[:x,y,w,h] for another device's screen"
+                .into())
+        }
         SourceSpec::Video(_) => {
             Err("video: sources aren't supported yet (they need the VideoToolbox decoder, #335); use image:<path> for a still".into())
         }
@@ -720,7 +777,8 @@ fn link_rows(host: &dyn Host, env: &Env, d: &Device) -> Vec<Value> {
         } else if unserved {
             state = "feed missing";
             row["fix"] = json!(
-                "its emu reads another device's screen from a feed this server no longer serves (it restarted): link it again, or reboot \
+                "its emu reads another device's screen from a feed this server doesn't serve (its saved link changed, or it was booted \
+                 with no server running): link it again, or reboot \
                  the device with `simee boot`; it shows the test card meanwhile"
             );
         } else {
@@ -871,6 +929,8 @@ pub(crate) struct Feeds {
     live: Mutex<HashMap<String, Box<dyn LiveFeed>>>,
     /// One lock per simulator: a link, an unlink or a boot's reapply of it runs whole, one at a time.
     devices: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// The feeds running devices read were served again ([`resume_feeds`]): once per server.
+    resumed: AtomicBool,
 }
 
 /// This process's feeds, made on first use (a process that never links serves none).
@@ -878,7 +938,12 @@ static FEEDS: OnceLock<Arc<Feeds>> = OnceLock::new();
 
 impl Feeds {
     pub(crate) fn new(serve: impl Fn(&Path, SourceSpec) -> Result<Box<dyn LiveFeed>, String> + Send + Sync + 'static) -> Feeds {
-        Feeds { serve: Box::new(serve), live: Mutex::new(HashMap::new()), devices: Mutex::new(HashMap::new()) }
+        Feeds {
+            serve: Box::new(serve),
+            live: Mutex::new(HashMap::new()),
+            devices: Mutex::new(HashMap::new()),
+            resumed: AtomicBool::new(false),
+        }
     }
 
     /// This process's feeds: real ones, all reading one capture hub (so two cameras linked to one
@@ -2476,14 +2541,63 @@ mod tests {
             let served = sim_camera::feed::socket_path_in(&state, &format!("cam-{facing}.sock")).expect("path");
             assert_eq!(sim_android::camera_feed_socket(short, facing), served);
         }
-        if std::env::temp_dir().as_os_str().len() > 50 {
-            eprintln!("skipped the fallback: this temp directory is too long for it");
-            return;
-        }
         let long = Path::new("/Users/someone-with-a-long-name/some/deeply/nested/avd/home/that/goes/on/and/on/Pixel_9_API_36.avd");
         let state = emu_avd::state_dir(long);
         let served = sim_camera::feed::socket_path_in(&state, "cam-back.sock").expect("fallback");
-        assert!(!served.starts_with(&state), "{}", served.display());
+        assert!(!served.starts_with(&state) && served.to_string_lossy().starts_with("/tmp/simee-"), "{}", served.display());
         assert_eq!(sim_android::camera_feed_socket(long, "back"), served);
+    }
+
+    #[test]
+    fn boot_many_serves_the_feeds_of_its_saved_device_links_first() {
+        let ios = Ios::new("dev-many", false);
+        sim_android::save_cameras(&ios.f.root.join("avd/phone.avd"), &[("front".into(), "device:tablet".into())]).expect("save");
+        let mut s = ios.session(ios.env(true, false, true));
+        // Stopped by an iOS-only parameter after the feeds are served, as `boot` is.
+        let err = run(&mut s, "boot_many", json!({"devices": ["phone"], "settle": true})).expect_err("settle is iOS's");
+        assert!(err.contains("for iOS devices only"), "{err}");
+        assert_eq!(ios.take_log(), [format!("serve device:tablet on {}", ios.android_socket("front"))]);
+        // Elsewhere: handed to the server, like `boot`'s.
+        let mut s = ios.session(ios.env(false, true, true));
+        run(&mut s, "boot_many", json!({"devices": ["phone"], "settle": true})).expect_err("settle");
+        let forwarded = std::mem::take(&mut *ios.forwarded.lock().expect("forwarded"));
+        assert_eq!(forwarded, [("camera_link".to_owned(), json!({"device": "phone", "facing": "front", "source": "device:tablet"}))]);
+    }
+
+    /// A server that starts while B runs, its emu reading the feed of a saved `device:` link (the
+    /// last server stopped, or B was booted by `boot_many` elsewhere): its first camera call serves
+    /// that feed again, once, and only for the camera emu reads it on.
+    #[test]
+    fn a_new_server_serves_the_feeds_running_devices_read() {
+        let ios = Ios::new("dev-resume", false);
+        let avd = ios.f.root.join("avd/phone.avd");
+        sim_android::save_cameras(&avd, &[("back".into(), "device:tablet".into()), ("front".into(), "device:tablet".into())])
+            .expect("save");
+        let emulator = ios.f.running();
+        // emu reads the back camera's feed; the front one was relinked from emu's own console.
+        *emulator.cameras.lock().expect("cameras") =
+            vec![("back".into(), format!("feed:{}", ios.android_socket("back"))), ("front".into(), "qr:x".into())];
+        // Not a server: nothing to serve from here.
+        let mut s = ios.session(ios.env(false, false, true));
+        run(&mut s, "camera_sources", json!({})).expect("sources");
+        assert!(ios.take_log().is_empty());
+        let mut s = ios.session(ios.env(true, false, true));
+        let rows = run(&mut s, "camera_links", json!({"device": "phone"})).expect("links");
+        assert_eq!(ios.take_log(), [format!("serve device:tablet on {}", ios.android_socket("back"))]);
+        assert_eq!(rows[0]["state"], "linked", "{rows}");
+        run(&mut s, "camera_sources", json!({})).expect("sources");
+        assert!(ios.take_log().is_empty(), "once per server");
+    }
+
+    /// `feed:` is simee's own plumbing (what a boot hands emu for a `device:` link): linking it by
+    /// hand is refused, so nothing saves a link the next boot would drop.
+    #[test]
+    fn a_feed_source_is_refused_when_linked_by_hand() {
+        let f = Fixture::new("feed-refused");
+        let mut s = f.session();
+        let err =
+            run(&mut s, "camera_link", json!({"device": "phone", "facing": "back", "source": "feed:/tmp/x.sock"})).expect_err("feed:");
+        assert!(err.contains("feed:") && err.contains("device:"), "{err}");
+        assert_eq!(f.saved(), "", "nothing saved");
     }
 }

@@ -1035,7 +1035,11 @@ fn dispatch(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
                 udids.push(udid);
             }
             match first.map(|(platform, _)| platform) {
-                Some(Platform::Android) => crate::android::boot_many(&mut s.android, p, &udids),
+                Some(Platform::Android) => {
+                    // Saved `device:` links' feeds are served first, as `boot`'s are.
+                    crate::camera::before_boot_many(s, &udids);
+                    crate::android::boot_many(&mut s.android, p, &udids)
+                }
                 _ => {
                     let mut p = p.clone();
                     p["devices"] = udids.into_iter().map(Value::String).collect();

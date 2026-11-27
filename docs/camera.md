@@ -53,7 +53,7 @@ cargo test -p simee-camera lists_host_cameras -- --nocapture
 | `solid:<colour>` | one colour: a name (`red`, `grey`, `orange`, …) or hex (`#336699`, `#369`) |
 | `video:<path>` | not yet: returns `Unsupported` until the VideoToolbox decoder is wired up |
 | `device:<udid or name>[:x,y,w,h]` | another simee device's live screen, optionally cropped to a region in that device's pixels: an AVD name, or a simulator's UDID, name or `booted` (macOS). [Below](#another-devices-screen). |
-| `feed:<socket>` | a camera feed's socket (absolute path): what emu reads another device's screen from, served by simee. Not for linking by hand. |
+| `feed:<socket>` | a camera feed's socket (absolute path): what emu reads another device's screen from, served by simee. Not for linking by hand: `camera_link` refuses it (link `device:`). |
 
 Everything after the first `:` belongs to the source, so `qr:https://example.com/a:b` works. In a
 `device:` id, a last `:x,y,w,h` (four numbers) is the region; any other `:` is part of the name.
@@ -70,21 +70,27 @@ or a document that A shows (pairing and login flows, two-device tests). `crates/
   would unify; there is no feature). `crates/emu-vmm/tests/device_stacks.rs` checks emu's
   dependency graph. Opening a `device:` id anywhere else fails Unsupported, naming the server.
 - **To an Android target** (B is an AVD): the server serves A's screen on a feed per camera,
-  `cam-<facing>.sock` in B's state directory (`sim_android::camera_feed_socket`; a hashed name in
-  a private per-user temp directory when that path is too long), and relinks B's emu to
-  `feed:<socket>` through its console. The link is saved as `device:<A>` (`cameras.ini`); a boot
-  hands emu the feed's socket in its place, and the server serves the saved links' feeds before
-  emu starts (a boot outside the server hands them to it). emu shows the test card until the feed
-  is served, trying again with the backoff above. Outside a server, `camera_link` hands a
-  `device:` link (or the replacement of one) to the running server; with none, it is refused on a
-  running B and saved for the boot on a shut-down one. `camera_links` shows the feed as the
-  `device:` source it serves, `feed missing` when the server serving it restarted.
+  `cam-<facing>.sock` in B's state directory (`sim_android::camera_feed_socket`; when that path is
+  too long for a socket, a hashed name in `/tmp/simee-<uid>`, private (0700, checked ours) and
+  named by the user id, not `$USER` or `$TMPDIR`, so the server and a boot agree on it), and
+  relinks B's emu to `feed:<socket>` through its console. The link is saved as `device:<A>`
+  (`cameras.ini`); a boot hands emu the feed's socket in its place, and the server serves the saved
+  links' feeds before emu starts, for `boot` and `boot_many` alike (a boot outside the server hands
+  them to it). A server that starts while B already runs (the last one stopped or was upgraded)
+  serves the feeds B's emu reads (`camera list` shows `feed:<its socket>`) on its first camera call
+  or boot: lazily, so a server that never touches a camera scans nothing. emu shows the test card
+  until the feed is served, trying again with the backoff above. Outside a server, `camera_link`
+  hands a `device:` link (or the replacement of one) to the running server; with none, it is
+  refused on a running B and saved for the boot on a shut-down one. `camera_links` shows the feed
+  as the `device:` source it serves, `feed missing` when no server serves it.
 - **To an iOS target:** the server's feed for the simulator (the shim's) serves A's screen like any
   source.
 - **Frames:** an Android device's through emu's display socket and shared frame ring, asked for
   only what the camera needs: `fps <camera rate>`, and `hello <width>` with the smallest whole
   downscale of A's screen that keeps the region at the camera's resolution
-  (`device::needed_width`), asked again when A turns. A simulator's through its framebuffer
+  (`device::needed_width`), asked again when A turns and when a larger or faster camera joins the
+  capture (one capture of A serves its largest subscriber, scaled down for each smaller one, never
+  the first subscriber's size scaled up). A simulator's through its framebuffer
   `IOSurface`'s frame callback, copied out when the surface's seed says it changed, at most at the
   camera's rate. Each subscriber size is then drawn in one pass: the region cropped, scaled to fill
   the size (aspect kept, overflow cropped from both sides, nearest neighbour), swizzled to BGRA.
@@ -106,7 +112,10 @@ or a document that A shows (pairing and login flows, two-device tests). `crates/
   simulator source on Linux is `Unsupported`. No first frame within 5 s is a capture error. A
   source device that shuts down mid-capture (its display socket closes; the simulator leaves the
   booted state) ends the capture with `Missing`, reported as `SourceMissing`; the feed tries it
-  again with the backoff, and emu, whose feed goes silent, shows the test card meanwhile.
+  again with the backoff. emu shows the test card ("source missing" in its log) whenever its feed
+  is up but sends no frame for a second (`feed::STALL`): A not booted yet when B boots, or A shut
+  down mid-stream; never black or A's last frame. It stays connected, so A's frames replace the
+  card as soon as they come again.
 
 ```bash
 simee open-url <A> https://example.com/qr                  # iOS; on Android: adb -s <serial> shell am start -a android.intent.action.VIEW -d <url>

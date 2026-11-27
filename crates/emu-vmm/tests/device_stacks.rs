@@ -2,98 +2,113 @@
 //! camera as a `feed:` the simee server serves, so nothing emu builds may depend on
 //! `simee-android` or `simee-coresim`, behind a feature or not. Cargo unifies features across the
 //! packages one invocation builds (`cargo build -p simee -p simee-emu`, as the release does), so an
-//! optional dependency that simee's side enables would reach emu too: this walks every workspace
-//! dependency emu's manifest can reach, optional ones included, whatever their features.
+//! optional dependency that simee's side enables would reach emu too: this asks Cargo's own
+//! resolver (`cargo tree`, offline) which packages depend on each stack with every workspace
+//! feature on and the dependencies of every target emu builds for, following normal ones only (emu's own
+//! dev-dependencies don't link into it). Cargo resolves the manifests, so a dependency table
+//! (`[dependencies.x]`, `[target.'cfg(..)'.dependencies.x]`), a path dependency under another key
+//! (`foo = { path = "..", package = "simee-android" }`) or a workspace one are all seen.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// The crates emu must never reach.
 const DEVICE_STACKS: [&str; 2] = ["simee-android", "simee-coresim"];
 
-/// `[workspace.dependencies]` entries with a path: dependency key -> (package name, directory).
-fn workspace_crates(root: &Path) -> BTreeMap<String, (String, PathBuf)> {
-    let text = std::fs::read_to_string(root.join("Cargo.toml")).expect("workspace Cargo.toml");
-    let mut out = BTreeMap::new();
-    let mut in_deps = false;
-    for line in text.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_deps = line == "[workspace.dependencies]";
-            continue;
-        }
-        if !in_deps || !line.contains("path =") {
-            continue;
-        }
-        let Some((key, rest)) = line.split_once('=') else { continue };
-        let field = |name: &str| {
-            let at = rest.find(&format!("{name} = \""))? + name.len() + 4;
-            rest[at..].split('"').next().map(str::to_owned)
-        };
-        let path = field("path").expect("a path");
-        let package = field("package").unwrap_or_else(|| key.trim().to_owned());
-        out.insert(key.trim().to_owned(), (package, root.join(path)));
-    }
-    out
-}
+/// The targets emu builds for, whose target-specific dependencies count.
+const TARGETS: [&str; 3] = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"];
 
-/// The dependency keys a manifest names in its `[dependencies]` and target dependency tables
-/// (not dev- or build-dependencies), optional ones included.
-fn dependency_keys(manifest: &Path) -> Vec<String> {
-    let text = std::fs::read_to_string(manifest).unwrap_or_else(|e| panic!("{}: {e}", manifest.display()));
-    let mut keys = Vec::new();
-    let mut in_deps = false;
-    for line in text.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_deps = line == "[dependencies]" || (line.starts_with("[target.") && line.ends_with(".dependencies]"));
-            continue;
+/// The packages of the workspace at `root` that depend on `stack` through normal dependencies
+/// (itself included), with every feature of every member on and the dependencies of [`TARGETS`]:
+/// empty when the workspace has no such package.
+fn dependents(root: &Path, stack: &str) -> Vec<String> {
+    let tree = |offline: bool| {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let mut cmd = Command::new(cargo);
+        cmd.args(["tree", "--workspace", "--all-features", "-e", "normal", "--prefix", "none", "--format", "{p}", "-i", stack]);
+        for target in TARGETS {
+            cmd.args(["--target", target]);
         }
-        if in_deps
-            && !line.starts_with('#')
-            && let Some((key, _)) = line.split_once(['=', '.'])
-            && !key.trim().is_empty()
-        {
-            keys.push(key.trim().to_owned());
+        if offline {
+            cmd.arg("--offline");
         }
+        cmd.arg("--manifest-path").arg(root.join("Cargo.toml")).output().expect("cargo tree runs")
+    };
+    // Offline first; a host that hasn't fetched another target's crates (a Linux CI runner and
+    // the macOS-only ones) fetches them.
+    let mut out = tree(true);
+    if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("--offline was specified") {
+        out = tree(false);
     }
-    keys
-}
-
-/// Every workspace package reachable from the manifest in `dir`, by name, with the path to it.
-fn reachable(dir: &Path, crates: &BTreeMap<String, (String, PathBuf)>) -> BTreeMap<String, Vec<String>> {
-    let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut todo = vec![(dir.to_path_buf(), vec!["simee-emu".to_owned()])];
-    let mut visited = BTreeSet::new();
-    while let Some((dir, path)) = todo.pop() {
-        if !visited.insert(dir.clone()) {
-            continue;
-        }
-        for key in dependency_keys(&dir.join("Cargo.toml")) {
-            let Some((package, at)) = crates.get(&key) else { continue };
-            let mut via = path.clone();
-            via.push(package.clone());
-            seen.entry(package.clone()).or_insert_with(|| via.clone());
-            todo.push((at.clone(), via));
-        }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        // A workspace without that package has nothing depending on it.
+        assert!(stderr.contains("did not match any packages"), "cargo tree -i {stack}: {stderr}");
+        return Vec::new();
     }
-    seen
+    let mut names: Vec<String> =
+        String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.split_whitespace().next()).map(str::to_owned).collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 #[test]
 fn emu_reaches_neither_device_stack_even_through_optional_dependencies() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let emu = root.join("apps/emu");
-    if !emu.join("Cargo.toml").is_file() {
+    if !root.join("apps/emu/Cargo.toml").is_file() {
         eprintln!("skipped: not in the simee workspace, so apps/emu isn't here");
         return;
     }
-    let crates = workspace_crates(&root);
-    assert!(crates.values().any(|(p, _)| p == "simee-android"), "the walk sees the workspace's crates: {crates:?}");
-    let seen = reachable(&emu, &crates);
-    assert!(seen.contains_key("simee-camera") && seen.contains_key("simee-emu-vmm"), "the walk follows emu's dependencies: {seen:?}");
     for stack in DEVICE_STACKS {
-        assert!(!seen.contains_key(stack), "emu reaches {stack}: {}", seen[stack].join(" -> "));
+        let on = dependents(&root, stack);
+        assert!(!on.iter().any(|p| p == "simee-emu"), "emu reaches {stack}: {stack} is a dependency of {on:?}");
+        // simee itself does link it: the walk would see emu if it did.
+        assert!(on.iter().any(|p| p == "simee"), "the walk sees simee reach {stack}: {on:?}");
+        assert!(on.iter().any(|p| p == stack), "{on:?}");
     }
-    // simee itself does link them: the walk would see it if emu did.
-    let simee = reachable(&root.join("apps/simee"), &crates);
-    assert!(DEVICE_STACKS.iter().all(|s| simee.contains_key(*s)), "{simee:?}");
+    let camera = dependents(&root, "simee-camera");
+    assert!(camera.iter().any(|p| p == "simee-emu"), "the walk follows emu's dependencies: {camera:?}");
+}
+
+/// A throwaway workspace whose emu reaches simee-android in the ways a manifest-text walk missed:
+/// a dependency table (`[target.'cfg(unix)'.dependencies.mid]`), and a path dependency under
+/// another key (`droid = { path = .., package = "simee-android", optional = true }`).
+fn fixture(tag: &str) -> PathBuf {
+    let root = PathBuf::from("/tmp").join(format!("emu-stacks-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let write = |path: &str, text: &str| {
+        let at = root.join(path);
+        std::fs::create_dir_all(at.parent().expect("dir")).expect("mkdir");
+        std::fs::write(at, text).expect("write");
+    };
+    write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"apps/emu\", \"crates/mid\", \"crates/android\"]\n\n\
+         [workspace.dependencies]\nmid = { path = \"crates/mid\" }\n",
+    );
+    write(
+        "apps/emu/Cargo.toml",
+        "[package]\nname = \"simee-emu\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[target.'cfg(unix)'.dependencies.mid]\nworkspace = true\n",
+    );
+    write(
+        "crates/mid/Cargo.toml",
+        "[package]\nname = \"mid\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[features]\nscreens = [\"dep:droid\"]\n\n\
+         [dependencies]\ndroid = { path = \"../android\", package = \"simee-android\", optional = true }\n",
+    );
+    write("crates/android/Cargo.toml", "[package]\nname = \"simee-android\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    for krate in ["apps/emu", "crates/mid", "crates/android"] {
+        write(&format!("{krate}/src/lib.rs"), "");
+    }
+    root
+}
+
+#[test]
+fn a_dependency_table_or_a_renamed_path_dependency_is_caught() {
+    let root = fixture("forms");
+    let on = dependents(&root, "simee-android");
+    let none = dependents(&root, "simee-coresim");
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(on.iter().any(|p| p == "simee-emu") && on.iter().any(|p| p == "mid"), "{on:?}");
+    assert!(none.is_empty(), "no such package: nothing depends on it: {none:?}");
 }
