@@ -641,7 +641,8 @@ fn burst_server(count: usize, size: usize) -> (u16, std::thread::JoinHandle<()>)
 fn arrivals(n: &mut Nat, count: usize, start: Instant, mut each: impl FnMut(&mut Nat, usize)) -> Vec<Duration> {
     let mut at = Vec::new();
     while at.len() < count {
-        let f = next_frame(n, Duration::from_secs(10), |f| matches!(packet::parse(f), Frame::Udp { .. })).expect("datagram");
+        let f = next_frame(n, Duration::from_secs(10), |f| matches!(packet::parse(f), Frame::Udp { .. }))
+            .unwrap_or_else(|| panic!("datagram {} of {count} never came (the one before it at {:?})", at.len() + 1, at.last()));
         assert!(matches!(packet::parse(&f), Frame::Udp { .. }));
         at.push(start.elapsed());
         each(n, at.len());
