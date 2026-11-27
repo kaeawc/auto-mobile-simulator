@@ -89,7 +89,8 @@ mod tests {
     fn the_newest_frame_is_the_picture_with_its_capture_time_and_count_of_skipped_ones() {
         let display = fake_display("source", (6, 4), 4, Duration::from_millis(20));
         let mut source = AndroidSource::connect(&display.dir, 0).expect("connect");
-        assert!(source.picture().expect("picture").is_none(), "nothing before the first frame");
+        assert!(source.picture().expect("picture").is_none(), "nothing before the first frame: the display holds them back");
+        display.go();
         let first = source.wait(Instant::now() + Duration::from_secs(5)).expect("wait").expect("a frame");
         std::thread::sleep(Duration::from_millis(200));
         let picture = source.picture().expect("picture").expect("a picture");

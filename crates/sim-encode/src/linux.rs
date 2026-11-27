@@ -26,6 +26,11 @@ fn encoder_error(what: &str, e: impl std::fmt::Display) -> Error {
 const MAX_LONG_SIDE: u32 = 3840;
 const MAX_SHORT_SIDE: u32 = 2160;
 
+/// The ceiling OpenH264 is given when [`EncoderConfig::max_bitrate_bps`] is `None`, and the most
+/// any target can be: 240 Mbit/s, under level 5.2's maximum. Above that OpenH264 pulls its ceiling
+/// back to the stream's level maximum, which can fall under the target and refuse it.
+const NO_CEILING: u32 = 240_000_000;
+
 /// An [`I420`] as the encoder's input.
 struct Planes<'a>(&'a I420);
 
@@ -86,7 +91,7 @@ impl OpenH264Encoder {
         if config.hardware == Hardware::Require {
             return Err(Error::Unsupported("OpenH264 is a software encoder; Linux has no hardware H.264 path here yet".into()));
         }
-        let bitrate = config.clamp_bitrate(u64::from(config.bitrate_bps));
+        let bitrate = config.clamp_bitrate(u64::from(config.bitrate_bps)).min(NO_CEILING);
         Ok(OpenH264Encoder {
             config,
             bitrate,
@@ -167,9 +172,10 @@ impl OpenH264Encoder {
         Ok(())
     }
 
-    /// What the encoder may reach: the ceiling, or the target itself when there is none.
+    /// What a retarget may reach: [`EncoderConfig::max_bitrate_bps`], or [`NO_CEILING`] without
+    /// one. Never under the target itself.
     fn ceiling(&self, bps: u32) -> u32 {
-        self.config.max_bitrate_bps.map_or(bps, |m| m.max(bps))
+        self.config.max_bitrate_bps.unwrap_or(NO_CEILING).min(NO_CEILING).max(bps)
     }
 }
 
@@ -180,10 +186,7 @@ fn retarget(encoder: &mut RawEncoder, bps: u32, ceiling: u32) -> Result<()> {
         ENCODER_OPTION, ENCODER_OPTION_BITRATE, ENCODER_OPTION_MAX_BITRATE, LAYER_NUM, SBitrateInfo, SPATIAL_LAYER_0, SPATIAL_LAYER_ALL,
     };
     let mut set = |option: ENCODER_OPTION, layer: LAYER_NUM, bits: u32| -> Result<()> {
-        let mut info = SBitrateInfo {
-            iLayer: layer,
-            iBitrate: i32::try_from(bits).map_err(|_| Error::InvalidInput(format!("bitrate {bits} bit/s")))?,
-        };
+        let mut info = SBitrateInfo { iLayer: layer, iBitrate: i32::try_from(bits).unwrap_or(i32::MAX) };
         // SAFETY: `raw_api` is `unsafe` because a caller can change parameters the safe wrapper
         // relies on; the bitrate and its ceiling are not among them (the wrapper reads neither
         // back). The encoder is initialised (this runs after its first picture). `SetOption`
@@ -246,7 +249,7 @@ impl Encoder<Picture> for OpenH264Encoder {
     }
 
     fn set_bitrate(&mut self, bps: u64) -> Result<()> {
-        self.bitrate = self.config.clamp_bitrate(bps);
+        self.bitrate = self.config.clamp_bitrate(bps).min(NO_CEILING);
         Ok(())
     }
 }

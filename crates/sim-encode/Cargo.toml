@@ -10,7 +10,7 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["h264", "videotoolbox", "encoder", "streaming", "simulator"]
 categories = ["multimedia::video", "multimedia::encoding"]
-include = ["/Cargo.toml", "/LICENSE", "/examples", "/src"]
+include = ["/Cargo.toml", "/LICENSE", "/build.rs", "/examples", "/src"]
 
 [lib]
 doctest = false

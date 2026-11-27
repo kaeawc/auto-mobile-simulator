@@ -314,9 +314,16 @@ have emu shrink frames by a whole factor before they're sent (`hello <max_width>
 re-request after a dropped IDR and `Controls::set_bitrate` work unchanged. It is behind
 `simee-encode`'s `openh264` feature (off by default, Linux only); without the feature
 `simee_encode::available()` is false there, as before, and everything else builds and tests on
-every host. Building with the feature compiles OpenH264's C++ (`g++`; with `nasm` on x86_64 the
-encoder is 2.4x faster, see [Encode cost on Linux](#encode-cost-on-linux)); no system library is
+every host. Building with the feature compiles OpenH264's C++ (`g++`); no system library is
 needed at run time.
+
+**Install `nasm` on x86_64.** `openh264-sys2` assembles OpenH264's SIMD with `nasm`, and without it
+silently builds the plain C++: the encoder is 2.4 times slower (61.8 ms against 26.1 ms per
+full-size picture, [Encode cost on Linux](#encode-cost-on-linux)). `apt-get install nasm` (CI's
+`linux` job does) before the first build; `nasm` appearing later doesn't rebuild anything, so
+`cargo clean -p openh264-sys2` after installing it. `simee-encode`'s build script prints a cargo
+warning on x86 Linux with the feature when `nasm` isn't found, or when `OPENH264_NO_ASM` is set.
+aarch64 needs nothing: its NEON code is assembled by `cc`.
 
 ```bash
 cargo test -p simee-encode --features openh264
@@ -347,7 +354,12 @@ for again.
   takes effect on the next picture through `SetOption`: the ceiling on spatial layer 0 first (a
   target over the layer's ceiling is refused; `SPATIAL_LAYER_ALL` would set another limit), then
   the target. OpenH264 has no equivalent of `DataRateLimits` (a limit over one second):
-  `max_bitrate_bps` is the ceiling a retarget may reach and the encoder's per-layer maximum.
+  `max_bitrate_bps` is the ceiling a retarget may reach and the encoder's per-layer maximum. With
+  `max_bitrate_bps: None` the ceiling is 240 Mbit/s (under level 5.2's maximum, above which
+  OpenH264 pulls its ceiling back under the target and refuses it), which is also the most any
+  target can be, so an absurd request never fails the stream. The encoder starts with its
+  ceiling equal to the starting target (the Rust wrapper can't set it earlier), so the first
+  picture is held to it; the real ceiling is set right after.
 - *Colour.* The frames arrive as 32-bit RGBA or BGRA (emu's ring is RGBA) and are converted to
   I420 in `i420.rs`: BT.709, limited range, each chroma sample the mean of its 2x2 block, and the
   SPS says so (VUI colour description), which is what a browser assumes for HD video anyway.
@@ -387,10 +399,11 @@ unless a build asks for it. Whether to ship an encoder built from source, or to 
 feature on, `cargo clippy --target x86_64-unknown-linux-gnu` from a Mac stops in `openh264-sys2`'s
 build script (the same reason `simee-rtc`'s `rust-crypto` is opt-in). Checked here by linting
 `aarch64-unknown-linux-gnu` from an x86_64 host: it passes without the feature and fails with
-`failed to find tool "aarch64-linux-gnu-g++"` with it. CI's `linux` job and the pre-push hook
-therefore don't build or run the Linux encoder until they pass `--features openh264` to
-`simee-encode` (`cargo clippy -p simee-encode --all-targets --features openh264` and
-`cargo test -p simee-encode --features openh264`).
+`failed to find tool "aarch64-linux-gnu-g++"` with it. So the pre-push hook doesn't build the
+Linux encoder; CI's `linux` job does, with its own steps after the workspace's: `nasm` installed,
+`cargo clippy -p simee-encode --all-targets --features openh264` and
+`cargo nextest run -p simee-encode --features openh264`. Run the same before pushing a change
+to `src/linux.rs`, `tests/openh264.rs` or the bench.
 
 ### Encode cost
 
@@ -506,7 +519,8 @@ BGRA and RGBA giving identical streams, BT.709 colours after a lossy round trip,
 up and down (bytes per picture 1235, 13627 and 413 at 200 kbit/s, 3 Mbit/s and 200 kbit/s again
 on noise; with the `SetOption` call removed the second figure is 822 and the test fails), a
 picture the rate control skips, the refusals (hardware required, over 3840x2160, a short buffer,
-fps 0), and the whole loop on a fake source and clock with the real encoder (the 30 fps cap, an
+fps 0), a retarget with no ceiling (not held to the starting target, an absurd request held to
+240 Mbit/s, the SPS unchanged), and the whole loop on a fake source and clock with the real encoder (the 30 fps cap, an
 IDR requested mid-run answered by the next picture, a retarget). The same tests passed on
 `aarch64-unknown-linux-gnu` under `qemu-user` (OpenH264 built from source with its NEON code)
 and on x86_64 with `OPENH264_NO_ASM=1`.
@@ -604,9 +618,9 @@ it. A real stream end to end (Chromium over WHEP) is #268's.
   methods; they aren't built yet.
 - **Linux hardware encoders** (VA-API, NVENC, V4L2) and a faster software path: OpenH264 runs one
   thread (one slice) per encoder, a full-size stream tops out near 30 fps on the VM measured, and
-  the colour conversion is single-threaded. The Linux encoder is behind the `openh264` feature,
-  which CI's `linux` job doesn't enable yet (see "Linux: OpenH264" for the commands), and
-  `libloading` (Cisco's binary, with its patent coverage) isn't offered.
+  the colour conversion is single-threaded. The Linux encoder is behind the `openh264` feature
+  (`scripts/check.sh` doesn't build it; CI's `linux` job does), and `libloading` (Cisco's binary,
+  with its patent coverage) isn't offered.
 - **Pipelined encoding.** One picture is in flight at a time, so a full-size iPhone stream can't
   quite reach 60 fps (17 ms per moving frame); submitting the next frame before the previous one
   is out would lift the rate, not the latency.

@@ -187,12 +187,21 @@ pub(crate) mod tests {
 
     use sim_core::stream::FrameHeader;
 
-    /// A display socket in a fresh AVD directory that, once a client has said hello, sends
-    /// `frames` solid frames of `size` (frame `i` is filled with byte `i`), one every `gap`, on
-    /// the socket itself (no ring), then keeps the connection open until `done` is dropped.
+    /// A display socket in a fresh AVD directory. Once a client has connected, it sends nothing
+    /// until [`FakeDisplay::go`]; then it sends `frames` solid frames of `size` (frame `i` is
+    /// filled with byte `i`), one every `gap`, on the socket itself (no ring), and keeps the
+    /// connection open until it is dropped. Holding the frames back is what lets a test look at
+    /// the source before any frame exists.
     pub(crate) struct FakeDisplay {
         pub(crate) dir: std::path::PathBuf,
+        go: std::sync::mpsc::Sender<()>,
         _done: std::sync::mpsc::Sender<()>,
+    }
+
+    impl FakeDisplay {
+        pub(crate) fn go(&self) {
+            self.go.send(()).expect("the fake display is running");
+        }
     }
 
     pub(crate) fn fake_display(name: &str, size: (u32, u32), frames: u8, gap: Duration) -> FakeDisplay {
@@ -200,11 +209,16 @@ pub(crate) mod tests {
         let state = emu_avd::state_dir(&dir);
         std::fs::create_dir_all(&state).expect("state dir");
         let listener = UnixListener::bind(state.join("display.sock")).expect("bind");
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let (done, done_rx) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
             let Ok((mut conn, _)) = listener.accept() else { return };
-            let mut hello = [0u8; 1];
+            // Wait for the test's go (or for the test to end).
+            if go_rx.recv().is_err() {
+                return;
+            }
             // The client's request lines come first; any byte means it is connected.
+            let mut hello = [0u8; 1];
             let _ = conn.read(&mut hello);
             for i in 0..frames {
                 let header = FrameHeader::new(size.0, size.1, size.0, size.1, u64::from(i)).expect("header");
@@ -216,9 +230,9 @@ pub(crate) mod tests {
                 std::thread::sleep(gap);
             }
             // Hold the connection until the test ends.
-            let _ = rx.recv();
+            let _ = done_rx.recv();
         });
-        FakeDisplay { dir, _done: tx }
+        FakeDisplay { dir, go, _done: done }
     }
 
     impl Drop for FakeDisplay {
@@ -231,6 +245,7 @@ pub(crate) mod tests {
     fn frames_are_reported_once_and_taken_newest_with_the_count_of_those_skipped() {
         let display = fake_display("reader", (4, 2), 5, Duration::from_millis(20));
         let mut reader = FrameReader::connect(&display.dir, 0).expect("connect");
+        display.go();
         let soon = || Instant::now() + Duration::from_secs(5);
         let first = reader.wait(soon()).expect("wait").expect("a frame");
         // Let the rest arrive: the reader keeps only the newest.
@@ -252,6 +267,7 @@ pub(crate) mod tests {
     fn a_closed_display_ends_the_wait_with_an_error() {
         let display = fake_display("closed", (2, 2), 1, Duration::ZERO);
         let mut reader = FrameReader::connect(&display.dir, 0).expect("connect");
+        display.go();
         assert!(reader.wait(Instant::now() + Duration::from_secs(5)).expect("wait").is_some());
         reader.link.shutdown(std::net::Shutdown::Both).expect("shutdown");
         let err = reader.wait(Instant::now() + Duration::from_secs(5)).expect_err("closed");

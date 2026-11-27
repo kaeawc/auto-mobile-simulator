@@ -164,7 +164,9 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   built from source, behind the off-by-default `openh264` feature so the Linux cross-clippy from
   macOS needs no C++ toolchain), `i420.rs` (BGRA/RGBA to BT.709 I420 and the `max_size` downscale,
   on reused buffers), `android_frames.rs` (the display-socket reader both platforms' `AndroidSource`
-  use), `linux_source.rs`; `examples/linux_bench.rs` (scripts/bench/encode-linux.sh).
+  use), `linux_source.rs`, `build.rs` (a cargo warning when the feature builds OpenH264 on x86 without
+  `nasm`, 2.4x slower); `examples/linux_bench.rs` (scripts/bench/encode-linux.sh). CI's `linux` job
+  lints and tests the crate with `--features openh264`; `scripts/check.sh` doesn't.
 - `crates/sim-android` — the Android backend's client: AVDs as labelled devices, system images as
   runtimes, AVD creation shaped by form factor, starting `emu` and waiting for boot, the console
   client (`console.rs`) and the display socket client (`display.rs`). No FFI.

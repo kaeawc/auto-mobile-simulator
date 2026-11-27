@@ -197,6 +197,42 @@ fn the_bitrate_follows_set_bitrate_in_both_directions() {
 }
 
 #[test]
+fn without_a_ceiling_a_retarget_is_not_held_to_the_starting_target() {
+    // `max_bitrate_bps: None`: nothing caps a retarget (OpenH264 itself isn't told the target is
+    // its maximum), and an absurd request is held to what the encoder accepts rather than
+    // failing this and every later picture.
+    let config = EncoderConfig { bitrate_bps: 200_000, max_bitrate_bps: None, ..config() };
+    let mut encoder = OpenH264Encoder::new(config).expect("config");
+    let bytes = |encoder: &mut OpenH264Encoder, from: u32, n: u32| -> usize {
+        (from..from + n)
+            .map(|i| {
+                let picture = synthetic::picture(Content::Noise, 160, 320, i, PixelOrder::Rgba);
+                encoder.encode(&picture, ms(33) * i, false).expect("encode").iter().map(|u| u.data.len()).sum::<usize>()
+            })
+            .sum()
+    };
+    bytes(&mut encoder, 0, 30);
+    let low = bytes(&mut encoder, 30, 60);
+    encoder.set_bitrate(3_000_000).expect("set");
+    bytes(&mut encoder, 90, 30);
+    let high = bytes(&mut encoder, 120, 60);
+    assert!(high > low * 3, "{low} bytes at 200 kbit/s, then {high} at 3 Mbit/s");
+    for absurd in [u64::from(u32::MAX) + 1, u64::MAX] {
+        encoder.set_bitrate(absurd).expect("set");
+        assert_eq!(encoder.bitrate(), 240_000_000, "held to what OpenH264 accepts");
+        bytes(&mut encoder, 180, 3);
+    }
+    // Retargets don't change the level the stream was announced at: a publisher negotiated it.
+    let before = encoder.parameter_sets().sps().map(<[u8]>::to_vec);
+    let idr = (200..220).find_map(|i| {
+        let picture = synthetic::picture(Content::Noise, 160, 320, i, PixelOrder::Rgba);
+        encoder.encode(&picture, ms(33) * i, true).expect("encode").into_iter().find(|u| u.keyframe)
+    });
+    assert!(idr.is_some(), "a requested IDR came out");
+    assert_eq!(encoder.parameter_sets().sps().map(<[u8]>::to_vec), before, "the SPS is the same after every retarget");
+}
+
+#[test]
 fn a_picture_the_encoder_skips_comes_back_as_no_access_unit() {
     // Noise can't fit 100 kbit/s: after the first IDR the rate control skips pictures. Every unit
     // that does come out still decodes, and forced IDRs eventually come out (the loop asks again
