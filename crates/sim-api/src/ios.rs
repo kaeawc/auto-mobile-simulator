@@ -624,6 +624,30 @@ fn capture(s: &mut Session, p: &Value) -> Result<sim_core::frame::Frame, String>
     }
 }
 
+/// `contrast_check` on a simulator: its screen, its scale, and `appearance`'s two modes.
+struct ContrastTarget<'a> {
+    s: &'a mut Session,
+    p: &'a Value,
+}
+
+impl crate::contrast::Target for ContrastTarget<'_> {
+    fn capture(&mut self) -> Result<sim_core::frame::Frame, String> {
+        capture(self.s, self.p)
+    }
+
+    fn scale(&mut self) -> Option<f64> {
+        self.s.device(self.p).ok()?.device_type().ok().map(|t| t.screen_scale).filter(|s| *s > 0.0)
+    }
+
+    fn set_appearance(&mut self, mode: crate::contrast::Mode) -> Result<(), String> {
+        let mode = match mode {
+            crate::contrast::Mode::Light => Appearance::Light,
+            crate::contrast::Mode::Dark => Appearance::Dark,
+        };
+        self.s.device(self.p)?.set_appearance(mode).map_err(err)
+    }
+}
+
 /// The simulators to resolve a `device` across platforms with: what selection reads of each.
 pub fn selection_infos(s: &mut Session) -> Result<Vec<sim_core::device::DeviceInfo>, String> {
     s.ctx()?.selection_infos().map_err(err)
@@ -929,7 +953,11 @@ pub const PROFILES: &[Profile] = &[Profile { name: "slim", disabled: SLIM }];
 /// syslogd/logd (`logs`), configd_sim and nsurlsessiond (networking), and what simee's own
 /// methods reach in the device: carkitd (`carplay`), biometrickitd (`biometric`), apsd (`push`),
 /// securityd (`reset_keychain`), cfprefsd (`defaults_*`, `keyboard_language`), notifyd (`notify`,
-/// `memory_warning`), mediaserverd (audio).
+/// `memory_warning`), mediaserverd (audio). Also kept though a slim clone spends 1-6 CPU-s on each
+/// in its first two minutes: donotdisturbd and liveactivitiesd (notification delivery, Live
+/// Activities), AuthenticationServicesAgent (password AutoFill, passkeys), callservicesd
+/// (CallKit), calaccessd (EventKit), mobileassetd (keyboard and font assets), identityservicesd
+/// and diagnosticd (the log stream).
 const SLIM: &[&str] = &[
     // Lock and home screen wallpapers: PosterBoard and the ~15 poster extensions it keeps alive.
     "com.apple.PosterBoard",
@@ -1006,6 +1034,26 @@ const SLIM: &[&str] = &[
     "com.apple.jetpackassetd",
     "com.apple.replicatord",
     "com.apple.diagnosticextensionsd",
+    // What a slim clone still spent its first two minutes on (measured per job, iOS 27.2 and
+    // 18.6; docs/farm.md). App Intents: linkd runs donotdisturbd's Focus-filter first-launch task,
+    // which starts the Calendar, Safari and Messages intents extensions and Calendar itself
+    // 13-38 s after the boot (~8 CPU-s, the burst that held the settle window open).
+    "com.apple.linkd",
+    // Watch faces and settings sync, with no watch paired.
+    "com.apple.nanotimekitcompaniond",
+    "com.apple.nanoprefsyncd.2",
+    // Exchange/CalDAV/CardDAV account sync (no accounts) and Safari's breached-password lookups.
+    "com.apple.dataaccess.dataaccessd",
+    "com.apple.Safari.passwordbreachd",
+    // Fitness: activity sharing, awards, Fitness+ (healthd is off already).
+    "com.apple.activitysharingd",
+    "com.apple.activityawardsd",
+    "com.apple.fitcore",
+    // Focus status sharing, Memoji, Apple Intelligence's model catalog, Family Sharing alerts.
+    "com.apple.StatusKitAgent",
+    "com.apple.avatarsd",
+    "com.apple.modelcatalogd",
+    "com.apple.familynotification",
 ];
 
 fn profile(name: &str) -> Result<&'static Profile, String> {
@@ -1596,6 +1644,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         }
         // Captured on the device's worker, encoded here: the worker is free for input meanwhile.
         "screenshot" => screenshot_result(&capture(s, p)?, p),
+        "contrast_check" => crate::contrast::run(&mut ContrastTarget { s, p }, p),
         m if INPUT_METHODS.contains(&m) => input(s, m, p),
         "rotate" => rotate(&s.device(p)?, opt_orientation(p)?),
         "fold" => {
@@ -2949,9 +2998,50 @@ mod tests {
         // later boot and the device never settles (docs/farm.md).
         let slim = profile("slim").expect("slim");
         assert!(!slim.disabled.contains(&"com.apple.sleepd"));
-        assert_eq!(slim.disabled.len(), 62);
+        assert_eq!(slim.disabled.len(), 74);
         for companion in ["com.apple.companionappd", "com.apple.NPKCompanionAgent", "com.apple.brook.brookcompaniond"] {
             assert!(slim.disabled.contains(&companion), "{companion} stays in: re-applied on every boot");
+        }
+    }
+
+    #[test]
+    fn the_slim_profile_turns_off_what_a_fresh_clone_still_burns_cpu_on() {
+        // Measured per launchd job in a slim clone's first 120 s (iOS 27.2 and 18.6, docs/farm.md):
+        // linkd runs donotdisturbd's Focus-filter first-launch task, which starts the Calendar,
+        // Safari and Messages App Intents extensions and Calendar itself 13-38 s after the boot,
+        // the burst that held the settle window open; the rest are watch, account-sync, fitness
+        // and Focus-status daemons with nothing to do on a test device.
+        let slim = profile("slim").expect("slim");
+        for label in [
+            "com.apple.linkd",
+            "com.apple.nanotimekitcompaniond",
+            "com.apple.nanoprefsyncd.2",
+            "com.apple.dataaccess.dataaccessd",
+            "com.apple.Safari.passwordbreachd",
+            "com.apple.activitysharingd",
+            "com.apple.activityawardsd",
+            "com.apple.fitcore",
+            "com.apple.StatusKitAgent",
+            "com.apple.avatarsd",
+            "com.apple.modelcatalogd",
+            "com.apple.familynotification",
+        ] {
+            assert!(slim.disabled.contains(&label), "{label}");
+        }
+        // Heavy too, but app flows reach them: notifications and Focus (push), Live Activities,
+        // password AutoFill and passkeys, CallKit, EventKit, assets the keyboard and fonts load,
+        // and the log stream `logs` reads.
+        for kept in [
+            "com.apple.donotdisturbd",
+            "com.apple.liveactivitiesd",
+            "com.apple.AuthenticationServicesCore.AuthenticationServicesAgent",
+            "com.apple.telephonyutilities.callservicesd",
+            "com.apple.calaccessd",
+            "com.apple.mobileassetd",
+            "com.apple.identityservicesd",
+            "com.apple.diagnosticd",
+        ] {
+            assert!(!slim.disabled.contains(&kept), "{kept} is needed");
         }
     }
 

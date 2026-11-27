@@ -17,6 +17,7 @@
 //! macOS hosts; elsewhere they fail with a clear reason.
 
 mod android;
+mod contrast;
 #[cfg(target_os = "macos")]
 mod duo;
 mod forward;
@@ -27,6 +28,7 @@ mod ios;
 mod ios;
 mod methods;
 mod params;
+pub mod prefs;
 mod schema;
 pub mod settle;
 

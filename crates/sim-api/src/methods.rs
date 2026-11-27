@@ -70,6 +70,24 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          from a golden that has booted under simee (copy-on-write clones of its disks). A booted-once template's copies skip the \
          first-boot work",
     ),
+    (
+        "export",
+        "device, to",
+        "Pack a shut-down device into a portable bundle at `to` (a .tar file, else a new directory) with no host path in it: \
+         manifest.json and content-addressed chunks (1 MiB, BLAKE3, each LZ4-compressed; zero ranges stored as extents). \
+         Android: an AVD that has booted under simee (its simee disks, config.ini without host paths, boot.prop) and \
+         its system image's identity; captures disks, not RAM (resume is a cold boot). Returns sizes, the identity and the \
+         secrets inventory. iOS simulators: not yet (the next step of #170)",
+    ),
+    (
+        "import",
+        "from, name, allow_mismatch?(false)",
+        "Create device `name` from a bundle `export` wrote. Android: finds the system image by content (API, tag, ABI, revision, \
+         BLAKE3 of its images, fingerprint) and refuses, naming what to install, when none matches (allow_mismatch: use another \
+         installed revision of the same API, tag and ABI, named in `mismatch`); checks every chunk and disk hash; drops \
+         config.ini keys holding host paths (listed in `dropped`); writes nothing unless it all succeeds. The import keeps the \
+         exported device's guest identity (ro.serialno, android_id). iOS: not yet",
+    ),
     ("shutdown", "device", "Shut down"),
     ("erase", "device", "Erase content and settings (shut down first)"),
     (
@@ -83,6 +101,16 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "device, path?, display?(main|outer|inner|carplay)",
         "PNG to path, else base64 in `png` (a folded Android foldable: its outer screen as the scanout shows it, a Pixel Fold's 949x1840; \
          an iPhone Duo's inner screen as its framebuffer holds it, 2007x2853)",
+    ),
+    (
+        "contrast_check",
+        "device, region?, scale?, appearance?(both), restore?(light|dark), settle_ms?(500), path?, display?(main|outer|inner|carplay)",
+        "Text and controls below WCAG contrast in a screenshot, from pixels alone: finds text-like regions, estimates each one's foreground and \
+         background, and reports those under 4.5:1 (normal text) or 3:1 (large text of about 18 pt, icons and controls) with their box, the \
+         two colours and the ratio, and the screenshot with the findings boxed (`png`, or written to path). Text over a photo or a busy \
+         background has no one background and isn't judged. appearance both (iOS) checks the light and the dark UI (switches, waits settle_ms, \
+         checks) and leaves the device in restore (default light); Android can't switch appearance yet. region is {x, y, width, height} \
+         in pixels; scale is pixels per point (default: the device's, else 1)",
     ),
     (
         "tap",
@@ -112,17 +140,22 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     ("type", "device, text", "Type on the hardware keyboard (iOS: a key report every 3 ms)"),
     ("key", "device, usage", "Press a key by HID usage (iOS: down and up 3 ms apart)"),
-    ("open_url", "device, url", "Open a URL"),
-    ("install", "device, path", "Install an .app"),
-    ("uninstall", "device, bundle_id", "Uninstall an app"),
+    ("open_url", "device, url", "Open a URL (Android: `am start -a VIEW`)"),
+    (
+        "install",
+        "device, path",
+        "Install an .app (Android: an .apk with `adb install -r`, an .aab through bundletool when it is on the PATH)",
+    ),
+    ("uninstall", "device, bundle_id", "Uninstall an app (Android: the package name; `pm uninstall`)"),
     (
         "launch",
-        "device, bundle_id, args?, env?, shaped?, restart?",
-        "Launch with arguments and environment (shaped: inject the network shaper; restart: terminate a running instance \
-         first, default true; false brings a running app to the front); returns pid",
+        "device, bundle_id, restart?; iOS: args?, env?, shaped?",
+        "Launch (iOS: with arguments and environment, shaped injecting the network shaper; Android: the package's launcher activity); \
+         restart: terminate a running instance first, default true (Android: `am start -S`); false brings a running app to the \
+         front; returns pid (Android: and the activity it started)",
     ),
-    ("terminate", "device, bundle_id", "Terminate an app"),
-    ("apps", "device", "Installed bundle ids"),
+    ("terminate", "device, bundle_id", "Terminate an app (Android: `am force-stop`)"),
+    ("apps", "device; Android: all?", "Installed bundle ids (Android: the third-party packages, with all the system's too)"),
     ("appearance", "device, mode(light|dark)", "Light or dark UI"),
     ("location", "device, latitude, longitude", "Simulated location"),
     ("privacy", "device, action(grant|revoke), service, bundle_id", "Privacy permission"),
@@ -168,6 +201,43 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("clear_container", "device, path", "Empty a container (an app's data) without deleting it"),
     ("defaults_read", "device, domain", "Read a preferences domain"),
     ("defaults_write", "device, domain, key, value, type?", "Write a preference (type: string|int|float|bool)"),
+    (
+        "prefs_stores",
+        "device, bundle_id",
+        "An app's preference stores, each with the id the other prefs_* methods take: Android `shared_prefs/<name>.xml` and DataStore \
+         `datastore/<name>.preferences_pb`, iOS the app's domain (its bundle id) and its app-group suites; any other iOS domain is \
+         reachable by its name",
+    ),
+    (
+        "prefs_read",
+        "device, bundle_id, store?",
+        "Every key of an app's preference stores (or one) with its typed value, {type, value}: string, int, long, float, double, \
+         bool, string_set (Android), date (ISO 8601), data (base64), array and dictionary (iOS; of typed values), and the \
+         read-only unsupported {native, raw} for what no type holds exactly. iOS reads integers as long and reals as double. \
+         Without store, each store answers {store, values} or {store, error}",
+    ),
+    (
+        "prefs_write",
+        "device, bundle_id, store, key, value, type(string|int|long|float|double|bool|string_set|date|data|array|dictionary)",
+        "Set one key to a typed value (refused when the value isn't of its type or the store can't hold the type); visible says \
+         whether the app sees it now or after_relaunch, app what was done to the app for it (untouched, stopped, relaunched: \
+         a running Android app writes its old values back over the file), with a note on why",
+    ),
+    ("prefs_delete", "device, bundle_id, store, key", "Remove one key; visible and app as prefs_write's"),
+    (
+        "prefs_batch",
+        "device, bundle_id, store, ops([{key, type, value} | {key, delete: true}])",
+        "Set and remove several keys of one store, all or nothing: every op is checked first (each key once), then the store \
+         is written once or not at all",
+    ),
+    (
+        "prefs_watch",
+        "device, bundle_id, store?, cursor?, wait_ms?",
+        "Changes to an app's preference stores (or one), as `logs` stream does: the first call starts a feed in this process and \
+         returns a cursor; a call with it returns the changes since, {store, key, old, new, at}, oldest first, waiting up to \
+         wait_ms (at most 60000) for one, and the next cursor (reset: the feed restarted, re-read; missed: changes dropped unread \
+         past its 16 MiB; ended: the device stopped or nobody read it for 5 minutes, and a call without a cursor starts anew)",
+    ),
     ("crash_reports", "device", "Host crash reports for this device"),
     ("info", "device", "Paths and identity"),
     (
@@ -262,6 +332,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
 pub struct Session {
     pub(crate) ios: crate::ios::Session,
     pub(crate) android: crate::android::Session,
+    pub(crate) prefs: crate::prefs::Session,
 }
 
 impl Session {
@@ -286,21 +357,34 @@ const ALL_PLATFORMS: &[&str] = &[
     "shutdown",
     "screen",
     "screenshot",
+    "contrast_check",
     "tap",
     "swipe",
     "touch",
     "button",
     "type",
     "key",
+    "open_url",
+    "install",
+    "uninstall",
+    "launch",
+    "terminate",
+    "apps",
     "location",
     "info",
     "rotate",
     "fold",
     "rotary",
     "stylus",
+    "prefs_stores",
+    "prefs_read",
+    "prefs_write",
+    "prefs_delete",
+    "prefs_batch",
+    "prefs_watch",
 ];
 /// Methods only Android devices have.
-const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad"];
+const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad", "export", "import"];
 
 /// The platforms whose devices `method` works on.
 pub fn platforms(method: &str) -> &'static [Platform] {
@@ -429,6 +513,11 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         }
         // Need no device: resolving the default `booted` would fail with two simulators booted.
         "device_types" | "audio_capture_stop" => crate::ios::call(&mut s.ios, method, p),
+        // Makes a device from a bundle; the bundle's manifest says whose.
+        "import" => match opt_platform(p)? {
+            Some(Platform::Ios) => Err("`import` takes Android bundles for now; iOS bundles are the next step of #170".into()),
+            _ => crate::android::import(&mut s.android, p),
+        },
         "boot_many" => {
             // One platform per call: each backend boots its own devices its own way.
             let mut udids = Vec::new();
@@ -458,6 +547,11 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
                     crate::ios::call(&mut s.ios, method, &p)
                 }
             }
+        }
+        m if crate::prefs::is_method(m) => {
+            let (platform, udid) = resolve(s, p)?;
+            ios_device_exists(s, platform, str_param(p, "device").unwrap_or("booted"))?;
+            crate::prefs::call(s.prefs.backend(platform), platform, &udid, m, p)
         }
         m if METHODS.iter().any(|(name, ..)| *name == m) => {
             let (platform, udid) = resolve(s, p)?;
@@ -900,6 +994,44 @@ mod tests {
     }
 
     #[test]
+    fn android_devices_export_to_bundles_and_import_under_new_names() {
+        let (mut s, root) = short_android_session("bundle");
+        let sys = root.join("sdk/system-images/android-36/google_apis/arm64-v8a");
+        std::fs::write(
+            sys.join("source.properties"),
+            "Pkg.Revision=7\nAndroidVersion.ApiLevel=36\nSystemImage.TagId=google_apis\nSystemImage.Abi=arm64-v8a\n",
+        )
+        .expect("props");
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        call(&mut s, "create", &json!({"platform": "android", "name": "golden", "system_image": mobile})).expect("golden");
+        let to = root.join("golden.tar");
+        let err = call(&mut s, "export", &json!({"device": "golden", "to": to})).expect_err("never booted");
+        assert!(err.contains("no simee user data"), "{err}");
+        let disks = emu_avd::state_dir(&root.join("avd/golden.avd"));
+        std::fs::create_dir_all(&disks).expect("simee");
+        std::fs::write(disks.join("userdata.img"), b"settled").expect("userdata");
+        let ex = call(&mut s, "export", &json!({"device": "golden", "to": to})).expect("export");
+        assert_eq!(ex["summary"]["form"].as_str(), Some("tar"));
+        assert_eq!(ex["identity"]["android"]["api"], "36");
+        assert_eq!((ex["captures"]["ram"].as_bool(), ex["resume"].as_str()), (Some(false), Some("cold-boot")));
+        let im = call(&mut s, "import", &json!({"from": to, "name": "copy"})).expect("import");
+        assert_eq!((im["device"]["udid"].as_str(), im["device"]["platform"].as_str()), (Some("copy"), Some("android")));
+        assert_eq!((im["exported_as"].as_str(), im["guest_identity"]["on_import"].as_str()), (Some("golden"), Some("duplicated")));
+        assert_eq!((im["mismatch"].is_null(), im["dropped"].as_array().map(Vec::len)), (true, Some(0)));
+        let bad = call(&mut s, "import", &json!({"from": to, "name": "copy3", "allow_mismatch": "yes"})).expect_err("bool");
+        assert!(bad.contains("allow_mismatch"), "{bad}");
+        assert_eq!(std::fs::read(emu_avd::state_dir(&root.join("avd/copy.avd")).join("userdata.img")).expect("imported"), b"settled");
+        let err = call(&mut s, "import", &json!({"from": to, "name": "copy2", "platform": "ios"})).expect_err("ios");
+        assert!(err.contains("Android bundles"), "{err}");
+        // A running device is refused before anything is written.
+        let _fake = sim_android::testing::fake_emulator(s.android.backend(), "golden");
+        let err = call(&mut s, "export", &json!({"device": "golden", "to": root.join("again.tar")})).expect_err("running");
+        assert_eq!(err, "golden must be shut down to export it");
+        assert!(!root.join("again.tar").exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn android_xr_devices_take_xr_controls() {
         let (mut s, root) = android_session("xr");
         let xr = "system-images;android-34;google-xr;arm64-v8a";
@@ -1179,6 +1311,8 @@ mod tests {
         android.create("fold", "system-images;android-36;google_apis;arm64-v8a", Some(FormFactor::Foldable)).expect("create");
         android.create("watch", "system-images;android-34;android-wear;arm64-v8a", None).expect("watch");
         android.create("car", "system-images;android-34-ext9;android-automotive;arm64-v8a", None).expect("car");
+        // The app methods run adb: the fake one, so the probe never reaches a host's.
+        sim_android::testing::fake_adb(&android);
         // One fake emulator is advertised at a time (its advertisement is named for this process).
         let mut fakes = vec![fake_emulator(&android, "fold")];
         let mut advertised = "fold";

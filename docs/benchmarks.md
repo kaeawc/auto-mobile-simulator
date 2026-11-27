@@ -429,6 +429,43 @@ idle), same host and day. `scripts/farm-bench-android.sh`.
 Most of the settle time is the guest's telephony retrying mobile data, since emu has no network
 device yet ([#29](https://github.com/kaeawc/simee/issues/29)).
 
+## Android: device bundles
+
+`simee export` / `simee import` ([#170](https://github.com/kaeawc/simee/issues/170)) on an API 36
+`google_apis` arm64 AVD (revision 7, 4 GB data partition) after its first boot under emu, 100 s of
+uptime and a file written to `/data/local/tmp`; M3 Max, macOS 26.6.2, 2026-11-27, host load 5–50.
+Chunks are LZ4 (`lz4_flex`, pure Rust). The zstd column is the same recipe on another fresh AVD
+the same day, with zstd's C library at level 3 (level 19 gave 1193 MB, no smaller, in 16.4 s).
+One run each. No stock tool exports an AVD, so there is no comparison with one.
+
+```bash
+simee export <avd> <dir-or-file.tar>
+simee import <file>.tar <new-name>       # then boot it: the file and settings are there
+```
+
+| Measure | LZ4 (shipped) | zstd 3 |
+| --- | --- | --- |
+| Disks' logical size (userdata, cache, encryptionkey) | 4383 MB | 4383 MB |
+| Disks' allocated size on the host | 1243 MB | 1219 MB |
+| Bundle (tar) | 1225 MB (98.5% of allocated) | 1192 MB (97.8%) |
+| userdata in stored 1 MiB chunks / compressed | 1202 MiB / 1166 MiB (97.0%) | 1178 MiB / 1137 MiB (96.5%) |
+| Export (8 threads), wall | 7.2 s | 7.6 s |
+| Import from the tar (streamed, every hash checked), wall | 6.7 s, 15 MB peak RSS | 7.0 s, 18 MB peak RSS |
+| `/data` used, as the guest's `df` reports it | | 861 MB |
+| Two clones of one golden, each booted once for 100 s: chunks shared | | 981 of ~1210 (81%) |
+| The second clone's new chunks, given the first's, compressed | | 200 MiB |
+
+User data is ciphertext (`/data` sits on dm-default-key, keyed from `encryptionkey.img`), so its
+chunks don't compress: either codec's gain is the zero 4 KiB blocks inside 1 MiB chunks, and LZ4
+gives up half a point for no zstd dependency. Hashing (BLAKE3 of the disks and of the 4.4 GB system
+image) dominates both directions, so the codec doesn't move the times. The bundle stores ~1.14 GB
+of non-zero user data for 861 MB of files, which suggests freed blocks that were never discarded
+still hold ciphertext. Between clones of one golden, a boot dirties about 200 MiB of chunks.
+Shrinking bundles (deltas against the golden, discarding freed blocks before export) is
+[#171](https://github.com/kaeawc/simee/issues/171). An import leaves zero ranges as holes, but
+APFS fills a hole shorter than ~16 MiB between written blocks with zeros (measured), so an
+imported userdata takes ~4% more host space than its source (1260 MB against 1228 MB).
+
 ## iOS: simee against `simctl`
 
 One new iPhone per run under each tool, same host, 2026-11-24, 3 runs each; the
@@ -714,6 +751,44 @@ target dir) and after against the same device back to back:
 
 A 300 ms swipe's motion now takes 300 ms within 1% quiet and loaded (it took 18% and 33% longer);
 the call ends one sample step (17 ms) after the last move, when the finger lifts, as planned.
+
+## Desktop: Rune's native Metal backend against wgpu
+
+What the desktop window costs on wgpu's Metal backend (`SIMEE_GPU_BACKEND=wgpu`), which the 3D
+device view needs (Rune's native Metal backend has no depth attachments or MSAA resolves,
+anomalyco/rune#2547), against Rune's native Metal backend, the default. The flat view is the same in
+both. Apple M3 Max (Mac15,9, 16 CPUs), macOS 26.6.2, Rune `f6f6e04`, 2026-11-27. Each value is the
+median of 5 runs per backend, run alternately (metal then wgpu, then wgpu then metal). The 1-minute
+load average at the start of the runs was 5 to 11 for iOS and 8 to 22 for Android. Two Android
+pairs that started at load 48 to 140 were run again. CPU and GPU are percentages of one core and of
+the GPU. GPU time is the process's `accumulatedGPUTime` from `ioreg -c AGXDeviceUserClient`.
+
+| Measure | iOS: Metal | iOS: wgpu | Android: Metal | Android: wgpu |
+| --- | --- | --- | --- | --- |
+| Launch to first presented frame | 111 ms | 106 ms | 117 ms | 119 ms |
+| Idle CPU (static screen, 20 s) | 1.00% | 1.10% | 0.65% | 0.60% |
+| Idle GPU | 0.63% | 0.66% | 0.00% | 0.00% |
+| CPU during swipes (20 swipes, 20 s) | 10.0% | 11.6% | 20.5% | 18.8% |
+| GPU during swipes | 8.4% | 9.2% | 11.3% | 10.8% |
+| Frames drawn during swipes | 1,277 | 1,265 | 1,363 | 1,364 |
+| Frame time (start to present), p50 / p95 | 1.24 / 1.51 ms | 1.34 / 1.58 ms | 1.45 / 2.47 ms | 1.26 / 1.89 ms |
+| Gap between frames during swipes, p50 / p95 | 9.3 / 18.4 ms | 9.4 / 20.5 ms | 9.8 / 24.0 ms | 9.9 / 23.9 ms |
+| Resident memory after the swipes | 126 MiB | 134 MiB | 164 MiB | 176 MiB |
+
+Devices: an iPhone 17 Pro on iOS 27.2 (simulator), and an API 36 `google_apis` phone at
+1080x2400 on emu. The iOS window draws about 3 frames a second while idle and the Android one
+none, on both backends. In window screenshots (`screencapture -l`), all 10 iOS idle shots are
+byte-identical across backends, and so are the Android shots taken in the same device state. Shots
+after a swipe, Home, Rotate (portrait to landscape and back, Safari and Android Settings) and the
+bezel match byte for byte, except where the device's own content changed between runs (Safari's
+favicons loading, a notification's age). Input through the window works the same on both backends.
+
+The measuring build is `cargo build --release --features tooling,rune/frame-profile` (Rune's
+per-frame log, `RUNE_FRAME_LOG`; `--window-script` replays the swipes as window drags). Each run
+starts the window with `RUNE_GPU_BACKEND=<metal|wgpu> SIMEE_DEVICE=<device>`. Run times are counted
+from the first frame: idle from 10 to 30 s, a screenshot at 31 s, then swipes from 32 to 52 s, one
+drag on `device-screen` a second (iOS left and right, Android up and down). The shipped build
+without `frame-profile` was not measured.
 
 ## MCP server
 

@@ -4,6 +4,7 @@
 //! `<name>.avd/config.ini`, the system image directory) so existing AVDs boot unchanged.
 
 mod bootconfig;
+pub mod bundle;
 pub mod gpu;
 mod ini;
 pub mod sdk_device;
@@ -23,6 +24,8 @@ pub enum Error {
     Io(PathBuf, std::io::Error),
     #[error("{0}")]
     Config(String),
+    #[error(transparent)]
+    Bundle(#[from] sim_bundle::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
