@@ -615,6 +615,10 @@ impl CompressionSession {
             Hardware::Prefer => (enable, boolean(true)),
             Hardware::Avoid => (enable, boolean(false)),
         }])?;
+        // Built before the session exists, so a failure here has nothing to release.
+        // SAFETY: VideoToolbox's constant string.
+        let key = unsafe { kVTEncodeFrameOptionKey_ForceKeyFrame };
+        let force_keyframe = dictionary(&[(key, boolean(true))])?;
         let outputs = Box::new(Outputs { samples: Mutex::new(Vec::new()) });
         let refcon = (&*outputs as *const Outputs).cast_mut().cast::<c_void>();
         let mut session = ptr::null_mut();
@@ -641,9 +645,6 @@ impl CompressionSession {
         if session.is_null() {
             return Err(Error::Service { op: "VTCompressionSessionCreate", message: "no session".into() });
         }
-        // SAFETY: VideoToolbox's constant string.
-        let key = unsafe { kVTEncodeFrameOptionKey_ForceKeyFrame };
-        let force_keyframe = dictionary(&[(key, boolean(true))])?;
         let mut s = CompressionSession { session, outputs, force_keyframe, hardware: false };
         s.configure(config, profile)?;
         // SAFETY: the session is live.
@@ -855,6 +856,9 @@ impl H264Decoder {
         // refcon outlives the session.
         let rc = unsafe { VTDecompressionSessionCreate(ptr::null(), format.0.cast_mut(), ptr::null(), ptr::null(), &record, &mut session) };
         check("VTDecompressionSessionCreate", rc)?;
+        if session.is_null() {
+            return Err(Error::Service { op: "VTDecompressionSessionCreate", message: "no session".into() });
+        }
         Ok(H264Decoder { session, format, decoded })
     }
 

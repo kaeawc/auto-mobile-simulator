@@ -943,6 +943,26 @@ No script: the runs open the desktop window on the host's display with a device 
 with a Rune `--window-script` file and read Rune's per-frame log and `ioreg`; the script files and
 the log parser used weren't checked in. The setup above is what to rebuild.
 
+## Video encode (H.264, VideoToolbox)
+
+`simee-encode` turning a device's frames into H.264 for the WebRTC publisher: 10 s per run with a
+swipe every 0.7 s, medians of 3 rounds, defaults (Constrained Baseline, 4 Mbit/s average, IDR every
+2 s), 2026-11-27, Apple M3 Max (Mac15,9), macOS 26.6.2, hardware encoder. Reproduce:
+`scripts/bench/encode.sh --udid <booted iPhone>` or `--avd <running AVD>`. The method, the full
+tables (latency p95, picture step, output rate, IDR sizes) and what the numbers say are in
+[streaming.md](streaming.md#encode-cost); the tablet and iPad rows are not measured yet.
+
+| Device, size, fps cap | Encoded, fps | Encode latency p50, ms | Encoding process CPU, % of a core |
+| --- | --- | --- | --- |
+| iPhone 17 Pro, 1206x2622, 30 | 26.8 | 17.28 | 2.7 |
+| iPhone 17 Pro, 1206x2622, 60 | 46.4 | 17.20 | 4.0 |
+| iPhone 17 Pro, 588x1280, 30 | 26.9 | 6.07 | 2.8 |
+| iPhone 17 Pro, 588x1280, 60 | 46.8 | 6.06 | 4.2 |
+| Android API 36, 1080x2400, 30 | 26.9 | 14.51 | 8.5 |
+| Android API 36, 1080x2400, 60 | 45.7 | 14.45 | 9.8 |
+| Android API 36, 576x1280, 30 | 22.1 | 5.80 | 6.9 |
+| Android API 36, 576x1280, 60 | 37.3 | 5.77 | 8.1 |
+
 ## MCP server
 
 What the MCP server's protocol layer costs to build, against the official Rust SDK. Linux VM,

@@ -11,12 +11,12 @@ simee-api
 simee-audio
 simee-coresim
 simee-emu
-simee-encode
 simee-emu-avd
 simee-emu-gfxstream
 simee-emu-hvf
 simee-emu-sdk
 simee-emu-vmm
+simee-encode
 simee-host
 simee-mcp
 simee-netshape

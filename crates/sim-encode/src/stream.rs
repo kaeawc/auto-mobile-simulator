@@ -35,6 +35,16 @@ pub trait Source {
     /// The newest frame, ready for the encoder (the last one again when nothing new arrived);
     /// `None` before the first.
     fn picture(&mut self) -> Result<Option<&Self::Picture>>;
+    /// When the picture a [`Source::picture`] call just took was captured, once, if that call
+    /// took a new one (it can be newer than the frame `wait` reported): the stamp for it.
+    fn take_captured(&mut self) -> Option<Instant> {
+        None
+    }
+    /// Frames that arrived and were replaced by the one a [`Source::picture`] call just took,
+    /// without `wait` ever reporting them; once.
+    fn take_unreported(&mut self) -> u64 {
+        0
+    }
 }
 
 /// What turns pictures into access units.
@@ -173,12 +183,24 @@ pub fn run_with_clock<S: Source, E: Encoder<S::Picture>>(
             }
             Action::Encode { captured, heartbeat } => {
                 pacer.encoded(now);
+                if source.picture()?.is_none() {
+                    continue;
+                }
+                let stamp = source.take_captured().filter(|_| !heartbeat).unwrap_or(captured);
+                let extra = source.take_unreported();
+                stats.frames += extra;
+                stats.superseded += extra;
                 let Some(picture) = source.picture()? else { continue };
                 let keyframe = controls.take_keyframe() || first;
-                let units = encoder.encode(picture, pts.stamp(captured), keyframe)?;
+                let units = encoder.encode(picture, pts.stamp(stamp), keyframe)?;
                 first = false;
                 if units.is_empty() {
                     stats.dropped += 1;
+                }
+                // A requested IDR that the encoder dropped (or answered with a P frame) is asked
+                // for again: the viewer is still waiting for it.
+                if keyframe && !units.iter().any(|u| u.keyframe) {
+                    controls.request_keyframe();
                 }
                 for mut unit in units {
                     unit.heartbeat = heartbeat;
@@ -191,7 +213,7 @@ pub fn run_with_clock<S: Source, E: Encoder<S::Picture>>(
             }
         }
     }
-    stats.superseded = pacer.superseded;
+    stats.superseded += pacer.superseded;
     Ok(stats)
 }
 
@@ -352,6 +374,47 @@ mod tests {
         // same picture one slot later, with no new frame and no heartbeat configured.
         assert_eq!(got, vec![(true, false), (false, false), (true, false)]);
         assert!(units[2].pts > units[1].pts);
+    }
+
+    /// Drops the first `drops` pictures it is asked to make an IDR of.
+    struct DroppingEncoder {
+        drops: usize,
+        calls: Vec<bool>,
+    }
+
+    impl Encoder<usize> for DroppingEncoder {
+        fn encode(&mut self, picture: &usize, pts: Duration, keyframe: bool) -> Result<Vec<AccessUnit>> {
+            self.calls.push(keyframe);
+            if keyframe && self.drops > 0 {
+                self.drops -= 1;
+                return Ok(Vec::new());
+            }
+            Ok(vec![AccessUnit { data: vec![*picture as u8], pts, keyframe, heartbeat: false, encode_time: Duration::ZERO }])
+        }
+
+        fn set_bitrate(&mut self, _: u64) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_idr_the_encoder_drops_is_asked_for_again_until_one_comes_out() {
+        let t0 = Instant::now();
+        let now = Rc::new(Cell::new(t0));
+        let controls = Rc::new(Controls::default());
+        let frames = (0..10).map(|i| ms(i * 40)).collect();
+        let mut source = FakeSource { now: now.clone(), t0, frames, next: 0, end: ms(500), newest: None, controls: controls.clone() };
+        let mut encoder = DroppingEncoder { drops: 2, calls: Vec::new() };
+        let mut units = Vec::new();
+        let stats = run_with_clock(&mut source, &mut encoder, Pacing::new(30, None), &controls, &FakeClock(now), |u| {
+            units.push(u);
+            Ok(Flow::Continue)
+        })
+        .expect("run");
+        assert_eq!(stats.dropped, 2);
+        assert_eq!(&encoder.calls[..4], &[true, true, true, false], "the request survives each drop");
+        assert!(units[0].keyframe, "the first unit out is the IDR");
+        assert_eq!(stats.keyframes, 1, "and it isn't repeated once it came out");
     }
 
     #[test]

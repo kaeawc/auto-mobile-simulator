@@ -59,6 +59,13 @@ pub struct IosSource {
     _watch: FrameWatch,
     /// The surface the current pixel buffer wraps, by address (a rotation brings a new one).
     surface: Option<(usize, sim_coresim::Surface, PixelBuffer)>,
+    /// A surface has been seen; one that is gone after that means the device went away.
+    seen_surface: bool,
+}
+
+/// Whether the device went away: it had a surface and now has none.
+fn device_gone(seen_surface: bool, has_surface: bool) -> bool {
+    seen_surface && !has_surface
 }
 
 impl IosSource {
@@ -67,10 +74,11 @@ impl IosSource {
         let signal = Arc::new(Signal::default());
         let s = signal.clone();
         let watch = display.watch_frames(move || s.post(Instant::now())).map_err(|e| Error::Source(e.to_string()))?;
-        if display.surface().is_some() {
+        let display_has_surface = display.surface().is_some();
+        if display_has_surface {
             signal.post(Instant::now());
         }
-        Ok(IosSource { display, signal, _watch: watch, surface: None })
+        Ok(IosSource { display, signal, _watch: watch, surface: None, seen_surface: display_has_surface })
     }
 }
 
@@ -78,11 +86,22 @@ impl Source for IosSource {
     type Picture = PixelBuffer;
 
     fn wait(&mut self, deadline: Instant) -> Result<Option<Instant>> {
-        Ok(self.signal.wait(deadline))
+        let frame = self.signal.wait(deadline);
+        if frame.is_none() && device_gone(self.seen_surface, self.display.surface().is_some()) {
+            return Err(Error::Source("the display has no surface any more (the device went away)".into()));
+        }
+        Ok(frame)
     }
 
     fn picture(&mut self) -> Result<Option<&PixelBuffer>> {
-        let Some(surface) = self.display.surface_handle() else { return Ok(None) };
+        let Some(surface) = self.display.surface_handle() else {
+            return if device_gone(self.seen_surface, false) {
+                Err(Error::Source("the display has no surface any more (the device went away)".into()))
+            } else {
+                Ok(None)
+            };
+        };
+        self.seen_surface = true;
         let addr = surface.as_raw() as usize;
         if self.surface.as_ref().is_none_or(|(a, _, _)| *a != addr) {
             let buffer = PixelBuffer::wrap_surface(&surface).map_err(|e| Error::Source(e.to_string()))?;
@@ -131,6 +150,9 @@ pub struct AndroidSource {
     current: Option<PixelBuffer>,
     /// The last frame `wait` reported, by sequence number.
     reported: Option<u64>,
+    /// What the last `picture` call that took a frame saw, until the stream loop reads it.
+    taken_at: Option<Instant>,
+    unreported: u64,
     reader: Option<JoinHandle<()>>,
 }
 
@@ -174,7 +196,7 @@ impl AndroidSource {
                 }
             })
             .map_err(|e| Error::Source(e.to_string()))?;
-        Ok(AndroidSource { shared, link, pool: None, current: None, reported: None, reader: Some(reader) })
+        Ok(AndroidSource { shared, link, pool: None, current: None, reported: None, taken_at: None, unreported: 0, reader: Some(reader) })
     }
 
     /// The device's own display size (what input coordinates are in), once a frame has arrived.
@@ -224,6 +246,10 @@ impl Source for AndroidSource {
     fn picture(&mut self) -> Result<Option<&PixelBuffer>> {
         let taken = self.shared.lock().frame.take();
         if let Some(frame) = taken {
+            // The reader may have replaced the frame `wait` reported with newer ones.
+            self.unreported = self.reported.map_or(0, |r| frame.seq.saturating_sub(r));
+            self.reported = Some(self.reported.map_or(frame.seq, |r| r.max(frame.seq)));
+            self.taken_at = Some(frame.at);
             let (w, h) = (frame.width, frame.height);
             if self.pool.as_ref().is_none_or(|p| p.size() != (w, h)) {
                 self.pool = Some(PixelBufferPool::new(w, h, PixelFormat::Rgba).map_err(|e| Error::Source(e.to_string()))?);
@@ -235,6 +261,14 @@ impl Source for AndroidSource {
         }
         Ok(self.current.as_ref())
     }
+
+    fn take_captured(&mut self) -> Option<Instant> {
+        self.taken_at.take()
+    }
+
+    fn take_unreported(&mut self) -> u64 {
+        std::mem::take(&mut self.unreported)
+    }
 }
 
 impl Drop for AndroidSource {
@@ -244,5 +278,18 @@ impl Drop for AndroidSource {
         if let Some(r) = self.reader.take() {
             let _ = r.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_surface_that_was_there_and_is_gone_means_the_device_went_away() {
+        assert!(device_gone(true, false));
+        assert!(!device_gone(true, true));
+        assert!(!device_gone(false, false), "not rendered yet is not gone");
+        assert!(!device_gone(false, true));
     }
 }
