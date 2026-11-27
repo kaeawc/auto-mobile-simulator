@@ -2,8 +2,10 @@
 """What CI has to run on macOS, derived from the code.
 
     scripts/ci-scope.py macos-crates     # the crates that can behave differently on macOS, and why
-    scripts/ci-scope.py check            # .config/macos-tests.txt names exactly those crates
-    scripts/ci-scope.py changes < files  # which jobs a change list needs (key=value lines)
+    scripts/ci-scope.py check            # .config/macos-tests.txt names exactly those crates, and
+                                         # software-mode.yml's PR paths take what its build reads
+    scripts/ci-scope.py changes [--base <rev> | --base-tree <dir>] < files
+                                         # which jobs a change list needs (key=value lines)
 
 The `linux` job runs the whole workspace's tests; the macOS `lint-test` job lints the whole
 workspace (cfg(macos) code only compiles there) but tests only the crates in
@@ -14,18 +16,31 @@ macOS-only dependency, when it carries Objective-C, Swift or C with `__APPLE__`,
 on macOS and depends (normal or dev) on a crate that is in. Code gated off on macOS
 (`#[cfg(target_os = "linux")] mod soft;`, emu-kvm) doesn't count. `check` fails when a crate is
 missing from the list (or listed without reason), so the macOS test run can't silently drop one.
+`check` also derives what Software mode's `cargo build -p` compiles on Linux (`cargo metadata`,
+then the module trees) and fails when its pull_request paths skip a file that build reads, or
+name a crate it doesn't build.
 
 `changes` reads changed paths (one per line; renames as both paths) and prints `lint`,
 `desktop`, `emu` and `macos` (desktop or emu) as true/false: whether the change can affect the
 macOS lint-test job, the desktop workspace (macOS and Linux), or the macOS release build of emu.
 Docs, Linux-only Rust files, scripts no CI job runs and other workflows affect none of them; a
 script counts for the jobs whose config or code names it (and the scripts it names, in turn).
-Anything it doesn't know affects all. Stdlib only; runs on Python 3.8+.
+Each path is judged in this tree and in the --base tree (the diff's other side) and the answers
+are OR-ed, so a deleted, renamed or newly gated file counts by what it was too. Scoping fails
+safe: a path it doesn't know, a path in neither tree, a name a job uses that points at no file,
+or anything it can't read or parse (a tree, a cfg, an argument) affects all. Stdlib only; runs
+on Python 3.8+.
 """
 
+import io
+import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tarfile
+import tempfile
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 LIST = ".config/macos-tests.txt"
@@ -51,6 +66,8 @@ def parse_cfg(text):
         return toks[pos[0]] if pos[0] < len(toks) else None
 
     def take():
+        if pos[0] >= len(toks):
+            raise ValueError("can't parse cfg(%s)" % text)
         pos[0] += 1
         return toks[pos[0] - 1]
 
@@ -70,7 +87,10 @@ def parse_cfg(text):
             return ("kv", name, take().strip('"'))
         return ("name", name)
 
-    return pred()
+    e = pred()
+    if pos[0] != len(toks):
+        raise ValueError("can't parse cfg(%s)" % text)
+    return e
 
 
 def ev(e, env, unknown):
@@ -366,21 +386,22 @@ def scan(path):
     return _scans[path]
 
 
-def module_tree(root, env, overrides=None):
+def module_tree(root, env, overrides=None, reached=None):
     """{file: compiled?} for every file reachable from root on env. A file is compiled when every
-    gate on its way (mod-declaration cfgs, the files' own #![cfg]) holds there."""
-    seen = {}
+    gate on its way (mod-declaration cfgs, the files' own #![cfg]) holds there. `reached`, when
+    given, collects {file: compiled but for its own #![cfg]?}."""
+    seen, reach = {}, {} if reached is None else reached
 
     def visit(path, on, is_dir_owner):
-        prev = seen.get(path)
-        if prev is True or (prev is False and not on):
+        if path in seen and (reach.get(path) or not on):
             return
+        reach[path] = reach.get(path, False) or on
         mods, uses, _ = scan(path)
         if on:
             for _, kind, e in uses:
                 if kind == "file" and not present(e, env, overrides):
                     on = False
-        seen[path] = on or bool(prev)
+        seen[path] = on or seen.get(path, False)
         here = os.path.dirname(path)
         own = here if is_dir_owner else os.path.join(here, os.path.splitext(os.path.basename(path))[0])
         for name, cfgs, p in mods:
@@ -399,8 +420,10 @@ def module_tree(root, env, overrides=None):
     return seen
 
 
-def compiled(crate, env, kinds=("lib", "bin", "test", "example", "bench", "build"), overrides=None):
-    """{file: compiled?} over the crate's roots of the given kinds."""
+def compiled(crate, env, kinds=("lib", "bin", "test", "example", "bench", "build"), overrides=None, own_gate=True):
+    """{file: compiled?} over the crate's roots of the given kinds; with own_gate=False, whether
+    each file would be compiled were it not for its own #![cfg] (so whether editing only that
+    file can change what's compiled)."""
     out = {}
     for root, kind in roots(crate):
         if kind not in kinds:
@@ -408,7 +431,9 @@ def compiled(crate, env, kinds=("lib", "bin", "test", "example", "bench", "build
         if kind == "build":
             out[root] = True
             continue
-        for f, on in module_tree(root, env, overrides).items():
+        reached = {}
+        tree = module_tree(root, env, overrides, reached)
+        for f, on in (tree if own_gate else reached).items():
             out[f] = out.get(f, False) or on
     return out
 
@@ -510,11 +535,153 @@ def cmd_check():
         if derived[n] and n not in listed:
             errors.append("%s: %s can behave differently on macOS (%s) but the macOS job doesn't test it: add it"
                           % (LIST, n, "; ".join(derived[n][:3])))
+    sw_errors, sw_crates = software_errors(crates)
+    errors += sw_errors
     for e in errors:
         print("ci-scope: " + e, file=sys.stderr)
     if not errors:
         print("ci-scope: %s matches the %d crates that can behave differently on macOS" % (LIST, sum(1 for v in derived.values() if v)))
+        print("ci-scope: %s's pull_request paths take every file its build of %d crates reads on Linux"
+              % (SOFTWARE, len(sw_crates)))
     return 1 if errors else 0
+
+
+# --- Software mode's pull_request paths ------------------------------------------------------
+
+SOFTWARE = ".github/workflows/software-mode.yml"
+# Files outside the crates that change what Software mode builds or how.
+SOFTWARE_ALWAYS = ("Cargo.lock", "Cargo.toml", "rust-toolchain.toml", ".cargo", ".github/actions/rust-toolchain", SOFTWARE)
+INCLUDE = re.compile(r'\binclude_(?:str|bytes)!\s*\(\s*("(?:[^"\\]|\\.)*"\s*\))?')
+
+
+def glob_re(pattern):
+    """A GitHub paths-filter pattern as a regex: `*` stays within a directory, `**` doesn't."""
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif pattern.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif pattern[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif pattern[i] == "?":
+            out, i = out + "[^/]", i + 1
+        else:
+            out, i = out + re.escape(pattern[i]), i + 1
+    return re.compile("^" + out + "$")
+
+
+def filter_runs(patterns, path):
+    """Whether a paths filter takes path: the last pattern that matches wins, `!` excludes."""
+    hit = False
+    for pat in patterns:
+        if glob_re(pat.lstrip("!")).match(path):
+            hit = not pat.startswith("!")
+    return hit
+
+
+def software_filter(text):
+    """(pull_request paths, packages its `cargo build -p` builds) from software-mode.yml."""
+    lines = text.splitlines()
+    at = next(i for i, ln in enumerate(lines) if re.match(r"\s+pull_request:\s*$", ln))
+    if not re.match(r"\s+paths:\s*$", lines[at + 1]):
+        raise ValueError("%s: pull_request has no paths list" % SOFTWARE)
+    patterns = []
+    for ln in lines[at + 2:]:
+        m = re.match(r'\s+-\s+"([^"]+)"\s*(?:#.*)?$', ln)
+        if m:
+            patterns.append(m.group(1))
+        elif ln.strip() and not ln.strip().startswith("#"):
+            break
+    builds = re.findall(r"^\s*(?:-\s+run:\s+)?cargo build\b(.*)$", text, re.M)
+    packages = sorted({p for b in builds for p in re.findall(r"-p\s+(\S+)", b)})
+    if not patterns or not packages:
+        raise ValueError("%s: can't read its pull_request paths or its cargo build line" % SOFTWARE)
+    return patterns, packages
+
+
+def linux_closure(packages):
+    """The workspace packages `cargo build -p <packages>` compiles on x86_64 Linux, from
+    `cargo metadata` (path dependencies, normal and build, whose target holds on Linux)."""
+    out = subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1", "--offline"], cwd=ROOT,
+                         check=True, stdout=subprocess.PIPE).stdout
+    pkgs = {p["name"]: p for p in json.loads(out.decode())["packages"]}
+    seen, todo = set(), list(packages)
+    while todo:
+        n = todo.pop()
+        if n in seen:
+            continue
+        if n not in pkgs:
+            raise ValueError("%s builds %s, which is not a workspace package" % (SOFTWARE, n))
+        seen.add(n)
+        for d in pkgs[n]["dependencies"]:
+            t = d.get("target")
+            if not d.get("path") or d.get("kind") == "dev":
+                continue
+            if t and not (present(parse_cfg(t[3:]), LINUX) if t.startswith("cfg(") else "linux" in t):
+                continue
+            todo.append(d["name"])
+    return seen
+
+
+def test_spans(text):
+    """[(start, end)] of the items compiled only under cfg(test)."""
+    spans = []
+    for start, end, inner, is_inner, item in attributes(text):
+        if is_inner or not re.match(r"cfg\s*\(", inner):
+            continue
+        o = inner.index("(")
+        if present(parse_cfg(inner[o:balanced(inner, o, "(", ")")]), LINUX, {"test": False}):
+            continue
+        brace, semi = text.find("{", item), text.find(";", item)
+        spans.append((item, semi if brace < 0 or 0 <= semi < brace else balanced(text, brace, "{", "}")))
+    return spans
+
+
+def software_inputs(crates, names):
+    """Every file whose change can change what Software mode builds: the toolchain and lockfile,
+    each built crate's Cargo.toml and build script, every .rs file its Linux build reaches (one
+    gated off only by its own #![cfg] counts: editing it alone can turn it on), and what those
+    files include_str!/include_bytes! outside their tests."""
+    out = set()
+    for f in SOFTWARE_ALWAYS:
+        out |= set(walk_files(f)) if os.path.isdir(os.path.join(ROOT, f)) else {f}
+    build = dict(kinds=("lib", "bin", "build"), overrides={"test": False})
+    for n in sorted(names):
+        c = crates[n]
+        out.add(os.path.join(c.dir, "Cargo.toml"))
+        out |= {f for f, on in compiled(c, LINUX, own_gate=False, **build).items() if on}
+        for f, on in compiled(c, LINUX, **build).items():
+            if not on or not f.endswith(".rs"):
+                continue
+            text = scan(f)[2]
+            spans = test_spans(text)
+            for m in INCLUDE.finditer(text):
+                if any(a <= m.start() < b for a, b in spans):
+                    continue
+                if not m.group(1):
+                    raise ValueError("%s:%d includes a path ci-scope can't read" % (f, text.count("\n", 0, m.start()) + 1))
+                lit = m.group(1).rstrip(")").strip()[1:-1]
+                out.add(os.path.normpath(os.path.join(os.path.dirname(f), lit)))
+    return out
+
+
+def software_errors(crates):
+    """(errors, built crates): software-mode.yml's pull_request paths must take every file its
+    build reads on Linux, and name no crate it doesn't build."""
+    patterns, packages = software_filter(read(SOFTWARE))
+    names = linux_closure(packages)
+    errors = []
+    for f in sorted(software_inputs(crates, names)):
+        if not filter_runs(patterns, f):
+            errors.append("%s: a pull request changing %s skips Software mode, but `cargo build -p %s` builds it on "
+                          "Linux: include it (or narrow the exclusion that drops it)" % (SOFTWARE, f, " -p ".join(packages)))
+    dirs = {c.dir: n for n, c in crates.items()}
+    for pat in patterns:
+        m = re.match(r"((?:apps|crates)/[^/*]+)/\*\*$", pat)
+        if m and m.group(1) in dirs and dirs[m.group(1)] not in names:
+            errors.append("%s: pull_request paths name %s, which its build doesn't compile on Linux: drop it" % (SOFTWARE, pat))
+    return errors, names
 
 
 # --- what a change list needs ----------------------------------------------------------------
@@ -556,39 +723,69 @@ EVERYTHING = re.compile(r"^(\.github/workflows/ci\.yml|\.github/actions/|\.cargo
 # (its runner, scripts/sign-run.sh, runs the macOS tests and the desktop's).
 SCRIPT_USERS = ((".github/workflows/ci.yml", {"lint", "desktop", "emu"}), (".github/actions", {"lint", "desktop", "emu"}),
                 (".cargo/config.toml", {"lint", "desktop"}))
+SCRIPT_REF = re.compile(r"(?<![\w./-])scripts/[\w.-]+(?:/[\w.-]+)*")
+SHELL = re.compile(r"#!\s*/\S*(sh|bash)\b|#!\s*/usr/bin/env\s+(sh|bash)\b")
+# A shell variable holding the script's own directory (sign-run.sh's `here="$(cd "$(dirname "$0")" && pwd)"`).
+HERE = re.compile(r"(?m)^\s*(?:local\s+|readonly\s+)?(\w+)=.*\bdirname\b.*\$\{?0\b")
 
 
 def script_scopes(rust_refs):
-    """{scripts/<file>: jobs} for the scripts a job runs: those the workflow, its actions or
-    cargo's config name, those the tests name (rust_refs), and those a used script names in turn
-    (sign-run.sh's hypervisor.entitlements)."""
+    """({scripts/<file>: jobs}, [unresolved]) for the scripts a job runs: those the workflow, its
+    actions or cargo's config name, those the tests name (rust_refs), and those a used script
+    names in turn (sign-run.sh's hypervisor.entitlements). A name that points at no file in this
+    tree is unresolved."""
     scripts = [f for f in walk_files("scripts") if os.path.isfile(os.path.join(ROOT, f))]
     named = lambda text, f: re.search(r"(?<![\w.-])%s(?![\w.-])" % re.escape(os.path.basename(f)), text)
-    out = {}
+    exists = lambda f: os.path.lexists(os.path.join(ROOT, f))
+    out, unresolved = {}, []
     for user, jobs in SCRIPT_USERS:
-        texts = [read(f) for f in (walk_files(user) if os.path.isdir(os.path.join(ROOT, user)) else [user])
-                 if os.path.isfile(os.path.join(ROOT, f))]
-        for f in scripts:
-            if any(re.search(r"(?<![\w.-])%s(?![\w.-])" % re.escape(f), t) for t in texts):
-                out.setdefault(f, set()).update(jobs)
-    for f in rust_refs:
-        if f in scripts:
-            out.setdefault(f, set()).add("lint")
+        users = walk_files(user) if os.path.isdir(os.path.join(ROOT, user)) else [user]
+        for u in users:
+            if not os.path.isfile(os.path.join(ROOT, u)):
+                continue
+            for m in SCRIPT_REF.finditer(read(u)):
+                ref = m.group(0).rstrip(".")
+                if exists(ref):
+                    out.setdefault(ref, set()).update(jobs)
+                else:
+                    unresolved.append("%s names %s" % (u, ref))
+    for f in sorted(rust_refs):
+        if f.startswith("scripts/"):
+            if exists(f):
+                out.setdefault(f, set()).add("lint")
+            else:
+                unresolved.append("%s names %s" % (sorted(rust_refs[f])[0], f))
+    shell = lambda f: os.path.isfile(os.path.join(ROOT, f)) and SHELL.match(read(f))
     grew = True
     while grew:
         grew = False
         for user in sorted(out):
-            text = read(user)
-            if not re.match(r"#!\s*/\S*(sh|bash)\b|#!\s*/usr/bin/env\s+(sh|bash)\b", text):
+            if not shell(user):
                 continue  # only shell scripts run what they name; this one merely mentions some
+            text = read(user)
             for f in scripts:
                 if f != user and named(text, f) and not out[user] <= out.get(f, set()):
                     out.setdefault(f, set()).update(out[user])
                     grew = True
-    return out
+    # What a used script runs from its own directory has to be there.
+    for user in sorted(out):
+        if not shell(user):
+            continue
+        text = read(user)
+        for var in sorted(set(HERE.findall(text))):
+            for m in re.finditer(r"\$\{?%s\}?/([\w.-]+)" % var, text):
+                ref = os.path.normpath(os.path.join(os.path.dirname(user), m.group(1)))
+                if not exists(ref):
+                    unresolved.append("%s names %s" % (user, ref))
+    return out, unresolved
 
 
-def scopes(paths):
+JOBS = ("lint", "desktop", "emu")
+
+
+def tree_scopes(paths):
+    """({job: [path]}, paths this tree has) for the tree at ROOT. A path this tree doesn't have
+    is left to the other tree, which judges what it was (deleted) or is (added)."""
     crates = workspace()
     by_dir = sorted(((c.dir + "/", n) for n, c in crates.items()), key=lambda t: -len(t[0]))
     emu = closure(crates, "emu")
@@ -606,18 +803,19 @@ def scopes(paths):
         if on:
             for m in REFERENCED.finditer(scan(f)[2]):
                 refs.setdefault(m.group(1), set()).add(f)
-    used_scripts = script_scopes(refs)
-    need = {"lint": [], "desktop": [], "emu": []}
+    used_scripts, unresolved = script_scopes(refs)
+    need = {k: ["(unresolved: %s)" % u for u in unresolved] for k in JOBS}
+    here = set()
     for p in paths:
-        p = p.strip()
-        if not p:
+        if not os.path.lexists(os.path.join(ROOT, p)):
             continue
+        here.add(p)
         hit = set()
         owner = next((n for d, n in by_dir if p.startswith(d)), None)
         if p in refs:
             hit.add("lint")
         if EVERYTHING.match(p):
-            hit |= {"lint", "desktop", "emu"}
+            hit |= set(JOBS)
         elif p == "Cargo.lock" or p.startswith(".config/"):
             hit |= {"lint", "emu"} if p == "Cargo.lock" else {"lint"}
         elif p in used_scripts:
@@ -634,26 +832,95 @@ def scopes(paths):
                     hit.add("lint")
                 rel = p[len(crates[owner].dir) + 1:]
                 outside_build = rel.split("/")[0] in ("tests", "examples", "benches")
-                # A Rust file no module tree reaches here (deleted, or new and not yet declared)
-                # counts; one the trees know is in a build only if a build compiles it.
+                # A Rust file no module tree reaches (not declared yet) counts; one the trees
+                # know is in a build only if a build compiles it.
                 unknown = not (p.endswith(".rs") and p in on_mac)
                 if owner in emu and not outside_build and release.get(p, unknown):
                     hit.add("emu")
                 if owner in desk and not outside_build and desk_build.get(p, unknown):
                     hit.add("desktop")
         elif not NONE.search(p):
-            hit |= {"lint", "desktop", "emu"}
+            hit |= set(JOBS)
         for k in hit:
             need[k].append(p)
+    return need, here
+
+
+def at_root(root, fn, *args):
+    """fn(*args) with ROOT pointing at another tree."""
+    global ROOT
+    saved, ROOT = ROOT, root
+    _scans.clear()
+    try:
+        return fn(*args)
+    finally:
+        ROOT = saved
+        _scans.clear()
+
+
+def scopes(paths, trees=None):
+    """{job: [path]}: a path needs a job when it does in either tree (the diff's base and head),
+    so a renamed, deleted or newly gated file is judged by what it was too. A path no tree has
+    can't be judged and needs every job."""
+    paths = [p.strip() for p in paths if p.strip()]
+    need, seen = {k: [] for k in JOBS}, set()
+    for tree in trees or [ROOT]:
+        got, here = at_root(tree, tree_scopes, paths)
+        seen |= here
+        for k in JOBS:
+            need[k] += [p for p in got[k] if p not in need[k]]
+    for p in paths:
+        if p not in seen:
+            for k in JOBS:
+                need[k].append(p)
     return need
+
+
+def extract(rev, dest):
+    """The tree at rev, written to dest."""
+    data = subprocess.run(["git", "-C", ROOT, "archive", "--format=tar", rev], check=True, stdout=subprocess.PIPE).stdout
+    with tarfile.open(fileobj=io.BytesIO(data)) as tf:
+        if hasattr(tarfile, "data_filter"):
+            tf.extractall(dest, filter="data")
+        else:
+            tf.extractall(dest)
+    return dest
+
+
+def changed(args, paths):
+    """scopes() over this tree and each --base <rev> / --base-tree <dir>."""
+    trees, tmp = [ROOT], None
+    try:
+        i = 0
+        while i < len(args):
+            if args[i] not in ("--base", "--base-tree") or i + 1 >= len(args):
+                raise ValueError("unknown argument %s" % args[i])
+            if args[i] == "--base":
+                tmp = tmp or tempfile.mkdtemp(prefix="ci-scope-")
+                trees.append(extract(args[i + 1], os.path.join(tmp, str(i))))
+            else:
+                if not os.path.isfile(os.path.join(args[i + 1], "Cargo.toml")):
+                    raise ValueError("%s is not a tree of this workspace" % args[i + 1])
+                trees.append(os.path.abspath(args[i + 1]))
+            i += 2
+        return scopes(paths, trees)
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def cmd_changes(args):
     if "--all" in args:
-        need = {"lint": ["(all)"], "desktop": ["(all)"], "emu": ["(all)"]}
+        need = {k: ["(all)"] for k in JOBS}
     else:
-        need = scopes(sys.stdin.read().splitlines())
-    for k in ("lint", "desktop", "emu"):
+        # Fail safe: a change it can't scope (a tree it can't read, a cfg it can't parse, an
+        # argument it doesn't know) runs everything.
+        try:
+            need = changed(args, sys.stdin.read().splitlines())
+        except Exception as e:
+            print("ci-scope: can't scope this change (%s: %s): running everything" % (type(e).__name__, e), file=sys.stderr)
+            need = {k: ["(can't scope)"] for k in JOBS}
+    for k in JOBS:
         print("%s=%s" % (k, "true" if need[k] else "false"))
         why = ", ".join(need[k][:5]) + (" ..." if len(need[k]) > 5 else "") if need[k] else "nothing it reads changed"
         print("ci-scope: %s: %s" % (k, why), file=sys.stderr)

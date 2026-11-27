@@ -35,7 +35,9 @@ jobs:
       macos: ${{ steps.scope.outputs.macos }}
     steps:
       # A pull request's checkout is its merge commit; its first parent is the base branch. A
-      # rename lists both paths (--no-renames): moving a file CI uses away counts.
+      # rename lists both paths (--no-renames), and each path is judged in both trees (--base):
+      # moving a file CI uses away, or gating one off macOS, counts by what it was. Scoping fails
+      # safe: whatever ci-scope.py can't read, and the script failing outright, run everything.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -44,10 +46,15 @@ jobs:
         run: |
           set -o pipefail
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            git diff --no-renames --name-only HEAD^1 HEAD | python3 scripts/ci-scope.py changes >> "$GITHUB_OUTPUT"
+            scope() { git diff --no-renames --name-only HEAD^1 HEAD | python3 scripts/ci-scope.py changes --base HEAD^1; }
           else
-            python3 scripts/ci-scope.py changes --all >> "$GITHUB_OUTPUT"
+            scope() { python3 scripts/ci-scope.py changes --all; }
           fi
+          if ! scope > scope.txt; then
+            echo "::warning::ci-scope.py failed: running every job"
+            printf '%s\n' lint=true desktop=true emu=true macos=true > scope.txt
+          fi
+          cat scope.txt >> "$GITHUB_OUTPUT"
 
   fmt:
     runs-on: ubuntu-latest
@@ -56,9 +63,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # The macOS test list names every crate with macOS-specific code.
-      - run: python3 scripts/ci-scope.py check
       - uses: ./.github/actions/rust-toolchain
+      # The macOS test list names every crate with macOS-specific code, and Software mode's
+      # pull_request paths every file its build reads (this reads `cargo metadata`).
+      - run: python3 scripts/ci-scope.py check
       - run: cargo fmt --all --check
       - run: rustfmt --check --edition 2024 desktop/src/main.rs
 
