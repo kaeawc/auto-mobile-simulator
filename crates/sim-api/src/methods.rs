@@ -570,9 +570,10 @@ mod tests {
         assert!(err.starts_with("display=carplay is an iPhone's CarPlay screen"), "{err}");
         let err = call(&mut s, "carplay", &json!({"device": "fold", "on": true})).expect_err("iOS-only");
         assert_eq!(err, "`carplay` isn't available on Android devices (it works on iOS)");
-        assert!(
-            call(&mut s, "tap", &json!({"device": "no-such-device", "x": 1, "y": 1})).expect_err("missing").contains("no device matches")
-        );
+        // `platform` keeps the lookup off the simulator service, whose first start on a fresh
+        // runner can outlast the test (#110).
+        let missing = json!({"device": "no-such-device", "platform": "android", "x": 1, "y": 1});
+        assert_eq!(call(&mut s, "tap", &missing).expect_err("missing"), "no device matches `no-such-device`");
         call(&mut s, "delete", &json!({"device": "watch"})).expect("delete");
         assert_eq!(call(&mut s, "devices", &json!({"platform": "android"})).expect("devices").as_array().map(Vec::len), Some(1));
         std::fs::remove_dir_all(root).ok();
@@ -812,7 +813,9 @@ mod tests {
             let err = call(&mut s, "boot_many", &many(extra.clone())).expect_err("refused");
             assert!(err.starts_with(want), "{extra}: {err}");
         }
-        let err = call(&mut s, "boot_many", &json!({"devices": ["pixel", "nope"]})).expect_err("unknown");
+        // An unknown name with no `platform` would list every simulator too, and the simulator
+        // service's first start on a fresh runner can outlast the test (#110).
+        let err = call(&mut s, "boot_many", &json!({"devices": ["pixel", "nope"], "platform": "android"})).expect_err("unknown");
         assert_eq!(err, "no device matches `nope`");
         let err = call(&mut s, "boot", &json!({"device": "pixel", "settle": true})).expect_err("iOS-only parameter");
         assert!(err.starts_with("`boot` takes `settle` for iOS devices only"), "{err}");
