@@ -1,22 +1,21 @@
 name: Software mode
 
 # Boots an API 36 x86_64 image in emu's software mode (QEMU's TCG with emu's devices, #55) on a
-# hosted runner, and checks it the way a user would: `sys.boot_completed`, a screenshot of the
-# launcher over display.sock, a tap, and a clean stop through the console. Software mode doesn't
-# use the runner's /dev/kvm. QEMU 11.1 (Ubuntu's is older) is built once and cached, as are the
-# system image and the SDK's Linux renderer.
+# hosted runner, and checks it the way a user would: `sys.boot_completed`, a screenshot over
+# display.sock and a tap; on main and manual runs also the launcher drawn and a clean stop through
+# the console. Software mode doesn't use the runner's /dev/kvm. QEMU 11.1 (Ubuntu's is older) is
+# built once and cached, as are the system image and the SDK's Linux renderer.
 on:
+  # Every push to main runs the full check.
   push:
     branches: [main]
-    paths:
-      - "apps/emu/**"
-      - "apps/simee/**"
-      - "crates/emu-*/**"
-      - "crates/sim-android/**"
-      - "crates/sim-api/**"
-      - "crates/sim-core/**"
-      - "Cargo.lock"
-      - ".github/workflows/software-mode.yml"
+  # A pull request runs it only when the change can reach the software-mode path on Linux: emu,
+  # the simee CLI and what they build from. Not: macOS-only code (`scripts/ci-scope.py` knows
+  # what each platform compiles), the iOS backend and the sim-core modules only it or the iPad
+  # pointer's parameters use (sim-api's ios*.rs and duo.rs; carplay, debug, framebuffer, indigo,
+  # launchd, pacing, plist, pointer, reuse, worker), the MCP tool schemas (schema.rs), Linux KVM
+  # (software mode doesn't use /dev/kvm, and emu doesn't link emu-kvm), tests and docs. Later
+  # patterns win over earlier ones.
   pull_request:
     paths:
       - "apps/emu/**"
@@ -26,7 +25,38 @@ on:
       - "crates/sim-api/**"
       - "crates/sim-core/**"
       - "Cargo.lock"
+      - "Cargo.toml"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
+      - ".github/actions/rust-toolchain/**"
       - ".github/workflows/software-mode.yml"
+      - "!**/*.md"
+      - "!**/tests/**"
+      - "!**/tests.rs"
+      - "!**/examples/**"
+      - "!**/benches/**"
+      - "!apps/emu/src/vkprobe.rs"
+      - "!crates/emu-gfxstream/src/channel.rs"
+      - "!crates/emu-gfxstream/src/macho.rs"
+      - "!crates/emu-hvf/src/ffi.rs"
+      - "!crates/emu-hvf/src/hv.rs"
+      - "!crates/emu-kvm/**"
+      - "!crates/emu-vmm/src/machine.rs"
+      - "!crates/emu-vmm/src/vcpu.rs"
+      - "!crates/sim-api/native/**"
+      - "!crates/sim-api/src/ios*.rs"
+      - "!crates/sim-api/src/duo.rs"
+      - "!crates/sim-api/src/schema.rs"
+      - "!crates/sim-core/src/carplay.rs"
+      - "!crates/sim-core/src/debug.rs"
+      - "!crates/sim-core/src/framebuffer.rs"
+      - "!crates/sim-core/src/indigo.rs"
+      - "!crates/sim-core/src/launchd.rs"
+      - "!crates/sim-core/src/pacing.rs"
+      - "!crates/sim-core/src/plist.rs"
+      - "!crates/sim-core/src/pointer.rs"
+      - "!crates/sim-core/src/reuse.rs"
+      - "!crates/sim-core/src/worker.rs"
   workflow_dispatch:
 
 concurrency:
@@ -64,7 +94,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: software-mode
@@ -108,24 +138,30 @@ jobs:
           target/release/emu -provision 36 -tag default -abi x86_64
       - run: target/release/emu -create-avd ci -sysdir system-images/android-36/default/x86_64
       - run: target/release/emu -avd ci -dry-run
+      # A pull request's check ends at `sys.boot_completed`, one screenshot (the display's size)
+      # and one tap, which prove the path works; main and manual runs also wait for the launcher,
+      # check it was drawn, and stop the guest through the console.
       - name: Boot, screenshot, tap, stop
+        env:
+          FULL: ${{ github.event_name != 'pull_request' }}
         run: |
           adb="$ANDROID_HOME/platform-tools/adb"
           "$adb" start-server
           target/release/emu -avd ci -verbose > emu.log 2>&1 &
           pid=$!
           # A fresh userdata's first boot: 375 s on a 4-vCPU Xeon; allow 30 minutes.
-          for _ in $(seq 1 180); do
+          for _ in $(seq 1 900); do
             grep -q "boot completed" emu.log && break
             kill -0 "$pid" || { echo "emu exited before boot completed"; exit 1; }
-            sleep 10
+            sleep 2
           done
           grep "boot completed" emu.log
           test "$("$adb" -s emulator-5554 shell getprop sys.boot_completed | tr -d '\r')" = 1
-          sleep 30
+          if [ "$FULL" = true ]; then sleep 30; min=20000; else min=0; fi
           target/release/simee screenshot ci shot.png
-          python3 -c "import struct,sys; d=open('shot.png','rb').read(); w,h=struct.unpack('>II',d[16:24]); print(w,h,len(d)); sys.exit(0 if (w,h)==(720,1280) and len(d)>20000 else 1)"
+          python3 -c "import struct,sys; d=open('shot.png','rb').read(); w,h=struct.unpack('>II',d[16:24]); print(w,h,len(d)); sys.exit(0 if (w,h)==(720,1280) and len(d)>$min else 1)"
           target/release/simee tap ci 360 600
+          [ "$FULL" = true ] || exit 0
           "$adb" -s emulator-5554 emu kill
           for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
           ! kill -0 "$pid" 2>/dev/null

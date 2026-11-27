@@ -21,6 +21,33 @@ env:
   RUSTUP_MAX_RETRIES: 10
 
 jobs:
+  # What a pull request can reach (scripts/ci-scope.py): macOS runners are the scarce ones, so a
+  # change that touches only docs, Linux-only code or other workflows skips the macOS jobs, and
+  # one that can't reach the desktop or the emu release build skips that half of `emu-desktop`.
+  # Pushes to main and manual runs run everything.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      lint: ${{ steps.scope.outputs.lint }}
+      desktop: ${{ steps.scope.outputs.desktop }}
+      emu: ${{ steps.scope.outputs.emu }}
+      macos: ${{ steps.scope.outputs.macos }}
+    steps:
+      # A pull request's checkout is its merge commit; its first parent is the base branch.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - id: scope
+        run: |
+          set -o pipefail
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            git diff --name-only HEAD^1 HEAD | python3 scripts/ci-scope.py changes >> "$GITHUB_OUTPUT"
+          else
+            python3 scripts/ci-scope.py changes --all >> "$GITHUB_OUTPUT"
+          fi
+
   fmt:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -28,7 +55,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup show active-toolchain || rustup toolchain install
+      # The macOS test list names every crate with macOS-specific code.
+      - run: python3 scripts/ci-scope.py check
+      - uses: ./.github/actions/rust-toolchain
       - run: cargo fmt --all --check
       - run: rustfmt --check --edition 2024 desktop/src/main.rs
 
@@ -42,14 +71,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: linux
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --locked --all-targets --profile ci -- -D warnings
-      - run: rustup component add llvm-tools-preview
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-llvm-cov,cargo-nextest
@@ -88,7 +118,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: kvm-x86
@@ -104,8 +134,12 @@ jobs:
           { echo '### KVM notify cost (x86_64 runner)'; echo '```text'; grep notify_cost: bench.txt; nproc; grep -m1 'model name' /proc/cpuinfo; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   # The simulator service and Hypervisor.framework only exist on macOS, so the iOS and Android
-  # backends are linted and tested there (unit tests don't need the hypervisor).
+  # backends are linted there (the whole workspace: cfg(macos) code only compiles there) and the
+  # crates with macOS-specific code are tested there (.config/macos-tests.txt; the `linux` job
+  # tests every crate). Unit tests don't need the hypervisor.
   lint-test:
+    needs: changes
+    if: needs.changes.outputs.lint == 'true'
     runs-on: macos-26
     timeout-minutes: 30
     steps:
@@ -115,7 +149,7 @@ jobs:
       # A fresh runner's CoreSimulatorService can take longer than a test's 30 s to answer its
       # first connection (#110): start it now, in the background, so it is up by the tests.
       - run: (xcrun simctl list devices > /dev/null 2>&1 &)
-      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: macos
@@ -129,51 +163,59 @@ jobs:
       - name: Wait for the simulator service
         timeout-minutes: 5
         run: time xcrun simctl list devices > /dev/null
-      - run: cargo nextest run --locked --workspace --cargo-profile ci --hide-progress-bar
+      - name: Test the crates with macOS-specific code
+        run: |
+          packages=()
+          while read -r name; do packages+=(-p "$name"); done < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' .config/macos-tests.txt)
+          echo "${packages[@]}"
+          cargo nextest run --locked --cargo-profile ci --hide-progress-bar "${packages[@]}"
 
-  # The Android emulator binary. Booting a guest needs nested Hypervisor.framework, which hosted
-  # runners lack, so that stays a local check (docs/android.md). It is its own job so the release
-  # build runs beside the lint and tests instead of after them, with its own cache (release
-  # artifacts don't share anything with the `ci` profile).
-  emu:
-    runs-on: macos-26
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: macos-release
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo build --locked --release -p emu
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: emu-macos-arm64
-          path: target/release/emu
-
-  desktop:
+  # The macOS builds beside lint-test, on one runner so a pull request takes two of the
+  # account's macOS slots: the Android emulator's release binary (booting a guest needs nested
+  # Hypervisor.framework, which hosted runners lack, so that stays a local check, docs/android.md)
+  # and the desktop workspace. Each half runs only when the change can reach it, with its own
+  # cache (release artifacts share nothing with the `ci` profile, and the desktop is its own
+  # workspace).
+  emu-desktop:
+    needs: changes
+    if: needs.changes.outputs.macos == 'true'
     runs-on: macos-26
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/rust-toolchain
+      - if: needs.changes.outputs.emu == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: macos-release
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - if: needs.changes.outputs.emu == 'true'
+        run: cargo build --locked --release -p emu
+      - if: needs.changes.outputs.emu == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: emu-macos-arm64
+          path: target/release/emu
+      - if: needs.changes.outputs.desktop == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: desktop
           shared-key: desktop
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cd desktop && cargo clippy --locked --all-targets --profile ci -- -D warnings
-      - run: cd desktop && cargo test --locked --profile ci
+      - if: needs.changes.outputs.desktop == 'true'
+        run: cd desktop && cargo clippy --locked --all-targets --profile ci -- -D warnings
+      - if: needs.changes.outputs.desktop == 'true'
+        run: cd desktop && cargo test --locked --profile ci
 
   # The window and its headless view tests also run on Linux: the iOS side compiles to a stub
   # there (desktop/src/device.rs), so labels, scenes and input mapping are checked without a Mac.
   desktop-linux:
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -182,7 +224,7 @@ jobs:
           persist-credentials: false
       # The runner image's package index is usually fresh enough; refresh only when the install fails.
       - run: sudo apt-get install -y --no-install-recommends libxkbcommon-dev || (sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev)
-      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: desktop
@@ -191,3 +233,20 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cd desktop && cargo clippy --locked --all-targets --profile ci -- -D warnings
       - run: cd desktop && cargo test --locked --profile ci
+
+  # One check that sums up the run, for the merge loop and branch protection: green when every
+  # job passed or was skipped because the change can't reach it, red when any failed or was
+  # cancelled (a failed `changes` fails it too, though the jobs after it show as skipped).
+  ci-ok:
+    if: always()
+    needs: [changes, fmt, linux, kvm-x86, lint-test, emu-desktop, desktop-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          for r in $RESULTS; do
+            case $r in success | skipped) ;; *) exit 1 ;; esac
+          done
