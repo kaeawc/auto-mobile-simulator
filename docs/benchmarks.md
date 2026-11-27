@@ -567,6 +567,31 @@ process. `network_state`'s remaining
 time is its in-device `launchctl getenv` (for `injected`), which runs under the device's
 `launchd_sim`, not the server.
 
+### iPad `pointer` click
+
+iPad Pro 13-inch (M5), iOS 27.2 (24B8117), the InputProbe test app (it logs where each click
+lands), `pointer` `action: click` through a release `simee serve`, one persistent connection,
+20 targets spread over the screen; a fresh server for each of 10 runs (its first click homes),
+the first run clicking all 20 targets and the other 9 three. Before and after #122 built from the
+same tree into separate target dirs, against the same device back to back (2026-11-27, M3 Max,
+macOS 26.6.2). Quiet is host load 9-37 from other work; loaded adds 32 `yes` processes (load
+14-96). Before #122 every call homed the pointer; now a server moves on from where its last call
+left it, in steps of up to 120 pt instead of 10 pt, and homes on its first call, after a failure
+or rotation, and every 100 calls.
+
+| Case | before (ms) | after (ms) |
+| --- | --- | --- |
+| First click (homes), quiet, median of 10 | 3493 | 1839 |
+| Later click, quiet, median of 37 | 3641 | 408 |
+| First click (homes), loaded, median of 10 | 3638 | 1849 |
+| Later click, loaded, median of 37 | 3803 | 412 |
+
+All 20 clicks landed on their targets in every case: within 0.36 pt (median 0.28) before and
+0.10 pt (median 0.00) after, quiet and loaded, read back from the app's log. 120 later clicks to
+random points after one homing stayed within 0.32 pt. A later click is now the move (23
+reports at most, 16 ms apart, sent against deadlines), 64 ms for the move to land and the 80 ms
+press.
+
 ## MCP server
 
 What the MCP server's protocol layer costs to build, against the official Rust SDK. Linux VM,
@@ -641,11 +666,8 @@ Claims that would belong in the README once someone runs them:
   host's Spotlight privacy settings to measure.
 - Time per automation step through `simee mcp` (a `tools/call` of `tap`, then `screenshot`) against
   the socket API and the CLI on the same device.
-- iPad `pointer` latency on a quiet host (`simee pointer <udid> X Y click`, `pointer … --to`,
-  through `simee serve`). Measured 2026-11-26 only at host load 294-642: a homed click 3.36-3.48 s
-  and a `--to` drag 4.01-4.08 s (median of 5), against about 1.4 s of 16 ms reports. Placement
-  with 6 halving steps is measured: 0.0 / 0.0 pt on iOS 26.5, 0.32 / 0.36 pt (median / max, 12
-  targets) on 27.2.
+- iPad `pointer … --to` drag latency on a quiet host, and `pointer` timing and placement on
+  iOS 26.5 since #122 (clicks on 27.2 are under "iPad `pointer` click").
 - Host CPU of an idle booted device, emu against the SDK emulator.
 - API 29 first boots against stock, API 30 first and warm boots, and their idle host CPU: an
   API 29 or 30 device under emu sat at 150–170% of a core after the AutoMobile harness, with
