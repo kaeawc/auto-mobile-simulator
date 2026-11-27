@@ -573,6 +573,12 @@ impl DisplaySink for FrameStore {
 /// ends the composer's commands, so the tail is what catches the last frame of an animation.
 /// A quiet guest costs nothing: the thread sleeps until the next fence. A notice with no new
 /// frame behind it costs a reader one readback of an unchanged frame, and only while one reads.
+///
+/// With a [`PostProbe`] ([`PostTicker::start_probed`]) the notices follow the posts instead:
+/// while pokes are recent the thread asks the probe every `poll` and gives a notice only when the
+/// last post changed. A fence comes before its frame is posted, so a fence-paced notice reads
+/// the old frame back and the new one waits out the interval; a probed one comes within `poll`
+/// of the post, once per post. While the probe can't answer, notices are fence-paced as above.
 pub struct PostTicker {
     state: Mutex<TickState>,
     wake: Condvar,
@@ -583,6 +589,11 @@ pub struct PostTicker {
 
 /// See [`PostTicker::hold_until`].
 pub type Hold = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// What tells a [`PostTicker`] a new post from none: an identity of the renderer's last post that
+/// changes with each post (the posted color buffer's handle), or `None` while it can't be read.
+/// Called on the ticker's thread, unlocked, every poll while fences come: it has to be cheap.
+pub type PostProbe = Arc<dyn Fn() -> Option<u32> + Send + Sync>;
 
 #[derive(Default)]
 struct TickState {
@@ -597,8 +608,21 @@ struct TickState {
 }
 
 impl PostTicker {
-    /// Starts the notice thread for a `width` x `height` display.
+    /// Starts the notice thread for a `width` x `height` display, its notices paced by fences.
     pub fn start(sink: Arc<dyn DisplaySink>, width: u32, height: u32, interval: Duration, tail: Duration) -> Arc<PostTicker> {
+        Self::start_probed(sink, width, height, interval, tail, None)
+    }
+
+    /// [`PostTicker::start`], its notices following the posts `probe` tells apart, asked every
+    /// `poll` while fences come (see [`PostTicker`]).
+    pub fn start_probed(
+        sink: Arc<dyn DisplaySink>,
+        width: u32,
+        height: u32,
+        interval: Duration,
+        tail: Duration,
+        probe: Option<(PostProbe, Duration)>,
+    ) -> Arc<PostTicker> {
         let ticker = Arc::new(PostTicker {
             state: Mutex::new(TickState::default()),
             wake: Condvar::new(),
@@ -606,7 +630,8 @@ impl PostTicker {
             thread: Mutex::new(None),
         });
         let t = ticker.clone();
-        let spawned = std::thread::Builder::new().name("post-ticker".into()).spawn(move || t.run(&*sink, width, height, interval, tail));
+        let pace = Pace { interval, tail, probe };
+        let spawned = std::thread::Builder::new().name("post-ticker".into()).spawn(move || t.run(&*sink, width, height, &pace));
         match spawned {
             Ok(h) => *ticker.thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(h),
             Err(e) => eprintln!("emu: post-ticker: {e}; host frames won't update"),
@@ -658,7 +683,10 @@ impl PostTicker {
         }
     }
 
-    fn run(&self, sink: &dyn DisplaySink, width: u32, height: u32, interval: Duration, tail: Duration) {
+    fn run(&self, sink: &dyn DisplaySink, width: u32, height: u32, pace: &Pace) {
+        let tail = pace.tail;
+        // The post the last notice was for (probed), so the same post isn't noticed twice.
+        let mut seen: Option<u32> = None;
         loop {
             let hold = {
                 let mut s = self.lock();
@@ -677,8 +705,13 @@ impl PostTicker {
                 }
                 s.hold.clone()
             };
-            // The hold is asked unlocked: it may call into the renderer, whose fences poke.
+            // The hold and the probe are asked unlocked: they call into the renderer, whose
+            // fences poke.
             let met = hold.as_ref().is_none_or(|h| h());
+            let post = pace.probe.as_ref().and_then(|(p, _)| p());
+            // A met hold notices whatever is posted: the next boot's first post may reuse the
+            // handle of the last boot's last (see `machine::blank_until_next_post`).
+            let fresh = post.is_none() || post != seen || hold.is_some();
             let notice = {
                 let mut s = self.lock();
                 // Checked again under the lock: a hold set since it was read holds this notice
@@ -691,11 +724,13 @@ impl PostTicker {
                     };
                 if notice {
                     s.hold = None;
-                    s.noticing = true;
                 }
+                let notice = notice && fresh;
+                s.noticing = notice;
                 notice
             };
             if notice {
+                seen = post;
                 // Ends the notice even if the sink panics, so a hold never waits for it forever.
                 struct Noticed<'a>(&'a PostTicker);
                 impl Drop for Noticed<'_> {
@@ -707,9 +742,19 @@ impl PostTicker {
                 let _end = Noticed(self);
                 sink.posted(width, height);
             }
-            std::thread::sleep(interval);
+            std::thread::sleep(match (&pace.probe, post) {
+                (Some((_, poll)), Some(_)) => *poll,
+                _ => pace.interval,
+            });
         }
     }
+}
+
+/// How a [`PostTicker`] paces its notices (see [`PostTicker::start_probed`]).
+struct Pace {
+    interval: Duration,
+    tail: Duration,
+    probe: Option<(PostProbe, Duration)>,
 }
 
 #[cfg(test)]
@@ -784,6 +829,95 @@ mod tests {
         // One fence after a quiet spell wakes it again.
         ticker.poke();
         wait_for("a fence after a quiet spell to wake the ticker", || posts.0.load(Ordering::Relaxed) > after);
+        ticker.stop();
+    }
+
+    /// A renderer's last post as the probe sees it: host composition cycling through its targets.
+    #[derive(Default)]
+    struct FakeRenderer {
+        posts: AtomicUsize,
+        /// The probe can't read the renderer (a missing or uninitialized `FrameBuffer`).
+        unreadable: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakeRenderer {
+        fn post(&self) {
+            self.posts.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn probe(self: &Arc<Self>) -> PostProbe {
+            let r = self.clone();
+            Arc::new(move || (!r.unreadable.load(Ordering::SeqCst)).then(|| (r.posts.load(Ordering::SeqCst) % 3) as u32 + 1))
+        }
+    }
+
+    /// Pokes for `ms` (fences with no post behind them).
+    fn fences(ticker: &PostTicker, ms: u64) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(ms) {
+            ticker.poke();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_probed_ticker_notices_each_post_once_and_soon() {
+        let (posts, renderer) = (Arc::new(Posts::default()), Arc::new(FakeRenderer::default()));
+        // An interval and a tail of a minute: a notice paced by fences after the first would take
+        // a minute, so any later notice within the waits' 5 s timeout came from the probe.
+        let minute = Duration::from_secs(60);
+        let probe = Some((renderer.probe(), Duration::from_millis(1)));
+        let ticker = PostTicker::start_probed(posts.clone(), 2560, 1600, minute, minute, probe);
+        ticker.poke();
+        wait_for("the current post to be noticed", || posts.0.load(Ordering::Relaxed) == 1);
+        for n in 2..=6 {
+            // Fences before the post (the composer's commands): no notice of an unchanged frame.
+            fences(&ticker, 5);
+            assert_eq!(posts.0.load(Ordering::Relaxed), n - 1, "a fence with no post behind it");
+            renderer.post();
+            wait_for("a post to be noticed within the poll, not the interval", || posts.0.load(Ordering::Relaxed) >= n);
+        }
+        // (Can only false-pass: a stalled ticker also reads 6.)
+        fences(&ticker, 20);
+        assert_eq!(posts.0.load(Ordering::Relaxed), 6, "one notice per post");
+        ticker.stop();
+    }
+
+    #[test]
+    fn a_probed_ticker_sleeps_through_a_quiet_guest_and_follows_fences_while_it_cannot_probe() {
+        let (posts, renderer) = (Arc::new(Posts::default()), Arc::new(FakeRenderer::default()));
+        let probe = Some((renderer.probe(), Duration::from_millis(1)));
+        let ticker = PostTicker::start_probed(posts.clone(), 2560, 1600, Duration::from_millis(5), Duration::from_millis(20), probe);
+        // No fence: a post isn't looked for (the probe is asked only while fences come).
+        renderer.post();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(posts.0.load(Ordering::Relaxed), 0, "no fence, no notice");
+        // The renderer can't be probed: notices come with the fences, as without a probe.
+        renderer.unreadable.store(true, Ordering::SeqCst);
+        fences(&ticker, 60);
+        wait_for("fence-paced notices", || posts.0.load(Ordering::Relaxed) >= 2);
+        ticker.stop();
+    }
+
+    #[test]
+    fn a_met_hold_notices_the_next_boots_post_even_on_the_last_boots_handle() {
+        let (posts, renderer) = (Arc::new(Posts::default()), Arc::new(FakeRenderer::default()));
+        let minute = Duration::from_secs(60);
+        let probe = Some((renderer.probe(), Duration::from_millis(1)));
+        let ticker = PostTicker::start_probed(posts.clone(), 2560, 1600, minute, minute, probe);
+        ticker.poke();
+        wait_for("the last boot's post to be noticed", || posts.0.load(Ordering::Relaxed) == 1);
+        // A reset, and the next boot's first post on the same handle: the probe reads no change.
+        let posted_new = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        ticker.hold_until({
+            let posted_new = posted_new.clone();
+            Arc::new(move || posted_new.load(Ordering::SeqCst))
+        });
+        fences(&ticker, 10);
+        posted_new.store(true, Ordering::SeqCst);
+        wait_for("the next boot's post to be noticed", || posts.0.load(Ordering::Relaxed) == 2);
+        fences(&ticker, 20);
+        assert_eq!(posts.0.load(Ordering::Relaxed), 2, "noticed once");
         ticker.stop();
     }
 
