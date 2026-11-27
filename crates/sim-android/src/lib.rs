@@ -707,6 +707,13 @@ impl Device {
         if let Some(port) = port {
             cmd.args(["-port", &port.to_string()]);
         }
+        // The cameras simee linked (`camera_link`, `boot` with `camera_back`): they win over
+        // config.ini, so they come back on every boot.
+        if let Some(avd) = &self.avd {
+            for (facing, source) in saved_cameras(&avd.dir) {
+                cmd.arg(format!("-camera-{facing}")).arg(source);
+            }
+        }
         cmd
     }
 
@@ -1156,6 +1163,54 @@ fn booted(r: &Running, adb: Option<&Path>) -> bool {
             .and_then(|l| l.first().and_then(|n| n.trim().parse::<u64>().ok()))
             .is_some_and(|n| n > 0),
     }
+}
+
+/// The camera links simee keeps for an AVD, in its state directory ([`emu_avd::state_dir`]): one
+/// `back=<source id>` / `front=<source id>` line each (`sim-api`'s `camera_link` writes it). Every
+/// boot from here passes them to emu as `-camera-back` / `-camera-front`, so they come back after
+/// a reboot or a server restart.
+pub const CAMERAS_FILE: &str = "cameras.ini";
+
+/// The cameras emu has, in the order [`saved_cameras`] returns them.
+pub const CAMERA_FACINGS: [&str; 2] = ["back", "front"];
+
+/// The saved camera links of the AVD in `avd_dir` ([`CAMERAS_FILE`]): (facing, source id), back
+/// first. A missing file is no links; a line that isn't a known facing is ignored.
+pub fn saved_cameras(avd_dir: &Path) -> Vec<(String, String)> {
+    let text = std::fs::read_to_string(emu_avd::state_dir(avd_dir).join(CAMERAS_FILE)).unwrap_or_default();
+    let mut links: Vec<(String, String)> = text
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+        .filter(|(k, v)| CAMERA_FACINGS.contains(&k.as_str()) && !v.is_empty())
+        .collect();
+    links.sort_by_key(|(k, _)| CAMERA_FACINGS.iter().position(|f| f == k));
+    links.dedup_by(|a, b| a.0 == b.0);
+    links
+}
+
+/// Replaces the saved camera links of the AVD in `avd_dir` (none: removes the file). Written to a
+/// temporary file and renamed, so a boot never reads half a file.
+pub fn save_cameras(avd_dir: &Path, links: &[(String, String)]) -> Result<(), String> {
+    let dir = emu_avd::state_dir(avd_dir);
+    let path = dir.join(CAMERAS_FILE);
+    if links.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("{}: {e}", path.display())),
+            _ => Ok(()),
+        };
+    }
+    let mut text = String::new();
+    for (facing, source) in links {
+        if !CAMERA_FACINGS.contains(&facing.as_str()) || source.contains(['\n', '\r']) || source.trim().is_empty() {
+            return Err(format!("can't save camera link {facing}={source:?}: a camera is back or front, its source one line"));
+        }
+        text.push_str(&format!("{facing}={}\n", source.trim()));
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let tmp = dir.join(format!("{CAMERAS_FILE}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The last `n` lines of a device's guest console (`<avd>/simee/console.log`). Without
@@ -1695,6 +1750,30 @@ mod tests {
         assert_eq!(Path::new(&args[at + 1]), emu_avd::state_dir(&d.avd.as_ref().expect("avd").dir).join(LOGCAT_FILE));
         let at = args.iter().position(|a| a == "-logcat").expect("-logcat");
         assert_eq!(args[at + 1], LOGCAT_FILTER);
+    }
+
+    #[test]
+    fn launches_pass_the_saved_camera_links() {
+        let f = fixture("camera-arg");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let d = f.android.device("phone").expect("device");
+        let dir = d.avd.as_ref().expect("avd").dir.clone();
+        let args =
+            |d: &Device| -> Vec<String> { d.launch_command(None, false).get_args().map(|a| a.to_string_lossy().into_owned()).collect() };
+        assert!(!args(&d).iter().any(|a| a.starts_with("-camera")), "nothing saved, nothing passed");
+        save_cameras(&dir, &[("front".into(), "solid:orange".into()), ("back".into(), "qr:hello world".into())]).expect("save");
+        let saved = [("back".to_owned(), "qr:hello world".to_owned()), ("front".to_owned(), "solid:orange".to_owned())];
+        assert_eq!(saved_cameras(&dir), saved);
+        let a = args(&d);
+        let at = a.iter().position(|x| x == "-camera-back").expect("-camera-back");
+        assert_eq!(a[at + 1], "qr:hello world");
+        let at = a.iter().position(|x| x == "-camera-front").expect("-camera-front");
+        assert_eq!(a[at + 1], "solid:orange");
+        assert!(save_cameras(&dir, &[("side".into(), "qr:x".into())]).is_err());
+        assert!(save_cameras(&dir, &[("back".into(), "qr:a\nfront=x".into())]).is_err(), "one line per link");
+        assert_eq!(saved_cameras(&dir), saved, "a refused save keeps what was there");
+        save_cameras(&dir, &[]).expect("clear");
+        assert!(saved_cameras(&dir).is_empty() && !emu_avd::state_dir(&dir).join(CAMERAS_FILE).exists());
     }
 
     #[test]

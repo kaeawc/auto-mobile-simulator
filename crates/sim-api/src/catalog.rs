@@ -60,7 +60,9 @@ pub fn effect(method: &str) -> Option<Effect> {
         "help" | "identity" | "host" | "devices_usage" | "form_factors" | "devices" | "runtimes" | "device_types" | "screen"
         | "screenshot" | "apps" | "ca_debug_state" | "logs" | "processes" | "connections" | "traffic" | "containers" | "ls" | "read"
         | "du" | "crash_reports" | "info" | "defaults_read" | "network_state" | "network_flows" | "network_env" | "audio_state"
-        | "settle" | "admission_check" => Read,
+        | "settle" | "admission_check" | "camera_sources" | "camera_links" => Read,
+        // Saved with the device and applied live: linking the same source again changes nothing.
+        "camera_link" | "camera_unlink" => Set,
         "appearance" | "location" | "status_bar" | "clear_status_bar" | "content_size" | "increase_contrast" | "dynamic_island"
         | "backlight" | "keyboard_language" | "hardware_keyboard" | "ca_debug" | "network_clear" | "audio_volume" | "audio_route"
         | "audio_mute" | "fold" | "carplay" | "profile" | "privacy" => Set,
@@ -106,12 +108,14 @@ pub enum Group {
     Network,
     /// The device's audio on the host.
     Audio,
+    /// The device's cameras and the host's camera sources.
+    Camera,
     /// The host and the server itself.
     Host,
 }
 
 impl Group {
-    pub const ALL: [Group; 11] = [
+    pub const ALL: [Group; 12] = [
         Group::Lifecycle,
         Group::Apps,
         Group::Input,
@@ -122,6 +126,7 @@ impl Group {
         Group::Prefs,
         Group::Network,
         Group::Audio,
+        Group::Camera,
         Group::Host,
     ];
 
@@ -138,6 +143,7 @@ impl Group {
             Group::Prefs => "prefs",
             Group::Network => "network",
             Group::Audio => "audio",
+            Group::Camera => "camera",
             Group::Host => "host",
         }
     }
@@ -167,6 +173,7 @@ pub fn group(method: &str) -> Option<Group> {
         "prefs_stores" | "prefs_read" | "prefs_write" | "prefs_delete" | "prefs_batch" | "prefs_watch" => Prefs,
         "network_shape" | "network_state" | "network_flows" | "network_clear" | "network_env" => Network,
         "audio_state" | "audio_volume" | "audio_route" | "audio_capture_start" | "audio_capture_stop" | "audio_mute" => Audio,
+        "camera_sources" | "camera_link" | "camera_unlink" | "camera_links" => Camera,
         _ => return None,
     })
 }
