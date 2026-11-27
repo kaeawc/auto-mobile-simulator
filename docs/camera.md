@@ -58,6 +58,10 @@ Everything after the first `:` belongs to the source, so `qr:https://example.com
 `device:<A>` makes device A's screen another device's camera feed, so B's app can scan a QR code
 or a document that A shows (pairing and login flows, two-device tests). `crates/sim-camera/src/device.rs`.
 
+- **Build:** behind the `device-source` cargo feature of `simee-camera` (off by default), which
+  `simee-api` enables; `emu` links the crate without it, so it carries neither the Android nor the
+  iOS stack. Without the feature a `device:` id still parses and opening it fails Unsupported
+  ("device sources are served by simee, not emu").
 - **Frames:** an Android device's through emu's display socket and shared frame ring at full size
   (one `pread` per device frame, as the desktop window reads them); a simulator's through its
   framebuffer `IOSurface`'s frame callback, copied out once when the surface's seed says it

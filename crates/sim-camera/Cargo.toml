@@ -15,6 +15,12 @@ include = ["/Cargo.toml", "/LICENSE", "/fixtures", "/src"]
 [lib]
 doctest = false
 
+[features]
+default = []
+# `device:` sources open another device's screen, which links the Android and iOS stacks: simee
+# enables it, emu (which links this crate for its camera HAL) does not.
+device-source = ["dep:sim-android", "dep:sim-coresim"]
+
 [dependencies]
 font8x8.workspace = true
 png.workspace = true
@@ -24,9 +30,10 @@ sim-core.workspace = true
 thiserror.workspace = true
 zune-jpeg.workspace = true
 
-# `device:` sources: an Android device's screen through emu's display socket and frame ring.
+# `device:` sources (feature `device-source`): an Android device's screen through emu's display
+# socket and frame ring.
 [target.'cfg(unix)'.dependencies]
-sim-android.workspace = true
+sim-android = { workspace = true, optional = true }
 
 # Host camera enumeration and capture: AVFoundation through the Objective-C runtime (loaded on
 # first use, so a binary that links this crate doesn't load AVFoundation until it asks for a camera).
@@ -36,7 +43,7 @@ block2.workspace = true
 libc.workspace = true
 objc2.workspace = true
 objc2-foundation.workspace = true
-sim-coresim.workspace = true
+sim-coresim = { workspace = true, optional = true }
 
 # V4L2 enumeration: `open` and `ioctl` on /dev/video*.
 [target.'cfg(target_os = "linux")'.dependencies]

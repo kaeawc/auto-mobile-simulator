@@ -321,7 +321,7 @@ pub fn open(spec: &DeviceSpec) -> Result<Box<dyn Source>> {
     Ok(Box::new(DeviceSource::new(&spec.device, spec.region, screen).reading(reader)))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "device-source"))]
 fn start(name: &str, screen: Arc<Screen>) -> Result<Reader> {
     let env = sim_android::Env::from_env();
     if env.has_avd(name) {
@@ -331,17 +331,23 @@ fn start(name: &str, screen: Arc<Screen>) -> Result<Reader> {
     ios(name, screen)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), feature = "device-source"))]
 fn start(name: &str, _screen: Arc<Screen>) -> Result<Reader> {
     Err(Error::Unsupported(format!("device:{name}: a device's screen as a camera source needs macOS or Linux")))
 }
 
-#[cfg(target_os = "macos")]
+/// Without the `device-source` feature (emu's build): the id parses, and opening it says who serves it.
+#[cfg(not(feature = "device-source"))]
+fn start(name: &str, _screen: Arc<Screen>) -> Result<Reader> {
+    Err(Error::Unsupported(format!("device:{name}: device sources are served by simee, not emu")))
+}
+
+#[cfg(all(target_os = "macos", feature = "device-source"))]
 fn ios(name: &str, screen: Arc<Screen>) -> Result<Reader> {
     Ok(Box::new(ios::Reader::start(name, screen)?))
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(target_os = "macos"), feature = "device-source"))]
 fn ios(name: &str, _screen: Arc<Screen>) -> Result<Reader> {
     Err(Error::Unsupported(format!(
         "device:{name}: no AVD is named {name:?}, and an iOS simulator's screen as a camera source needs macOS"
@@ -349,7 +355,7 @@ fn ios(name: &str, _screen: Arc<Screen>) -> Result<Reader> {
 }
 
 /// Android: emu's display socket, frames through its shared ring.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "device-source"))]
 mod android {
     use std::os::unix::net::UnixStream;
     use std::path::Path;
@@ -408,7 +414,7 @@ mod android {
 
 /// iOS: the framebuffer surface's frame callback. The service's objects aren't `Send`, so one
 /// thread makes the context, finds the device and reads its display for the capture's life.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "device-source"))]
 mod ios {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
@@ -811,7 +817,7 @@ mod tests {
 
     /// The Android reader against a fake display socket: the hello it sends, a frame it posts,
     /// and the socket closing as the device going away.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "device-source"))]
     #[test]
     fn the_android_reader_posts_display_frames_and_reports_the_device_gone() {
         use sim_core::stream::FrameHeader;
@@ -847,10 +853,19 @@ mod tests {
         assert!(matches!(&err, Some(Error::Missing(m)) if m.contains("B isn't running")), "{err:?}");
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(all(unix, not(target_os = "macos"), feature = "device-source"))]
     #[test]
     fn an_ios_device_source_is_unsupported_off_macos() {
         let err = ios("iPhone 16", Arc::new(Screen::default())).err();
         assert!(matches!(&err, Some(Error::Unsupported(m)) if m.contains("needs macOS")), "{err:?}");
+    }
+
+    #[cfg(not(feature = "device-source"))]
+    #[test]
+    fn a_device_source_parses_but_is_unsupported_without_the_device_source_feature() {
+        let d = spec("device:Pixel_9:0,0,10,10");
+        assert_eq!(d.device, "Pixel_9");
+        let err = open(&d).err();
+        assert!(matches!(&err, Some(Error::Unsupported(m)) if m.contains("served by simee, not emu")), "{err:?}");
     }
 }
