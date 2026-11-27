@@ -118,6 +118,7 @@ the valid ones. Every mode renders through gfxstream; what differs is the Vulkan
 | `swiftshader`, `swiftshader_indirect` | SwiftShader, software Vulkan on the CPU | comparing against lavapipe |
 | `software`, `guest` | lavapipe, with stock's notice that guest rendering isn't supported | an AVD configured that way keeps booting |
 | `off`, `none` | no renderer; the guest boots without graphics | boot-only checks (flag only; `hw.gpu.mode=off` in `config.ini` is ignored) |
+| `metal` (flag only, experimental) | `host`, and posted frames also go to simee's encoder as IOSurfaces copied on the GPU instead of read back | measuring the Metal present path (#356, docs/research/metal-present.md) |
 
 Rendering inside the guest (virtio-gpu 2D with Mesa in the image) isn't possible with SDK
 images: a scan of the API 34 to 37 system images found none that ships a guest renderer, and

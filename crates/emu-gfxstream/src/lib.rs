@@ -15,6 +15,7 @@ mod channel;
 mod elf;
 #[cfg(target_os = "macos")]
 mod macho;
+pub mod metal;
 
 #[cfg(target_os = "macos")]
 pub use channel::{ChannelRead, ChannelWrite, RenderChannel};
@@ -387,6 +388,10 @@ pub struct Renderer {
     gl: AtomicBool,
     /// Iovec arrays the renderer may still point at.
     iovs: Mutex<IovStore>,
+    /// The Metal present path ([`Renderer::last_posted_surface`]), set up on first use; `None`
+    /// when this renderer doesn't have it in the expected shape.
+    #[cfg(target_os = "macos")]
+    metal: OnceLock<Option<MetalPath>>,
 }
 
 impl Drop for Renderer {
@@ -493,6 +498,8 @@ impl Renderer {
             vk_trust: AtomicU8::new(VkTrust::Unchecked as u8),
             gl: AtomicBool::new(true),
             iovs: Mutex::new(IovStore::default()),
+            #[cfg(target_os = "macos")]
+            metal: OnceLock::new(),
         })
     }
 
@@ -1277,27 +1284,7 @@ impl VkRead {
         if std::env::var("EMU_READBACK").is_ok_and(|v| v == "gl") {
             return None;
         }
-        // The file the symbols come from must be the image that's loaded (not, say, a renderer
-        // updated in place since).
-        let file_uuid = macho::image_uuid(&macho::load_commands(backend).ok()?)?;
-        if loaded_uuid(handle)? != file_uuid {
-            return None;
-        }
-        let found = macho::symbols(backend, &[GET_FB, HAS_EMULATION_VK, READ_COLOR_BUFFER_VK]).ok()?;
-        let [Some(get_fb), Some(has_vk), Some(read)] = found[..] else { return None };
-        let live = |name: &str| {
-            let c = CString::new(name).ok()?;
-            // SAFETY: dlsym with a live handle and a NUL-terminated name.
-            let p = unsafe { libc::dlsym(handle, c.as_ptr()) };
-            (!p.is_null()).then_some(p as u64)
-        };
-        // The image's slide, agreed on by two exported symbols.
-        let slide = live(GET_FB)?.wrapping_sub(get_fb);
-        let has_vk_live = live(HAS_EMULATION_VK)?;
-        if has_vk_live.wrapping_sub(has_vk) != slide {
-            return None;
-        }
-        Some(VkSymbols { slide, has_vk_live, read })
+        private_vk_member(handle, backend, READ_COLOR_BUFFER_VK)
     }
 
     #[cfg(target_os = "linux")]
@@ -1308,22 +1295,7 @@ impl VkRead {
     #[cfg(target_os = "macos")]
     fn resolve(handle: *mut c_void, backend: &Path, fb: *mut c_void) -> Option<VkRead> {
         let VkSymbols { slide, has_vk_live, read } = Self::symbols(handle, backend)?;
-        // SAFETY: the address is the entry of an exported function in the loaded image, whose
-        // code pages are mapped readable; 20 bytes stay inside its text segment.
-        let code: [u32; 5] = unsafe { std::ptr::read_unaligned(has_vk_live as usize as *const [u32; 5]) };
-        let (to_impl, to_vk) = macho::pointer_test_offsets(code)?;
-        // SAFETY: the same two loads `hasEmulationVk()` does on the live FrameBuffer: its
-        // implementation pointer, then that object's VkEmulation pointer (null without Vulkan).
-        let emulation = unsafe {
-            let imp = std::ptr::read((fb as usize + to_impl) as *const *mut c_void);
-            if imp.is_null() {
-                return None;
-            }
-            std::ptr::read((imp as usize + to_vk) as *const *mut c_void)
-        };
-        if emulation.is_null() {
-            return None;
-        }
+        let emulation = live_vk_emulation(has_vk_live, fb)?;
         let read = read.wrapping_add(slide) as usize;
         // SAFETY: the address of `VkEmulation::readColorBufferToBytes(unsigned x5, void*,
         // unsigned long long)` in the loaded image (its symbol in the same build, checked by UUID,
@@ -1341,6 +1313,162 @@ impl VkRead {
         // 4-byte RGBA, the size of `out`, and the first frames are checked against GL's).
         unsafe { (self.read)(self.emulation, cb, 0, 0, width, height, out.as_mut_ptr().cast(), out.len() as u64) }
     }
+}
+
+/// A private `VkEmulation` member's file address (as [`VkSymbols::read`]), with the image's slide
+/// and `hasEmulationVk`'s live address, from the renderer file that's loaded.
+#[cfg(target_os = "macos")]
+fn private_vk_member(handle: *mut c_void, backend: &Path, member: &str) -> Option<VkSymbols> {
+    // The file the symbols come from must be the image that's loaded (not, say, a renderer
+    // updated in place since).
+    let file_uuid = macho::image_uuid(&macho::load_commands(backend).ok()?)?;
+    if loaded_uuid(handle)? != file_uuid {
+        return None;
+    }
+    let found = macho::symbols(backend, &[GET_FB, HAS_EMULATION_VK, member]).ok()?;
+    let [Some(get_fb), Some(has_vk), Some(read)] = found[..] else { return None };
+    let live = |name: &str| {
+        let c = CString::new(name).ok()?;
+        // SAFETY: dlsym with a live handle and a NUL-terminated name.
+        let p = unsafe { libc::dlsym(handle, c.as_ptr()) };
+        (!p.is_null()).then_some(p as u64)
+    };
+    // The image's slide, agreed on by two exported symbols.
+    let slide = live(GET_FB)?.wrapping_sub(get_fb);
+    let has_vk_live = live(HAS_EMULATION_VK)?;
+    if has_vk_live.wrapping_sub(has_vk) != slide {
+        return None;
+    }
+    Some(VkSymbols { slide, has_vk_live, read })
+}
+
+#[cfg(target_os = "macos")]
+const COLOR_BUFFER_METAL: &str = "_ZN9gfxstream4host2vk11VkEmulation31getColorBufferMetalMemoryHandleEj";
+
+/// `MTLResource_id VkEmulation::getColorBufferMetalMemoryHandle(uint32_t)`: the color buffer's
+/// memory as gfxstream exported it (`vkGetMemoryMetalHandleEXT`, a placement `MTLHeap`),
+/// unretained, null if it has none. It takes the emulation's own lock.
+#[cfg(target_os = "macos")]
+type ColorBufferMetal = unsafe extern "C" fn(*mut c_void, u32) -> *mut c_void;
+
+/// The `-gpu metal` present path ([`metal`]) and whether its surfaces have matched the readback.
+#[cfg(target_os = "macos")]
+struct MetalPath {
+    presenter: Mutex<metal::Presenter<metal::MetalGpu>>,
+    /// [`VkTrust`], as a u8.
+    trust: AtomicU8,
+    matches: AtomicU8,
+    mismatches: AtomicU8,
+}
+
+#[cfg(target_os = "macos")]
+impl Renderer {
+    /// Whether this renderer build has the Metal handle of its color buffers in the expected
+    /// shape (the private `getColorBufferMetalMemoryHandle`, found as [`VkRead`] is), so
+    /// [`Renderer::last_posted_surface`] can work.
+    pub fn can_present_metal(&self) -> bool {
+        private_vk_member(self.handle, &self.backend, COLOR_BUFFER_METAL).is_some()
+    }
+
+    /// The present path, set up once the renderer has its FrameBuffer.
+    fn metal_path(&self) -> Option<&MetalPath> {
+        if let Some(p) = self.metal.get() {
+            return p.as_ref();
+        }
+        let f = self.fb_api().ok()?;
+        // SAFETY: getFB returns the renderer's singleton or null (before init: not decided yet).
+        let fb = unsafe { (f.get_fb)() };
+        if fb.is_null() {
+            return None;
+        }
+        self.metal
+            .get_or_init(|| {
+                let VkSymbols { slide, has_vk_live, read: member } = private_vk_member(self.handle, &self.backend, COLOR_BUFFER_METAL)?;
+                let emulation = live_vk_emulation(has_vk_live, fb)? as usize;
+                // SAFETY: the address of `VkEmulation::getColorBufferMetalMemoryHandle(unsigned)`
+                // in the loaded image (its symbol in the same build, checked by UUID, slid like the
+                // image); gfxstream declares it an instance method (`this` first, Itanium ABI), and
+                // its disassembly (docs/research/metal-present.md) shows one: it locks the
+                // emulation, finds the buffer, returns one pointer field.
+                let lookup = unsafe { std::mem::transmute::<usize, ColorBufferMetal>(member.wrapping_add(slide) as usize) };
+                // SAFETY: the live VkEmulation, which lives as long as the renderer, and the member
+                // above, which tolerates unknown handles (null).
+                let gpu = metal::MetalGpu::new(Box::new(move |cb| unsafe { lookup(emulation as *mut c_void, cb) }));
+                Some(MetalPath {
+                    presenter: Mutex::new(metal::Presenter::new(gpu)),
+                    trust: AtomicU8::new(VkTrust::Unchecked as u8),
+                    matches: AtomicU8::new(0),
+                    mismatches: AtomicU8::new(0),
+                })
+            })
+            .as_ref()
+    }
+
+    /// Color buffer `cb` (`width` x `height`) copied on the GPU into a pooled BGRA IOSurface
+    /// ([`metal::Presenter::present`]), unchecked: for a buffer nothing is drawing into (the
+    /// headless harness). `None` without the Metal path, a free surface, or memory to copy from.
+    pub fn color_buffer_surface(&self, cb: u32, width: u32, height: u32) -> Option<Arc<metal::MetalSurface>> {
+        let path = self.metal_path()?;
+        path.presenter.lock().unwrap_or_else(|e| e.into_inner()).present(cb, width, height)
+    }
+
+    /// The last posted color buffer (host composition's output), `width` x `height`, copied on
+    /// the GPU into a pooled BGRA IOSurface that stays this frame's until every holder drops it:
+    /// the `-gpu metal` present path, ordered after the compositor's post (see [`metal`]).
+    /// `Ok(None)` when there's nothing posted, no free surface, or the path is off: callers then
+    /// read the frame back ([`Renderer::read_last_posted_to`]).
+    ///
+    /// It's used once its first frames that could show a difference match the readback of the
+    /// same buffer byte for byte (red and blue swapped), and never if they don't: until then
+    /// surfaces are made and checked but not handed out.
+    pub fn last_posted_surface(&self, width: u32, height: u32) -> Result<Option<Arc<metal::MetalSurface>>> {
+        let cb = self.last_posted_color_buffer()?;
+        let Some(path) = self.metal_path().filter(|_| cb != 0) else { return Ok(None) };
+        let trust = VkTrust::from(path.trust.load(Ordering::Relaxed));
+        if trust == VkTrust::Off {
+            return Ok(None);
+        }
+        let Some(surface) = path.presenter.lock().unwrap_or_else(|e| e.into_inner()).present(cb, width, height) else { return Ok(None) };
+        if trust == VkTrust::Trusted {
+            return Ok(Some(surface));
+        }
+        let mut want = vec![0u8; width as usize * height as usize * 4];
+        let read = match self.vk.get().and_then(Option::as_ref) {
+            Some(vk) => vk.read(cb, width, height, &mut want),
+            None => self.read_color_buffer(cb, width, height, &mut want).is_ok(),
+        };
+        if read && sim_core::pixels::reveals_layout(&want, width, height) {
+            let same = surface.with_bgra(|px, stride| metal::bgra_matches_rgba(px, stride, &want, width, height)) == Some(true);
+            let (count, then) = if same { (&path.matches, VkTrust::Trusted) } else { (&path.mismatches, VkTrust::Off) };
+            let decided = count.fetch_add(1, Ordering::Relaxed) + 1 >= VK_CHECKS
+                && path.trust.compare_exchange(VkTrust::Unchecked as u8, then as u8, Ordering::Relaxed, Ordering::Relaxed).is_ok();
+            if decided {
+                let what = if same { "Metal present path on" } else { "Metal present path differs from the readback; reading frames back" };
+                eprintln!("emu: {what}");
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// The live `VkEmulation`, through the two loads of `FrameBuffer::hasEmulationVk()` (at
+/// `has_vk_live`), decoded and used only if it is exactly that accessor.
+#[cfg(target_os = "macos")]
+fn live_vk_emulation(has_vk_live: u64, fb: *mut c_void) -> Option<*mut c_void> {
+    // SAFETY: the address is the entry of an exported function in the loaded image, whose
+    // code pages are mapped readable; 20 bytes stay inside its text segment.
+    let code: [u32; 5] = unsafe { std::ptr::read_unaligned(has_vk_live as usize as *const [u32; 5]) };
+    let (to_impl, to_vk) = macho::pointer_test_offsets(code)?;
+    // SAFETY: the same two loads `hasEmulationVk()` does on the live FrameBuffer: its
+    // implementation pointer, then that object's VkEmulation pointer (null without Vulkan).
+    let emulation = unsafe {
+        let imp = std::ptr::read((fb as usize + to_impl) as *const *mut c_void);
+        if imp.is_null() {
+            return None;
+        }
+        std::ptr::read((imp as usize + to_vk) as *const *mut c_void)
+    };
+    (!emulation.is_null()).then_some(emulation)
 }
 
 /// The `LC_UUID` of the image `handle` loaded, read from its Mach-O header in memory.

@@ -283,6 +283,7 @@ impl Instance {
             virtual_queue: virtual_queue(&guest_egl(&self.avd), AngleImage::of(&self.avd)),
             // Their GLES encoder's transport (see `pipe_gles`).
             pipe_gles: pipe_gles(&self.avd),
+            metal_present: opts.metal_present,
         })
     }
 

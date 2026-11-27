@@ -9,6 +9,13 @@
 //! with a 32-byte record; only that record crosses the socket. Other clients get the RGBA rows on
 //! the socket, as before.
 //!
+//! A client that sends `surfaces <name>` (simee's encoder) gets each posted frame, under
+//! `-gpu metal`, as the IOSurface the renderer's GPU copied it into: the surface's Mach send right
+//! goes to the port it checked in under `<name>`, and an `EMUM` record says which. The surface is
+//! held for that client until it sends `release <seq>`. A frame with no surface (a presented one,
+//! a downscaled stream, a turned one for a client that doesn't turn frames, every surface held)
+//! goes the client's other way (ring or socket).
+//!
 //! A turned device's frames go to a client that sent `rotates` as the panel lies, with an `EMUO`
 //! record saying how to turn them, so it turns them as it draws and nothing here turns them; any
 //! other client gets them turned upright ([`FrameStore::latest_upright`]). Touches are in pixels
@@ -22,7 +29,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use emu_hvf::SharedMap;
-use emu_vmm::display::FrameStore;
+use emu_vmm::display::{FrameStore, SharedSurface};
 use sim_core::gesture::Phase;
 use sim_core::pixels::{downscale_factor, downscale_into, downscaled_size};
 use sim_core::rotation::Rotation;
@@ -36,6 +43,9 @@ const DEFAULT_INTERVAL: Duration = Duration::from_millis(16);
 const FPS: std::ops::RangeInclusive<u32> = 1..=240;
 /// Slots per ring: a client reading a frame within two frame intervals never races the writer.
 const RING_SLOTS: u32 = 3;
+/// Surfaces a client may hold unreleased; past that its frames go the other way until it
+/// releases some.
+const MAX_LEASES: usize = 4;
 
 pub struct DisplayServer {
     path: PathBuf,
@@ -105,6 +115,13 @@ struct Wants {
     changed: Condvar,
     /// Passes of the frame loop, for telling a parked stream from a spinning one in tests.
     passes: AtomicU64,
+    /// Where this client's surfaces go (`surfaces <name>`).
+    #[cfg(target_os = "macos")]
+    surfaces: Mutex<Option<emu_gfxstream::metal::MachSender>>,
+    /// Surfaces sent and not yet released, by sequence number: each is held for the client.
+    leases: Mutex<std::collections::HashMap<u32, Arc<dyn SharedSurface>>>,
+    #[cfg(target_os = "macos")]
+    next_seq: AtomicU32,
 }
 
 impl Wants {
@@ -131,6 +148,24 @@ impl Wants {
             .changed
             .wait_timeout_while(g, timeout, |_| self.max_width.load(Ordering::Relaxed) == 0 && !self.done.load(Ordering::Relaxed));
     }
+    /// Surfaces go to the port the client checked in under `name` from the next frame on.
+    fn send_surfaces_to(&self, name: &str) {
+        #[cfg(target_os = "macos")]
+        {
+            let sender = emu_gfxstream::metal::MachSender::look_up(name);
+            if sender.is_none() {
+                eprintln!("emu: display: no surface port named {name}; sending frames as pixels");
+            }
+            *self.surfaces.lock().unwrap_or_else(|e| e.into_inner()) = sender;
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = name;
+    }
+
+    fn release(&self, seq: u32) {
+        self.leases.lock().unwrap_or_else(|e| e.into_inner()).remove(&seq);
+    }
+
     fn interval(&self) -> Duration {
         match self.fps.load(Ordering::Relaxed) {
             0 => DEFAULT_INTERVAL,
@@ -175,6 +210,8 @@ fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<e
             (Input::Shared, _) => wants.shared.store(true, Ordering::Relaxed),
             (Input::Socket, _) => wants.shared.store(false, Ordering::Relaxed),
             (Input::Rotates, _) => wants.rotates.store(true, Ordering::Relaxed),
+            (Input::Surfaces(name), _) => wants.send_surfaces_to(&name),
+            (Input::Release(seq), _) => wants.release(seq),
             (Input::Touch { x, y, phase }, Some(emu_vmm::Inputs { touch: Some(touch), .. })) => {
                 // Clients point at the screen they show: upright as the guest rotated its
                 // display, a folded foldable's view from its origin on the scanout.
@@ -224,6 +261,8 @@ enum Out {
     Socket(FrameHeader),
     /// In the ring's `slot`; `announce` when the ring is new.
     Shared { header: FrameHeader, slot: u32, announce: Option<PathBuf> },
+    /// Surface `seq`, already sent to the client's port.
+    Surface { header: FrameHeader, seq: u32 },
 }
 
 /// How a stream's frames are turned: as the panel lies for a client that turns them itself, else
@@ -271,7 +310,9 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
         let n = display.frames().max(n);
         let started = Instant::now();
         let turn = if wants.rotates.load(Ordering::Relaxed) { Turn::Panel } else { Turn::Upright };
-        let frame = if wants.shared.load(Ordering::Relaxed) && !ring_failed {
+        let frame = if let Some(surface) = surface_frame(display, wants, mw, turn) {
+            Some(surface)
+        } else if wants.shared.load(Ordering::Relaxed) && !ring_failed {
             shared_frame(display, mw, n, &mut ring, dir, turn).unwrap_or_else(|e| {
                 // No ring: this client gets its frames on the socket from the next one.
                 eprintln!("emu: display: no shared frame ring ({e}); sending frames on the socket");
@@ -309,6 +350,13 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
                     msg.extend_from_slice(p);
                 }
                 msg.extend(Record::Shared { header: *header, slot: *slot }.encode());
+                out.write_all(&msg)
+            }
+            Out::Surface { header, seq } => {
+                sent = header.frame;
+                let mut msg = Vec::with_capacity(64);
+                msg.extend(tell.iter().flatten());
+                msg.extend(Record::Surface { header: *header, seq: *seq }.encode());
                 out.write_all(&msg)
             }
         };
@@ -350,6 +398,7 @@ impl Stats {
         let (header, how) = match frame {
             Out::Socket(h) => (h, "socket"),
             Out::Shared { header, .. } => (header, "ring"),
+            Out::Surface { header, .. } => (header, "surface"),
         };
         let summary = |v: &mut Vec<f64>| {
             v.sort_by(f64::total_cmp);
@@ -367,6 +416,43 @@ impl Stats {
             summary(&mut self.capture),
             summary(&mut self.send)
         ))
+    }
+}
+
+/// The latest frame as a surface sent to the client's port (its lease kept until `release`), for
+/// a client that asked for surfaces: only a full-size frame, as the client shows it (unturned, or
+/// to a client that turns frames itself). `None` sends the frame the client's other way.
+fn surface_frame(display: &FrameStore, wants: &Wants, max_width: u32, turn: Turn) -> Option<Out> {
+    #[cfg(target_os = "macos")]
+    {
+        let sender = wants.surfaces.lock().unwrap_or_else(|e| e.into_inner());
+        let sender = sender.as_ref()?;
+        if turn == Turn::Upright && display.rotation() != Rotation::Deg0 {
+            return None;
+        }
+        let mut leases = wants.leases.lock().unwrap_or_else(|e| e.into_inner());
+        if leases.len() >= MAX_LEASES {
+            return None;
+        }
+        let (frame, surface) = display.latest_surface()?;
+        let (w, h) = surface.size();
+        if downscale_factor(w, max_width) != 1 {
+            return None;
+        }
+        let header = FrameHeader::new(w, h, w, h, frame)?;
+        let seq = wants.next_seq.fetch_add(1, Ordering::Relaxed);
+        // Held before it goes: a release can't come before the lease.
+        leases.insert(seq, surface.clone());
+        if !surface.mach_port().is_some_and(|port| sender.send(port, seq)) {
+            leases.remove(&seq);
+            return None;
+        }
+        Some(Out::Surface { header, seq })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (display, wants, max_width, turn, MAX_LEASES);
+        None
     }
 }
 
@@ -709,6 +795,98 @@ mod tests {
         drop((frames, d));
         wait_until("the ring's removal", || rig.rings().is_empty());
         assert!(closed.elapsed() < Duration::from_millis(500), "took {:?}", closed.elapsed());
+    }
+
+    /// A real IOSurface as the store holds a `-gpu metal` frame, counting its holders' drops.
+    #[cfg(target_os = "macos")]
+    struct TestSurface(sim_coresim::Surface, Arc<AtomicUsize>);
+
+    #[cfg(target_os = "macos")]
+    impl SharedSurface for TestSurface {
+        fn size(&self) -> (u32, u32) {
+            self.0.size()
+        }
+        fn mach_port(&self) -> Option<u32> {
+            self.0.mach_port()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for TestSurface {
+        fn drop(&mut self) {
+            self.1.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A store that copies each post into a new [`TestSurface`]: the IDs made, in order, and the
+    /// count of those dropped.
+    #[cfg(target_os = "macos")]
+    fn with_surfaces(rig: &Rig) -> (Arc<Mutex<Vec<u32>>>, Arc<AtomicUsize>) {
+        let (ids, dropped) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicUsize::new(0)));
+        let (i, d) = (ids.clone(), dropped.clone());
+        rig.store.set_surface_readback(Box::new(move |w, h| {
+            let s = sim_coresim::Surface::new_bgra(w, h).ok()?;
+            i.lock().expect("ids").push(s.id());
+            Some(Arc::new(TestSurface(s, d.clone())) as Arc<dyn SharedSurface>)
+        }));
+        (ids, dropped)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn surface_clients_get_each_frame_through_their_port_and_hold_it_until_they_release_it() {
+        let rig = Rig::new("surf");
+        let (ids, dropped) = with_surfaces(&rig);
+        let inbox = sim_coresim::SurfaceInbox::check_in().expect("check in");
+        let mut d = Display::connect(&rig.dir).expect("connect");
+        d.request_shared().expect("shm");
+        d.send(&Input::Surfaces(inbox.name().to_owned())).expect("surfaces");
+        d.send(&Input::Hello { max_width: u32::MAX }).expect("hello");
+        let r = d.try_clone().expect("clone");
+        r.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+        let mut frames = Frames::new(r);
+        let mut buf = Vec::new();
+        rig.store.posted(64, 32);
+        let sim_android::display::Next::Surface { header, seq } = frames.newest_into(&mut buf, || true).expect("record") else {
+            panic!("a surface record");
+        };
+        assert_eq!((header.width, header.height, header.frame), (64, 32, 1));
+        let (got_seq, got) = inbox.recv(Duration::from_secs(1)).expect("recv").expect("the surface, before its record");
+        assert_eq!((got_seq, got.id()), (seq, ids.lock().expect("ids")[0]), "the store's surface itself");
+        assert_eq!(rig.reads.load(Ordering::Relaxed), 0, "nothing read back");
+        // The next frame: the store lets the first go, the client still holds it.
+        rig.store.posted(64, 32);
+        let next = frames.newest_into(&mut buf, || true).expect("record");
+        assert!(matches!(next, sim_android::display::Next::Surface { header, .. } if header.frame == 2), "{next:?}");
+        assert!(inbox.recv(Duration::from_secs(1)).expect("recv").is_some());
+        assert_eq!(dropped.load(Ordering::Relaxed), 0, "leased to the client");
+        d.send(&Input::Release(seq)).expect("release");
+        wait_until("the released surface to go", || dropped.load(Ordering::Relaxed) == 1);
+        // A downscaled stream gets pixels: surfaces are full size only.
+        d.send(&Input::Hello { max_width: 32 }).expect("hello");
+        std::thread::sleep(Duration::from_millis(50));
+        rig.store.posted(64, 32);
+        let px = frames.newest_into(&mut buf, || true).expect("record");
+        assert!(matches!(px, sim_android::display::Next::Pixels(h) if h.width == 32), "{px:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_surface_client_whose_port_is_gone_gets_ring_frames() {
+        let rig = Rig::new("nosurf");
+        let _ = with_surfaces(&rig);
+        let mut d = Display::connect(&rig.dir).expect("connect");
+        d.request_shared().expect("shm");
+        d.send(&Input::Surfaces("dev.simee.surfaces.nobody".into())).expect("surfaces");
+        d.send(&Input::Hello { max_width: u32::MAX }).expect("hello");
+        let r = d.try_clone().expect("clone");
+        r.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+        let mut frames = Frames::new(r);
+        rig.store.posted(8, 4);
+        let mut buf = Vec::new();
+        let next = frames.newest_into(&mut buf, || true).expect("frame");
+        assert!(matches!(next, sim_android::display::Next::Pixels(h) if (h.width, h.frame) == (8, 1)), "{next:?}");
+        assert_eq!(buf, pixels(8, 4, 1), "read back as before");
     }
 
     #[test]

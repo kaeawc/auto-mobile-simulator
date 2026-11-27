@@ -739,6 +739,78 @@ mod imp {
             cpu.push(thread_cpu_ms() - c);
         }
         println!("encoder's RGBA-to-BGRA copy x{n}: wall {:.3} ms, this thread {:.3} ms CPU", median(&mut swap), median(&mut cpu));
+        shipped_paths(r, p, &cb, n)
+    }
+
+    /// The two paths as emu and simee run them, end to end in this process, per frame:
+    ///
+    /// - readback: `VkRead` into a buffer (emu's ring slot), a copy of it (simee's `pread` from
+    ///   the ring), and the encoder's pool fill (`PixelBufferPool::fill`, RGBA to BGRA);
+    /// - `-gpu metal`: `Renderer::color_buffer_surface` (alias cache, pool of 3, the compute pass,
+    ///   waited for), a Mach port for it sent to an inbox (`MachSender`), received
+    ///   (`SurfaceInbox::recv`) and wrapped for VideoToolbox (`PixelBuffer::wrap_surface`).
+    fn shipped_paths(r: &gfx::Renderer, p: &Private, cb: &ColorBuffer, n: usize) -> Res<()> {
+        use sim_coresim::videotoolbox::{PixelBuffer, PixelBufferPool, PixelFormat};
+        let (w, h) = (cb.width, cb.height);
+        let first = r.color_buffer_surface(cb.id, w, h).ok_or("no surface from the library path")?;
+        let same = first.with_bgra(|px, stride| gfx::metal::bgra_matches_rgba(px, stride, &cb.src, w, h)) == Some(true);
+        println!("library surface: {}", if same { "matches the upload (red and blue swapped)" } else { "DIFFERS" });
+        drop(first);
+        let inbox = sim_coresim::SurfaceInbox::check_in().map_err(|e| e.to_string())?;
+        let sender = gfx::metal::MachSender::look_up(inbox.name()).ok_or("no inbox port")?;
+        // (emu side, simee side, wall) per frame.
+        let (mut emu, mut simee, mut wall) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+        let p0 = process_cpu_ms();
+        for seq in 0..n as u32 {
+            let (t, c) = (Instant::now(), thread_cpu_ms());
+            let s = r.color_buffer_surface(cb.id, w, h).ok_or("no free surface")?;
+            if !sender.send(s.mach_port().ok_or("no port")?, seq) {
+                return Err("send failed".into());
+            }
+            let c1 = thread_cpu_ms();
+            let (_, got) = inbox.recv(std::time::Duration::from_secs(1)).map_err(|e| e.to_string())?.ok_or("nothing received")?;
+            let picture = PixelBuffer::wrap_surface(&got).map_err(|e| e.to_string())?;
+            std::hint::black_box(&picture);
+            let c2 = thread_cpu_ms();
+            wall.push(t.elapsed().as_secs_f64() * 1e3);
+            emu.push(c1 - c);
+            simee.push(c2 - c1);
+            // The client's release: the surface goes back to the pool with its last holder.
+            drop((picture, got, s));
+        }
+        let metal_process = (process_cpu_ms() - p0) / n as f64;
+        println!(
+            "-gpu metal x{n}: wall {:.3} ms, emu thread {:.3} ms CPU (present + send), simee thread {:.3} ms CPU (receive + wrap), process {metal_process:.3} ms CPU",
+            median(&mut wall),
+            median(&mut emu),
+            median(&mut simee)
+        );
+        let pool = PixelBufferPool::new(w, h, PixelFormat::Rgba).map_err(|e| e.to_string())?;
+        let (mut slot, mut read) = (vec![0u8; cb.src.len()], vec![0u8; cb.src.len()]);
+        let (mut emu, mut simee, mut wall) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+        let p0 = process_cpu_ms();
+        for _ in 0..n {
+            let (t, c) = (Instant::now(), thread_cpu_ms());
+            if !vk_read(p, cb, &mut slot) {
+                return Err("readColorBufferToBytes failed".into());
+            }
+            let c1 = thread_cpu_ms();
+            read.copy_from_slice(&slot);
+            let picture = pool.fill(&read, w as usize * 4).map_err(|e| e.to_string())?;
+            std::hint::black_box(&picture);
+            let c2 = thread_cpu_ms();
+            wall.push(t.elapsed().as_secs_f64() * 1e3);
+            emu.push(c1 - c);
+            simee.push(c2 - c1);
+        }
+        let read_process = (process_cpu_ms() - p0) / n as f64;
+        println!(
+            "readback x{n}: wall {:.3} ms, emu thread {:.3} ms CPU (VkRead), simee thread {:.3} ms CPU (ring copy + pool fill), process {read_process:.3} ms CPU",
+            median(&mut wall),
+            median(&mut emu),
+            median(&mut simee)
+        );
+        println!("saved per frame: {:.3} ms of process CPU", read_process - metal_process);
         Ok(())
     }
 

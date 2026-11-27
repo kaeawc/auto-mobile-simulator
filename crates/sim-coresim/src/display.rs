@@ -33,7 +33,18 @@ const FORMAT_BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 /// keeps rendering into it, so readers see live (possibly mid-update) contents.
 pub struct Surface(Obj);
 
+// SAFETY: an IOSurface is a thread-safe CF object; this handle only retains it and reads its
+// properties.
+unsafe impl Send for Surface {}
+// SAFETY: as above.
+unsafe impl Sync for Surface {}
+
 impl Surface {
+    /// Takes over a retained IOSurface.
+    pub(crate) fn from_retained(surface: Obj) -> Surface {
+        Surface(surface)
+    }
+
     /// The raw `IOSurfaceRef`, valid while this handle lives.
     pub fn as_raw(&self) -> *mut c_void {
         Retained::as_ptr(&self.0).cast_mut().cast()

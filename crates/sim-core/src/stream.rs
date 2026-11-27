@@ -11,7 +11,10 @@
 //! - `touch <x> <y> down|move|up` in pixels of the screen as the guest rotated its display (the
 //!   frames' pixels, turned upright when the stream says to turn them);
 //! - `key <name>`: press and release a key by its console name (`HOME`, `BACK`, `POWER`, `A`, ...);
-//! - `wheel <ticks>` on the rotary / scroll device.
+//! - `wheel <ticks>` on the rotary / scroll device;
+//! - `surfaces <name>`: send frames as IOSurfaces to the Mach port checked in under bootstrap name
+//!   `<name>` (`EMUM`, below), where the server has them (`emu -gpu metal`); macOS only;
+//! - `release <seq>`: the client is done with surface `seq` (`EMUM`): the server may reuse it.
 //!
 //! Server → client, 32-byte [`Record`]s, little-endian:
 //! - `EMUF` ([`FrameHeader`]: u32 width, height, device width, device height, u64 frame number,
@@ -21,7 +24,12 @@
 //!   u32 is the slot), so only these 32 bytes cross the socket;
 //! - `EMUO`: the frames after it are to be turned clockwise by the last u32's quarter turns
 //!   ([`Rotation`]) to show upright, as the guest rotated its display. Only to clients that sent
-//!   `rotates`, before their first frame and whenever it changes.
+//!   `rotates`, before their first frame and whenever it changes;
+//! - `EMUM`: a frame the server's GPU copied into an IOSurface (BGRA, full size), whose Mach send
+//!   right went to the client's port just before this record, in a message with id
+//!   [`SURFACE_MSG_ID`] carrying the surface port and the record's last u32, its sequence number.
+//!   Only to clients that sent `surfaces`; each one is held for the client until it sends
+//!   `release <seq>`. A frame the server can't hand over that way goes out as `EMUS` or `EMUF`.
 //!
 //! `EMUR` and `EMUS` go only to clients that sent `shm`; a server that predates it ignores the
 //! line and keeps sending `EMUF`, so clients read whichever arrives. The ring ([`ring`]) is a
@@ -38,6 +46,12 @@ pub const SHARED_MAGIC: &[u8; 4] = b"EMUS";
 pub const RING_MAGIC: &[u8; 4] = b"EMUR";
 /// How the frames after it are turned.
 pub const ROTATION_MAGIC: &[u8; 4] = b"EMUO";
+/// A frame handed over as an IOSurface (Mach port).
+pub const SURFACE_MAGIC: &[u8; 4] = b"EMUM";
+/// `msgh_id` of the Mach message that carries an `EMUM` frame's IOSurface port: "EMUM" as a
+/// little-endian u32. Its body is one port descriptor (the surface's send right, moved) and then
+/// the record's sequence number as a u32.
+pub const SURFACE_MSG_ID: i32 = i32::from_le_bytes(*SURFACE_MAGIC);
 /// Size of a frame header in bytes.
 pub const HEADER_LEN: usize = 32;
 
@@ -106,6 +120,9 @@ pub enum Record {
     Ring { path_len: u32 },
     /// `EMUO`: the frames after it show upright turned clockwise by this much.
     Rotation(Rotation),
+    /// `EMUM`: the frame is IOSurface `seq`, sent to the client's Mach port (see the module docs);
+    /// the header's `len` is the BGRA size it would have as tight rows.
+    Surface { header: FrameHeader, seq: u32 },
 }
 
 impl Record {
@@ -113,6 +130,7 @@ impl Record {
         match self {
             Record::Frame(h) => h.encode(),
             Record::Shared { header, slot } => header.encode_as(SHARED_MAGIC, *slot),
+            Record::Surface { header, seq } => header.encode_as(SURFACE_MAGIC, *seq),
             Record::Ring { path_len } => {
                 let mut out = [0u8; HEADER_LEN];
                 out[0..4].copy_from_slice(RING_MAGIC);
@@ -140,6 +158,10 @@ impl Record {
             },
             m if m == SHARED_MAGIC => match len {
                 Some(len) => Ok(Record::Shared { header: FrameHeader { len, ..h }, slot: last }),
+                None => Err("frame size mismatch".into()),
+            },
+            m if m == SURFACE_MAGIC => match len {
+                Some(len) => Ok(Record::Surface { header: FrameHeader { len, ..h }, seq: last }),
                 None => Err("frame size mismatch".into()),
             },
             m if m == RING_MAGIC => match last {
@@ -324,6 +346,11 @@ pub enum Input {
     },
     Key(String),
     Wheel(i32),
+    /// Frames as IOSurfaces ([`Record::Surface`]) to the Mach port checked in under this bootstrap
+    /// name (no whitespace).
+    Surfaces(String),
+    /// Done with surface `seq` ([`Record::Surface`]).
+    Release(u32),
 }
 
 impl Input {
@@ -344,6 +371,8 @@ impl Input {
             }
             Self::Key(name) => format!("key {name}"),
             Self::Wheel(ticks) => format!("wheel {ticks}"),
+            Self::Surfaces(name) => format!("surfaces {name}"),
+            Self::Release(seq) => format!("release {seq}"),
         }
     }
 
@@ -366,6 +395,8 @@ impl Input {
             },
             ["key", name] => Self::Key((*name).to_owned()),
             ["wheel", ticks] => Self::Wheel(ticks.parse().ok()?),
+            ["surfaces", name] => Self::Surfaces((*name).to_owned()),
+            ["release", seq] => Self::Release(seq.parse().ok()?),
             _ => return None,
         })
     }
@@ -400,6 +431,7 @@ mod tests {
             Record::Ring { path_len: 40 },
             Record::Rotation(Rotation::Deg270),
             Record::Rotation(Rotation::Deg0),
+            Record::Surface { header, seq: 77 },
         ];
         for r in records {
             assert_eq!(Record::decode(&r.encode()), Ok(r), "{r:?}");
@@ -425,6 +457,11 @@ mod tests {
             Err("bad frame header".into()),
             "an old client's decoder takes only frames"
         );
+        let surface = Record::Surface { header, seq: 77 }.encode();
+        assert_eq!(&surface[0..4], b"EMUM");
+        assert_eq!(&surface[28..32], &77u32.to_le_bytes(), "the sequence number rides in the last u32");
+        assert_eq!(FrameHeader::decode(&surface), Err("bad frame header".into()), "an old client's decoder takes only frames");
+        assert_eq!(SURFACE_MSG_ID.to_le_bytes(), *b"EMUM");
     }
 
     #[test]
@@ -475,11 +512,15 @@ mod tests {
             Input::Touch { x: 12.0, y: 22.0, phase: Phase::Up },
             Input::Key("HOME".into()),
             Input::Wheel(-2),
+            Input::Surfaces("dev.simee.surfaces.42.0".into()),
+            Input::Release(7),
         ];
         for i in inputs {
             assert_eq!(Input::parse(&i.to_line()), Some(i.clone()), "{}", i.to_line());
         }
         assert_eq!(Input::Touch { x: 10.4, y: 19.6, phase: Phase::Up }.to_line(), "touch 10 20 up");
+        assert_eq!(Input::parse("release x"), None);
+        assert_eq!(Input::parse("surfaces"), None);
     }
 
     #[test]
