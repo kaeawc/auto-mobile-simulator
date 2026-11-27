@@ -75,7 +75,7 @@ pub struct GuestRam {
 pub const DISCARD_GRANULE: u64 = 0x4000;
 
 // SAFETY: the mapping is plain bytes with no interior references; all access goes through
-// copying accessors (see the type docs).
+// copying accessors or, for aligned integers, atomic ones (see the type docs).
 unsafe impl Send for GuestRam {}
 // SAFETY: as above.
 unsafe impl Sync for GuestRam {}
@@ -401,12 +401,13 @@ impl GuestRam {
         Ok(())
     }
 
-    /// The host address of an aligned `T` at guest `addr`, or `None` when the host address isn't
-    /// aligned for it (the caller copies bytes instead).
-    fn aligned<T>(&self, addr: u64) -> std::result::Result<Option<*mut T>, MemError> {
-        let off = self.offset(addr, size_of::<T>())?;
-        // SAFETY: `off + size_of::<T>()` is within the mapping (checked above).
-        let p = unsafe { self.ptr.add(off) }.cast::<T>();
+    /// The host address of the atomic `A` at guest `addr`, or `None` when the host address isn't
+    /// aligned for `A` (the caller copies bytes instead). Checked against the atomic's alignment,
+    /// which can exceed the integer's (`AtomicU64` on 32-bit x86).
+    fn aligned<A>(&self, addr: u64) -> std::result::Result<Option<*mut A>, MemError> {
+        let off = self.offset(addr, size_of::<A>())?;
+        // SAFETY: `off + size_of::<A>()` is within the mapping (checked above).
+        let p = unsafe { self.ptr.add(off) }.cast::<A>();
         Ok(p.is_aligned().then_some(p))
     }
 
@@ -418,10 +419,10 @@ impl GuestRam {
     // addresses keep the byte copy.
 
     pub fn read_u16(&self, addr: u64) -> std::result::Result<u16, MemError> {
-        if let Some(p) = self.aligned::<u16>(addr)? {
+        if let Some(p) = self.aligned::<AtomicU16>(addr)? {
             // SAFETY: `p` is aligned and in the mapping, which lives as long as `self`; other
             // accesses to it are the guest's or these accessors' (see the type docs).
-            return Ok(u16::from_le(unsafe { AtomicU16::from_ptr(p) }.load(Ordering::Relaxed)));
+            return Ok(u16::from_le(unsafe { &*p }.load(Ordering::Relaxed)));
         }
         let mut b = [0; 2];
         self.read(addr, &mut b)?;
@@ -429,9 +430,9 @@ impl GuestRam {
     }
 
     pub fn read_u32(&self, addr: u64) -> std::result::Result<u32, MemError> {
-        if let Some(p) = self.aligned::<u32>(addr)? {
+        if let Some(p) = self.aligned::<AtomicU32>(addr)? {
             // SAFETY: as in `read_u16`.
-            return Ok(u32::from_le(unsafe { AtomicU32::from_ptr(p) }.load(Ordering::Relaxed)));
+            return Ok(u32::from_le(unsafe { &*p }.load(Ordering::Relaxed)));
         }
         let mut b = [0; 4];
         self.read(addr, &mut b)?;
@@ -439,9 +440,9 @@ impl GuestRam {
     }
 
     pub fn read_u64(&self, addr: u64) -> std::result::Result<u64, MemError> {
-        if let Some(p) = self.aligned::<u64>(addr)? {
+        if let Some(p) = self.aligned::<AtomicU64>(addr)? {
             // SAFETY: as in `read_u16`.
-            return Ok(u64::from_le(unsafe { AtomicU64::from_ptr(p) }.load(Ordering::Relaxed)));
+            return Ok(u64::from_le(unsafe { &*p }.load(Ordering::Relaxed)));
         }
         let mut b = [0; 8];
         self.read(addr, &mut b)?;
@@ -449,18 +450,18 @@ impl GuestRam {
     }
 
     pub fn write_u16(&self, addr: u64, v: u16) -> std::result::Result<(), MemError> {
-        if let Some(p) = self.aligned::<u16>(addr)? {
+        if let Some(p) = self.aligned::<AtomicU16>(addr)? {
             // SAFETY: as in `read_u16`.
-            unsafe { AtomicU16::from_ptr(p) }.store(v.to_le(), Ordering::Relaxed);
+            unsafe { &*p }.store(v.to_le(), Ordering::Relaxed);
             return Ok(());
         }
         self.write(addr, &v.to_le_bytes())
     }
 
     pub fn write_u32(&self, addr: u64, v: u32) -> std::result::Result<(), MemError> {
-        if let Some(p) = self.aligned::<u32>(addr)? {
+        if let Some(p) = self.aligned::<AtomicU32>(addr)? {
             // SAFETY: as in `read_u16`.
-            unsafe { AtomicU32::from_ptr(p) }.store(v.to_le(), Ordering::Relaxed);
+            unsafe { &*p }.store(v.to_le(), Ordering::Relaxed);
             return Ok(());
         }
         self.write(addr, &v.to_le_bytes())
