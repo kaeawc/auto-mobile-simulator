@@ -91,7 +91,7 @@ display socket: each vCPU 0.64–0.66, SwiftShader workers 0.34 in total.
 
 emu's own device threads (vsock, the vhost-user kicks, the GPU, the sensors, the console) are 0.03
 cores at their busiest and 0.01 idle: nothing in emu's Rust is a cost. The host never runs out of
-cores either: no phase passes 3.05 of 4, and the vCPUs are 54% busy in the swipes. What bounds
+cores either: no phase passes 3.05 of 4, and the vCPUs are 65% busy in the display-socket swipes. What bounds
 a frame is how fast one guest thread runs, because the guest thread that draws a frame (the
 launcher's UI thread, SurfaceFlinger) is one translated thread.
 
@@ -115,16 +115,24 @@ Top 10 symbols per phase (cores; `qemu` is QEMU's own code, the rest are named):
 | Swipes (display socket) | translated guest code 0.76 | `helper_lookup_tb_ptr` 0.30 | `qht_lookup_custom` 0.18 | SwiftShader shader JIT 0.17 | `probe_access_internal` 0.08 | `mmu_translate` 0.08 | `tlb_set_page_full` 0.05 | `tb_lookup_cmp` 0.05 | `do_ld4_mmu` 0.05 | `do_ld_8` 0.05 |
 | Swipes (adb) | translated guest code 0.51 | SwiftShader shader JIT 0.51 | `helper_lookup_tb_ptr` 0.25 | `qht_lookup_custom` 0.14 | `probe_access_internal` 0.05 | `mmu_translate` 0.05 | `tlb_set_page_full` 0.04 | `tb_lookup_cmp` 0.03 | `do_ld_8` 0.03 | `x86_get_tb_cpu_state` 0.03 |
 
-What the vCPU threads (the biggest consumer in every phase) spend their time on, boot, as a share
-of vCPU time: translated guest code 31%; finding the next translation block, 35%
-(`helper_lookup_tb_ptr` 14%, `qht_lookup_custom` 7%, `tb_lookup_cmp`, `x86_get_tb_cpu_state`,
-`tb_htable_lookup`, `curr_cflags`: the rest); soft MMU, 15% (`probe_access_internal`,
-`mmu_translate`, `tlb_set_page_full`, `do_ld_*`, `victim_tlb_hit`, `tlb_reset_dirty`); translating
-new code (`tcg_gen_code`, `liveness_pass_1`), 6% in boot and about 0 afterwards. The shares are
-the same in the swipes (31% / 38% / 16%) and when idle (29% / 34% / 16%). Only about a third of the time
-QEMU is busy runs the guest's own code. Translation is not the cost of software mode once
-the cache is warm; the cost is dispatch between translated blocks and the TLB, both of which
-are per-instruction overhead that grows with how often the guest changes address space or jumps indirectly.
+What the vCPU threads (the biggest consumer in every phase) spend their time on, as a share of
+their busy time (the five TCG groups of the table above):
+
+| Phase | Translated guest code | Finding the next block (TB lookup) | Soft MMU | Translating new code | Other QEMU |
+| --- | --- | --- | --- | --- | --- |
+| Boot | 31% | 27% | 18% | 6% | 18% |
+| 60–120 s after | 33% | 26% | 25% | 3% | 13% |
+| Idle | 30% | 28% | 26% | 0% | 16% |
+| Swipes (display socket) | 29% | 25% | 22% | 8% | 15% |
+| Swipes (adb) | 31% | 30% | 21% | 2% | 15% |
+
+In boot the lookup is `helper_lookup_tb_ptr` 14% of vCPU time, `qht_lookup_custom` 7%, then
+`tb_lookup_cmp`, `x86_get_tb_cpu_state`, `tb_htable_lookup` and `curr_cflags`; the soft MMU is
+`probe_access_internal`, `mmu_translate`, `tlb_set_page_full`, `do_ld_*` and `victim_tlb_hit`.
+Only about 30% of the time the vCPUs are busy runs the guest's own code, in every phase; 50 to
+55% goes to jumping between translated blocks and to the soft TLB. Translating new code is a
+boot-time cost (6 to 8%, and 0 when idle); once the cache is warm the cost of software mode is
+dispatch and address translation, per instruction. Section 4 tests why they're so high.
 
 ### What the guest is doing
 
@@ -141,8 +149,8 @@ came 166.0 s after the start, 10 s after the guest's last milestone):
 | screen enabled | 132.1 s | 12.9 s |
 | boot animation stops (`sf_stop_bootanim`) | 155.1 s | 23.0 s |
 
-Busiest guest processes (`dumpsys cpuinfo`, percent of one guest CPU): 14 s of the 60 s window
-that ends 60 s after boot completes: system_server 86%, the ranchu composer HAL 69% (59% user),
+Busiest guest processes (`dumpsys cpuinfo`, percent of one guest CPU): the 14 s ending about 74 s
+after boot completes: system_server 86%, the ranchu composer HAL 69% (59% user),
 Settings 47%, SurfaceFlinger 30%, SystemUI 24%, the launcher 20%. In the idle window: system_server
 30%, SystemUI 12%, the composer HAL 10%, SurfaceFlinger 8.3%, the sensors HAL 6.2%, the launcher 4.3%.
 One guest thread's speed is what it waits on: system_server's boot is serial.
