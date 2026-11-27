@@ -117,7 +117,7 @@ mod imp {
         }
 
         #[test]
-        fn listen_rows_keep_only_this_processs_listeners() {
+        fn listen_rows_keep_only_this_process_listeners() {
             let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
                 0: 0100007F:15B2 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 111 1 0 100 0 0 10 0\n\
                 1: 0100007F:15B3 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 222 1 0 100 0 0 10 0\n\
