@@ -51,6 +51,11 @@ on:
       - "rust-toolchain.toml"
       - ".github/actions/rust-toolchain/**"
       - ".github/actions/enable-kvm/**"
+      # What the KVM leg's benchmark runs.
+      - "scripts/android-bench.sh"
+      - "scripts/bench/android-boot.sh"
+      - "scripts/bench/lib.sh"
+      - "scripts/bench/summarize.py"
       - ".github/workflows/software-mode.yml"
       - "!**/*.md"
       - "!**/tests/**"
