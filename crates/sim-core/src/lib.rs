@@ -1,5 +1,6 @@
 //! Pure, dependency-light simee building blocks. No FFI, no I/O: everything here is unit-tested.
 
+pub mod body;
 pub mod carplay;
 pub mod contrast;
 pub mod debug;
