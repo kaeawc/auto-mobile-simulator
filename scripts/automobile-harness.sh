@@ -11,6 +11,7 @@ udid=${1:?usage: scripts/automobile-harness.sh <udid> [auto-mobile checkout]}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 am_dir=$(cd "${2:-$repo/../auto-mobile}" && pwd)
 
+# shellcheck source=automobile-daemon.sh
 . "$repo/scripts/automobile-daemon.sh"
 session=
 cleanup() {
@@ -24,7 +25,10 @@ echo "== getApple"
 out=$(am getApple --udid "$udid")
 echo "$out" | tail -20
 session=$(echo "$out" | grep -oE 'sessionUuid[^0-9a-f]*[0-9a-f-]{36}' | head -1 | grep -oE '[0-9a-f-]{36}' || true)
-[ -n "$session" ] || { echo "no session minted" >&2; exit 1; }
+[ -n "$session" ] || {
+  echo "no session minted" >&2
+  exit 1
+}
 echo "== observe (session $session)"
 am --session-uuid "$session" observe | tail -40
 echo "== pressButton home"

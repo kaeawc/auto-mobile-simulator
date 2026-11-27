@@ -93,7 +93,8 @@ cd desktop && cargo test     # Rune headless view tests
 ```
 
 After any change: `cargo c && cargo lint && cargo t`. Before pushing: `scripts/check.sh` (CI's
-checks, fastest first: fmt, clippy for this host and for the other platform's target, the tests,
+checks, fastest first: the script and docs linters (`scripts/lint.sh`, docs/development.md
+"Linters"), fmt, clippy for this host and for the other platform's target, the tests,
 the desktop when it changed; a few seconds warm). `scripts/install-hooks.sh` makes it the
 pre-push hook. Coverage: `cargo llvm-cov nextest --workspace --summary-only` (CI's Linux job
 fails under its `--fail-under-lines` floor; raise the floor with coverage, never lower it). On a non-macOS host, also lint the macOS

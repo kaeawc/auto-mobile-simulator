@@ -24,6 +24,7 @@ else
 fi
 
 log=$(mktemp -d "${TMPDIR:-/tmp}/simee-am-run.XXXXXX")
+# shellcheck source=automobile-daemon.sh
 . "$repo/scripts/automobile-daemon.sh"
 session=
 cleanup() {
@@ -35,10 +36,17 @@ trap cleanup EXIT
 am_daemon_up "$am_dir"
 
 echo "== ${acquire[*]}"
-out=$(am "${acquire[@]}" 2>&1) || { echo "$out" | tail -30; echo "acquire failed" >&2; exit 1; }
+out=$(am "${acquire[@]}" 2>&1) || {
+  echo "$out" | tail -30
+  echo "acquire failed" >&2
+  exit 1
+}
 echo "$out" | tail -15
 session=$(echo "$out" | grep -oE 'sessionUuid[^0-9a-f]*[0-9a-f-]{36}' | head -1 | grep -oE '[0-9a-f-]{36}' || true)
-[ -n "$session" ] || { echo "no session minted" >&2; exit 1; }
+[ -n "$session" ] || {
+  echo "no session minted" >&2
+  exit 1
+}
 
 # One line per tool: name, then arguments. Extend as simee grows; the matrix shows what's left.
 tools=(
@@ -89,27 +97,34 @@ tools=(
   "injectAudioInput --tone {\"frequencyHz\":440,\"durationMs\":500}"
   "deviceSnapshot --action capture --snapshotName simee-harness"
 )
-pass=0; fail=0
+pass=0
+fail=0
 # Wall time per tool call, in ms: bash 5's EPOCHREALTIME, else perl (a few ms of its own startup).
 now_ms() {
-  if [ -n "${EPOCHREALTIME:-}" ]; then local t=${EPOCHREALTIME/[.,]/}; echo $((t / 1000))
-  else perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; fi
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    local t=${EPOCHREALTIME/[.,]/}
+    echo $((t / 1000))
+  else
+    perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'
+  fi
 }
-printf 'tool\tresult\tms\n' > "$log/coverage.tsv"
+printf 'tool\tresult\tms\n' >"$log/coverage.tsv"
 for line in "${tools[@]}"; do
   # HARNESS_ONLY=<regex> runs just the matching tools.
   if [ -n "${HARNESS_ONLY:-}" ] && ! [[ "$line" =~ $HARNESS_ONLY ]]; then continue; fi
-  read -r -a argv <<< "$line"
+  read -r -a argv <<<"$line"
   t0=$(now_ms)
   if out=$(am --session-uuid "$session" "${argv[@]}" 2>&1); then
-    result=pass; pass=$((pass + 1))
+    result=pass
+    pass=$((pass + 1))
   else
-    result=fail; fail=$((fail + 1))
-    echo "$out" | tail -8 > "$log/fail-$(printf '%s' "$line" | tr -c 'A-Za-z0-9' _).log"
+    result=fail
+    fail=$((fail + 1))
+    echo "$out" | tail -8 >"$log/fail-$(printf '%s' "$line" | tr -c 'A-Za-z0-9' _).log"
   fi
   ms=$(($(now_ms) - t0))
   printf '%-40s %s %6d ms\n' "$line" "$result" "$ms"
-  printf '%s\t%s\t%s\n' "$line" "$result" "$ms" >> "$log/coverage.tsv"
+  printf '%s\t%s\t%s\n' "$line" "$result" "$ms" >>"$log/coverage.tsv"
 done
 echo "== $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

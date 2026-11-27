@@ -1,0 +1,14 @@
+# yamllint over the workflows, the composite actions and any other YAML in the tree
+# (`yamllint --strict .`). The default rules, fitted to this repository's style: long `run:`
+# lines and comments stay on one line, `on:` is a key, and a trailing comment needs one space.
+extends: default
+
+ignore-from-file: .gitignore
+
+rules:
+  document-start: disable
+  line-length: disable
+  truthy:
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1

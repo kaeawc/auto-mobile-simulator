@@ -2,29 +2,65 @@
 # What CI checks, fastest first, stopping at the first failure; each step prints its time.
 #
 #   scripts/check.sh            # everything the change needs (the pre-push hook runs this)
-#   scripts/check.sh --quick    # fmt, host clippy and tests only
+#   scripts/check.sh --quick    # linters, fmt, host clippy and tests only
 #   scripts/check.sh --all      # every step, whatever changed
 #
-# Steps: rustfmt; clippy for this host; clippy for the other platform's target when its std is
+# Steps: the script and docs linters (scripts/lint.sh: each one installed here, else a skip
+# line); rustfmt; clippy for this host; clippy for the other platform's target when its std is
 # installed (macOS code from Linux: `rustup target add aarch64-apple-darwin`, and the reverse),
 # which type-checks code this host never compiles; the workspace tests (nextest if installed);
 # the desktop workspace when desktop/ changed (or with --all). A change that touches only docs
-# runs nothing.
+# runs the linters and nothing else.
 # Changed files are those since the merge base with origin/main, plus uncommitted ones.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 mode=changed
 case "${1:-}" in
   --quick) mode=quick ;;
   --all) mode=all ;;
   "") ;;
-  *) echo "usage: scripts/check.sh [--quick|--all]" >&2; exit 2 ;;
+  *)
+    echo "usage: scripts/check.sh [--quick|--all]" >&2
+    exit 2
+    ;;
 esac
 
 base=$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo HEAD)
-changed=$( (git diff --name-only "$base"...HEAD; git diff --name-only HEAD; git ls-files --others --exclude-standard) 2>/dev/null | sort -u)
+changed=$( (
+  git diff --name-only "$base"...HEAD
+  git diff --name-only HEAD
+  git ls-files --others --exclude-standard
+) 2>/dev/null | sort -u)
 touches() { [[ $mode == all ]] || command grep -qE "$1" <<<"$changed"; }
+
+total=$(date +%s)
+step() {
+  local name=$1
+  shift
+  local start
+  start=$(date +%s)
+  printf 'check: %-34s' "$name"
+  local out
+  if out=$("$@" 2>&1); then
+    printf 'ok  (%ss)\n' $(($(date +%s) - start))
+  else
+    printf 'FAILED (%ss)\n\n%s\n\n  rerun: %s\n' $(($(date +%s) - start)) "$out" "$*"
+    exit 1
+  fi
+}
+
+# Seconds each, and docs need them too: before the docs-only exit. shellcheck needs shfmt to
+# list the scripts.
+for tool in shellcheck shfmt lychee typos actionlint yamllint; do
+  bin=$tool
+  [[ $tool == shellcheck ]] && ! command -v shfmt >/dev/null 2>&1 && bin=shfmt
+  if command -v "$bin" >/dev/null 2>&1; then
+    step "$tool" scripts/lint.sh "$tool"
+  else
+    printf 'check: %-34sskipped: %s not installed\n' "$tool" "$bin"
+  fi
+done
 
 if [[ $mode == changed && -n $changed ]] && ! command grep -qvE '\.md$|^docs/|\.png$' <<<"$changed"; then
   echo "check: only docs changed; nothing to build"
@@ -38,20 +74,6 @@ if [[ $(uname -s) == Linux ]]; then
     echo "check: warning: ${missing}missing (apt-get install zip unzip): emu-sdk's installs_renderer_from_a_local_archive and installs_system_images_with_sparse_disks will SKIP, and CI runs them" >&2
   fi
 fi
-
-total=$(date +%s)
-step() {
-  local name=$1; shift
-  local start=$(date +%s)
-  printf 'check: %-34s' "$name"
-  local out
-  if out=$("$@" 2>&1); then
-    printf 'ok  (%ss)\n' $(( $(date +%s) - start ))
-  else
-    printf 'FAILED (%ss)\n\n%s\n\n  rerun: %s\n' $(( $(date +%s) - start )) "$out" "$*"
-    exit 1
-  fi
-}
 
 installed_target() { rustup target list --installed 2>/dev/null | command grep -qx "$1"; }
 
@@ -82,4 +104,4 @@ if [[ $mode != quick ]] && touches '^desktop/'; then
   step "desktop clippy" bash -c 'cd desktop && cargo clippy --all-targets --quiet -- -D warnings'
   step "desktop tests" bash -c 'cd desktop && cargo test --quiet'
 fi
-echo "check: all passed in $(( $(date +%s) - total ))s"
+echo "check: all passed in $(($(date +%s) - total))s"
