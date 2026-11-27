@@ -10,11 +10,9 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["hypervisor", "hvf", "arm64", "macos", "virtualization"]
 categories = ["virtualization", "os::macos-apis"]
-include = ["/Cargo.toml", "/src", "/tests"]
+include = ["/Cargo.toml", "/LICENSE", "/src", "/tests"]
 
 [lib]
-# Code names the crate as it did before the crates.io rename: `emu_hvf::`.
-name = "emu_hvf"
 doctest = false
 
 [dependencies]

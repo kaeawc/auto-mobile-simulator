@@ -10,11 +10,9 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["ios", "simulator", "debugging", "macos"]
 categories = ["development-tools::debugging", "os::macos-apis"]
-include = ["/Cargo.toml", "/fixtures", "/src"]
+include = ["/Cargo.toml", "/LICENSE", "/fixtures", "/src"]
 
 [lib]
-# Code names the crate as it did before the crates.io rename: `sim_debug::`.
-name = "sim_debug"
 doctest = false
 
 [dependencies]

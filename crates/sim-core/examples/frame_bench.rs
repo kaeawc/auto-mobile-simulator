@@ -4,8 +4,8 @@
 //!     cargo run --release -p simee-core --example frame_bench [image.png ...]
 use std::time::Instant;
 
-use sim_core::frame::{Frame, encode_png};
-use sim_core::pixels::{PixelFormat, downscale, to_rgba};
+use simee_core::frame::{Frame, encode_png};
+use simee_core::pixels::{PixelFormat, downscale, to_rgba};
 
 fn main() {
     let paths: Vec<String> = std::env::args().skip(1).collect();

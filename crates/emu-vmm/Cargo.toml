@@ -10,11 +10,9 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["android", "emulator", "vmm", "virtio", "hypervisor"]
 categories = ["emulators", "virtualization"]
-include = ["/Cargo.toml", "/examples", "/src"]
+include = ["/Cargo.toml", "/LICENSE", "/examples", "/src"]
 
 [lib]
-# Code names the crate as it did before the crates.io rename: `emu_vmm::`.
-name = "emu_vmm"
 doctest = false
 
 [dependencies]

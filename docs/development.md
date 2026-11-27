@@ -66,10 +66,13 @@ signed), `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`.
 
 Every workspace crate is published to crates.io under a `simee-` name (`simee-core`,
 `simee-emu-vmm`, …; the CLI is `simee`, the emulator `simee-emu`), at the one workspace version,
-with `=X.Y.Z` pins between them. Code keeps the old names: `[workspace.dependencies]` maps
-`sim-core` to the `simee-core` package and each crate's `[lib] name` stays `sim_core`, so
-`use sim_core::...` is unchanged, while cargo's `-p` takes the package name (`cargo test -p
-simee-core`). The desktop app (`desktop/`) is not published.
+with `=X.Y.Z` pins between them. Each library is named after its package, so a downstream user
+writes `simee-core = "0.1"` and `use simee_core::...`. Workspace code keeps the old names:
+`[workspace.dependencies]` maps the key `sim-core` to the `simee-core` package, so a dependent
+says `use sim_core::...`, while a crate's own tests and examples use its package name
+(`simee_core::`) and cargo's `-p` takes the package name (`cargo test -p simee-core`). Every
+crate ships the MIT text through a `LICENSE` symlink to the root one. The desktop app
+(`desktop/`) is not published.
 
 1. Add what changed under `## [Unreleased]` in [CHANGELOG.md](../CHANGELOG.md) as you go.
 2. `scripts/release.sh 0.2.0` branches from `origin/main`, bumps the workspace version and the
@@ -91,6 +94,19 @@ Trusted publishing (no long-lived token in the repository): the `publish` job ru
 trades the job's OIDC token for a short-lived crates.io token. Each crate's settings on crates.io
 name the trusted publisher: repository `kaeawc/simee`, workflow `release.yml`, environment
 `crates-io`. crates.io only offers that once a crate exists, so a new crate's first version is
-published with a personal token (`cargo login`, then `scripts/publish.sh`) and gets its trusted
-publisher added afterwards.
+published with a personal token and gets its trusted publisher added afterwards.
+
+First publish (no simee crate on crates.io yet; the Release workflow skips with a notice until
+one is):
+
+1. On crates.io, create an API token scoped to `publish-new` and `publish-update`, with the
+   crate name pattern `simee*` and a short expiry. `cargo login` with it.
+2. From an up-to-date `main` checkout: `scripts/publish.sh --dry-run`, then `scripts/publish.sh`.
+   crates.io rate-limits new crates, so expect HTTP 429 partway through; wait and rerun, it
+   skips what is already up.
+3. For every crate, add the trusted publisher above in its crates.io settings.
+4. Delete the token on crates.io and `cargo logout`.
+5. Push the `vX.Y.Z` tag at the commit you published from (`git tag v0.1.0 <sha> && git push
+   origin v0.1.0`): the Release workflow builds the binaries and creates the GitHub release, and
+   its `scripts/publish.sh` skips every crate, now that each one is up.
 

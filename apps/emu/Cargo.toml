@@ -10,7 +10,7 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["android", "emulator", "avd", "hypervisor", "mobile"]
 categories = ["emulators", "command-line-utilities", "development-tools::testing"]
-include = ["/Cargo.toml", "/build.rs", "/src", "/tests"]
+include = ["/Cargo.toml", "/LICENSE", "/build.rs", "/src", "/tests"]
 
 [[bin]]
 name = "emu"

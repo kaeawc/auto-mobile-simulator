@@ -10,11 +10,9 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["android", "emulator", "snapshot", "bundle", "lz4"]
 categories = ["development-tools::testing", "compression"]
-include = ["/Cargo.toml", "/src"]
+include = ["/Cargo.toml", "/LICENSE", "/src"]
 
 [lib]
-# Code names the crate as it did before the crates.io rename: `sim_bundle::`.
-name = "sim_bundle"
 doctest = false
 
 [dependencies]

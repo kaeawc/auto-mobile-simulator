@@ -10,11 +10,9 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["ios", "simulator", "audio", "macos"]
 categories = ["development-tools::testing", "os::macos-apis", "multimedia::audio"]
-include = ["/Cargo.toml", "/fixtures", "/native", "/src"]
+include = ["/Cargo.toml", "/LICENSE", "/fixtures", "/native", "/src"]
 
 [lib]
-# Code names the crate as it did before the crates.io rename: `sim_audio::`.
-name = "sim_audio"
 doctest = false
 
 [dependencies]

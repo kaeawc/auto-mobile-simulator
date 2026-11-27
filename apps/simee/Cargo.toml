@@ -10,7 +10,7 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["ios", "android", "simulator", "emulator", "mcp"]
 categories = ["command-line-utilities", "development-tools::testing", "emulators"]
-include = ["/Cargo.toml", "/src", "/tests"]
+include = ["/Cargo.toml", "/LICENSE", "/src", "/tests"]
 
 [[bin]]
 name = "simee"

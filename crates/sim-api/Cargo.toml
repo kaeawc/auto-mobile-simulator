@@ -10,11 +10,9 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["ios", "android", "simulator", "emulator", "automation"]
 categories = ["development-tools::testing", "simulation"]
-include = ["/Cargo.toml", "/examples", "/native", "/src", "/tests"]
+include = ["/Cargo.toml", "/LICENSE", "/examples", "/native", "/src", "/tests"]
 
 [lib]
-# Code names the crate as it did before the crates.io rename: `sim_api::`.
-name = "sim_api"
 doctest = false
 
 [dependencies]

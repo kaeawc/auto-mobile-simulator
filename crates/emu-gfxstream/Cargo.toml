@@ -10,11 +10,9 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["android", "emulator", "gfxstream", "gpu", "virtio"]
 categories = ["emulators", "graphics"]
-include = ["/Cargo.toml", "/build.rs", "/examples", "/src"]
+include = ["/Cargo.toml", "/LICENSE", "/build.rs", "/examples", "/src"]
 
 [lib]
-# Code names the crate as it did before the crates.io rename: `emu_gfxstream::`.
-name = "emu_gfxstream"
 doctest = false
 
 [dependencies]

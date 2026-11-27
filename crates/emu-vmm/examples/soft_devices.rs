@@ -17,12 +17,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use emu_vmm::devices::goldfish_pipe::{GlProcess, RefCount};
-    use emu_vmm::pipe::{PipeRegistry, adb::AdbService, misc::MiscService, qemud::BootProperties, sensors};
-    use emu_vmm::vhost_user::BackendChannel;
-    use emu_vmm::virtio::console::{Console, PortSpec, Sink};
-    use emu_vmm::virtio::vsock::{Vsock, event_channel};
-    use emu_vmm::virtio::{VirtioDevice, net};
+    use simee_emu_vmm::devices::goldfish_pipe::{GlProcess, RefCount};
+    use simee_emu_vmm::pipe::{PipeRegistry, adb::AdbService, misc::MiscService, qemud::BootProperties, sensors};
+    use simee_emu_vmm::vhost_user::BackendChannel;
+    use simee_emu_vmm::virtio::console::{Console, PortSpec, Sink};
+    use simee_emu_vmm::virtio::vsock::{Vsock, event_channel};
+    use simee_emu_vmm::virtio::{VirtioDevice, net};
 
     const PIPE_SLOT: u8 = 0x1e;
 
@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The goldfish address space and the renderer first: the pipe registry's `refcount` frees
     // color buffers in the renderer, and the renderer's DMA reaches into the area.
     let lib64 = std::env::var_os("EMU_LIB64").map(PathBuf::from);
-    let gas = emu_vmm::vfio_user::GoldfishAs::new(16 << 30)?;
+    let gas = simee_emu_vmm::vfio_user::GoldfishAs::new(16 << 30)?;
     let (area, ram) = (gas.area(), gas.guest_ram_handle());
     let gpu = match &lib64 {
         Some(lib64) => Some(gpu(lib64, area, ram)?),
@@ -54,13 +54,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.register("QemuMiscPipe", Box::new(MiscService { on_event: None }));
     // What emu's own machine serves (crates/emu-vmm/src/machine.rs): a HAL whose pipe isn't
     // served retries it in a loop (the camera and fingerprint HALs took half a core each).
-    registry.register("clipboard", Box::new(emu_vmm::pipe::clipboard::ClipboardService { clipboard: Arc::default() }));
-    registry.register("qemud:fingerprintlisten", Box::new(emu_vmm::pipe::fingerprint::FingerprintService { fingerprint: Arc::default() }));
-    registry.register("qemud:gps", Box::new(emu_vmm::pipe::gps::GpsService { gps: Arc::default() }));
-    registry.register("multidisplay", Box::new(emu_vmm::pipe::misc::Silent("multidisplay")));
-    registry.register("qemud:camera", Box::new(emu_vmm::pipe::fingerprint::CameraService));
+    registry.register("clipboard", Box::new(simee_emu_vmm::pipe::clipboard::ClipboardService { clipboard: Arc::default() }));
+    registry.register(
+        "qemud:fingerprintlisten",
+        Box::new(simee_emu_vmm::pipe::fingerprint::FingerprintService { fingerprint: Arc::default() }),
+    );
+    registry.register("qemud:gps", Box::new(simee_emu_vmm::pipe::gps::GpsService { gps: Arc::default() }));
+    registry.register("multidisplay", Box::new(simee_emu_vmm::pipe::misc::Silent("multidisplay")));
+    registry.register("qemud:camera", Box::new(simee_emu_vmm::pipe::fingerprint::CameraService));
     registry.register("GLProcessPipe", Box::new(GlProcess::default()));
-    let on_last_ref = gpu.as_ref().map(|(_, _, _, r)| -> emu_vmm::devices::goldfish_pipe::OnLastRef {
+    let on_last_ref = gpu.as_ref().map(|(_, _, _, r)| -> simee_emu_vmm::devices::goldfish_pipe::OnLastRef {
         let r = r.clone();
         Arc::new(move |handle| {
             let _ = r.release_color_buffer(handle);
@@ -72,20 +75,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vsock_path = dir.join("vsock.sock");
     qemu.push(format!("-chardev socket,id=vsock,path={}", vsock_path.display()));
     qemu.push("-device vhost-user-vsock-pci,chardev=vsock".into());
-    servers.push(emu_vmm::vhost_user::serve(&vsock_path, "vsock", Box::new(vsock))?);
+    servers.push(simee_emu_vmm::vhost_user::serve(&vsock_path, "vsock", Box::new(vsock))?);
 
-    let telephony = Arc::new(emu_vmm::telephony::Telephony::default());
+    let telephony = Arc::new(simee_emu_vmm::telephony::Telephony::default());
     let (console, handles) = Console::new(vec![
         PortSpec { name: String::new(), backend: Box::new(Sink) },
         PortSpec { name: "modem".into(), backend: telephony.backend() },
         PortSpec { name: String::new(), backend: Box::new(Sink) },
-        PortSpec { name: "uwb".into(), backend: Box::new(emu_vmm::bt::UwbPort::default()) },
-        PortSpec { name: "bluetooth".into(), backend: Box::new(emu_vmm::bt::BluetoothPort::new(emu_vmm::bt::address_for(b"soft"))) },
+        PortSpec { name: "uwb".into(), backend: Box::new(simee_emu_vmm::bt::UwbPort::default()) },
+        PortSpec {
+            name: "bluetooth".into(),
+            backend: Box::new(simee_emu_vmm::bt::BluetoothPort::new(simee_emu_vmm::bt::address_for(b"soft"))),
+        },
     ]);
     if let Some(h) = handles.get(1) {
         telephony.attach(h.clone());
     }
-    let nat: Box<dyn net::Backend> = match emu_vmm::net::Nat::new(emu_vmm::net::Config::default()) {
+    let nat: Box<dyn net::Backend> = match simee_emu_vmm::net::Nat::new(simee_emu_vmm::net::Config::default()) {
         Ok(n) => Box::new(n),
         Err(e) => {
             eprintln!("no NAT ({e}): link only");
@@ -115,14 +121,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
         let gas_path = dir.join("goldfish-as.sock");
-        servers.push(emu_vmm::vfio_user::serve(&gas_path, "goldfish-as", Box::new(gas))?);
-        qemu.push(format!("-device '{}'", emu_vmm::vfio_user::qemu_device(&gas_path, None)));
+        servers.push(simee_emu_vmm::vfio_user::serve(&gas_path, "goldfish-as", Box::new(gas))?);
+        qemu.push(format!("-device '{}'", simee_emu_vmm::vfio_user::qemu_device(&gas_path, None)));
         let pipe_path = dir.join("goldfish-pipe.sock");
-        let carrier = emu_vmm::vfio_user::GoldfishPipeCarrier::new(registry.clone());
-        servers.push(emu_vmm::vfio_user::serve(&pipe_path, "goldfish-pipe", Box::new(carrier))?);
-        qemu.push(format!("-device '{}'", emu_vmm::vfio_user::qemu_device(&pipe_path, Some(PIPE_SLOT))));
+        let carrier = simee_emu_vmm::vfio_user::GoldfishPipeCarrier::new(registry.clone());
+        servers.push(simee_emu_vmm::vfio_user::serve(&pipe_path, "goldfish-pipe", Box::new(carrier))?);
+        qemu.push(format!("-device '{}'", simee_emu_vmm::vfio_user::qemu_device(&pipe_path, Some(PIPE_SLOT))));
         let aml = dir.join("goldfish-pipe.aml");
-        std::fs::write(&aml, emu_vmm::acpi::goldfish_pipe_ssdt(PIPE_SLOT, emu_vmm::layout::GOLDFISH_PIPE_SIZE as u32))?;
+        std::fs::write(&aml, simee_emu_vmm::acpi::goldfish_pipe_ssdt(PIPE_SLOT, simee_emu_vmm::layout::GOLDFISH_PIPE_SIZE as u32))?;
         qemu.push(format!("-acpitable file={}", aml.display()));
         // The 64-bit window has to hold the GPU's 8 GiB region and the 16 GiB address space.
         qemu.push("-global i440FX-pcihost.pci-hole64-size=64G".into());
@@ -132,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let path = dir.join(format!("{name}.sock"));
         qemu.push(format!("-chardev socket,id={name},path={}", path.display()));
         qemu.push(format!("-device vhost-user-test-device-pci,chardev={name},virtio-id={id},num_vqs={queues},config_size={config}"));
-        servers.push(emu_vmm::vhost_user::serve_with(&path, name, dev, chan)?);
+        servers.push(simee_emu_vmm::vhost_user::serve_with(&path, name, dev, chan)?);
     }
     std::fs::write(dir.join("qemu.args"), qemu.join(" "))?;
     println!("adb on 127.0.0.1:{port}; QEMU arguments (also in {}):\n{}", dir.join("qemu.args").display(), qemu.join(" "));
@@ -150,13 +156,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[allow(clippy::type_complexity)]
 fn gpu(
     lib64: &std::path::Path,
-    area: emu_vmm::vfio_user::AreaHandle,
-    ram: emu_vmm::vfio_user::AreaHandle,
+    area: simee_emu_vmm::vfio_user::AreaHandle,
+    ram: simee_emu_vmm::vfio_user::AreaHandle,
 ) -> Result<
     (
-        Box<dyn emu_vmm::virtio::VirtioDevice>,
-        emu_vmm::vhost_user::BackendChannel,
-        std::sync::Arc<emu_vmm::display::FrameStore>,
+        Box<dyn simee_emu_vmm::virtio::VirtioDevice>,
+        simee_emu_vmm::vhost_user::BackendChannel,
+        std::sync::Arc<simee_emu_vmm::display::FrameStore>,
         std::sync::Arc<emu_gfxstream::Renderer>,
     ),
     Box<dyn std::error::Error>,
@@ -165,8 +171,8 @@ fn gpu(
     use std::time::Duration;
 
     use emu_gfxstream::{Icd, Renderer, flags};
-    use emu_vmm::display::{DisplaySink, FrameStore, PostTicker};
-    use emu_vmm::virtio::gpu::{Gpu, GpuConfig, fence_handler};
+    use simee_emu_vmm::display::{DisplaySink, FrameStore, PostTicker};
+    use simee_emu_vmm::virtio::gpu::{Gpu, GpuConfig, fence_handler};
 
     let (w, h) = (720, 1280);
     // SwiftShader: the SDK's lavapipe crashes in a render thread minutes into a boot, and
@@ -191,14 +197,15 @@ fn gpu(
     r.init_with_features(w, h, rflags, Some(&features), std::env::var_os("EMU_VERBOSE").is_some(), on_fence)?;
     // Guest-physical to host for the renderer's DMA paths: guest RAM and the address-space area.
     let translate: emu_gfxstream::DmaTranslator = Box::new(move |gpa| {
-        let hit = |h: &emu_vmm::vfio_user::AreaHandle| h.get().and_then(|m| m.host_range(gpa, 1));
+        let hit = |h: &simee_emu_vmm::vfio_user::AreaHandle| h.get().and_then(|m| m.host_range(gpa, 1));
         hit(&ram).or_else(|| hit(&area)).map_or(std::ptr::null_mut(), |h| h.as_ptr())
     });
     r.set_dma_translator(Some(translate))?;
     let reader = r.clone();
     store.set_readback(Box::new(move |w, h, buf| reader.read_last_posted_to(w, h, buf).is_ok()));
-    let chan = emu_vmm::vhost_user::BackendChannel::default();
-    let window = Arc::new(emu_vmm::vhost_user::ShmemWindow::new(chan.clone(), emu_vmm::virtio::gpu::SHM_HOST_VISIBLE, r.clone()));
+    let chan = simee_emu_vmm::vhost_user::BackendChannel::default();
+    let window =
+        Arc::new(simee_emu_vmm::vhost_user::ShmemWindow::new(chan.clone(), simee_emu_vmm::virtio::gpu::SHM_HOST_VISIBLE, r.clone()));
     let gpu = Gpu::new(GpuConfig {
         width: w,
         height: h,
@@ -214,7 +221,7 @@ fn gpu(
 /// The size of the device's config space: the last offset that reads non-zero, rounded up to 4
 /// bytes, as QEMU's generic frontend needs it up front.
 #[cfg(target_os = "linux")]
-fn config_size(dev: &dyn emu_vmm::virtio::VirtioDevice) -> usize {
+fn config_size(dev: &dyn simee_emu_vmm::virtio::VirtioDevice) -> usize {
     let mut buf = [0u8; 256];
     dev.read_config(0, &mut buf);
     buf.iter().rposition(|&b| b != 0).map_or(0, |i| (i + 1).next_multiple_of(4))

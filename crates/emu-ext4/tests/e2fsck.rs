@@ -6,7 +6,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use emu_ext4::{FEATURE_COMPAT, FEATURE_INCOMPAT, FEATURE_RO_COMPAT, Superblock};
+use simee_emu_ext4::{FEATURE_COMPAT, FEATURE_INCOMPAT, FEATURE_RO_COMPAT, Superblock};
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
@@ -40,7 +40,7 @@ fn check(size: u64) {
     let image = TempImage(std::env::temp_dir().join(format!("emu-ext4-{}-{size}.img", std::process::id())));
     let file = File::options().read(true).write(true).create(true).truncate(true).open(&image.0).expect("create image");
     let uuid = *b"emu-rs-ext4-test";
-    emu_ext4::format(&file, size, "userdata", uuid).expect("format");
+    simee_emu_ext4::format(&file, size, "userdata", uuid).expect("format");
 
     let sb = Superblock::read(&file).expect("superblock");
     assert_eq!(sb.block_size, 4096);
@@ -75,7 +75,7 @@ fn e2fsck_64m() {
 
 #[test]
 fn e2fsck_minimum() {
-    check(emu_ext4::MIN_SIZE);
+    check(simee_emu_ext4::MIN_SIZE);
 }
 
 #[test]
@@ -106,7 +106,7 @@ fn e2fsck_10g_stays_sparse() {
     let path = std::env::temp_dir().join(format!("emu-ext4-sparse-{}.img", std::process::id()));
     let image = TempImage(path);
     let file = File::options().read(true).write(true).create(true).truncate(true).open(&image.0).expect("create image");
-    emu_ext4::format(&file, 10 * GIB, "userdata", [7; 16]).expect("format");
+    simee_emu_ext4::format(&file, 10 * GIB, "userdata", [7; 16]).expect("format");
     let allocated = file.metadata().expect("metadata").blocks() * 512;
     eprintln!("10 GiB image: {allocated} bytes allocated");
     assert!(allocated < 2 * MIB, "10 GiB image allocates {allocated} bytes");

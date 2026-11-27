@@ -20,14 +20,14 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #![allow(clippy::undocumented_unsafe_blocks, clippy::unwrap_used)]
 
-use emu_hvf::{Exit, GuestRam, Reg, SysReg, Vcpu, Vm};
+use simee_emu_hvf::{Exit, GuestRam, Reg, SysReg, Vcpu, Vm};
 
 const DATA: u64 = 0x4000_0000;
 const LEN: u64 = 64 << 20;
 const CODE: u64 = 0x8000_0000;
 
 fn footprint() -> u64 {
-    emu_hvf::phys_footprint().unwrap()
+    simee_emu_hvf::phys_footprint().unwrap()
 }
 
 fn mib(b: u64) -> f64 {

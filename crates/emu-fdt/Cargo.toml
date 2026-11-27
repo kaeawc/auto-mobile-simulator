@@ -10,11 +10,9 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["fdt", "device-tree", "dtb", "emulator"]
 categories = ["emulators", "embedded"]
-include = ["/Cargo.toml", "/src"]
+include = ["/Cargo.toml", "/LICENSE", "/src"]
 
 [lib]
-# Code names the crate as it did before the crates.io rename: `emu_fdt::`.
-name = "emu_fdt"
 doctest = false
 
 [lints]

@@ -18,9 +18,9 @@ homepage = "https://github.com/kaeawc/simee"
 # Every crate inherits deps from here, so each dependency is built with one feature set no matter
 # which `-p` subset you build.
 [workspace.dependencies]
-# The workspace crates, published to crates.io as `simee-*` (scripts/publish.sh). The keys keep
-# their old names so code says `sim_core::`; the `=` pins move with the workspace version
-# (scripts/release.sh).
+# The workspace crates, published to crates.io as `simee-*` (scripts/publish.sh), each library
+# named after its package (`simee_core`). The keys keep the old names, so dependents say
+# `sim_core::`; the `=` pins move with the workspace version (scripts/release.sh).
 sim-core = { package = "simee-core", path = "crates/sim-core", version = "=0.1.0" }
 sim-coresim = { package = "simee-coresim", path = "crates/sim-coresim", version = "=0.1.0" }
 sim-debug = { package = "simee-debug", path = "crates/sim-debug", version = "=0.1.0" }

@@ -10,11 +10,9 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["mcp", "ios", "android", "simulator", "emulator"]
 categories = ["development-tools::testing", "simulation"]
-include = ["/Cargo.toml", "/src"]
+include = ["/Cargo.toml", "/LICENSE", "/src"]
 
 [lib]
-# Code names the crate as it did before the crates.io rename: `sim_mcp::`.
-name = "sim_mcp"
 doctest = false
 
 [dependencies]

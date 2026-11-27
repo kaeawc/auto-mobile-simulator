@@ -9,12 +9,12 @@ fn main() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use sim_coresim::{Appearance, Context};
+    use simee_coresim::{Appearance, Context};
 
     let Some(udid) = std::env::args().nth(1) else {
         return eprintln!("usage: frame_watch <udid>");
     };
-    let run = || -> sim_coresim::Result<(u64, u32, u32)> {
+    let run = || -> simee_coresim::Result<(u64, u32, u32)> {
         let device = Context::new()?.device(&udid)?;
         let display = device.display()?;
         let frames = Arc::new(AtomicU64::new(0));

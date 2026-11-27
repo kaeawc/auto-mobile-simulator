@@ -10,11 +10,9 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["android", "emulator", "avd", "adb", "mobile"]
 categories = ["development-tools::testing", "emulators"]
-include = ["/Cargo.toml", "/src"]
+include = ["/Cargo.toml", "/LICENSE", "/src"]
 
 [lib]
-# Code names the crate as it did before the crates.io rename: `sim_android::`.
-name = "sim_android"
 doctest = false
 
 [dependencies]

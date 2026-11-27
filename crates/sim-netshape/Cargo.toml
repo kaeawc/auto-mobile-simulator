@@ -10,11 +10,9 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["ios", "simulator", "network", "shaping", "macos"]
 categories = ["development-tools::testing", "network-programming"]
-include = ["/Cargo.toml", "/native", "/src", "/tests"]
+include = ["/Cargo.toml", "/LICENSE", "/native", "/src", "/tests"]
 
 [lib]
-# Code names the crate as it did before the crates.io rename: `sim_netshape::`.
-name = "sim_netshape"
 doctest = false
 
 [dependencies]

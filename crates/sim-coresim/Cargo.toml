@@ -10,11 +10,9 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["ios", "simulator", "coresimulator", "macos", "mobile"]
 categories = ["development-tools::testing", "os::macos-apis", "simulation"]
-include = ["/Cargo.toml", "/examples", "/src"]
+include = ["/Cargo.toml", "/LICENSE", "/examples", "/src"]
 
 [lib]
-# Code names the crate as it did before the crates.io rename: `sim_coresim::`.
-name = "sim_coresim"
 doctest = false
 
 [dependencies]

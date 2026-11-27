@@ -10,11 +10,9 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["kvm", "hypervisor", "linux", "virtualization", "arm64"]
 categories = ["virtualization", "os::linux-apis"]
-include = ["/Cargo.toml", "/src"]
+include = ["/Cargo.toml", "/LICENSE", "/src"]
 
 [lib]
-# Code names the crate as it did before the crates.io rename: `emu_kvm::`.
-name = "emu_kvm"
 doctest = false
 
 [dependencies]

@@ -64,6 +64,24 @@ jobs:
           else
             mode=release
           fi
+          # Trusted publishing needs each crate to exist on crates.io, so the very first version
+          # is published by hand. Until then a release run would only fail at the login.
+          if [ "$mode" = release ]; then
+            published=0
+            for manifest in crates/*/Cargo.toml apps/*/Cargo.toml; do
+              name="$(sed -n 's/^name = "\(.*\)"$/\1/p' "$manifest" | head -1)"
+              code="$(curl -sS -o /dev/null -w '%{http_code}' "https://index.crates.io/${name:0:2}/${name:2:2}/$name")"
+              case "$code" in
+                200) published=1; break ;;
+                404) ;;
+                *) echo "::error::crates.io index answered $code for $name"; exit 1 ;;
+              esac
+            done
+            if [ "$published" = 0 ]; then
+              echo "::notice::no simee crate is on crates.io yet: first publish is manual: see docs/development.md Releasing"
+              mode=skip
+            fi
+          fi
           echo "mode=$mode" | tee -a "$GITHUB_OUTPUT"
 
   # The `simee` CLI and the `emu` emulator. macOS: Apple silicon only (Hypervisor.framework's arm64

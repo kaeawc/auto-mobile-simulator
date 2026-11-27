@@ -10,11 +10,9 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["android", "sdk", "emulator", "provisioning"]
 categories = ["emulators", "development-tools"]
-include = ["/Cargo.toml", "/src", "/testdata"]
+include = ["/Cargo.toml", "/LICENSE", "/src", "/testdata"]
 
 [lib]
-# Code names the crate as it did before the crates.io rename: `emu_sdk::`.
-name = "emu_sdk"
 doctest = false
 
 [dependencies]

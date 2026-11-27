@@ -10,11 +10,9 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["ext4", "filesystem", "mkfs", "emulator"]
 categories = ["filesystem", "emulators"]
-include = ["/Cargo.toml", "/src", "/tests"]
+include = ["/Cargo.toml", "/LICENSE", "/src", "/tests"]
 
 [lib]
-# Code names the crate as it did before the crates.io rename: `emu_ext4::`.
-name = "emu_ext4"
 doctest = false
 
 [lints]
