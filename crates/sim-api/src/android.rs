@@ -198,9 +198,23 @@ fn outcome_json(o: &sim_android::BootOutcome) -> Value {
     }
 }
 
-/// `boot_many` for AVDs (`udids`, already resolved): [`Android::boot_many`], at most
-/// `concurrency` emulators starting at once, each on its own console port.
-pub fn boot_many(s: &mut Session, p: &Value, udids: &[String]) -> Result<Value, String> {
+/// A [`crate::progress::BootHook`] as the Android window's hook: each outcome as its `devices` entry.
+struct Outcomes<'a>(&'a dyn crate::progress::BootHook);
+
+impl sim_android::BootHook for Outcomes<'_> {
+    fn start(&self, i: usize) -> Result<(), String> {
+        self.0.start(i)
+    }
+
+    fn finished(&self, i: usize, outcome: &sim_android::BootOutcome) {
+        self.0.finished(i, &outcome_json(outcome));
+    }
+}
+
+/// `boot_many` for AVDs (`udids`, already resolved): [`Android::boot_many_hooked`], at most
+/// `concurrency` emulators starting at once, each on its own console port, with `hook` asked and
+/// told about each.
+pub(crate) fn boot_many(s: &mut Session, p: &Value, udids: &[String], hook: &dyn crate::progress::BootHook) -> Result<Value, String> {
     reject_ios_boot_params("boot_many", p)?;
     if udids.is_empty() {
         return Err("give `devices`: a list of AVD names".into());
@@ -208,7 +222,7 @@ pub fn boot_many(s: &mut Session, p: &Value, udids: &[String]) -> Result<Value, 
     let concurrency = crate::params::concurrency(p)?;
     let (timeout, first) = boot_many_options(p)?;
     let start = std::time::Instant::now();
-    let outcomes = s.backend().boot_many(udids, concurrency, timeout, first)?;
+    let outcomes = s.backend().boot_many_hooked(udids, concurrency, timeout, first, &Outcomes(hook))?;
     let devices: Vec<Value> = outcomes.iter().map(outcome_json).collect();
     let failed = outcomes.iter().filter(|o| o.result.is_err()).count();
     Ok(json!({"concurrency": concurrency, "all_s": (start.elapsed().as_secs_f64() * 10.0).round() / 10.0, "failed": failed,

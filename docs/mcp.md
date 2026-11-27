@@ -305,7 +305,7 @@ a list in `crates/sim-mcp/src/tools.rs`; every other tool answers inline.
 ### Progress
 
 A long call reports its steps as `sim-api` reaches them: `boot_many` the devices done of all
-(`booting d0, d1; 2 of 8 done`), `boot`, `create`, `clone` and the other long methods their phases
+(`3 of 8 done`, as each finishes), `boot`, `create`, `clone` and the other long methods their phases
 (`install`: checking, then installing with the bundle's size, 0 to 2). A client that gave a
 progress token on a blocked call gets each step as `notifications/progress` with `progress` and
 `total` in those units (devices, phases), at once; between steps a heartbeat every 2 s keeps it
@@ -314,12 +314,13 @@ increases. A call that counts nothing, or whose first progress was a heartbeat, 
 instead (`progress` is the seconds it has run, no `total`). Nothing is sent after the response. A
 task's steps are its `statusMessage`. The older revisions get the same notifications.
 
-`boot_many` with a watcher (an MCP client) boots in waves of `concurrency`, one backend
-`boot_many` per wave, so it can report each wave and stop between them; a wave waits for its
-slowest device before the next starts, where an unwatched call (the CLI, the socket API) starts
-the next device as soon as any finishes. Per-device steps inside a wave (settled, created), bytes
-for `install`, `export` and `import`, and stopping a `settle` or a memory tool mid-run need hooks
-in the backends (`ios.rs`, `sim-android`, `memtools.rs`) and are not here yet.
+`boot_many` boots the same way whether or not anyone watches it: its backend's window keeps
+`concurrency` devices booting and starts the next as soon as any finishes, with the same ports,
+shaper builds and settle timeouts. A hook in the window tells the call as each device finishes
+(the step a watcher hears) and is asked before each start (how a cancel starts no more). Phases
+inside a device's boot (settled), bytes for `install`, `export` and `import`, and stopping a
+`settle` or a memory tool mid-run need hooks in the backends (`ios.rs`, `sim-android`,
+`memtools.rs`) and are not here yet.
 - A `boot`, `boot_many`, `create` or `clone` result carries `admission` (and `pacing`) in
   `structuredContent` only; the text is one line, such as `ok (admit)`, so it doesn't repeat them.
 - At most 8 task calls run at once; a ninth is refused with a tool error until one ends. A

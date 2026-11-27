@@ -24,6 +24,11 @@ pub fn selection_infos(_: &mut Session) -> Result<Vec<sim_core::device::DeviceIn
     Ok(Vec::new())
 }
 
+/// No iOS devices to boot.
+pub(crate) fn boot_many_hooked(s: &mut Session, p: &Value, _: &dyn crate::progress::BootHook) -> Result<Value, String> {
+    call(s, "boot_many", p)
+}
+
 /// Listings are empty; every other method names a device that can't exist here.
 pub fn call(_: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     match method {

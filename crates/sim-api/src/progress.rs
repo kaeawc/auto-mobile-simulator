@@ -74,6 +74,28 @@ pub fn call_step(phase: &str, done: u64, total: u64, message: impl Into<String>)
     report(&Progress { phase: phase.to_owned(), done, total: Some(total), message: message.into() });
 }
 
+/// What a backend's boot window (`boot_many`: at most `concurrency` devices booting at once, the
+/// next started as soon as any finishes) tells and asks its caller about each device, from the
+/// window's own threads (#297). `i` is the device's place in the call's `devices`.
+pub(crate) trait BootHook: Sync {
+    /// Asked before device `i` starts: `Err(why)` starts no more (each device not started gets
+    /// `why` as its error).
+    fn start(&self, i: usize) -> Result<(), String>;
+    /// Device `i` finished, booted or not: its entry in `boot_many`'s `devices`.
+    fn finished(&self, i: usize, device: &serde_json::Value);
+}
+
+/// The hook of a backend `boot_many` called directly: every device starts, nothing is told.
+pub(crate) struct Unwatched;
+
+impl BootHook for Unwatched {
+    fn start(&self, _: usize) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn finished(&self, _: usize, _: &serde_json::Value) {}
+}
+
 /// How often a call whose work runs on another thread looks at its caller's cancel flag.
 const WATCH: Duration = Duration::from_millis(20);
 
@@ -117,6 +139,17 @@ impl<T> Handoff<T> {
 /// its result by [`Handoff::give`] undoes it: its caller is gone. Without hooks on this thread
 /// (nothing can cancel), runs `job` here.
 pub(crate) fn interruptible<T: Send + 'static>(name: &str, job: impl FnOnce(&Handoff<T>) + Send + 'static) -> Result<Option<T>, String> {
+    interruptible_watching(name, job, || ())
+}
+
+/// [`interruptible`], calling `watch` on this thread each time it looks at the cancel flag (every
+/// 20 ms while the job runs elsewhere), so the call can report what its job has done so far: the
+/// progress hooks belong to this thread. Without hooks it is never called.
+pub(crate) fn interruptible_watching<T: Send + 'static>(
+    name: &str,
+    job: impl FnOnce(&Handoff<T>) + Send + 'static,
+    mut watch: impl FnMut(),
+) -> Result<Option<T>, String> {
     let (handoff, rx) = Handoff::new();
     if !has_call_hooks() {
         job(&handoff);
@@ -130,7 +163,11 @@ pub(crate) fn interruptible<T: Send + 'static>(name: &str, job: impl FnOnce(&Han
         .map_err(|e| format!("cannot start a thread for `{name}`: {e}"))?;
     let ended = || format!("`{name}` ended without a result (its thread panicked)");
     loop {
-        match rx.recv_timeout(WATCH) {
+        let got = rx.recv_timeout(WATCH);
+        if got.is_err() {
+            watch();
+        }
+        match got {
             Ok(result) => return Ok(Some(result)),
             // This thread's handoff holds a sender too, so the end is the thread's, not the channel's.
             Err(RecvTimeoutError::Timeout) if thread.is_finished() => return rx.try_recv().map(Some).map_err(|_| ended()),

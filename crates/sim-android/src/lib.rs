@@ -340,12 +340,27 @@ impl Android {
     /// launch to booted, or why it didn't. A device that fails doesn't stop the others; the next
     /// one starts as soon as any finishes.
     pub fn boot_many(&self, avds: &[String], concurrency: usize, timeout: Duration, first_port: u16) -> Result<Vec<BootOutcome>, String> {
+        self.boot_many_hooked(avds, concurrency, timeout, first_port, &Unhooked)
+    }
+
+    /// [`Android::boot_many`] with `hook` asked before each AVD starts and told as each finishes
+    /// (see [`BootHook`]); the window, ports and timeouts are the same. An AVD the hook stopped
+    /// is in the result with the hook's reason as its error.
+    pub fn boot_many_hooked(
+        &self,
+        avds: &[String],
+        concurrency: usize,
+        timeout: Duration,
+        first_port: u16,
+        hook: &dyn BootHook,
+    ) -> Result<Vec<BootOutcome>, String> {
         let locks = emu_avd::port_lock_dir();
         let free = |p: u16| port_usable(locks.as_deref(), p, port_free);
         // A farm stays silent: N devices would open N host audio streams.
-        self.boot_many_with(avds, concurrency, timeout, first_port, free, |d, port| d.launch_command(Some(port), false))
+        self.boot_window(avds, concurrency, timeout, first_port, free, |d, port| d.launch_command(Some(port), false), hook)
     }
 
+    #[cfg(test)]
     fn boot_many_with(
         &self,
         avds: &[String],
@@ -354,6 +369,20 @@ impl Android {
         first_port: u16,
         free: impl Fn(u16) -> bool + Sync,
         launch: impl Fn(&Device, u16) -> Command + Sync,
+    ) -> Result<Vec<BootOutcome>, String> {
+        self.boot_window(avds, concurrency, timeout, first_port, free, launch, &Unhooked)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn boot_window(
+        &self,
+        avds: &[String],
+        concurrency: usize,
+        timeout: Duration,
+        first_port: u16,
+        free: impl Fn(u16) -> bool + Sync,
+        launch: impl Fn(&Device, u16) -> Command + Sync,
+        hook: &dyn BootHook,
     ) -> Result<Vec<BootOutcome>, String> {
         let running = self.running();
         let devices: Vec<Device> = avds.iter().map(|a| self.device(a)).collect::<Result<_, _>>()?;
@@ -389,6 +418,11 @@ impl Android {
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some((d, port)) = jobs.get(i) else { break };
+                        if let Err(why) = hook.start(i) {
+                            let outcome = BootOutcome { avd: d.info.udid.clone(), console_port: *port, result: Err(why) };
+                            results.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(outcome);
+                            continue;
+                        }
                         let (mut port, mut tries) = (*port, 0);
                         let started = Instant::now();
                         let result = loop {
@@ -406,6 +440,7 @@ impl Android {
                             }
                         };
                         let outcome = BootOutcome { avd: d.info.udid.clone(), console_port: port, result };
+                        hook.finished(i, &outcome);
                         results.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(outcome);
                     }
                 });
@@ -428,6 +463,27 @@ impl Android {
         let sdk = self.env.sdk_root.as_ref().map(|r| r.join("platform-tools/adb")).filter(|p| p.is_file());
         sdk.or_else(|| Command::new("adb").arg("version").output().ok().filter(|o| o.status.success()).map(|_| PathBuf::from("adb")))
     }
+}
+
+/// What [`Android::boot_many_hooked`]'s window tells and asks its caller about each AVD, from the
+/// window's threads; `i` is the AVD's place in `avds`.
+pub trait BootHook: Sync {
+    /// Asked before AVD `i` starts: `Err(why)` starts no more (each AVD not started fails with
+    /// `why`).
+    fn start(&self, i: usize) -> Result<(), String>;
+    /// AVD `i` finished, booted or not.
+    fn finished(&self, i: usize, outcome: &BootOutcome);
+}
+
+/// The hook of a plain [`Android::boot_many`]: every AVD starts, nothing is told.
+struct Unhooked;
+
+impl BootHook for Unhooked {
+    fn start(&self, _: usize) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn finished(&self, _: usize, _: &BootOutcome) {}
 }
 
 /// One device's result in [`Android::boot_many`].
@@ -2020,6 +2076,85 @@ mod tests {
         ports.dedup();
         assert_eq!(ports.len(), 4, "one port each");
         assert!(f.android.boot_many(&["nope".to_string()], 1, Duration::from_secs(1), 5600).is_err(), "unknown AVDs fail up front");
+    }
+
+    /// Records when each AVD started and finished; after `stop_after` have finished it starts no more.
+    struct Watch {
+        t0: Instant,
+        stop_after: usize,
+        started: std::sync::Mutex<Vec<(usize, Duration)>>,
+        finished: std::sync::Mutex<Vec<(usize, Duration, bool)>>,
+    }
+
+    impl BootHook for Watch {
+        fn start(&self, i: usize) -> Result<(), String> {
+            if self.finished.lock().expect("finished").len() >= self.stop_after {
+                return Err("not started: stopped".into());
+            }
+            self.started.lock().expect("started").push((i, self.t0.elapsed()));
+            Ok(())
+        }
+
+        fn finished(&self, i: usize, outcome: &BootOutcome) {
+            self.finished.lock().expect("finished").push((i, self.t0.elapsed(), outcome.result.is_ok()));
+        }
+    }
+
+    /// `slow`, `f1`, `f2` and `f3` booted two at a time by a fresh fixture `tag` with `hook`:
+    /// `slow` takes 1.5 s, the others 0.2 s each.
+    fn boot_hooked(tag: &str, hook: &Watch) -> Vec<BootOutcome> {
+        let f = fixture(tag);
+        let names: Vec<String> = ["slow", "f1", "f2", "f3"].iter().map(|s| s.to_string()).collect();
+        for n in &names {
+            f.android.create(n, "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        }
+        fake_adb(&f);
+        let _console = fake_emulator(&f.android, "console-only");
+        let me = f.android.running_dir.clone().expect("running").join(format!("pid_{}.ini", std::process::id()));
+        let ad = std::fs::read_to_string(&me).expect("fake ad");
+        let console = Running::parse(&format!("pid_{}.ini", std::process::id()), &ad).expect("parse").console_port;
+        let run = f.android.running_dir.clone().expect("running");
+        let launch = |d: &Device, _port: u16| {
+            let took = if d.info.udid == "slow" { 1.5 } else { 0.2 };
+            sh(&format!(
+                "printf 'port.serial={console}\\navd.name={}\\nemulator=simee\\n' > {}/pid_$$.ini; sleep {took}; \
+                 echo 'emu: boot completed in {took}s'; sleep 3",
+                d.info.udid,
+                run.display()
+            ))
+        };
+        f.android.boot_window(&names, 2, Duration::from_secs(20), 5600, |_| true, launch, hook).expect("boot_many")
+    }
+
+    fn watch(stop_after: usize) -> Watch {
+        Watch { t0: Instant::now(), stop_after, started: Default::default(), finished: Default::default() }
+    }
+
+    #[test]
+    fn a_hooked_boot_many_refills_its_window_as_each_device_finishes() {
+        let all = watch(usize::MAX);
+        let out = boot_hooked("hooked", &all);
+        assert!(out.iter().all(|o| o.result.is_ok()), "{out:?}");
+        let started = all.started.into_inner().expect("started");
+        let finished = all.finished.into_inner().expect("finished");
+        let at = |i: usize| started.iter().find(|s| s.0 == i).expect("started").1;
+        let slow_done = finished.iter().find(|f| f.0 == 0).expect("slow finished").1;
+        // f1, f2 and f3 boot one after another beside `slow`, not after it.
+        assert!(at(3) < slow_done, "f3 started as f2 finished, not after slow: {started:?} {finished:?}");
+        assert_eq!((finished.len(), finished.last().map(|f| f.0)), (4, Some(0)), "slow finished last: {finished:?}");
+    }
+
+    #[test]
+    fn a_hooked_boot_many_starts_no_more_once_told_to_stop() {
+        // Stopped once one has finished: f1 is done, `slow` (in flight) finishes, f2 and f3 never start.
+        let one = watch(1);
+        let out = boot_hooked("hookstop", &one);
+        let mut started: Vec<usize> = one.started.into_inner().expect("started").iter().map(|s| s.0).collect();
+        started.sort_unstable();
+        assert_eq!(started, [0, 1]);
+        assert!(out[..2].iter().all(|o| o.result.is_ok()), "{out:?}");
+        assert!(out[2..].iter().all(|o| o.result == Err("not started: stopped".into())), "{out:?}");
+        assert_eq!(one.finished.into_inner().expect("finished").len(), 2, "only the two started are told they finished");
     }
 
     #[test]

@@ -12,7 +12,7 @@ use sim_host::Verdict;
 use sim_host::admission::{Admission, Clock, HostState, Item, Limits, Paced, Step, SystemClock, Wait, admit, pace, verdict_name};
 
 use crate::params::{need_str, opt_form_factor, opt_platform, str_param};
-use crate::progress::{Handoff, call_cancelled, call_progress, call_step, has_call_hooks, interruptible};
+use crate::progress::{BootHook, Handoff, call_cancelled, call_progress, call_step, has_call_hooks, interruptible, interruptible_watching};
 
 /// (method, parameters, description). `device` is a UDID, a name, or `booted`. [`platforms`]
 /// says which platforms' devices each method works on.
@@ -837,8 +837,8 @@ fn admitted(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
 }
 
 /// `boot_many` with its admission. `wait` boots the devices in chunks as the host admits them,
-/// each chunk as `boot_many` boots its devices, and reports the ones it never started. A watched
-/// call boots in waves ([`boot_waves`]) and reports each wave it has done.
+/// each chunk as `boot_many` boots its devices, and reports the ones it never started. Every call
+/// boots through its backend's window ([`boot_window`]); a watched one hears each device done.
 fn boot_many_admitted(s: &mut Session, p: &Value, mode: Mode) -> Result<Value, String> {
     let queries = crate::params::strings(p, "devices");
     let targets: Result<Vec<Target>, String> = queries.iter().map(|q| target(s, q, p.get("platform"))).collect();
@@ -853,17 +853,13 @@ fn boot_many_admitted(s: &mut Session, p: &Value, mode: Mode) -> Result<Value, S
     tally.borrow().step("booting", format!("0 of {} devices booted", targets.len()));
     let a = judge_now(s, &new(&targets), concurrency);
     gate(mode, &a)?;
-    let fleet = has_call_hooks().then(|| Fleet::of(s));
+    let fleet = Fleet::of(s);
     if mode != Mode::Wait {
-        let result = match &fleet {
-            Some(fleet) => boot_waves(fleet, p, &targets, concurrency, &mut tally.borrow_mut())?,
-            None => dispatch(s, "boot_many", p)?,
-        };
+        let result = boot_window(&fleet, p, &targets, concurrency, &mut tally.borrow_mut())?;
         return Ok(with_admission(result, &a, None));
     }
     let wait = wait_options(p)?;
     let clock = SystemClock::start();
-    let platform = targets[0].item.platform.as_str();
     let session = std::cell::RefCell::new(s);
     let chunks = std::cell::RefCell::new(Vec::<Vec<String>>::new());
     let paced = pace(
@@ -874,15 +870,8 @@ fn boot_many_admitted(s: &mut Session, p: &Value, mode: Mode) -> Result<Value, S
         call_cancelled,
         |rest| judge_now(&mut session.borrow_mut(), &new(rest), concurrency),
         |chunk| {
-            let ids: Vec<String> = chunk.iter().map(|t| t.udid.clone()).collect();
-            let mut q = p.clone();
-            q["devices"] = ids.iter().cloned().map(Value::String).collect();
-            q["platform"] = json!(platform);
-            chunks.borrow_mut().push(ids);
-            match &fleet {
-                Some(fleet) => boot_waves(fleet, &q, chunk, concurrency, &mut tally.borrow_mut()),
-                None => dispatch(&mut session.borrow_mut(), "boot_many", &q),
-            }
+            chunks.borrow_mut().push(chunk.iter().map(|t| t.udid.clone()).collect());
+            boot_window(&fleet, p, chunk, concurrency, &mut tally.borrow_mut())
         },
         |step| progress("boot_many", step),
     );
@@ -942,8 +931,11 @@ fn merge_chunks(results: &[Result<Value, String>], ids: &[Vec<String>]) -> Resul
 /// (a session's iOS service connection stays on the thread that made it), over the caller's
 /// Android SDK and AVD home. A fake in tests.
 trait Booter: Send + Sync + 'static {
-    /// Runs `method` (`boot`, `boot_many`) on a session of this thread's own.
+    /// Runs `method` (`boot`) on a session of this thread's own.
     fn run(&self, method: &str, p: &Value) -> Result<Value, String>;
+    /// `boot_many` of `p`'s devices on a session of this thread's own, its backend's window asking
+    /// and telling `hook` about each device.
+    fn boot_many(&self, p: &Value, hook: &dyn BootHook) -> Result<Value, String>;
     /// Shuts down these devices of `platform`, at once (each on its own thread); errors are
     /// ignored (one that never came up has nothing to stop).
     fn shut_down(&self, platform: Platform, ids: &[String]);
@@ -967,6 +959,10 @@ impl Fleet {
 impl Booter for Fleet {
     fn run(&self, method: &str, p: &Value) -> Result<Value, String> {
         dispatch(&mut self.session(), method, p)
+    }
+
+    fn boot_many(&self, p: &Value, hook: &dyn BootHook) -> Result<Value, String> {
+        boot_many_hooked(&mut self.session(), p, hook)
     }
 
     fn shut_down(&self, platform: Platform, ids: &[String]) {
@@ -997,18 +993,74 @@ impl Tally {
     }
 }
 
-/// `{device, error}` for each of `ids`, as `boot_many` reports a device it didn't boot.
-fn not_booted<'a>(ids: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<Value> {
-    ids.map(|(id, error)| json!({"device": id, "error": error})).collect()
+/// What a `boot_many` knows of its backend's window while it runs: which devices have started and
+/// which finished (with their entries), and, once its caller cancelled, why no more start. The
+/// window's threads reach it as their [`BootHook`].
+struct Window<B: Booter> {
+    fleet: std::sync::Arc<B>,
+    platform: Platform,
+    ids: Vec<String>,
+    /// Which devices this call starts (they weren't running).
+    ours: Vec<bool>,
+    state: std::sync::Mutex<WindowState>,
 }
 
-/// `boot_many` of `targets` (one platform; `p`'s options) for a caller that watches: in waves of
-/// `concurrency`, each one `boot_many` of the backend on a thread of its own, so the caller hears
-/// each wave done and a cancel is seen at once. Cancelled, the wave in flight has the devices this
-/// call started shut down (one that was running already is left running), the waves after it never
-/// start, and the result has the devices done, every other one's reason, and `cancelled: true`.
-/// The first wave failing as a whole (a parameter the backend refuses) is the call's error.
-fn boot_waves(
+struct WindowState {
+    started: Vec<bool>,
+    done: Vec<Option<Value>>,
+    stop: Option<String>,
+}
+
+impl<B: Booter> Window<B> {
+    fn state(&self) -> std::sync::MutexGuard<'_, WindowState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Devices finished (booted or failed) and failed.
+    fn counts(&self) -> (u64, u64) {
+        let st = self.state();
+        let done = st.done.iter().flatten();
+        (done.clone().count() as u64, done.filter(|d| d.get("error").is_some()).count() as u64)
+    }
+}
+
+impl<B: Booter> BootHook for Window<B> {
+    fn start(&self, i: usize) -> Result<(), String> {
+        let mut st = self.state();
+        if let Some(why) = &st.stop {
+            return Err(why.clone());
+        }
+        if let Some(s) = st.started.get_mut(i) {
+            *s = true;
+        }
+        Ok(())
+    }
+
+    fn finished(&self, i: usize, device: &Value) {
+        let late = {
+            let mut st = self.state();
+            if let Some(d) = st.done.get_mut(i) {
+                *d = Some(device.clone());
+            }
+            st.stop.is_some() && self.ours.get(i) == Some(&true) && device.get("error").is_none()
+        };
+        // Booted after its caller cancelled (the shutdown then may have come too early to stop
+        // it): this call started it, so it is shut down.
+        if late && let Some(id) = self.ids.get(i) {
+            self.fleet.shut_down(self.platform, std::slice::from_ref(id));
+        }
+    }
+}
+
+/// `boot_many` of `targets` (one platform; `p`'s options): one backend `boot_many` of them all,
+/// whose window keeps `concurrency` devices booting and starts the next as soon as any finishes,
+/// with this call's [`Window`] as its hook. Whether or not a caller watches it runs the same; a
+/// watched one runs on a thread of its own ([`interruptible_watching`]), so the caller hears each
+/// device done and a cancel is seen at once. Cancelled, no more devices start, the ones this call
+/// started that are still booting are shut down (one that was running already is left running),
+/// and the result has the devices done, every other one's reason, and `cancelled: true`. The
+/// backend failing as a whole (a parameter it refuses) is the call's error.
+fn boot_window(
     fleet: &std::sync::Arc<impl Booter>,
     p: &Value,
     targets: &[Target],
@@ -1016,84 +1068,77 @@ fn boot_waves(
     tally: &mut Tally,
 ) -> Result<Value, String> {
     let platform = targets.first().map_or(Platform::Ios, |t| t.item.platform);
+    let ids: Vec<String> = targets.iter().map(|t| t.udid.clone()).collect();
+    let n = ids.len();
+    let window = std::sync::Arc::new(Window {
+        fleet: fleet.clone(),
+        platform,
+        ids: ids.clone(),
+        ours: targets.iter().map(|t| !t.running).collect(),
+        state: std::sync::Mutex::new(WindowState { started: vec![false; n], done: vec![None; n], stop: None }),
+    });
+    let mut q = p.clone();
+    q["devices"] = ids.into_iter().map(Value::String).collect();
+    q["platform"] = json!(platform.as_str());
+    q["concurrency"] = json!(concurrency);
     let start = std::time::Instant::now();
-    let (mut results, mut ids, mut cancelled) = (Vec::new(), Vec::new(), false);
-    for wave in targets.chunks(concurrency.max(1)) {
-        let wave_ids: Vec<String> = wave.iter().map(|t| t.udid.clone()).collect();
-        let ours: Vec<String> = wave.iter().filter(|t| !t.running).map(|t| t.udid.clone()).collect();
-        cancelled = cancelled || call_cancelled();
-        if cancelled {
-            let devices = not_booted(wave_ids.iter().map(|id| (id.as_str(), "not started: boot_many was cancelled")));
-            results.push(Ok(json!({"devices": devices, "failed": wave.len(), "unsettled": 0})));
-            ids.push(wave_ids);
-            continue;
+    let base = (tally.done, tally.failed);
+    let heard = |tally: &mut Tally, window: &Window<_>| {
+        let (done, failed) = window.counts();
+        if base.0 + done == tally.done {
+            return false;
         }
-        tally.step("booting", format!("booting {}; {} of {} done{}", wave_ids.join(", "), tally.done, tally.total, tally.failed()));
-        let mut q = p.clone();
-        q["devices"] = wave_ids.iter().cloned().map(Value::String).collect();
-        q["platform"] = json!(platform.as_str());
-        let offset = start.elapsed().as_secs_f64();
-        let (theirs, undo) = (fleet.clone(), ours.clone());
-        let got = interruptible("boot_many", move |h: &Handoff<Result<Value, String>>| {
-            // A wave that finishes after its caller left: what it booted is shut down.
-            if h.give(theirs.run("boot_many", &q)).is_some() {
-                theirs.shut_down(platform, &undo);
-            }
-        })?;
-        match got {
-            Some(Err(e)) if results.is_empty() => return Err(e),
-            Some(r) => {
-                let r = r.map(|mut r| {
-                    shift_times(&mut r, offset);
-                    r
-                });
-                let failed = match &r {
-                    Ok(r) => r["failed"].as_u64().unwrap_or(0),
-                    Err(_) => wave.len() as u64,
-                };
-                tally.done += wave.len() as u64;
-                tally.failed += failed;
-                results.push(r);
+        (tally.done, tally.failed) = (base.0 + done, base.1 + failed);
+        true
+    };
+    let theirs = window.clone();
+    let got = interruptible_watching(
+        "boot_many",
+        move |h: &Handoff<Result<Value, String>>| {
+            // Devices that finish after the caller left are shut down by the hook as each does.
+            h.give(theirs.fleet.boot_many(&q, &*theirs));
+        },
+        || {
+            if heard(tally, &window) {
                 tally.step("booted", format!("{} of {} done{}", tally.done, tally.total, tally.failed()));
             }
-            None => {
-                cancelled = true;
-                fleet.shut_down(platform, &ours);
-                let why = |t: &Target| {
-                    if t.running {
-                        "cancelled while boot_many waited for it to finish booting (it was running already: left running)"
-                    } else {
-                        "cancelled while booting: shut down (this call had started it)"
-                    }
-                };
-                let devices = not_booted(wave.iter().map(|t| (t.udid.as_str(), why(t))));
-                results.push(Ok(json!({"devices": devices, "failed": wave.len(), "unsettled": 0})));
-                tally.step(
-                    "cancelled",
-                    format!("cancelled with {} of {} done; shut down {} it was booting", tally.done, tally.total, ours.len()),
-                );
-            }
+        },
+    )?;
+    if let Some(r) = got {
+        let r = r?;
+        if heard(tally, &window) {
+            tally.step("booted", format!("{} of {} done{}", tally.done, tally.total, tally.failed()));
         }
-        ids.push(wave_ids);
+        return Ok(r);
     }
-    let (devices, failed, unsettled) = merge_chunks(&results, &ids)?;
+    let (devices, booting) = {
+        let mut st = window.state();
+        st.stop = Some("not started: boot_many was cancelled".into());
+        let mut booting = Vec::new();
+        let devices: Vec<Value> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| match (&st.done[i], st.started[i]) {
+                (Some(d), _) => d.clone(),
+                (None, true) if t.running => json!({"device": t.udid,
+                    "error": "cancelled while boot_many waited for it to finish booting (it was running already: left running)"}),
+                (None, true) => {
+                    booting.push(t.udid.clone());
+                    json!({"device": t.udid, "error": "cancelled while booting: shut down (this call had started it)"})
+                }
+                (None, false) => json!({"device": t.udid, "error": "not started: boot_many was cancelled"}),
+            })
+            .collect();
+        (devices, booting)
+    };
+    fleet.shut_down(platform, &booting);
+    heard(tally, &window);
+    tally.step("cancelled", format!("cancelled with {} of {} done; shut down {} it was booting", tally.done, tally.total, booting.len()));
+    let failed = devices.iter().filter(|d| d.get("error").is_some()).count();
+    let unsettled = devices.iter().filter(|d| d["settled"] == json!(false)).count();
     let all_s = (start.elapsed().as_secs_f64() * 10.0).round() / 10.0;
-    let mut result = json!({"concurrency": concurrency, "all_s": all_s, "failed": failed, "unsettled": unsettled, "devices": devices});
-    if cancelled {
-        result["cancelled"] = true.into();
-    }
-    Ok(result)
-}
-
-/// Moves a wave's per-device `started_s` and `done_s` (iOS: from the wave's start) to the call's.
-fn shift_times(r: &mut Value, by: f64) {
-    for d in r["devices"].as_array_mut().into_iter().flatten() {
-        for key in ["started_s", "done_s"] {
-            if let Some(t) = d[key].as_f64() {
-                d[key] = json!(((t + by) * 10.0).round() / 10.0);
-            }
-        }
-    }
+    Ok(json!({"concurrency": concurrency, "all_s": all_s, "failed": failed, "unsettled": unsettled, "devices": devices,
+        "cancelled": true}))
 }
 
 /// A watched `boot` of `udid`, which isn't running: the boot runs on a thread of its own, and a
@@ -1296,36 +1341,7 @@ fn dispatch(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             Some(Platform::Ios) => Err("`import` takes Android bundles for now; iOS bundles are the next step of #170".into()),
             _ => crate::android::import(&mut s.android, p),
         },
-        "boot_many" => {
-            // One platform per call: each backend boots its own devices its own way.
-            let mut udids = Vec::new();
-            let mut first: Option<(Platform, String)> = None;
-            for q in crate::params::strings(p, "devices") {
-                let (platform, udid) = resolve(s, &json!({"device": q, "platform": p.get("platform")}))?;
-                match &first {
-                    None => first = Some((platform, q.clone())),
-                    Some((other, q0)) if *other != platform => {
-                        ios_device_exists(s, platform, &q)?;
-                        ios_device_exists(s, *other, q0)?;
-                        return Err(format!(
-                            "`boot_many` boots one platform's devices per call: `{q0}` is an {} device and `{q}` an {} one",
-                            other.label(),
-                            platform.label()
-                        ));
-                    }
-                    Some(_) => {}
-                }
-                udids.push(udid);
-            }
-            match first.map(|(platform, _)| platform) {
-                Some(Platform::Android) => crate::android::boot_many(&mut s.android, p, &udids),
-                _ => {
-                    let mut p = p.clone();
-                    p["devices"] = udids.into_iter().map(Value::String).collect();
-                    crate::ios::call(&mut s.ios, method, &p)
-                }
-            }
-        }
+        "boot_many" => boot_many_hooked(s, p, &crate::progress::Unwatched),
         m if crate::prefs::is_method(m) => {
             let (platform, udid) = resolve(s, p)?;
             ios_device_exists(s, platform, str_param(p, "device").unwrap_or("booted"))?;
@@ -1348,6 +1364,39 @@ fn dispatch(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             }
         }
         other => Err(format!("unknown method `{other}`; call `help`")),
+    }
+}
+
+/// `boot_many` past admission: its backend's boot window, with `hook` asked before each device
+/// starts and told as each finishes. One platform per call: each backend boots its own devices
+/// its own way.
+fn boot_many_hooked(s: &mut Session, p: &Value, hook: &dyn crate::progress::BootHook) -> Result<Value, String> {
+    let mut udids = Vec::new();
+    let mut first: Option<(Platform, String)> = None;
+    for q in crate::params::strings(p, "devices") {
+        let (platform, udid) = resolve(s, &json!({"device": q, "platform": p.get("platform")}))?;
+        match &first {
+            None => first = Some((platform, q.clone())),
+            Some((other, q0)) if *other != platform => {
+                ios_device_exists(s, platform, &q)?;
+                ios_device_exists(s, *other, q0)?;
+                return Err(format!(
+                    "`boot_many` boots one platform's devices per call: `{q0}` is an {} device and `{q}` an {} one",
+                    other.label(),
+                    platform.label()
+                ));
+            }
+            Some(_) => {}
+        }
+        udids.push(udid);
+    }
+    match first.map(|(platform, _)| platform) {
+        Some(Platform::Android) => crate::android::boot_many(&mut s.android, p, &udids, hook),
+        _ => {
+            let mut p = p.clone();
+            p["devices"] = udids.into_iter().map(Value::String).collect();
+            crate::ios::boot_many_hooked(&mut s.ios, &p, hook)
+        }
     }
 }
 
@@ -1986,37 +2035,77 @@ mod tests {
         assert_eq!(merge_chunks(&[], &[]), Ok((vec![], 0, 0)));
     }
 
-    /// A fleet whose boots take no time, except that each wave from `hold` on waits until
-    /// `released`: it records every wave it was asked to boot and every device it shut down.
+    /// A boot time in [`FakeFleet::ms`] that lasts until the fleet is `released`.
+    const HOLD: u64 = u64::MAX;
+
+    /// A fleet whose device `d<i>` takes `ms[i]` milliseconds to boot (none past the end; [`HOLD`]
+    /// until `released`), booting `boot_many`'s devices in a sliding window as the backends do. It
+    /// records each `boot_many` call's devices, each device it started and each it shut down.
     #[derive(Default)]
     struct FakeFleet {
-        hold: Option<usize>,
+        ms: Vec<u64>,
         released: std::sync::atomic::AtomicBool,
-        waves: std::sync::Mutex<Vec<Vec<String>>>,
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        begun: std::sync::Mutex<Vec<String>>,
         shut: std::sync::Mutex<Vec<String>>,
-        /// The answer to a wave, instead of booting it.
+        /// The answer to a `boot_many`, instead of booting its devices.
         fail: Option<String>,
     }
 
+    impl FakeFleet {
+        fn boot(&self, id: &str) {
+            self.begun.lock().expect("begun").push(id.to_owned());
+            let ms = id.strip_prefix('d').and_then(|n| n.parse::<usize>().ok()).and_then(|i| self.ms.get(i).copied()).unwrap_or(0);
+            if ms == HOLD {
+                while !self.released.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+        }
+    }
+
     impl Booter for FakeFleet {
-        fn run(&self, method: &str, p: &Value) -> Result<Value, String> {
-            let ids = match method {
-                "boot" => vec![str_param(p, "device").unwrap_or("").to_owned()],
-                _ => crate::params::strings(p, "devices"),
-            };
-            let wave = {
-                let mut waves = self.waves.lock().expect("waves");
-                waves.push(ids.clone());
-                waves.len() - 1
-            };
+        fn run(&self, _: &str, p: &Value) -> Result<Value, String> {
+            let id = str_param(p, "device").unwrap_or("").to_owned();
+            self.boot(&id);
+            Ok(json!({"devices": [{"device": id, "boot_s": 1.0}], "failed": 0, "unsettled": 0}))
+        }
+
+        fn boot_many(&self, p: &Value, hook: &dyn BootHook) -> Result<Value, String> {
+            let ids = crate::params::strings(p, "devices");
+            self.calls.lock().expect("calls").push(ids.clone());
             if let Some(e) = &self.fail {
                 return Err(e.clone());
             }
-            while self.hold.is_some_and(|h| wave >= h) && !self.released.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            let devices: Vec<Value> = ids.iter().map(|d| json!({"device": d, "boot_s": 1.0, "started_s": 0.0, "done_s": 1.0})).collect();
-            Ok(json!({"devices": devices, "failed": 0, "unsettled": 0}))
+            let k = p["concurrency"].as_u64().unwrap_or(1) as usize;
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let results = std::sync::Mutex::new(vec![Value::Null; ids.len()]);
+            let t0 = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..k.clamp(1, ids.len().max(1)) {
+                    scope.spawn(|| {
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(id) = ids.get(i) else { break };
+                            if let Err(why) = hook.start(i) {
+                                results.lock().expect("results")[i] = json!({"device": id, "error": why});
+                                continue;
+                            }
+                            let started_s = t0.elapsed().as_secs_f64();
+                            self.boot(id);
+                            let done_s = t0.elapsed().as_secs_f64();
+                            let d = json!({"device": id, "boot_s": done_s - started_s, "started_s": started_s, "done_s": done_s});
+                            hook.finished(i, &d);
+                            results.lock().expect("results")[i] = d;
+                        }
+                    });
+                }
+            });
+            let devices = results.into_inner().expect("results");
+            let failed = devices.iter().filter(|d| d.get("error").is_some()).count();
+            Ok(json!({"concurrency": k, "all_s": t0.elapsed().as_secs_f64(), "devices": devices, "failed": failed, "unsettled": 0}))
         }
 
         fn shut_down(&self, _: Platform, ids: &[String]) {
@@ -2060,81 +2149,98 @@ mod tests {
     }
 
     #[test]
-    fn a_watched_boot_many_reports_each_wave_done_of_all() {
-        let fleet = std::sync::Arc::new(FakeFleet::default());
-        let heard = std::sync::Arc::default();
-        let (hooks, _) = watching(&heard, |_| false);
-        let mut tally = Tally { done: 0, failed: 0, total: 5 };
-        let r = with_call_hooks(hooks, || boot_waves(&fleet, &json!({}), &targets(5, &[]), 2, &mut tally)).expect("booted");
-        let step = |phase: &str, done| (phase.to_owned(), done, Some(5));
-        assert_eq!(
-            counts(&heard),
-            [step("booting", 0), step("booted", 2), step("booting", 2), step("booted", 4), step("booting", 4), step("booted", 5)]
-        );
-        assert_eq!(heard.lock().expect("heard")[0].message, "booting d0, d1; 0 of 5 done");
-        assert_eq!(*fleet.waves.lock().expect("waves"), [vec!["d0", "d1"], vec!["d2", "d3"], vec!["d4"]]);
-        assert_eq!((r["failed"].as_u64(), r["concurrency"].as_u64(), r.get("cancelled")), (Some(0), Some(2), None), "{r}");
-        let devices = r["devices"].as_array().expect("devices");
-        assert_eq!(devices.iter().map(|d| d["device"].as_str().unwrap_or("")).collect::<Vec<_>>(), ["d0", "d1", "d2", "d3", "d4"]);
-        assert!(devices.iter().all(|d| d["boot_s"] == 1.0), "{r}");
-        assert!(fleet.shut.lock().expect("shut").is_empty());
-        // A first wave the backend refuses is the call's error, as an unwatched call's would be.
+    fn a_boot_many_refills_its_window_as_each_device_finishes_watched_or_not() {
+        // d0 takes 0.9 s, d1..d5 0.15 s each, two at a time: in one window d1..d5 boot one after
+        // another beside d0 (all of it ~0.9 s); in waves of two it would take 0.9 + 0.15 + 0.15 s.
+        let ms = vec![900, 150, 150, 150, 150, 150];
+        for watched in [false, true] {
+            let fleet = std::sync::Arc::new(FakeFleet { ms: ms.clone(), ..Default::default() });
+            let heard = std::sync::Arc::default();
+            let mut tally = Tally { done: 0, failed: 0, total: 6 };
+            let run = |tally: &mut Tally| boot_window(&fleet, &json!({}), &targets(6, &[]), 2, tally);
+            let r =
+                if watched { with_call_hooks(watching(&heard, |_| false).0, || run(&mut tally)) } else { run(&mut tally) }.expect("booted");
+            assert_eq!(fleet.calls.lock().expect("calls").len(), 1, "one window for every device (watched: {watched})");
+            let devices = r["devices"].as_array().expect("devices");
+            assert_eq!(
+                devices.iter().map(|d| d["device"].as_str().unwrap_or("")).collect::<Vec<_>>(),
+                ["d0", "d1", "d2", "d3", "d4", "d5"]
+            );
+            let at = |i: usize, k: &str| devices[i][k].as_f64().expect("time");
+            assert!(at(5, "started_s") < at(0, "done_s"), "d5 started as d4 finished, not after d0 (watched: {watched}): {r}");
+            assert!(r["all_s"].as_f64().expect("all_s") < 1.1, "the sliding-window bound, not the waves' (watched: {watched}): {r}");
+            assert_eq!((r["failed"].as_u64(), r.get("cancelled")), (Some(0), None), "{r}");
+            assert_eq!((tally.done, tally.failed), (6, 0));
+            let steps = counts(&heard);
+            if watched {
+                // Each device done as it finishes, the count only rising, ending at all of them.
+                assert!(steps.iter().all(|s| s.0 == "booted" && s.2 == Some(6)), "{steps:?}");
+                assert!(steps.windows(2).all(|w| w[0].1 < w[1].1) && steps.last().map(|s| s.1) == Some(6), "{steps:?}");
+                assert!(steps.len() >= 3, "heard while it ran, not only at the end: {steps:?}");
+            } else {
+                assert!(steps.is_empty(), "nobody to tell: {steps:?}");
+            }
+            assert!(fleet.shut.lock().expect("shut").is_empty());
+        }
+        // A backend that refuses the call (a parameter) makes it the call's error.
         let refused =
             std::sync::Arc::new(FakeFleet { fail: Some("`boot_many` takes `settle` for iOS devices only".into()), ..Default::default() });
+        let heard = std::sync::Arc::default();
         let (hooks, _) = watching(&heard, |_| false);
         let err =
-            with_call_hooks(hooks, || boot_waves(&refused, &json!({}), &targets(4, &[]), 2, &mut Tally { done: 0, failed: 0, total: 4 }));
+            with_call_hooks(hooks, || boot_window(&refused, &json!({}), &targets(4, &[]), 2, &mut Tally { done: 0, failed: 0, total: 4 }));
         assert_eq!(err.expect_err("refused"), "`boot_many` takes `settle` for iOS devices only");
-        assert_eq!(refused.waves.lock().expect("waves").len(), 1, "nothing after the refusal");
     }
 
     #[test]
-    fn cancelling_a_boot_many_of_eight_stops_within_a_second_and_shuts_down_what_it_started() {
-        // Two waves of four; the second holds until released. The caller cancels as the second
-        // wave starts, with four devices done; d5 of the second was running already.
-        let fleet = std::sync::Arc::new(FakeFleet { hold: Some(1), ..Default::default() });
+    fn a_cancelled_boot_many_returns_the_devices_done_and_shuts_down_the_ones_it_was_booting() {
+        // Ten devices four at a time: d0..d3 take 50 ms, the rest hold until released; d5 was
+        // running already. Cancelled at 300 ms: d0..d3 are done, d4..d7 booting, d8 and d9 not
+        // started.
+        let fleet = std::sync::Arc::new(FakeFleet { ms: vec![50, 50, 50, 50, HOLD, HOLD, HOLD, HOLD, HOLD, HOLD], ..Default::default() });
         let heard = std::sync::Arc::default();
-        let (hooks, cancelled_at) = watching(&heard, |p| p.phase == "booting" && p.done == 4);
-        let mut tally = Tally { done: 0, failed: 0, total: 8 };
-        let r = with_call_hooks(hooks, || boot_waves(&fleet, &json!({}), &targets(8, &[5]), 4, &mut tally)).expect("partial");
+        let (hooks, cancelled_at) = watching(&heard, |_| false);
+        let at = cancelled_at.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            *at.lock().expect("at") = Some(std::time::Instant::now());
+        });
+        let mut tally = Tally { done: 0, failed: 0, total: 10 };
+        let r = with_call_hooks(hooks, || boot_window(&fleet, &json!({}), &targets(10, &[5]), 4, &mut tally)).expect("partial");
         let took = cancelled_at.lock().expect("at").expect("cancelled").elapsed();
         assert!(took < Duration::from_secs(1), "stopped {took:?} after the cancel");
-        assert_eq!((r["cancelled"].as_bool(), r["failed"].as_u64()), (Some(true), Some(4)), "{r}");
+        assert_eq!((r["cancelled"].as_bool(), r["failed"].as_u64()), (Some(true), Some(6)), "{r}");
         let devices = r["devices"].as_array().expect("devices");
-        assert!(devices[..4].iter().all(|d| d["boot_s"] == 1.0 && d.get("error").is_none()), "the four done are returned: {r}");
+        assert!(devices[..4].iter().all(|d| d.get("error").is_none() && d["boot_s"].is_number()), "the four done are returned: {r}");
         let errors: Vec<&str> = devices[4..].iter().map(|d| d["error"].as_str().unwrap_or("")).collect();
-        assert!(errors.iter().enumerate().all(|(i, e)| e.contains(if i == 1 { "left running" } else { "shut down" })), "{errors:?}");
-        // The ones this call started in the wave in flight are shut down at once; d5 isn't touched.
+        assert!(errors[0].contains("shut down") && errors[1].contains("left running"), "{errors:?}");
+        assert!(errors[2].contains("shut down") && errors[3].contains("shut down"), "{errors:?}");
+        assert_eq!(errors[4..], ["not started: boot_many was cancelled"; 2]);
+        // The ones this call started that were still booting are shut down at once; d5 isn't touched.
         assert_eq!(*fleet.shut.lock().expect("shut"), ["d4", "d6", "d7"]);
         let last = heard.lock().expect("heard").last().cloned().expect("a step");
-        assert_eq!((last.phase.as_str(), last.done, last.total), ("cancelled", 4, Some(8)));
-        // The wave, finishing after its caller left, shuts its devices down again (a boot that had
-        // not yet begun when the cancel came would otherwise come up after it).
+        assert_eq!((last.phase.as_str(), last.done, last.total), ("cancelled", 4, Some(10)));
+        assert_eq!(last.message, "cancelled with 4 of 10 done; shut down 3 it was booting");
+        // Released, the window starts nothing more, and its devices that come up after the cancel
+        // are shut down again (a shutdown that came before the boot had begun would miss them).
         fleet.released.store(true, std::sync::atomic::Ordering::Relaxed);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while fleet.shut.lock().expect("shut").len() < 6 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(fleet.shut.lock().expect("shut")[3..], ["d4", "d6", "d7"]);
-    }
-
-    #[test]
-    fn a_boot_many_cancelled_between_waves_starts_no_more() {
-        let fleet = std::sync::Arc::new(FakeFleet::default());
-        let heard = std::sync::Arc::default();
-        let (hooks, _) = watching(&heard, |p| p.phase == "booted" && p.done == 2);
-        let mut tally = Tally { done: 0, failed: 0, total: 6 };
-        let r = with_call_hooks(hooks, || boot_waves(&fleet, &json!({}), &targets(6, &[]), 2, &mut tally)).expect("partial");
-        assert_eq!(fleet.waves.lock().expect("waves").len(), 1, "no wave started after the cancel");
-        assert_eq!((r["cancelled"].as_bool(), r["failed"].as_u64()), (Some(true), Some(4)), "{r}");
-        let devices = r["devices"].as_array().expect("devices");
-        assert!(devices[2..].iter().all(|d| d["error"] == "not started: boot_many was cancelled"), "{r}");
-        assert!(fleet.shut.lock().expect("shut").is_empty(), "nothing in flight to shut down");
+        let mut late = fleet.shut.lock().expect("shut")[3..].to_vec();
+        late.sort();
+        assert_eq!(late, ["d4", "d6", "d7"]);
+        std::thread::sleep(Duration::from_millis(50));
+        let mut begun = fleet.begun.lock().expect("begun").clone();
+        begun.sort();
+        assert_eq!(begun, ["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"], "d8 and d9 never started");
+        assert_eq!(fleet.calls.lock().expect("calls").len(), 1);
     }
 
     #[test]
     fn a_watched_boot_cancelled_mid_boot_shuts_down_the_device_it_started() {
-        let fleet = std::sync::Arc::new(FakeFleet { hold: Some(0), ..Default::default() });
+        let fleet = std::sync::Arc::new(FakeFleet { ms: vec![HOLD], ..Default::default() });
         let heard = std::sync::Arc::default();
         // Cancelled 100 ms into the boot.
         let (hooks, cancelled_at) = watching(&heard, |_| false);

@@ -485,7 +485,7 @@ fn stepping_rig() -> Rig {
     Rig::over(Toolsets::all(), |fake| {
         Arc::new(Stepping {
             fake,
-            before: vec![(0, 8, "booting d0, d1, d2, d3; 0 of 8 done")],
+            before: vec![(0, 8, "0 of 8 devices booted")],
             after: vec![(4, 8, "4 of 8 done"), (8, 8, "8 of 8 done")],
         })
     })
@@ -507,15 +507,17 @@ fn a_long_calls_steps_are_its_progress_with_a_total_and_beats_between_them_only_
     params["_meta"] = Rig::meta(false);
     params["_meta"]["progressToken"] = json!("t1");
     let id = rig.send_raw("tools/call", params);
-    // The first step at once, then heartbeats partway to the next device while the wave boots.
+    // The first step at once, then heartbeats partway to the next device while the first ones boot.
     let first = rig.notification("notifications/progress");
     assert_eq!((first["params"]["progress"].as_f64(), first["params"]["total"].as_u64()), (Some(0.0), Some(8)), "{first}");
-    assert_eq!(first["params"]["message"], "boot_many: booting d0, d1, d2, d3; 0 of 8 done");
+    assert_eq!(first["params"]["message"], "boot_many: 0 of 8 devices booted");
     let beat = rig.notification("notifications/progress");
     let between = beat["params"]["progress"].as_f64().expect("progress");
     assert!(between > 0.0 && between < 1.0 && beat["params"]["total"] == 8, "{beat}");
     assert!(
-        beat["params"]["message"].as_str().is_some_and(|m| m.starts_with("boot_many is still running (") && m.ends_with("0 of 8 done"))
+        beat["params"]["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("boot_many is still running (") && m.ends_with("0 of 8 devices booted"))
     );
     gate.release();
     let (progress, response) = progress_until(&rig, id);
@@ -560,15 +562,12 @@ fn a_tasks_status_says_its_step_and_a_cancelled_boot_many_keeps_the_devices_done
     let deadline = Instant::now() + WAIT;
     let message = loop {
         let m = rig.modern("tasks/get", json!({"taskId": id}))["result"]["statusMessage"].as_str().unwrap_or("").to_owned();
-        if m.ends_with("0 of 8 done") || Instant::now() > deadline {
+        if m.ends_with("0 of 8 devices booted") || Instant::now() > deadline {
             break m;
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    assert!(
-        message.starts_with("boot_many has been running for ") && message.ends_with(": booting d0, d1, d2, d3; 0 of 8 done"),
-        "{message}"
-    );
+    assert!(message.starts_with("boot_many has been running for ") && message.ends_with(": 0 of 8 devices booted"), "{message}");
     rig.modern("tasks/cancel", json!({"taskId": id}));
     gate.release();
     let task = loop {
