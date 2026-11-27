@@ -148,11 +148,10 @@ impl Android {
         self.env.list_avds().into_iter().map(|name| self.describe(&name, &running).info).collect()
     }
 
-    /// Whether an AVD is named exactly `name` (its UDID), without loading any. Compared with the
-    /// directory's own names, not by opening `<name>.ini`: on a case-insensitive filesystem
-    /// (APFS) `Pixel.ini` opens `pixel.ini`.
+    /// Whether an AVD is named exactly `name` (its UDID), without loading or listing any: one
+    /// stat of its pointer, in exact case ([`emu_avd::Env::has_avd`]).
     pub fn has_avd(&self, name: &str) -> bool {
-        !name.is_empty() && self.env.list_avds().iter().any(|n| n == name)
+        self.env.has_avd(name)
     }
 
     /// Resolves a UDID-or-name query (`booted` is the only running device) to a device. An exact

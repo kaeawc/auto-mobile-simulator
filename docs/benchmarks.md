@@ -527,6 +527,25 @@ gap, 73 ms at 50 ms, 32 ms from 100 ms on). `restart: false` waits for a launch 
 still in progress: about 3.15 s after a cold launch began, up to ~0.8 s after one brought the app
 forward.
 
+### Per-call device lookup on a crowded host
+
+iPhone 17 Pro, iOS 27.2 (24B8117), booted, on a host with 90 simulators and 112 AVDs, through a
+release `simee serve`, one persistent connection, median of 20 round trips over the socket (the
+median of 3 runs, the builds before and after #120 interleaved against the same device), 1-minute
+load 10-23 (2026-11-26, M3 Max, macOS 26.6). "Before" sorted every simulator
+(`-[SimDeviceSet devices]`) to find one by UDID, listed the AVD home to route each call, and read
+the framebuffer size through a remote proxy on every `screen` and tap; "after" looks the UDID up
+in the set's dictionary (`devicesByUDID`), stats one `<name>.ini`, and keeps the size per boot
+until a rotation or fold.
+
+| Method | before (ms) | after (ms) |
+| --- | --- | --- |
+| `location` | 1.54 | 0.66 |
+| `screen` | 0.34 | 0.04 |
+
+What `location` has left is the service's own round trip (`host_support_mig_set_location_lat_lon`,
+~95% of its samples).
+
 ### Introspection: `processes`, `connections`, `kill`, `network_state`
 
 iPhone 17 Pro, iOS 27.2 (24B8117), freshly booted (~205 device processes, ~1200 on the host),
