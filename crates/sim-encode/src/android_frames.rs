@@ -162,6 +162,13 @@ impl FrameReader {
         Some(Taken { at: frame.at, width: frame.width, height: frame.height, rgba: frame.rgba, unreported })
     }
 
+    /// The sequence number of the frame in the mailbox, and of the last one `wait` reported: what
+    /// a test needs to wait for a frame to have arrived, and to say how many were skipped.
+    #[cfg(test)]
+    pub(crate) fn seqs(&self) -> (Option<u64>, Option<u64>) {
+        (self.shared.lock().frame.as_ref().map(|f| f.seq), self.reported)
+    }
+
     /// Hands a taken frame's buffer back for the reader to fill with the next one.
     pub fn recycle(&self, buffer: Vec<u8>) {
         self.shared.lock().spare = buffer;
@@ -241,20 +248,30 @@ pub(crate) mod tests {
         }
     }
 
+    /// Waits until the reader has the frame with sequence number `seq` in its mailbox.
+    pub(crate) fn wait_for_seq(reader: &FrameReader, seq: u64) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while reader.seqs().0 != Some(seq) {
+            assert!(Instant::now() < deadline, "frame {seq} never arrived: {:?}", reader.seqs());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     #[test]
     fn frames_are_reported_once_and_taken_newest_with_the_count_of_those_skipped() {
-        let display = fake_display("reader", (4, 2), 5, Duration::from_millis(20));
+        // Five frames, sent back to back.
+        let display = fake_display("reader", (4, 2), 5, Duration::ZERO);
         let mut reader = FrameReader::connect(&display.dir, 0).expect("connect");
         display.go();
-        let soon = || Instant::now() + Duration::from_secs(5);
-        let first = reader.wait(soon()).expect("wait").expect("a frame");
+        let first = reader.wait(Instant::now() + Duration::from_secs(10)).expect("wait").expect("a frame");
+        let reported = reader.seqs().1.expect("wait reported one");
         // Let the rest arrive: the reader keeps only the newest.
-        std::thread::sleep(Duration::from_millis(250));
+        wait_for_seq(&reader, 4);
         let taken = reader.take().expect("a frame");
         assert_eq!((taken.width, taken.height, taken.rgba.len()), (4, 2, 32));
         assert!(taken.rgba.iter().all(|&b| b == 4), "the newest of five, which holds byte 4");
         assert!(taken.at >= first);
-        assert!(taken.unreported >= 1, "frames replaced before `wait` could report them are counted: {}", taken.unreported);
+        assert_eq!(taken.unreported, 4 - reported, "the frames after the reported one that were replaced before `take`");
         assert_eq!(reader.device_size(), Some((4, 2)));
         assert!(reader.take().is_none(), "a frame is taken once");
         // Nothing new: wait times out rather than reporting the taken frame again.

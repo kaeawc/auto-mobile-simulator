@@ -82,23 +82,25 @@ impl Source for AndroidSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::android_frames::tests::fake_display;
+    use crate::android_frames::tests::{fake_display, wait_for_seq};
     use std::time::Duration;
 
     #[test]
     fn the_newest_frame_is_the_picture_with_its_capture_time_and_count_of_skipped_ones() {
-        let display = fake_display("source", (6, 4), 4, Duration::from_millis(20));
+        let display = fake_display("source", (6, 4), 4, Duration::ZERO);
         let mut source = AndroidSource::connect(&display.dir, 0).expect("connect");
         assert!(source.picture().expect("picture").is_none(), "nothing before the first frame: the display holds them back");
         display.go();
-        let first = source.wait(Instant::now() + Duration::from_secs(5)).expect("wait").expect("a frame");
-        std::thread::sleep(Duration::from_millis(200));
+        let first = source.wait(Instant::now() + Duration::from_secs(10)).expect("wait").expect("a frame");
+        let reported = source.reader.seqs().1.expect("wait reported one");
+        wait_for_seq(&source.reader, 3);
         let picture = source.picture().expect("picture").expect("a picture");
         assert_eq!((picture.size(), picture.stride, picture.order), ((6, 4), 24, PixelOrder::Rgba));
         assert!(picture.data.iter().all(|&b| b == 3), "the newest of four, which holds byte 3");
         let captured = source.take_captured().expect("when it arrived");
         assert!(captured >= first && source.take_captured().is_none(), "once");
-        assert!(source.take_unreported() >= 1 && source.take_unreported() == 0, "the skipped frames, once");
+        assert_eq!(source.take_unreported(), 3 - reported, "the skipped frames");
+        assert_eq!(source.take_unreported(), 0, "once");
         assert_eq!(source.device_size(), Some((6, 4)));
         // Asking again hands back the same picture until a newer frame arrives.
         assert!(source.picture().expect("picture").is_some());
