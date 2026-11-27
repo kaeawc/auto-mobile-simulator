@@ -527,6 +527,27 @@ gap, 73 ms at 50 ms, 32 ms from 100 ms on). `restart: false` waits for a launch 
 still in progress: about 3.15 s after a cold launch began, up to ~0.8 s after one brought the app
 forward.
 
+### Introspection: `processes`, `connections`, `kill`, `network_state`
+
+iPhone 17 Pro, iOS 27.2 (24B8117), freshly booted (~205 device processes, ~1200 on the host),
+through a release `simee serve`, median of 10 round trips over the socket, the build before and
+after #118 against the same device back to back, host load 19–34 (2026-11-27, M3 Max, macOS
+26.6.2). `kill` is of a just-launched `com.apple.Preferences`. Host children counted by polling
+the server's `proc_listchildpids` every 0.2 ms over 5 calls.
+
+| Method | `ps`/`lsof`/`kill` (ms) | libproc (ms) | Host spawns per call, before → after |
+| --- | --- | --- | --- |
+| `processes` | 141.6 | 3.5 | 2 → 0 |
+| `connections` | 190.7 | 2.5 | 3 → 0 |
+| `kill` | 126.3 | 2.5 | 2 → 0 |
+| `network_state` | 385.4 | 198.6 | 3 → 0 |
+
+For scale, `crash_reports` (a device lookup and a directory listing) takes 1.5 ms on the same
+server; the libproc reads themselves take 0.9 ms (`processes`) and 0.5 ms (`connections`) in
+process. `network_state`'s remaining
+time is its in-device `launchctl getenv` (for `injected`), which runs under the device's
+`launchd_sim`, not the server.
+
 ## MCP server
 
 What the MCP server's protocol layer costs to build, against the official Rust SDK. Linux VM,

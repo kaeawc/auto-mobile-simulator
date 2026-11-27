@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde_json::Value;
+use sim_core::plist::Scalar;
 
 /// The helper's Swift source.
 pub const HELPER_SOURCE: &str = include_str!("../native/simaudio.swift");
@@ -56,28 +57,53 @@ pub fn settings_path(data_path: &Path) -> PathBuf {
     data_path.join("var/run/simulatoraudio/audiosettings.plist")
 }
 
-/// Reads the device's audio settings (UIDs, volume, ringer) as JSON.
-pub fn settings(data_path: &Path) -> Result<Value, String> {
-    let path = settings_path(data_path);
-    let out = Command::new("/usr/bin/plutil").args(["-convert", "json", "-o", "-"]).arg(&path).output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(format!("{}: {}", path.display(), String::from_utf8_lossy(&out.stderr).trim()));
-    }
-    serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+/// The settings file's entries; an error when it can't be read or isn't the flat XML dictionary
+/// the runtime writes.
+fn read_settings(path: &Path) -> Result<Vec<(String, Scalar)>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    sim_core::plist::parse_dict(&text)
+        .ok_or_else(|| format!("{}: not an XML property list of one dictionary of strings, numbers and booleans", path.display()))
 }
 
-fn plutil_replace(data_path: &Path, key: &str, kind: &str, value: &str) -> Result<(), String> {
+/// Reads the device's audio settings (UIDs, volume, ringer) as JSON (read in process: no `plutil`).
+pub fn settings(data_path: &Path) -> Result<Value, String> {
+    let entries = read_settings(&settings_path(data_path))?;
+    Ok(Value::Object(
+        entries
+            .into_iter()
+            .map(|(k, v)| {
+                let v = match v {
+                    Scalar::String(s) => Value::from(s),
+                    Scalar::Integer(i) => Value::from(i),
+                    Scalar::Real(r) => Value::from(r),
+                    Scalar::Bool(b) => Value::from(b),
+                };
+                (k, v)
+            })
+            .collect(),
+    ))
+}
+
+/// Sets `key` in the device's settings file, rewritten in process (to a temporary file renamed
+/// over it, so a reader never sees half a file).
+fn replace(data_path: &Path, key: &str, value: Scalar) -> Result<(), String> {
     let path = settings_path(data_path);
     if !path.exists() {
         return Err(format!("{} does not exist; is the device booted?", path.display()));
     }
-    let out = Command::new("/usr/bin/plutil").args(["-replace", key, kind, value]).arg(&path).output().map_err(|e| e.to_string())?;
-    if out.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()) }
+    let mut entries = read_settings(&path)?;
+    sim_core::plist::set(&mut entries, key, value);
+    let tmp = path.with_extension("plist.simee");
+    std::fs::write(&tmp, sim_core::plist::render_dict(&entries)).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
 }
 
 /// Sets the device's output volume, 0–100 (100 is unity gain). Applies to audio clients started afterwards.
 pub fn set_volume(data_path: &Path, level: u8) -> Result<(), String> {
-    plutil_replace(data_path, "sim_volume", "-integer", &level.min(100).to_string())
+    replace(data_path, "sim_volume", Scalar::Integer(i64::from(level.min(100))))
 }
 
 /// Pins the device's input or output to a host device UID (or `default`). Unlike the simulator's
@@ -86,7 +112,7 @@ pub fn set_volume(data_path: &Path, level: u8) -> Result<(), String> {
 /// devices change, so callers re-apply after those.
 pub fn set_route(data_path: &Path, output: bool, uid: &str) -> Result<(), String> {
     let uid = if uid == "default" { HOST_DEFAULT_UID } else { uid };
-    plutil_replace(data_path, if output { "sim_output_device_uid" } else { "sim_input_device_uid" }, "-string", uid)
+    replace(data_path, if output { "sim_output_device_uid" } else { "sim_input_device_uid" }, Scalar::String(uid.to_owned()))
 }
 
 /// A running tap of one device's audio output.
@@ -157,8 +183,7 @@ mod tests {
         assert_ne!(fnv1a(HELPER_SOURCE), fnv1a(""));
     }
 
-    // Settings are read and edited with the host's `plutil`, which only macOS ships.
-    #[cfg(target_os = "macos")]
+    // Settings are read and edited in process, so this runs on any host.
     #[test]
     fn route_and_volume_edit_a_settings_file() {
         let root = std::env::temp_dir().join(format!("sim-audio-test-{}", std::process::id()));
@@ -168,8 +193,36 @@ mod tests {
         set_volume(&root, 40).expect("volume");
         set_route(&root, true, "default").expect("route");
         let s = settings(&root).expect("read");
-        assert_eq!(s["sim_volume"], 40);
-        assert_eq!(s["sim_output_device_uid"], HOST_DEFAULT_UID);
+        assert_eq!(s, serde_json::json!({"sim_volume": 40, "sim_output_device_uid": HOST_DEFAULT_UID}));
+        assert!(!path.with_extension("plist.simee").exists(), "no temporary file left");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// What `plutil -convert json` printed for the runtime's file, and what `plutil -replace` left
+    /// after `sim_volume` 40 (iOS 27.2, macOS 26.6), against the in-process read and write.
+    #[test]
+    fn reads_and_writes_match_what_plutil_did_on_the_runtimes_file() {
+        let root = std::env::temp_dir().join(format!("sim-audio-plutil-{}", std::process::id()));
+        let path = settings_path(&root);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(&path, include_str!("../fixtures/audiosettings.plist")).expect("plist");
+        let plutil_json: Value = serde_json::from_str(include_str!("../fixtures/audiosettings.plutil.json")).expect("json");
+        assert_eq!(settings(&root).expect("read"), plutil_json);
+        set_volume(&root, 40).expect("volume");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), include_str!("../fixtures/audiosettings.plutil-replaced.plist"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_file_is_an_error() {
+        let root = std::env::temp_dir().join(format!("sim-audio-bad-{}", std::process::id()));
+        assert!(set_volume(&root, 1).expect_err("missing").contains("does not exist"));
+        let path = settings_path(&root);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(&path, "bplist00").expect("write");
+        assert!(set_volume(&root, 1).expect_err("binary").contains("not an XML property list"));
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "bplist00", "left as it was");
+        assert!(settings(&root).is_err());
         std::fs::remove_dir_all(root).ok();
     }
 }
