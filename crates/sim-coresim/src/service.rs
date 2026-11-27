@@ -218,8 +218,7 @@ impl Context {
 
     /// All devices in the default set, sorted by runtime then name.
     pub fn devices(&self) -> Result<Vec<Device>> {
-        let list = rt::object_prop(&self.set, sel!(devices))?;
-        let mut devices: Vec<Device> = rt::array_items(&list).into_iter().map(|obj| Device { obj, kit: self.kit }).collect();
+        let mut devices = self.unsorted_devices()?;
         devices.sort_by_cached_key(|d| {
             let i = d.info();
             (i.runtime_id, i.name, i.udid)
@@ -229,11 +228,39 @@ impl Context {
 
     /// Resolves a UDID, a name, or `booted`.
     pub fn device(&self, query: &str) -> Result<Device> {
-        self.resolve(query).map(|(device, _)| device)
+        match self.by_udid(query) {
+            Some(device) => Ok(device),
+            None => self.resolve(query).map(|(device, _)| device),
+        }
+    }
+
+    /// The device whose UDID `query` is (in any case), looked up in the set's UDID-keyed
+    /// dictionary: one hash lookup however many simulators the host has. The dictionary is the
+    /// service's live one (`-devicesByUDID` copies it per call; the copy is lazy), so a deleted
+    /// device misses and a renamed one reads its new name. `None` when `query` isn't a UDID, no
+    /// device has it, or the service has no such dictionary: the caller then selects.
+    fn by_udid(&self, query: &str) -> Option<Device> {
+        if !sim_core::device::is_udid(query) {
+            return None;
+        }
+        let devices = rt::optional_prop(&self.set, sel!(devicesByUDID))?;
+        let cls = rt::class(c"NSUUID").ok()?;
+        // SAFETY: `alloc` returns an uninitialized instance, consumed by the init call below.
+        let alloc: objc2::rc::Allocated<AnyObject> = unsafe { msg_send![cls, alloc] };
+        // SAFETY: `-[NSUUID initWithUUIDString:]` takes an NSString and returns nil unless it is a
+        // UUID (any case).
+        let key: Option<Obj> = unsafe { msg_send![alloc, initWithUUIDString: &*rt::nsstring(query)] };
+        // SAFETY: the dictionary maps NSUUIDs to SimDevices; `objectForKey:` returns nil or the value.
+        let obj: Option<Obj> = unsafe { msg_send![&*devices, objectForKey: &*key?] };
+        obj.map(|obj| Device { obj, kit: self.kit })
     }
 
     /// Resolves a UDID, a name, or `booted`, with the device's info (read while selecting).
     pub fn resolve(&self, query: &str) -> Result<(Device, DeviceInfo)> {
+        if let Some(device) = self.by_udid(query) {
+            let info = device.info();
+            return Ok((device, info));
+        }
         let mut devices = self.unsorted_devices()?;
         // `select` reads only the UDID, name and state, and doesn't depend on order: read just
         // those of every device (the UDID alone when it names one), then the full info of the
@@ -265,8 +292,15 @@ impl Context {
         Ok(self.unsorted_devices()?.iter().map(Device::selection_info).collect())
     }
 
+    /// Every device in the set, in no order: the UDID-keyed dictionary's values where the service
+    /// has one, as `-[SimDeviceSet devices]` sorts them all (`-[SimDevice compare:]`, which reads
+    /// each runtime) on every call, ~0.9 ms with 89 simulators against microseconds.
     fn unsorted_devices(&self) -> Result<Vec<Device>> {
-        let list = rt::object_prop(&self.set, sel!(devices))?;
+        let list: Obj = match rt::optional_prop(&self.set, sel!(devicesByUDID)) {
+            // SAFETY: `allValues` on an NSDictionary returns a non-nil NSArray.
+            Some(by_udid) => unsafe { msg_send![&*by_udid, allValues] },
+            None => rt::object_prop(&self.set, sel!(devices))?,
+        };
         Ok(rt::array_items(&list).into_iter().map(|obj| Device { obj, kit: self.kit }).collect())
     }
 

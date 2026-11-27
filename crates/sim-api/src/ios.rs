@@ -369,7 +369,20 @@ struct Input {
 struct Screens {
     main: Display,
     inner: Option<Display>,
+    /// Each one's framebuffer size once read (main, inner), with the [`TURNS`] it was read at.
+    /// Reading it fetches the surface through a remote proxy (~0.15 ms, most of a `screen` call);
+    /// a port keeps its surface's size for the boot (rotating turns the picture, not the surface:
+    /// 1206x2622 in all four orientations on an iPhone 17 Pro, iOS 27.2), and these displays are
+    /// found again, `updateIOPorts` and all, in every new boot.
+    sizes: [std::cell::Cell<Option<SizeAt>>; 2],
 }
+
+/// A framebuffer size (width, height) and the [`TURNS`] it was read at.
+type SizeAt = (u64, (u32, u32));
+
+/// Rotations and folds this process has sent, on any device: a framebuffer size read before one
+/// is read again.
+static TURNS: AtomicU64 = AtomicU64::new(0);
 
 /// A screen a touch lands on: its size, and the screen ID whose digitizer takes it (`None`: the
 /// main digitizer, as before).
@@ -384,7 +397,22 @@ fn inner_for<T>(device_type_id: &str, second: Option<T>) -> Option<T> {
 impl Screens {
     fn open(device: &Device) -> Result<Self, String> {
         let (main, inner) = device.builtin_displays().map_err(err)?;
-        Ok(Self { main, inner: inner_for(&device.info().device_type_id, inner) })
+        Ok(Self { main, inner: inner_for(&device.info().device_type_id, inner), sizes: Default::default() })
+    }
+
+    /// The framebuffer size of `display`, one of these: read once, then kept until a rotation or
+    /// fold ([`TURNS`]). A display with no surface yet is an error, and nothing is kept.
+    fn size(&self, display: &Display) -> Result<(u32, u32), String> {
+        let slot = &self.sizes[usize::from(!std::ptr::eq(display, &self.main))];
+        let turns = TURNS.load(Ordering::Acquire);
+        if let Some((at, size)) = slot.get()
+            && at == turns
+        {
+            return Ok(size);
+        }
+        let size = display.size().map_err(err)?;
+        slot.set(Some((turns, size)));
+        Ok(size)
     }
 
     /// The display `which` names and, on a device with two built-in screens, the screen ID of its
@@ -447,9 +475,14 @@ impl Input {
         result
     }
 
-    /// Runs `with` on the built-in display `which` names, reused like the HID client (and dropped,
-    /// with the device, on any failure).
-    fn display<R>(&mut self, udid: &str, which: duo::Display, with: impl FnOnce(&Display) -> Result<R, String>) -> Result<R, String> {
+    /// Runs `with` on the built-in display `which` names (and the screens it is one of), reused like
+    /// the HID client (and dropped, with the device, on any failure).
+    fn display<R>(
+        &mut self,
+        udid: &str,
+        which: duo::Display,
+        with: impl FnOnce(&Screens, &Display) -> Result<R, String>,
+    ) -> Result<R, String> {
         let result = self.try_display(udid, which, with);
         if result.is_err() {
             self.device = None;
@@ -458,10 +491,15 @@ impl Input {
         result
     }
 
-    fn try_display<R>(&mut self, udid: &str, which: duo::Display, with: impl FnOnce(&Display) -> Result<R, String>) -> Result<R, String> {
+    fn try_display<R>(
+        &mut self,
+        udid: &str,
+        which: duo::Display,
+        with: impl FnOnce(&Screens, &Display) -> Result<R, String>,
+    ) -> Result<R, String> {
         let Self { ctx, device, changes, watch, screens, .. } = self;
         let (device, key) = connect(ctx, device, changes, watch, udid)?;
-        screens.with(key, || Screens::open(device), |s| with(s.pick(which)?.0))
+        screens.with(key, || Screens::open(device), |s| with(s, s.pick(which)?.0))
     }
 
     fn try_run<R>(
@@ -478,7 +516,7 @@ impl Input {
                 || Screens::open(device),
                 |s| {
                     let (display, id) = s.pick(which)?;
-                    let (w, h) = display.size().map_err(err)?;
+                    let (w, h) = s.size(display)?;
                     Ok((Size::new(f64::from(w), f64::from(h)), id))
                 },
             )?),
@@ -525,7 +563,7 @@ fn on_display<R: Send + 'static>(
     s: &mut Session,
     p: &Value,
     which: duo::Display,
-    with: impl FnOnce(&Display) -> Result<R, String> + Send + 'static,
+    with: impl FnOnce(&Screens, &Display) -> Result<R, String> + Send + 'static,
 ) -> Result<R, String> {
     let udid = s.udid(p)?;
     let result = INPUT.run(&udid.clone(), move |input| sim_coresim::autoreleasepool(|| input.display(&udid, which, with)))?;
@@ -548,14 +586,14 @@ fn as_typed(error: String, p: &Value) -> String {
 fn screen_size(s: &mut Session, p: &Value) -> Result<(u32, u32), String> {
     match display(p)? {
         duo::Display::CarPlay => s.device(p)?.external_display().and_then(|d| d.size()).map_err(err),
-        which => on_display(s, p, which, |d| d.size().map_err(err)),
+        which => on_display(s, p, which, |screens, d| screens.size(d)),
     }
 }
 
 fn capture(s: &mut Session, p: &Value) -> Result<sim_core::frame::Frame, String> {
     match display(p)? {
         duo::Display::CarPlay => s.device(p)?.external_display().and_then(|d| d.capture()).map_err(err),
-        which => on_display(s, p, which, |d| d.capture().map_err(err)),
+        which => on_display(s, p, which, |_, d| d.capture().map_err(err)),
     }
 }
 
@@ -772,7 +810,9 @@ fn rotate(device: &Device, wanted: Option<Orientation>) -> Result<Value, String>
     let mut guard = ORIENTATIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let known = guard.get_or_insert_with(Default::default);
     let next = wanted.unwrap_or_else(|| known.get(&udid).copied().unwrap_or(Orientation::Portrait).clockwise());
-    device.set_orientation(next).map_err(err)?;
+    let sent = device.set_orientation(next);
+    TURNS.fetch_add(1, Ordering::AcqRel);
+    sent.map_err(err)?;
     known.insert(udid, next);
     Ok(json!({"orientation": next.as_str()}))
 }
@@ -1463,7 +1503,11 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "screenshot" => screenshot_result(&capture(s, p)?, p),
         m if INPUT_METHODS.contains(&m) => input(s, m, p),
         "rotate" => rotate(&s.device(p)?, opt_orientation(p)?),
-        "fold" => crate::duo::fold(&s.device(p)?, p),
+        "fold" => {
+            let folded = crate::duo::fold(&s.device(p)?, p);
+            TURNS.fetch_add(1, Ordering::AcqRel);
+            folded
+        }
         "carplay" => {
             let on = need_bool(p, "on")?;
             s.device(p)?.set_carplay(on).map_err(err)?;
@@ -2082,6 +2126,64 @@ mod tests {
     }
 
     use super::*;
+
+    /// A session that stays open (as `simee serve`'s does) finds a device by UDID and name, then
+    /// misses it under its old name once another process renames it and under its UDID once that
+    /// deletes it: the lookup reads the service's live device set, never a copy of its own.
+    /// `SIMEE_E2E_CREATE=1 cargo test -p sim-api renamed_or_deleted -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "creates, renames and deletes a simulator (SIMEE_E2E_CREATE=1)"]
+    fn a_renamed_or_deleted_device_misses_the_session_lookup() {
+        if std::env::var_os("SIMEE_E2E_CREATE").is_none() {
+            return;
+        }
+        /// Deletes the test's simulator however the test ends.
+        struct Spare(String);
+        impl Drop for Spare {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("xcrun").args(["simctl", "delete", &self.0]).output();
+            }
+        }
+        let simctl = |args: &[&str]| {
+            let out = std::process::Command::new("xcrun").arg("simctl").args(args).output().expect("simctl");
+            assert!(out.status.success(), "simctl {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        /// How long `ok` held after the change, polling: the service tells this process about
+        /// another's change asynchronously.
+        fn settles(mut ok: impl FnMut() -> bool) -> Duration {
+            let start = std::time::Instant::now();
+            while !ok() {
+                assert!(start.elapsed() < Duration::from_secs(10), "still stale after 10 s");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            start.elapsed()
+        }
+        let mut s = Session::default();
+        let ctx = s.ctx().expect("service");
+        let ty = ctx.device_types().expect("types").into_iter().find(|t| t.product_family == "iPhone").expect("an iPhone type");
+        let runtime = ctx.runtimes().expect("runtimes").into_iter().rfind(|r| r.available && r.identifier.contains(".iOS-")).expect("iOS");
+        let (name, renamed) = (format!("simee-lookup-{}", std::process::id()), format!("simee-lookup-{}-renamed", std::process::id()));
+        let udid = ctx.create(&name, &ty.identifier, &runtime.identifier).expect("create").udid();
+        let _spare = Spare(udid.clone());
+        let lookup = |s: &mut Session, q: &str| s.device(&json!({"device": q})).map(|d| d.info());
+        let as_named = |s: &mut Session, q: &str| lookup(s, q).map(|i| (i.udid, i.name));
+        assert_eq!(as_named(&mut s, &udid), Ok((udid.clone(), name.clone())));
+        assert_eq!(as_named(&mut s, &udid.to_ascii_lowercase()), Ok((udid.clone(), name.clone())), "any case");
+        assert_eq!(as_named(&mut s, &name), Ok((udid.clone(), name.clone())));
+
+        simctl(&["rename", &udid, &renamed]);
+        let took = settles(|| lookup(&mut s, &name).is_err());
+        assert_eq!(lookup(&mut s, &name).map(|i| i.udid), Err(format!("no device matches `{name}`")));
+        assert_eq!(as_named(&mut s, &renamed), Ok((udid.clone(), renamed.clone())));
+        assert_eq!(as_named(&mut s, &udid), Ok((udid.clone(), renamed.clone())), "by UDID, the new name");
+        eprintln!("rename seen after {took:?}");
+
+        simctl(&["delete", &udid]);
+        let took = settles(|| lookup(&mut s, &udid).is_err());
+        assert_eq!(lookup(&mut s, &udid).map(|i| i.udid), Err(format!("no device matches `{udid}`")));
+        assert!(lookup(&mut s, &renamed).is_err());
+        eprintln!("delete seen after {took:?}");
+    }
 
     /// `processes`, `connections`, `kill`, `network_state`'s `boot_injected` check and the audio
     /// settings spawn nothing on the host. Measured in a process of its own (every child any test
