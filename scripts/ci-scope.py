@@ -815,8 +815,8 @@ REFERENCED = re.compile(r'"(?:\.\./)*((?:docs|scripts)/[A-Za-z0-9_./-]+)"')
 NONE = re.compile(r"^(docs/|website/|\.github/workflows/(?:software-mode|release|website)\.yml$|\.githooks/|\.local/|LICENSE$|\.gitignore$"
                   r"|Makefile$|bacon\.toml$|rustfmt\.toml$|\.editorconfig$|\.shellcheckrc$|\.yamllint\.yml$"
                   r"|lychee\.toml$|_typos\.toml$)|\.md$|^scripts/")
-# Scripts only jobs that run on every change use (docs-scripts, mediamtx): they reach no scoped job.
-LINT_ONLY = {"scripts/lint.sh", "scripts/mediamtx-fetch.sh"}
+# Scripts only the docs-scripts job runs: it runs on every change, so they reach no scoped job.
+LINT_ONLY = {"scripts/lint.sh"}
 EVERYTHING = re.compile(r"^(\.github/workflows/ci\.yml|\.github/actions/|\.cargo/|rust-toolchain\.toml$|Cargo\.toml$"
                         r"|scripts/ci-scope\.py$)")
 # What runs scripts in these jobs: the workflow and its actions (every job), and cargo's config

@@ -242,7 +242,7 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   the live demo's MediaMTX relay on Fly (`website-media.yml`), fed by `scripts/live-demo.sh`. Its copy carries no number of its own:
   measured claims come from the README and docs. Docs: `website/README.md`.
 - `scripts/` — `brand.sh` (redraws `assets/brand/` from `sim_core::mark`), `desktop-app.sh` (the
-  desktop as `simee.app` with its icon), `mediamtx.sh` (MediaMTX on free ports by hand), `mediamtx-fetch.sh` (the pinned, SHA-256-checked MediaMTX release: version and hashes live there; CI's `mediamtx` job runs `simee-rtc`'s tests against it), `parity.sh`, `ios-matrix.sh` (every iOS feature on one device: the
+  desktop as `simee.app` with its icon), `mediamtx.sh` (MediaMTX on free ports by hand), `mediamtx-fetch.sh` (the pinned, SHA-256-checked MediaMTX release: version and hashes live there; CI's `mediamtx` and macOS `lint-test` jobs run `simee-rtc`'s tests against it), `parity.sh`, `ios-matrix.sh` (every iOS feature on one device: the
   `docs/ios-versions.md` table), `automobile-harness.sh`, `automobile-farm.sh` (every device through
   one private AutoMobile daemon; `automobile-daemon.sh` starts, joins and stops it, and the
   harnesses join it through `AM_DAEMON_ENV`), `pf-shape.sh` (pf/dummynet, needs sudo);

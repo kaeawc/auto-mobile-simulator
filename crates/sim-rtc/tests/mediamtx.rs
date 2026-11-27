@@ -14,6 +14,13 @@ use common::{BASELINE, MAIN, MediaMtx};
 use simee_rtc::h264;
 use simee_rtc::{Error, InputConfig, InputSession, ProfileLevelId, Publisher, PublisherConfig};
 
+/// The unsigned integer after `"key":` in a compact JSON body (the first such key, any depth).
+fn json_number(body: &str, key: &str) -> Option<u64> {
+    let rest = &body[body.find(&format!("\"{key}\":"))? + key.len() + 3..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 /// Publish `fixture` in a loop (an IDR every five frames, so MediaMTX gathers its tracks whenever
 /// it looks) until the path is ready, then check the API's view of it: a WebRTC session as the
 /// source, one H264 track whose SPS profile is `mediamtx_profile`, and bytes received.
@@ -49,7 +56,7 @@ fn publishes_and_is_ready(fixture: &[u8], profile: ProfileLevelId, name: &str, m
     assert!(body.contains("\"tracks\":[\"H264\"]"), "no single H264 track in {body}");
     assert!(body.contains(&format!("\"profile\":\"{mediamtx_profile}\"")), "profile is not {mediamtx_profile} in {body}");
     assert!(body.contains("\"source\":{\"type\":\"webRTCSession\""), "source is not a WebRTC session in {body}");
-    assert!(!body.contains("\"inboundBytes\":0,"), "no bytes received in {body}");
+    assert!(json_number(&body, "inboundBytes").is_some_and(|n| n > 0), "no bytes received in {body}");
     publisher.close().expect("close");
 }
 
@@ -73,6 +80,15 @@ fn harness_starts_and_stops_mediamtx() {
     let port = mtx.api_port;
     drop(mtx);
     assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "api still listening after drop");
+}
+
+#[test]
+fn json_number_reads_a_field_wherever_it_is() {
+    assert_eq!(json_number(r#"{"a":1,"inboundBytes":1684,"b":2}"#, "inboundBytes"), Some(1684));
+    assert_eq!(json_number(r#"{"a":1,"inboundBytes":7}"#, "inboundBytes"), Some(7));
+    assert_eq!(json_number(r#"{"inboundBytes":0,"a":1}"#, "inboundBytes"), Some(0));
+    assert_eq!(json_number(r#"{"bytesReceived":5}"#, "inboundBytes"), None);
+    assert_eq!(json_number(r#"{"inboundBytes":"x"}"#, "inboundBytes"), None);
 }
 
 /// MediaMTX v1.19.2 doesn't carry the `simee-input` channel (#271): it refuses an offer with an

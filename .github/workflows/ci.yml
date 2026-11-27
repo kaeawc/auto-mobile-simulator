@@ -160,7 +160,8 @@ jobs:
   # `simee-rtc`'s end-to-end tests: the `linux` job builds without the `rust-crypto` DTLS backend,
   # so those skip there. MediaMTX is the release pinned in scripts/mediamtx-fetch.sh, checked
   # against its SHA-256 on every run (the download is about a second; an Actions cache entry would
-  # cost as much to restore and evict rust-cache targets from the full 10 GB cache). Setting
+  # cost as much to restore and evict other entries from the full cache). `lint-test` runs the
+  # same tests on macOS (it tests simee-rtc already). Setting
   # SIMEE_REQUIRE_MEDIAMTX makes a skipped MediaMTX test a failure, so a broken download or a
   # missing DTLS backend can't go green by skipping.
   mediamtx:
@@ -173,11 +174,13 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
+      # Restore-only, from the `linux` job's entry: the repository's Actions cache is over its
+      # limit, and a second Linux entry saved from main would evict older ones (macOS included).
+      # What `linux` didn't build (aws-lc, for `rust-crypto`) compiles each run.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: mediamtx
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: linux
+          save-if: false
       - name: MediaMTX
         run: |
           bin=$(scripts/mediamtx-fetch.sh "$RUNNER_TEMP/mediamtx")
@@ -236,7 +239,17 @@ jobs:
       - name: Wait for the simulator service
         timeout-minutes: 5
         run: time xcrun simctl list devices > /dev/null
+      # simee-rtc's MediaMTX tests (Apple's DTLS backend; the `mediamtx` job runs them on Linux):
+      # the pinned, SHA-256-checked release, about a second. SIMEE_REQUIRE_MEDIAMTX below makes a
+      # skipped MediaMTX test a failure.
+      - name: MediaMTX
+        run: |
+          bin=$(scripts/mediamtx-fetch.sh "$RUNNER_TEMP/mediamtx")
+          "$bin" --version
+          echo "MEDIAMTX_BIN=$bin" >> "$GITHUB_ENV"
       - name: Test the crates with macOS-specific code
+        env:
+          SIMEE_REQUIRE_MEDIAMTX: "1"
         run: |
           packages=()
           while read -r name; do packages+=(-p "$name"); done < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' .config/macos-tests.txt)

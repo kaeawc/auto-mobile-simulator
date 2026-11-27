@@ -130,7 +130,7 @@ Run it: `MEDIAMTX_BIN=/path/to/mediamtx cargo test -p simee-rtc --test mediamtx`
 
 #### In CI
 
-CI's `mediamtx` job (`.github/workflows/ci.yml`) runs all of `simee-rtc`'s tests with
+CI's `mediamtx` job (`.github/workflows/ci.yml`, and the macOS `lint-test` job for the same MediaMTX tests) runs all of `simee-rtc`'s tests with
 `--features rust-crypto` against MediaMTX v1.19.2, so the publisher's end-to-end tests (WHIP to
 the fake server, the input channel, MediaMTX) run on Linux; the `linux` job builds without a DTLS
 backend, where they skip. `scripts/mediamtx-fetch.sh` is the one place with the pin: the version
@@ -153,7 +153,7 @@ download can't go green; a `MEDIAMTX_BIN` that names no file always fails.
 The archive is not cached with `actions/cache`: the download, check and unpack take about 1.4 s,
 a cache restore costs about that, and the repository's Actions cache is full. The job's build
 (`rust-crypto` compiles aws-lc) is cached by `rust-cache` like the others, saved from `main`.
-macOS jobs don't run MediaMTX; the darwin pins are there for a Mac running the script.
+The macOS `lint-test` job fetches the darwin arm64 pin the same way and runs the same MediaMTX tests (simee-rtc is one of the crates it tests), with `SIMEE_REQUIRE_MEDIAMTX` set; no extra macOS job. The `mediamtx` job's Rust build restores the `linux` job's cache and saves none of its own (the Actions cache is over its limit).
 
 What the first real run (v1.19.2, Linux amd64) settled:
 
@@ -633,7 +633,7 @@ it. A real stream end to end (Chromium over WHEP) is #268's.
   of RFC 9725 §4.6 (ICE servers) are not read. Trickle ICE is in the client but the publisher
   doesn't need it with host candidates gathered up front.
 - **Linux in CI.** The `linux` job tests without `rust-crypto`, so the publisher's end-to-end
-  tests skip there; the `mediamtx` job runs them with it (macOS runs them too, without MediaMTX).
+  tests skip there; the `mediamtx` job runs them with it, and macOS's `lint-test` runs them with Apple's DTLS and MediaMTX.
 - **Reconnects.** A publisher reports `Disconnected`; publishing again is a new publisher with a
   new WHIP resource. A stream whose peer disconnects ends (`state: "ended"`); starting it again is
   the client's `stream_start`.
