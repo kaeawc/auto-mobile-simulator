@@ -289,10 +289,12 @@ a list in `crates/sim-mcp/src/tools.rs`; every other tool answers inline.
   extension allows: the task is `cancelled` at once, and the call stops at its next safe point,
   undoing what it had half done:
   - `boot_many` starts no more devices and shuts down, within a second, those it was booting that
-    it had started (one that was running already is left running). Its result has the devices that
-    finished, a reason for every other one and `cancelled: true`, and the cancelled task keeps it
-    as its `result`.
-  - `boot` shuts down the device it was booting, if it started it.
+    it had started: the ones it found off when their turn came and booted itself. A device that was
+    running or booting when its turn came (another caller's, even one started after this call was
+    admitted) is left as it was. Its result has the devices that finished, a reason for every
+    other one and `cancelled: true`, and the cancelled task keeps it as its `result`: listeners
+    hear the task again (`notifications/tasks`, still `cancelled`) once that result is in.
+  - `boot` shuts down the device it was booting, if it started it (by the same rule).
   - `create`, `clone` and `import` delete the device they made, if the cancel came while they ran.
   - A call waiting for the host to admit its devices (`admission: "wait"`) stops waiting and starts
     nothing.

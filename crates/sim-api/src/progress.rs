@@ -81,6 +81,11 @@ pub(crate) trait BootHook: Sync {
     /// Asked before device `i` starts: `Err(why)` starts no more (each device not started gets
     /// `why` as its error).
     fn start(&self, i: usize) -> Result<(), String>;
+    /// Asked just before the backend boots device `i`, which is off at that instant (iOS: shut
+    /// down; Android: no emulator runs it): `Ok` and the call has started it, so it is the call's
+    /// to shut down if cancelled; `Err(why)` boots it not (`why` is its error). Never asked for a
+    /// device that was booted or booting when its turn came: the call only waits on that one.
+    fn launching(&self, i: usize) -> Result<(), String>;
     /// Device `i` finished, booted or not: its entry in `boot_many`'s `devices`.
     fn finished(&self, i: usize, device: &serde_json::Value);
 }
@@ -93,7 +98,38 @@ impl BootHook for Unwatched {
         Ok(())
     }
 
+    fn launching(&self, _: usize) -> Result<(), String> {
+        Ok(())
+    }
+
     fn finished(&self, _: usize, _: &serde_json::Value) {}
+}
+
+/// What a single `boot` asks before it launches its device ([`launching`]).
+type LaunchHook = Box<dyn Fn() -> Result<(), String>>;
+
+thread_local! {
+    static LAUNCH: RefCell<Option<LaunchHook>> = const { RefCell::new(None) };
+}
+
+/// Runs `f` (a single `boot` on this thread) with `hook` as what [`launching`] asks; the previous
+/// one comes back after.
+pub(crate) fn with_launch_hook<R>(hook: impl Fn() -> Result<(), String> + 'static, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<LaunchHook>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LAUNCH.with(|h| *h.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(LAUNCH.with(|h| h.borrow_mut().replace(Box::new(hook))));
+    f()
+}
+
+/// What a single `boot` on this thread asks just before the backend boots its device, which is
+/// off at that instant, as [`BootHook::launching`] does for a `boot_many`'s: `Err(why)` boots it
+/// not. Without a hook (an unwatched boot) it boots.
+pub(crate) fn launching() -> Result<(), String> {
+    LAUNCH.with(|h| h.borrow().as_ref().map_or(Ok(()), |hook| hook()))
 }
 
 /// How often a call whose work runs on another thread looks at its caller's cancel flag.

@@ -1271,7 +1271,9 @@ pub(crate) fn mem_deadline(p: &Value) -> Duration {
 /// Boots `device` by `plan`: the boot, then the profile, then the settle wait, each timed. Only
 /// a failed boot is an error: a profile or settle wait that fails after it is reported in the
 /// timings (`profile.error`; `settled: false` with `settle_error`), the device left booted.
-fn boot_device(device: &Device, plan: &BootPlan) -> Result<Value, String> {
+/// `launching` is asked just before the boot is issued for a device that is off at that instant
+/// (not booted or booting): `Err` boots it not, and only a device it said yes to is this call's.
+fn boot_device(device: &Device, plan: &BootPlan, launching: &dyn Fn() -> Result<(), String>) -> Result<Value, String> {
     let start = std::time::Instant::now();
     let info = device.info();
     let udid = info.udid;
@@ -1286,6 +1288,10 @@ fn boot_device(device: &Device, plan: &BootPlan) -> Result<Value, String> {
     let preset = plan.profile.filter(|_| !was_booted).map(|profile| preset_profile(&udid, profile));
     let jobs = plan.profile.filter(|_| !was_booted).map(|profile| boot_jobs(&udid, profile)).unwrap_or_default();
     let boot_started = std::time::SystemTime::now();
+    // Read again now: another caller may have booted it since, and then this call only waits.
+    if !matches!(device.state(), DeviceState::Booted | DeviceState::Booting) {
+        launching()?;
+    }
     if !was_booted && (!env.is_empty() || !jobs.is_empty()) {
         device.boot_with(&sim_coresim::BootOptions { env: &env, jobs: &jobs }).map_err(err)?;
     }
@@ -1661,7 +1667,7 @@ fn boot_many(udids: &[String], concurrency: usize, plan: &BootPlan, hook: &dyn c
                     let queued_s = start.elapsed().as_secs_f64();
                     let result = sim_coresim::autoreleasepool(|| {
                         let device = ctx.as_ref().map_err(Clone::clone)?.device(udid).map_err(err)?;
-                        boot_device(&device, plan)
+                        boot_device(&device, plan, &|| hook.launching(i))
                     });
                     let mut value = result.unwrap_or_else(|e| json!({"device": udid, "error": e}));
                     value["started_s"] = json!(round(queued_s));
@@ -1759,7 +1765,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "boot" => {
             let d = s.device(p)?;
             let plan = boot_plan(p, 1, false, || build_shapers(&[d.info().runtime_id]))?;
-            let timed = boot_device(&d, &plan)?;
+            let timed = boot_device(&d, &plan, &crate::progress::launching)?;
             // The device's saved camera links (#323): its feed and the device-wide injection.
             crate::camera::ios_booted(s, &d.info().udid);
             // Without settle or a profile, `boot` answers as it always has.

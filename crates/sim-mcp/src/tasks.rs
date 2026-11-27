@@ -320,7 +320,8 @@ impl Tasks {
 
     /// Records how a task ended, unless it was cancelled first, and tells its listeners. A
     /// cancelled task keeps the result its call returned when that result says it is partial
-    /// (`cancelled: true`: what it finished before it stopped); any other is discarded.
+    /// (`cancelled: true`: what it finished before it stopped), and its listeners hear it again
+    /// with that result; any other is discarded.
     fn finish(&self, id: &str, outcome: Result<Value, Value>) {
         let mut table = self.lock();
         let Some(entry) = table.entries.get_mut(id) else { return };
@@ -329,6 +330,7 @@ impl Tasks {
         {
             *partial = Some(result.clone());
             entry.updated = SystemTime::now();
+            self.announce(&table, id);
             return;
         }
         if !matches!(entry.state, State::Working) {
@@ -564,6 +566,36 @@ mod tests {
         assert_eq!(statuses[0].0, "working");
         assert!(statuses[0].1.ends_with(": installing a.apk on phone (2.0 MB)"), "{statuses:?}");
         assert_eq!(statuses[1].0, "completed");
+    }
+
+    #[test]
+    fn listeners_hear_a_cancelled_task_get_its_partial_result() {
+        let tasks = Tasks::default();
+        let (release, wait) = channel::<()>();
+        let id = tasks
+            .create("boot_many", move || {
+                wait.recv().ok();
+                json!({"content": [], "structuredContent": {"cancelled": true, "failed": 3}, "isError": false})
+            })
+            .expect("create")["taskId"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        let (tx, rx) = channel::<String>();
+        let tx = Mutex::new(tx);
+        let sink: Sink = Arc::new(move |line| {
+            tx.lock().expect("tx").send(line).ok();
+        });
+        tasks.subscribe(json!(1), std::slice::from_ref(&id), sink, |_| {});
+        assert!(tasks.cancel(&id));
+        release.send(()).expect("release");
+        let notes: Vec<Value> =
+            (0..2).map(|_| serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).expect("note")).expect("json")).collect();
+        // Cancelled at once with nothing yet, then again with what the call had done.
+        assert_eq!((notes[0]["params"]["status"].as_str(), notes[0]["params"].get("result")), (Some("cancelled"), None));
+        assert_eq!(notes[1]["params"]["status"], "cancelled");
+        assert_eq!(notes[1]["params"]["result"]["structuredContent"]["failed"], 3);
+        assert!(notes[1]["params"]["statusMessage"].as_str().is_some_and(|m| m.contains("returned what it had done")), "{}", notes[1]);
     }
 
     #[test]

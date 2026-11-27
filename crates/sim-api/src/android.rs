@@ -206,6 +206,10 @@ impl sim_android::BootHook for Outcomes<'_> {
         self.0.start(i)
     }
 
+    fn launching(&self, i: usize) -> Result<(), String> {
+        self.0.launching(i)
+    }
+
     fn finished(&self, i: usize, outcome: &sim_android::BootOutcome) {
         self.0.finished(i, &outcome_json(outcome));
     }
@@ -289,7 +293,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
         "boot" => {
             reject_ios_boot_params(method, p)?;
             let (timeout, audio) = boot_options(p)?;
-            null(d.boot(&android, timeout, audio))
+            null(d.boot_asking(&android, timeout, audio, &crate::progress::launching))
         }
         "clone" => {
             if d.running.is_some() {
