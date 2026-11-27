@@ -58,6 +58,7 @@ installed_target() { rustup target list --installed 2>/dev/null | command grep -
 step fmt cargo fmt --all --check
 step "fmt (desktop)" rustfmt --check --edition 2024 desktop/src/main.rs
 step clippy cargo clippy --all-targets --quiet -- -D warnings
+step "macOS test list" python3 scripts/ci-scope.py check
 if [[ $mode != quick ]]; then
   case "$(uname -s)" in
     Linux) other=aarch64-apple-darwin ;;

@@ -1,32 +1,71 @@
 name: Software mode
 
 # Boots an API 36 x86_64 image in emu's software mode (QEMU's TCG with emu's devices, #55) on a
-# hosted runner, and checks it the way a user would: `sys.boot_completed`, a screenshot of the
-# launcher over display.sock, a tap, and a clean stop through the console. Software mode doesn't
-# use the runner's /dev/kvm. QEMU 11.1 (Ubuntu's is older) is built once and cached, as are the
-# system image and the SDK's Linux renderer.
+# hosted runner, and checks it the way a user would: `sys.boot_completed`, a screenshot over
+# display.sock, a tap and a clean stop through the console; on main and manual runs also the
+# launcher drawn. Software mode doesn't use the runner's /dev/kvm. QEMU 11.1 (Ubuntu's is older) is
+# built once and cached, as are the system image and the SDK's Linux renderer.
 on:
+  # Every push to main runs the full check.
   push:
     branches: [main]
-    paths:
-      - "apps/emu/**"
-      - "apps/simee/**"
-      - "crates/emu-*/**"
-      - "crates/sim-android/**"
-      - "crates/sim-api/**"
-      - "crates/sim-core/**"
-      - "Cargo.lock"
-      - ".github/workflows/software-mode.yml"
+  # A pull request runs it only when the change can reach what `cargo build -p emu -p simee`
+  # compiles on Linux: every crate those two pull in, the lockfile and the toolchain. Not: tests,
+  # examples, benches and docs, and the files that build gates off Linux from another file
+  # (macOS-only modules behind a `#[cfg] mod` line, the Objective-C only they include). A file
+  # gated off only by its own `#![cfg]` stays in (editing it alone can turn it on). Later
+  # patterns win over earlier ones. `scripts/ci-scope.py check` (CI's fmt job,
+  # scripts/check.sh) fails when a file that build reads is skipped, or a crate it doesn't build
+  # is named.
   pull_request:
     paths:
       - "apps/emu/**"
       - "apps/simee/**"
-      - "crates/emu-*/**"
+      - "crates/emu-avd/**"
+      - "crates/emu-ext4/**"
+      - "crates/emu-fdt/**"
+      - "crates/emu-gfxstream/**"
+      - "crates/emu-hvf/**"
+      - "crates/emu-sdk/**"
+      - "crates/emu-vmm/**"
       - "crates/sim-android/**"
       - "crates/sim-api/**"
+      - "crates/sim-audio/**"
+      - "crates/sim-bundle/**"
       - "crates/sim-core/**"
+      - "crates/sim-coresim/**"
+      - "crates/sim-debug/**"
+      - "crates/sim-mcp/**"
+      - "crates/sim-netshape/**"
       - "Cargo.lock"
+      - "Cargo.toml"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
+      - ".github/actions/rust-toolchain/**"
       - ".github/workflows/software-mode.yml"
+      - "!**/*.md"
+      - "!**/tests/**"
+      - "!**/tests.rs"
+      - "!**/examples/**"
+      - "!**/benches/**"
+      - "!apps/emu/src/vkprobe.rs"
+      - "!crates/emu-gfxstream/src/channel.rs"
+      - "!crates/emu-gfxstream/src/macho.rs"
+      - "!crates/emu-hvf/src/ffi.rs"
+      - "!crates/emu-hvf/src/hv.rs"
+      - "!crates/emu-vmm/src/machine.rs"
+      - "!crates/emu-vmm/src/vcpu.rs"
+      - "!crates/sim-api/native/displaytool.entitlements"
+      - "!crates/sim-api/native/displaytool.m"
+      - "!crates/sim-api/src/duo.rs"
+      - "!crates/sim-api/src/ios.rs"
+      - "!crates/sim-coresim/src/carplay.rs"
+      - "!crates/sim-coresim/src/display.rs"
+      - "!crates/sim-coresim/src/error.rs"
+      - "!crates/sim-coresim/src/hid.rs"
+      - "!crates/sim-coresim/src/procs.rs"
+      - "!crates/sim-coresim/src/rt.rs"
+      - "!crates/sim-coresim/src/service.rs"
   workflow_dispatch:
 
 concurrency:
@@ -64,7 +103,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: software-mode
@@ -108,23 +147,64 @@ jobs:
           target/release/emu -provision 36 -tag default -abi x86_64
       - run: target/release/emu -create-avd ci -sysdir system-images/android-36/default/x86_64
       - run: target/release/emu -avd ci -dry-run
+      # Every run checks `sys.boot_completed`, a screenshot of the display's size that isn't one
+      # solid colour (polled, 40 tries: right after boot the capture can still fail or come back
+      # blank), a tap and a clean stop through the console. Main and manual runs also give the
+      # launcher 30 s and want a screenshot of it (over 20 kB); a pull request goes on as soon as
+      # something is drawn.
       - name: Boot, screenshot, tap, stop
+        env:
+          FULL: ${{ github.event_name != 'pull_request' }}
         run: |
+          # Exits 0 when the PNG is 720x1280, over $2 bytes and not one solid colour.
+          cat > "$RUNNER_TEMP/drawn.py" <<'EOF'
+          import struct, sys, zlib
+          d = open(sys.argv[1], "rb").read()
+          w, h, depth, ctype = struct.unpack(">IIBB", d[16:26])
+          bpp = {0: 1, 2: 3, 4: 2, 6: 4}[ctype] * depth // 8
+          data, i = b"", 8
+          while i < len(d):
+              n, kind = struct.unpack(">I4s", d[i:i + 8])
+              data += d[i + 8:i + 8 + n] if kind == b"IDAT" else b""
+              i += 12 + n
+          raw, stride = zlib.decompress(data), w * bpp
+          prev, first, solid = bytearray(stride), None, True
+          for y in range(h):
+              f, line = raw[y * (stride + 1)], bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+              for x in range(stride) if f else ():
+                  a, b = line[x - bpp] if x >= bpp else 0, prev[x]
+                  c = prev[x - bpp] if x >= bpp else 0
+                  if f == 4:
+                      p = a + b - c
+                      a = a if abs(p - a) <= abs(p - b) and abs(p - a) <= abs(p - c) else b if abs(p - b) <= abs(p - c) else c
+                  line[x] = (line[x] + (a if f in (1, 4) else b if f == 2 else (a + b) // 2)) & 255
+              first = first or line[:bpp]
+              if line != first * w:
+                  solid = False
+                  break
+              prev = line
+          print(w, h, len(d), "one solid colour" if solid else "drawn")
+          sys.exit(0 if (w, h) == (720, 1280) and len(d) > int(sys.argv[2]) and not solid else 1)
+          EOF
           adb="$ANDROID_HOME/platform-tools/adb"
           "$adb" start-server
           target/release/emu -avd ci -verbose > emu.log 2>&1 &
           pid=$!
           # A fresh userdata's first boot: 375 s on a 4-vCPU Xeon; allow 30 minutes.
-          for _ in $(seq 1 180); do
+          for _ in $(seq 1 900); do
             grep -q "boot completed" emu.log && break
             kill -0 "$pid" || { echo "emu exited before boot completed"; exit 1; }
-            sleep 10
+            sleep 2
           done
           grep "boot completed" emu.log
           test "$("$adb" -s emulator-5554 shell getprop sys.boot_completed | tr -d '\r')" = 1
-          sleep 30
-          target/release/simee screenshot ci shot.png
-          python3 -c "import struct,sys; d=open('shot.png','rb').read(); w,h=struct.unpack('>II',d[16:24]); print(w,h,len(d)); sys.exit(0 if (w,h)==(720,1280) and len(d)>20000 else 1)"
+          if [ "$FULL" = true ]; then sleep 30; min=20000; else min=0; fi
+          drawn=
+          for _ in $(seq 1 40); do
+            target/release/simee screenshot ci shot.png && python3 "$RUNNER_TEMP/drawn.py" shot.png "$min" && { drawn=1; break; }
+            sleep 2
+          done
+          test -n "$drawn"
           target/release/simee tap ci 360 600
           "$adb" -s emulator-5554 emu kill
           for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
