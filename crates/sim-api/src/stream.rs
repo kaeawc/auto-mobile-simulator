@@ -609,7 +609,7 @@ impl Streams {
         let timed_out = || Err(format!("no first frame and WHIP connection within {} s", self.start_timeout.as_secs()));
         let deadline = Instant::now() + self.start_timeout;
         let outcome = loop {
-            if crate::methods::call_cancelled() {
+            if crate::progress::call_cancelled() {
                 break Err("cancelled: stream_start was cancelled".to_owned());
             }
             let slice = deadline.saturating_duration_since(Instant::now()).min(CANCEL_POLL);
@@ -621,7 +621,7 @@ impl Streams {
         };
         // Connected, but nobody is waiting for the stream any more: tear it down.
         let outcome = match outcome {
-            Ok(_) if crate::methods::call_cancelled() => Err("cancelled: stream_start was cancelled".to_owned()),
+            Ok(_) if crate::progress::call_cancelled() => Err("cancelled: stream_start was cancelled".to_owned()),
             other => other,
         };
         match outcome {
@@ -1853,9 +1853,9 @@ mod tests {
             flag.store(true, Ordering::SeqCst);
         });
         let seen = cancel.clone();
-        let hooks = crate::methods::CallHooks { cancelled: Box::new(move || seen.load(Ordering::SeqCst)), progress: Box::new(|_| {}) };
+        let hooks = crate::progress::CallHooks { cancelled: Box::new(move || seen.load(Ordering::SeqCst)), progress: Box::new(|_| {}) };
         let began = Instant::now();
-        let err = crate::methods::with_call_hooks(hooks, || f.start(json!({"whip_url": URL}))).expect_err("cancelled");
+        let err = crate::progress::with_call_hooks(hooks, || f.start(json!({"whip_url": URL}))).expect_err("cancelled");
         timer.join().expect("timer");
         assert!(err.contains("cancelled"), "{err}");
         assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
