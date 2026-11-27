@@ -938,6 +938,7 @@ dependencies = [
  "simee-coresim",
  "simee-debug",
  "simee-emu-avd",
+ "simee-host",
  "simee-netshape",
 ]
 
@@ -1083,6 +1084,15 @@ dependencies = [
  "simee-emu-hvf",
  "smoltcp",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "simee-host"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "serde",
+ "simee-coresim",
 ]
 
 [[package]]

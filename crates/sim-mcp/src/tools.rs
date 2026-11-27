@@ -43,7 +43,7 @@ fn effect(method: &str) -> Option<Effect> {
         "prefs_write" | "prefs_delete" | "prefs_batch" => Destroy,
         // Read a corpse of the app: nothing on the device changes.
         "mem_leaks" | "mem_heap" | "mem_vmmap" | "mem_history" => Read,
-        "help" | "identity" | "form_factors" | "devices" | "runtimes" | "device_types" | "screen" | "screenshot" | "apps"
+        "help" | "identity" | "host" | "form_factors" | "devices" | "runtimes" | "device_types" | "screen" | "screenshot" | "apps"
         | "ca_debug_state" | "logs" | "processes" | "connections" | "traffic" | "containers" | "ls" | "read" | "du" | "crash_reports"
         | "info" | "defaults_read" | "network_state" | "network_flows" | "network_env" | "audio_state" | "settle" | VIEW_TOOL => Read,
         "appearance" | "location" | "status_bar" | "clear_status_bar" | "content_size" | "increase_contrast" | "dynamic_island"

@@ -27,6 +27,7 @@ sim-debug = { package = "simee-debug", path = "crates/sim-debug", version = "=0.
 sim-api = { package = "simee-api", path = "crates/sim-api", version = "=0.1.0" }
 sim-mcp = { package = "simee-mcp", path = "crates/sim-mcp", version = "=0.1.0" }
 sim-netshape = { package = "simee-netshape", path = "crates/sim-netshape", version = "=0.1.0" }
+sim-host = { package = "simee-host", path = "crates/sim-host", version = "=0.1.0" }
 sim-audio = { package = "simee-audio", path = "crates/sim-audio", version = "=0.1.0" }
 sim-android = { package = "simee-android", path = "crates/sim-android", version = "=0.1.0" }
 sim-bundle = { package = "simee-bundle", path = "crates/sim-bundle", version = "=0.1.0" }
