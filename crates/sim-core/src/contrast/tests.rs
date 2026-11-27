@@ -562,6 +562,55 @@ fn a_labelled_screen_has_every_failing_label_found_and_no_false_positives() {
     assert!(passing.iter().all(|l| report.regions.iter().any(|r| overlaps(r.rect, l.rect) && !r.fails())), "a passing label has no region");
 }
 
+// ---- boxes and regions (#221) --------------------------------------------------------------------
+
+/// A white frame with a field: a 2 pixel `border` round a white fill, and `text` inside.
+fn field(border: Rgb, text: Rgb) -> (Frame, Rect) {
+    let mut f = solid(520, 260, rgb(0xffffff));
+    fill_rect(&mut f, 60, 60, 300, 90, border);
+    fill_rect(&mut f, 62, 62, 296, 86, rgb(0xffffff));
+    let rect = draw_text(&mut f, 90, 90, 3, "Email", text);
+    (f, rect)
+}
+
+#[test]
+fn a_border_does_not_hide_failing_text_inside_it() {
+    let (f, text) = field(rgb(0xc6c6c8), rgb(0x8e8e93));
+    let report = check(&f, &Options { region: None, scale: 2.0 });
+    let inside = Rect { x: 62, y: 62, width: 296, height: 86 };
+    let found: Vec<&Region> = region_in(&report, text).into_iter().filter(|r| contains(inside, r.rect)).collect();
+    assert!(found.iter().any(|r| r.fails() && r.foreground == rgb(0x8e8e93) && r.background == rgb(0xffffff)), "{:?}", report.regions);
+}
+
+#[test]
+fn a_border_is_judged_as_a_component_not_as_text() {
+    let (f, _) = field(rgb(0xc6c6c8), rgb(0x000000));
+    let report = check(&f, &Options { region: None, scale: 2.0 });
+    let border: Vec<&Region> = report.regions.iter().filter(|r| r.rect.width >= 290).collect();
+    assert_eq!(border.len(), 1, "{:?}", report.regions);
+    assert_eq!(border[0].kind, Kind::Component);
+    assert!(border[0].fails(), "#c6c6c8 on white is 1.8:1, under 3:1");
+    // Dark text in the same box passes.
+    assert!(report.regions.iter().filter(|r| r.rect.width < 290).all(|r| !r.fails()), "{:?}", report.regions);
+}
+
+#[test]
+fn a_dark_border_and_dark_text_pass() {
+    let (f, _) = field(rgb(0x555555), rgb(0x111111));
+    let report = check(&f, &Options { region: None, scale: 2.0 });
+    assert!(report.findings().next().is_none(), "{:?}", report.regions);
+}
+
+#[test]
+fn a_region_drawn_tightly_round_a_label_checks_it() {
+    let mut f = solid(520, 300, rgb(0xffffff));
+    let word = draw_text(&mut f, 200, 120, 3, "Wordy", rgb(0x999999));
+    let tight = Rect { x: word.x - 10, y: word.y - 10, width: word.width + 20, height: word.height + 20 };
+    assert!(f64::from(word.width) * f64::from(word.height) > 0.3 * f64::from(tight.width) * f64::from(tight.height));
+    let report = check(&f, &Options { region: Some(tight), scale: 2.0 });
+    assert_eq!(report.findings().count(), 1, "{:?}", report.regions);
+}
+
 /// Timing of the check on a 1206x2622 frame: `cargo test --release -p sim-core contrast_cost -- --ignored --nocapture`.
 #[test]
 #[ignore = "benchmark"]
