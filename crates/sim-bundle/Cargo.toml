@@ -1,6 +1,6 @@
 [package]
 name = "sim-bundle"
-description = "Portable device bundles: a manifest, content-addressed zstd chunks, and the same as one plain tar; verified on import."
+description = "Portable device bundles: a manifest, content-addressed LZ4 chunks, and the same as one plain tar; verified on import."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
