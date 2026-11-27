@@ -13,6 +13,7 @@ mod console;
 mod display_server;
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 mod fold;
+mod golden;
 mod instance;
 mod provision;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -157,7 +158,8 @@ fn main() -> ExitCode {
 }
 
 /// `-create-avd`: writes the AVD shaped like its image's form factor (a round watch, a TV, an XR
-/// headset, ...), with the requested hardware on top, warning if its image is missing.
+/// headset, ...), with the requested hardware on top, warning if its image is missing. Then its
+/// image's golden user data (`golden.rs`) unless `-no-golden`.
 fn create_avd(env: &emu_avd::Env, name: &str, sysdir: &str, opts: &args::Opts) -> Result<()> {
     let mut spec = emu_avd::NewAvd::for_image(name, sysdir);
     if let Some(lcd) = opts.lcd {
@@ -175,6 +177,9 @@ fn create_avd(env: &emu_avd::Env, name: &str, sysdir: &str, opts: &args::Opts) -
         eprintln!("emu: warning: {e} (install it with emu -provision <api>)");
     }
     println!("created {name} at {}", dir.display());
+    // Started from its image's settled user data (booting the image once if it has none): after
+    // the AVD is reported created, which it is whatever happens next.
+    golden::start_from_golden(env, name, opts);
     Ok(())
 }
 

@@ -5,6 +5,7 @@
 
 mod bootconfig;
 pub mod bundle;
+pub mod golden;
 pub mod gpu;
 mod ini;
 pub mod sdk_device;
