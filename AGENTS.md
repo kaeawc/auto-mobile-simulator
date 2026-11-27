@@ -227,8 +227,9 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
 - `website/` — the public site, a Rune app in web document mode and its own workspace (like
   `desktop/`): `content.rs` (the README sections and `docs/*.md` it publishes, link and anchor
   rewriting), `home.rs`, `docs.rs`, `devices.rs` (drawn from `sim-core`'s form factor matrix),
-  `demos.rs`; `scripts/build.sh` writes `website/dist` (wasm plus each page's static HTML);
-  deployed to Fly by `.github/workflows/website.yml`. Its copy carries no number of its own:
+  `demos.rs` (live streams via `public/live.js`); `scripts/build.sh` writes `website/dist` (wasm
+  plus each page's static HTML); deployed to Fly by `.github/workflows/website.yml`. `media/` is
+  the live demo's MediaMTX relay on Fly (`website-media.yml`), fed by `scripts/live-demo.sh`. Its copy carries no number of its own:
   measured claims come from the README and docs. Docs: `website/README.md`.
 - `scripts/` — `parity.sh`, `ios-matrix.sh` (every iOS feature on one device: the
   `docs/ios-versions.md` table), `automobile-harness.sh`, `automobile-farm.sh` (every device through

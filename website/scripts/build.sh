@@ -15,6 +15,8 @@ site=$(cd "$(dirname "$0")/.." && pwd)
 repo=$(cd "$site/.." && pwd)
 out=${OUT:-$site/dist}
 origin=${SIMEE_WEB_ORIGIN:-https://simee-web.fly.dev}
+# The live demo's relay (website/media), which /demos/ plays from.
+media=${SIMEE_WEB_MEDIA_ORIGIN:-https://simee-media.fly.dev}
 dev=false
 for a in "$@"; do
   case $a in
@@ -59,14 +61,14 @@ widths=$("$bin" --widths)
 page() { # page PATH TITLE DESCRIPTION FILE CANONICAL
   local path=$1 title=$2 description=$3 file=$4 canonical=$5
   mkdir -p "$(dirname "$file")"
-  python3 - "$site/index.html" "$file" "$origin" "$path" "$title" "$description" "$canonical" "$dev" <<'PY'
+  python3 - "$site/index.html" "$file" "$origin" "$path" "$title" "$description" "$canonical" "$dev" "$media" <<'PY'
 import html, sys
-template, file, origin, path, title, description, canonical, dev = sys.argv[1:]
+template, file, origin, path, title, description, canonical, dev, media = sys.argv[1:]
 url = origin + path
 page = open(template).read()
 page = page.replace("<!--robots-->", '<meta name="robots" content="noindex, nofollow" />' if dev == "true" else "")
 page = page.replace("<!--canonical-->", f'<link rel="canonical" href="{html.escape(url)}" />' if canonical == "1" else "")
-for key, value in (("__TITLE__", title), ("__DESCRIPTION__", description), ("__URL__", url), ("__ORIGIN__", origin)):
+for key, value in (("__TITLE__", title), ("__DESCRIPTION__", description), ("__URL__", url), ("__ORIGIN__", origin), ("__MEDIA__", media)):
     page = page.replace(key, html.escape(value))
 open(file, "w").write(page)
 PY

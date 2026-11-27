@@ -20,7 +20,10 @@ impeccable.style), with no copy that repeats the README or a doc:
   the repository its GitHub page. Headings keep GitHub's anchors.
 - `/devices/`: device concepts from `sim-core`'s support matrix and reference profiles, so the
   page changes when `form_factor.rs` does.
-- `/demos/`: the desktop window, as figures.
+- `/demos/`: emu and the SDK's emulator live, side by side, then the desktop window as figures.
+  Rune draws a box per stream; `public/live.js` lays a video over each and plays it over WHEP
+  from the relay in `media/` (its README), fed by `scripts/live-demo.sh` on a demo Mac. Build
+  with `SIMEE_WEB_MEDIA_ORIGIN` to play from another relay (default https://simee-media.fly.dev).
 
 Fonts: CMU Serif (Computer Modern Unicode, SIL OFL, `public/fonts/CMU-OFL.txt`) for text, Rune's
 embedded IBM Plex Mono for code.

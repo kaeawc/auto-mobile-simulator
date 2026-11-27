@@ -18,6 +18,8 @@
     <meta name="twitter:card" content="summary_large_image" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="alternate" type="text/plain" href="/llms.txt" title="llms.txt" />
+    <!-- The live demo's relay: public/live.js plays its streams on /demos/. -->
+    <meta name="simee-media" content="__MEDIA__" />
     <!-- Rune loads the same files (App::font_url), so the page and the canvas share one download. -->
     <link rel="preload" href="/fonts/cmunrm.otf" as="font" type="font/otf" crossorigin />
     <link rel="preload" href="/fonts/cmunbx.otf" as="font" type="font/otf" crossorigin />
@@ -40,6 +42,7 @@
   </head>
   <body>
     <!-- rune:body -->
+    <script src="/live.js" defer></script>
     <script type="module">
       // The page is already here as static HTML; this hands it to Rune, which draws the same page
       // on the GPU and hides the static copy once its first frame is up. Without WebGPU, or if
