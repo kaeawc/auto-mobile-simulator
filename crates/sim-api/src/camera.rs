@@ -10,7 +10,7 @@
 //! webcam link whose camera the host no longer lists reports `source missing`.
 
 use serde_json::{Value, json};
-use sim_android::{CAMERA_FACINGS, Device, save_cameras, saved_cameras};
+use sim_android::{CAMERA_FACINGS, Device, saved_cameras, update_cameras};
 use sim_camera::catalog::SYNTHETIC;
 use sim_camera::{Authorization, HostCamera, SourceSpec};
 use sim_core::platform::Platform;
@@ -230,6 +230,15 @@ fn resolve_source(host: &dyn Host, source: &str) -> Result<Resolved, String> {
     if source.contains(['\n', '\r']) {
         return Err("a source id is one line".into());
     }
+    // emu's console splits a command on whitespace and joins it with single spaces, so a source
+    // with a run of whitespace (or a tab, or a control character) would link differently live
+    // than from the saved file at boot.
+    if source.chars().any(char::is_control) || source.chars().any(|c| c.is_whitespace() && c != ' ') || source.contains("  ") {
+        return Err(
+            "a source id can't contain control characters, or whitespace other than single spaces (the device console would change it, so the live link and the next boot would differ)"
+                .into(),
+        );
+    }
     let plain = |id: &str| Ok(Resolved { id: id.to_owned(), name: None });
     match source {
         "none" => return plain("none"),
@@ -314,13 +323,31 @@ fn simee_or_off(d: &Device) -> Result<bool, String> {
 /// `camera_link`: checks the source, relinks a running device live, then saves the link.
 fn link(host: &dyn Host, d: &Device, facings: &[&str], source: &str) -> Result<Value, String> {
     let resolved = resolve_source(host, source)?;
-    let (dir, mut links) = saved(d)?;
+    let (dir, links) = saved(d)?;
     let running = simee_or_off(d)?;
     let mut note = None;
     if running {
         let before = live(d);
+        let mut done: Vec<(&str, String)> = Vec::new();
         for facing in facings {
-            relink(d, facing, &resolved.id)?;
+            if let Err(e) = relink(d, facing, &resolved.id) {
+                // Put back what was relinked before the failure, and save nothing.
+                let mut restored = Vec::new();
+                for (done_facing, previous) in done.iter().rev() {
+                    match relink(d, done_facing, previous) {
+                        Ok(()) => restored.push(format!("the {done_facing} camera was put back on {previous}")),
+                        Err(re) => restored.push(format!("the {done_facing} camera is still on {} ({re})", resolved.id)),
+                    }
+                }
+                return Err(if restored.is_empty() { e } else { format!("{e}; {}", restored.join("; ")) });
+            }
+            let previous = before
+                .as_ref()
+                .and_then(|b| b.iter().find(|(f, _)| f == facing))
+                .map(|(_, s)| s.clone())
+                .or_else(|| links.iter().find(|(f, _)| f == facing).map(|(_, s)| s.clone()))
+                .unwrap_or_else(|| default_link(d, facing));
+            done.push((facing, previous));
             let was_off = before.as_ref().is_some_and(|b| b.iter().any(|(f, s)| f == facing && s == "none"));
             if was_off && resolved.id != "none" {
                 note = Some(format!(
@@ -330,12 +357,12 @@ fn link(host: &dyn Host, d: &Device, facings: &[&str], source: &str) -> Result<V
             }
         }
     }
-    for facing in facings {
-        links.retain(|(f, _)| f != facing);
-        links.push(((*facing).to_owned(), resolved.id.clone()));
-    }
-    links.sort_by_key(|(f, _)| CAMERA_FACINGS.iter().position(|c| c == f));
-    save_cameras(&dir, &links)?;
+    update_cameras(&dir, |links| {
+        for facing in facings {
+            links.retain(|(f, _)| f != facing);
+            links.push(((*facing).to_owned(), resolved.id.clone()));
+        }
+    })?;
     let mut out = json!({"device": d.info.udid, "applied": if running { "live" } else { "at_boot" }, "links": link_rows(host, d)});
     if let Some(name) = resolved.name {
         out["name"] = json!(name);
@@ -356,9 +383,17 @@ fn avd_default(d: &Device, facing: &str) -> String {
     }
 }
 
+/// [`avd_default`] as emu reports it live: the stock test-card values are `pattern:testcard`.
+fn default_link(d: &Device, facing: &str) -> String {
+    match avd_default(d, facing).as_str() {
+        "emulated" => "pattern:testcard".into(),
+        other => other.into(),
+    }
+}
+
 /// `camera_unlink`: removes the links; a running device goes back to the AVD's own cameras live.
 fn unlink(host: &dyn Host, d: &Device, facings: &[&str]) -> Result<Value, String> {
-    let (dir, mut links) = saved(d)?;
+    let (dir, links) = saved(d)?;
     let running = simee_or_off(d)?;
     let mut now = Vec::new();
     for facing in facings {
@@ -369,8 +404,7 @@ fn unlink(host: &dyn Host, d: &Device, facings: &[&str]) -> Result<Value, String
         now.push(json!({"facing": facing, "source": default}));
     }
     let unlinked: Vec<String> = links.iter().filter(|(f, _)| facings.contains(&f.as_str())).map(|(f, _)| f.clone()).collect();
-    links.retain(|(f, _)| !facings.contains(&f.as_str()));
-    save_cameras(&dir, &links)?;
+    update_cameras(&dir, |links| links.retain(|(f, _)| !facings.contains(&f.as_str())))?;
     Ok(json!({"device": d.info.udid, "unlinked": unlinked, "now": now, "applied": if running { "live" } else { "at_boot" },
         "links": link_rows(host, d)}))
 }
@@ -388,6 +422,8 @@ fn link_rows(host: &dyn Host, d: &Device) -> Vec<Value> {
         let (source, mut state) = match (&saved, &live) {
             (None, None) => continue,
             (None, Some(l)) if l == "none" => continue,
+            // The AVD's own camera (emu maps the stock values to the test card): nobody linked it.
+            (None, Some(l)) if *l == default_link(d, facing) => continue,
             (None, Some(l)) => (l.clone(), "unsaved"),
             (Some(s), Some(l)) if s != l => (s.clone(), "relinked"),
             (Some(s), _) => (s.clone(), if running { "linked" } else { "saved" }),
@@ -596,6 +632,79 @@ mod tests {
             ["camera link back qr:hello", "camera link back webcam:CAMO-1", "camera link front webcam:CAMO-1", "camera link back none"]
         );
         assert_eq!(f.saved(), "front=webcam:CAMO-1\n");
+    }
+
+    fn set_avd_cameras(f: &Fixture, back: &str, front: &str) {
+        let path = f.root.join("avd/phone.avd/config.ini");
+        let mut text = std::fs::read_to_string(&path).expect("config.ini");
+        text.push_str(&format!("\nhw.camera.back={back}\nhw.camera.front={front}\n"));
+        std::fs::write(&path, text).expect("config.ini");
+    }
+
+    #[test]
+    fn the_avds_own_default_cameras_are_not_listed_as_links() {
+        let f = Fixture::new("defaults");
+        set_avd_cameras(&f, "virtualscene", "emulated");
+        let emulator = f.running();
+        // emu maps both stock values to the test card at boot, and `camera list` says so.
+        *emulator.cameras.lock().expect("cameras") =
+            vec![("back".into(), "pattern:testcard".into()), ("front".into(), "pattern:testcard".into())];
+        let mut s = f.session();
+        assert_eq!(run(&mut s, "camera_links", json!({"device": "phone"})).expect("links"), json!([]), "nobody linked these");
+        // A link made from the console only is still shown.
+        emulator.cameras.lock().expect("cameras")[0].1 = "qr:console".into();
+        let rows = run(&mut s, "camera_links", json!({"device": "phone"})).expect("links");
+        assert_eq!((rows.as_array().map(Vec::len), rows[0]["state"].clone()), (Some(1), json!("unsaved")));
+        // A saved link shows, and after the unlink the camera is on its default again: no row.
+        run(&mut s, "camera_link", json!({"device": "phone", "facing": "front", "source": "solid:red"})).expect("link");
+        let r = run(&mut s, "camera_unlink", json!({"device": "phone", "facing": "front"})).expect("unlink");
+        assert_eq!(r["now"], json!([{"facing": "front", "source": "emulated"}]));
+        assert_eq!(r["links"].as_array().map(Vec::len), Some(1), "only the console-linked back camera: {}", r["links"]);
+        assert_eq!(r["links"][0]["facing"], "back");
+    }
+
+    #[test]
+    fn a_source_whose_whitespace_the_console_would_change_is_refused() {
+        let f = Fixture::new("whitespace");
+        let emulator = f.running();
+        let mut s = f.session();
+        for source in ["qr:a  b", "text:a\tb", "qr:a\u{a0}b", "text:a\u{7}b"] {
+            let err = run(&mut s, "camera_link", json!({"device": "phone", "facing": "back", "source": source})).expect_err(source);
+            assert!(err.contains("whitespace") || err.contains("control"), "{source:?}: {err}");
+        }
+        assert_eq!(f.saved(), "");
+        assert!(emulator.console.lock().expect("console").iter().all(|c| !c.starts_with("camera link")), "nothing reached the console");
+        // A single space is kept as it is, live and at boot.
+        run(&mut s, "camera_link", json!({"device": "phone", "facing": "back", "source": "qr:a b"})).expect("single space");
+        assert_eq!(f.saved(), "back=qr:a b\n");
+        assert_eq!(emulator.cameras.lock().expect("cameras")[0].1, "qr:a b");
+    }
+
+    #[test]
+    fn both_rolls_the_back_camera_back_when_the_front_relink_fails() {
+        let f = Fixture::new("both-fails");
+        let emulator = f.running();
+        *emulator.cameras.lock().expect("cameras") = vec![("back".into(), "qr:old".into()), ("front".into(), "solid:red".into())];
+        *emulator.camera_link_fails.lock().expect("fails") = Some("front".into());
+        let mut s = f.session();
+        run(&mut s, "camera_link", json!({"device": "phone", "facing": "back", "source": "qr:old"})).expect("saved back");
+        assert_eq!(f.saved(), "back=qr:old\n");
+        let err = run(&mut s, "camera_link", json!({"device": "phone", "facing": "both", "source": "qr:new"})).expect_err("front fails");
+        assert!(err.contains("camera link front qr:new") && err.contains("back camera was put back on qr:old"), "{err}");
+        assert_eq!(f.saved(), "back=qr:old\n", "nothing new was saved");
+        let live = emulator.cameras.lock().expect("cameras").clone();
+        assert!(live.contains(&("back".into(), "qr:old".into())), "the back camera is on its previous source: {live:?}");
+        let console: Vec<String> =
+            emulator.console.lock().expect("console").iter().filter(|c| c.starts_with("camera link")).cloned().collect();
+        assert_eq!(
+            console[1..],
+            ["camera link back qr:new", "camera link front qr:new", "camera link back qr:old"],
+            "back, front (fails), back restored"
+        );
+        // Both succeeding still links and saves both.
+        *emulator.camera_link_fails.lock().expect("fails") = None;
+        run(&mut s, "camera_link", json!({"device": "phone", "facing": "both", "source": "qr:new"})).expect("both");
+        assert_eq!(f.saved(), "back=qr:new\nfront=qr:new\n");
     }
 
     #[test]

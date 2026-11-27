@@ -7,7 +7,7 @@ look at their screens, read their logs, and watch them change.
 | MCP feature | What simee gives it |
 | --- | --- |
 | Tools | One per method in `sim-api`'s table, generated from it, and `device_view`, with output schemas and annotations, in toolsets a client picks (`core` by default) |
-| Resources | Devices, runtimes, form factors, and each device's info, screenshot, logs and apps |
+| Resources | Devices, runtimes, form factors, camera sources, and each device's info, screenshot, logs and apps |
 | Subscriptions | Change notifications for those resources, by re-reading them while subscribed |
 | Tasks | `boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase`, `shutdown`, `export`, `import`, `mem_leaks`, `mem_heap` as pollable, cancellable tasks |
 | App | `device_view`: a device's screen with tap, swipe, type and button controls, in the conversation |
@@ -208,6 +208,7 @@ A test keeps this page honest: it fails if a tool isn't named here.
 | `simee://runtimes` | iOS runtimes and Android system images |
 | `simee://device-types` | iOS device types |
 | `simee://form-factors` | The form-factor matrix, with inputs or why one is unsupported |
+| `simee://camera/sources` | Every source a device camera can link to, and the host's camera permission (`camera_sources`) |
 | `simee://devices/{device}` | The device's info (`info`) |
 | `simee://devices/{device}/screenshot` | The screen now, a PNG (`image/png`; a booted device) |
 | `simee://devices/{device}/logs` | The last minute of the unified log (`text/plain`; iOS) |

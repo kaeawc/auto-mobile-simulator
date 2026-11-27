@@ -710,6 +710,9 @@ impl Device {
         // The cameras simee linked (`camera_link`, `boot` with `camera_back`): they win over
         // config.ini, so they come back on every boot.
         if let Some(avd) = &self.avd {
+            for warning in saved_cameras_warnings(&avd.dir) {
+                eprintln!("{warning}");
+            }
             for (facing, source) in saved_cameras(&avd.dir) {
                 cmd.arg(format!("-camera-{facing}")).arg(source);
             }
@@ -1175,24 +1178,114 @@ pub const CAMERAS_FILE: &str = "cameras.ini";
 pub const CAMERA_FACINGS: [&str; 2] = ["back", "front"];
 
 /// The saved camera links of the AVD in `avd_dir` ([`CAMERAS_FILE`]): (facing, source id), back
-/// first. A missing file is no links; a line that isn't a known facing is ignored.
+/// first. A missing file is no links; a line that isn't a valid link is skipped (see
+/// [`saved_cameras_warnings`]).
 pub fn saved_cameras(avd_dir: &Path) -> Vec<(String, String)> {
-    let text = std::fs::read_to_string(emu_avd::state_dir(avd_dir).join(CAMERAS_FILE)).unwrap_or_default();
-    let mut links: Vec<(String, String)> = text
-        .lines()
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
-        .filter(|(k, v)| CAMERA_FACINGS.contains(&k.as_str()) && !v.is_empty())
-        .collect();
+    read_cameras(avd_dir).0
+}
+
+/// A warning for each line of the AVD's [`CAMERAS_FILE`] that [`saved_cameras`] skips, naming
+/// the file and the line. A boot prints them and goes on with the valid links.
+pub fn saved_cameras_warnings(avd_dir: &Path) -> Vec<String> {
+    read_cameras(avd_dir).1
+}
+
+/// Whether `v` is a camera source emu takes (`-camera-back`): none, a stock value, `webcamN`, or
+/// `<kind>:<rest>` of a simee source kind. emu checks the rest (a colour, a path) itself.
+fn camera_source_ok(v: &str) -> bool {
+    if matches!(v, "none" | "emulated" | "virtualscene") {
+        return true;
+    }
+    if v.strip_prefix("webcam").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+        return true;
+    }
+    v.split_once(':').is_some_and(|(kind, rest)| {
+        ["webcam", "pattern", "qr", "text", "image", "video", "solid"].contains(&kind) && !rest.trim().is_empty()
+    })
+}
+
+fn read_cameras(avd_dir: &Path) -> (Vec<(String, String)>, Vec<String>) {
+    let path = emu_avd::state_dir(avd_dir).join(CAMERAS_FILE);
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let (mut links, mut warnings) = (Vec::new(), Vec::new());
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let skip = |why: &str| format!("{}: line {}: {why} ({line:?}); skipped", path.display(), n + 1);
+        match line.split_once('=').map(|(k, v)| (k.trim(), v.trim())) {
+            None => warnings.push(skip("not `back=<source>` or `front=<source>`")),
+            Some((k, _)) if !CAMERA_FACINGS.contains(&k) => warnings.push(skip("a camera is back or front")),
+            Some((_, v)) if !camera_source_ok(v) => warnings.push(skip("not a camera source")),
+            Some((k, v)) => links.push((k.to_owned(), v.to_owned())),
+        }
+    }
     links.sort_by_key(|(k, _)| CAMERA_FACINGS.iter().position(|f| f == k));
     links.dedup_by(|a, b| a.0 == b.0);
-    links
+    (links, warnings)
+}
+
+/// Holds an AVD's camera-links lock (an advisory lock file next to the links) until dropped, so
+/// two saves of one AVD run one after the other. A lock file older than [`LOCK_STALE`] is a dead
+/// holder's and is taken over.
+struct CamerasLock(PathBuf);
+
+const LOCK_STALE: Duration = Duration::from_secs(30);
+
+impl CamerasLock {
+    fn take(dir: &Path) -> Result<CamerasLock, String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let path = dir.join(format!("{CAMERAS_FILE}.lock"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Ok(CamerasLock(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale =
+                        std::fs::metadata(&path).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > LOCK_STALE));
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                    } else if Instant::now() > deadline {
+                        return Err(format!("{}: another save holds the lock", path.display()));
+                    } else {
+                        sleep(Duration::from_millis(2));
+                    }
+                }
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            }
+        }
+    }
+}
+
+impl Drop for CamerasLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Replaces the saved camera links of the AVD in `avd_dir` (none: removes the file). Written to a
-/// temporary file and renamed, so a boot never reads half a file.
+/// temporary file of its own and renamed, under the AVD's lock, so a boot never reads half a file
+/// and concurrent saves don't collide.
 pub fn save_cameras(avd_dir: &Path, links: &[(String, String)]) -> Result<(), String> {
     let dir = emu_avd::state_dir(avd_dir);
+    let _lock = CamerasLock::take(&dir)?;
+    write_cameras(&dir, links)
+}
+
+/// Reads the saved links, applies `change` and saves them, all under the AVD's lock: concurrent
+/// updates each see the other's, so none is lost. Returns what was saved.
+pub fn update_cameras(avd_dir: &Path, change: impl FnOnce(&mut Vec<(String, String)>)) -> Result<Vec<(String, String)>, String> {
+    let dir = emu_avd::state_dir(avd_dir);
+    let _lock = CamerasLock::take(&dir)?;
+    let mut links = saved_cameras(avd_dir);
+    change(&mut links);
+    links.sort_by_key(|(f, _)| CAMERA_FACINGS.iter().position(|c| c == f));
+    write_cameras(&dir, &links)?;
+    Ok(links)
+}
+
+fn write_cameras(dir: &Path, links: &[(String, String)]) -> Result<(), String> {
     let path = dir.join(CAMERAS_FILE);
     if links.is_empty() {
         return match std::fs::remove_file(&path) {
@@ -1207,10 +1300,13 @@ pub fn save_cameras(avd_dir: &Path, links: &[(String, String)]) -> Result<(), St
         }
         text.push_str(&format!("{facing}={}\n", source.trim()));
     }
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let tmp = dir.join(format!("{CAMERAS_FILE}.{}.tmp", std::process::id()));
+    static SAVES: AtomicU64 = AtomicU64::new(0);
+    let tmp = dir.join(format!("{CAMERAS_FILE}.{}.{}.tmp", std::process::id(), SAVES.fetch_add(1, Ordering::Relaxed)));
     std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
 }
 
 /// The last `n` lines of a device's guest console (`<avd>/simee/console.log`). Without
@@ -1774,6 +1870,77 @@ mod tests {
         assert_eq!(saved_cameras(&dir), saved, "a refused save keeps what was there");
         save_cameras(&dir, &[]).expect("clear");
         assert!(saved_cameras(&dir).is_empty() && !emu_avd::state_dir(&dir).join(CAMERAS_FILE).exists());
+    }
+
+    #[test]
+    fn a_bad_cameras_ini_line_is_skipped_with_a_warning_and_the_boot_goes_on() {
+        let f = fixture("camera-bad-line");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let d = f.android.device("phone").expect("device");
+        let dir = d.avd.as_ref().expect("avd").dir.clone();
+        let state = emu_avd::state_dir(&dir);
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::write(state.join(CAMERAS_FILE), "back=foo:bar\n# a comment\nfront=qr:hello\nside=qr:x\nnonsense\n").expect("write");
+        assert_eq!(saved_cameras(&dir), [("front".to_owned(), "qr:hello".to_owned())], "only the valid link");
+        let warnings = saved_cameras_warnings(&dir);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains(CAMERAS_FILE) && warnings[0].contains("line 1") && warnings[0].contains("foo:bar"), "{warnings:?}");
+        assert!(warnings[1].contains("line 4") && warnings[2].contains("line 5"), "{warnings:?}");
+        let args: Vec<String> = d.launch_command(None, false).get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(!args.iter().any(|a| a == "-camera-back"), "the bad link isn't passed to emu");
+        let at = args.iter().position(|a| a == "-camera-front").expect("-camera-front");
+        assert_eq!(args[at + 1], "qr:hello");
+        // Every kind of source emu takes stays valid.
+        for ok in
+            ["none", "emulated", "virtualscene", "webcam0", "webcam:OBS-1", "pattern:testcard", "text:a b", "image:/x.png", "solid:red"]
+        {
+            std::fs::write(state.join(CAMERAS_FILE), format!("back={ok}\n")).expect("write");
+            assert!(saved_cameras_warnings(&dir).is_empty(), "{ok}");
+            assert_eq!(saved_cameras(&dir).len(), 1, "{ok}");
+        }
+    }
+
+    #[test]
+    fn concurrent_saves_neither_collide_nor_lose_an_update() {
+        let f = fixture("camera-concurrent");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let dir = f.android.device("phone").expect("device").avd.as_ref().expect("avd").dir.clone();
+        for round in 0..20 {
+            save_cameras(&dir, &[]).expect("clear");
+            let threads: Vec<_> = ["back", "front"]
+                .into_iter()
+                .map(|facing| {
+                    let dir = dir.clone();
+                    std::thread::spawn(move || {
+                        update_cameras(&dir, |links| {
+                            links.retain(|(f, _)| f != facing);
+                            links.push((facing.to_owned(), format!("qr:{facing}")));
+                        })
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().expect("thread").unwrap_or_else(|e| panic!("round {round}: {e}"));
+            }
+            assert_eq!(
+                saved_cameras(&dir),
+                [("back".to_owned(), "qr:back".to_owned()), ("front".to_owned(), "qr:front".to_owned())],
+                "round {round}: both updates kept"
+            );
+        }
+        // Plain saves from many threads at once never fail on a shared temporary file.
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let dir = dir.clone();
+                std::thread::spawn(move || save_cameras(&dir, &[("back".into(), format!("qr:{i}"))]))
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("thread").expect("save");
+        }
+        let state = emu_avd::state_dir(&dir);
+        let leftovers: Vec<_> = std::fs::read_dir(&state).expect("dir").flatten().map(|e| e.file_name()).collect();
+        assert!(!leftovers.iter().any(|n| n.to_string_lossy().ends_with(".tmp")), "{leftovers:?}");
     }
 
     #[test]
