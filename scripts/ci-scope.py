@@ -52,6 +52,19 @@ MAC = {"target_os": "macos", "target_vendor": "apple", "target_family": "unix", 
        "target_env": "", "target_pointer_width": "64", "target_endian": "little", "unix": True, "windows": False}
 LINUX = {"target_os": "linux", "target_vendor": "unknown", "target_family": "unix", "target_arch": "x86_64",
          "target_env": "gnu", "target_pointer_width": "64", "target_endian": "little", "unix": True, "windows": False}
+# The cfgs build scripts set (`cargo::rustc-cfg`), as each build script decides them for the two
+# targets above: apps/emu/build.rs and crates/emu-vmm/build.rs pick the hypervisor backend.
+# `check` fails when a build script declares one (`rustc-check-cfg`) that isn't here.
+BUILD_CFGS = {
+    # name: (on MAC, on LINUX)
+    "hv": (True, False),
+    "hv_hvf": (True, False),
+    "hv_kvm": (False, False),
+    "soft": (False, True),
+    "boots": (True, True),
+}
+MAC.update({n: v[0] for n, v in BUILD_CFGS.items()})
+LINUX.update({n: v[1] for n, v in BUILD_CFGS.items()})
 LINT_ATTRS = ("allow", "expect", "warn", "deny", "forbid")
 
 
@@ -593,6 +606,7 @@ def cmd_check():
                           % (LIST, n, "; ".join(derived[n][:3])))
     sw_errors, sw_crates = software_errors(crates)
     errors += sw_errors
+    errors += build_cfg_errors(crates)
     for e in errors:
         print("ci-scope: " + e, file=sys.stderr)
     if not errors:
@@ -600,6 +614,21 @@ def cmd_check():
         print("ci-scope: %s's pull_request paths take every file its build of %d crates reads on Linux"
               % (SOFTWARE, len(sw_crates)))
     return 1 if errors else 0
+
+
+def build_cfg_errors(crates):
+    """Each cfg a build script declares that BUILD_CFGS doesn't give a value on both targets."""
+    errors = []
+    for c in sorted(crates.values(), key=lambda c: c.dir):
+        rel = os.path.join(c.dir, "build.rs")
+        if not os.path.isfile(os.path.join(ROOT, rel)):
+            continue
+        for names in re.findall(r"rustc-check-cfg=cfg\(([^)]*)\)", read(rel)):
+            for n in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", names):
+                if n not in BUILD_CFGS:
+                    errors.append("%s declares cfg %s: add it to BUILD_CFGS in scripts/ci-scope.py with its value "
+                                  "on aarch64 macOS and x86_64 Linux" % (rel, n))
+    return errors
 
 
 # --- Software mode's pull_request paths ------------------------------------------------------

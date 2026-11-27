@@ -23,7 +23,7 @@ libc.workspace = true
 rustix.workspace = true
 sim-core.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
 emu-kvm.workspace = true
 
 [dev-dependencies]

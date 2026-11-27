@@ -183,6 +183,7 @@ fn renderer_features(virtual_queue: bool, pipe_gles: bool, extra: Option<&str>) 
 
 /// Whether the environment asks for a renderer with GL even for a guest on ANGLE: GL
 /// composition (`EMU_GL_COMPOSITION`) or `EMU_RENDERER_GL=1`.
+#[cfg(target_os = "macos")]
 fn gl_requested() -> bool {
     std::env::var_os("EMU_GL_COMPOSITION").is_some()
         || std::env::var_os("EMU_RENDERER_GL").is_some()
@@ -196,6 +197,7 @@ fn gl_requested() -> bool {
 /// renderer's file read in place of the loaded image ([`emu_gfxstream::has_vulkan_readback`]).
 /// Nothing draws with the host's GLES then, so a launcher can pick its ANGLE backend for init
 /// cost alone while the process is still single-threaded.
+#[cfg(target_os = "macos")]
 pub fn runs_without_gl(vulkan_only: bool, lib64: &std::path::Path) -> bool {
     vulkan_only && !gl_requested() && emu_gfxstream::has_vulkan_readback(lib64)
 }
@@ -1037,6 +1039,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn only_a_guest_on_angle_with_a_readable_renderer_runs_without_gl() {
         let nowhere = std::env::temp_dir().join(format!("emu-vmm-no-renderer-{}", std::process::id()));
         assert!(!runs_without_gl(true, &nowhere), "no renderer file: it keeps GL");

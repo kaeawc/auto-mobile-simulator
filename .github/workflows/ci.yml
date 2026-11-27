@@ -189,7 +189,7 @@ jobs:
         with:
           persist-credentials: false
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-arm gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
       - run: rustup target add aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -310,7 +310,7 @@ jobs:
   # cancelled (a failed `changes` fails it too, though the jobs after it show as skipped).
   ci-ok:
     if: always()
-    needs: [changes, fmt, docs-scripts, linux, kvm-x86, lint-test, emu-desktop, desktop-linux]
+    needs: [changes, fmt, docs-scripts, linux, kvm-x86, kvm-arm64-smoke, lint-test, emu-desktop, desktop-linux]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

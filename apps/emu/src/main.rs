@@ -297,7 +297,9 @@ fn dry_run(env: &emu_avd::Env, name: &str, opts: &args::Opts) -> Result<ExitCode
 
 #[cfg(not(boots))]
 fn boot(_: &emu_avd::Env, name: &str, _: &args::Opts, _: std::sync::mpsc::Receiver<i32>, _: std::time::Instant) -> Result<ExitCode> {
-    anyhow::bail!("cannot boot {name}: simee needs Hypervisor.framework on an Apple silicon Mac, KVM on arm64 Linux, or an x86_64 Linux host for software mode")
+    anyhow::bail!(
+        "cannot boot {name}: simee needs Hypervisor.framework on an Apple silicon Mac, KVM on arm64 Linux, or an x86_64 Linux host for software mode"
+    )
 }
 
 /// Once the guest has booted, a foldable tells it its posture (stock sends it after boot).
