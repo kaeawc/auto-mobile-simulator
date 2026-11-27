@@ -36,7 +36,7 @@ impl Rig {
     fn over(toolsets: Toolsets, wrap: impl FnOnce(Arc<Fake>) -> Arc<dyn Backend>) -> Rig {
         let fake = Arc::new(Fake::with_devices());
         let backend = wrap(fake.clone());
-        let timing = Timing { watch: Duration::from_millis(20), heartbeat: Duration::from_millis(40) };
+        let timing = Timing { watch: Pace::uniform(Duration::from_millis(20)), heartbeat: Duration::from_millis(40) };
         let (tx, rx) = channel::<String>();
         let tx = Mutex::new(tx);
         let sink: Sink = Arc::new(move |line| drop(tx.lock().expect("tx").send(line)));
@@ -269,12 +269,15 @@ fn resources_are_listed_and_read() {
     assert!(
         resources.iter().any(|r| r["uri"] == "simee://devices") && resources.iter().any(|r| r["uri"] == "simee://devices/phone/screenshot")
     );
+    assert!(resources.iter().any(|r| r["uri"] == "simee://devices/phone/screen"), "the agent-sized screen is listed for a booted device");
     assert_eq!((list["result"]["ttlMs"].clone(), list["result"]["cacheScope"].clone()), (json!(0), json!("private")));
     let read = rig.modern("resources/read", json!({"uri": "simee://devices/phone"}));
     assert_eq!(read["result"]["contents"][0]["uri"], "simee://devices/phone");
     assert!(read["result"]["contents"][0]["text"].as_str().is_some_and(|t| t.contains("udid")));
     let templates = rig.modern("resources/templates/list", json!({}));
-    assert_eq!(templates["result"]["resourceTemplates"].as_array().map(Vec::len), Some(4));
+    let names: Vec<&str> =
+        templates["result"]["resourceTemplates"].as_array().expect("templates").iter().filter_map(|t| t["name"].as_str()).collect();
+    assert_eq!(names, ["device", "screen", "screenshot", "logs", "apps", "processes", "prefs", "prefs-store"]);
     let missing = rig.modern("resources/read", json!({"uri": "simee://devices/"}));
     assert_eq!(missing["error"]["code"], rpc::INVALID_PARAMS);
     assert_eq!(missing["error"]["data"]["uri"], "simee://devices/");
@@ -688,6 +691,104 @@ fn listening_acknowledges_first_then_sends_what_changed() {
 }
 
 #[test]
+fn nothing_is_read_for_resources_nobody_subscribed_to() {
+    let rig = Rig::new();
+    rig.fake.answer("screenshot", Ok(json!({"png": "AAAA"})));
+    rig.fake.answer("processes", Ok(json!([])));
+    // Reading and listing resources, and listing them again, is the calls it asks for and no more.
+    rig.modern("resources/read", json!({"uri": "simee://devices/phone/screenshot"}));
+    rig.modern("resources/list", json!({}));
+    rig.modern("resources/templates/list", json!({}));
+    // A listen that asks for nothing starts no watcher either.
+    let id = rig.send_modern("subscriptions/listen", json!({"notifications": {}}), false);
+    assert_eq!(rig.next_message().expect("ack")["method"], "notifications/subscriptions/acknowledged");
+    std::thread::sleep(SHORT * 3);
+    let after = |m: &str| rig.fake.called(m).len();
+    assert_eq!((after("screenshot"), after("processes"), after("devices")), (1, 0, 1), "one read, one listing, and then quiet");
+    assert!(rig.quiet());
+    rig.send(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id}}));
+}
+
+#[test]
+fn a_listener_hears_when_a_screen_changes_under_the_name_it_gave() {
+    let rig = Rig::new();
+    rig.fake.answer("screenshot", Ok(json!({"png": "AAAA"})));
+    rig.fake.answer("processes", Ok(json!([{"pid": 1, "path": "/a"}])));
+    let screen = "simee://device/phone/screen";
+    let processes = "simee://devices/phone/processes";
+    let id = rig.send_modern(
+        "subscriptions/listen",
+        json!({"notifications": {"resourceSubscriptions": [screen, processes, "simee://device/phone/nope"]}}),
+        false,
+    );
+    let ack = rig.next_message().expect("acknowledgement");
+    assert_eq!(ack["params"]["notifications"], json!({"resourceSubscriptions": [screen, processes]}));
+    rig.until_read("screenshot");
+    rig.until_read("processes");
+    // A new frame is announced; a busier process list is not, but a new process is.
+    rig.fake.answer("screenshot", Ok(json!({"png": "BBBB"})));
+    rig.fake.answer("processes", Ok(json!([{"pid": 1, "path": "/a", "cpu": 80.0}])));
+    let updated = rig.notification("notifications/resources/updated");
+    assert_eq!((updated["params"]["uri"].clone(), updated["params"]["_meta"][META_SUBSCRIPTION].clone()), (json!(screen), json!(id)));
+    assert!(rig.quiet(), "a process list that is only busier says nothing: {:?}", rig.notes.borrow());
+    rig.fake.answer("processes", Ok(json!([{"pid": 1, "path": "/a"}, {"pid": 2, "path": "/b"}])));
+    let started = rig.notification("notifications/resources/updated");
+    assert_eq!(started["params"]["uri"], processes);
+}
+
+#[test]
+fn a_listener_hears_when_a_device_boots_or_is_deleted() {
+    let rig = Rig::new();
+    let id = rig.send_modern("subscriptions/listen", json!({"notifications": {"resourcesListChanged": true}}), false);
+    rig.next_message().expect("acknowledgement");
+    rig.until_read("devices");
+    let iphone = "0000AAAA-BBBB-CCCC-DDDD-EEEEFFFF0000";
+    rig.fake.answer("devices", Ok(json!([{"udid": "phone", "state": "Booted"}, {"udid": iphone, "state": "Booted"}])));
+    assert_eq!(rig.notification("notifications/resources/list_changed")["params"]["_meta"][META_SUBSCRIPTION], id);
+    rig.fake.answer("devices", Ok(json!([{"udid": iphone, "state": "Booted"}])));
+    rig.notification("notifications/resources/list_changed");
+    assert!(rig.quiet(), "{:?}", rig.notes.borrow());
+}
+
+#[test]
+fn ending_the_connection_ends_its_subscriptions() {
+    let Rig { server, fake, rx, .. } = Rig::new();
+    fake.answer("screenshot", Ok(json!({"png": "AAAA"})));
+    let meta = Rig::meta(false);
+    let listen = json!({"jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen",
+        "params": {"_meta": meta, "notifications": {"resourcesListChanged": true, "resourceSubscriptions": ["simee://devices/phone/screen"]}}});
+    server.handle_line(&listen.to_string());
+    // An older client's subscription is the connection's too.
+    server
+        .handle_line(&json!({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}}).to_string());
+    server.handle_line(
+        &json!({"jsonrpc": "2.0", "id": 3, "method": "resources/subscribe", "params": {"uri": "simee://devices/phone/apps"}}).to_string(),
+    );
+    while fake.answered("screenshot") == 0 || fake.answered("devices") == 0 || fake.answered("apps") == 0 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(server);
+    // Reads under way finish; then nothing more is read, and nothing more said.
+    let total = || ["screenshot", "devices", "apps"].iter().map(|m| fake.called(m).len()).sum::<usize>();
+    let mut seen = total();
+    loop {
+        std::thread::sleep(SHORT);
+        let now = total();
+        if now == seen {
+            break;
+        }
+        seen = now;
+    }
+    while rx.try_recv().is_ok() {}
+    fake.answer("screenshot", Ok(json!({"png": "BBBB"})));
+    fake.answer("devices", Ok(json!([])));
+    fake.answer("apps", Ok(json!(["x"])));
+    std::thread::sleep(SHORT * 3);
+    assert_eq!(total(), seen, "no more reads");
+    assert!(rx.try_recv().is_err(), "no more notifications");
+}
+
+#[test]
 fn a_listener_hears_when_its_task_finishes() {
     let rig = Rig::new();
     let gate = rig.fake.gate("boot");
@@ -787,8 +888,34 @@ fn an_older_client_subscribes_to_resources_the_old_way() {
     while rig.rx.try_recv().is_ok() {}
     rig.fake.answer("info", Ok(json!({"state": "Shutdown"})));
     assert!(rig.quiet(), "unsubscribed");
+    // Unsubscribing the last one ends the watching, the list's included.
+    let reads = rig.fake.called("devices").len();
+    rig.fake.answer("devices", Ok(json!([])));
+    std::thread::sleep(SHORT);
+    assert_eq!(rig.fake.called("devices").len(), reads);
     // Modern requests don't have it.
     assert_eq!(rig.modern("resources/subscribe", json!({"uri": "simee://devices"}))["error"]["code"], -32601);
+}
+
+#[test]
+fn an_older_client_hears_list_changed_while_it_has_a_subscription() {
+    let rig = Rig::new();
+    let id = rig.send_raw("initialize", json!({"protocolVersion": "2025-11-25", "capabilities": {}}));
+    let init = rig.response(id);
+    assert_eq!(init["result"]["capabilities"]["resources"], json!({"subscribe": true, "listChanged": true}));
+    rig.fake.answer("screenshot", Ok(json!({"png": "AAAA"})));
+    let uri = "simee://devices/phone/screen";
+    let id = rig.send_raw("resources/subscribe", json!({"uri": uri}));
+    assert_eq!(rig.response(id)["result"], json!({}));
+    rig.until_read("screenshot");
+    rig.until_read("devices");
+    // A second subscription doesn't restart the first one's baseline: its change is still announced.
+    rig.fake.answer("screenshot", Ok(json!({"png": "BBBB"})));
+    let id = rig.send_raw("resources/subscribe", json!({"uri": "simee://devices/phone/apps"}));
+    assert_eq!(rig.response(id)["result"], json!({}));
+    assert_eq!(rig.notification("notifications/resources/updated")["params"], json!({"uri": uri}));
+    rig.fake.answer("devices", Ok(json!([])));
+    assert_eq!(rig.notification("notifications/resources/list_changed")["params"], json!({}));
 }
 
 #[test]

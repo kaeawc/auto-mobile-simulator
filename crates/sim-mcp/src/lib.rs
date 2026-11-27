@@ -3,8 +3,9 @@
 //!
 //! - **Tools**: one per method in `sim-api`'s table, generated from it ([`tools`]), plus
 //!   `device_view`, in toolsets a client picks (`SIMEE_MCP_TOOLSETS`; `core` by default).
-//! - **Resources**: devices, runtimes and form factors, each device's info, screenshot and (iOS)
-//!   logs and apps ([`resources`]), with change notifications ([`watch`]).
+//! - **Resources**: devices, runtimes and form factors, each device's info, screen, screenshot,
+//!   apps and (iOS) logs and processes, and an app's preferences ([`resources`]), with change
+//!   notifications for any of them, throttled by kind ([`watch`]).
 //! - **Tasks**: boot, create, install and the other long methods as pollable, cancellable tasks
 //!   ([`tasks`]).
 //! - **Prompts**: common workflows (boot and install, reproduce a bug, audit contrast, find
@@ -48,15 +49,29 @@ pub fn stdout_sink() -> tasks::Sink {
 const DRAIN: Duration = Duration::from_secs(10);
 
 /// Serves one client on stdin and stdout until stdin closes, with the toolsets
-/// `SIMEE_MCP_TOOLSETS` names (default `core`). Nothing else may be written to stdout.
+/// `SIMEE_MCP_TOOLSETS` names (default `core`) and the subscription pace `SIMEE_MCP_SCREEN_FPS`
+/// sets. Nothing else may be written to stdout.
 pub fn serve_stdio(backend: Arc<dyn Backend>) -> std::io::Result<()> {
-    let toolsets = Toolsets::from_env().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    serve(backend, std::io::stdin().lock(), stdout_sink(), toolsets)
+    let invalid = |e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
+    let toolsets = Toolsets::from_env().map_err(invalid)?;
+    let timing = server::Timing::from_env().map_err(invalid)?;
+    serve_with(backend, std::io::stdin().lock(), stdout_sink(), toolsets, timing)
 }
 
 /// Serves the lines of `input` to completion, answering through `sink`.
-pub fn serve(backend: Arc<dyn Backend>, mut input: impl BufRead, sink: tasks::Sink, toolsets: Toolsets) -> std::io::Result<()> {
-    let server = Server::new(backend, sink, toolsets);
+pub fn serve(backend: Arc<dyn Backend>, input: impl BufRead, sink: tasks::Sink, toolsets: Toolsets) -> std::io::Result<()> {
+    serve_with(backend, input, sink, toolsets, server::Timing::default())
+}
+
+/// [`serve`] with `timing`. The server, and with it every subscription, ends when `input` does.
+pub fn serve_with(
+    backend: Arc<dyn Backend>,
+    mut input: impl BufRead,
+    sink: tasks::Sink,
+    toolsets: Toolsets,
+    timing: server::Timing,
+) -> std::io::Result<()> {
+    let server = Server::with_timing(backend, sink, timing, toolsets);
     let mut line = Vec::new();
     loop {
         line.clear();

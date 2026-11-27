@@ -15,7 +15,7 @@ fn limits() -> Limits {
 }
 
 fn timing() -> Timing {
-    Timing { watch: Duration::from_millis(20), heartbeat: Duration::from_millis(40) }
+    Timing { watch: crate::watch::Pace::uniform(Duration::from_millis(20)), heartbeat: Duration::from_millis(40) }
 }
 
 /// A scratch directory, removed on drop.
@@ -408,6 +408,33 @@ fn subscriptions_listen_streams_on_its_post_until_the_client_closes_it() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(lock(&rig.running.shared.router.routes).is_empty());
+}
+
+#[test]
+fn ending_a_session_stops_what_it_watches() {
+    let rig = Rig::new();
+    rig.fake.answer("screenshot", Ok(json!({"png": "AAAA"})));
+    let mut client = rig.client();
+    client.initialize("2025-11-25");
+    assert_eq!(client.call("resources/subscribe", json!({"uri": "simee://devices/phone/screen"}))["result"], json!({}));
+    let deadline = Instant::now() + WAIT;
+    while rig.fake.called("screenshot").is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    client.write_request("DELETE", &[], b"");
+    assert_eq!(client.read_reply().status, 204);
+    // A read under way may finish; then none follows.
+    let mut reads = rig.fake.called("screenshot").len();
+    loop {
+        std::thread::sleep(Duration::from_millis(150));
+        let now = rig.fake.called("screenshot").len();
+        if now == reads {
+            break;
+        }
+        reads = now;
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(rig.fake.called("screenshot").len(), reads, "the ended session still reads");
 }
 
 #[test]

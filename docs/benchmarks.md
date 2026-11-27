@@ -65,6 +65,7 @@ recoverable from what was recorded, or they need something the repository doesn'
 | [iOS memory tools](#ios-memory-tools) | `mem_vmmap` 0.60 s … `mem_leaks` 2.30 s | | M3 Max, 2026-11-27 | `ios-api.py --suite mem` |
 | [Desktop: Metal against wgpu](#desktop-runes-native-metal-backend-against-wgpu) | | | M3 Max, 2026-11-27 | no script (below) |
 | [MCP server](#mcp-server) | 1 crate | `rmcp`: 75 crates, 41 s build | Linux VM, 2026-11-26 | `scripts/bench/mcp-build.sh` |
+| [MCP idle subscription](#mcp-idle-subscription) | 1 wake-up a second, 0 ms CPU in 10 s | simee before: 98.5 wake-ups a second, 40 ms | 4-vCPU Xeon VM, 2026-11-27 | `cargo test --release -p simee-mcp idle_subscription -- --ignored --nocapture` |
 | [Build times](#build-times-local) | 74–77 CPU s | simee before: 131–136 | Apple silicon, 2026-11-26 | `scripts/bench/build-times.sh` |
 
 ## Android: emu against the SDK emulator
@@ -1038,6 +1039,27 @@ dependencies). `Cargo.lock` has 140 packages in all. Reproduce: `scripts/bench/m
 (it downloads `rmcp` into cargo's cache; nothing is added to this repository). Why this decides the protocol layer:
 [mcp.md](mcp.md#why-the-protocol-layer-is-hand-written).
 
+## MCP idle subscription
+
+What a subscribed resource costs while nothing changes: the watch thread's own wake-ups and CPU
+(`/proc/self/task/<tid>`), over 10 s after a 0.5 s settle, against a fake backend that answers at
+once, so it is the watcher and not the device. Linux VM, 4 vCPUs (Xeon @ 2.2 GHz, Linux 6.1),
+2026-11-27, release build, one run each (the numbers are counts, not timings). "Before" is
+`main` at 6ad2666, whose watcher slept in 10 ms steps and compared the clock, with the same test
+body copied in (the old `spawn` took one interval, 1 s).
+
+| Subscribed to | Wake-ups a second, before | after | CPU in 10 s, before | after | Reads in 10 s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| one screen | 98.5 | 1.0 | 40 ms | 0 ms (under the 10 ms tick) | 11 |
+| the resource list | 98.2 | 1.0 | 40 ms | 0 ms | 11 |
+| one screen and the list | 98.5 | 1.0 | 40 ms | 0 ms | 22 |
+
+The reads are the real cost on a device: a subscribed screen is one `screenshot` a second at the
+default pace (`SIMEE_MCP_SCREEN_FPS` raises or lowers it), and each is the call timed in
+[Time per automation step](#ios-simee-against-simctl). The host CPU of a subscribed screen on a
+device is [not yet measured](#not-yet-measured). A resource nobody subscribed to costs nothing:
+the server has no thread and makes no read (a test counts the backend's calls).
+
 ## Build times (local)
 
 Apple silicon Mac, 16 CPUs, macOS 26.6, 2026-11-26. The host was heavily loaded by other builds
@@ -1192,6 +1214,9 @@ Claims that would belong in the README once someone runs them:
   device's directory (6,562 files), so the host's `mds_stores` indexes what devices write. What
   excluding `~/Library/Developer/CoreSimulator` from Spotlight saves a farm needs a change to the
   host's Spotlight privacy settings to measure.
+- Host CPU of an MCP client subscribed to a booted device's `screen`, `logs` and `processes`
+  resources, on iOS and Android, at the default pace and at `SIMEE_MCP_SCREEN_FPS=10`, against the
+  same device read by polling `screenshot` from the client.
 - Time per automation step through `simee mcp` (a `tools/call` of `tap`, then `screenshot`) against
   the socket API and the CLI on the same device.
 - A 10 ms `button` hold for the iPhone's side, Siri, Apple Pay, Action and volume buttons and on

@@ -525,7 +525,8 @@ enum CameraCmd {
 }
 
 /// `simee mcp --http`'s settings: the address (`host:port`, a name resolved to its first address),
-/// the token file (or none, `--no-auth`) and the toolsets `SIMEE_MCP_TOOLSETS` names.
+/// the token file (or none, `--no-auth`), the toolsets `SIMEE_MCP_TOOLSETS` names and the screen
+/// subscription pace `SIMEE_MCP_SCREEN_FPS` sets.
 fn mcp_http_config(
     addr: &str,
     token_file: Option<std::path::PathBuf>,
@@ -543,6 +544,7 @@ fn mcp_http_config(
     config.no_auth = no_auth;
     config.insecure_remote = insecure_remote;
     config.toolsets = sim_mcp::Toolsets::from_env().map_err(anyhow::Error::msg)?;
+    config.timing = sim_mcp::server::Timing::from_env().map_err(anyhow::Error::msg)?;
     Ok(config)
 }
 

@@ -7,8 +7,8 @@ look at their screens, read their logs, and watch them change.
 | MCP feature | What simee gives it |
 | --- | --- |
 | Tools | One per method in `sim-api`'s table, generated from it, and `device_view`, with output schemas and annotations, in toolsets a client picks (`core` by default) |
-| Resources | Devices, runtimes, form factors, camera sources, and each device's info, screenshot, logs and apps |
-| Subscriptions | Change notifications for those resources, by re-reading them while subscribed |
+| Resources | Devices, runtimes, form factors, camera sources, each device's info, screen, screenshot, apps, logs and processes, and an app's preferences by template |
+| Subscriptions | Change notifications for those resources and for the resource list, throttled by kind, by re-reading them only while subscribed |
 | Prompts | Common workflows (boot and install, reproduce a bug, audit contrast, find slowness, test across form factors) that name the tools to call and their toolsets |
 | Tasks | `boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase`, `shutdown`, `export`, `import`, `mem_leaks`, `mem_heap` as pollable, cancellable tasks |
 | App | `device_view`: a device's screen with tap, swipe, type and button controls, in the conversation |
@@ -208,32 +208,68 @@ A test keeps this page honest: it fails if a tool isn't named here.
 
 | URI | Contents |
 | --- | --- |
-| `simee://devices` | Every device on both platforms (JSON) |
+| `simee://devices` | Every device on both platforms, with its state (JSON) |
 | `simee://runtimes` | iOS runtimes and Android system images |
 | `simee://device-types` | iOS device types |
 | `simee://form-factors` | The form-factor matrix, with inputs or why one is unsupported |
 | `simee://camera/sources` | Every source a device camera can link to, and the host's camera permission (`camera_sources`) |
-| `simee://devices/{device}` | The device's info (`info`) |
-| `simee://devices/{device}/screenshot` | The screen now, a PNG (`image/png`; a booted device) |
-| `simee://devices/{device}/logs` | The last minute of the unified log (`text/plain`; iOS) |
+| `simee://devices/{device}` | The device's info (`info`): identity, form factor, sub-platform, profile, paths |
+| `simee://devices/{device}/screen` | The screen now, a PNG shrunk so its longest side is at most 1024 px (a 1206×2622 iPhone is 402×874): what an agent reads (a booted device) |
+| `simee://devices/{device}/screenshot` | The screen now, a PNG at the device's own size (a booted device) |
+| `simee://devices/{device}/logs` | The newest 200 lines of the last minute of the unified log (`text/plain`; iOS) |
 | `simee://devices/{device}/apps` | Installed bundle ids (iOS) |
+| `simee://devices/{device}/processes` | The device's processes with CPU and memory (`processes`; iOS) |
+| `simee://devices/{device}/prefs/{bundle_id}` | Every key of an app's preference stores, typed (`prefs_read`, read fresh) |
+| `simee://devices/{device}/prefs/{bundle_id}/{store}` | One preference store of an app (a `store` id from `prefs_stores`) |
 | `ui://simee/device` | The device view's page (`text/html;profile=mcp-app`) |
 
-`{device}` is a UDID or an AVD name. `resources/list` includes each device's resources that apply
-to it (a screenshot for a booted device, logs and apps for an iOS one), and
-`resources/templates/list` the four templates. Android has no log resource: its console is the
-`console` tool. A device that doesn't exist is the specification's "resource not found" (`-32602`
-for the current revision, `-32002` for the earlier ones); one that isn't running is an internal
-error that says so.
+`{device}` is a UDID or an AVD name; `{bundle_id}` and `{store}` are as the `prefs_*` tools take
+them. Each is percent-encoded as one path segment. `simee://device/{device}…` is read as
+`simee://devices/{device}…`, and a subscription is announced under the spelling the client gave.
+`resources/list` includes each device's resources that apply to it (screens for a booted device,
+logs and processes for a booted iOS one, apps for an iOS one), and `resources/templates/list` all
+eight templates. Preferences are templates only, since every app has some. Android has no log or
+process resource (its console is the `console` tool) and no preferences yet (they answer as
+not found, like the tools' "not yet available"). A device that doesn't exist is the
+specification's "resource not found" (`-32602` for the current revision, `-32002` for the earlier
+ones); one that isn't running is an internal error that says so.
+
+`screen` is the one to subscribe to. A client that wants the device's own pixels reads
+`screenshot`, the `screenshot` tool's answer unchanged. Neither takes a size.
 
 **Subscriptions.** The API has nothing to subscribe to, so a subscription re-reads: while a client
 is subscribed (`subscriptions/listen` with `resourceSubscriptions`, or `resources/subscribe` for an
-older client), one thread reads each subscribed resource once a second and sends
-`notifications/resources/updated` when the bytes differ. `resourcesListChanged` sends
-`notifications/resources/list_changed` when a device appears, disappears, or starts or stops
-running. Subscribing to a screenshot costs a screenshot a second; the thread stops when the client
-cancels the listen (`notifications/cancelled`). The server never changes its tool list, so it
-doesn't offer `toolsListChanged`.
+older client), a watcher re-reads each subscribed resource at that kind's pace and sends
+`notifications/resources/updated` when it differs from the last read. The pace is also the most
+often it can be announced, so a burst of changes is one notification, and the client reads the
+state at that moment:
+
+| Resource | Re-read every | Counts as a change |
+| --- | --- | --- |
+| `screen`, `screenshot` | 1 s (`SIMEE_MCP_SCREEN_FPS`, above 0 and up to 30 frames a second) | The device's frame differs; an unchanged frame isn't shrunk or sent |
+| `logs` | 1 s | A new newest line: lines aging out of the minute say nothing, and a burst is one notification |
+| `processes` | 2 s | A process starts or exits (its pid and path); CPU and memory moving don't count |
+| `devices` and the resource list (`resourcesListChanged`) | 1 s | A device appears, disappears, or starts or stops running (`notifications/resources/list_changed`) |
+| Everything else (`info`, `apps`, `prefs`, the catalogues) | 2 s | The bytes differ |
+
+What is already there when a subscription starts is its baseline: nothing is sent for it. A
+subscription added to a connection that has others keeps their baselines. A resource that can't
+be read (a device that isn't running) counts as a state, so booting a device announces its screen.
+
+**Cost.** A connection with no subscriptions has no thread and makes no read: reading, listing
+and listing templates are the calls they ask for and no more. A subscription is one thread per
+connection (per session over HTTP, which is its own server) that sleeps until the next read is
+due: 1 wake-up a second for a screen, the list, or both, and no CPU a test can see
+([benchmarks.md](benchmarks.md#mcp-idle-subscription)). The reads themselves are what costs:
+a subscribed screen is one `screenshot` a second (more at a higher `SIMEE_MCP_SCREEN_FPS`), each
+read one period after the last finished, so a slow screenshot lowers the rate instead of piling
+up. The thread stops when the client cancels the listen (`notifications/cancelled`),
+unsubscribes its last resource, or its connection ends (stdin closes; the HTTP session is deleted
+or expires), and no notification follows.
+
+An older client has no way to ask for `list_changed`, so for it the list is watched while it has
+any subscription. `listChanged` is advertised for both. The server never changes its tool list,
+so it doesn't offer `toolsListChanged`.
 
 ## Prompts
 
@@ -457,7 +493,11 @@ takes milliseconds). Reproduce: `cargo test --release -p simee-mcp http_call_ove
 - Cancelling stops `boot`, `boot_many`, `create`, `clone` and `import` at their next safe point
   and undoes what they half did; it doesn't stop an install, erase, settle or memory tool already
   running (above).
-- The change notifications are polled, once a second, and only for what a client subscribed to.
+- The change notifications are polled, at each resource's pace above, and only for what a client
+  subscribed to; a change shows up at the next read, not when it happens. A subscribed screen
+  costs a screenshot a read even when it doesn't change (no cheaper change probe exists in the
+  API), and an input made through simee's own tools doesn't bring the next read forward.
+  A change between a client's last read and its subscription's baseline read isn't announced.
 - Over HTTP: no TLS, no OAuth (a bearer token from a file is the only authentication; both are
   tracked in a follow-up issue), no resumable streams, and an `Origin` allowlist beyond loopback
   and the connection limits aren't configurable.

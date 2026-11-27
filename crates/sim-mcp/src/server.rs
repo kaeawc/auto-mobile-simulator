@@ -17,7 +17,7 @@ use crate::backend::{Backend, Executor};
 use crate::rpc::{self, Ctx, EXT_TASKS, Era, INTERNAL_ERROR, Incoming, LEGACY, MODERN, RpcError};
 use crate::tasks::{Ctl, Sink, Tasks};
 use crate::tools::{self, Pages, Toolsets};
-use crate::watch::{self, Emit, Spec, Watcher};
+use crate::watch::{self, Emit, Pace, Spec, Watcher};
 use crate::{prompts, resources};
 
 /// What the server tells a client about using it.
@@ -25,7 +25,8 @@ const INSTRUCTIONS: &str = "simee drives iOS simulators and Android emulators. C
 (a UDID, a name, or `booted`). Every tool says which platforms it works on. `screenshot` returns the screen as an image; \
 `tap`, `swipe`, `type` and `button` take device pixels. `boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase` and \
 `shutdown` can take a while: with the tasks extension they return a task to poll with tasks/get (cancel with tasks/cancel). \
-Resources under simee://devices carry each device's info and screenshot; `device_view` opens a live, clickable view of a device. \
+Resources under simee://devices carry each device's info, screen (shrunk for you), logs and processes: subscribe to be told when one changes instead of polling; \
+`device_view` opens a live, clickable view of a device. \
 The tools listed are the toolsets this server was started with (SIMEE_MCP_TOOLSETS, default `core`); calling one that isn't listed \
 says which toolset has it. `processes`, `logs`, `connections` and `devices_usage` page with `limit` and `cursor`.";
 
@@ -42,14 +43,29 @@ fn server_info() -> Value {
 /// Timing knobs, shortened in tests.
 #[derive(Clone, Copy)]
 pub struct Timing {
-    pub watch: Duration,
+    /// How often each kind of subscribed resource is re-read.
+    pub watch: Pace,
     pub heartbeat: Duration,
 }
 
 impl Default for Timing {
     fn default() -> Timing {
-        Timing { watch: watch::INTERVAL, heartbeat: HEARTBEAT }
+        Timing { watch: Pace::default(), heartbeat: HEARTBEAT }
     }
+}
+
+impl Timing {
+    /// The defaults, with what the environment sets (`SIMEE_MCP_SCREEN_FPS`).
+    pub fn from_env() -> Result<Timing, String> {
+        Ok(Timing { watch: Pace::from_env()?, ..Timing::default() })
+    }
+}
+
+/// A legacy client's subscriptions: the URIs, and the watcher of them while there are any.
+#[derive(Default)]
+struct Subscribed {
+    uris: BTreeSet<String>,
+    watcher: Option<Watcher>,
 }
 
 /// An open `subscriptions/listen`.
@@ -75,9 +91,9 @@ struct Inner {
     running: Mutex<usize>,
     idle: Condvar,
     listens: Mutex<HashMap<String, Listen>>,
-    /// A legacy client's `resources/subscribe` URIs, watched by one watcher.
-    legacy_uris: Mutex<BTreeSet<String>>,
-    legacy_watcher: Mutex<Option<Watcher>>,
+    /// A legacy client's `resources/subscribe` URIs, watched by one watcher that exists while there
+    /// are any.
+    subscribed: Mutex<Subscribed>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -111,8 +127,7 @@ impl Server {
                 running: Mutex::new(0),
                 idle: Condvar::new(),
                 listens: Mutex::default(),
-                legacy_uris: Mutex::default(),
-                legacy_watcher: Mutex::default(),
+                subscribed: Mutex::default(),
             }),
         }
     }
@@ -361,7 +376,7 @@ impl Inner {
         let version = LEGACY.iter().find(|v| **v == requested).unwrap_or(&LEGACY[0]);
         *lock(&self.legacy) = Some((params.get("capabilities").cloned().unwrap_or(Value::Null), version));
         json!({"protocolVersion": version,
-            "capabilities": {"tools": {}, "resources": {"subscribe": true}, "prompts": {"listChanged": false}},
+            "capabilities": {"tools": {}, "resources": {"subscribe": true, "listChanged": true}, "prompts": {"listChanged": false}},
             "serverInfo": server_info(), "instructions": INSTRUCTIONS})
     }
 
@@ -561,19 +576,25 @@ impl Inner {
         if resources::parse(uri).is_none() {
             return Err(rpc::for_era(RpcError::invalid_params("Resource not found").with_data(json!({"uri": uri})), Era::Legacy));
         }
-        let uris: Vec<String> = {
-            let mut set = lock(&self.legacy_uris);
-            if method == "resources/subscribe" {
-                set.insert(uri.to_owned());
-            } else {
-                set.remove(uri);
-            }
-            set.iter().cloned().collect()
-        };
-        let sink = self.sink.clone();
-        let emit: Emit = Arc::new(move |method, params| sink(json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string()));
-        *lock(&self.legacy_watcher) =
-            (!uris.is_empty()).then(|| watch::spawn(self.backend.clone(), Spec { uris, list_changed: false }, self.timing.watch, emit));
+        let mut subscribed = lock(&self.subscribed);
+        if method == "resources/subscribe" {
+            subscribed.uris.insert(uri.to_owned());
+        } else {
+            subscribed.uris.remove(uri);
+        }
+        // An older client has no way to ask for `list_changed`, so its subscribing to anything is
+        // the ask: it is watched while some subscription is.
+        let spec = Spec { uris: subscribed.uris.iter().cloned().collect(), list_changed: !subscribed.uris.is_empty() };
+        if spec.uris.is_empty() {
+            subscribed.watcher = None;
+        } else if let Some(watcher) = &subscribed.watcher {
+            watcher.update(spec);
+        } else {
+            let sink = self.sink.clone();
+            let emit: Emit =
+                Arc::new(move |method, params| sink(json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string()));
+            subscribed.watcher = Some(watch::spawn(self.backend.clone(), spec, self.timing.watch, emit));
+        }
         Ok(json!({}))
     }
 }
