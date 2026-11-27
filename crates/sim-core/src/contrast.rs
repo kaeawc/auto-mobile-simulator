@@ -516,6 +516,7 @@ pub fn check(frame: &Frame, opts: &Options) -> Report {
     };
     let min_px = (MIN_INK_PT * scale).max(5.0);
     let mut regions = Vec::new();
+    let mut frames = Vec::new();
     for b in blobs(&img, scale) {
         let (w, h) = (f64::from(b.x1 - b.x0 + 1), f64::from(b.y1 - b.y0 + 1));
         let pt = h / scale;
@@ -523,10 +524,25 @@ pub fn check(frame: &Frame, opts: &Options) -> Report {
         if h < min_px || w < min_px * 0.4 || pt > MAX_INK_PT || w / h > 60.0 || h / w > 6.0 || b.edges < 10 {
             continue;
         }
-        if w * h > 0.3 * f64::from(img.w as u32) * f64::from(img.h as u32) {
+        // Judged against the frame, not the region: a region drawn tightly round a label is not a panel.
+        if w * h > 0.3 * f64::from(frame.width) * f64::from(frame.height) {
             continue;
         }
         let rect = Rect { x: b.x0, y: b.y0, width: b.x1 - b.x0 + 1, height: b.y1 - b.y0 + 1 };
+        // A hollow box's border is its own finding, a non-text element (3:1) against what is outside
+        // it; the text inside is judged on its own against the box's fill.
+        if let Some((edge, outside)) = thin_frame(&img, rect) {
+            let rect = Rect { x: rect.x + area.x, y: rect.y + area.y, ..rect };
+            frames.push(rect);
+            regions.push(Region {
+                rect,
+                kind: Kind::Component,
+                foreground: edge,
+                background: outside,
+                ratio: contrast_ratio(edge, outside),
+            });
+            continue;
+        }
         let Some(f) = fit(&img, rect) else { continue };
         let fraction = f.ink as f64 / f.area as f64;
         if f.ink < 8 || !(0.03..=0.75).contains(&fraction) || f.purity < PURITY {
@@ -548,7 +564,78 @@ pub fn check(frame: &Frame, opts: &Options) -> Report {
             ratio: worst.0,
         });
     }
-    Report { regions: lines(regions, scale) }
+    Report { regions: lines(regions, scale, &frames) }
+}
+
+fn near(a: Rgb, b: Rgb, tol: u8) -> bool {
+    (0..3).all(|i| a[i].abs_diff(b[i]) <= tol)
+}
+
+/// A hollow box (a field, a card, an outlined button): a uniform line of one colour along all four
+/// sides, different from what is outside, and not the same colour a little way in (that is a
+/// filled shape). Returns the border colour and the colour outside it.
+fn thin_frame(img: &Img, r: Rect) -> Option<(Rgb, Rgb)> {
+    let (w, h) = (i64::from(r.width), i64::from(r.height));
+    if w < 12 || h < 12 {
+        return None;
+    }
+    let (x0, y0) = (i64::from(r.x), i64::from(r.y));
+    let (x1, y1) = (x0 + w - 1, y0 + h - 1);
+    let px = |x: i64, y: i64| -> Option<Rgb> {
+        (x >= 0 && y >= 0 && (x as usize) < img.w && (y as usize) < img.h).then(|| img.px(x as usize, y as usize))
+    };
+    let (xs, ys) = (w / 5..w * 4 / 5, h / 5..h * 4 / 5);
+    let outside: Vec<Rgb> = xs
+        .clone()
+        .flat_map(|i| [px(x0 + i, y0 - 3), px(x0 + i, y1 + 3)])
+        .chain(ys.clone().flat_map(|j| [px(x0 - 3, y0 + j), px(x1 + 3, y0 + j)]))
+        .flatten()
+        .collect();
+    if outside.len() < 8 {
+        return None;
+    }
+    let out = round(mode_colour(outside.iter().copied())?);
+    if outside.iter().filter(|&&c| near(c, out, 12)).count() * 10 < outside.len() * 8 {
+        return None;
+    }
+    // The line `d` pixels in from a side, over its middle: its colour when it is uniform and inked.
+    let line = |side: usize, d: i64| -> Option<Rgb> {
+        let at = |i: i64| match side {
+            0 => px(x0 + i, y0 + d),
+            1 => px(x0 + i, y1 - d),
+            2 => px(x0 + d, y0 + i),
+            _ => px(x1 - d, y0 + i),
+        };
+        let span = if side < 2 { xs.clone() } else { ys.clone() };
+        let pixels: Vec<Rgb> = span.map(at).collect::<Option<_>>()?;
+        let c = round(mode_colour(pixels.iter().copied())?);
+        let uniform = pixels.iter().filter(|&&p| near(p, c, 12)).count() * 10 >= pixels.len() * 9;
+        (uniform && !near(c, out, INK_STEP as u8)).then_some(c)
+    };
+    let mut edge = None;
+    let mut deepest = 0;
+    for side in 0..4 {
+        let (d, c) = (0..4).find_map(|d| line(side, d).map(|c| (d, c)))?;
+        if edge.is_some_and(|e| !near(e, c, 12)) {
+            return None;
+        }
+        edge = Some(c);
+        deepest = deepest.max(d);
+    }
+    let edge = edge?;
+    // A border is thin next to the box (a stroke of a big letter or a filled shape is not): the line
+    // a tenth of the way in, and the one just past the border, are both not its colour.
+    let (past, tenth) = (deepest + 4, w.min(h) / 10 + 1);
+    if past.max(tenth) * 2 >= h.min(w) {
+        return None;
+    }
+    for inner in [past, tenth] {
+        let sample: Vec<Rgb> = xs.clone().filter_map(|i| px(x0 + i, y0 + inner)).collect();
+        if sample.is_empty() || sample.iter().filter(|&&p| near(p, edge, 12)).count() * 2 > sample.len() {
+            return None;
+        }
+    }
+    Some((edge, out))
 }
 
 /// What a box of ink is judged as: squarish and tall enough is an icon or control, else text,
@@ -590,16 +677,18 @@ fn same_line(a: &Region, b: &Region) -> bool {
 /// Joins the glyphs and words of a line into one region (the worst ratio, the kind of what the
 /// line spans), and drops fragments inside another region (the dot of an "i" that didn't join its
 /// letter, the inside of a checkbox).
-fn lines(regions: Vec<Region>, scale: f64) -> Vec<Region> {
+fn lines(regions: Vec<Region>, scale: f64, frames: &[Rect]) -> Vec<Region> {
     let mut regions = regions;
     loop {
         let before = regions.len();
         let mut out: Vec<Region> = Vec::with_capacity(regions.len());
         for r in regions {
-            if out.iter().any(|o| contains(o.rect, r.rect)) {
+            // A hollow box's border neither swallows what is inside it nor joins its line.
+            if out.iter().any(|o| contains(o.rect, r.rect) && !frames.contains(&o.rect)) {
                 continue;
             }
-            match out.iter_mut().rev().take(96).find(|o| same_line(o, &r)) {
+            let is_frame = frames.contains(&r.rect);
+            match out.iter_mut().rev().take(96).find(|o| !is_frame && !frames.contains(&o.rect) && same_line(o, &r)) {
                 Some(o) => {
                     let (x0, y0) = (o.rect.x.min(r.rect.x), o.rect.y.min(r.rect.y));
                     let x1 = (o.rect.x + o.rect.width).max(r.rect.x + r.rect.width);
