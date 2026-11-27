@@ -7,7 +7,11 @@
 //! - [`id`] parses source ids (`webcam:<id or name>`, `pattern:testcard`, `qr:<text>`, …) and
 //!   resolves a webcam query by id, name, index or part of the name.
 //! - [`Source`] produces BGRA frames at a requested size; [`Hub`] runs one capture per source and
-//!   fans it out to every subscriber, stopping it when the last one goes.
+//!   fans it out to every subscriber, stopping it when the last one goes. A webcam opens in the
+//!   mode nearest the request (size, then frame rate): AVFoundation on macOS, V4L2 streaming
+//!   (YUYV and Motion JPEG to BGRA) on Linux.
+//! - [`hotplug`]: [`Hub::events`] streams cameras added and removed (host notifications, debounced)
+//!   and captures whose source went missing.
 //! - [`tcc`] reads the host camera permission (never prompting) and turns a missing grant into an
 //!   error that names the fix, instead of black frames.
 //!
@@ -18,12 +22,19 @@
 #[cfg(target_os = "macos")]
 mod avf;
 pub mod catalog;
+#[cfg(any(target_os = "linux", test))]
+mod convert;
 pub mod draw;
 mod error;
 pub mod frame;
+pub mod hotplug;
 pub mod hub;
 pub mod id;
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+mod select;
 pub mod source;
+#[cfg(any(target_os = "linux", test))]
+mod stream;
 pub mod synth;
 pub mod tcc;
 #[cfg(target_os = "linux")]
@@ -32,7 +43,8 @@ mod v4l2;
 pub use catalog::{CameraKind, Change, Format, HostCamera, host_cameras};
 pub use error::{Error, Result};
 pub use frame::{CameraFrame, FrameSpec, Tick};
-pub use hub::{Hub, Subscription};
+pub use hotplug::{Event, HostHotPlug, HotPlug, Signals};
+pub use hub::{Events, Hub, Subscription};
 pub use id::{Pattern, SourceSpec, resolve_webcam};
 pub use source::{HostOpener, Opener, Source};
 pub use tcc::Authorization;

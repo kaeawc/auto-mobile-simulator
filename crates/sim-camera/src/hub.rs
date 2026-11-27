@@ -5,21 +5,30 @@
 //! frame per distinct size (a still or a same-size frame is shared, never copied), a camera's one
 //! frame is fitted to each size. The capture stops, dropping the source and releasing any camera,
 //! as soon as the last subscription is dropped.
+//!
+//! [`Hub::events`] is the hub's event stream: cameras added and removed (debounced host
+//! notifications, then a fresh listing diffed against the last), and captures whose source went
+//! missing mid-stream. The host watch starts with the first stream and stops with the last.
 
 use std::collections::HashMap;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::catalog::{self, HostCamera};
 use crate::error::{Error, Result};
 use crate::frame::{CameraFrame, FrameSpec, Tick};
+use crate::hotplug::{Debounce, Event, HostHotPlug, HotPlug, MAX_DELAY, QUIET, Signals};
 use crate::id::SourceSpec;
 use crate::source::{Opener, Source};
 
 /// Frames a slow subscriber may fall behind by before newer frames are dropped for it (the
 /// capture never waits for a subscriber).
 const QUEUE: usize = 2;
+
+/// How often the hot-plug watch checks, with no signals, whether anyone still listens.
+const IDLE: Duration = Duration::from_millis(250);
 
 /// The captures running now, keyed by canonical source id.
 pub struct Hub {
@@ -29,7 +38,23 @@ pub struct Hub {
 struct Inner {
     opener: Box<dyn Opener>,
     captures: Mutex<HashMap<String, Entry>>,
+    hotplug: Box<dyn HotPlug>,
+    watch: Mutex<Watch>,
 }
+
+/// The event streams open now, and whether the host watch runs for them.
+#[derive(Default)]
+struct Watch {
+    listeners: Vec<(u64, Sender<Event>)>,
+    next_id: u64,
+    running: bool,
+    /// Why this generation of the watch stopped, when it failed: what each of its streams' next
+    /// receive returns. A restart gets a fresh cell, so it can't overwrite a cause a stream of the
+    /// failed watch hasn't read yet.
+    cause: Cause,
+}
+
+type Cause = Arc<Mutex<Option<Error>>>;
 
 /// A source's slot in the hub: being opened (by one subscriber, outside the lock) or running.
 #[derive(Clone)]
@@ -109,7 +134,43 @@ pub struct Active {
 
 impl Hub {
     pub fn new(opener: impl Opener + 'static) -> Hub {
-        Hub { inner: Arc::new(Inner { opener: Box::new(opener), captures: Mutex::new(HashMap::new()) }) }
+        Hub::with_hotplug(opener, HostHotPlug)
+    }
+
+    /// A hub whose hot-plug events come from `hotplug` (fakes in tests).
+    pub fn with_hotplug(opener: impl Opener + 'static, hotplug: impl HotPlug + 'static) -> Hub {
+        Hub {
+            inner: Arc::new(Inner {
+                opener: Box::new(opener),
+                captures: Mutex::new(HashMap::new()),
+                hotplug: Box::new(hotplug),
+                watch: Mutex::new(Watch::default()),
+            }),
+        }
+    }
+
+    /// The hub's events from now on: cameras added and removed, and captures whose source went
+    /// missing. The first stream starts watching the host (and fails here when it can't); the
+    /// watch stops when the last stream is dropped.
+    pub fn events(&self) -> Result<Events> {
+        let mut watch = lock(&self.inner.watch);
+        if !watch.running {
+            // Watch first, then list: a change between the two is still signalled.
+            let signals = self.inner.hotplug.watch()?;
+            let known = self.inner.hotplug.cameras()?;
+            let weak = Arc::downgrade(&self.inner);
+            thread::Builder::new()
+                .name("camera hot-plug".into())
+                .spawn(move || run_watch(weak, signals, known))
+                .map_err(|e| Error::Capture(format!("can't start the hot-plug thread: {e}")))?;
+            watch.running = true;
+            watch.cause = Cause::default();
+        }
+        let (tx, rx) = mpsc::channel();
+        let id = watch.next_id;
+        watch.next_id += 1;
+        watch.listeners.push((id, tx));
+        Ok(Events { id, inner: self.inner.clone(), rx, cause: watch.cause.clone() })
     }
 
     /// Subscribes to `source` at `spec`. Opens the source (and fails here, with the reason, when
@@ -182,6 +243,49 @@ impl Hub {
     }
 }
 
+/// Sends `event` to every event stream, dropping streams that are gone.
+fn broadcast(inner: &Inner, event: &Event) {
+    lock(&inner.watch).listeners.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+}
+
+/// The hot-plug thread: debounced host signals, each burst a fresh listing diffed against the
+/// last. Ends when the last stream goes (checked every `IDLE`) or the host watch fails.
+fn run_watch(hub: Weak<Inner>, mut signals: Box<dyn Signals>, mut known: Vec<HostCamera>) {
+    let mut debounce = Debounce::new(QUIET, MAX_DELAY);
+    loop {
+        let signalled = signals.wait(debounce.timeout(Instant::now(), IDLE));
+        let Some(inner) = hub.upgrade() else { return };
+        match signalled {
+            Ok(true) => debounce.signal(Instant::now()),
+            Ok(false) => {}
+            Err(e) => {
+                let mut watch = lock(&inner.watch);
+                // Dropping the senders ends every stream; each then reads `failure`.
+                watch.running = false;
+                *lock(&watch.cause) = Some(e);
+                watch.listeners.clear();
+                return;
+            }
+        }
+        {
+            let mut watch = lock(&inner.watch);
+            if watch.listeners.is_empty() {
+                watch.running = false;
+                return;
+            }
+        }
+        // A listing that fails (a node udev hasn't opened up yet) waits for the next signal.
+        if debounce.take(Instant::now())
+            && let Ok(now) = inner.hotplug.cameras()
+        {
+            for change in catalog::changes(&known, &now) {
+                broadcast(&inner, &Event::from(change));
+            }
+            known = now;
+        }
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -234,6 +338,46 @@ impl Subscription {
     fn ended(&self) -> Error {
         let failure = lock(&self.capture.state).failure.clone();
         failure.unwrap_or_else(|| Error::Capture(format!("the capture of {} stopped", self.capture.key)))
+    }
+}
+
+/// One consumer's stream of hub events. Dropping it unlistens; the host watch stops with the last.
+pub struct Events {
+    id: u64,
+    inner: Arc<Inner>,
+    rx: Receiver<Event>,
+    cause: Cause,
+}
+
+impl Events {
+    /// The next event, waiting up to `timeout`; `Ok(None)` on a timeout. Once the host watch has
+    /// failed: the events already queued, then the failure.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<Event>> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(event) => Ok(Some(event)),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => Err(self.ended()),
+        }
+    }
+
+    /// An event if one is waiting.
+    pub fn try_recv(&self) -> Result<Option<Event>> {
+        match self.rx.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(self.ended()),
+        }
+    }
+
+    fn ended(&self) -> Error {
+        let failure = lock(&self.cause).clone();
+        failure.unwrap_or_else(|| Error::Capture("the hot-plug watch stopped".into()))
+    }
+}
+
+impl Drop for Events {
+    fn drop(&mut self) {
+        lock(&self.inner.watch).listeners.retain(|(id, _)| *id != self.id);
     }
 }
 
@@ -290,11 +434,16 @@ fn run_capture(hub: Weak<Inner>, capture: Arc<Capture>, mut source: Box<dyn Sour
             Ok(frames) => deliver(&mut state.subscribers, &frames, &due),
             Err(e) => {
                 // Dropping the senders ends every subscriber's stream; each then reads `failure`.
-                state.failure = Some(e);
+                state.failure = Some(e.clone());
                 state.stopped = true;
                 state.subscribers.clear();
                 drop(state);
                 remove(&hub, &capture);
+                if matches!(e, Error::Missing(_))
+                    && let Some(inner) = hub.upgrade()
+                {
+                    broadcast(&inner, &Event::SourceMissing { source: capture.key.clone(), error: e });
+                }
                 return;
             }
         }
@@ -370,7 +519,7 @@ mod tests {
     use crate::synth;
 
     /// Counts opens and drops; frames are the synthetic source's, or an error after `fail_after`
-    /// frames.
+    /// frames (a webcam's is an unplug).
     #[derive(Clone, Default)]
     struct Counts {
         opened: Arc<AtomicUsize>,
@@ -387,6 +536,7 @@ mod tests {
         inner: Box<dyn Source>,
         counts: Counts,
         fail_after: Option<usize>,
+        webcam: bool,
     }
 
     impl Source for Counted {
@@ -397,6 +547,9 @@ mod tests {
         fn frame(&mut self, spec: FrameSpec, tick: Tick) -> Result<CameraFrame> {
             let n = self.counts.frames.fetch_add(1, Ordering::SeqCst);
             if self.fail_after.is_some_and(|max| n >= max) {
+                if self.webcam {
+                    return Err(Error::Missing("the camera was unplugged".into()));
+                }
                 return Err(Error::Capture("unplugged".into()));
             }
             self.inner.frame(spec, tick)
@@ -424,7 +577,8 @@ mod tests {
                 other => synth::open(other)?,
             };
             self.counts.opened.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(Counted { inner, counts: self.counts.clone(), fail_after: self.fail_after }))
+            let webcam = matches!(source, SourceSpec::Webcam(_));
+            Ok(Box::new(Counted { inner, counts: self.counts.clone(), fail_after: self.fail_after, webcam }))
         }
     }
 
@@ -672,5 +826,170 @@ mod tests {
             .collect();
         assert_eq!(capture_spec(&subs), Some(spec(1280, 720, 60)));
         assert_eq!(capture_spec(&[]), None);
+    }
+
+    /// Host cameras and signals the test controls. `watch` hands out a fresh signal channel and
+    /// counts the watches started and the ones dropped.
+    #[derive(Clone, Default)]
+    struct Plug {
+        cameras: Arc<Mutex<Vec<HostCamera>>>,
+        listings: Arc<AtomicUsize>,
+        watches: Arc<AtomicUsize>,
+        stopped: Arc<AtomicUsize>,
+        signal: Arc<Mutex<Option<mpsc::Sender<Result<()>>>>>,
+        refuse: bool,
+    }
+
+    struct PlugSignals {
+        rx: Receiver<Result<()>>,
+        stopped: Arc<AtomicUsize>,
+    }
+
+    impl Signals for PlugSignals {
+        fn wait(&mut self, timeout: Duration) -> Result<bool> {
+            match self.rx.recv_timeout(timeout) {
+                Ok(Ok(())) => Ok(true),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Ok(false),
+            }
+        }
+    }
+
+    impl Drop for PlugSignals {
+        fn drop(&mut self) {
+            self.stopped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl HotPlug for Plug {
+        fn cameras(&self) -> Result<Vec<HostCamera>> {
+            self.listings.fetch_add(1, Ordering::SeqCst);
+            Ok(lock(&self.cameras).clone())
+        }
+
+        fn watch(&self) -> Result<Box<dyn Signals>> {
+            if self.refuse {
+                return Err(Error::Unsupported("no hot-plug here".into()));
+            }
+            self.watches.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = mpsc::channel();
+            *lock(&self.signal) = Some(tx);
+            Ok(Box::new(PlugSignals { rx, stopped: self.stopped.clone() }))
+        }
+    }
+
+    impl Plug {
+        fn signal(&self, what: Result<()>) {
+            if let Some(tx) = lock(&self.signal).as_ref() {
+                let _ = tx.send(what);
+            }
+        }
+
+        fn set(&self, cameras: &[HostCamera]) {
+            *lock(&self.cameras) = cameras.to_vec();
+        }
+    }
+
+    fn plugged(fail_after: Option<usize>) -> (Hub, Plug) {
+        let plug = Plug::default();
+        (Hub::with_hotplug(Fake { counts: Counts::default(), fail_after }, plug.clone()), plug)
+    }
+
+    fn next_event(events: &Events) -> Event {
+        match events.recv_timeout(Duration::from_secs(5)) {
+            Ok(Some(e)) => e,
+            other => panic!("no event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_burst_of_hot_plug_signals_is_one_listing_and_its_changes() {
+        let (hub, plug) = plugged(None);
+        let (a, b) = (crate::catalog::tests::camera("a", "A"), crate::catalog::tests::camera("b", "B"));
+        plug.set(std::slice::from_ref(&a));
+        let events = hub.events().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(plug.listings.load(Ordering::SeqCst), 1, "the baseline");
+        plug.set(&[a.clone(), b.clone()]);
+        for _ in 0..3 {
+            plug.signal(Ok(()));
+        }
+        assert_eq!(next_event(&events), Event::Added(b.clone()));
+        assert_eq!(events.recv_timeout(QUIET * 2), Ok(None), "one listing, one change");
+        assert_eq!(plug.listings.load(Ordering::SeqCst), 2);
+
+        let second = hub.events().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(plug.watches.load(Ordering::SeqCst), 1, "streams share one watch");
+        plug.set(std::slice::from_ref(&b));
+        plug.signal(Ok(()));
+        assert_eq!(next_event(&events), Event::Removed(a.clone()));
+        assert_eq!(next_event(&second), Event::Removed(a));
+    }
+
+    #[test]
+    fn the_watch_stops_with_the_last_stream_and_restarts_on_demand() {
+        let (hub, plug) = plugged(None);
+        let (one, two) = (hub.events().unwrap_or_else(|e| panic!("{e}")), hub.events().unwrap_or_else(|e| panic!("{e}")));
+        drop(one);
+        thread::sleep(IDLE * 2);
+        assert_eq!(plug.stopped.load(Ordering::SeqCst), 0, "one stream left");
+        drop(two);
+        wait_until("the watch to stop", || plug.stopped.load(Ordering::SeqCst) == 1);
+        let _three = hub.events().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(plug.watches.load(Ordering::SeqCst), 2, "a fresh watch");
+    }
+
+    #[test]
+    fn an_unplugged_source_is_reported_missing_to_its_subscribers_and_the_event_stream() {
+        let (hub, _plug) = plugged(Some(2));
+        let events = hub.events().unwrap_or_else(|e| panic!("{e}"));
+        let sub = hub.subscribe(&parse("webcam:cam"), spec(64, 48, 100)).unwrap_or_else(|e| panic!("{e}"));
+        let failure = loop {
+            match sub.recv_timeout(Duration::from_secs(5)) {
+                Ok(Some(_)) => continue,
+                other => break other,
+            }
+        };
+        let missing = Error::Missing("the camera was unplugged".into());
+        assert_eq!(failure, Err(missing.clone()));
+        assert_eq!(next_event(&events), Event::SourceMissing { source: "webcam:the-id".into(), error: missing });
+        // Another failure isn't a missing source.
+        let other = hub.subscribe(&parse("solid:red"), spec(64, 48, 100)).unwrap_or_else(|e| panic!("{e}"));
+        while let Ok(Some(_)) = other.recv_timeout(Duration::from_secs(5)) {}
+        assert_eq!(events.recv_timeout(Duration::from_millis(100)), Ok(None));
+    }
+
+    #[test]
+    fn a_watch_that_cannot_start_or_fails_ends_its_streams_with_the_reason() {
+        let plug = Plug { refuse: true, ..Plug::default() };
+        let hub = Hub::with_hotplug(Fake { counts: Counts::default(), fail_after: None }, plug);
+        assert!(matches!(hub.events().err(), Some(Error::Unsupported(_))));
+
+        let (hub, plug) = plugged(None);
+        let events = hub.events().unwrap_or_else(|e| panic!("{e}"));
+        plug.signal(Err(Error::Io("inotify: read failed".into())));
+        let err = loop {
+            match events.recv_timeout(Duration::from_secs(5)) {
+                Ok(None) => panic!("the failure never came"),
+                Ok(Some(_)) => continue,
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err, Error::Io("inotify: read failed".into()));
+        // The next stream starts a fresh watch.
+        assert!(hub.events().is_ok());
+        assert_eq!(plug.watches.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_restarted_watch_keeps_the_cause_for_streams_that_had_not_read_it() {
+        let (hub, plug) = plugged(None);
+        let first = hub.events().unwrap_or_else(|e| panic!("{e}"));
+        plug.signal(Err(Error::Io("inotify: read failed".into())));
+        wait_until("the watch to fail", || !lock(&hub.inner.watch).running);
+        // Another caller restarts the watch before `first` reads the failure.
+        let second = hub.events().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(plug.watches.load(Ordering::SeqCst), 2);
+        assert_eq!(first.try_recv(), Err(Error::Io("inotify: read failed".into())));
+        assert_eq!(second.try_recv(), Ok(None));
     }
 }

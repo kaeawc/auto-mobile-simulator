@@ -2,7 +2,9 @@
 //! lists built-in, external, Continuity and Desk View cameras and every CoreMediaIO camera
 //! extension (OBS Virtual Camera, Camo, mmhmm); `authorizationStatusForMediaType:` reads the
 //! camera permission without prompting; `Webcam` captures BGRA frames through an
-//! `AVCaptureSession` and a video data output.
+//! `AVCaptureSession` and a video data output, in the device format nearest the request with its
+//! frame duration fixed; `watch` turns `AVCaptureDeviceWasConnected` / `WasDisconnected`
+//! notifications into hot-plug signals.
 //!
 //! Classes and constants are looked up at runtime, so an older macOS without one (Continuity
 //! Camera's device type is macOS 14+) skips it instead of failing to load.
@@ -10,11 +12,12 @@
 
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr::{self, NonNull};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
+use objc2::encode::{Encode, Encoding};
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyClass, AnyObject, Bool, NSObject, NSObjectProtocol, Sel};
 use objc2::{AnyThread, DefinedClass, define_class, msg_send, sel};
@@ -23,6 +26,8 @@ use objc2_foundation::{NSError, NSString};
 use crate::catalog::{Format, HostCamera, classify_apple};
 use crate::error::{Error, Result};
 use crate::frame::{CameraFrame, FrameSpec, Tick};
+use crate::hotplug::Signals;
+use crate::select::{self, Interval, Mode, Rates};
 use crate::source::Source;
 use crate::tcc::Authorization;
 
@@ -30,6 +35,7 @@ type Obj = Retained<AnyObject>;
 
 const AVFOUNDATION: &CStr = c"/System/Library/Frameworks/AVFoundation.framework/AVFoundation";
 const COREMEDIA: &CStr = c"/System/Library/Frameworks/CoreMedia.framework/CoreMedia";
+const COREMEDIAIO: &CStr = c"/System/Library/Frameworks/CoreMediaIO.framework/CoreMediaIO";
 const COREVIDEO: &CStr = c"/System/Library/Frameworks/CoreVideo.framework/CoreVideo";
 
 /// The device types to discover, newest first; each is skipped when this macOS lacks it.
@@ -53,6 +59,41 @@ unsafe extern "C" {
     fn dispatch_release(object: *mut c_void);
 }
 
+/// `CMTime`: `value / timescale` seconds.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CMTime {
+    value: i64,
+    timescale: i32,
+    flags: u32,
+    epoch: i64,
+}
+
+/// `kCMTimeFlags_Valid`.
+const TIME_VALID: u32 = 1;
+
+// SAFETY: the layout above is CoreMedia's `CMTime` (`{?=qiIq}`), an anonymous struct of int64_t,
+// int32_t, uint32_t, int64_t.
+unsafe impl Encode for CMTime {
+    const ENCODING: Encoding = Encoding::Struct("?", &[i64::ENCODING, i32::ENCODING, u32::ENCODING, i64::ENCODING]);
+}
+
+impl CMTime {
+    /// The duration as an interval; `None` for an invalid, zero or negative time.
+    fn interval(self) -> Option<Interval> {
+        if self.flags & TIME_VALID == 0 || self.value <= 0 || self.timescale <= 0 {
+            return None;
+        }
+        Some(Interval { num: self.value as u64, den: self.timescale as u64 })
+    }
+
+    fn of(interval: Interval) -> Option<CMTime> {
+        let value = i64::try_from(interval.num).ok().filter(|&v| v > 0)?;
+        let timescale = i32::try_from(interval.den).ok().filter(|&t| t > 0)?;
+        Some(CMTime { value, timescale, flags: TIME_VALID, epoch: 0 })
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Dimensions {
@@ -66,6 +107,8 @@ struct Dimensions {
 struct Api {
     video: usize,
     device_types: Vec<usize>,
+    /// `AVCaptureDeviceWasConnectedNotification` and `WasDisconnectedNotification`.
+    plugged: Vec<usize>,
     pixel_format_key: usize,
     format_dimensions: unsafe extern "C" fn(*const c_void) -> Dimensions,
     format_subtype: unsafe extern "C" fn(*const c_void) -> u32,
@@ -123,6 +166,10 @@ fn load() -> Result<Api> {
     Ok(Api {
         video: constant(av, c"AVMediaTypeVideo").ok_or_else(|| Error::Unavailable("AVMediaTypeVideo".into()))?,
         device_types,
+        plugged: [c"AVCaptureDeviceWasConnectedNotification", c"AVCaptureDeviceWasDisconnectedNotification"]
+            .iter()
+            .filter_map(|name| constant(av, name))
+            .collect(),
         pixel_format_key: constant(cv, c"kCVPixelBufferPixelFormatTypeKey")
             .ok_or_else(|| Error::Unavailable("kCVPixelBufferPixelFormatTypeKey".into()))?,
         format_dimensions: function(cm, c"CMVideoFormatDescriptionGetDimensions")?,
@@ -306,6 +353,177 @@ fn max_fps(format: &AnyObject) -> Option<f64> {
     ranges.map(|r| array(&r)).unwrap_or_default().iter().map(|r| unsafe { msg_send![&**r, maxFrameRate] }).reduce(f64::max)
 }
 
+/// A device's formats, each as a mode for [`select::nearest`]: its dimensions and the frame
+/// durations of its `videoSupportedFrameRateRanges`, exactly as the device states them.
+fn modes(api: &Api, device: &AnyObject) -> (Vec<Obj>, Vec<Mode>) {
+    if !responds(device, sel!(formats)) {
+        return (Vec::new(), Vec::new());
+    }
+    // SAFETY: `formats` returns an NSArray of AVCaptureDeviceFormat.
+    let list: Option<Obj> = unsafe { msg_send![device, formats] };
+    let formats = list.map(|l| array(&l)).unwrap_or_default();
+    let modes = formats.iter().map(|f| mode(api, f)).collect();
+    (formats, modes)
+}
+
+/// One format as a mode; a format with no description has no size, which the selection skips.
+fn mode(api: &Api, format: &AnyObject) -> Mode {
+    let mut mode = Mode { width: 0, height: 0, rank: 0, rates: Vec::new() };
+    if !responds(format, sel!(formatDescription)) {
+        return mode;
+    }
+    // SAFETY: `formatDescription` returns a CMFormatDescriptionRef owned by the format.
+    let desc: *const c_void = unsafe { send(format, sel!(formatDescription)) };
+    if desc.is_null() {
+        return mode;
+    }
+    // SAFETY: `desc` is a live video format description (the format retains it).
+    let dims = unsafe { (api.format_dimensions)(desc) };
+    (mode.width, mode.height) = (dims.width.max(0) as u32, dims.height.max(0) as u32);
+    if responds(format, sel!(videoSupportedFrameRateRanges)) {
+        // SAFETY: returns an NSArray of AVFrameRateRange.
+        let ranges: Option<Obj> = unsafe { msg_send![format, videoSupportedFrameRateRanges] };
+        for range in ranges.map(|r| array(&r)).unwrap_or_default() {
+            // SAFETY: `minFrameDuration` and `maxFrameDuration` return CMTime.
+            let (fastest, slowest): (CMTime, CMTime) =
+                unsafe { (msg_send![&*range, minFrameDuration], msg_send![&*range, maxFrameDuration]) };
+            if let (Some(fastest), Some(slowest)) = (fastest.interval(), slowest.interval()) {
+                mode.rates.push(Rates { fastest, slowest });
+            }
+        }
+    }
+    mode
+}
+
+/// Switches `device` to the format nearest `spec` and fixes its frame duration there (both limits
+/// to one value from that format's own ranges, as AVFoundation raises on any other). Returns
+/// whether the device is left locked for configuration: the caller unlocks it after
+/// `startRunning`, which would otherwise reset the format to the session preset's. A device that
+/// can't be locked (another app holds it) keeps its current format; frames are scaled either way.
+fn configure(api: &Api, device: &AnyObject, spec: FrameSpec) -> bool {
+    let (formats, modes) = modes(api, device);
+    let Some(choice) = select::nearest(&modes, spec) else { return false };
+    let mut error: *mut NSError = ptr::null_mut();
+    // SAFETY: `lockForConfiguration:` takes an NSError** out-parameter and returns BOOL.
+    if !responds(device, sel!(lockForConfiguration:)) || !unsafe { msg_send![device, lockForConfiguration: &mut error] } {
+        return false;
+    }
+    // SAFETY: the format is one of the device's own `formats`.
+    let _: () = unsafe { msg_send![device, setActiveFormat: &*formats[choice.index]] };
+    let duration = choice.interval.and_then(CMTime::of);
+    if let Some(t) = duration
+        && responds(device, sel!(setActiveVideoMinFrameDuration:))
+        && responds(device, sel!(setActiveVideoMaxFrameDuration:))
+    {
+        // SAFETY: both take a CMTime; `t` is the request inside, or an end of, one of the active
+        // format's frame rate ranges.
+        unsafe {
+            let _: () = msg_send![device, setActiveVideoMinFrameDuration: t];
+            let _: () = msg_send![device, setActiveVideoMaxFrameDuration: t];
+        }
+    }
+    true
+}
+
+/// `AVCaptureDeviceWasConnected` / `WasDisconnected` notifications as hot-plug signals. The
+/// observers' blocks run on whatever thread posts the notification and only send on a channel.
+pub(crate) struct DeviceNotifications {
+    center: Obj,
+    observers: Vec<Obj>,
+    rx: Receiver<()>,
+}
+
+// SAFETY: NSNotificationCenter is thread-safe, and the observers are opaque tokens only passed
+// back to it (`removeObserver:`); nothing else touches them.
+unsafe impl Send for DeviceNotifications {}
+
+/// `CMIOObjectPropertyAddress`.
+#[repr(C)]
+struct CmioAddress {
+    selector: u32,
+    scope: u32,
+    element: u32,
+}
+
+/// `OSStatus CMIOObjectSetPropertyData(CMIOObjectID, const CMIOObjectPropertyAddress *, UInt32
+/// qualifierDataSize, const void *qualifierData, UInt32 dataSize, const void *data)`.
+type CmioSetPropertyData = unsafe extern "C" fn(u32, *const CmioAddress, u32, *const c_void, u32, *const c_void) -> i32;
+
+/// Makes CoreMediaIO post its device notifications from its own thread. AVFoundation's
+/// `AVCaptureDeviceWasConnected` / `WasDisconnected` arrive on the run loop named by
+/// `kCMIOHardwarePropertyRunLoop`, by default the main thread's, which a CLI or daemon never runs;
+/// setting it to NULL moves delivery to CoreMediaIO's own thread. Once per process; the error says
+/// why delivery is left as it was.
+fn own_notification_thread() -> std::result::Result<(), String> {
+    static DONE: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    DONE.get_or_init(|| {
+        let lib = open(COREMEDIAIO).map_err(|e| e.to_string())?;
+        let set = function::<CmioSetPropertyData>(lib, c"CMIOObjectSetPropertyData").map_err(|e| e.to_string())?;
+        // 'rnlp' on the system object (1), global scope ('glob'), main element (0).
+        let address = CmioAddress { selector: u32::from_be_bytes(*b"rnlp"), scope: u32::from_be_bytes(*b"glob"), element: 0 };
+        let none: *const c_void = ptr::null();
+        // SAFETY: the address and the pointer-sized data (a NULL CFRunLoopRef) outlive the call;
+        // there is no qualifier.
+        let status = unsafe { set(1, &address, 0, ptr::null(), size_of::<*const c_void>() as u32, (&raw const none).cast::<c_void>()) };
+        if status == 0 { Ok(()) } else { Err(format!("CMIOObjectSetPropertyData failed with OSStatus {status}")) }
+    })
+    .clone()
+}
+
+pub(crate) fn watch() -> Result<Box<dyn Signals>> {
+    let api = api()?;
+    if let Err(note) = own_notification_thread() {
+        // Notifications then depend on the host running a main run loop; the hub's stall
+        // detection still reports an unplugged camera's capture.
+        eprintln!("sim-camera: hot-plug notifications may not be delivered without a main run loop ({note})");
+    }
+    if api.plugged.len() < 2 {
+        return Err(Error::Unavailable("AVCaptureDeviceWasConnectedNotification".into()));
+    }
+    autoreleasepool(|_| {
+        // SAFETY: `+defaultCenter` returns the process' notification center.
+        let center: Option<Obj> = unsafe { msg_send![class(c"NSNotificationCenter")?, defaultCenter] };
+        let center = center.ok_or_else(|| Error::Unavailable("NSNotificationCenter".into()))?;
+        let (tx, rx) = mpsc::channel();
+        let mut watch = DeviceNotifications { center, observers: Vec::new(), rx };
+        for &name in &api.plugged {
+            let tx = tx.clone();
+            let block = RcBlock::new(move |_note: *mut AnyObject| {
+                let _ = tx.send(());
+            });
+            let none: *const AnyObject = ptr::null();
+            // SAFETY: takes a notification name, a nil sender filter, a nil queue (run on the
+            // posting thread) and a `void (^)(NSNotification *)` block, which it copies; returns
+            // the observer token.
+            let observer: Option<Obj> =
+                unsafe { msg_send![&*watch.center, addObserverForName: object(name), object: none, queue: none, usingBlock: &*block] };
+            watch.observers.extend(observer);
+        }
+        Ok(Box::new(watch) as Box<dyn Signals>)
+    })
+}
+
+impl Signals for DeviceNotifications {
+    fn wait(&mut self, timeout: Duration) -> Result<bool> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(()) => {
+                while self.rx.try_recv().is_ok() {}
+                Ok(true)
+            }
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Ok(false),
+        }
+    }
+}
+
+impl Drop for DeviceNotifications {
+    fn drop(&mut self) {
+        for observer in &self.observers {
+            // SAFETY: `removeObserver:` takes a token `addObserverForName:...` returned.
+            let _: () = unsafe { msg_send![&*self.center, removeObserver: &**observer] };
+        }
+    }
+}
+
 /// A frame the delegate copied out, and when.
 struct Arrived {
     width: u32,
@@ -428,7 +646,7 @@ impl Webcam {
         autoreleasepool(|_| Self::open_inner(camera, spec))
     }
 
-    fn open_inner(camera: &HostCamera, _spec: FrameSpec) -> Result<Webcam> {
+    fn open_inner(camera: &HostCamera, spec: FrameSpec) -> Result<Webcam> {
         let api = api()?;
         let unique_id = NSString::from_str(&camera.id);
         // SAFETY: `+deviceWithUniqueID:` takes an NSString and returns a device or nil.
@@ -479,10 +697,16 @@ impl Webcam {
         if !unsafe { msg_send![&*webcam.session, canAddOutput: &*webcam.output] } {
             return Err(Error::Capture(format!("{} can't deliver video frames", camera.name)));
         }
-        // SAFETY: checked above; `startRunning` blocks until the session runs or fails.
+        // SAFETY: checked above.
+        let _: () = unsafe { msg_send![&*webcam.session, addOutput: &*webcam.output] };
+        let locked = configure(api, &webcam.device, spec);
+        // SAFETY: `startRunning` blocks until the session runs or fails; `unlockForConfiguration`
+        // balances `configure`'s lock.
         unsafe {
-            let _: () = msg_send![&*webcam.session, addOutput: &*webcam.output];
             let _: () = msg_send![&*webcam.session, startRunning];
+            if locked {
+                let _: () = msg_send![&*webcam.device, unlockForConfiguration];
+            }
         }
         Ok(webcam)
     }
@@ -501,7 +725,7 @@ impl Webcam {
         // SAFETY: `isConnected` returns BOOL.
         let connected: bool = unsafe { msg_send![&*self.device, isConnected] };
         if !connected {
-            return Error::Capture(format!("{} was disconnected", self.name));
+            return Error::Missing(format!("{} was disconnected", self.name));
         }
         Error::Capture(format!("no frames from {} for {} s", self.name, FRAME_TIMEOUT.as_secs()))
     }
@@ -561,5 +785,82 @@ mod tests {
     fn avfoundation_loads_and_discovers_device_types() {
         let api = api().unwrap_or_else(|e| panic!("{e}"));
         assert!(!api.device_types.is_empty(), "at least the built-in camera type");
+        assert_eq!(api.plugged.len(), 2, "both hot-plug notifications");
+    }
+
+    /// CoreMediaIO accepts a NULL run loop (touches no camera: nothing is opened, no prompt). Live
+    /// delivery of a real plug still needs the #335 live check.
+    #[test]
+    fn hot_plug_notifications_move_to_coremediaio_own_thread() {
+        assert_eq!(own_notification_thread(), Ok(()));
+    }
+
+    /// Registers and removes the hot-plug observers (no camera is opened, nothing prompts).
+    #[test]
+    fn device_notifications_start_and_stop() {
+        let mut signals = watch().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(signals.wait(Duration::from_millis(10)), Ok(false));
+        drop(signals);
+    }
+
+    /// Reads each listed camera's formats and frame durations as modes, the way `configure` does
+    /// before a capture, without opening, locking or capturing from it. Passes with no cameras.
+    #[test]
+    fn listed_cameras_formats_read_as_modes() {
+        let api = api().unwrap_or_else(|e| panic!("{e}"));
+        for camera in cameras().unwrap_or_default() {
+            autoreleasepool(|_| {
+                let unique_id = NSString::from_str(&camera.id);
+                let device = class(c"AVCaptureDevice").unwrap_or_else(|e| panic!("{e}"));
+                // SAFETY: `+deviceWithUniqueID:` takes an NSString and returns a device or nil.
+                let device: Option<Obj> = unsafe { msg_send![device, deviceWithUniqueID: &*unique_id] };
+                let Some(device) = device else { return };
+                let (formats, modes) = modes(api, &device);
+                assert_eq!(formats.len(), modes.len());
+                let sized = modes.iter().filter(|m| m.width > 0).count();
+                println!(
+                    "{}: {} format(s), {sized} sized, choice for VGA {:?}",
+                    camera.name,
+                    modes.len(),
+                    select::nearest(&modes, FrameSpec::default())
+                );
+                for r in modes.iter().flat_map(|m| &m.rates) {
+                    assert!(r.fastest.fps() >= r.slowest.fps() - 1e-9, "{r:?}");
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn cmtimes_convert_to_intervals_and_back_exactly() {
+        let time = |value, timescale, flags| CMTime { value, timescale, flags, epoch: 0 };
+        assert_eq!(time(1001, 30000, TIME_VALID).interval(), Some(Interval { num: 1001, den: 30000 }));
+        assert_eq!(time(1, 30, 0).interval(), None, "not valid");
+        assert_eq!(time(0, 30, TIME_VALID).interval(), None);
+        assert_eq!(time(1, -30, TIME_VALID).interval(), None);
+        let ntsc = Interval { num: 1001, den: 30000 };
+        assert_eq!(CMTime::of(ntsc), Some(time(1001, 30000, TIME_VALID)));
+        assert_eq!(CMTime::of(Interval { num: 1, den: u64::MAX }), None, "a timescale past i32");
+        assert_eq!(CMTime::of(Interval { num: 0, den: 30 }), None);
+        assert_eq!(size_of::<CMTime>(), 24);
+    }
+
+    /// A Logitech C920's list as AVFoundation reports it (each format one range of 30 fps down to
+    /// 5), chosen for requests the hub makes.
+    #[test]
+    fn webcam_requests_choose_the_nearest_avfoundation_format() {
+        let range = |fps: i32| Rates {
+            fastest: Interval { num: 1, den: fps as u64 },
+            slowest: CMTime { value: 1, timescale: 5, flags: TIME_VALID, epoch: 0 }.interval().unwrap_or(Interval { num: 1, den: 5 }),
+        };
+        let formats = [(640, 480, 30), (800, 600, 24), (1280, 720, 30), (1600, 896, 15), (1920, 1080, 30), (2304, 1536, 2)];
+        let modes: Vec<Mode> =
+            formats.iter().map(|&(width, height, fps)| Mode { width, height, rank: 0, rates: vec![range(fps)] }).collect();
+        let pick = |w, h, fps| select::nearest(&modes, FrameSpec { width: w, height: h, fps }).map(|c| (formats[c.index], c.interval));
+        let per = |den| Some(Interval { num: 1, den });
+        assert_eq!(pick(640, 480, 30), Some(((640, 480, 30), per(30))));
+        assert_eq!(pick(1280, 720, 15), Some(((1280, 720, 30), per(15))));
+        assert_eq!(pick(1920, 1080, 60), Some(((1920, 1080, 30), per(30))), "capped at the format's fastest");
+        assert_eq!(pick(1600, 900, 30), Some(((1600, 896, 15), per(15))));
     }
 }
