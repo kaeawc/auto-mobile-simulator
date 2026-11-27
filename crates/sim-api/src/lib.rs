@@ -13,7 +13,8 @@
 //! ([`Client::call_binary`], docs/api.md).
 //!
 //! `{"method": "help"}` lists every method with its parameters. Each connection gets its own
-//! thread and its own service connection. Device methods need the iOS backend, which exists on
+//! thread (one a closed connection left waiting, when there is one) and its own service
+//! connection. Device methods need the iOS backend, which exists on
 //! macOS hosts; elsewhere they fail with a clear reason.
 
 mod android;
@@ -37,6 +38,10 @@ pub mod settle;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -171,11 +176,95 @@ fn serve_stream(stream: UnixStream, mut call: impl FnMut(&str, &Value) -> Result
     }
 }
 
+/// Makes each connection's session.
+type MakeSession = Arc<dyn Fn() -> methods::Session + Send + Sync>;
+
+/// Connection threads whose connection closed, waiting a while for the next one: handing a new
+/// connection to one costs less than starting a thread for it. Each connection still gets a
+/// session of its own, made for it, and a thread of its own while it is open.
+struct Threads {
+    make: MakeSession,
+    /// Idle threads, newest last, by id.
+    idle: Mutex<Vec<(u64, Sender<UnixStream>)>>,
+    next_id: AtomicU64,
+    /// At most this many threads wait for connections; more than that end with theirs.
+    max_idle: usize,
+    /// How long an idle thread waits for a connection before it ends.
+    idle_for: Duration,
+}
+
+impl Threads {
+    fn new(make: MakeSession) -> Arc<Threads> {
+        Threads::with_limits(make, 8, Duration::from_secs(30))
+    }
+
+    fn with_limits(make: MakeSession, max_idle: usize, idle_for: Duration) -> Arc<Threads> {
+        Arc::new(Threads { make, idle: Mutex::default(), next_id: AtomicU64::new(0), max_idle, idle_for })
+    }
+
+    fn idle(&self) -> std::sync::MutexGuard<'_, Vec<(u64, Sender<UnixStream>)>> {
+        self.idle.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Serves `stream` on an idle thread, or on a new one when none waits.
+    fn serve(self: &Arc<Threads>, stream: UnixStream) -> std::io::Result<()> {
+        let mut stream = stream;
+        {
+            // Sent under the lock, so a thread that finds itself no longer listed knows a
+            // connection is in its channel ([`Threads::run`]).
+            let mut idle = self.idle();
+            while let Some((_, thread)) = idle.pop() {
+                match thread.send(stream) {
+                    Ok(()) => return Ok(()),
+                    Err(std::sync::mpsc::SendError(back)) => stream = back,
+                }
+            }
+        }
+        let threads = self.clone();
+        std::thread::Builder::new().name("simee-api".into()).spawn(move || threads.run(stream)).map(drop)
+    }
+
+    /// A connection thread: serves `stream`, then the connections handed to it while it waits.
+    fn run(&self, stream: UnixStream) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = channel();
+        let mut stream = stream;
+        loop {
+            serve_connection(stream, &*self.make);
+            {
+                let mut idle = self.idle();
+                if idle.len() >= self.max_idle {
+                    return;
+                }
+                idle.push((id, tx.clone()));
+            }
+            stream = match rx.recv_timeout(self.idle_for) {
+                Ok(next) => next,
+                Err(_) => {
+                    let mut idle = self.idle();
+                    match idle.iter().position(|(other, _)| *other == id) {
+                        Some(i) => {
+                            idle.remove(i);
+                            return;
+                        }
+                        // Taken off the list as the wait ended: its connection is in the channel.
+                        None => match rx.try_recv() {
+                            Ok(next) => next,
+                            Err(_) => return,
+                        },
+                    }
+                }
+            };
+        }
+    }
+}
+
 /// Listens on `path` (replacing a stale socket) and serves connections until the process exits.
 pub fn serve(path: &Path) -> std::io::Result<()> {
     let listener = bind(path)?;
+    let threads = Threads::new(Arc::new(methods::Session::default));
     for stream in listener.incoming().flatten() {
-        std::thread::Builder::new().name("simee-api".into()).spawn(move || serve_connection(stream, &methods::Session::default))?;
+        threads.serve(stream)?;
     }
     Ok(())
 }
@@ -189,11 +278,10 @@ pub fn serve_in_background(path: PathBuf) -> std::io::Result<()> {
 /// AVD home, say).
 pub fn serve_in_background_with(path: PathBuf, make: impl Fn() -> methods::Session + Send + Sync + 'static) -> std::io::Result<()> {
     let listener = bind(&path)?;
-    let make = std::sync::Arc::new(make);
+    let threads = Threads::new(Arc::new(make));
     std::thread::Builder::new().name("simee-api-accept".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
-            let make = make.clone();
-            let _ = std::thread::Builder::new().name("simee-api".into()).spawn(move || serve_connection(stream, &*make));
+            let _ = threads.serve(stream);
         }
     })?;
     Ok(())
@@ -495,6 +583,124 @@ mod tests {
         assert_eq!(wire, expected);
     }
 
+    /// Everything the serve loop sends back for `input`, once the client stops writing.
+    fn served(input: &[u8]) -> Vec<u8> {
+        let (mut ours, theirs) = UnixStream::pair().expect("pair");
+        std::thread::spawn(move || serve_stream(theirs, |m, _| if m == "fail" { Err("it failed".into()) } else { Ok(json!(m)) }));
+        ours.write_all(input).expect("write");
+        ours.shutdown(std::net::Shutdown::Write).expect("shutdown");
+        let mut wire = Vec::new();
+        std::io::Read::read_to_end(&mut ours, &mut wire).expect("read");
+        wire
+    }
+
+    #[test]
+    fn the_serve_loop_reads_lines_as_it_always_has() {
+        // `\n` and `\r\n` endings, blank and whitespace-only lines skipped, a bad line answered, and
+        // a last line with no newline answered at the end of the stream.
+        let wire =
+            served(b"{\"id\":1,\"method\":\"a\"}\r\n\n \t\r\n{\"id\":2,\"method\":\"fail\"}\nnot json\r\n{\"id\":3,\"method\":\"c\"}");
+        let expected = [
+            old_response(&json!(1), &Ok(json!("a"))),
+            old_response(&json!(2), &Err("it failed".into())),
+            old_response(&Value::Null, &Err(bad_request("not json"))),
+            old_response(&json!(3), &Ok(json!("c"))),
+        ]
+        .map(|line| line + "\n")
+        .concat();
+        assert_eq!(String::from_utf8_lossy(&wire), expected);
+        // A line that isn't UTF-8 ends the connection: nothing after it is answered.
+        let wire = served(b"{\"id\":1,\"method\":\"a\"}\n\xff\xfe\n{\"id\":2,\"method\":\"b\"}\n");
+        assert_eq!(String::from_utf8_lossy(&wire), old_response(&json!(1), &Ok(json!("a"))) + "\n");
+    }
+
+    #[test]
+    fn served_replies_are_the_bytes_handle_line_gives() {
+        let path = crate::test_socket(&format!("simee-api-same-{}.sock", std::process::id()));
+        serve_in_background(path.clone()).expect("bind");
+        let mut s = methods::Session::default();
+        for _ in 0..2 {
+            let mut stream = BufReader::new(UnixStream::connect(&path).expect("connect"));
+            for line in [
+                r#"{"id":1,"method":"identity"}"#,
+                r#"{"id":"two","method":"help","params":null}"#,
+                r#"{"id":3,"method":"form_factors","params":{"platform":"android"}}"#,
+                r#"{"id":4,"method":"form_factors","params":{"platform":"plan9"}}"#,
+                r#"{"id":5,"method":"nope"}"#,
+                r#"{"method":"identity","binary":true}"#,
+                "{",
+            ] {
+                stream.get_mut().write_all(format!("{line}\n").as_bytes()).expect("write");
+                let mut reply = String::new();
+                stream.read_line(&mut reply).expect("read");
+                assert_eq!(reply, handle_line(&mut s, line) + "\n", "{line}");
+            }
+        }
+        std::fs::remove_file(path).ok();
+    }
+
+    /// A session maker that records which thread made each session.
+    fn recording() -> (MakeSession, Arc<Mutex<Vec<std::thread::ThreadId>>>) {
+        let made = Arc::new(Mutex::new(Vec::new()));
+        let log = made.clone();
+        let make: MakeSession = Arc::new(move || {
+            log.lock().expect("log").push(std::thread::current().id());
+            methods::Session::default()
+        });
+        (make, made)
+    }
+
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let start = std::time::Instant::now();
+        while !done() {
+            assert!(start.elapsed() < Duration::from_secs(10), "{what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A client whose connection `threads` serves.
+    fn connect_to(threads: &Arc<Threads>) -> Client {
+        let (ours, theirs) = UnixStream::pair().expect("pair");
+        threads.serve(theirs).expect("serve");
+        Client::from_stream(ours)
+    }
+
+    #[test]
+    fn a_connection_thread_serves_the_next_connection_with_a_new_session() {
+        let (make, made) = recording();
+        let threads = Threads::new(make);
+        for n in 1..=3 {
+            let mut client = connect_to(&threads);
+            assert_eq!(client.call("identity", &Value::Null).as_ref(), Ok(identity()));
+            drop(client);
+            wait_until("the thread waits for the next connection", || threads.idle().len() == 1);
+            assert_eq!(made.lock().expect("made").len(), n, "a session of its own for each connection");
+        }
+        let made = made.lock().expect("made");
+        assert!(made.iter().all(|id| *id == made[0]), "one thread served all three in turn: {made:?}");
+    }
+
+    #[test]
+    fn open_connections_have_threads_of_their_own_and_idle_threads_are_bounded() {
+        let (make, made) = recording();
+        let threads = Threads::with_limits(make, 2, Duration::from_millis(300));
+        let mut clients: Vec<Client> = (0..4).map(|_| connect_to(&threads)).collect();
+        for client in &mut clients {
+            assert_eq!(client.call("identity", &Value::Null).as_ref(), Ok(identity()));
+        }
+        let ids = made.lock().expect("made").clone();
+        assert_eq!(ids.len(), 4);
+        assert!(ids.iter().enumerate().all(|(i, a)| !ids[..i].contains(a)), "four threads at once: {ids:?}");
+        drop(clients);
+        // Two wait for the next connection (the other two ended), then those end too.
+        wait_until("two threads wait", || threads.idle().len() == 2);
+        wait_until("idle threads end after a while", || threads.idle().is_empty());
+        // A connection after that is served on a new thread.
+        let mut client = connect_to(&threads);
+        assert_eq!(client.call("identity", &Value::Null).as_ref(), Ok(identity()));
+        assert!(!ids.contains(made.lock().expect("made").last().expect("made")));
+    }
+
     #[test]
     fn a_truncated_binary_reply_is_an_error_not_a_hang() {
         let (ours, theirs) = UnixStream::pair().expect("pair");
@@ -579,6 +785,61 @@ mod tests {
              binary then client writes {client_file:.2} ms"
         );
         std::fs::remove_file(file).ok();
+    }
+
+    /// The median of 5 rounds of the mean microseconds per call of `f` (up to 20 000 calls or
+    /// 300 ms a round).
+    fn per_call_us(mut f: impl FnMut()) -> f64 {
+        let mut rounds: Vec<f64> = (0..5)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                let mut n = 0;
+                while n < 20_000 && (n < 20 || start.elapsed() < std::time::Duration::from_millis(300)) {
+                    f();
+                    n += 1;
+                }
+                start.elapsed().as_secs_f64() * 1e6 / n as f64
+            })
+            .collect();
+        rounds.sort_by(f64::total_cmp);
+        rounds[2]
+    }
+
+    /// Where a cheap call's time goes, in this process: parsing the request line, the method
+    /// (dropping its result included), writing the response line; then the whole of
+    /// `handle_line_into`, a round trip on a kept connection, and one on a new connection per call.
+    ///     cargo test --release -p sim-api call_overhead -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn call_overhead() {
+        let path = crate::test_socket(&format!("simee-api-ovh-{}.sock", std::process::id()));
+        serve_in_background(path.clone()).expect("bind");
+        let mut client = Client::connect(&path).expect("connect");
+        let mut s = methods::Session::default();
+        let mut out = Vec::new();
+        // `method` includes dropping its result; `line` is all of `handle_line_into`.
+        println!(
+            "{:<13} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9}  µs per call",
+            "method", "parse", "method", "write", "line", "kept", "per-conn"
+        );
+        for method in ["identity", "help", "form_factors"] {
+            let line = format!(r#"{{"id":1,"method":"{method}"}}"#);
+            let parse = per_call_us(|| drop(std::hint::black_box(serde_json::from_str::<Request>(&line).expect("request"))));
+            let run = per_call_us(|| drop(std::hint::black_box(methods::call(&mut s, method, &Value::Null))));
+            let result = methods::call(&mut s, method, &Value::Null);
+            let write = per_call_us(|| {
+                out.clear();
+                respond(&json!(1), &result, None, &mut out);
+            });
+            let whole = per_call_us(|| {
+                out.clear();
+                handle_line_into(&mut s, &line, &mut out);
+            });
+            let kept = per_call_us(|| drop(client.call(method, &Value::Null).expect("kept")));
+            let fresh = per_call_us(|| drop(call(&path, method, Value::Null).expect("per connection")));
+            println!("{method:<13} {parse:>8.2} {run:>8.2} {write:>8.2} {whole:>8.2} {kept:>8.2} {fresh:>9.2}");
+        }
+        std::fs::remove_file(path).ok();
     }
 
     /// A 3 MB screenshot response's round trip over the socket, old path against new (server
