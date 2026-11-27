@@ -162,7 +162,11 @@ fn renderer_features(virtual_queue: bool, pipe_gles: bool, extra: Option<&str>) 
 /// Whether the environment asks for a renderer with GL even for a guest on ANGLE: GL
 /// composition (`EMU_GL_COMPOSITION`) or `EMU_RENDERER_GL=1`.
 fn gl_requested() -> bool {
-    std::env::var_os("EMU_GL_COMPOSITION").is_some() || std::env::var_os("EMU_RENDERER_GL").is_some()
+    std::env::var_os("EMU_GL_COMPOSITION").is_some()
+        || std::env::var_os("EMU_RENDERER_GL").is_some()
+        // The direct Vulkan readback is turned off, so frames go through GL (see
+        // `emu_gfxstream`'s `VkRead::symbols`): the renderer keeps GL, and host ANGLE must too.
+        || std::env::var("EMU_READBACK").is_ok_and(|v| v == "gl")
 }
 
 /// Whether the renderer in `lib64` will run without GL for a guest on ANGLE (`vulkan_only`, as
