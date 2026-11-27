@@ -100,12 +100,12 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `button` | Android, iOS | device, button(home\|lock\|side\|siri\|apple-pay\|action \| back\|volume-up\|volume-down\|recents\|menu\|up\|down\|left\|right\|select\|play-pause), hold_ms? | Press a hardware button, as the device's form factor has it: the Siri Remote on Apple TV (menu/back, home, select, play-pause, arrows) and the D-pad on Android TV; on Apple Watch home is the crown's press. Held hold_ms (default: 10 for home and lock on an iPhone or iPad, else 80) |
 | `type` | Android, iOS | device, text | Type on the hardware keyboard (iOS: a key report every 3 ms) |
 | `key` | Android, iOS | device, usage | Press a key by HID usage (iOS: down and up 3 ms apart) |
-| `open_url` | iOS | device, url | Open a URL |
-| `install` | iOS | device, path | Install an .app |
-| `uninstall` | iOS | device, bundle_id | Uninstall an app |
-| `launch` | iOS | device, bundle_id, args?, env?, shaped? | Launch with arguments and environment (shaped: inject the network shaper); returns pid |
-| `terminate` | iOS | device, bundle_id | Terminate an app |
-| `apps` | iOS | device | Installed bundle ids |
+| `open_url` | Android, iOS | device, url | Open a URL (Android: `am start -a VIEW`) |
+| `install` | Android, iOS | device, path | Install an .app (Android: an .apk with `adb install -r`, an .aab through bundletool when it is on the PATH) |
+| `uninstall` | Android, iOS | device, bundle_id | Uninstall an app (Android: the package name; `pm uninstall`) |
+| `launch` | Android, iOS | device, bundle_id, restart?; iOS: args?, env?, shaped? | Launch (iOS: with arguments and environment, shaped injecting the network shaper; Android: the package's launcher activity); restart: terminate a running instance first, default true (Android: `am start -S`); false brings a running app to the front; returns pid |
+| `terminate` | Android, iOS | device, bundle_id | Terminate an app (Android: `am force-stop`) |
+| `apps` | Android, iOS | device; Android: all? | Installed bundle ids (Android: the third-party packages, with all the system's too) |
 | `appearance` | iOS | device, mode(light\|dark) | Light or dark UI |
 | `location` | Android, iOS | device, latitude, longitude | Simulated location |
 | `privacy` | iOS | device, action(grant\|revoke), service, bundle_id | Privacy permission |

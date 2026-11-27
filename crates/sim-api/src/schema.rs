@@ -52,7 +52,7 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         "hold_ms" | "duration_ms" | "timeout_s" | "settle_timeout_s" | "concurrency" | "first_port" | "usage" | "pid" | "signal"
         | "ticks" | "pressure" | "level" | "wifi_bars" | "cellular_bars" | "battery_level" | "state" | "port_base" | "port_count" => Int,
         "booted" | "on" | "suppressed" | "undo" | "shaped" | "settle" | "settle_foreground" | "audio" | "mute" | "sizes" | "offline"
-        | "proxy" | "face" | "foreground" | "eraser" | "folded" | "restart" | "stream" => Bool,
+        | "proxy" | "face" | "foreground" | "eraser" | "folded" | "restart" | "stream" | "all" => Bool,
         "env" => StrMap,
         "payload" => Obj,
         "rules" => Objects,

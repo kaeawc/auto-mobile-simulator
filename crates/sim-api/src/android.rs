@@ -52,10 +52,22 @@ const IOS_BOOT_PARAMS: &[(&str, &str)] = &[
     ("env", "it is a simulator launchd's environment"),
 ];
 
+/// `launch` parameters only iOS devices take, and why.
+const IOS_LAUNCH_PARAMS: &[(&str, &str)] = &[
+    ("args", "an Android app starts from an intent, not a command line"),
+    ("env", "an Android app starts from an intent, with the environment its zygote gives it"),
+    ("shaped", "the network shaper is injected into a simulator's processes"),
+];
+
 /// Rejects iOS-only boot parameters that ask for something (a `false`, `null`, empty or absent
 /// one asks for nothing), naming the platform that has them.
 fn reject_ios_boot_params(method: &str, p: &Value) -> Result<(), String> {
-    for (key, why) in IOS_BOOT_PARAMS {
+    reject_ios_params(method, p, IOS_BOOT_PARAMS)
+}
+
+/// [`reject_ios_boot_params`] for any table of iOS-only parameters.
+fn reject_ios_params(method: &str, p: &Value, params: &[(&str, &str)]) -> Result<(), String> {
+    for (key, why) in params {
         let asks = match p.get(*key) {
             None | Some(Value::Null | Value::Bool(false)) => false,
             Some(Value::Object(m)) => !m.is_empty(),
@@ -67,6 +79,42 @@ fn reject_ios_boot_params(method: &str, p: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The app methods, over adb: the parameters are read before anything runs, so a missing one is
+/// reported whether or not the device is up. Results are iOS's: nothing for `install`,
+/// `uninstall`, `terminate` and `open_url`, `{pid}` for `launch` (null when the app's process
+/// isn't named for its package), the package names for `apps`.
+fn app(android: &Android, d: &sim_android::Device, method: &str, p: &Value) -> Result<Value, String> {
+    let null = |r: Result<(), String>| r.map(|()| Value::Null);
+    match method {
+        "install" => {
+            let path = need_str(p, "path")?;
+            null(d.adb(android)?.install(std::path::Path::new(path)))
+        }
+        "uninstall" => {
+            let package = need_str(p, "bundle_id")?;
+            null(d.adb(android)?.uninstall(package))
+        }
+        "launch" => {
+            let package = need_str(p, "bundle_id")?;
+            reject_ios_params(method, p, IOS_LAUNCH_PARAMS)?;
+            let restart = opt_bool(p, "restart")?.unwrap_or(true);
+            d.adb(android)?.launch(package, restart).map(|pid| json!({"pid": pid}))
+        }
+        "terminate" => {
+            let package = need_str(p, "bundle_id")?;
+            null(d.adb(android)?.terminate(package))
+        }
+        "apps" => {
+            let all = opt_bool(p, "all")?.unwrap_or(false);
+            d.adb(android)?.apps(all).map(|names| json!(names))
+        }
+        _ => {
+            let url = need_str(p, "url")?;
+            null(d.adb(android)?.open_url(url))
+        }
+    }
 }
 
 /// `fold`: `folded` (the console's `fold` or `unfold`), a hinge `angle`, or a `posture` (stock's
@@ -206,6 +254,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             sleep(Duration::from_millis(15));
             null(d.key(usage, Direction::Up))
         }
+        "install" | "uninstall" | "launch" | "terminate" | "apps" | "open_url" => app(&android, &d, method, p),
         "location" => {
             let (lat, lon) = (crate::params::need_f64(p, "latitude")?, crate::params::need_f64(p, "longitude")?);
             null(d.set_location(lat, lon))
@@ -280,5 +329,124 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             }
         }
         other => Err(format!("`{other}` isn't implemented for Android devices")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+    use sim_android::testing::{FakeAdb, FakeEmulator, fake_adb, fake_emulator};
+
+    use crate::methods::{Session, call};
+
+    /// A session over a running AVD `phone` whose adb is the fake. Keep the returned emulator:
+    /// it answers the console for as long as it lives.
+    fn session(tag: &str) -> (Session, std::path::PathBuf, FakeAdb, FakeEmulator) {
+        let root = std::path::PathBuf::from("/tmp").join(format!("sa-app-{tag}-{}", std::process::id()));
+        let image = root.join("sdk/system-images/android-36/google_apis/x86_64");
+        std::fs::create_dir_all(&image).expect("image dir");
+        std::fs::write(image.join("system.img"), b"s").expect("system.img");
+        std::fs::write(image.join("source.properties"), "AndroidVersion.ApiLevel=36\nSystemImage.TagId=google_apis\n").expect("props");
+        let mut android = sim_android::Android::new(emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") });
+        android.running_dir = Some(root.join("running"));
+        android.create("phone", "system-images;android-36;google_apis;x86_64", None).expect("create");
+        let adb = fake_adb(&android);
+        let emulator = fake_emulator(&android, "phone");
+        (Session::with_android(android), root, adb, emulator)
+    }
+
+    fn run(s: &mut Session, method: &str, p: Value) -> Result<Value, String> {
+        let mut p = p;
+        p["device"] = json!("phone");
+        p["platform"] = json!("android");
+        call(s, method, &p)
+    }
+
+    #[test]
+    fn help_lists_both_platforms_for_the_app_methods() {
+        let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
+        for method in ["install", "uninstall", "launch", "terminate", "apps", "open_url"] {
+            let row = help.as_array().and_then(|a| a.iter().find(|x| x["method"] == method)).expect(method);
+            assert_eq!(row["platforms"], json!(["android", "ios"]), "{method}");
+        }
+    }
+
+    #[test]
+    fn the_app_methods_answer_as_on_ios() {
+        let (mut s, root, adb, _emulator) = session("shapes");
+        let apk = root.join("app.apk");
+        std::fs::write(&apk, b"PK").expect("apk");
+        assert_eq!(run(&mut s, "install", json!({"path": apk})), Ok(Value::Null));
+        assert_eq!(run(&mut s, "launch", json!({"bundle_id": "com.example.app"})), Ok(json!({"pid": 4321})));
+        assert_eq!(run(&mut s, "apps", json!({})), Ok(json!(["com.example.app", "com.example.zeta"])));
+        assert_eq!(
+            run(&mut s, "apps", json!({"all": true})),
+            Ok(json!(["android", "com.android.settings", "com.example.app", "com.example.zeta"]))
+        );
+        assert_eq!(run(&mut s, "open_url", json!({"url": "https://example.com/"})), Ok(Value::Null));
+        assert_eq!(run(&mut s, "terminate", json!({"bundle_id": "com.example.app"})), Ok(Value::Null));
+        assert_eq!(run(&mut s, "uninstall", json!({"bundle_id": "com.example.app"})), Ok(Value::Null));
+        let calls = adb.calls();
+        assert_eq!(calls[0], format!("install -r {}", apk.display()));
+        assert_eq!(
+            calls[2],
+            "shell am start -W -S -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n 'com.example.app/.MainActivity'"
+        );
+        assert_eq!(
+            calls[3..],
+            [
+                "shell pidof -s com.example.app",
+                "shell pm list packages -3",
+                "shell pm list packages",
+                "shell am start -a android.intent.action.VIEW -d 'https://example.com/'",
+                "shell am force-stop com.example.app",
+                "shell pm uninstall com.example.app",
+            ]
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn launch_restarts_unless_restart_is_false() {
+        let (mut s, root, adb, _emulator) = session("restart");
+        run(&mut s, "launch", json!({"bundle_id": "com.example.app", "restart": false})).expect("front");
+        run(&mut s, "launch", json!({"bundle_id": "com.example.app", "restart": null})).expect("default");
+        let starts: Vec<String> = adb.calls().into_iter().filter(|c| c.starts_with("shell am start")).collect();
+        assert!(starts[0].starts_with("shell am start -W -a "), "no -S when restart is false: {starts:?}");
+        assert!(starts[1].starts_with("shell am start -W -S "), "-S by default, as iOS terminates first: {starts:?}");
+        assert!(run(&mut s, "launch", json!({"bundle_id": "com.example.app", "restart": "no"})).is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn launch_refuses_what_only_ios_has() {
+        let (mut s, root, adb, _emulator) = session("iosonly");
+        for (key, value) in [("args", json!(["-x"])), ("env", json!({"A": "b"})), ("shaped", json!(true))] {
+            let err = run(&mut s, "launch", json!({"bundle_id": "com.example.app", key: value})).expect_err(key);
+            assert!(err.starts_with(&format!("`launch` takes `{key}` for iOS devices only")), "{err}");
+        }
+        // Asking for nothing is fine.
+        run(&mut s, "launch", json!({"bundle_id": "com.example.app", "args": [], "env": {}, "shaped": false})).expect("empty");
+        assert_eq!(adb.calls().len(), 3, "only the last call ran adb");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn failures_reach_the_caller() {
+        let (mut s, root, _adb, _emulator) = session("fail");
+        let err = run(&mut s, "uninstall", json!({"bundle_id": "com.missing.app"})).expect_err("not installed");
+        assert_eq!(err, "adb failed: Failure [DELETE_FAILED_INTERNAL_ERROR]");
+        let err = run(&mut s, "launch", json!({"bundle_id": "com.missing.app"})).expect_err("no launcher");
+        assert!(err.contains("has no launcher activity"), "{err}");
+        let err = run(&mut s, "install", json!({"path": root.join("absent.apk")})).expect_err("absent");
+        assert!(err.ends_with("isn't a file"), "{err}");
+        let err = run(&mut s, "open_url", json!({"url": "nowhere://x"})).expect_err("no handler");
+        assert!(err.contains("Activity not started"), "{err}");
+        for (method, param) in
+            [("install", "path"), ("uninstall", "bundle_id"), ("launch", "bundle_id"), ("terminate", "bundle_id"), ("open_url", "url")]
+        {
+            assert_eq!(run(&mut s, method, json!({})), Err(format!("missing string parameter `{param}`")), "{method}");
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 }

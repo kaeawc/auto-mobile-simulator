@@ -116,3 +116,69 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
     }
     lines.lock().expect("lines").clone()
 }
+
+/// A stand-in `adb` in `android`'s SDK (`platform-tools/adb`, a shell script): it logs each
+/// invocation and answers the app commands the way a device does, with the texts a real
+/// API 36 guest prints. Package `com.example.app` is installed with a launcher activity (and
+/// third-party; `com.example.svc` launches but never has a process), `com.missing.app` isn't, `broken.apk` fails to install and `com.example.crash`
+/// has an activity that doesn't start.
+pub fn fake_adb(android: &Android) -> FakeAdb {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = android.env.sdk_root.as_ref().expect("sdk root").join("platform-tools");
+    std::fs::create_dir_all(&dir).expect("platform-tools");
+    let adb = dir.join("adb");
+    std::fs::write(&adb, FAKE_ADB).expect("adb");
+    std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    FakeAdb { log: dir.join("adb.log") }
+}
+
+/// What a [`fake_adb`] was asked.
+pub struct FakeAdb {
+    log: std::path::PathBuf,
+}
+
+impl FakeAdb {
+    /// Each invocation's arguments, in order, without the leading `-s <serial>`.
+    pub fn calls(&self) -> Vec<String> {
+        let text = std::fs::read_to_string(&self.log).unwrap_or_default();
+        text.lines().map(|l| l.split_once(' ').and_then(|(_, rest)| rest.split_once(' ')).map_or(l, |(_, r)| r).to_owned()).collect()
+    }
+}
+
+const FAKE_ADB: &str = r#"#!/bin/sh
+echo "$*" >> "$(dirname "$0")/adb.log"
+[ "$1" = "-s" ] && shift 2
+case "$1" in
+install)
+  case "$*" in
+    *broken.apk*) echo "Performing Streamed Install" >&2; echo "adb: failed to install broken.apk: Failure [INSTALL_PARSE_FAILED_NOT_APK: Failed to parse /data/app/vmdl1.tmp/base.apk]" >&2; exit 1;;
+  esac
+  echo "Performing Streamed Install"
+  echo "Success";;
+shell)
+  case "$2" in
+    "pm uninstall com.missing.app") echo "Failure [DELETE_FAILED_INTERNAL_ERROR]";;
+    "pm uninstall "*) echo "Success";;
+    "pm list packages -3") printf 'package:com.example.app\npackage:com.example.zeta\n';;
+    "pm list packages") printf 'package:com.android.settings\npackage:com.example.zeta\npackage:android\npackage:com.example.app\n';;
+    "cmd package resolve-activity --brief -c android.intent.category.LAUNCHER com.example.app")
+      printf 'priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false\ncom.example.app/.MainActivity\n';;
+    "cmd package resolve-activity --brief -c android.intent.category.LAUNCHER com.example.crash")
+      printf 'priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false\ncom.example.crash/.Gone\n';;
+    "cmd package resolve-activity --brief -c android.intent.category.LAUNCHER com.example.svc")
+      printf 'priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false\ncom.example.svc/.Main\n';;
+    "cmd package resolve-activity"*) echo "No activity found";;
+    "am start"*"com.example.crash/.Gone"*)
+      printf 'Starting: Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] cmp=com.example.crash/.Gone }\nError type 3\nError: Activity class {com.example.crash/com.example.crash.Gone} does not exist.\n';;
+    "am start"*"android.intent.action.VIEW"*"nowhere://"*)
+      printf 'Starting: Intent { act=android.intent.action.VIEW dat=nowhere://x }\nError: Activity not started, unable to resolve Intent { act=android.intent.action.VIEW dat=nowhere://x flg=0x10000000 }\n';;
+    "am start"*"android.intent.action.VIEW"*) printf 'Starting: Intent { act=android.intent.action.VIEW dat=https://example.com/ }\n';;
+    "am start"*) printf 'Starting: Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] cmp=com.example.app/.MainActivity }\nStatus: ok\nLaunchState: COLD\nActivity: com.example.app/.MainActivity\nTotalTime: 812\nWaitTime: 820\nComplete\n';;
+    "pidof -s com.example.app") echo "4321";;
+    "pidof -s "*) ;;
+    "am force-stop "*) ;;
+    *) echo "fake adb: unhandled: $2" >&2; exit 2;;
+  esac;;
+*) echo "fake adb: unhandled: $*" >&2; exit 2;;
+esac
+"#;

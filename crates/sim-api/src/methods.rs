@@ -112,17 +112,22 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     ("type", "device, text", "Type on the hardware keyboard (iOS: a key report every 3 ms)"),
     ("key", "device, usage", "Press a key by HID usage (iOS: down and up 3 ms apart)"),
-    ("open_url", "device, url", "Open a URL"),
-    ("install", "device, path", "Install an .app"),
-    ("uninstall", "device, bundle_id", "Uninstall an app"),
+    ("open_url", "device, url", "Open a URL (Android: `am start -a VIEW`)"),
+    (
+        "install",
+        "device, path",
+        "Install an .app (Android: an .apk with `adb install -r`, an .aab through bundletool when it is on the PATH)",
+    ),
+    ("uninstall", "device, bundle_id", "Uninstall an app (Android: the package name; `pm uninstall`)"),
     (
         "launch",
-        "device, bundle_id, args?, env?, shaped?, restart?",
-        "Launch with arguments and environment (shaped: inject the network shaper; restart: terminate a running instance \
-         first, default true; false brings a running app to the front); returns pid",
+        "device, bundle_id, restart?; iOS: args?, env?, shaped?",
+        "Launch (iOS: with arguments and environment, shaped injecting the network shaper; Android: the package's launcher activity); \
+         restart: terminate a running instance first, default true (Android: `am start -S`); false brings a running app to the \
+         front; returns pid",
     ),
-    ("terminate", "device, bundle_id", "Terminate an app"),
-    ("apps", "device", "Installed bundle ids"),
+    ("terminate", "device, bundle_id", "Terminate an app (Android: `am force-stop`)"),
+    ("apps", "device; Android: all?", "Installed bundle ids (Android: the third-party packages, with all the system's too)"),
     ("appearance", "device, mode(light|dark)", "Light or dark UI"),
     ("location", "device, latitude, longitude", "Simulated location"),
     ("privacy", "device, action(grant|revoke), service, bundle_id", "Privacy permission"),
@@ -292,6 +297,12 @@ const ALL_PLATFORMS: &[&str] = &[
     "button",
     "type",
     "key",
+    "open_url",
+    "install",
+    "uninstall",
+    "launch",
+    "terminate",
+    "apps",
     "location",
     "info",
     "rotate",
@@ -1179,6 +1190,8 @@ mod tests {
         android.create("fold", "system-images;android-36;google_apis;arm64-v8a", Some(FormFactor::Foldable)).expect("create");
         android.create("watch", "system-images;android-34;android-wear;arm64-v8a", None).expect("watch");
         android.create("car", "system-images;android-34-ext9;android-automotive;arm64-v8a", None).expect("car");
+        // The app methods run adb: the fake one, so the probe never reaches a host's.
+        sim_android::testing::fake_adb(&android);
         // One fake emulator is advertised at a time (its advertisement is named for this process).
         let mut fakes = vec![fake_emulator(&android, "fold")];
         let mut advertised = "fold";
