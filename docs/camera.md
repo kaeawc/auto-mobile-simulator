@@ -3,9 +3,10 @@
 `crates/sim-camera` (`simee-camera`) is the host side of device cameras: a catalog of the host's
 cameras and the synthetic sources, one source id scheme for all of them, and a capture hub that
 feeds any number of consumers from one capture per source. `emu`'s Android camera HAL service
-([below](#android-the-goldfish-camera-hal)) links it; the API methods and CLI (`camera_sources`,
-`camera_link`, #323) and the iOS capture shim (#322) build on it next. The plan is epic #319; the
-iOS background is [research/audio-camera.md](research/audio-camera.md) §3.
+([below](#android-the-goldfish-camera-hal)) links it, and the API, CLI and MCP tools
+([below](#linking-a-device-camera-api-cli-mcp), #323) link a device camera to a source; the iOS
+capture shim (#322) builds on it next. The plan is epic #319; the iOS background is
+[research/audio-camera.md](research/audio-camera.md) §3.
 
 ## What exists
 
@@ -13,10 +14,10 @@ iOS background is [research/audio-camera.md](research/audio-camera.md) §3.
 |---|---|---|
 | Host camera listing (`catalog::host_cameras`) | AVFoundation `AVCaptureDeviceDiscoverySession`: built-in, external, Continuity Camera, Desk View, and every CoreMediaIO camera extension | V4L2: every `/dev/video*` node that can capture, with `VIDIOC_QUERYCAP` and the format, size and interval enumerations |
 | Virtual camera marking | transport type `virt` (what camera extensions report), or a known name, maker or model (OBS, Camo, mmhmm, "virtual", …) | the v4l2loopback driver or bus (`platform:v4l2loopback-*`), the vivid and akvcam test drivers |
-| Capture from a host camera | `AVCaptureSession` with a BGRA video data output, scaled to each request | not yet: V4L2 streaming capture returns `Unsupported` |
+| Capture from a host camera | `AVCaptureSession` with a BGRA video data output, in the format nearest the request, scaled to each request | V4L2 streaming (4 mmap buffers), YUYV and Motion JPEG to BGRA ([details](#capture-details)) |
 | Camera permission (`tcc::status`) | `authorizationStatusForMediaType:`, never prompts | none needed (`not-required`) |
 | Synthetic sources | all but `video:` | all but `video:` |
-| Hot-plug | `catalog::changes` diffs two listings into added/removed events; the caller polls | same |
+| Hot-plug (`Hub::events`) | `AVCaptureDeviceWasConnected` / `WasDisconnected`, debounced, then a fresh listing diffed against the last | inotify on `/dev` for `video*` nodes, the same way |
 
 Each host camera has a stable id: AVFoundation's `uniqueID` on macOS and the V4L2 bus info on
 Linux (`usb-0000:00:14.0-1`, `platform:v4l2loopback-000`), with a name, kind (`built_in`,
@@ -70,6 +71,81 @@ id share one):
   the camera. The next subscription starts a fresh capture.
 - A capture that fails (a camera unplugged, frames stopping) ends every subscription with that
   error, after the frames already queued.
+
+### Capture details
+
+**Capture (Linux):** V4L2 streaming. simee picks the format, size and rate nearest the request
+(`ENUM_FMT`/`FRAMESIZES`/`FRAMEINTERVALS`) and sets them with `S_FMT`/`G_FMT` and `S_PARM`. It
+then streams through 4 mmap buffers (`REQBUFS`, `QBUF`/`DQBUF` with `poll`, `STREAMON`/`OFF`).
+
+- YUYV (BT.601) and MJPEG become BGRA only when a subscriber asks for a frame. MJPEG frames that
+  leave out the standard Huffman tables get them added.
+- Damaged frames are skipped.
+- A camera already in use (EBUSY) gives `Busy`. EACCES gives a permission error naming the `video`
+  group. An unplug (ENODEV) gives `Missing`.
+
+**Webcam size and fps (macOS):** the `AVCaptureDevice` format nearest the request becomes
+`activeFormat`, matched on size first, then rate.
+
+- Both frame-duration limits are set to the requested rate, or to the nearer end of the format's
+  own range.
+- The device stays locked across `startRunning`, so the session preset doesn't reset it.
+- A device that can't be locked keeps its current format.
+
+**Hot-plug:** `Hub::events()` gives `Added` and `Removed` events.
+
+- **Linux:** inotify on `/dev` for `video*` nodes.
+- **macOS:** `AVCaptureDeviceWasConnected` and `AVCaptureDeviceWasDisconnected`.
+- Signals are debounced (300 ms quiet, 2 s cap) before the cameras are listed again and compared
+  with the last listing.
+- `SourceMissing` is reported when a running capture loses its camera.
+- The watch starts with the first stream and stops with the last.
+
+## Linking a device camera (API, CLI, MCP)
+
+Four API methods (docs/api.md), the `simee camera` commands (docs/cli.md) and the same four tools in
+the MCP server's `camera` toolset (docs/mcp.md):
+
+| Method | CLI | What it does |
+|---|---|---|
+| `camera_sources {kind?}` | `simee camera sources [--kind host\|virtual\|synthetic]` | The host's cameras (each with its `virtual` flag) and the synthetic kinds, each with the `source` id to link, and the camera permission's status and fix. Reads the TCC status; never prompts. |
+| `camera_link {device, facing, source}` | `simee camera link <device> [--back\|--front\|--both] <source>` | Links a camera (`facing`: back, front or both) to a source. |
+| `camera_unlink {device, facing?}` | `simee camera unlink <device> [--back\|--front]` | Removes the link (default both); the camera goes back to the AVD's own (`hw.camera.*` in config.ini: none, the test card, or a source id there). |
+| `camera_links {device?}` | `simee camera links [<device>]` | Every link, one row per camera, with its state. |
+
+`boot` takes `camera_back` and `camera_front` (`simee boot <device> --camera-back <source>
+--camera-front <source>`): each is linked as `camera_link` does, then the device boots.
+
+- **Sources:** any source id above, `emulated` (the test card) or `none` (the camera off), or a
+  host camera's name, index or part of its name: `obs` finds "OBS Virtual Camera", and a name
+  that matches several cameras fails, listing them. A host camera is saved by its stable id
+  (`webcam:<id>`), so a rename or a replug keeps the link. An `image:` path must be absolute (the
+  CLI makes it so); `video:` isn't supported yet.
+- **Saved:** links live in the device's state (`<avd>/simee/cameras.ini`, `back=<source>` and
+  `front=<source>` lines). Every boot passes them to emu as `-camera-back` / `-camera-front`, so
+  they come back after a reboot or a server restart, whichever front end boots the device.
+- **Live:** a running device is relinked through emu's console (`camera link`), on the guest's
+  next frame. The guest's camera provider lists cameras once, when it starts: a camera that was
+  off at boot appears after a reboot, and `camera_link` says so (`note`).
+- **States** (`camera_links`): `linked` (running, as saved), `saved` (shut down: applies at the next
+  boot), `relinked` (changed from the console since: `live` says to what; the next boot restores
+  the saved link), `unsaved` (linked from the console only), `off`, `source missing` (the host no
+  longer lists the camera, and emu shows the test card until it is back) and `permission missing`
+  (with the fix).
+- **Errors name the fix:** a camera permission that isn't granted (the table above; checked
+  before a webcam is linked), an ambiguous or unknown name (with the matches, or what exists and
+  the synthetic sources), a device the stock emulator runs (boot it with `simee boot`), and an emu
+  built before its camera console (#321: rebuild it and reboot).
+- **iOS:** the methods answer that iOS camera links come with the iOS camera feed (#322).
+
+```bash
+simee camera sources
+simee camera link Pixel --back qr:hello      # Pixel back: qr:hello (linked)
+simee camera link Pixel --front obs          # Pixel front: webcam:<id> [OBS Virtual Camera] (linked)
+simee camera links
+simee camera unlink Pixel --front            # Pixel front: none (unlinked)
+simee boot Pixel --camera-back pattern:testcard
+```
 
 ## Camera permission (TCC)
 
@@ -196,9 +272,16 @@ and the relink to `qr:hello`.
 Tracked in #335:
 
 - `video:<path>`: needs VideoToolbox decoding (`Unsupported` until then).
-- Capture from a camera on Linux: V4L2 streaming (`VIDIOC_REQBUFS` with mmap buffers, YUYV and
-  MJPEG to BGRA). Listing works.
 - A live capture from a macOS camera has no automated test: it needs the camera permission, which
-  the tests never ask for.
+  the tests never ask for. The live macOS check of the nearest format and of hot-plug, and
+  confirming that the device notifications arrive without a main run loop, are still to do.
 - NV12 frames and IOSurface-backed output: frames are BGRA bytes.
-- Hot-plug is a diff of two listings; nothing watches for changes yet.
+
+Camera links (#323):
+
+- iOS devices: the methods refuse them until the iOS camera feed (#322).
+- `fps` and `size` on `camera_link`: an Android guest picks its camera's size itself (from the
+  sizes `list` offers) and its rate, so they are not taken yet.
+- The source list as an MCP resource: the `camera_sources` tool only.
+- `source missing` comes from the host's camera listing (a webcam link whose camera isn't listed
+  now); emu's own capture failures are in its log (`<avd>/simee/emu.log`).

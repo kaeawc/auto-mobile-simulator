@@ -20,6 +20,11 @@ pub struct FakeEmulator {
     pub fold_status: Arc<Mutex<Option<String>>>,
     /// What simee's `rotation` answers: degrees the guest rotated its display (0 at first).
     pub rotation: Arc<Mutex<u32>>,
+    /// What each camera is linked to (`camera list`): `camera link` sets it, and a test can seed
+    /// it. Empty: `camera list` answers a bare `OK`.
+    pub cameras: Arc<Mutex<Vec<(String, String)>>>,
+    /// A facing (`back`, `front`) whose `camera link` fails with `KO`; None: none does.
+    pub camera_link_fails: Arc<Mutex<Option<String>>>,
 }
 
 /// Starts a fake emulator for AVD `avd` and advertises it in `android`'s running dir, so the AVD
@@ -41,6 +46,9 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
     let status = fold_status.clone();
     let rotation = Arc::new(Mutex::new(0));
     let turned = rotation.clone();
+    let cameras: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let camera_link_fails: Arc<Mutex<Option<String>>> = Arc::default();
+    let (links, fails) = (cameras.clone(), camera_link_fails.clone());
     // The advertised adb port is the console's plus one, so the console must not be on 65535 (an
     // ephemeral port the OS hands out now and then): bind again, keeping the unusable one held so
     // the next bind gets another.
@@ -59,6 +67,7 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
         for stream in listener.incoming().flatten() {
             // A thread per connection, so concurrent clients are served concurrently.
             let (log, status, turned) = (log.clone(), status.clone(), turned.clone());
+            let (links, fails) = (links.clone(), fails.clone());
             std::thread::spawn(move || {
                 let mut out = stream.try_clone().expect("clone");
                 let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
@@ -87,6 +96,30 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
                         ["car", "list"] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\n\
                                         property=INFO_MAKE id=0x11100101 area=0 status=available value=Toy Car\r\nOK"
                             .to_owned(),
+                        ["camera", "list"] => {
+                            let mut text = String::new();
+                            for (facing, source) in links.lock().expect("cameras").iter() {
+                                text.push_str(&format!("{facing}: {source}\r\n"));
+                            }
+                            format!("{text}OK")
+                        }
+                        // Like emu's console: the source is the rest of the line, its whitespace
+                        // collapsed to single spaces.
+                        ["camera", "link", facing, source @ ..] if !source.is_empty() => {
+                            if fails.lock().expect("fails").as_deref() == Some(*facing) {
+                                "KO: camera link failed".to_owned()
+                            } else {
+                                let mut links = links.lock().expect("cameras");
+                                links.retain(|(f, _)| f != facing);
+                                // The stock values are the test card, as emu reports them.
+                                let source = match source.join(" ").as_str() {
+                                    "emulated" | "virtualscene" => "pattern:testcard".to_owned(),
+                                    other => other.to_owned(),
+                                };
+                                links.push(((*facing).to_owned(), source));
+                                "OK".to_owned()
+                            }
+                        }
                         ["screenshot", path] => {
                             let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };
                             std::fs::write(path, sim_core::frame::encode_png(&frame).expect("png")).expect("write png");
@@ -122,7 +155,7 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
     let emulator = if stock { "" } else { "emulator=simee\n" };
     let ad = format!("port.serial={port}\nport.adb={}\navd.name={avd}\n{emulator}", port + 1);
     std::fs::write(running.join(format!("pid_{}.ini", std::process::id())), ad).expect("advertise");
-    FakeEmulator { console, display, fold_status, rotation }
+    FakeEmulator { console, display, fold_status, rotation, cameras, camera_link_fails }
 }
 
 /// `lines` once it holds `n` entries (or after 5 s, whatever it holds).

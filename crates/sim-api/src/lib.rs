@@ -18,6 +18,7 @@
 //! macOS hosts; elsewhere they fail with a clear reason.
 
 mod android;
+mod camera;
 pub mod catalog;
 mod contrast;
 #[cfg(target_os = "macos")]
