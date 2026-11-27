@@ -242,6 +242,33 @@ impl Snapshot {
     }
 }
 
+/// What the machine is, for `simee doctor`: the chip, the model, the macOS release and whether
+/// it can run Hypervisor.framework guests. `None` fields are unavailable on this host.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Machine {
+    /// `machdep.cpu.brand_string` (`Apple M3 Max`, `Intel(R) Core(TM) i9-9980HK ...`).
+    pub cpu: Option<String>,
+    pub chip: Option<sim_core::support::Chip>,
+    /// `hw.model` (`Mac15,9`).
+    pub model: Option<String>,
+    /// `sysctl.proc_translated`: this process runs under Rosetta (an x86_64 build on Apple silicon).
+    pub translated: Option<bool>,
+    pub macos: Option<sim_core::support::Version>,
+    pub macos_build: Option<String>,
+    /// `kern.hv_support`.
+    pub hv_support: Option<bool>,
+}
+
+/// Reads [`Machine`]: a few sysctls and `SystemVersion.plist`, no process spawned.
+pub fn machine() -> Machine {
+    let (macos, macos_build) = std::fs::read_to_string(sim_core::support::SYSTEM_VERSION_PLIST)
+        .ok()
+        .and_then(|t| sim_core::support::Version::from_system_version(&t))
+        .map_or((None, None), |(v, b)| (Some(v), b));
+    let m = platform::machine();
+    Machine { macos, macos_build, ..m }
+}
+
 /// The data volume: macOS keeps user data on its own volume under the sealed system volume.
 pub const DATA_VOLUME: &str = if cfg!(target_os = "macos") { "/System/Volumes/Data" } else { "/" };
 
@@ -296,6 +323,36 @@ mod platform {
         sysfs::mac_thermal(thermal_state())
     }
 
+    fn text(name: &str) -> Option<String> {
+        let b = sysctl(name)?;
+        let s = String::from_utf8_lossy(&b).trim_end_matches('\0').trim().to_owned();
+        (!s.is_empty()).then_some(s)
+    }
+
+    fn flag(name: &str) -> Option<bool> {
+        int::<4>(name).map(|b| u32::from_ne_bytes(b) != 0)
+    }
+
+    pub fn machine() -> Machine {
+        let cpu = text("machdep.cpu.brand_string");
+        // `hw.optional.arm64` is 1 on Apple silicon even for a translated (x86_64) process, whose
+        // brand string reads as the emulated Intel CPU's.
+        let chip = match flag("hw.optional.arm64") {
+            Some(true) => Some(sim_core::support::Chip::AppleSilicon),
+            _ if cpu.as_deref().is_some_and(|c| c.contains("Intel")) => Some(sim_core::support::Chip::Intel),
+            _ => None,
+        };
+        Machine {
+            cpu,
+            chip,
+            model: text("hw.model"),
+            translated: Some(flag("sysctl.proc_translated").unwrap_or(false)),
+            macos: None,
+            macos_build: None,
+            hv_support: flag("kern.hv_support"),
+        }
+    }
+
     pub fn power() -> Power {
         let p = power_sources();
         sysfs::mac_power(p.providing.as_deref(), p.has_battery, p.percent, p.charging, p.minutes_remaining, low_power_mode())
@@ -335,6 +392,11 @@ mod platform {
 
     pub fn power() -> Power {
         sysfs::power(Path::new("/sys"))
+    }
+
+    /// Not a Mac: no chip in the matrix, no Hypervisor.framework.
+    pub fn machine() -> Machine {
+        Machine { cpu: None, chip: None, model: None, translated: None, macos: None, macos_build: None, hv_support: None }
     }
 }
 
@@ -604,6 +666,24 @@ mod tests {
         println!("thermal: {:?} ({:?}); power: {}; memory: {}", s.thermal.state, s.thermal.reason, s.power.summary, mem.level_reason);
         let r = report(s, &Ring::default(), Thresholds::default());
         assert!(!r.reasons.is_empty());
+    }
+
+    #[test]
+    fn the_machine_names_its_chip_and_release() {
+        let m = machine();
+        println!("{m:?}");
+        if cfg!(target_os = "macos") {
+            assert!(m.cpu.is_some() && m.model.is_some() && m.hv_support.is_some(), "{m:?}");
+            assert!(m.macos.is_some_and(|v| v.major >= 11) && m.macos_build.is_some(), "{m:?}");
+            let want = if cfg!(target_arch = "aarch64") || m.translated == Some(true) {
+                sim_core::support::Chip::AppleSilicon
+            } else {
+                sim_core::support::Chip::Intel
+            };
+            assert_eq!(m.chip, Some(want));
+        } else {
+            assert_eq!((m.chip, m.hv_support), (None, None));
+        }
     }
 
     /// `cargo test -p simee-host --release sample_cost -- --ignored --nocapture`

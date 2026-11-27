@@ -18,6 +18,7 @@ doctest = false
 [dependencies]
 rustix.workspace = true
 serde.workspace = true
+sim-core.workspace = true
 
 # macOS reads the kernel's sysctls through sim-coresim, the one crate here that allows `unsafe`.
 [target.'cfg(target_os = "macos")'.dependencies]

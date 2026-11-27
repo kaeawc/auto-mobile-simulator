@@ -7,6 +7,8 @@
 //! otherwise (and always for `boot`, see `sim_api::IN_CALLER`) they run in this process. The
 //! output is the same either way.
 
+mod doctor;
+
 use std::io::Write;
 use std::time::Duration;
 
@@ -54,6 +56,13 @@ enum Cmd {
         /// Only this form factor: phone, tablet, foldable, watch, tv, auto, vision.
         #[arg(long)]
         form_factor: Option<String>,
+    },
+    /// This host against the support matrix: chip, macOS, Xcode, Hypervisor.framework, the host's
+    /// health, and which features are on or off and why (docs/development.md "Support matrix").
+    Doctor {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Every form factor on every platform: sub-platform and inputs, or why it's unsupported.
     FormFactors {
@@ -583,6 +592,14 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
                 writeln!(out, "{}", serde_json::to_string_pretty(&devices)?)?;
             } else {
                 write!(out, "{}", list_text(&serde_json::from_value::<Vec<DeviceInfo>>(devices)?))?;
+            }
+        }
+        Cmd::Doctor { json } => {
+            let r = doctor::report(call("host", json!({})).ok().as_ref());
+            if json {
+                writeln!(out, "{}", serde_json::to_string_pretty(&r)?)?;
+            } else {
+                write!(out, "{}", doctor::text(&r))?;
             }
         }
         Cmd::FormFactors { json, platform } => {

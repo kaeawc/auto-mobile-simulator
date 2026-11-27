@@ -264,11 +264,37 @@ fn real_main() -> Result<ExitCode> {
 /// prints the same `accel:` block).
 fn accel_check() -> (bool, String) {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    return (true, "Hypervisor.framework (arm64) is usable".into());
+    return match android_support(host_macos()) {
+        Ok(off) => {
+            let mut what = String::from("Hypervisor.framework (arm64) is usable");
+            for why in off {
+                what.push('\n');
+                what.push_str(&why);
+            }
+            (true, what)
+        }
+        Err(why) => (false, why),
+    };
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     return software::accel_check();
     #[cfg(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))))]
     (false, "simee needs Hypervisor.framework on an Apple silicon Mac, or software mode on x86_64 Linux".into())
+}
+
+/// This host's macOS release (`SystemVersion.plist`), `None` off macOS.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn host_macos() -> Option<sim_core::support::Version> {
+    let text = std::fs::read_to_string(sim_core::support::SYSTEM_VERSION_PLIST).ok()?;
+    sim_core::support::Version::from_system_version(&text).map(|(v, _)| v)
+}
+
+/// The support matrix's Android rows (`sim_core::support`, `simee doctor`) on macOS `macos`: an
+/// error when no guest can boot here (below the floor), else why each optional feature is off.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn android_support(macos: Option<sim_core::support::Version>) -> std::result::Result<Vec<String>, String> {
+    use sim_core::support::{FLOORS, check};
+    check("android", macos)?;
+    Ok(FLOORS.iter().filter(|f| f.requires == Some("android")).filter_map(|f| check(f.id, macos).err()).collect())
 }
 
 /// `-avd NAME -dry-run`: prints the boot plan without booting (on any host), and fails if the
@@ -339,6 +365,9 @@ fn boot(
 
     // Before anything is created or started: refusing takes milliseconds, and the error is the
     // last line front ends show (`emu exited … before booting: <line>`).
+    for off in android_support(host_macos()).map_err(anyhow::Error::msg)? {
+        eprintln!("emu: {off}");
+    }
     if !instance::allow_old_images()
         && let Some(why) = instance::unsupported(&env.load(name)?)
     {
@@ -474,6 +503,21 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn startup_refuses_below_the_android_floor_and_names_what_is_off() {
+        use sim_core::support::Version;
+        let e = android_support(Some(Version::new(14, 6, 1))).expect_err("below 15");
+        assert!(e.contains("needs macOS 15") && e.contains("hv_gic_create") && e.contains("runs macOS 14.6.1"), "{e}");
+        let off = android_support(Some(Version::new(15, 4, 0))).expect("15 boots");
+        assert_eq!(off.len(), 1, "{off:?}");
+        assert!(off[0].starts_with("4 KiB guest memory granule needs macOS 26"), "{}", off[0]);
+        assert_eq!(android_support(Some(Version::new(26, 0, 0))), Ok(vec![]));
+        assert_eq!(android_support(None), Ok(vec![]), "unknown: the hypervisor itself says");
+        if cfg!(target_os = "macos") {
+            assert!(host_macos().is_some_and(|v| v.major >= 11));
+        }
+    }
 
     /// Checks the guard makes in `[from, to)` of its life, following its own schedule.
     fn guard_checks(from: Duration, to: Duration) -> usize {
