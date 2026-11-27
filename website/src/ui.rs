@@ -1,11 +1,12 @@
 //! The frame every page shares (a running head and a footer rule), numbered sections, captions
 //! and Markdown in the paper's style.
 
-use rune::{Align, Color, El, Span, TextStyle, Tx, col, el, oklch, rich, row, text};
+use rune::{Align, Color, El, LineCap, Shape, Span, TextStyle, Tx, canvas, col, el, oklch, rich, row, text};
 use rune_kit::{Markdown, MarkdownStyle};
 
 use crate::content::{self, REPO};
 use crate::gem;
+use crate::theme::Theme;
 use crate::tokens::*;
 use crate::{Route, State};
 
@@ -28,8 +29,8 @@ pub fn link_text(key: &str, label: &str, href: &str, style: TextStyle) -> El {
     row().key(key).href(href).hover_group().child(text(label.to_owned()).font(style).color(link()).group_color(fg()))
 }
 
-/// The running head: the mark and name, then the pages, over a rule.
-pub fn topbar(route: &Route, angle: f32) -> El {
+/// The running head: the mark and name, then the pages and the theme toggle, over a rule.
+pub fn topbar(route: &Route, theme: Theme, angle: f32) -> El {
     let here = |r: fn(&Route) -> bool| r(route);
     let item = |key: &str, label: &str, href: &str, current: bool| {
         row()
@@ -43,12 +44,17 @@ pub fn topbar(route: &Route, angle: f32) -> El {
         .key("nav")
         .role("navigation")
         .label("simee")
-        .gap(18.0)
+        .gap(16.0)
         .flex_wrap()
-        .child(item("nav-docs", "Docs", "/docs/", here(|r| matches!(r, Route::Docs | Route::Doc(_)))))
+        .center_y()
+        .child(item("nav-benchmarks", "Benchmarks", "/benchmarks/", here(|r| matches!(r, Route::Benchmarks))))
+        .child(item("nav-debugging", "Debugging", "/debugging/", here(|r| matches!(r, Route::Debugging))))
         .child(item("nav-devices", "Devices", "/devices/", here(|r| matches!(r, Route::Devices))))
         .child(item("nav-demos", "Demos", "/demos/", here(|r| matches!(r, Route::Demos))))
-        .child(item("nav-source", "Source", REPO, false));
+        .child(item("nav-limitations", "Limitations", "/limitations/", here(|r| matches!(r, Route::Limitations))))
+        .child(item("nav-docs", "Docs", "/docs/", here(|r| matches!(r, Route::Docs | Route::Doc(_)))))
+        .child(item("nav-source", "Source", REPO, false))
+        .child(theme_toggle(theme));
     let brand = row()
         .key("brand")
         .href("/")
@@ -64,6 +70,27 @@ pub fn topbar(route: &Route, angle: f32) -> El {
         .pt(16.0)
         .child(row().key("top-row").w_full().justify_between().center_y().gap(16.0).flex_wrap().pb(10.0).child(brand).child(pages))
         .child(el().key("top-rule").w_full().h(1.0).fill(rule()).a11y_hidden())
+}
+
+/// The theme toggle: a half-lit disc and what the page follows (System, Light, Dark); a press
+/// moves to the next. Without Rune, index.html's script does the same to the static page.
+fn theme_toggle(theme: Theme) -> El {
+    let disc = Shape::new()
+        .view_box(12.0, 12.0)
+        .stroke_svg("M6 0.75 A5.25 5.25 0 1 1 6 11.25 A5.25 5.25 0 1 1 6 0.75 Z", 1.0, LineCap::Round, fg2())
+        .fill_svg("M6 0.75 A5.25 5.25 0 0 1 6 11.25 Z", fg2());
+    row()
+        .key("theme")
+        .role("button")
+        .label(format!("Theme: {}", theme.label()))
+        .focusable(true)
+        .hover_group()
+        .gap(6.0)
+        .center_y()
+        .py(4.0)
+        .on_press(|s: &mut State| s.cycle_theme())
+        .child(canvas(disc).key("theme-disc").size(12.0, 12.0).a11y_hidden())
+        .child(text(theme.label()).key("theme-label").font(SMALL).color(fg2()).group_color(fg()))
 }
 
 pub fn footer() -> El {
@@ -110,9 +137,11 @@ pub fn centered(key: &str, s: &str, style: TextStyle, color: rune::Color) -> El 
     text(s.to_owned()).key(key).font(style).color(color).wrap().selectable(true).align(Align::Center).w_full()
 }
 
-/// The Markdown style every page uses: Rune's neutral light, in CMU Serif with the paper's colours.
+/// The Markdown style every page uses: Rune's neutral one for the theme, in CMU Serif with the
+/// paper's colours, paragraphs at the text column's width and tables across the page.
 pub fn markdown_style() -> MarkdownStyle {
-    MarkdownStyle::neutral(false)
+    MarkdownStyle::neutral(dark())
+        .prose_width(MEASURE)
         .text(fg())
         .muted(fg2())
         .link(link())
@@ -133,7 +162,7 @@ pub fn markdown_style() -> MarkdownStyle {
         .table_header_fill(Color::TRANSPARENT)
         .table_header_rule(rule())
         .table_header_weight(700.0)
-        .table_rules(oklch(0.9, 0.0, 0.0))
+        .table_rules(if dark() { oklch(0.26, 0.0, 0.0) } else { oklch(0.9, 0.0, 0.0) })
         .table_tabular_figures(true)
         .table_flush_left(true)
         .table_full_width(true)

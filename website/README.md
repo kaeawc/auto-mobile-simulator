@@ -9,21 +9,37 @@ JavaScript get. It is its own Cargo workspace, like `desktop/`, pinned to the sa
 ## What it shows
 
 Set as a paper (CMU Serif, numbered sections, captioned tables, booktabs rules; design rules from
-impeccable.style), with no copy that repeats the README or a doc:
+impeccable.style), with no copy that repeats the README or a doc. Paragraphs stop at the text
+column (680 pt); tables and figures use half again that width where the browser has it.
 
 - `/`: title, Figure 1 (the mark, a gem Rune draws and turns, `src/gem.rs`), the abstract (the
-  README's first paragraph), then §1 Performance and §2 Debugging (the README's comparison tables
-  and `docs/debugging.md`'s debug surface), §3 Quick start, §4 Limitations, References. The site
-  adds captions only, so every number is one the README quotes from `docs/benchmarks.md`.
+  README's first paragraph), §1 Performance (the README's one table, iOS and Android), §2 Quick
+  start (the README's, without its support table) and further reading.
+- `/benchmarks/`: the README's comparison with the stock tools, a table per platform.
+- `/debugging/`: `docs/debugging.md`'s iOS debug surface.
+- `/limitations/`: the README's "Not yet".
 - `/docs/` and `/docs/{slug}/`: the Markdown in `docs/`, the list in `src/content.rs` (`DOCS`).
   Links to another published doc become its page, `docs/*.png` become `/img/`, anything else in
-  the repository its GitHub page. Headings keep GitHub's anchors.
+  the repository its GitHub page, and so does a code span that is a repository path
+  (`scripts/bench/android-boot.sh`). Headings keep GitHub's anchors.
 - `/devices/`: device concepts from `sim-core`'s support matrix and reference profiles, so the
   page changes when `form_factor.rs` does.
-- `/demos/`: emu and the SDK's emulator live, side by side, then the desktop window as figures.
-  Rune draws a box per stream; `public/live.js` lays a video over each and plays it over WHEP
-  from the relay in `media/` (its README), fed by `scripts/live-demo.sh` on a demo Mac. Build
-  with `SIMEE_WEB_MEDIA_ORIGIN` to play from another relay (default https://simee-media.fly.dev).
+- `/demos/`: the desktop window, as figures. The live demo (emu and the SDK's emulator side by
+  side) is built but hidden (`LIVE` in `src/demos.rs`) until its relay streams:
+  `public/live.js` plays it over WHEP from `media/` (its README), fed by `scripts/live-demo.sh`.
+  Build with `SIMEE_WEB_MEDIA_ORIGIN` to play from another relay.
+
+Every number on the site is one the README or a doc quotes from `docs/benchmarks.md`; the site
+adds captions only.
+
+## Light and dark
+
+The page follows the system's `prefers-color-scheme`, and the toggle at the end of the running
+head cycles System, Light, Dark. The choice is kept in `localStorage` (`simee-theme`) and set on
+`<html data-theme>` before the first paint (`src/theme.rs`, `index.html`). Rune draws both themes
+(`tokens.rs`). The static HTML is exported in the light theme; in dark, `index.html`'s CSS inverts
+it and turns pictures and the gem back, so readers without WebGPU get a dark page too and Rune's
+first frame (black page) matches it.
 
 Fonts: CMU Serif (Computer Modern Unicode, SIL OFL, `public/fonts/CMU-OFL.txt`) for text, Rune's
 embedded IBM Plex Mono for code.

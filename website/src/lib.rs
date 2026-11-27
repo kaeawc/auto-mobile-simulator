@@ -19,10 +19,13 @@ mod devices;
 mod docs;
 mod gem;
 mod home;
+mod pages;
+mod theme;
 mod tokens;
 mod ui;
 
 use content::Doc;
+use theme::Theme;
 use tokens::*;
 
 /// The widths each page's static HTML is laid out at (`--html-widths`).
@@ -33,6 +36,9 @@ pub const TITLE: &str = "simee · iOS simulators and Android emulators from one 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
     Home,
+    Benchmarks,
+    Debugging,
+    Limitations,
     Docs,
     Doc(&'static Doc),
     Devices,
@@ -60,6 +66,9 @@ impl Route {
         let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
         match parts.as_slice() {
             [] => Route::Home,
+            ["benchmarks"] => Route::Benchmarks,
+            ["debugging"] => Route::Debugging,
+            ["limitations"] => Route::Limitations,
             ["docs"] => Route::Docs,
             ["docs", slug] => Doc::find(slug).map_or(Route::NotFound, Route::Doc),
             ["devices"] => Route::Devices,
@@ -70,7 +79,13 @@ impl Route {
 
     /// Every page the site publishes, as (path, route): what `scripts/build.sh` exports.
     pub fn all() -> Vec<(String, Route)> {
-        let mut all = vec![("/".to_owned(), Route::Home), ("/docs/".to_owned(), Route::Docs)];
+        let mut all = vec![
+            ("/".to_owned(), Route::Home),
+            ("/benchmarks/".to_owned(), Route::Benchmarks),
+            ("/debugging/".to_owned(), Route::Debugging),
+            ("/limitations/".to_owned(), Route::Limitations),
+            ("/docs/".to_owned(), Route::Docs),
+        ];
         all.extend(content::DOCS.iter().map(|d| (d.href(), Route::Doc(d))));
         all.push(("/devices/".to_owned(), Route::Devices));
         all.push(("/demos/".to_owned(), Route::Demos));
@@ -81,6 +96,9 @@ impl Route {
     pub fn title(&self) -> String {
         match self {
             Route::Home => TITLE.to_owned(),
+            Route::Benchmarks => "Benchmarks · simee".to_owned(),
+            Route::Debugging => "Debugging · simee".to_owned(),
+            Route::Limitations => "Limitations · simee".to_owned(),
             Route::Docs => "Docs · simee".to_owned(),
             Route::Doc(d) => format!("{} · simee docs", d.title()),
             Route::Devices => "Device concepts · simee".to_owned(),
@@ -93,6 +111,9 @@ impl Route {
     pub fn description(&self) -> String {
         match self {
             Route::Home | Route::NotFound => content::readme_lede(),
+            Route::Benchmarks => "simee against the Android SDK's emulator, Simulator.app and simctl: boot times, memory, frame pacing, idle cost and command latency, with how each was measured.".to_owned(),
+            Route::Debugging => "What simee exposes on a simulated iOS device that the stock tools don't: processes, sockets, containers, preferences, logs, rendering overlays and device state.".to_owned(),
+            Route::Limitations => "What simee doesn't do yet.".to_owned(),
             Route::Docs => "simee's documentation: the comparison with the stock tools, benchmarks, the CLI, API and MCP server, both platforms' backends and the architecture.".to_owned(),
             Route::Doc(d) => d.summary(),
             Route::Devices => "Every form factor simee supports on iOS and Android, with each kind's reference profile and inputs.".to_owned(),
@@ -115,16 +136,24 @@ pub struct State {
     images: Option<ImageCache>,
     /// The frame clock, in seconds: what turns the gem.
     t: f64,
+    /// Light, dark or the system's.
+    theme: Theme,
 }
 
 impl State {
     fn new() -> State {
-        State { route: current_route(), images: None, t: 0.0 }
+        State { route: current_route(), images: None, t: 0.0, theme: theme::load() }
     }
 
     #[cfg(test)]
     fn at(route: Route) -> State {
-        State { route, images: None, t: 0.0 }
+        State { route, images: None, t: 0.0, theme: Theme::System }
+    }
+
+    /// The toggle in the running head: the next theme, kept for the next page.
+    fn cycle_theme(&mut self) {
+        self.theme = self.theme.next();
+        theme::store(self.theme);
     }
 
     /// The image `docs/{name}` the site serves at `/img/{name}`. On the web it is fetched from
@@ -162,7 +191,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
 /// A screenshot from `docs/`, framed, holding its box at `aspect` before it arrives.
 pub(crate) fn shot(s: &State, cx: &Cx<State>, name: &str, alt: &str, aspect: f32) -> El {
     let key = format!("shot-{name}");
-    let shown = cx.layout_size(&key).map_or(MEASURE, |sz| sz[0]);
+    let shown = cx.layout_size(&key).map_or(PAGE, |sz| sz[0]);
     let scale = cx.env().scale.max(1.0);
     let mut e = el().key(key).role("image").label(alt).w_full().aspect_ratio(aspect).border(1.0, rule_faint());
     if let Some(img) = s.image(name, shown, scale) {
@@ -172,11 +201,15 @@ pub(crate) fn shot(s: &State, cx: &Cx<State>, name: &str, alt: &str, aspect: f32
 }
 
 fn view(s: &State, cx: &mut Cx<State>) -> El {
+    tokens::set_dark(s.theme.dark(cx.env().system_dark));
     let bp = cx.layout_with("page", |r| Bp::of(r[2])).unwrap_or(Bp { at: 1000 });
     let gutter = bp.gutter();
-    let framed = |e: El| e.w_full().max_w(MEASURE + 2.0 * gutter).px(gutter);
+    let framed = |e: El| e.w_full().max_w(PAGE + 2.0 * gutter).px(gutter);
     let main = match s.route {
         Route::Home => home::page(s, cx, bp),
+        Route::Benchmarks => pages::benchmarks(bp),
+        Route::Debugging => pages::debugging(bp),
+        Route::Limitations => pages::limitations(bp),
         Route::Docs => docs::index(bp),
         Route::Doc(doc) => docs::page(doc, bp),
         Route::Devices => devices::page(bp),
@@ -188,7 +221,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         .w_full()
         .fill(bg())
         .items_center()
-        .child(framed(ui::topbar(&s.route, angle(s, cx))))
+        .child(framed(ui::topbar(&s.route, s.theme, angle(s, cx))))
         .child(framed(col().key("main").role("main").child(main)))
         .child(framed(ui::footer()))
 }

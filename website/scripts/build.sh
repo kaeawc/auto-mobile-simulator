@@ -54,7 +54,8 @@ for image in desktop.png desktop-android.png; do
   cp "$repo/docs/$image" "$out/img/"
 done
 
-# The static pages: the native app lays each route out at every width and fills the template.
+# The static pages: the native app lays each route out at every width and fills the template,
+# in the light theme (index.html's CSS inverts it for dark).
 cargo build --locked -q --bin simee-website
 bin=$site/target/debug/simee-website
 widths=$("$bin" --widths)
@@ -72,7 +73,7 @@ for key, value in (("__TITLE__", title), ("__DESCRIPTION__", description), ("__U
     page = page.replace(key, html.escape(value))
 open(file, "w").write(page)
 PY
-  (cd "$out" && SIMEE_WEB_ROUTE=$path "$bin" --html "$file" --html-widths "$widths" --html-template "$file")
+  (cd "$out" && SIMEE_WEB_ROUTE=$path "$bin" --html "$file" --html-widths "$widths" --html-template "$file" --theme light)
   # Exported images name the file the app read, relative to dist/; every page needs it from the root.
   python3 - "$file" <<'PY'
 import sys

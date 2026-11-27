@@ -142,10 +142,11 @@ pub fn resolve_links(md: &str, dir: &str) -> String {
         if line.trim_start().starts_with("```") {
             fence = !fence;
         }
-        if fence || !line.contains("](") {
+        if fence {
             out.push_str(line);
         } else {
-            out.push_str(&resolve_line(line, dir));
+            let line = if line.contains("](") { resolve_line(line, dir) } else { line.to_owned() };
+            out.push_str(&link_code_paths(&line, dir));
         }
     }
     out
@@ -173,6 +174,52 @@ fn resolve_line(line: &str, dir: &str) -> String {
         rest = &after[close..];
     }
     out.push_str(rest);
+    out
+}
+
+/// The top-level directories whose files a code span may name (`scripts/bench/android-boot.sh`).
+const REPO_DIRS: [&str; 7] = ["scripts/", "crates/", "apps/", "desktop/", "website/", "tests/", "docs/"];
+
+/// `line` with each code span that is a path in the repository (and nothing else) made a link
+/// to it: on GitHub, or its page here for a published doc. A span already inside a link's text
+/// stays as it is.
+fn link_code_paths(line: &str, dir: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find('`') {
+        let Some(len) = rest[open + 1..].find('`') else { break };
+        let code = &rest[open + 1..open + 1 + len];
+        let close = open + 1 + len + 1;
+        out.push_str(&rest[..open]);
+        let in_link = out.ends_with('[');
+        let is_path = REPO_DIRS.iter().any(|d| code.starts_with(d))
+            && code.len() > 4
+            && code.chars().all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c));
+        if is_path && !in_link {
+            let rel = if dir.is_empty() { code.to_owned() } else { format!("{}/{code}", "../".repeat(dir.split('/').count())) };
+            out.push_str(&format!("[`{code}`]({})", site_url(&rel, dir)));
+        } else {
+            out.push_str(&rest[open..close]);
+        }
+        rest = &rest[close..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `md` without its tables: a section quoted somewhere a table would repeat another page.
+pub fn without_tables(md: &str) -> String {
+    let mut out = String::new();
+    let mut fence = false;
+    for line in md.lines() {
+        if line.starts_with("```") {
+            fence = !fence;
+        }
+        if fence || !line.trim_start().starts_with('|') {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
     out
 }
 
