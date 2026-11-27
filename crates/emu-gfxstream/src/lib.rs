@@ -1046,7 +1046,9 @@ impl Renderer {
     }
 
     /// The handle of the color buffer the renderer posted last (0 before any post). A different
-    /// handle means a new post; a new post of the same buffer keeps it.
+    /// handle means a new post; a new post of the same buffer keeps it. Host composition posts
+    /// its targets in turn (three on API 36), so each of its posts changes it. One load, no lock:
+    /// cheap enough to poll every millisecond.
     pub fn last_posted_color_buffer(&self) -> Result<u32> {
         let f = self.fb_api()?;
         // SAFETY: getFB returns the renderer's singleton or null; getLastPostedColorBuffer is a
