@@ -2253,7 +2253,9 @@ mod tests {
             );
             let at = |i: usize, k: &str| devices[i][k].as_f64().expect("time");
             assert!(at(5, "started_s") < at(0, "done_s"), "d5 started as d4 finished, not after d0 (watched: {watched}): {r}");
-            assert!(r["all_s"].as_f64().expect("all_s") < 1.1, "the sliding-window bound, not the waves' (watched: {watched}): {r}");
+            // The window property is the line above (in waves, d5 would start only after d0 is
+            // done). An absolute wall-clock bound isn't asserted: a loaded CI runner stretched d0's
+            // 0.9 s to 1.02 s and the whole run past any tight bound.
             assert_eq!((r["failed"].as_u64(), r.get("cancelled")), (Some(0), None), "{r}");
             assert_eq!((tally.done, tally.failed), (6, 0));
             let steps = counts(&heard);
