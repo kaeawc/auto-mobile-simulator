@@ -4,8 +4,8 @@ name: Software mode
 # runner, and checks it the way a user would: `sys.boot_completed`, a screenshot over
 # display.sock, a tap and a clean stop through the console; on main and manual runs also the
 # launcher drawn. It runs twice: on the runner's KVM (x86_64 hosted runners expose /dev/kvm), and
-# with `-accel off` in QEMU's TCG, as on a host without KVM. The KVM run then first-boots the same
-# image in the stock emulator on the same runner, and both boot times go to the job summary. QEMU
+# with `-accel off` in QEMU's TCG, as on a host without KVM. The KVM run then benchmarks emu
+# against the stock emulator on the same runner (scripts/bench/android-boot.sh). QEMU
 # 11.1 (Ubuntu's is older) is built once and cached, as are the system image and the SDK's Linux
 # renderer.
 on:
@@ -231,37 +231,25 @@ jobs:
           "$adb" -s emulator-5554 emu kill
           for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
           ! kill -0 "$pid" 2>/dev/null
-      # The same image's first boot in the stock emulator, on the same runner and KVM, measured the
-      # same way: from launch to `sys.boot_completed` over adb. The runner's sdkmanager installs
-      # the emulator package into the cached SDK.
-      - name: Stock emulator first boot
+      # emu against the stock emulator on the same runner and KVM (scripts/bench/android-boot.sh):
+      # each round a new AVD, both cold and warm boots to `sys.boot_completed`, peak RSS and the
+      # guest microbenchmarks, the order alternating. A pull request runs one round (--quick, a
+      # smoke test); main and manual runs three, the medians docs/benchmarks.md quotes. The
+      # runner's sdkmanager installs the emulator package into the cached SDK.
+      - name: emu against the stock emulator on KVM
         if: matrix.accel == 'kvm'
+        env:
+          ROUNDS: ${{ github.event_name == 'pull_request' && '--quick' || '--rounds 3' }}
         run: |
           yes 2>/dev/null | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager --sdk_root="$ANDROID_HOME" emulator > /dev/null
-          "$ANDROID_HOME/emulator/emulator" -version | head -1 | tee stock-version.txt
-          target/release/emu -create-avd stock -sysdir system-images/android-36/default/x86_64 -no-golden
-          adb="$ANDROID_HOME/platform-tools/adb"
-          start=$(date +%s.%N)
-          "$ANDROID_HOME/emulator/emulator" -avd stock -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data \
-            -gpu swiftshader_indirect -accel on > stock.log 2>&1 &
-          pid=$!
-          booted=
-          for _ in $(seq 1 450); do
-            [ "$("$adb" -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && { booted=1; break; }
-            kill -0 "$pid" || { echo "the stock emulator exited before boot completed"; tail -30 stock.log; exit 1; }
-            sleep 2
-          done
-          test -n "$booted"
-          stock=$(echo "$(date +%s.%N) - $start" | bc)
-          "$adb" -s emulator-5554 emu kill
-          for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+          "$ANDROID_HOME/emulator/emulator" -version | head -1
+          # shellcheck disable=SC2086 # ROUNDS is one or two words.
+          scripts/bench/android-boot.sh --image system-images/android-36/default/x86_64 --lcd 720x1280@320 --port 5580 \
+            --out bench/results $ROUNDS | tee bench-table.md
           {
-            echo "### First boot to sys.boot_completed, API 36 default x86_64, KVM ($(nproc) vCPUs, $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs))"
+            echo "### emu against the stock emulator on KVM ($(nproc) vCPUs, $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs))"
             echo
-            echo "| Emulator | Seconds |"
-            echo "|---|---|"
-            printf '| emu (software mode on KVM) | %.1f |\n' "$EMU_BOOT_S"
-            printf '| stock %s | %.1f |\n' "$(sed 's/.*version //' stock-version.txt)" "$stock"
+            cat bench-table.md
           } >> "$GITHUB_STEP_SUMMARY"
       - if: always() && matrix.accel == 'tcg'
         run: |
@@ -272,7 +260,7 @@ jobs:
           name: software-mode-${{ matrix.accel }}
           path: |
             emu.log
-            stock.log
             shot.png
+            bench/
             ${{ runner.temp }}/avd/ci.avd/simee/console.log
           if-no-files-found: ignore
