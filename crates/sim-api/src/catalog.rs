@@ -60,7 +60,7 @@ pub fn effect(method: &str) -> Option<Effect> {
         "help" | "identity" | "host" | "devices_usage" | "form_factors" | "devices" | "runtimes" | "device_types" | "screen"
         | "screenshot" | "apps" | "ca_debug_state" | "logs" | "processes" | "connections" | "traffic" | "containers" | "ls" | "read"
         | "du" | "crash_reports" | "info" | "defaults_read" | "network_state" | "network_flows" | "network_env" | "audio_state"
-        | "settle" => Read,
+        | "settle" | "admission_check" => Read,
         "appearance" | "location" | "status_bar" | "clear_status_bar" | "content_size" | "increase_contrast" | "dynamic_island"
         | "backlight" | "keyboard_language" | "hardware_keyboard" | "ca_debug" | "network_clear" | "audio_volume" | "audio_route"
         | "audio_mute" | "fold" | "carplay" | "profile" | "privacy" => Set,
@@ -152,8 +152,8 @@ pub fn group(method: &str) -> Option<Group> {
     use Group::*;
     Some(match method {
         "help" | "identity" | "host" | "devices_usage" => Host,
-        "form_factors" | "devices" | "runtimes" | "device_types" | "create" | "delete" | "boot" | "boot_many" | "settle" | "profile"
-        | "clone" | "export" | "import" | "shutdown" | "erase" | "info" => Lifecycle,
+        "form_factors" | "devices" | "runtimes" | "device_types" | "create" | "delete" | "boot" | "boot_many" | "admission_check"
+        | "settle" | "profile" | "clone" | "export" | "import" | "shutdown" | "erase" | "info" => Lifecycle,
         "screen" | "screenshot" | "contrast_check" | "logs" => Observe,
         "tap" | "swipe" | "touch" | "button" | "type" | "key" | "rotate" | "fold" | "xr" | "touchpad" | "stylus" | "rotary"
         | "watch_gesture" | "remote_swipe" | "pointer" | "biometric" => Input,

@@ -50,6 +50,9 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         // mem_* (and launch's stack logging for them)
         "address" => Str,
         "raw" | "malloc_stack_logging" => Bool,
+        // boot, boot_many, create and clone's admission, and admission_check (#275)
+        "admission" => Str,
+        "admission_timeout_s" | "count" => Int,
         "device" | "platform" | "form_factor" | "name" | "device_type" | "runtime" | "system_image" | "path" | "url" | "bundle_id"
         | "text" | "base64" | "domain" | "key" | "language" | "uid" | "capture_id" | "program" | "command" | "predicate" | "last"
         | "preset" | "direction" | "gesture" | "button" | "phase" | "action" | "service" | "scope" | "display" | "orientation"
@@ -385,6 +388,30 @@ mod tests {
     }
 
     #[test]
+    fn admission_is_a_choice_on_every_lifecycle_call() {
+        // #275: boot and boot_many may wait; create and clone report or refuse.
+        for (method, modes) in [
+            ("boot", json!(["ignore", "refuse", "wait"])),
+            ("boot_many", json!(["ignore", "refuse", "wait"])),
+            ("create", json!(["ignore", "refuse"])),
+            ("clone", json!(["ignore", "refuse"])),
+        ] {
+            let s = schema(method);
+            assert_eq!((&s["properties"]["admission"]["enum"], s["properties"]["admission"].get("default")), (&modes, None), "{method}");
+            assert!(!s["required"].as_array().expect("required").contains(&json!("admission")), "{method}");
+        }
+        let boot = schema("boot_many");
+        assert_eq!(boot["properties"]["admission_timeout_s"], json!({"type": "integer", "description": "seconds"}));
+        let check = schema("admission_check");
+        assert_eq!(check["required"], json!(["platform"]));
+        assert_eq!(check["properties"]["platform"]["enum"], json!(["ios", "android"]));
+        assert_eq!(
+            (&check["properties"]["form_factor"]["default"], &check["properties"]["count"]["default"]),
+            (&json!("phone"), &json!(1))
+        );
+    }
+
+    #[test]
     fn alternatives_are_all_optional() {
         let write = schema("write");
         assert_eq!(write["required"], json!(["device", "path"]));
@@ -455,6 +482,12 @@ mod tests {
             (Platform::Android, "boot") => text(crate::android::boot_options(p)),
             (Platform::Android, "boot_many") => text(crate::android::boot_many_options(p)),
             (Platform::Android, "import") => text(crate::android::import_allows_mismatch(p)),
+            // It needs a platform to read the rest.
+            (_, "admission_check") => text(crate::methods::check_params(&{
+                let mut p = p.clone();
+                p["platform"] = json!("android");
+                p
+            })),
             (_, "contrast_check") => text(crate::contrast::sweep_options(p)),
             #[cfg(target_os = "macos")]
             (Platform::Ios, "boot") => text(crate::ios::boot_plan_text(p, false)),

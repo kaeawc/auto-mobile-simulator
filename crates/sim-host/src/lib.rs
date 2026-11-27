@@ -1,7 +1,8 @@
 //! Host health for a simulator farm: load, memory pressure, swap, disk, thermal state and power,
 //! sampled without forking, kept in a 15-minute ring, and judged by an admit / hold / backoff
 //! verdict. The thresholds and rules are ported from spectra (MIT, same author); see `verdict`.
-//! The same sampler attributes the host's load to each running device (`usage`).
+//! The same sampler attributes the host's load to each running device (`usage`), and `admission`
+//! predicts what new devices would add to it.
 //!
 //! macOS reads sysctls, `NSProcessInfo` and IOKit through `sim-coresim` (this crate forbids
 //! `unsafe`); Linux reads `/proc` and `/sys`; `statvfs` comes from rustix. Each reading is
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+pub mod admission;
 pub mod parse;
 pub mod ring;
 pub mod sysfs;
@@ -540,9 +542,13 @@ impl Sampler {
         let wait = if usage::AVAILABLE && self.handle.is_some() { self.interval * 3 } else { Duration::ZERO };
         let (st, _) =
             self.shared.tick.wait_timeout_while(st, wait, |s| s.usage.samples() < 2 && !s.stopped).unwrap_or_else(|e| e.into_inner());
-        let mut r = st.usage.report();
-        r.host.memory_total_bytes = st.latest.as_ref().and_then(|s| s.memory.as_ref()).map(|m| m.total_bytes);
-        r
+        usage_of(&st)
+    }
+
+    /// [`Sampler::usage`] without the wait: right after the sampler started, the rates are `None`.
+    /// What admission reads, which never holds a boot up.
+    pub fn usage_now(&self) -> usage::Report {
+        usage_of(&self.shared.state.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// The newest snapshot and the report on it.
@@ -558,6 +564,12 @@ impl Sampler {
     pub fn ring(&self) -> Ring {
         self.shared.state.lock().unwrap_or_else(|e| e.into_inner()).ring.clone()
     }
+}
+
+fn usage_of(st: &State) -> usage::Report {
+    let mut r = st.usage.report();
+    r.host.memory_total_bytes = st.latest.as_ref().and_then(|s| s.memory.as_ref()).map(|m| m.total_bytes);
+    r
 }
 
 impl Drop for Sampler {

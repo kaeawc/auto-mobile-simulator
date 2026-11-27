@@ -25,10 +25,24 @@ use crate::METHODS;
 
 /// Shared types, by name.
 const DEFS: &[(&str, &str)] = &[
+    ("device", "{...@device_fields}"),
     (
-        "device",
-        r#"{udid: string, name: string, state: string, runtime_id: string, device_type_id: string, available: boolean,
-            platform: "ios"|"android", form_factor: string|null, sub_platform: string|null}"#,
+        "device_fields",
+        r#"udid: string, name: string, state: string, runtime_id: string, device_type_id: string, available: boolean,
+            platform: "ios"|"android", form_factor: string|null, sub_platform: string|null"#,
+    ),
+    (
+        "admission",
+        r#"{verdict: "admit"|"hold"|"backoff", reasons: [string], predicted: {subject: string, devices: number, admissible: number,
+            costs: [{platform: "ios"|"android", form_factor: string|null, count: number, idle_cpu_pct: number, boot_cpu_pct: number,
+            idle_memory_bytes: number, boot_memory_bytes: number, source: string}], boot_cpu_pct: number, idle_cpu_pct: number,
+            boot_memory_bytes: number, idle_memory_bytes: number, memory_used_pct: {now: number, after: number}|null,
+            memory_available_bytes: {now: number, after: number}|null, load: {now: number, after: number, limit: number}|null}}"#,
+    ),
+    (
+        "pacing",
+        r#"{waited_s: number, timed_out: boolean, steps: [{at_s: number, started: number, waiting: number,
+            verdict: "admit"|"hold"|"backoff", reason: string}]}"#,
     ),
     ("rate", r#"{"1s": number|null, "1m": number|null}"#),
     (
@@ -95,22 +109,24 @@ pub const OUTPUTS: &[(&str, &str)] = &[
         "[{identifier: string, name: string, model: string, product_family: string, screen_width: number, screen_height: number,
             screen_scale: number, platform: string, form_factor: string|null}]",
     ),
-    ("create", "@device"),
+    ("create", "{...@device_fields, admission?: @admission}"),
     ("delete", "null"),
     (
         "boot",
-        "null|{device: string, boot_s: number, was_booted: boolean, profile?: object, settled?: boolean, settle_s?: number,
-            settle_error?: string, waited_s?: number, ...@load}",
+        "null|{admission: @admission, pacing?: @pacing}|{device: string, boot_s: number, was_booted: boolean, profile?: object,
+            settled?: boolean, settle_s?: number, settle_error?: string, waited_s?: number, ...@load, admission?: @admission,
+            pacing?: @pacing}",
     ),
     (
         "boot_many",
         "{concurrency: number, all_s: number, failed: number, unsettled: number,
             devices: [{device: string, error?: string, boot_s?: number, started_s?: number, done_s?: number, console_port?: number,
-            serial?: string, settled?: boolean, settle_s?: number, settle_error?: string}]}",
+            serial?: string, settled?: boolean, settle_s?: number, settle_error?: string}], admission?: @admission, pacing?: @pacing}",
     ),
+    ("admission_check", "@admission"),
     ("settle", "{settle_s: number, ...@load}"),
     ("profile", "{name: string, failed: [string], disabled?: number, already?: number, not_loaded?: [string], enabled?: number}"),
-    ("clone", "@device"),
+    ("clone", "{...@device_fields, admission?: @admission}"),
     (
         "export",
         "{device: string, to: string, summary: object, identity: object, captures: {disks: boolean, ram: boolean}, resume: string,

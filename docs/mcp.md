@@ -155,7 +155,7 @@ in `SIMEE_MCP_TOOLSETS` (commas between names; `all` for every tool). Unset, it 
 | Toolset | Tools |
 | --- | --- |
 | `core` (the default) | `devices`, `boot`, `shutdown`, `info`, `screen`, `screenshot`, `tap`, `swipe`, `type`, `key`, `button`, `rotate`, `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `logs`, `appearance`, `location`, `device_view` |
-| `lifecycle` | Devices: `form_factors`, `devices`, `runtimes`, `device_types`, `create`, `delete`, `boot`, `boot_many`, `settle`, `profile`, `clone`, `export`, `import`, `shutdown`, `erase`, `info` |
+| `lifecycle` | Devices: `form_factors`, `devices`, `runtimes`, `device_types`, `create`, `delete`, `boot`, `boot_many`, `admission_check`, `settle`, `profile`, `clone`, `export`, `import`, `shutdown`, `erase`, `info` |
 | `apps` | `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `privacy`, `push` |
 | `input` | `tap`, `swipe`, `touch`, `button`, `type`, `key`, `rotate`, `fold`, `xr`, `touchpad`, `stylus`, `rotary`, `watch_gesture`, `remote_swipe`, `pointer`, `biometric` |
 | `observe` | `screen`, `screenshot`, `contrast_check`, `logs`, `device_view` |
@@ -188,7 +188,7 @@ reverse):
 
 | Tools | Platforms |
 | --- | --- |
-| `help`, `identity`, `host`, `devices_usage`, `form_factors`, `devices`, `runtimes`, `create`, `delete`, `boot`, `boot_many`, `clone`, `shutdown`, `screen`, `screenshot`, `contrast_check`, `tap`, `swipe`, `touch`, `button`, `type`, `key`, `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `location`, `info`, `rotate`, `rotary`, `stylus`, `device_view` | Android, iOS |
+| `help`, `identity`, `host`, `devices_usage`, `form_factors`, `devices`, `runtimes`, `create`, `delete`, `boot`, `boot_many`, `admission_check`, `clone`, `shutdown`, `screen`, `screenshot`, `contrast_check`, `tap`, `swipe`, `touch`, `button`, `type`, `key`, `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `location`, `info`, `rotate`, `rotary`, `stylus`, `device_view` | Android, iOS |
 | `console`, `fold`, `xr`, `vehicle`, `touchpad`, `export`, `import` | Android (iOS bundles: the next step of #170) |
 | `prefs_stores`, `prefs_read`, `prefs_write`, `prefs_delete`, `prefs_batch`, `prefs_watch` | Android, iOS (iOS is implemented; Android answers "not yet available") |
 | `device_types`, `settle`, `profile`, `erase`, `appearance`, `privacy`, `push`, `status_bar`, `clear_status_bar`, `content_size`, `increase_contrast`, `dynamic_island`, `backlight`, `keyboard_language`, `hardware_keyboard`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `memory_warning`, `notify`, `biometric`, `exec`, `logs`, `processes`, `kill`, `connections`, `traffic`, `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container`, `defaults_read`, `defaults_write`, `crash_reports`, `network_shape`, `network_state`, `network_flows`, `network_clear`, `network_env`, `audio_state`, `audio_volume`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `audio_mute`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
