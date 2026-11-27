@@ -272,8 +272,16 @@ impl Opts {
             .into_iter()
             .map(|(facing, flag)| {
                 let key = format!("hw.camera.{}", facing.dir());
-                let value = flag.clone().or_else(|| config(&key)).unwrap_or_default();
-                let link = emu_vmm::pipe::camera::parse_link(&value).unwrap_or_else(|e| {
+                let parsed = match flag {
+                    Some(value) => (value.clone(), emu_vmm::pipe::camera::parse_link(value)),
+                    None => {
+                        let value = config(&key).unwrap_or_default();
+                        let link = config_link(&key, &value);
+                        (value, link)
+                    }
+                };
+                let (value, link) = parsed;
+                let link = link.unwrap_or_else(|e| {
                     eprintln!("emu: {key}={value} isn't a camera source ({e}); the {} camera is off", facing.dir());
                     None
                 });
@@ -281,6 +289,22 @@ impl Opts {
             })
             .collect()
     }
+}
+
+/// A `hw.camera.*` value from an AVD's config.ini as a link. A real host camera is never opened
+/// implicitly from a config file (that triggers the camera permission and light): `emulated`,
+/// `virtualscene`, `videoplayback`, `webcam0`, `webcamN` and any other bare word are the test
+/// card, and only an explicit choice (a `-camera-*` flag, the console's `camera link`, or a simee
+/// source id such as `webcam:obs` in the file) links a host camera.
+fn config_link(key: &str, value: &str) -> Result<Option<SourceSpec>, String> {
+    let v = value.trim();
+    if matches!(v, "" | "none" | "emulated" | "virtualscene") || v.contains(':') {
+        return emu_vmm::pipe::camera::parse_link(v);
+    }
+    eprintln!(
+        "emu: {key}={v} in config.ini isn't opened implicitly; using the test card (use -camera-back/-camera-front {v} or `camera link` for a host camera)"
+    );
+    emu_vmm::pipe::camera::parse_link("pattern:testcard")
 }
 
 fn parse_lcd(v: &str) -> Result<(u32, u32, u32)> {
@@ -400,6 +424,24 @@ mod tests {
         assert_eq!(p("-avd pixel").camera_links(|_| None), vec![(Facing::Back, None), (Facing::Front, None)]);
         assert!(p("-camera-back webcam0").camera_back.is_some(), "a host camera, resolved when the guest opens it");
         assert!(parse(["-camera-back".to_string(), "bogus:x".to_string()]).is_err());
+    }
+
+    #[test]
+    fn config_ini_never_opens_a_host_camera() {
+        let card = Some(SourceSpec::parse("pattern:testcard").expect("card"));
+        let cfg = |v: &'static str| move |_: &str| Some(v.to_string());
+        for v in ["emulated", "virtualscene", "webcam0", "webcam3", "videoplayback", "somename"] {
+            let links = p("-avd pixel").camera_links(cfg(v));
+            assert_eq!((links[0].1.clone(), links[1].1.clone()), (card.clone(), card.clone()), "{v}");
+        }
+        assert_eq!(p("-avd pixel").camera_links(cfg("none")), vec![(Facing::Back, None), (Facing::Front, None)]);
+        // A simee source id in config.ini is explicit.
+        let links = p("-avd pixel").camera_links(cfg("webcam:obs"));
+        assert_eq!(links[0].1, Some(SourceSpec::Webcam("obs".into())));
+        // So is a flag, for its own camera only.
+        let links = p("-avd pixel -camera-back webcam0").camera_links(cfg("webcam1"));
+        assert_eq!(links[0].1, Some(SourceSpec::Webcam("webcam0".into())));
+        assert_eq!(links[1].1, card, "the front camera's config.ini value stays the test card");
     }
 
     #[test]

@@ -106,6 +106,26 @@ A flag wins over config.ini; neither means no camera. A bad flag fails the launc
 config.ini value is reported and that camera is off. A webcam id is resolved, and its permission
 checked, when the guest opens the camera, not at launch.
 
+A host camera is never opened implicitly from an AVD's config.ini (opening it triggers the macOS
+camera permission and the camera light). From config.ini, `emulated`, `virtualscene`,
+`videoplayback`, `webcam0`, `webcamN` and any other bare word mean `pattern:testcard`, `none` means
+no camera, and `emu` logs one line when it substitutes the test card for a webcam or another
+non-test-card value. A host camera needs an explicit choice: a `-camera-back` / `-camera-front`
+flag (`-camera-back webcam0`), the console's `camera link`, or a simee source id in the file
+(`hw.camera.back=webcam:obs`). Stock semantics are kept for `emulated`, `virtualscene` and `none`.
+
+### Limits
+
+Each camera allows 4 open sessions; opens of a name that matches no camera, or beyond the cap, are
+answered `ko` on the spot without a thread. The guest may start only the frame sizes `list`
+offered (up to 1280x720) and gets `ko` for others, including in `offset=` frames. One query is in
+flight per session: a query sent before the guest has read the previous reply is answered
+`ko:busy` without producing a frame, and a guest that keeps doing so has its pipe closed, so host
+memory per session is bounded by one frame. A source that fails to open or dies mid-stream shows
+the test card ("source missing" in the log) and is retried every 0.5 s, doubling to 8 s, instead
+of freezing on its last frame. A frame whose size doesn't match is `ko:conversion failed`, never
+zeros.
+
 The console relinks while the guest runs, and while it has the camera open:
 
 ```bash
