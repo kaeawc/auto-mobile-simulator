@@ -19,6 +19,10 @@ env:
   CARGO_NET_RETRY: 10
   RUST_BACKTRACE: short
   RUSTUP_MAX_RETRIES: 10
+  # Every nextest run here uses .config/nextest.toml's `ci` profile: one retry, no fail-fast
+  # and a longer slow-timeout, so a test that fails once on a loaded runner shows as FLAKY
+  # instead of failing the job. `--cargo-profile ci` is the cargo build profile, not this one.
+  NEXTEST_PROFILE: ci
 
 jobs:
   # What a pull request can reach (scripts/ci-scope.py): macOS runners are the scarce ones, so a
