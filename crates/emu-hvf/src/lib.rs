@@ -29,6 +29,9 @@ pub use shared::SharedMap;
 pub enum Error {
     #[error("{call} failed: {}", describe(*.code))]
     Hv { call: &'static str, code: i32 },
+    /// The host's macOS is older than the release whose Hypervisor.framework has `what`.
+    #[error("{what} needs macOS {needs} or later; this Mac runs macOS {host}")]
+    Unsupported { what: &'static str, needs: &'static str, host: String },
     #[error("a VM already exists in this process")]
     AlreadyCreated,
     #[error("mmap of {0} bytes failed")]
