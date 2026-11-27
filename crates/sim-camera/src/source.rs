@@ -90,14 +90,14 @@ fn open_webcam(camera: &HostCamera, spec: FrameSpec) -> Result<Box<dyn Source>> 
     Ok(Box::new(crate::avf::Webcam::open(camera, spec)?))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn open_webcam(camera: &HostCamera, spec: FrameSpec) -> Result<Box<dyn Source>> {
+    Ok(Box::new(crate::v4l2::open(camera, spec)?))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn open_webcam(camera: &HostCamera, _spec: FrameSpec) -> Result<Box<dyn Source>> {
-    // TODO(#335): V4L2 streaming capture (VIDIOC_S_FMT, VIDIOC_REQBUFS with mmap
-    // buffers, VIDIOC_STREAMON, YUYV and MJPEG to BGRA). Enumeration works today.
-    Err(crate::Error::Unsupported(format!(
-        "capturing from {} isn't supported on this host yet: V4L2 streaming capture isn't implemented (enumeration is)",
-        camera.name
-    )))
+    Err(crate::Error::Unsupported(format!("capturing from {} isn't supported on this host", camera.name)))
 }
 
 #[cfg(test)]
