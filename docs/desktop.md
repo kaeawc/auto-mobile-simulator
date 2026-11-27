@@ -167,6 +167,24 @@ the panel, the inspector or the window hidden it asks for nothing and schedules 
 that changes nothing shown draws no frame. Its visibility and sort persist in the settings file
 (`resources`). The headless scenes `resources` and `resources-memory` show it with fixed data.
 
+## Admission before a boot
+
+Before the window boots a device it asks the API's `admission_check` (the device's platform,
+form factor and count; see [Admission](api.md#admission)) whether the host can take it
+(`desktop/src/admission.rs`, #275), on a thread of its own so the window never waits. On admit
+the device boots with no UI. On hold or backoff a sheet drops from the top of the window with
+the numbers ("Booting pixel_tablet would take memory used from 78% to 89%") and every reason
+the API gave, and offers Boot anyway, Boot N (when the host admits some of the devices asked
+for but not all: the first N, from `predicted.admissible`) and Cancel (or Escape). Boot N is
+the default button when offered, otherwise Cancel. "Why? See the resource panel" shows the
+[resource panel](#resource-panel) beside the sheet, with the host's verdict now. "Don't ask
+again for Android phone devices this session" skips the check for that platform and form
+factor on the next boots, until the window quits; it is remembered only when the sheet boots,
+not when it is cancelled. A check never blocks silently: one that fails or can't start boots
+anyway and says so in the status bar. The window boots one device at a time (the toolbar's
+Boot), so Boot N shows only for a request of several devices; it creates and clones no devices
+yet. The headless scenes `admission` and `admission-many` show the sheet with fixed data.
+
 ## Screenshot preview
 
 ⌘S, or the toolbar's Screenshot button, saves the device's screen to the Desktop as a PNG, as
@@ -204,11 +222,21 @@ and HID session (the zero-copy surface keeps its latest frame and wakes the wind
 it), an Android device's display stream and console worker. The pop-out's first frame is the one
 the main window last showed, and it keeps drawing while the main window is hidden. Each window
 owns the device it shows, so its touches and keys can only reach that device. A pop-out has the
-device's toolbar (the form factor's controls, without the tablet stylus) and ⌘S. It is flat: the
-3D device view stays in the main window.
+device's toolbar (the form factor's controls, without the tablet stylus) and ⌘S; its console
+results and errors show on its own status line. It is flat: the 3D device view stays in the main
+window.
+
+A popped device that stops, shut down from the resource panel, the CLI or a script, or an
+emulator that went away, lets go of its connection at once: the pop-out says the device stopped
+and keeps only Pop Back In, and the device comes back to the main window as one that isn't
+running, never with its last frame. A pop-out asked for on a device that isn't connected yet (a
+row's menu on a device that wasn't selected) waits up to 10 seconds for it, then gives up and
+says so, so a later scan never pops it out unasked.
 
 Each device's pop-out frame is kept in the settings file (`popouts`, by UDID or AVD name), so
-popping the same device out again, in this run or the next, opens it where it was. Reopening the
+popping the same device out again, in this run or the next, opens it where it was. A frame saved
+on a display that's no longer connected opens on the nearest one that is, whole where it fits,
+as the main window's restore checks its own frame. Reopening the
 pop-outs that were open at quit is #288. The windows open at run time through Rune's
 `open_window`, which headless runs don't do: the `popped` scene shows the main window with its
 device out, and the pop-out's own view is checked in the tests.

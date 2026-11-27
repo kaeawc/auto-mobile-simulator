@@ -10,7 +10,7 @@ fn main() -> Result<(), String> {
     use std::io::BufRead;
     use std::sync::Arc;
 
-    use simee_camera::{FrameSpec, HostOpener, Hub, SourceSpec, ios_feed};
+    use simee_camera::{FrameSpec, HostOpener, Hub, SourceSpec, feed};
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [socket, source, rest @ ..] = args.as_slice() else {
@@ -22,7 +22,7 @@ fn main() -> Result<(), String> {
     };
     let source = SourceSpec::parse(source).map_err(|e| e.to_string())?;
     let hub = Arc::new(Hub::new(HostOpener::new()));
-    let feed = ios_feed::Feed::serve(hub, socket, source.clone(), spec).map_err(|e| e.to_string())?;
+    let feed = feed::Feed::serve(hub, socket, source.clone(), spec).map_err(|e| e.to_string())?;
     println!("serving {source} at {}x{}@{} on {}", spec.width, spec.height, spec.fps, feed.path().display());
     for line in std::io::stdin().lock().lines() {
         let line = line.map_err(|e| e.to_string())?;

@@ -1,6 +1,6 @@
 [package]
 name = "simee-camera"
-description = "Host camera sources for simulator and emulator devices: webcams, virtual cameras, files and synthetic patterns."
+description = "Host camera sources for simulator and emulator devices: webcams, virtual cameras, files, synthetic patterns and other devices' screens."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,6 +15,9 @@ include = ["/Cargo.toml", "/LICENSE", "/fixtures", "/src"]
 [lib]
 doctest = false
 
+# No Android or iOS stack here, behind a feature or not: emu links this crate for its camera HAL,
+# and a feature simee enabled would reach emu too when both build in one cargo invocation (features
+# unify). `device:` sources are read by `sim-api`; emu reads them as a `feed:` from the server.
 [dependencies]
 font8x8.workspace = true
 png.workspace = true

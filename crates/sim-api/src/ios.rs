@@ -1271,7 +1271,9 @@ pub(crate) fn mem_deadline(p: &Value) -> Duration {
 /// Boots `device` by `plan`: the boot, then the profile, then the settle wait, each timed. Only
 /// a failed boot is an error: a profile or settle wait that fails after it is reported in the
 /// timings (`profile.error`; `settled: false` with `settle_error`), the device left booted.
-fn boot_device(device: &Device, plan: &BootPlan) -> Result<Value, String> {
+/// `launching` is asked just before the boot is issued for a device that is off at that instant
+/// (not booted or booting): `Err` boots it not, and only a device it said yes to is this call's.
+fn boot_device(device: &Device, plan: &BootPlan, launching: &dyn Fn() -> Result<(), String>) -> Result<Value, String> {
     let start = std::time::Instant::now();
     let info = device.info();
     let udid = info.udid;
@@ -1286,6 +1288,10 @@ fn boot_device(device: &Device, plan: &BootPlan) -> Result<Value, String> {
     let preset = plan.profile.filter(|_| !was_booted).map(|profile| preset_profile(&udid, profile));
     let jobs = plan.profile.filter(|_| !was_booted).map(|profile| boot_jobs(&udid, profile)).unwrap_or_default();
     let boot_started = std::time::SystemTime::now();
+    // Read again now: another caller may have booted it since, and then this call only waits.
+    if !matches!(device.state(), DeviceState::Booted | DeviceState::Booting) {
+        launching()?;
+    }
     if !was_booted && (!env.is_empty() || !jobs.is_empty()) {
         device.boot_with(&sim_coresim::BootOptions { env: &env, jobs: &jobs }).map_err(err)?;
     }
@@ -1639,8 +1645,9 @@ fn wait_settled(udid: &str, rule: crate::settle::Rule, timeout: Duration, since_
 }
 
 /// Boots `udids` with at most `concurrency` boots (and settle waits) in flight; one result per
-/// device, in order: the `boot_device` timings, or `{device, error}`.
-fn boot_many(udids: &[String], concurrency: usize, plan: &BootPlan) -> Vec<Value> {
+/// device, in order: the `boot_device` timings, or `{device, error}`. `hook` is asked before each
+/// device starts (one it stops gets its reason as the error) and told as each finishes.
+fn boot_many(udids: &[String], concurrency: usize, plan: &BootPlan, hook: &dyn crate::progress::BootHook) -> Vec<Value> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::sync::Mutex::new(vec![Value::Null; udids.len()]);
     let start = std::time::Instant::now();
@@ -1653,20 +1660,51 @@ fn boot_many(udids: &[String], concurrency: usize, plan: &BootPlan) -> Vec<Value
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(udid) = udids.get(i) else { break };
+                    if let Err(why) = hook.start(i) {
+                        results.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[i] = json!({"device": udid, "error": why});
+                        continue;
+                    }
                     let queued_s = start.elapsed().as_secs_f64();
                     let result = sim_coresim::autoreleasepool(|| {
                         let device = ctx.as_ref().map_err(Clone::clone)?.device(udid).map_err(err)?;
-                        boot_device(&device, plan)
+                        boot_device(&device, plan, &|| hook.launching(i))
                     });
                     let mut value = result.unwrap_or_else(|e| json!({"device": udid, "error": e}));
                     value["started_s"] = json!(round(queued_s));
                     value["done_s"] = json!(round(start.elapsed().as_secs_f64()));
+                    hook.finished(i, &value);
                     results.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[i] = value;
                 }
             });
         }
     });
     results.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `boot_many` of `p`'s `devices`, with `hook` asked before each device starts and told as each
+/// finishes.
+pub(crate) fn boot_many_hooked(s: &mut Session, p: &Value, hook: &dyn crate::progress::BootHook) -> Result<Value, String> {
+    let udids = strings(p, "devices");
+    if udids.is_empty() {
+        return Err("give `devices`: a list of UDIDs or names".into());
+    }
+    let concurrency = crate::params::concurrency(p)?;
+    // Settles by default: the slot is held through the settle wait, so K bounds the boot
+    // storms in flight (what the K sweep measured), not just the service's boot calls.
+    let mut exact = Vec::with_capacity(udids.len());
+    let mut runtimes = Vec::with_capacity(udids.len());
+    for q in &udids {
+        let (_, info) = s.ctx()?.resolve(q).map_err(err)?;
+        exact.push(info.udid);
+        runtimes.push(info.runtime_id);
+    }
+    let plan = boot_plan(p, concurrency.min(udids.len()), true, || build_shapers(&runtimes))?;
+    let start = std::time::Instant::now();
+    let results = boot_many(&exact, concurrency, &plan, hook);
+    let failed = results.iter().filter(|r| r.get("error").is_some()).count();
+    let unsettled = results.iter().filter(|r| r["settled"] == json!(false)).count();
+    Ok(json!({"concurrency": concurrency, "all_s": round(start.elapsed().as_secs_f64()), "failed": failed,
+        "unsettled": unsettled, "devices": results}))
 }
 
 /// Rejects a `create` whose device type isn't the requested form factor. CarPlay (auto) is valid
@@ -1727,35 +1765,13 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "boot" => {
             let d = s.device(p)?;
             let plan = boot_plan(p, 1, false, || build_shapers(&[d.info().runtime_id]))?;
-            let timed = boot_device(&d, &plan)?;
+            let timed = boot_device(&d, &plan, &crate::progress::launching)?;
             // The device's saved camera links (#323): its feed and the device-wide injection.
             crate::camera::ios_booted(s, &d.info().udid);
             // Without settle or a profile, `boot` answers as it always has.
             Ok(if plan.settle.is_some() || plan.profile.is_some() { timed } else { Value::Null })
         }
-        "boot_many" => {
-            let udids = strings(p, "devices");
-            if udids.is_empty() {
-                return Err("give `devices`: a list of UDIDs or names".into());
-            }
-            let concurrency = crate::params::concurrency(p)?;
-            // Settles by default: the slot is held through the settle wait, so K bounds the boot
-            // storms in flight (what the K sweep measured), not just the service's boot calls.
-            let mut exact = Vec::with_capacity(udids.len());
-            let mut runtimes = Vec::with_capacity(udids.len());
-            for q in &udids {
-                let (_, info) = s.ctx()?.resolve(q).map_err(err)?;
-                exact.push(info.udid);
-                runtimes.push(info.runtime_id);
-            }
-            let plan = boot_plan(p, concurrency.min(udids.len()), true, || build_shapers(&runtimes))?;
-            let start = std::time::Instant::now();
-            let results = boot_many(&exact, concurrency, &plan);
-            let failed = results.iter().filter(|r| r.get("error").is_some()).count();
-            let unsettled = results.iter().filter(|r| r["settled"] == json!(false)).count();
-            Ok(json!({"concurrency": concurrency, "all_s": round(start.elapsed().as_secs_f64()), "failed": failed,
-                "unsettled": unsettled, "devices": results}))
-        }
+        "boot_many" => boot_many_hooked(s, p, &crate::progress::Unwatched),
         "settle" => {
             let d = s.device(p)?;
             if d.state() != DeviceState::Booted {

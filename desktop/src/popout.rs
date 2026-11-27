@@ -54,6 +54,9 @@ const MAX_W: f32 = 1440.0;
 const CHROME_W: f32 = 32.0;
 const CHROME_H: f32 = 16.0 + TITLE_BAR + 28.0 + 12.0 + 12.0 + 16.0 + 16.0;
 
+/// Seconds a pop-out asked for waits for its device to connect before it gives up.
+const PENDING_FOR: f64 = 10.0;
+
 /// The window that fits a device screen of `size` pixels: the screen at
 /// [`android::SCREEN_POINTS`] tall, as the main window shows it, shorter when that would be wider
 /// than [`MAX_W`] (a landscape tablet, a TV), and never narrower than [`MIN_W`].
@@ -81,6 +84,10 @@ struct Open {
     udid: String,
     /// The native window (none in headless runs and tests).
     window: Option<rune::WindowHandle>,
+    /// Wakes the pop-out, once it has set up.
+    waker: Option<Waker>,
+    /// Its device stopped: the window lets go of it and says so.
+    stopped: bool,
 }
 
 /// A device on its way back to the main window, with where its window was.
@@ -107,6 +114,21 @@ impl Hub {
         self.window(udid)?.placement().as_ref().and_then(crate::panes::frame_of)
     }
 
+    /// `udid`'s device stopped, shut down here or elsewhere: its window lets go of the
+    /// connection (the capture thread and HID session, or the display stream) and says so.
+    pub fn stop(&mut self, udid: &str) {
+        if let Some(o) = self.open.iter_mut().find(|o| o.udid == udid && !o.stopped) {
+            o.stopped = true;
+            if let Some(wake) = &o.waker {
+                wake();
+            }
+        }
+    }
+
+    fn stopped(&self, udid: &str) -> bool {
+        self.open.iter().any(|o| o.udid == udid && o.stopped)
+    }
+
     fn give_back(&mut self, returned: Returned) {
         self.returned.push(returned);
         if let Some(wake) = &self.main_waker {
@@ -120,8 +142,8 @@ impl Hub {
 pub struct Popouts {
     pub hub: Rc<RefCell<Hub>>,
     /// Pop this device out once the main window has connected it (a list row's menu on a device
-    /// that wasn't selected).
-    pending: Option<String>,
+    /// that wasn't selected), unless that takes longer than [`PENDING_FOR`].
+    pending: Option<Pending>,
     /// Pop-outs made where no window can open (headless runs and tests), for the caller to drive.
     pub unopened: Vec<Window>,
 }
@@ -130,6 +152,16 @@ impl Popouts {
     pub fn is_open(&self, udid: &str) -> bool {
         self.hub.borrow().is_open(udid)
     }
+
+    fn wait_for(&mut self, udid: &str) {
+        self.pending = Some(Pending { udid: udid.to_owned(), since: None });
+    }
+}
+
+/// A pop-out waiting for its device to connect, since the first poll that saw it.
+struct Pending {
+    udid: String,
+    since: Option<f64>,
 }
 
 /// A device's connection and what its screen is shown with, as it moves between windows.
@@ -145,6 +177,8 @@ pub struct Popped {
     pub size: (u32, u32),
     pub turn: Rotation,
     pub shape: Shape,
+    /// Finds an Android device for its console work (the main window's backend).
+    pub backend: Option<sim_android::Android>,
 }
 
 impl Popped {
@@ -163,8 +197,18 @@ impl Popped {
         self.live.is_none() && self.screen.is_none()
     }
 
+    /// The device stopped: shut down (here or elsewhere), or its emulator went away.
     fn stopped(&self) -> bool {
-        self.screen.as_ref().is_some_and(|sc| !sc.alive())
+        self.info.state != DeviceState::Booted || self.screen.as_ref().is_some_and(|sc| !sc.alive())
+    }
+
+    /// Lets go of a stopped device's connection: the capture thread and HID session, or the
+    /// display stream, and the last frame, so it never shows again.
+    fn let_go(&mut self) {
+        self.info.state = DeviceState::Shutdown;
+        self.live = None;
+        self.screen = None;
+        self.native.clear();
     }
 }
 
@@ -188,6 +232,8 @@ pub struct Window {
     titled: bool,
     /// The screen element's size in points.
     screen_view: (f32, f32),
+    /// Where the window opened: its saved frame's place, on a connected display.
+    placed: Option<(i32, i32)>,
 }
 
 impl Window {
@@ -251,13 +297,13 @@ fn pop_out(s: &mut State, udid: &str, tx: &mut Tx) {
         return focus(s, udid);
     }
     if s.selected.as_deref() != Some(udid) {
-        s.popouts.pending = Some(udid.to_owned());
+        s.popouts.wait_for(udid);
         s.actions.push(Action::Select(udid.to_owned()));
         tx.request_poll();
         return;
     }
     if !move_out(s) {
-        s.popouts.pending = Some(udid.to_owned());
+        s.popouts.wait_for(udid);
     }
 }
 
@@ -285,6 +331,7 @@ fn move_out(s: &mut State) -> bool {
         size,
         turn: s.screen_rotation(),
         shape: s.shape,
+        backend: s.android_backend.clone(),
         info,
     };
     // The main window's next device presents into a surface of its own.
@@ -305,17 +352,21 @@ fn move_out(s: &mut State) -> bool {
     let n = {
         let mut hub = s.popouts.hub.borrow_mut();
         hub.main_waker = s.waker.clone();
-        hub.open.push(Open { udid: udid.clone(), window: None });
+        hub.open.push(Open { udid: udid.clone(), window: None, waker: None, stopped: false });
         hub.opened += 1;
         hub.opened
     };
-    if s.offline {
+    // A frame saved on a display that's gone opens on one that's there.
+    w.placed = frame.map(|f| placed(f, &if s.offline { Vec::new() } else { rune::displays() }));
+    // Tests drive the window themselves: they can't open native ones.
+    if s.offline || cfg!(test) {
         s.popouts.unopened.push(w);
     } else {
         let size = frame.map_or(fitted, |f| (f.width.max(MIN_W), f.height));
         // Keyed by count too: the device's last window may still be closing this turn.
         let key = format!("popout-{udid}-{n}");
-        let window = rune::open_window(spec(key, w, size, frame.map(|f| (f.x, f.y))));
+        let position = w.placed;
+        let window = rune::open_window(spec(key, w, size, position));
         if let Some(o) = s.popouts.hub.borrow_mut().open.iter_mut().find(|o| o.udid == udid) {
             o.window = Some(window);
         }
@@ -327,6 +378,32 @@ fn move_out(s: &mut State) -> bool {
     }
     s.status = Some(format!("{} is in its own window", s.devices.iter().find(|d| d.udid == udid).map_or(udid.as_str(), |d| &d.name)));
     true
+}
+
+/// Where a window saved at `frame` opens: there while its title bar is on one of `displays`
+/// (as the main window's restore checks), else moved onto the display nearest it (the primary
+/// one breaks a tie), whole where it fits. With no displays to check (a headless run), where it
+/// was.
+fn placed(frame: WindowFrame, displays: &[rune::Display]) -> (i32, i32) {
+    let at = (frame.x, frame.y);
+    if displays.is_empty() || displays.iter().any(|d| crate::panes::in_title_bar(at, d)) {
+        return at;
+    }
+    let distance = |d: &rune::Display| {
+        let gap = |v: i32, lo: i32, len: u32| {
+            let (v, lo) = (i64::from(v), i64::from(lo));
+            (lo - v).max(v - (lo + i64::from(len))).max(0)
+        };
+        gap(at.0, d.position.0, d.size.0) + gap(at.1, d.position.1, d.size.1)
+    };
+    let Some(d) = displays.iter().min_by_key(|d| (distance(d), !d.primary)) else { return at };
+    // The frame's size is in points; the display, like the position, in physical pixels.
+    let size = |points: f32| (f64::from(points) * d.scale) as i64;
+    let clamp = |v: i32, lo: i32, len: u32, size: i64| {
+        let hi = (i64::from(lo) + i64::from(len) - size).max(i64::from(lo));
+        i64::from(v).clamp(i64::from(lo), hi) as i32
+    };
+    (clamp(at.0, d.position.0, d.size.0, size(frame.width)), clamp(at.1, d.position.1, d.size.1, size(frame.height)))
 }
 
 /// The pop-out window's spec: its own state, view and hooks, flat (no 3D compositor), at
@@ -345,22 +422,43 @@ fn spec(key: String, w: Window, size: (f32, f32), position: Option<(i32, i32)>) 
 
 /// Every main-window poll: brings handed-back devices home and pops out a pending one once
 /// it's connected. Returns whether the window should redraw.
-pub fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
+pub fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     let returned = std::mem::take(&mut s.popouts.hub.borrow_mut().returned);
     let mut changed = !returned.is_empty();
     for r in returned {
         move_in(s, r);
     }
-    if let Some(udid) = s.popouts.pending.clone() {
+    // A device out in its own window that stopped (here or elsewhere): its window lets go of it.
+    {
+        let mut hub = s.popouts.hub.borrow_mut();
+        let stopped: Vec<String> = hub
+            .open
+            .iter()
+            .filter(|o| !o.stopped && s.devices.iter().any(|d| d.udid == o.udid && d.state != DeviceState::Booted))
+            .map(|o| o.udid.clone())
+            .collect();
+        stopped.iter().for_each(|udid| hub.stop(udid));
+    }
+    if let Some(p) = &mut s.popouts.pending {
+        let since = *p.since.get_or_insert(t);
+        let udid = p.udid.clone();
         if s.selected.as_deref() != Some(udid.as_str()) {
             // Selected elsewhere since: that wins (its own selection may still be queued).
             if !s.actions.contains(&Action::Select(udid)) {
                 s.popouts.pending = None;
             }
+        } else if t - since > PENDING_FOR {
+            // It never connected: a scan connecting it later doesn't pop it out unasked.
+            s.popouts.pending = None;
+            let name = s.selected_info().map_or(udid, |d| d.name.clone());
+            s.status = Some(format!("{name} didn't connect in time: pop it out again once it shows"));
+            changed = true;
         } else if move_out(s) {
             s.popouts.pending = None;
             changed = true;
             tx.request_poll();
+        } else {
+            tx.wake_after(Duration::from_secs_f64(PENDING_FOR - (t - since) + 0.05));
         }
     }
     changed
@@ -369,8 +467,12 @@ pub fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
 /// Shows a device handed back from its window in the main window again, as its selected device,
 /// on the connection it had: the device the main window showed meanwhile is switched away from.
 fn move_in(s: &mut State, r: Returned) {
-    let Returned { device: p, frame } = r;
+    let Returned { device: mut p, frame } = r;
     let udid = p.info.udid.clone();
+    // One that stopped comes back as a device that isn't running, never with its last frame.
+    if p.stopped() || s.devices.iter().any(|d| d.udid == udid && d.state != DeviceState::Booted) {
+        p.let_go();
+    }
     s.popouts.hub.borrow_mut().open.retain(|o| o.udid != udid);
     if let Some(f) = frame {
         s.prefs.current.popouts.insert(udid.clone(), f);
@@ -382,11 +484,15 @@ fn move_in(s: &mut State, r: Returned) {
         crate::stylus_off(s);
         s.pause_screen();
         s.live = None;
-        if let Some(sc) = &p.screen {
+        if let Some(sc) = &mut p.screen {
+            // Its console work reports in the main window again.
+            let backend = s.android_backend.clone().unwrap_or_default();
+            sc.set_console(work::Worker::start("simee-android-console", android::lookup(backend, udid.clone()), s.outbox.clone()));
             sc.set_visible(s.visible);
         }
         if let Some(w) = &s.waker {
             p.native.set_waker(w.clone());
+            p.live.iter().for_each(|l| l.shared.set_waker(w.clone()));
         }
         if let Some(live) = &p.live {
             s.debug.data_path = Some(live.data_path());
@@ -401,6 +507,11 @@ fn move_in(s: &mut State, r: Returned) {
     s.offline_size = p.size;
     s.sized_for = None;
     s.selected = Some(udid);
+    // Back without a connection (it stopped): the scan asked for below connects it if it's
+    // running again by then.
+    if !s.offline && !s.showing_screen() {
+        s.connect_pending = true;
+    }
     if let Some(sc) = &s.scanner {
         sc.follow(s.selected.as_deref());
         sc.ask(s.selected.as_deref());
@@ -509,10 +620,19 @@ pub fn placeholder(udid: &str, t: Theme) -> El {
 // The pop-out window.
 
 fn setup(w: &mut Window, waker: Waker) {
-    if let Some(d) = &w.device {
-        d.native.set_waker(waker.clone());
+    w.outbox = work::Outbox::new(Some(waker.clone()));
+    let Some(d) = &mut w.device else { return };
+    d.native.set_waker(waker.clone());
+    d.live.iter().for_each(|l| l.shared.set_waker(waker.clone()));
+    if let Some(sc) = &mut d.screen {
+        // Its console work (rotate, fold, screenshots) reports in this window.
+        let find = android::lookup(d.backend.clone().unwrap_or_default(), d.info.udid.clone());
+        sc.set_console(work::Worker::start("simee-popout-console", find, w.outbox.clone()));
     }
-    w.outbox = work::Outbox::new(Some(waker));
+    let mut hub = w.hub.borrow_mut();
+    if let Some(o) = hub.open.iter_mut().find(|o| o.udid == d.info.udid) {
+        o.waker = Some(waker);
+    }
 }
 
 /// Closing the window hands the device back to the main window; the app quitting doesn't.
@@ -654,6 +774,14 @@ pub fn poll_window(w: &mut Window, t: f64, tx: &mut Tx) -> bool {
             live.button(button, Direction::Up);
         }
     }
+    if let Some(d) = &mut w.device
+        && d.info.state == DeviceState::Booted
+        && w.hub.borrow().stopped(&d.info.udid)
+    {
+        w.held = None;
+        d.let_go();
+        changed = true;
+    }
     for action in std::mem::take(&mut w.actions) {
         changed = true;
         if let Action::PopIn(_) = action {
@@ -708,7 +836,7 @@ fn console(w: &Window, job: impl FnOnce(&sim_android::Device) -> Result<(), Stri
 }
 
 fn perform_action(w: &mut Window, action: Action, t: f64, tx: &mut Tx) {
-    if w.device.as_ref().is_none_or(Popped::offline) {
+    if w.device.as_ref().is_none_or(|d| d.offline() || d.stopped()) {
         return;
     }
     match action {
@@ -748,6 +876,9 @@ fn perform_action(w: &mut Window, action: Action, t: f64, tx: &mut Tx) {
 
 fn perform_input(w: &mut Window, input: Input, t: f64, tx: &mut Tx) {
     let Some(d) = &w.device else { return };
+    if d.stopped() {
+        return;
+    }
     if d.offline() {
         w.sent.push(input);
         return;
@@ -803,6 +934,7 @@ fn screenshot(w: &mut Window) {
 mod tests {
     use super::*;
     use rune::{Env, Mods, Runtime};
+    use std::sync::{Arc, Mutex};
 
     fn cmd_shift(c: char) -> KeyEvent {
         KeyEvent { key: Key::Command(c), mods: Mods { cmd: true, shift: true, ..Mods::default() } }
@@ -849,8 +981,44 @@ mod tests {
         let mut win = Runtime::new(w, view, size, Env::new(true, 2.0));
         win.poll = Some(poll_window);
         win.on_key = Some(window_key);
+        win.update(|w, _| setup(w, Arc::new(|| {})));
         win.frame(0.0);
         win
+    }
+
+    /// Runs frames of `rt` until `done`, failing after 5 s.
+    fn until<S>(rt: &mut Runtime<S>, what: &str, done: impl Fn(&Runtime<S>) -> bool) {
+        let start = std::time::Instant::now();
+        while !done(rt) {
+            assert!(start.elapsed() < Duration::from_secs(5), "{what}");
+            std::thread::sleep(Duration::from_millis(2));
+            rt.frame(1.0 / 60.0);
+        }
+    }
+
+    /// The main window live (not a headless scene) on a running Pixel whose screen is connected
+    /// to a display socket that records what it's sent; its AVD lookups find nothing.
+    fn live_pixel(name: &str) -> (Runtime<State>, std::path::PathBuf, Arc<Mutex<Vec<String>>>) {
+        let (dir, lines) = crate::tests::recording_display(&format!("popout-{name}"));
+        let mut main = main_window(crate::android_scene);
+        main.update(|s, _| {
+            s.offline = false;
+            s.offline_screen = false;
+            let mut backend = sim_android::Android::new(sim_android::Env { sdk_root: None, avd_home: dir.join("no-avds") });
+            backend.running_dir = Some(dir.join("no-instances"));
+            s.android_backend = Some(backend.clone());
+            let console = work::Worker::start("test-console", android::lookup(backend, "pixel_9".into()), s.outbox.clone());
+            let sc = android::Screen::connect("pixel_9", dir.clone(), 1080, console).expect("connect");
+            sc.pixels.set(2, 1, vec![9; 8]);
+            s.screen = Some(sc);
+        });
+        main.frame(1.0 / 60.0);
+        assert!(main.find("device-screen").is_some(), "the live screen");
+        (main, dir, lines)
+    }
+
+    fn set_state(rt: &mut Runtime<State>, udid: &str, state: DeviceState) {
+        rt.state.devices.iter_mut().filter(|d| d.udid == udid).for_each(|d| d.state = state);
     }
 
     #[test]
@@ -1024,9 +1192,156 @@ mod tests {
         act(&mut main, Action::PopOut("A1".into()));
         let w = &main.state.popouts.unopened[0];
         assert!(w.keep_size, "opened at its saved size, which its first fit keeps");
+        assert_eq!(w.placed, Some((1500, 60)), "at its saved place (the tests have no displays to check it on)");
         // A device without a saved frame is fitted to its screen.
         act(&mut main, Action::PopOut("pixel_9".into()));
         assert!(!main.state.popouts.unopened[1].keep_size);
+        assert_eq!(main.state.popouts.unopened[1].placed, None, "where the system puts it");
+    }
+
+    fn display(position: (i32, i32), size: (u32, u32), primary: bool) -> rune::Display {
+        rune::Display { id: None, name: None, position, size, scale: 2.0, primary }
+    }
+
+    /// A frame saved on a display that's gone (an unplugged monitor) opens on one that's there,
+    /// whole where it fits; one on a connected display opens where it was.
+    #[test]
+    fn a_saved_frame_off_every_display_opens_on_one() {
+        let laptop = display((0, 0), (3024, 1964), true);
+        let monitor = display((3024, 0), (3840, 2160), false);
+        let frame = |x, y| WindowFrame { x, y, width: 500.0, height: 980.0 };
+        // On the laptop, and on the monitor while it's plugged in.
+        assert_eq!(placed(frame(100, 60), std::slice::from_ref(&laptop)), (100, 60));
+        assert_eq!(placed(frame(4000, 60), &[laptop.clone(), monitor.clone()]), (4000, 60));
+        // The monitor unplugged: right of the laptop, left of it, below it.
+        for (x, y) in [(4000, 60), (-800, 60), (100, 5000)] {
+            let (px, py) = placed(frame(x, y), std::slice::from_ref(&laptop));
+            assert!((0..=3024 - 1000).contains(&px) && (0..=1964 - 1960).contains(&py), "({x}, {y}) opens at ({px}, {py})");
+        }
+        // The laptop's lid shut, a monitor left of where the window was: on the monitor.
+        let (px, _) = placed(frame(100, 60), &[display((-3840, 0), (3840, 2160), true)]);
+        assert!((-3840..=-1000).contains(&px), "{px}");
+        // No displays to check against (a headless run): where it was.
+        assert_eq!(placed(frame(-800, 60), &[]), (-800, 60));
+    }
+
+    /// An iOS pop-out whose device stopped elsewhere (the CLI, a script) says so and lets go of
+    /// it, and pops back in as a device that isn't running rather than with its last frame.
+    #[test]
+    fn a_pop_out_notices_its_device_stopped() {
+        let mut main = main_window(two_running);
+        act(&mut main, Action::PopOut("A1".into()));
+        let mut win = take_window(&mut main, "A1");
+        assert!(win.find("home-button").is_some() && win.find("popout-stopped").is_none());
+        set_state(&mut main, "A1", DeviceState::Shutdown);
+        main.frame(1.0 / 60.0);
+        win.frame(1.0 / 60.0);
+        assert!(win.find("popout-stopped").is_some(), "the pop-out says the device stopped");
+        assert!(win.find("home-button").is_none() && win.find("popout-screen").is_none(), "no toolbar, no frozen screen");
+        assert!(win.find("popin-button").is_some(), "it can still go back");
+        win.state.inputs.push(Input::Down(1.0, 1.0));
+        win.frame(1.0 / 60.0);
+        assert!(win.state.sent.is_empty(), "nothing is sent to a stopped device");
+        let (x, y) = win.find("popin-button").unwrap();
+        win.pointer_down(x, y);
+        win.pointer_up(x, y);
+        win.frame(1.0 / 60.0);
+        main.frame(1.0 / 60.0);
+        assert_eq!(main.state.selected.as_deref(), Some("A1"), "back in the main window, which shows it isn't running");
+        assert!(main.find("boot-button").is_some());
+    }
+
+    /// An Android pop-out on a live screen: touches reach its device, hiding it pauses the
+    /// stream, popping it back in shows the same screen in the main window (no reconnect) and
+    /// streams again; nothing it does reaches the main window's input.
+    #[test]
+    fn an_android_pop_out_moves_its_live_screen_and_back() {
+        let (mut main, dir, lines) = live_pixel("roundtrip");
+        let signature = main.state.screen.as_ref().map(|sc| sc.pixels.signature());
+        act(&mut main, Action::PopOut("pixel_9".into()));
+        assert!(main.state.screen.is_none(), "the screen moved out");
+        let mut win = take_window(&mut main, "pixel_9");
+        assert_eq!(win.state.device.as_ref().and_then(|d| d.screen.as_ref()).map(|sc| sc.pixels.signature()), signature);
+        let ([x, y, w, h], _) = win.presented("popout-screen").expect("the Pixel's screen");
+        win.pointer_down(x + w / 2.0, y + h / 2.0);
+        win.pointer_up(x + w / 2.0, y + h / 2.0);
+        win.frame(1.0 / 60.0);
+        let touched = |_: &Runtime<Window>| lines.lock().expect("lines").iter().any(|l| l.starts_with("touch"));
+        until(&mut win, "the tap reached the Pixel's socket", touched);
+        assert!(main.state.inputs.is_empty(), "and not the main window");
+        let last_hello = || lines.lock().expect("lines").iter().rev().find(|l| l.starts_with("hello")).cloned();
+        win.update(|w, tx| on_visibility(w, false, tx));
+        until(&mut win, "a hidden pop-out pauses the stream", |_| last_hello().as_deref() == Some("hello 0"));
+        win.update(on_close);
+        main.frame(1.0 / 60.0);
+        assert_eq!(main.state.screen.as_ref().map(|sc| sc.pixels.signature()), signature, "the same screen, back");
+        until(&mut main, "the visible main window streams it again", |_| last_hello().as_deref() == Some("hello 1080"));
+        assert!(main.find("device-screen").is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The resource panel's Shut down on a device that's out: its window lets go of the
+    /// connection at once, so popping it back in brings no frozen frame to the main window.
+    #[test]
+    fn shutting_down_a_popped_device_drops_its_connection() {
+        let (mut main, dir, _lines) = live_pixel("shutdown");
+        act(&mut main, Action::PopOut("pixel_9".into()));
+        let mut win = take_window(&mut main, "pixel_9");
+        crate::resources::shut_down(&mut main.state, "pixel_9", "android", "Pixel 9");
+        assert_eq!(
+            main.state.resources.queued,
+            [crate::resources::Job::Shutdown { device: "pixel_9".into(), platform: "android".into(), name: "Pixel 9".into() }],
+            "shut down through the API"
+        );
+        main.frame(1.0 / 60.0);
+        win.frame(1.0 / 60.0);
+        assert!(win.state.device.as_ref().is_some_and(|d| d.screen.is_none() && d.live.is_none()), "the connection is gone");
+        assert!(win.find("popout-stopped").is_some());
+        win.update(on_close);
+        main.frame(1.0 / 60.0);
+        assert_eq!(main.state.selected.as_deref(), Some("pixel_9"));
+        assert!(main.state.screen.is_none() && main.find("device-screen").is_none(), "no frozen frame came back");
+        assert!(main.state.connect_pending, "the next scan connects it if it's running again");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An Android pop-out's console work reports in the pop-out, not the main window.
+    #[test]
+    fn a_pop_out_shows_its_own_console_results() {
+        let (mut main, dir, _lines) = live_pixel("console");
+        act(&mut main, Action::PopOut("pixel_9".into()));
+        let mut win = take_window(&mut main, "pixel_9");
+        let before = main.state.status.clone();
+        win.update(|w, _| w.actions.push(Action::Rotate));
+        until(&mut win, "the rotate's result in the pop-out", |w| w.state.status.is_some());
+        main.frame(1.0 / 60.0);
+        assert_eq!(main.state.status, before, "the main window says nothing new");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A pop-out asked for on a device that never connects gives up rather than popping out
+    /// unasked when a later scan connects it.
+    #[test]
+    fn a_pending_pop_out_gives_up() {
+        let mut main = main_window(two_running);
+        main.state.offline_screen = false;
+        act(&mut main, Action::PopOut("pixel_9".into()));
+        assert_eq!(main.state.selected.as_deref(), Some("pixel_9"));
+        assert!(!main.state.popouts.is_open("pixel_9"), "not connected yet");
+        // Connected in time, it pops out.
+        main.state.offline_screen = true;
+        settle(&mut main);
+        assert!(main.state.popouts.is_open("pixel_9"));
+        act(&mut main, Action::PopIn("pixel_9".into()));
+        // Not connected for long: given up, and the status says so.
+        main.state.offline_screen = false;
+        act(&mut main, Action::PopOut("A1".into()));
+        main.frame(PENDING_FOR + 1.0);
+        main.frame(1.0 / 60.0);
+        assert!(main.state.status.as_deref().is_some_and(|s| s.contains("pop it out again")), "{:?}", main.state.status);
+        main.state.offline_screen = true;
+        settle(&mut main);
+        assert!(!main.state.popouts.is_open("A1"), "no pop-out long after it was asked for");
     }
 
     fn popped(udid: &str) -> Popped {
@@ -1041,6 +1356,7 @@ mod tests {
             size: (402, 874),
             turn: Rotation::Deg0,
             shape: Shape::Rounded,
+            backend: None,
         }
     }
 }
