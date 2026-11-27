@@ -2252,7 +2252,11 @@ mod tests {
                 ["d0", "d1", "d2", "d3", "d4", "d5"]
             );
             let at = |i: usize, k: &str| devices[i][k].as_f64().expect("time");
-            assert!(at(5, "started_s") < at(0, "done_s"), "d5 started as d4 finished, not after d0 (watched: {watched}): {r}");
+            // In a window, d2 takes d1's slot the moment d1 finishes, while d0 still boots; in waves
+            // it would wait for d0 too. (d5 isn't used: a loaded runner stretched the 0.15 s boots
+            // to 0.3 s, so five of them outlast d0's 0.9 s even in a window.)
+            assert!(at(2, "started_s") < at(0, "done_s"), "d2 started as d1 finished, not after d0 (watched: {watched}): {r}");
+            assert!(at(2, "started_s") - at(1, "done_s") < 0.2, "d2 started when d1 finished (watched: {watched}): {r}");
             // The window property is the line above (in waves, d5 would start only after d0 is
             // done). An absolute wall-clock bound isn't asserted: a loaded CI runner stretched d0's
             // 0.9 s to 1.02 s and the whole run past any tight bound.
