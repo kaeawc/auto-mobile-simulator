@@ -32,6 +32,7 @@ mod keys;
 mod mark;
 mod scan;
 mod scene;
+mod shot_preview;
 mod stylus;
 #[cfg(target_os = "macos")]
 mod surface;
@@ -162,6 +163,8 @@ pub struct State {
     pub bezel: bezel::Bezel,
     /// The 3D device view's switch.
     pub view3d: scene::Toggle,
+    /// The screenshot previews in the window's bottom-right corner ([`shot_preview`]).
+    pub previews: shot_preview::Previews,
     /// Seconds the mark has been moving (a job running, a device starting or stopping), and the
     /// poll time it started at; `None` while it rests.
     pub mark_t: f32,
@@ -427,6 +430,7 @@ fn init() -> State {
         screen_view: (0.0, 0.0),
         bezel: bezel::Bezel::default(),
         view3d,
+        previews: shot_preview::Previews::default(),
     }
 }
 
@@ -620,6 +624,7 @@ fn headless() -> bool {
 
 fn setup(s: &mut State, waker: Waker) {
     s.native.set_waker(waker.clone());
+    s.previews.connect(waker.clone());
     s.outbox = work::Outbox::new(Some(waker.clone()));
     s.bezel.set_outbox(s.outbox.clone());
     s.waker = Some(waker);
@@ -895,6 +900,11 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             tx.wake_after(Duration::ZERO);
         }
     }
+    // Screenshot previews: a frame for every step of a slide, a wake at the next expiry.
+    changed |= s.previews.step(t);
+    if let Some(secs) = s.previews.wake_in(t) {
+        tx.wake_after(Duration::from_secs_f64(secs));
+    }
     changed
 }
 
@@ -910,10 +920,13 @@ fn toggle_view3d(s: &mut State) {
 }
 
 /// Window shortcuts the focused control left alone: ⌘3 toggles the 3D view; while it shows, ⌘0,
-/// ⌘1 ⌘2 ⌘4 ⌘5, ⌘F and ⌘[ ⌘] move it ([`scene::Command::for_key`]).
+/// ⌘1 ⌘2 ⌘4 ⌘5, ⌘F and ⌘[ ⌘] move it ([`scene::Command::for_key`]). ⌘S saves a screenshot
+/// wherever the focus is.
 fn on_key(s: &mut State, k: &rune::KeyEvent, tx: &mut Tx) -> bool {
     let action = if k.key == rune::Key::Command('3') && !k.mods.shift {
         Action::ToggleView3d
+    } else if keys::map(k) == KeyAction::Screenshot {
+        Action::Screenshot
     } else if let Some(c) = scene::Command::for_key(k)
         && scene::active(s).is_some()
     {
@@ -1039,9 +1052,13 @@ fn edge_touch(s: &State, x: f32, y: f32, phase: Phase, edge: sim_core::gesture::
 /// returns a status line only for what fails at once.
 fn screenshot(s: &State) -> Option<String> {
     let path = work::screenshot_path();
+    let inbox = s.previews.inbox();
     if let Some(sc) = &s.screen {
         sc.console(move |d| match d.screenshot_png_to(&path) {
-            Ok(_) => Ok(Some(format!("saved {}", path.display()))),
+            Ok(_) => {
+                inbox.post_file(&path);
+                Ok(Some(format!("saved {}", path.display())))
+            }
             Err(e) => Err(format!("screenshot failed: {e}")),
         });
         return None;
@@ -1057,7 +1074,7 @@ fn screenshot(s: &State) -> Option<String> {
     if frame.width == 0 || frame.height == 0 {
         return Some("no frame to save".into());
     }
-    work::save_png(frame, path, s.outbox.clone());
+    shot_preview::save_png(frame, path, s.outbox.clone(), inbox);
     None
 }
 
@@ -1077,12 +1094,20 @@ fn main() {
             ("turned", turned_scene),
             ("turned-tablet", turned_tablet_scene),
             ("empty", empty),
+            ("screenshot", |s| {
+                demo(s);
+                shot_preview::demo_shots(s, 2);
+            }),
+            ("android-screenshot", |s| {
+                android_scene(s);
+                shot_preview::demo_shots(s, 1);
+            }),
         ],
         setup: Some(setup),
         poll: Some(poll),
         on_key: Some(on_key),
         min_size: Some((1000.0, 560.0)),
-        ..AppSpec::new("simee", (1240.0, 870.0), init, view::view)
+        ..AppSpec::new("simee", (1240.0, 870.0), init, shot_preview::view)
     };
     // Live Rust editing runs the spec its own way, without the visibility hook.
     #[cfg(feature = "hot")]
