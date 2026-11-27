@@ -83,21 +83,43 @@ pub fn mesh(body: &Body) -> Mesh {
             radii: panel.radii,
             exponent: body.corner.exponent,
         };
-        // The part of each face's screen on this panel, clear of the edges.
-        let inner = [
-            cx - panel.size[0] / 2.0 + margin,
-            cx + panel.size[0] / 2.0 - margin,
-            cy - panel.size[1] / 2.0 + margin,
-            cy + panel.size[1] / 2.0 - margin,
-        ];
+        // The part of each face's screen on this panel, clear of the edges. A foldable's front
+        // screen runs to the hinge: right up to it for one flexible display (the body's front edge
+        // there is square, so the two halves meet exactly), else stopping half the gap short.
+        let hinge_side = body.fold.as_ref().map(|f| f.hinge_side(pi));
+        let flexible = body.fold.as_ref().is_some_and(|f| f.screen_gap <= 0.0);
+        let bounds = |face: Face| {
+            let mut inner = [
+                cx - panel.size[0] / 2.0 + margin,
+                cx + panel.size[0] / 2.0 - margin,
+                cy - panel.size[1] / 2.0 + margin,
+                cy + panel.size[1] / 2.0 - margin,
+            ];
+            if let (Some(f), Some(side), Face::Front) = (&body.fold, hinge_side, face) {
+                let near = if flexible { 0.0 } else { (f.screen_gap / 2.0).max(margin) };
+                let at = f.hinge.at;
+                match side {
+                    Side::Right => inner[1] = at - near,
+                    Side::Left => inner[0] = at + near,
+                    Side::Top => inner[3] = at - near,
+                    Side::Bottom => inner[2] = at + near,
+                }
+            }
+            inner
+        };
+        let square = hinge_side.filter(|_| flexible);
         let piece = |face: Face| {
             body.screens.iter().filter(|s| s.face == face).find_map(|s| {
-                let rect = screen_piece(body, s, inner)?;
+                let sharp = square.filter(|_| face == Face::Front);
+                let rect = screen_piece(body, s, bounds(face), sharp)?;
                 Some((s, RoundRect { center: [rect.center[0] - cx, rect.center[1] - cy], ..rect }))
             })
         };
         let (front, back) = (piece(Face::Front), piece(Face::Back));
-        b.part(Role::Shell, pi, |b| slab(b, &frame, &shell, t, body.bevel, front.map(|(_, r)| r).as_ref(), back.map(|(_, r)| r).as_ref()));
+        // A flexible display's panel has no rounded-over edge at the hinge on its front.
+        let (front_hole, back_hole) = (front.map(|(_, r)| r), back.map(|(_, r)| r));
+        let faces = Faces { front: front_hole.as_ref(), back: back_hole.as_ref(), flat: square.filter(|_| front.is_some()) };
+        b.part(Role::Shell, pi, |b| slab(b, &frame, &shell, t, body.bevel, &faces));
         for (face, piece) in [(Face::Front, front), (Face::Back, back)] {
             let Some((s, local)) = piece else { continue };
             let [l, r, bottom, top] = s.rect();
@@ -130,7 +152,7 @@ pub fn mesh(body: &Body) -> Mesh {
             radii: [bump.corner.radius; 4],
             exponent: bump.corner.exponent,
         };
-        b.part(Role::Bump, pi, |b| slab(b, &frame, &shape, bump.height + EMBED, 0.6, None, None));
+        b.part(Role::Bump, pi, |b| slab(b, &frame, &shape, bump.height + EMBED, 0.6, &Faces::default()));
     }
     let mut keys: Vec<SideKey> = body
         .buttons
@@ -167,7 +189,7 @@ pub fn mesh(body: &Body) -> Mesh {
             Side::Bottom => [at, p.center[1] - p.size[1] / 2.0 - out, 0.0],
         };
         let shape = RoundRect { center: [0.0, 0.0], half: [across / 2.0, along / 2.0], radii: [radius; 4], exponent: 2.0 };
-        b.part(role, pi, |b| slab(b, &Frame::side(side, origin), &shape, depth, bevel, None, None));
+        b.part(role, pi, |b| slab(b, &Frame::side(side, origin), &shape, depth, bevel, &Faces::default()));
     }
     b.mesh
 }
@@ -192,9 +214,10 @@ pub fn cached_mesh(body: &Body) -> Arc<Mesh> {
     Arc::clone(map.entry(body.id.clone()).or_insert_with(|| Arc::new(mesh(body))))
 }
 
-/// The part of screen `s` inside `bounds` (left, right, bottom, top), in body coordinates: its
-/// own corners where they fall inside, small corners where a hinge cuts it.
-fn screen_piece(body: &Body, s: &super::Screen, [bl, br, bb, bt]: [f32; 4]) -> Option<RoundRect> {
+/// The part of screen `s` inside `bounds` (left, right, bottom and top), in body coordinates: its
+/// own corners where they fall inside, small corners where a hinge cuts it, and none on the side
+/// `sharp` names where it is cut: there it meets the screen's other half.
+fn screen_piece(body: &Body, s: &super::Screen, [bl, br, bb, bt]: [f32; 4], sharp: Option<Side>) -> Option<RoundRect> {
     let [l, r, b, t] = s.rect();
     let (cl, cr, cb, ct) = (l.max(bl), r.min(br), b.max(bb), t.min(bt));
     if cr - cl < 1.0 || ct - cb < 1.0 {
@@ -208,8 +231,30 @@ fn screen_piece(body: &Body, s: &super::Screen, [bl, br, bb, bt]: [f32; 4]) -> O
     };
     let (keep_l, keep_r, keep_b, keep_t) = (cl == l, cr == r, cb == b, ct == t);
     let corner = |a: bool, b: bool| if a && b { radius } else { MIN_RADIUS };
-    let radii = [corner(keep_r, keep_t), corner(keep_l, keep_t), corner(keep_l, keep_b), corner(keep_r, keep_b)];
+    let mut radii = [corner(keep_r, keep_t), corner(keep_l, keep_t), corner(keep_l, keep_b), corner(keep_r, keep_b)];
+    let cut = match sharp {
+        Some(Side::Right) => !keep_r,
+        Some(Side::Left) => !keep_l,
+        Some(Side::Top) => !keep_t,
+        Some(Side::Bottom) => !keep_b,
+        None => false,
+    };
+    if let (true, Some(side)) = (cut, sharp) {
+        for k in side_quadrants(side) {
+            radii[k] = 0.0;
+        }
+    }
     Some(RoundRect { center: [(cl + cr) / 2.0, (cb + ct) / 2.0], half: [(cr - cl) / 2.0, (ct - cb) / 2.0], radii, exponent })
+}
+
+/// The two corners (indices into [`RoundRect::radii`]) on a side.
+fn side_quadrants(side: Side) -> [usize; 2] {
+    match side {
+        Side::Right => [0, 3],
+        Side::Top => [0, 1],
+        Side::Left => [1, 2],
+        Side::Bottom => [2, 3],
+    }
 }
 
 // --- geometry ---
@@ -290,7 +335,7 @@ impl RoundRect {
         let limit = self.half[0].min(self.half[1]);
         let mut out = Vec::with_capacity(RING);
         for (k, q) in QUADRANTS.iter().enumerate() {
-            let r0 = self.radii[k].clamp(MIN_RADIUS.min(limit), limit);
+            let r0 = self.radii[k].clamp(0.0, limit);
             let c = [self.center[0] + q[0] * (self.half[0] - r0), self.center[1] + q[1] * (self.half[1] - r0)];
             let r = (r0 - inset).max(0.0);
             for j in 0..=CORNER_STEPS {
@@ -341,6 +386,17 @@ impl Builder {
         }
     }
 
+    /// A triangle unless two of its corners coincide: one that has area zero but runs along an
+    /// edge another face meets (a screen's edge on the body's) stays, so the surface has no seam.
+    fn tri_exact(&mut self, a: u32, b: u32, c: u32) {
+        let p = |i: u32| self.mesh.positions[i as usize];
+        let near = |x: V3, y: V3| (0..3).map(|i| (x[i] - y[i]) * (x[i] - y[i])).sum::<f32>() < 1e-10;
+        let (pa, pb, pc) = (p(a), p(b), p(c));
+        if !(near(pa, pb) || near(pb, pc) || near(pa, pc)) {
+            self.mesh.indices.extend([a, b, c]);
+        }
+    }
+
     fn part(&mut self, role: Role, panel: usize, build: impl FnOnce(&mut Self)) {
         let first = self.mesh.indices.len() as u32;
         build(self);
@@ -351,10 +407,44 @@ impl Builder {
     }
 }
 
+/// What a [`slab`]'s caps carry: holes left in them for [`fill`] to close (the screens), and a
+/// side whose front edge is square, not rounded over.
+#[derive(Default)]
+struct Faces<'a> {
+    front: Option<&'a RoundRect>,
+    back: Option<&'a RoundRect>,
+    flat: Option<Side>,
+}
+
+/// How square the front edge is at each outline point, 0 (rounded over) to 1 (square), for a
+/// slab whose front edge on `side` is flat: 1 along the side, easing to 0 round its two corners.
+fn flat_weights(side: Option<Side>) -> [f32; RING] {
+    let mut w = [0.0; RING];
+    let Some(side) = side else { return w };
+    // The quarter turn the side sits at, counter-clockwise from the right.
+    let at = match side {
+        Side::Right => 0,
+        Side::Top => 1,
+        Side::Left => 2,
+        Side::Bottom => 3,
+    };
+    for k in 0..4 {
+        for j in 0..=CORNER_STEPS {
+            let t = j as f32 / CORNER_STEPS as f32;
+            if k == at {
+                w[k * (CORNER_STEPS + 1) + j] = 1.0 - t;
+            } else if (k + 1) % 4 == at {
+                w[k * (CORNER_STEPS + 1) + j] = t;
+            }
+        }
+    }
+    w
+}
+
 /// A closed rounded box in `frame`: `outline` in the local x/y plane, `depth` along local z
-/// (centred), the edges of both caps rounded over by `bevel`. `front` and `back` are holes left in
-/// the caps for [`fill`] to close (the screens).
-fn slab(b: &mut Builder, frame: &Frame, outline: &RoundRect, depth: f32, bevel: f32, front: Option<&RoundRect>, back: Option<&RoundRect>) {
+/// (centred), the edges of both caps rounded over by `bevel` (but for [`Faces::flat`], where the
+/// front goes straight down to the side). The holes in `faces` are for [`fill`] to close.
+fn slab(b: &mut Builder, frame: &Frame, outline: &RoundRect, depth: f32, bevel: f32, faces: &Faces) {
     let limit = outline.half[0].min(outline.half[1]);
     let bevel = bevel.min(depth / 2.0).min(limit - MIN_RADIUS).max(0.0);
     let outline = RoundRect { radii: outline.radii.map(|r| r.max(bevel + MIN_RADIUS)), ..*outline };
@@ -369,9 +459,16 @@ fn slab(b: &mut Builder, frame: &Frame, outline: &RoundRect, depth: f32, bevel: 
         let (s, c) = (i as f32 / BEVEL_STEPS as f32 * FRAC_PI_2).sin_cos();
         rings.push((bevel * (1.0 - c), -depth / 2.0 + bevel * (1.0 - s), c, -s));
     }
+    let flat = flat_weights(faces.flat);
+    let square = outline.ring(0.0);
     let base = b.mesh.positions.len() as u32;
-    for &(inset, z, out, along) in &rings {
-        for (p, n) in outline.ring(inset) {
+    for (r, &(inset, z, out, along)) in rings.iter().enumerate() {
+        for (i, (p, n)) in outline.ring(inset).into_iter().enumerate() {
+            // On the front, a flat side drops straight to the side wall instead of rounding over.
+            let w = if r <= BEVEL_STEPS { flat[i] } else { 0.0 };
+            let lerp = |a: f32, b: f32| a + (b - a) * w;
+            let p = [lerp(p[0], square[i].0[0]), lerp(p[1], square[i].0[1])];
+            let (out, along) = if r == 0 { (lerp(out, 0.0), lerp(along, 1.0)) } else { (lerp(out, 1.0), lerp(along, 0.0)) };
             let pos = frame.point(p, z);
             b.vertex(pos, frame.dir([n[0] * out, n[1] * out], along), uv(pos_local(frame, pos)));
         }
@@ -384,8 +481,8 @@ fn slab(b: &mut Builder, frame: &Frame, outline: &RoundRect, depth: f32, bevel: 
             b.tri(a0, b1, a1);
         }
     }
-    cap(b, frame, &outline, &uv, at(0, 0), depth / 2.0, true, front);
-    cap(b, frame, &outline, &uv, at(rings.len() - 1, 0), -depth / 2.0, false, back);
+    cap(b, frame, &outline, &uv, at(0, 0), depth / 2.0, true, faces.front, faces.flat.is_some());
+    cap(b, frame, &outline, &uv, at(rings.len() - 1, 0), -depth / 2.0, false, faces.back, false);
 }
 
 /// A position back in `frame`'s x/y plane.
@@ -396,6 +493,8 @@ fn pos_local(frame: &Frame, p: V3) -> V3 {
 }
 
 /// Closes a slab's cap ring (`first` its first vertex): a fan, or the band between it and a hole.
+/// `exact` keeps the band's triangles that have no area but lie along the hole's edge, where the
+/// hole runs along the ring (a flat side).
 #[allow(clippy::too_many_arguments)]
 fn cap(
     b: &mut Builder,
@@ -406,6 +505,7 @@ fn cap(
     z: f32,
     front: bool,
     hole: Option<&RoundRect>,
+    exact: bool,
 ) {
     let normal = frame.dir([0.0, 0.0], if front { 1.0 } else { -1.0 });
     let o = |i: usize| first + (i % RING) as u32;
@@ -416,13 +516,14 @@ fn cap(
                 b.vertex(frame.point(p, z), normal, uv([p[0], p[1], 0.0]));
             }
             let s = |i: usize| s0 + (i % RING) as u32;
+            let tri = |b: &mut Builder, x, y, z| if exact { b.tri_exact(x, y, z) } else { b.tri(x, y, z) };
             for i in 0..RING {
                 if front {
-                    b.tri(o(i), o(i + 1), s(i + 1));
-                    b.tri(o(i), s(i + 1), s(i));
+                    tri(b, o(i), o(i + 1), s(i + 1));
+                    tri(b, o(i), s(i + 1), s(i));
                 } else {
-                    b.tri(o(i), s(i + 1), o(i + 1));
-                    b.tri(o(i), s(i), s(i + 1));
+                    tri(b, o(i), s(i + 1), o(i + 1));
+                    tri(b, o(i), s(i), s(i + 1));
                 }
             }
         }
