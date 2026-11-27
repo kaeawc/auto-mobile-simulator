@@ -191,6 +191,7 @@ enum Cmd {
     /// Save the screen as a PNG.
     Screenshot {
         device: String,
+        /// Where to write the PNG; `-` writes it to stdout.
         path: String,
         /// iOS: `outer` or `inner` for an iPhone Duo's screen (`main` is the one in use), `carplay` for an iPhone's CarPlay screen.
         #[arg(long, default_value = "main")]
@@ -500,6 +501,16 @@ impl Transport {
     }
 
     fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.route(method, params, false).map(|(result, _)| result)
+    }
+
+    /// [`Transport::call`] taking a result's bytes raw (a PNG), on the server (a binary reply)
+    /// or here: the result and those bytes.
+    fn call_binary(&mut self, method: &str, params: Value) -> Result<(Value, Option<Vec<u8>>)> {
+        self.route(method, params, true)
+    }
+
+    fn route(&mut self, method: &str, params: Value, binary: bool) -> Result<(Value, Option<Vec<u8>>)> {
         let forwards = sim_api::forwards(method);
         let forward = forwards && self.connected();
         if forwards && !forward {
@@ -514,10 +525,15 @@ impl Transport {
             eprintln!("simee: `{method}` runs {}", if forward { "on the server" } else { "in this process (it always does)" });
         }
         let result = match (&mut self.server, forward) {
-            (Some(client), true) => client.call(method, &params),
+            (Some(client), true) if binary => client.call_binary(method, &params),
+            (Some(client), true) => client.call(method, &params).map(|result| (result, None)),
             _ => {
                 sim_api::track_input();
-                sim_api::call_method(self.local.get_or_insert_with(Box::default), method, &params)
+                let session = self.local.get_or_insert_with(Box::default);
+                match binary {
+                    true => sim_api::call_method_binary(session, method, &params),
+                    false => sim_api::call_method(session, method, &params).map(|result| (result, None)),
+                }
             }
         };
         result.map_err(anyhow::Error::msg)
@@ -676,6 +692,14 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
         }
         Cmd::Shutdown { device } => drop(call("shutdown", json!({"device": device}))?),
         Cmd::Erase { device } => drop(call("erase", json!({"device": device}))?),
+        // To stdout: the PNG comes back raw (a binary reply from a server), never as base64.
+        Cmd::Screenshot { device, path, display } if path == "-" => {
+            let (_, png) = transport.call_binary("screenshot", json!({"device": device, "display": display}))?;
+            out.write_all(&png.context("the screenshot came back without its PNG")?)?;
+            out.flush()?;
+        }
+        // To a file: the process that runs the method writes it, so its bytes never cross the
+        // socket.
         Cmd::Screenshot { device, path, display } => {
             drop(call("screenshot", json!({"device": device, "path": absolute(&path), "display": display}))?)
         }
@@ -1118,6 +1142,42 @@ mod tests {
         drop(server);
         std::fs::remove_file(&socket).ok();
         assert!(!Transport::open(&socket).connected(), "no server: this process");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A command's stdout as bytes (a PNG isn't UTF-8) and its error, run through `transport`.
+    fn output_bytes(transport: &mut Transport, args: &[&str]) -> (Vec<u8>, Option<String>) {
+        let cli = Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).expect("arguments");
+        let mut out = Vec::new();
+        let result = run(cli.command, transport, &mut out, &mut Vec::new());
+        (out, result.err().map(|e| e.to_string()))
+    }
+
+    #[test]
+    fn a_screenshot_to_stdout_is_the_png_here_and_on_a_server() {
+        let root = android_root("stdout");
+        let socket = root.join("api.sock");
+        let server_root = root.clone();
+        sim_api::serve_in_background_with(socket.clone(), move || android_session(&server_root)).expect("serve");
+        let mut local = Transport { local: Some(Box::new(android_session(&root))), ..Transport::local() };
+        let image = "system-images;android-36;google_apis;arm64-v8a";
+        assert_eq!(outputs(&mut local, &["create", "pixel", "--platform", "android", "--system-image", image]).0, "pixel\n");
+        let mut android = sim_android::Android::new(emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") });
+        android.running_dir = Some(root.join("running"));
+        let _emulator = sim_android::testing::fake_emulator(&android, "pixel");
+        let file = root.join("shot.png");
+        assert_eq!(outputs(&mut local, &["screenshot", "pixel", file.to_str().expect("path")]), (String::new(), String::new(), None));
+        let png = std::fs::read(&file).expect("the file");
+        assert!(png.starts_with(b"\x89PNG"), "{png:?}");
+        let mut server = Transport::open(&socket);
+        assert_eq!(output_bytes(&mut local, &["screenshot", "pixel", "-"]), (png.clone(), None), "in this process");
+        assert_eq!(output_bytes(&mut server, &["screenshot", "pixel", "-"]), (png.clone(), None), "on the server");
+        assert!(server.server.is_some(), "it was forwarded");
+        // A file is still written by whichever process runs the method, the server here.
+        std::fs::remove_file(&file).ok();
+        assert_eq!(output_bytes(&mut server, &["screenshot", "pixel", file.to_str().expect("path")]), (Vec::new(), None));
+        assert_eq!(std::fs::read(&file).ok(), Some(png));
+        std::fs::remove_file(&socket).ok();
         std::fs::remove_dir_all(root).ok();
     }
 

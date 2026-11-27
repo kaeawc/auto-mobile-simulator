@@ -11,6 +11,31 @@ A connection may send any number of requests, each answered before the next is r
 rather than connecting per call. Large results (a base64 `screenshot`) are written as one line
 straight from the result, so read up to the newline before parsing.
 
+**Binary replies.** A request may add `"binary": true` to take a result's bytes raw instead of as
+base64 in the line (a local client that wants the PNG skips the base64 encode, the JSON escaping and
+a third more bytes on the socket). When the result has a bytes field (today `screenshot`'s `png`
+without `path`), the response line carries `"binary": <len>`, the field holds `{"binary": <len>}`,
+and exactly `<len>` raw bytes follow the newline before the next response:
+
+```text
+→ {"id": 3, "method": "screenshot", "params": {"device": "booted"}, "binary": true}
+← {"binary":4383251,"id":3,"ok":true,"result":{"height":2622,"png":{"binary":4383251},"width":1206}}\n
+← <4383251 bytes of PNG>
+```
+
+- It is asked per request, so connections stay stateless, a client can mix both kinds, and every
+  request without the field (every existing client, MCP) gets the same bytes as before.
+- No bytes field (any other method, or `screenshot` with `path`), or an error: the normal response
+  line, with no `binary` and nothing after it. A server from before binary replies ignores the
+  field and answers with base64, so a client that asks should accept either.
+- Read the line, then exactly `<len>` bytes: a stream that ends first is an error (the Rust client,
+  `sim_api::Client::call_binary`, says `the reply ended after N of <len> bytes`).
+- A reply carries at most one attachment. `read`'s `base64` is not a bytes field yet: it stays base64.
+- `simee screenshot <device> -` writes the PNG to stdout this way (in its own process, the bytes are
+  never base64 either). `simee screenshot <device> <path>` keeps sending `path`: whichever process
+  runs the method writes the file, so the PNG doesn't cross the socket at all.
+- The MCP server stays base64: its tool results are JSON text.
+
 **The CLI and a server.** When a matching `simee serve` is listening on the default socket
 (`$SIMEE_SOCKET`, else `$TMPDIR/simee.sock`), other `simee` commands run their method on that
 server instead of in their own process: they skip connecting to the simulator service, reuse the

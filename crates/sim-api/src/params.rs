@@ -1,6 +1,8 @@
 //! Parameter parsing and result shaping shared by every backend, so a method means the same on
 //! iOS and Android.
 
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -327,28 +329,98 @@ pub fn reading_json(r: &vhal::Reading) -> Value {
     json!({"property": r.property, "id": format!("{:#010x}", r.id as u32), "area_id": r.area_id, "status": r.status, "value": value})
 }
 
-/// `screenshot`'s result: written to `path`, else the PNG inline as base64.
+/// `screenshot`'s result: written to `path`, else the PNG inline (see [`png_result`]).
 #[cfg(target_os = "macos")]
 pub fn screenshot_result(frame: &Frame, p: &Value) -> Result<Value, String> {
-    png_result(frame.width, frame.height, &encode_png(frame)?, p)
+    png_result(frame.width, frame.height, encode_png(frame)?, p)
 }
 
-/// An encoded screenshot written to `path`, or returned as base64 without one.
-pub fn png_result(width: u32, height: u32, png: &[u8], p: &Value) -> Result<Value, String> {
+/// An encoded screenshot written to `path`, or inline without one: base64 in `png`, or, while
+/// the caller takes raw bytes ([`taking_bytes`]), `png` holding `{"binary": <len>}` and the bytes
+/// moved beside the result (an owned `png` moves without a copy).
+pub fn png_result<'a>(width: u32, height: u32, png: impl Into<Cow<'a, [u8]>>, p: &Value) -> Result<Value, String> {
+    let png = png.into();
     match str_param(p, "path") {
-        Some(path) => std::fs::write(path, png).map(|()| json!({"path": path, "width": width, "height": height})).map_err(err),
+        Some(path) => std::fs::write(path, &png).map(|()| json!({"path": path, "width": width, "height": height})).map_err(err),
         None => {
-            // The base64 text moves into the result; `json!` would copy it.
             let mut result = json!({"width": width, "height": height});
-            result["png"] = Value::String(base64::engine::general_purpose::STANDARD.encode(png));
+            result["png"] = bytes_field(png);
             Ok(result)
         }
     }
 }
 
+thread_local! {
+    /// `Some` while a caller on this thread takes raw bytes ([`taking_bytes`]), holding the bytes
+    /// a result moved out (one field's: a reply carries at most one attachment).
+    static TAKEN: RefCell<Option<Option<Vec<u8>>>> = const { RefCell::new(None) };
+}
+
+/// Runs `f` (one method call) with this thread taking raw bytes: the first bytes field its result
+/// would carry as base64 (`png_result`'s `png`) holds `{"binary": <len>}` instead, and the bytes
+/// come back beside the result. Only results built on this thread are taken; any other caller
+/// (MCP, a call on another thread) gets base64 as before. Not reentrant: a nested call would end
+/// the outer one's taking (nothing nests today).
+pub fn taking_bytes<R>(f: impl FnOnce() -> R) -> (R, Option<Vec<u8>>) {
+    /// Stops the thread taking bytes however `f` ends, a panic included.
+    struct Stop;
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            TAKEN.with(|t| t.borrow_mut().take());
+        }
+    }
+    TAKEN.with(|t| *t.borrow_mut() = Some(None));
+    let stop = Stop;
+    let r = f();
+    let bytes = TAKEN.with(|t| t.borrow_mut().take().flatten());
+    drop(stop);
+    (r, bytes)
+}
+
+/// A bytes field's value: `{"binary": <len>}` with the bytes moved to this thread's taker when it
+/// has none yet, else the bytes as base64 (the text moves into the value; `json!` would copy it).
+fn bytes_field(bytes: Cow<'_, [u8]>) -> Value {
+    TAKEN.with(|t| match &mut *t.borrow_mut() {
+        Some(slot @ None) => {
+            let len = bytes.len();
+            *slot = Some(bytes.into_owned());
+            json!({"binary": len})
+        }
+        _ => Value::String(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bytes_go_beside_the_result_only_while_a_caller_takes_them() {
+        let png = b"\x89PNG\r\n\x1a\n\0\xff".to_vec();
+        let base64 = json!({"width": 2, "height": 1, "png": base64::engine::general_purpose::STANDARD.encode(&png)});
+        let inline = || png_result(2, 1, &png, &json!({}));
+        assert_eq!(inline(), Ok(base64.clone()), "nobody takes them: base64, as MCP gets");
+        let (result, bytes) = taking_bytes(inline);
+        assert_eq!(result, Ok(json!({"width": 2, "height": 1, "png": {"binary": png.len()}})));
+        assert_eq!(bytes.as_ref(), Some(&png));
+        // One attachment per reply: a second bytes field in the same call stays base64.
+        let ((first, second), bytes) = taking_bytes(|| (inline(), inline()));
+        assert_eq!((first.map(|r| r["png"].clone()), second), (Ok(json!({"binary": png.len()})), Ok(base64.clone())));
+        assert_eq!(bytes.map(|b| b.len()), Some(png.len()));
+        // A call that makes no bytes field takes none; another thread's result isn't taken; and
+        // the thread stops taking once the call is over, even one that panicked.
+        assert_eq!(taking_bytes(|| json!({"width": 2})), (json!({"width": 2}), None));
+        let (elsewhere, bytes) = taking_bytes(|| std::thread::scope(|t| t.spawn(inline).join().expect("thread")));
+        assert_eq!((elsewhere, bytes), (Ok(base64.clone()), None));
+        assert!(std::panic::catch_unwind(|| taking_bytes(|| panic!("in the call"))).is_err());
+        assert_eq!(inline(), Ok(base64));
+        // With `path` the file holds them and nothing is inline.
+        let path = std::env::temp_dir().join(format!("simee-png-result-{}.png", std::process::id()));
+        let (saved, bytes) = taking_bytes(|| png_result(2, 1, &png, &json!({"path": path.to_str()})));
+        assert_eq!((saved.map(|r| r["width"].clone()), bytes), (Ok(json!(2)), None));
+        assert_eq!(std::fs::read(&path).ok(), Some(png));
+        std::fs::remove_file(path).ok();
+    }
 
     #[test]
     fn form_factor_inputs_parse() {

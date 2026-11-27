@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -369,7 +369,20 @@ struct Input {
 struct Screens {
     main: Display,
     inner: Option<Display>,
+    /// Each one's framebuffer size once read (main, inner), with the [`TURNS`] it was read at.
+    /// Reading it fetches the surface through a remote proxy (~0.15 ms, most of a `screen` call);
+    /// a port keeps its surface's size for the boot (rotating turns the picture, not the surface:
+    /// 1206x2622 in all four orientations on an iPhone 17 Pro, iOS 27.2), and these displays are
+    /// found again, `updateIOPorts` and all, in every new boot.
+    sizes: [std::cell::Cell<Option<SizeAt>>; 2],
 }
+
+/// A framebuffer size (width, height) and the [`TURNS`] it was read at.
+type SizeAt = (u64, (u32, u32));
+
+/// Rotations and folds this process has sent, on any device: a framebuffer size read before one
+/// is read again.
+static TURNS: AtomicU64 = AtomicU64::new(0);
 
 /// A screen a touch lands on: its size, and the screen ID whose digitizer takes it (`None`: the
 /// main digitizer, as before).
@@ -384,7 +397,22 @@ fn inner_for<T>(device_type_id: &str, second: Option<T>) -> Option<T> {
 impl Screens {
     fn open(device: &Device) -> Result<Self, String> {
         let (main, inner) = device.builtin_displays().map_err(err)?;
-        Ok(Self { main, inner: inner_for(&device.info().device_type_id, inner) })
+        Ok(Self { main, inner: inner_for(&device.info().device_type_id, inner), sizes: Default::default() })
+    }
+
+    /// The framebuffer size of `display`, one of these: read once, then kept until a rotation or
+    /// fold ([`TURNS`]). A display with no surface yet is an error, and nothing is kept.
+    fn size(&self, display: &Display) -> Result<(u32, u32), String> {
+        let slot = &self.sizes[usize::from(!std::ptr::eq(display, &self.main))];
+        let turns = TURNS.load(Ordering::Acquire);
+        if let Some((at, size)) = slot.get()
+            && at == turns
+        {
+            return Ok(size);
+        }
+        let size = display.size().map_err(err)?;
+        slot.set(Some((turns, size)));
+        Ok(size)
     }
 
     /// The display `which` names and, on a device with two built-in screens, the screen ID of its
@@ -447,9 +475,14 @@ impl Input {
         result
     }
 
-    /// Runs `with` on the built-in display `which` names, reused like the HID client (and dropped,
-    /// with the device, on any failure).
-    fn display<R>(&mut self, udid: &str, which: duo::Display, with: impl FnOnce(&Display) -> Result<R, String>) -> Result<R, String> {
+    /// Runs `with` on the built-in display `which` names (and the screens it is one of), reused like
+    /// the HID client (and dropped, with the device, on any failure).
+    fn display<R>(
+        &mut self,
+        udid: &str,
+        which: duo::Display,
+        with: impl FnOnce(&Screens, &Display) -> Result<R, String>,
+    ) -> Result<R, String> {
         let result = self.try_display(udid, which, with);
         if result.is_err() {
             self.device = None;
@@ -458,10 +491,15 @@ impl Input {
         result
     }
 
-    fn try_display<R>(&mut self, udid: &str, which: duo::Display, with: impl FnOnce(&Display) -> Result<R, String>) -> Result<R, String> {
+    fn try_display<R>(
+        &mut self,
+        udid: &str,
+        which: duo::Display,
+        with: impl FnOnce(&Screens, &Display) -> Result<R, String>,
+    ) -> Result<R, String> {
         let Self { ctx, device, changes, watch, screens, .. } = self;
         let (device, key) = connect(ctx, device, changes, watch, udid)?;
-        screens.with(key, || Screens::open(device), |s| with(s.pick(which)?.0))
+        screens.with(key, || Screens::open(device), |s| with(s, s.pick(which)?.0))
     }
 
     fn try_run<R>(
@@ -478,7 +516,7 @@ impl Input {
                 || Screens::open(device),
                 |s| {
                     let (display, id) = s.pick(which)?;
-                    let (w, h) = display.size().map_err(err)?;
+                    let (w, h) = s.size(display)?;
                     Ok((Size::new(f64::from(w), f64::from(h)), id))
                 },
             )?),
@@ -525,7 +563,7 @@ fn on_display<R: Send + 'static>(
     s: &mut Session,
     p: &Value,
     which: duo::Display,
-    with: impl FnOnce(&Display) -> Result<R, String> + Send + 'static,
+    with: impl FnOnce(&Screens, &Display) -> Result<R, String> + Send + 'static,
 ) -> Result<R, String> {
     let udid = s.udid(p)?;
     let result = INPUT.run(&udid.clone(), move |input| sim_coresim::autoreleasepool(|| input.display(&udid, which, with)))?;
@@ -548,14 +586,14 @@ fn as_typed(error: String, p: &Value) -> String {
 fn screen_size(s: &mut Session, p: &Value) -> Result<(u32, u32), String> {
     match display(p)? {
         duo::Display::CarPlay => s.device(p)?.external_display().and_then(|d| d.size()).map_err(err),
-        which => on_display(s, p, which, |d| d.size().map_err(err)),
+        which => on_display(s, p, which, |screens, d| screens.size(d)),
     }
 }
 
 fn capture(s: &mut Session, p: &Value) -> Result<sim_core::frame::Frame, String> {
     match display(p)? {
         duo::Display::CarPlay => s.device(p)?.external_display().and_then(|d| d.capture()).map_err(err),
-        which => on_display(s, p, which, |d| d.capture().map_err(err)),
+        which => on_display(s, p, which, |_, d| d.capture().map_err(err)),
     }
 }
 
@@ -676,63 +714,61 @@ fn play_on(input: &mut Input, udid: &str, p: &Value, samples: &[Sample], edge: O
 }
 
 /// `pointer`: brings the iPad's pointer to a point (pixels) and hovers, clicks, presses or releases
-/// a button there, or drags from it to another. The pointer only moves relatively, so it is homed
-/// against the screen's edges first (`sim_core::pointer`), unless a button is held from an earlier
-/// call on this server in this boot (`down`), which moves on from there. A `down` that no later
-/// call could see (an in-process run), an `up` with nothing held, and a `move` or `up` after a
-/// failed call lost what was held are refused ([`pointer::check`]).
+/// a button there, or drags from it to another. The pointer only moves relatively, so it moves on
+/// from where the last call on this server in this boot left it, or from where a held button
+/// (`down`) keeps it, and is homed against the screen's edges first (`sim_core::pointer`) when
+/// neither is known: the first call, after a failure or a rotation, and every
+/// [`pointer::REHOME_EVERY`] calls (touches, the only other input, don't move the pointer). A
+/// `down` that no later call could see (an in-process run), an `up` with nothing held, and a
+/// `move` or `up` after a failed call lost what was held are refused ([`pointer::check`]).
 fn pointer_on(input: &mut Input, udid: &str, p: &Value) -> Result<Value, String> {
     let PointerRequest { at, action, button, hold, drag_to } = pointer_request(p)?;
     let boot = input.boot(udid)?;
     let held = input.pointer.get(boot);
     pointer::check(action, drag_to.is_some(), held, crate::serving())?;
+    let turns = TURNS.load(Ordering::Acquire);
+    let from = input.pointer.start(boot, turns);
     let result = input.run(udid, true, |hid, screen| {
         let screen = screen.ok_or("no screen size")?;
         let scale = if hid.scale() > 0.0 { hid.scale() } else { 1.0 };
         let points = Size::new(screen.width / scale, screen.height / scale);
         let in_points = |p: Point| Point::new(p.x.clamp(0.0, screen.width) / scale, p.y.clamp(0.0, screen.height) / scale);
         let to = in_points(at);
-        let (from, mut buttons) = match held {
-            Held::Down { at, buttons } => (Some(at), buttons),
-            Held::Nothing => (None, 0),
+        let mut buttons = match held {
+            Held::Down { buttons, .. } => buttons,
+            Held::Nothing => 0,
             Held::Lost => {
                 // Let go of whatever the guest may hold, where the pointer is, before homing: a
                 // held button would drag along the edges.
                 for b in [PointerButton::Primary, PointerButton::Secondary] {
                     hid.pointer_button(b, false, 0).map_err(err)?;
                 }
-                (None, 0)
+                0
             }
         };
-        let glide = |from: Option<Point>, to: Point, buttons: u32| -> Result<(), String> {
-            let from = match from {
-                Some(from) => from,
-                None => {
-                    // Home, then let the Dock the push into the bottom showed hide again.
-                    for (dx, dy) in pointer::home() {
-                        hid.pointer_motion(dx, dy, buttons).map_err(err)?;
-                        sleep(pointer::INTERVAL);
-                    }
-                    sleep(pointer::SETTLE);
-                    pointer::homed(points)
-                }
-            };
-            for (dx, dy) in pointer::path(Some(from), to, points) {
-                hid.pointer_motion(dx, dy, buttons).map_err(err)?;
-                sleep(pointer::INTERVAL);
-            }
-            Ok(())
+        // Against deadlines from the first report, so a busy host doesn't stretch the call; whether
+        // a report went out late (a stall), after which where the pointer stopped isn't known.
+        let glide = |from: Option<Point>, to: Point, buttons: u32| -> Result<bool, String> {
+            let plan = pointer::plan(from, to, points);
+            let started = Instant::now();
+            let late =
+                pointer::send_paced(&plan, || started.elapsed(), sleep, |(dx, dy)| hid.pointer_motion(dx, dy, buttons).map_err(err))?;
+            sleep(pointer::INTERVAL);
+            Ok(late)
         };
-        glide(from, to, buttons)?;
+        // Where the pointer is known to be after the call: not after a stall, nor on an edge or in
+        // a corner, where the guest may stop it short.
+        let known = |at: Point, late: bool| (!late && pointer::lands_at(at, points)).then_some(at);
+        let late = glide(from, to, buttons)?;
         let mask = button.mask();
         let left = |at: Point, buttons: u32| if buttons == 0 { Held::Nothing } else { Held::Down { at, buttons } };
         if let Some(end) = drag_to.map(in_points) {
             sleep(pointer::INTERVAL * 3);
             hid.pointer_button(button, true, buttons | mask).map_err(err)?;
-            glide(Some(to), end, buttons | mask)?;
+            let late = glide(Some(to), end, buttons | mask)? || late;
             sleep(pointer::INTERVAL * 3);
             hid.pointer_button(button, false, buttons).map_err(err)?;
-            return Ok(left(end, buttons));
+            return Ok((left(end, buttons), known(end, late)));
         }
         match action {
             PointerAction::Move => {}
@@ -752,10 +788,10 @@ fn pointer_on(input: &mut Input, udid: &str, p: &Value) -> Result<Value, String>
                 hid.pointer_button(button, false, buttons).map_err(err)?;
             }
         }
-        Ok(left(to, buttons))
+        Ok((left(to, buttons), known(to, late)))
     });
     match result {
-        Ok(next) => input.pointer.set(boot, next),
+        Ok((next, at)) => input.pointer.set(boot, next, at, from.is_none(), turns),
         Err(e) => {
             input.pointer.failed(boot, held, drag_to.is_some() || matches!(action, PointerAction::Click | PointerAction::Down));
             return Err(e);
@@ -772,7 +808,12 @@ fn rotate(device: &Device, wanted: Option<Orientation>) -> Result<Value, String>
     let mut guard = ORIENTATIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let known = guard.get_or_insert_with(Default::default);
     let next = wanted.unwrap_or_else(|| known.get(&udid).copied().unwrap_or(Orientation::Portrait).clockwise());
-    device.set_orientation(next).map_err(err)?;
+    // Counted before and after: a pointer call that starts while the device turns, or reads the
+    // count before it, doesn't move on from where the pointer was before.
+    TURNS.fetch_add(1, Ordering::AcqRel);
+    let sent = device.set_orientation(next);
+    TURNS.fetch_add(1, Ordering::AcqRel);
+    sent.map_err(err)?;
     known.insert(udid, next);
     Ok(json!({"orientation": next.as_str()}))
 }
@@ -1463,7 +1504,13 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "screenshot" => screenshot_result(&capture(s, p)?, p),
         m if INPUT_METHODS.contains(&m) => input(s, m, p),
         "rotate" => rotate(&s.device(p)?, opt_orientation(p)?),
-        "fold" => crate::duo::fold(&s.device(p)?, p),
+        "fold" => {
+            let device = s.device(p)?;
+            TURNS.fetch_add(1, Ordering::AcqRel);
+            let folded = crate::duo::fold(&device, p);
+            TURNS.fetch_add(1, Ordering::AcqRel);
+            folded
+        }
         "carplay" => {
             let on = need_bool(p, "on")?;
             s.device(p)?.set_carplay(on).map_err(err)?;
@@ -2082,6 +2129,64 @@ mod tests {
     }
 
     use super::*;
+
+    /// A session that stays open (as `simee serve`'s does) finds a device by UDID and name, then
+    /// misses it under its old name once another process renames it and under its UDID once that
+    /// deletes it: the lookup reads the service's live device set, never a copy of its own.
+    /// `SIMEE_E2E_CREATE=1 cargo test -p sim-api renamed_or_deleted -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "creates, renames and deletes a simulator (SIMEE_E2E_CREATE=1)"]
+    fn a_renamed_or_deleted_device_misses_the_session_lookup() {
+        if std::env::var_os("SIMEE_E2E_CREATE").is_none() {
+            return;
+        }
+        /// Deletes the test's simulator however the test ends.
+        struct Spare(String);
+        impl Drop for Spare {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("xcrun").args(["simctl", "delete", &self.0]).output();
+            }
+        }
+        let simctl = |args: &[&str]| {
+            let out = std::process::Command::new("xcrun").arg("simctl").args(args).output().expect("simctl");
+            assert!(out.status.success(), "simctl {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        /// How long `ok` held after the change, polling: the service tells this process about
+        /// another's change asynchronously.
+        fn settles(mut ok: impl FnMut() -> bool) -> Duration {
+            let start = std::time::Instant::now();
+            while !ok() {
+                assert!(start.elapsed() < Duration::from_secs(10), "still stale after 10 s");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            start.elapsed()
+        }
+        let mut s = Session::default();
+        let ctx = s.ctx().expect("service");
+        let ty = ctx.device_types().expect("types").into_iter().find(|t| t.product_family == "iPhone").expect("an iPhone type");
+        let runtime = ctx.runtimes().expect("runtimes").into_iter().rfind(|r| r.available && r.identifier.contains(".iOS-")).expect("iOS");
+        let (name, renamed) = (format!("simee-lookup-{}", std::process::id()), format!("simee-lookup-{}-renamed", std::process::id()));
+        let udid = ctx.create(&name, &ty.identifier, &runtime.identifier).expect("create").udid();
+        let _spare = Spare(udid.clone());
+        let lookup = |s: &mut Session, q: &str| s.device(&json!({"device": q})).map(|d| d.info());
+        let as_named = |s: &mut Session, q: &str| lookup(s, q).map(|i| (i.udid, i.name));
+        assert_eq!(as_named(&mut s, &udid), Ok((udid.clone(), name.clone())));
+        assert_eq!(as_named(&mut s, &udid.to_ascii_lowercase()), Ok((udid.clone(), name.clone())), "any case");
+        assert_eq!(as_named(&mut s, &name), Ok((udid.clone(), name.clone())));
+
+        simctl(&["rename", &udid, &renamed]);
+        let took = settles(|| lookup(&mut s, &name).is_err());
+        assert_eq!(lookup(&mut s, &name).map(|i| i.udid), Err(format!("no device matches `{name}`")));
+        assert_eq!(as_named(&mut s, &renamed), Ok((udid.clone(), renamed.clone())));
+        assert_eq!(as_named(&mut s, &udid), Ok((udid.clone(), renamed.clone())), "by UDID, the new name");
+        eprintln!("rename seen after {took:?}");
+
+        simctl(&["delete", &udid]);
+        let took = settles(|| lookup(&mut s, &udid).is_err());
+        assert_eq!(lookup(&mut s, &udid).map(|i| i.udid), Err(format!("no device matches `{udid}`")));
+        assert!(lookup(&mut s, &renamed).is_err());
+        eprintln!("delete seen after {took:?}");
+    }
 
     /// `processes`, `connections`, `kill`, `network_state`'s `boot_injected` check and the audio
     /// settings spawn nothing on the host. Measured in a process of its own (every child any test

@@ -36,10 +36,11 @@ pub struct GpuSpec {
     /// which HWUI on Vulkan asserts: for ANGLE guests on images that advertise the feature (the
     /// ones emu gives `skiavk`).
     pub virtual_queue: bool,
-    /// The guest's GLES encoder talks over the goldfish `opengles` pipe (API 29 and 30 images,
-    /// `qemu.gltransport=pipe`): the board has no virtio-gpu (those kernels' driver oopses on
-    /// it, and stock gives them none), each pipe gets a render channel of its own, and the
-    /// renderer offers none of the virtio-gpu-only extensions.
+    /// The guest's GLES encoder talks over the goldfish `opengles` pipe (API 29 to 32 images,
+    /// `gltransport=pipe`): the board has no virtio-gpu (API 29–30 kernels' driver oopses on
+    /// it, API 31–32's codec service may not open it, and stock gives none of them one), each
+    /// pipe gets a render channel of its own, and the renderer offers none of the
+    /// virtio-gpu-only extensions.
     pub pipe_gles: bool,
 }
 
@@ -115,7 +116,7 @@ pub fn warm_renderer(lib64: PathBuf, vulkan_only: bool, virtual_queue: bool) -> 
         display: Arc::new(crate::display::FrameStore::default()),
         vulkan_only,
         virtual_queue,
-        // Warming is for the guests that boot on bootconfig (API 31 and newer), not the GLES-pipe ones.
+        // Warming is for the virtio-gpu guests (API 33 and newer), not the GLES-pipe ones.
         pipe_gles: false,
     };
     renderer(&spec)?;
@@ -674,7 +675,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         }
         registry.register("multidisplay", Box::new(pipe::misc::Silent("multidisplay")));
         registry.register("qemud:camera", Box::new(pipe::fingerprint::CameraService));
-        // The GLES encoder's pipes on API 29–30 images, each to a render channel of its own.
+        // The GLES encoder's pipes on API 29–32 images, each to a render channel of its own.
         let gl_backend = cfg
             .gpu
             .as_ref()

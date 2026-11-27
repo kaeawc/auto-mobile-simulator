@@ -730,12 +730,26 @@ mod tests {
         }
     }
 
+    /// Polls `done` until it holds. The deadline is only a timeout (a hang fails instead of
+    /// stalling the run): how long the wait takes says nothing, so a loaded host passes.
+    fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < Duration::from_secs(5), "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn post_ticker_notices_while_fences_come_and_for_a_tail_after() {
         let posts = Arc::new(Posts::default());
-        let (interval, tail) = (Duration::from_millis(5), Duration::from_millis(40));
+        // The tail is wall-clock from the last fence, so a ticker thread that isn't scheduled for
+        // longer than the tail gives no tail notice at all, however long a test waits. A tail of
+        // 300 ms makes that a stall of hundreds of milliseconds, not tens.
+        let (interval, tail) = (Duration::from_millis(5), Duration::from_millis(300));
         let ticker = PostTicker::start(posts.clone(), 2560, 1600, interval, tail);
         std::thread::sleep(Duration::from_millis(30));
+        // (Can only false-pass: a ticker that never ran also reads 0.)
         assert_eq!(posts.0.load(Ordering::Relaxed), 0, "no fence, no notice");
 
         // A steady stream of fences for 100 ms: notices keep coming, at most one per interval.
@@ -750,17 +764,26 @@ mod tests {
         let most = (start.elapsed().as_millis() / interval.as_millis()) as usize + 1;
         assert!((2..=most).contains(&during), "{during} notices in {:?} (at most {most})", start.elapsed());
 
-        // The tail: notices go on for about 40 ms after the last fence, then stop.
-        std::thread::sleep(Duration::from_millis(120));
-        let after = posts.0.load(Ordering::Relaxed);
-        assert!(after > during, "the frame posted after the last fence is noticed");
+        // The tail: notices go on for the tail after the last fence, then stop.
+        wait_for("the frame posted after the last fence to be noticed", || posts.0.load(Ordering::Relaxed) > during);
+        // Wait the tail out: the count has not moved for half a tail. This wait can only end
+        // early if the thread stalls, and then the check below can only false-pass.
+        let quiet = Duration::from_millis(150);
+        let (mut after, mut since) = (posts.0.load(Ordering::Relaxed), Instant::now());
+        while since.elapsed() < quiet {
+            assert!(start.elapsed() < Duration::from_secs(10), "the tail never ended");
+            std::thread::sleep(Duration::from_millis(5));
+            let now = posts.0.load(Ordering::Relaxed);
+            if now != after {
+                (after, since) = (now, Instant::now());
+            }
+        }
         std::thread::sleep(Duration::from_millis(60));
         assert_eq!(posts.0.load(Ordering::Relaxed), after, "a quiet guest gets no notices");
 
         // One fence after a quiet spell wakes it again.
         ticker.poke();
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(posts.0.load(Ordering::Relaxed) > after);
+        wait_for("a fence after a quiet spell to wake the ticker", || posts.0.load(Ordering::Relaxed) > after);
         ticker.stop();
     }
 
@@ -853,13 +876,15 @@ mod tests {
         let posts = Arc::new(Posts::default());
         let ticker = PostTicker::start(posts.clone(), 2560, 1600, Duration::from_millis(1), Duration::from_secs(60));
         ticker.poke(); // busy: noticing every millisecond for a minute
-        std::thread::sleep(Duration::from_millis(10));
+        wait_for("the first notice", || posts.0.load(Ordering::Relaxed) > 0);
         let t = Instant::now();
         ticker.stop();
-        assert!(t.elapsed() < Duration::from_secs(1), "stop took {:?}", t.elapsed());
+        // A timeout, not a measurement: the tail alone is a minute, so a thread that ignored
+        // the stop would take far longer than this.
+        assert!(t.elapsed() < Duration::from_secs(5), "stop took {:?}", t.elapsed());
+        // stop() joined the thread: nothing can post after it returned, so read the count now.
         let n = posts.0.load(Ordering::Relaxed);
-        assert!(n > 0);
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10)); // can only false-pass
         assert_eq!(posts.0.load(Ordering::Relaxed), n, "no notice after stop returned");
         ticker.stop(); // twice is fine
     }
