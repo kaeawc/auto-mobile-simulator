@@ -169,6 +169,23 @@ fn first_port(p: &Value) -> Result<u16, String> {
     }
 }
 
+/// How long a boot waits for `sys.boot_completed` (`timeout_s`, default 300 s), and whether the
+/// device plays on the host (`audio`, default false: a farm booting N devices would open N host
+/// streams).
+pub(crate) fn boot_options(p: &Value) -> Result<(Duration, bool), String> {
+    Ok((Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)), opt_bool(p, "audio")?.unwrap_or(false)))
+}
+
+/// `boot_many`'s boot timeout and first console port.
+pub(crate) fn boot_many_options(p: &Value) -> Result<(Duration, u16), String> {
+    Ok((Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)), first_port(p)?))
+}
+
+/// `import`'s `allow_mismatch` (default false: only the exported revision of the system image).
+pub(crate) fn import_allows_mismatch(p: &Value) -> Result<bool, String> {
+    Ok(opt_bool(p, "allow_mismatch")?.unwrap_or(false))
+}
+
 /// One device's [`sim_android::BootOutcome`] in `boot_many`'s result: the same shape as an iOS
 /// device's (`device`, `boot_s`, or `error`), with the console port and adb serial.
 fn outcome_json(o: &sim_android::BootOutcome) -> Value {
@@ -189,8 +206,7 @@ pub fn boot_many(s: &mut Session, p: &Value, udids: &[String]) -> Result<Value, 
         return Err("give `devices`: a list of AVD names".into());
     }
     let concurrency = crate::params::concurrency(p)?;
-    let timeout = Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300));
-    let first = first_port(p)?;
+    let (timeout, first) = boot_many_options(p)?;
     let start = std::time::Instant::now();
     let outcomes = s.backend().boot_many(udids, concurrency, timeout, first)?;
     let devices: Vec<Value> = outcomes.iter().map(outcome_json).collect();
@@ -204,7 +220,7 @@ pub fn boot_many(s: &mut Session, p: &Value, udids: &[String]) -> Result<Value, 
 /// device's guest identity, which `config.ini` keys it dropped, and any revision mismatch.
 pub fn import(s: &mut Session, p: &Value) -> Result<Value, String> {
     let (from, name) = (need_str(p, "from")?, need_str(p, "name")?);
-    let allow_mismatch = opt_bool(p, "allow_mismatch")?.unwrap_or(false);
+    let allow_mismatch = import_allows_mismatch(p)?;
     let (info, im) = s.backend().import_avd(std::path::Path::new(from), name, allow_mismatch)?;
     Ok(json!({
         "device": info,
@@ -258,9 +274,8 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
         "delete" => null(android.delete(&d)),
         "boot" => {
             reject_ios_boot_params(method, p)?;
-            // Silent unless asked: a tool or farm booting N devices would open N host streams.
-            let audio = opt_bool(p, "audio")?.unwrap_or(false);
-            null(d.boot(&android, Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)), audio))
+            let (timeout, audio) = boot_options(p)?;
+            null(d.boot(&android, timeout, audio))
         }
         "clone" => {
             if d.running.is_some() {

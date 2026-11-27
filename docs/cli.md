@@ -127,4 +127,5 @@ The desktop window serves the same API on `$TMPDIR/simee-desktop.sock`. Full ref
 `simee mcp` serves [MCP](mcp.md) on stdin and stdout: every method above as a tool for an agent,
 with resources for devices and their screens, tasks for boots, and a device view. It runs the
 methods in its own process, like `--in-process`; configure it in the agent as the command `simee
-mcp`.
+mcp`. It serves the `core` toolset (about twenty tools) unless `SIMEE_MCP_TOOLSETS` names others
+(`core,debug`, or `all`): see [toolsets](mcp.md#toolsets).
