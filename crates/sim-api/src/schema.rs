@@ -46,7 +46,7 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         | "text" | "base64" | "domain" | "key" | "language" | "uid" | "capture_id" | "program" | "command" | "predicate" | "last"
         | "preset" | "direction" | "gesture" | "button" | "phase" | "action" | "service" | "scope" | "display" | "orientation"
         | "posture" | "mode" | "profile" | "type" | "time" | "data_network" | "wifi_mode" | "cellular_mode" | "operator"
-        | "battery_state" | "environment" | "press" | "property" | "pattern" => Str,
+        | "battery_state" | "environment" | "press" | "property" | "pattern" | "to" | "from" => Str,
         "x" | "y" | "z" | "x1" | "y1" | "x2" | "y2" | "to_x" | "to_y" | "latitude" | "longitude" | "delta" | "angle" | "passthrough"
         | "settle_cpu_pct" | "settle_window_s" | "cpu_pct" | "window_s" | "latency_ms" | "down_kbps" | "up_kbps" | "loss_pct" => Num,
         "hold_ms" | "duration_ms" | "timeout_s" | "settle_timeout_s" | "concurrency" | "first_port" | "usage" | "pid" | "signal"

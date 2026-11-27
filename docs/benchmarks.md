@@ -429,6 +429,43 @@ idle), same host and day. `scripts/farm-bench-android.sh`.
 Most of the settle time is the guest's telephony retrying mobile data, since emu has no network
 device yet ([#29](https://github.com/kaeawc/simee/issues/29)).
 
+## Android: device bundles
+
+`simee export` / `simee import` ([#170](https://github.com/kaeawc/simee/issues/170)) on one API 36
+`google_apis` arm64 AVD (revision 7, 4 GB data partition) after its first boot under emu, 100 s of
+uptime and a file written to `/data/local/tmp`; M3 Max, macOS 26.6.2, 2026-11-27, host load 5–50.
+One run each with zstd's C library; a second AVD exported with the shipped Rust backend
+(`rust-backend`) gave the same times (7.7 s, 17.5 s, import 7.0 s) and a 1183 MB bundle for its
+1206 MB allocated. No stock tool exports an AVD, so there is no comparison column.
+
+```bash
+simee export <avd> <dir>                 # zstd level 3, the default
+simee export <avd> <file>.tar --level 19
+simee import <file>.tar <new-name>       # then boot it: the file and settings are there
+```
+
+| Measure | Value |
+| --- | --- |
+| Disks' logical size (userdata, cache, encryptionkey) | 4383 MB |
+| Disks' allocated size on the host | 1219 MB |
+| Bundle, zstd 3 (directory) | 1192 MB (98% of allocated) |
+| Bundle, zstd 19 (tar) | 1193 MB: no smaller than level 3 |
+| userdata in stored 1 MiB chunks / compressed | 1178 MiB / 1137 MiB (96.5%) |
+| `/data` used, as the guest's `df` reports it | 861 MB |
+| Export, zstd 3 / zstd 19 (8 threads) | 7.6 s / 16.4 s wall |
+| Import from the tar (streamed, every hash checked) | 7.0 s wall, 18 MB peak RSS |
+| Two clones of that golden, each booted once for 100 s: chunks shared | 981 of ~1210 (81%) |
+| The second clone's new chunks, given the first's, compressed | 200 MiB |
+
+User data is ciphertext (`/data` sits on dm-default-key, keyed from `encryptionkey.img`), so its
+chunks don't compress: zstd's gain is the zero 4 KiB blocks inside 1 MiB chunks. The bundle stores
+~1.14 GB of non-zero user data for 861 MB of files, which suggests freed blocks that were never
+discarded still hold ciphertext. Between clones of one golden, a boot dirties about 200 MiB of
+chunks. Shrinking bundles (deltas against the golden, discarding freed blocks before export) is
+[#171](https://github.com/kaeawc/simee/issues/171). An import leaves zero ranges as holes, but
+APFS fills a hole shorter than ~16 MiB between written blocks with zeros (measured), so the
+imported userdata took 1258 MB on the host against the source's 1204 MB.
+
 ## iOS: simee against `simctl`
 
 One new iPhone per run under each tool, same host, 2026-11-24, 3 runs each; the

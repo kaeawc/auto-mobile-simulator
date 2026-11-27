@@ -25,6 +25,7 @@ sim-mcp = { path = "crates/sim-mcp" }
 sim-netshape = { path = "crates/sim-netshape" }
 sim-audio = { path = "crates/sim-audio" }
 sim-android = { path = "crates/sim-android" }
+sim-bundle = { path = "crates/sim-bundle" }
 emu-avd = { path = "crates/emu-avd" }
 emu-gfxstream = { path = "crates/emu-gfxstream" }
 emu-ext4 = { path = "crates/emu-ext4" }
@@ -56,6 +57,12 @@ smoltcp = { version = "0.14", default-features = false, features = ["std", "medi
 roxmltree = { version = "0.21", default-features = false, features = ["std"] }
 # The SDK repository publishes sha1 checksums; dependency-free pure Rust.
 sha1_smol = { version = "1", default-features = false }
+# Device bundles (sim-bundle): chunk and whole-disk hashes, and per-chunk compression. blake3's
+# `std` gives `update_reader` (it falls back to Rust intrinsics when no C compiler targets the
+# build). zstd's `rust-backend` is zstd ported to Rust (libzstd-rs-sys) instead of the C library:
+# no C toolchain, so `scripts/check.sh` lints the Linux target from macOS too.
+blake3 = { version = "1", default-features = false, features = ["std"] }
+zstd = { version = "0.14", default-features = false, features = ["rust-backend"] }
 # Host audio for emu's virtio-snd card (CoreAudio on macOS; emu-vmm only, macOS only).
 cpal = { version = "0.18", default-features = false }
 # Linux KVM (emu-kvm only): the rust-vmm ioctl wrappers Firecracker and Cloud Hypervisor use,

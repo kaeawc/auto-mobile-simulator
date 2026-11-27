@@ -12,6 +12,7 @@ doctest = false
 
 [dependencies]
 rustix.workspace = true
+sim-bundle.workspace = true
 sim-core.workspace = true
 thiserror.workspace = true
 

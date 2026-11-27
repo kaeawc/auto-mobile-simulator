@@ -14,7 +14,7 @@ pub const VIEW_TOOL: &str = "device_view";
 /// Methods that can run for many seconds: a client that declares the Tasks extension gets a task
 /// handle for these, and everything else a progress heartbeat while the call blocks. A method not
 /// listed runs inline. (`provision` and `record` aren't API methods, so they aren't tools.)
-pub const LONG_RUNNING: &[&str] = &["boot", "boot_many", "create", "clone", "install", "settle", "erase", "shutdown"];
+pub const LONG_RUNNING: &[&str] = &["boot", "boot_many", "create", "clone", "install", "settle", "erase", "shutdown", "export", "import"];
 
 /// What a method does to a device or the host, for the annotations a client's approval prompts
 /// read. Every method in the table is classified here on purpose (a test fails for one that isn't),
@@ -46,10 +46,11 @@ fn effect(method: &str) -> Option<Effect> {
         | "audio_mute" | "fold" | "carplay" | "profile" | "privacy" => Set,
         "create" | "boot" | "boot_many" | "clone" | "tap" | "swipe" | "touch" | "button" | "type" | "key" | "open_url" | "install"
         | "memory_warning" | "notify" | "biometric" | "rotate" | "rotary" | "watch_gesture" | "remote_swipe" | "xr" | "touchpad"
-        | "stylus" | "pointer" | "vehicle" | "audio_capture_stop" => Act,
+        | "stylus" | "pointer" | "vehicle" | "audio_capture_stop" | "import" => Act,
         // Runs programs, starts apps with an environment, replaces a network profile (inject "boot"
-        // reboots the device), delivers a payload, writes a recording to a path, drives the console.
-        "exec" | "launch" | "push" | "network_shape" | "console" | "audio_capture_start" | "kill" => Danger,
+        // reboots the device), delivers a payload, writes a recording or a bundle to a path, drives
+        // the console.
+        "exec" | "launch" | "push" | "network_shape" | "console" | "audio_capture_start" | "kill" | "export" => Danger,
         "delete" | "erase" | "shutdown" | "rm" | "uninstall" | "terminate" | "reset_keychain" | "clear_container" | "write"
         | "defaults_write" => Destroy,
         _ => return None,

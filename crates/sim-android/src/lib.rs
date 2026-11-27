@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 /// The SDK and AVD home an [`Android`] works over (`Android::env`).
 pub use emu_avd::Env;
+/// AVD export and import results ([`Android::export_avd`], [`Android::import_avd`]).
+pub use emu_avd::bundle;
 use emu_avd::{Avd, NewAvd, Running};
 use sim_core::device::{DeviceInfo, DeviceState, RuntimeInfo, Selection, select};
 use sim_core::form_factor::{FormFactor, InputMethod, Kind, Profile, android_profile};
@@ -293,6 +295,22 @@ impl Android {
     pub fn clone_avd(&self, golden: &str, name: &str) -> Result<DeviceInfo, String> {
         self.env.clone_avd(golden, name).map_err(|e| e.to_string())?;
         Ok(self.describe(name, &[]).info)
+    }
+
+    /// Exports `device`, which must be shut down, to a bundle at `to` (`emu_avd::Env::export_avd`):
+    /// a `.tar` file, else a new directory, its chunks compressed at zstd `level`.
+    pub fn export_avd(&self, device: &Device, to: &Path, level: i32) -> Result<emu_avd::bundle::Exported, String> {
+        if device.running.is_some() {
+            return Err(format!("{} must be shut down to export it", device.info.name));
+        }
+        let opts = emu_avd::bundle::Options { level, ..Default::default() };
+        self.env.export_avd(&device.info.udid, to, &opts).map_err(|e| e.to_string())
+    }
+
+    /// Imports the bundle at `from` as a new AVD `name` (`emu_avd::Env::import_avd`).
+    pub fn import_avd(&self, from: &Path, name: &str) -> Result<(DeviceInfo, emu_avd::bundle::Imported), String> {
+        let imported = self.env.import_avd(from, name).map_err(|e| e.to_string())?;
+        Ok((self.describe(name, &[]).info, imported))
     }
 
     /// Boots every AVD in `avds` (those not running yet), at most `concurrency` at a time, each

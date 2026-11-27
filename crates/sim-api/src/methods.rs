@@ -70,6 +70,22 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          from a golden that has booted under simee (copy-on-write clones of its disks). A booted-once template's copies skip the \
          first-boot work",
     ),
+    (
+        "export",
+        "device, to, level?",
+        "Pack a shut-down device into a portable bundle at `to` (a .tar file, else a new directory) with no host path in it: \
+         manifest.json and content-addressed chunks (1 MiB, BLAKE3, each zstd at level 1-19, default 3; zero ranges stored as \
+         extents). Android: an AVD that has booted under simee (its simee disks, config.ini without host paths, boot.prop) and \
+         its system image's identity; captures disks, not RAM (resume is a cold boot). Returns sizes, the identity and the \
+         secrets inventory. iOS simulators: not yet (the next step of #170)",
+    ),
+    (
+        "import",
+        "from, name",
+        "Create device `name` from a bundle `export` wrote. Android: finds the system image by content (API, tag, ABI, revision, \
+         BLAKE3 of its images, fingerprint) and refuses, naming what to install, when none matches; checks every chunk and \
+         disk hash. The import keeps the exported device's guest identity (ro.serialno, android_id). iOS: not yet",
+    ),
     ("shutdown", "device", "Shut down"),
     ("erase", "device", "Erase content and settings (shut down first)"),
     (
@@ -300,7 +316,7 @@ const ALL_PLATFORMS: &[&str] = &[
     "stylus",
 ];
 /// Methods only Android devices have.
-const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad"];
+const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad", "export", "import"];
 
 /// The platforms whose devices `method` works on.
 pub fn platforms(method: &str) -> &'static [Platform] {
@@ -429,6 +445,11 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         }
         // Need no device: resolving the default `booted` would fail with two simulators booted.
         "device_types" | "audio_capture_stop" => crate::ios::call(&mut s.ios, method, p),
+        // Makes a device from a bundle; the bundle's manifest says whose.
+        "import" => match opt_platform(p)? {
+            Some(Platform::Ios) => Err("`import` takes Android bundles for now; iOS bundles are the next step of #170".into()),
+            _ => crate::android::import(&mut s.android, p),
+        },
         "boot_many" => {
             // One platform per call: each backend boots its own devices its own way.
             let mut udids = Vec::new();
@@ -896,6 +917,43 @@ mod tests {
         let err = call(&mut s, "clone", &json!({"device": "golden", "name": "farm-2"})).expect_err("running");
         assert_eq!(err, "golden must be shut down to clone it");
         call(&mut s, "delete", &json!({"device": "farm-1"})).expect("delete the clone");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn android_devices_export_to_bundles_and_import_under_new_names() {
+        let (mut s, root) = short_android_session("bundle");
+        let sys = root.join("sdk/system-images/android-36/google_apis/arm64-v8a");
+        std::fs::write(
+            sys.join("source.properties"),
+            "Pkg.Revision=7\nAndroidVersion.ApiLevel=36\nSystemImage.TagId=google_apis\nSystemImage.Abi=arm64-v8a\n",
+        )
+        .expect("props");
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        call(&mut s, "create", &json!({"platform": "android", "name": "golden", "system_image": mobile})).expect("golden");
+        let to = root.join("golden.tar");
+        let err = call(&mut s, "export", &json!({"device": "golden", "to": to})).expect_err("never booted");
+        assert!(err.contains("no simee user data"), "{err}");
+        let disks = emu_avd::state_dir(&root.join("avd/golden.avd"));
+        std::fs::create_dir_all(&disks).expect("simee");
+        std::fs::write(disks.join("userdata.img"), b"settled").expect("userdata");
+        let bad = call(&mut s, "export", &json!({"device": "golden", "to": to, "level": 30})).expect_err("level");
+        assert!(bad.contains("level 30"), "{bad}");
+        let ex = call(&mut s, "export", &json!({"device": "golden", "to": to, "level": 19})).expect("export");
+        assert_eq!((ex["summary"]["form"].as_str(), ex["summary"]["level"].as_i64()), (Some("tar"), Some(19)));
+        assert_eq!(ex["identity"]["android"]["api"], "36");
+        assert_eq!((ex["captures"]["ram"].as_bool(), ex["resume"].as_str()), (Some(false), Some("cold-boot")));
+        let im = call(&mut s, "import", &json!({"from": to, "name": "copy"})).expect("import");
+        assert_eq!((im["device"]["udid"].as_str(), im["device"]["platform"].as_str()), (Some("copy"), Some("android")));
+        assert_eq!((im["exported_as"].as_str(), im["guest_identity"]["on_import"].as_str()), (Some("golden"), Some("duplicated")));
+        assert_eq!(std::fs::read(emu_avd::state_dir(&root.join("avd/copy.avd")).join("userdata.img")).expect("imported"), b"settled");
+        let err = call(&mut s, "import", &json!({"from": to, "name": "copy2", "platform": "ios"})).expect_err("ios");
+        assert!(err.contains("Android bundles"), "{err}");
+        // A running device is refused before anything is written.
+        let _fake = sim_android::testing::fake_emulator(s.android.backend(), "golden");
+        let err = call(&mut s, "export", &json!({"device": "golden", "to": root.join("again.tar")})).expect_err("running");
+        assert_eq!(err, "golden must be shut down to export it");
+        assert!(!root.join("again.tar").exists());
         std::fs::remove_dir_all(root).ok();
     }
 
