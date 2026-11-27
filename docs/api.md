@@ -120,6 +120,10 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `erase` | iOS | device | Erase content and settings (shut down first) |
 | `screen` | Android, iOS | device, display?(main\|outer\|inner\|carplay) | Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds). display (iOS): main is the screen in use (an unfolded iPhone Duo's inner one), outer and inner an iPhone Duo's two, carplay an iPhone's CarPlay screen |
 | `screenshot` | Android, iOS | device, path?, display?(main\|outer\|inner\|carplay) | PNG to path, else base64 in `png` (a folded Android foldable: its outer screen as the scanout shows it, a Pixel Fold's 949x1840; an iPhone Duo's inner screen as its framebuffer holds it, 2007x2853) |
+| `stream_start` | Android, iOS | device, whip_url, token?, fps?(30), max_size?(1280), bitrate?(2500000), audio?(false), input?(false) | Stream the screen as H.264 over WebRTC to a WHIP endpoint (plaintext http to a loopback host only, e.g. MediaMTX's `http://127.0.0.1:8889/<path>/whip`), with token as its bearer token; max_size caps the longest side (0: full size), bitrate is in bit/s; input offers the `simee-input` data channel, whose touches, keys, text, buttons, rotations, folds and scrolls reach the device. One stream per device and URL, living in this process (`simee serve`) on a 30 s lease that stream_status renews: a stream nobody renews is stopped. Returns stream_id, whip_resource and lease_ttl_s. macOS hosts only for now; audio isn't streamed yet |
+| `stream_status` | Android, iOS | stream_id | A stream's state (starting, running, ended and why), its stages in the order reached (requested, first_encoded_frame, whip_connected, ended; ms since requested) and stats (encoded, sent, keyframes, bytes, fps, bitrate_bps, the publisher's bitrate_estimate_bps, the viewers' pli and fir keyframe requests, input events and errors); renews its lease |
+| `stream_stop` | Android, iOS | stream_id | Stop a stream: ends its encode loop and sends the WHIP DELETE; its last status, with deleted |
+| `streams` | Android, iOS | device? | This process's streams (or one device's), each as stream_status shows it, without renewing a lease |
 | `contrast_check` | Android, iOS | device, region?, scale?, appearance?(current\|both), restore?(light\|dark), settle_ms?(500), path?, display?(main\|outer\|inner\|carplay) | Text and controls below WCAG contrast in a screenshot, from pixels alone: finds text-like regions, estimates each one's foreground and background, and reports those under 4.5:1 (normal text) or 3:1 (large text of about 18 pt, icons and controls) with their box, the two colours and the ratio, and the screenshot with the findings boxed (`png`, or written to path). Text over a photo or a busy background has no one background and isn't judged. appearance both (iOS) checks the light and the dark UI (switches, waits settle_ms, checks) and leaves the device in restore (default light); Android can't switch appearance yet. region is {x, y, width, height} in pixels; scale is pixels per point (default: the device's, else 1) |
 | `tap` | Android, iOS | device, x, y, hold_ms?, display?(main\|outer\|inner\|carplay) | Tap at pixels, held hold_ms (default: iOS 10, Android 60) (display, iOS only: an iPhone Duo's outer or inner screen, an iPhone's CarPlay screen) |
 | `swipe` | Android, iOS | device, x1, y1, x2, y2, duration_ms?, settle?, display?(main\|outer\|inner\|carplay), edge?(top\|bottom\|left\|right; iOS) | Swipe between pixels over duration_ms (default 300; iOS sends its samples on schedule, so a busy host doesn't stretch it); with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: home and the app switcher from the bottom, Notification Center and Control Center from the top (Android's edge gestures need only the start point) |
@@ -396,3 +400,33 @@ with that cursor returns the changes since, oldest first, and the next cursor:
   cursor starts a new feed.
 - To follow a store from a known state: `prefs_watch` first, then `prefs_read`, then poll with the
   cursor; a change made during the read is in the feed.
+
+## Streams (`stream_*`)
+
+`stream_start` publishes a device's screen as H.264 over WebRTC to a WHIP endpoint (a media
+server such as MediaMTX, which browsers then play over WHEP). It returns once the first frame is
+encoded and the WHIP session is connected (the shape below; the values are placeholders):
+
+```text
+→ {"method": "stream_start", "params": {"device": "iPhone 17", "whip_url": "http://127.0.0.1:8889/sim/whip", "input": true}}
+← {"id":null,"ok":true,"result":{"stream_id":"stream-1","whip_resource":"http://127.0.0.1:8889/sim/whip/1f0c…","lease_ttl_s":30,"device":"5B0E…"}}
+→ {"method": "stream_status", "params": {"stream_id": "stream-1"}}
+← {"id":null,"ok":true,"result":{"stream_id":"stream-1","state":"running","stages":[{"stage":"requested","ms":0.0},
+    {"stage":"first_encoded_frame","ms":…},{"stage":"whip_connected","ms":…}],"stats":{"fps":…,"keyframes":…,"pli":…,…},…}}
+```
+
+- A stream lives in the process that started it: run `simee serve` (the CLI forwards to it) or
+  the MCP server. One stream per device and WHIP URL; a second is refused with the first's id.
+- **Leases.** `stream_status` renews a stream's 30 s lease; a stream nobody renews is stopped
+  (its WHIP resource deleted), so a client that crashed leaves nothing running. `streams` lists
+  without renewing. A stream that ended on its own (the peer disconnected, the device went away)
+  stays listed, `state: "ended"` with its `reason`, until its lease lapses.
+- **Stopping.** `stream_stop` ends the encode loop, sends the WHIP DELETE and returns the last
+  status with `deleted`.
+- **Errors.** A URL the publisher refuses (`https`, plaintext to a host that isn't loopback, not
+  http), a device that isn't booted, the WHIP server refusing the token (401/403), `audio: true`
+  (#265), and any host without an encoder (Linux: #263) fail `stream_start`, leaving nothing
+  running. The token is never echoed.
+- **Input.** `input: true` offers the `simee-input` data channel; its events reach the device's
+  `touch`, `key`, `type`, `button`, `rotate`, `fold` and `swipe`, mapped from the stream frame to
+  device pixels. docs/streaming.md, "Streams from the API", has the mapping and the limits.

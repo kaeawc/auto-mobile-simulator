@@ -57,6 +57,11 @@ pub fn effect(method: &str) -> Option<Effect> {
         "prefs_write" | "prefs_delete" | "prefs_batch" => Destroy,
         // Read a corpse of the app: nothing on the device changes.
         "mem_leaks" | "mem_heap" | "mem_vmmap" | "mem_history" => Read,
+        // A stream sends the screen to a URL (and, with input, takes a viewer's touches); status
+        // only renews a lease; stop ends it.
+        "stream_start" => Danger,
+        "stream_status" | "streams" => Read,
+        "stream_stop" => Destroy,
         "help" | "identity" | "host" | "devices_usage" | "form_factors" | "devices" | "runtimes" | "device_types" | "screen"
         | "screenshot" | "apps" | "ca_debug_state" | "logs" | "processes" | "connections" | "traffic" | "containers" | "ls" | "read"
         | "du" | "crash_reports" | "info" | "defaults_read" | "network_state" | "network_flows" | "network_env" | "audio_state"
@@ -78,9 +83,10 @@ pub fn effect(method: &str) -> Option<Effect> {
 }
 
 /// Whether `method` reaches beyond the device and the host: `open_url` hands a URL to the device,
-/// which may fetch it from anywhere. Everything else stays on this machine.
+/// which may fetch it from anywhere, and `stream_start` sends the screen to a media server that
+/// relays it to any viewer. Everything else stays on this machine.
 pub fn open_world(method: &str) -> bool {
-    method == "open_url"
+    matches!(method, "open_url" | "stream_start")
 }
 
 /// What a method is for: the MCP server's toolsets, which a client picks from.
@@ -106,12 +112,14 @@ pub enum Group {
     Network,
     /// The device's audio on the host.
     Audio,
+    /// The screen streamed over WebRTC (WHIP).
+    Stream,
     /// The host and the server itself.
     Host,
 }
 
 impl Group {
-    pub const ALL: [Group; 11] = [
+    pub const ALL: [Group; 12] = [
         Group::Lifecycle,
         Group::Apps,
         Group::Input,
@@ -122,6 +130,7 @@ impl Group {
         Group::Prefs,
         Group::Network,
         Group::Audio,
+        Group::Stream,
         Group::Host,
     ];
 
@@ -138,6 +147,7 @@ impl Group {
             Group::Prefs => "prefs",
             Group::Network => "network",
             Group::Audio => "audio",
+            Group::Stream => "stream",
             Group::Host => "host",
         }
     }
@@ -167,6 +177,7 @@ pub fn group(method: &str) -> Option<Group> {
         "prefs_stores" | "prefs_read" | "prefs_write" | "prefs_delete" | "prefs_batch" | "prefs_watch" => Prefs,
         "network_shape" | "network_state" | "network_flows" | "network_clear" | "network_env" => Network,
         "audio_state" | "audio_volume" | "audio_route" | "audio_capture_start" | "audio_capture_stop" | "audio_mute" => Audio,
+        "stream_start" | "stream_status" | "stream_stop" | "streams" => Stream,
         _ => return None,
     })
 }
@@ -243,6 +254,8 @@ mod tests {
             "console",
             "audio_capture_start",
             "export",
+            "stream_start",
+            "stream_stop",
         ] {
             let e = effect(m).expect(m);
             assert!(e.destructive() && !e.read_only(), "{m}");
@@ -251,6 +264,6 @@ mod tests {
             assert!(effect(m).is_some_and(Effect::read_only), "{m}");
         }
         assert!(!effect("tap").expect("tap").idempotent() && effect("appearance").expect("appearance").idempotent());
-        assert!(open_world("open_url") && !open_world("tap"));
+        assert!(open_world("open_url") && open_world("stream_start") && !open_world("tap") && !open_world("stream_status"));
     }
 }

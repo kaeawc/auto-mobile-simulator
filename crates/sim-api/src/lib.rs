@@ -36,6 +36,7 @@ mod params;
 pub mod prefs;
 mod schema;
 pub mod settle;
+mod stream;
 mod usage;
 
 use std::io::{BufRead, BufReader, Write};
