@@ -57,8 +57,13 @@ id share one):
 
 - The first `subscribe` opens the source, and returns its error there: a missing camera, an
   ambiguous name, or the permission.
-- The capture runs at the largest size and the highest frame rate its subscribers asked for. Each
-  subscriber gets frames at its own size and rate; a frame already the right size is shared.
+- The capture runs at the highest frame rate its subscribers asked for. Each subscriber gets
+  frames at its own size and rate. A synthetic source draws one frame per distinct subscriber size
+  (a QR code keeps its quiet zone and the test card its counter strip at any aspect ratio); a
+  camera's frame is fitted to each size. A frame already the right size is shared.
+- Sources open outside the hub's lock: a slow `image:` path or camera start delays only subscribers
+  to that source.
+- `image:` files over 8192 px a side or 36 megapixels are refused before any pixels are allocated.
 - A slow subscriber falls at most two frames behind; newer frames are dropped for it, and the
   capture never waits.
 - Dropping the last `Subscription` stops the capture at once and drops the source, which releases
@@ -86,6 +91,8 @@ the status and never prompt. Synthetic sources need no permission. The permissio
 tested with a fake status (`tcc::Authorizer`).
 
 ## Not yet
+
+Tracked in #335:
 
 - `video:<path>`: needs VideoToolbox decoding (`Unsupported` until then).
 - Capture from a camera on Linux: V4L2 streaming (`VIDIOC_REQBUFS` with mmap buffers, YUYV and

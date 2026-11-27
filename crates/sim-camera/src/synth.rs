@@ -1,6 +1,7 @@
 //! Synthetic sources: no hardware, the same frames on every host. The test card is drawn fresh
 //! each tick; the others are stills, drawn once per size and shared (no copy) after that.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,7 +40,7 @@ pub fn open(source: &SourceSpec) -> Result<Box<dyn Source>> {
             Box::new(Still::new(move |spec| Ok(Canvas::new(spec.width, spec.height, colour).bgra)))
         }
         SourceSpec::Video(path) => {
-            // TODO(#320 follow-up): decode with VideoToolbox (AVAssetReader or a
+            // TODO(#335): decode with VideoToolbox (AVAssetReader or a
             // VTDecompressionSession) on macOS, looped, paced by the capture.
             return Err(Error::Unsupported(format!(
                 "video:{} isn't supported yet: video files need the VideoToolbox decoder, which isn't wired up; use image: for a still",
@@ -55,26 +56,37 @@ type Render = dyn Fn(FrameSpec) -> Result<Vec<u8>> + Send;
 /// A source whose frames don't change: drawn once per size, then shared.
 struct Still {
     render: Box<Render>,
-    cached: Option<CameraFrame>,
+    cached: HashMap<(u32, u32), Arc<[u8]>>,
 }
+
+/// Sizes a still keeps drawn at once; more distinct sizes than this start over.
+const STILL_SIZES: usize = 8;
 
 impl Still {
     fn new(render: impl Fn(FrameSpec) -> Result<Vec<u8>> + Send + 'static) -> Still {
-        Still { render: Box::new(render), cached: None }
+        Still { render: Box::new(render), cached: HashMap::new() }
     }
 }
 
 impl Source for Still {
     fn frame(&mut self, spec: FrameSpec, tick: Tick) -> Result<CameraFrame> {
-        let bgra = match &self.cached {
-            Some(f) if (f.width, f.height) == (spec.width, spec.height) => f.bgra.clone(),
-            _ => {
+        let size = (spec.width, spec.height);
+        let bgra = match self.cached.get(&size) {
+            Some(bgra) => bgra.clone(),
+            None => {
                 let bgra: Arc<[u8]> = (self.render)(spec)?.into();
-                self.cached = Some(CameraFrame { width: spec.width, height: spec.height, bgra: bgra.clone(), tick });
+                if self.cached.len() >= STILL_SIZES {
+                    self.cached.clear();
+                }
+                self.cached.insert(size, bgra.clone());
                 bgra
             }
         };
         Ok(CameraFrame { width: spec.width, height: spec.height, bgra, tick })
+    }
+
+    fn synthetic(&self) -> bool {
+        true
     }
 }
 
@@ -121,10 +133,66 @@ fn load_image(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
     }
 }
 
+/// The longest side an `image:` file may have, and the most pixels: bigger files are refused
+/// before anything is allocated for them (a header can claim far more than its bytes hold).
+pub const MAX_IMAGE_SIDE: u32 = 8192;
+pub const MAX_IMAGE_PIXELS: u64 = 36_000_000;
+
+fn check_size(width: u32, height: u32) -> std::result::Result<(), String> {
+    if width == 0
+        || height == 0
+        || width > MAX_IMAGE_SIDE
+        || height > MAX_IMAGE_SIDE
+        || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
+    {
+        return Err(format!(
+            "{width}x{height} is outside what image: accepts (up to {MAX_IMAGE_SIDE} px a side and {} megapixels)",
+            MAX_IMAGE_PIXELS / 1_000_000
+        ));
+    }
+    Ok(())
+}
+
+/// The size a PNG's IHDR claims.
+fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let ihdr = bytes.get(16..24)?;
+    let word = |i: usize| u32::from_be_bytes([ihdr[i], ihdr[i + 1], ihdr[i + 2], ihdr[i + 3]]);
+    (bytes.get(12..16)? == b"IHDR").then(|| (word(0), word(4)))
+}
+
+/// The size a JPEG's first start-of-frame segment claims.
+fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let mut i = 2;
+    while i + 4 <= bytes.len() {
+        if bytes[i] != 0xff {
+            i += 1;
+            continue;
+        }
+        let marker = bytes[i + 1];
+        if marker == 0xff {
+            i += 1;
+            continue;
+        }
+        if marker == 0x00 || marker == 0x01 || (0xd0..=0xd8).contains(&marker) {
+            i += 2;
+            continue;
+        }
+        if (0xc0..=0xcf).contains(&marker) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
+            let sof = bytes.get(i + 5..i + 9)?;
+            return Some((u32::from(u16::from_be_bytes([sof[2], sof[3]])), u32::from(u16::from_be_bytes([sof[0], sof[1]]))));
+        }
+        i += 2 + usize::from(u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]));
+    }
+    None
+}
+
 fn decode_png(bytes: &[u8]) -> std::result::Result<(u32, u32, Vec<u8>), String> {
+    let (w, h) = png_size(bytes).ok_or("not a valid PNG header")?;
+    check_size(w, h)?;
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
+    check_size(reader.info().width, reader.info().height)?;
     let mut buf = vec![0; reader.output_buffer_size().ok_or("PNG too large")?];
     let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
     buf.truncate(info.buffer_size());
@@ -145,7 +213,12 @@ fn decode_png(bytes: &[u8]) -> std::result::Result<(u32, u32, Vec<u8>), String> 
 fn decode_jpeg(bytes: &[u8]) -> std::result::Result<(u32, u32, Vec<u8>), String> {
     use zune_jpeg::zune_core::colorspace::ColorSpace;
     use zune_jpeg::zune_core::options::DecoderOptions;
-    let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+    let (w, h) = jpeg_size(bytes).ok_or("no frame header in the JPEG")?;
+    check_size(w, h)?;
+    let options = DecoderOptions::default()
+        .jpeg_set_out_colorspace(ColorSpace::RGB)
+        .set_max_width(MAX_IMAGE_SIDE as usize)
+        .set_max_height(MAX_IMAGE_SIDE as usize);
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(bytes), options);
     let rgb = decoder.decode().map_err(|e| e.to_string())?;
     let info = decoder.info().ok_or("JPEG has no header")?;
@@ -218,6 +291,10 @@ impl Source for Testcard {
             c.text(w.saturating_sub(lw) / 2, y, scale, line, Colour::WHITE);
         }
         Ok(CameraFrame { width: w, height: h, bgra: c.bgra.into(), tick })
+    }
+
+    fn synthetic(&self) -> bool {
+        true
     }
 }
 
@@ -425,6 +502,69 @@ mod tests {
         let missing = open(&SourceSpec::Image(dir.join("missing.png"))).err();
         assert!(matches!(missing, Some(Error::Io(_))), "{missing:?}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 { crc >> 1 ^ 0xedb8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
+    }
+
+    fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut out = (data.len() as u32).to_be_bytes().to_vec();
+        let body: Vec<u8> = kind.iter().chain(data).copied().collect();
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc32(&body).to_be_bytes());
+        out
+    }
+
+    fn open_bytes(name: &str, bytes: &[u8]) -> String {
+        let dir = temp_dir(name);
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).ok();
+        let err = open(&SourceSpec::Image(path)).err().map(|e| e.to_string()).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).ok();
+        err
+    }
+
+    #[test]
+    fn a_png_declaring_a_huge_size_is_refused_before_allocating() {
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&60_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&60_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend(png_chunk(b"IHDR", &ihdr));
+        png.extend(png_chunk(b"IDAT", &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01]));
+        png.extend(png_chunk(b"IEND", &[]));
+        let err = open_bytes("huge.png", &png);
+        assert!(err.contains("60000x60000") && err.contains("image: accepts"), "{err}");
+    }
+
+    #[test]
+    fn a_jpeg_declaring_a_huge_size_is_refused_before_decoding() {
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xc0, 0, 17, 8];
+        jpeg.extend_from_slice(&16_384u16.to_be_bytes());
+        jpeg.extend_from_slice(&16_384u16.to_be_bytes());
+        jpeg.extend_from_slice(&[3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1, 0xff, 0xd9]);
+        let err = open_bytes("huge.jpg", &jpeg);
+        assert!(err.contains("16384x16384") && err.contains("image: accepts"), "{err}");
+    }
+
+    #[test]
+    fn the_size_limits_pass_ordinary_images() {
+        assert!(check_size(8192, 4096).is_ok());
+        assert!(check_size(8192, 8192).is_err());
+        assert!(check_size(8193, 1).is_err());
+        assert_eq!(
+            jpeg_size(&std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/red-16x16.jpg")).unwrap_or_default()),
+            Some((16, 16))
+        );
     }
 
     #[test]

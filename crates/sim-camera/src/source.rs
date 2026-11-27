@@ -16,6 +16,14 @@ use crate::tcc::{self, Authorizer, HostAuthorizer};
 /// which releases any host camera it holds.
 pub trait Source: Send {
     fn frame(&mut self, spec: FrameSpec, tick: Tick) -> Result<CameraFrame>;
+
+    /// Whether the source draws its frames at whatever size it is asked for (a test card, a QR
+    /// code, a still). The hub then renders once per distinct subscriber size instead of cropping
+    /// one frame, which would cut a QR code's quiet zone or shift the test card's counter strip.
+    /// A camera, whose frames come at its own size, leaves this `false`.
+    fn synthetic(&self) -> bool {
+        false
+    }
 }
 
 /// Turns source ids into sources. The hub keys captures by [`Opener::canonical`], so two spellings
@@ -84,7 +92,7 @@ fn open_webcam(camera: &HostCamera, spec: FrameSpec) -> Result<Box<dyn Source>> 
 
 #[cfg(not(target_os = "macos"))]
 fn open_webcam(camera: &HostCamera, _spec: FrameSpec) -> Result<Box<dyn Source>> {
-    // TODO(#320 follow-up): V4L2 streaming capture (VIDIOC_S_FMT, VIDIOC_REQBUFS with mmap
+    // TODO(#335): V4L2 streaming capture (VIDIOC_S_FMT, VIDIOC_REQBUFS with mmap
     // buffers, VIDIOC_STREAMON, YUYV and MJPEG to BGRA). Enumeration works today.
     Err(crate::Error::Unsupported(format!(
         "capturing from {} isn't supported on this host yet: V4L2 streaming capture isn't implemented (enumeration is)",

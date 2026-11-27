@@ -1,8 +1,10 @@
 //! Fan-out: one capture per source, shared by every subscriber linked to it. The first
-//! subscription opens the source and starts its capture thread; the capture runs at the largest
-//! size and the highest rate its subscribers ask for, hands each subscriber frames at its own size
-//! and rate (a still or a same-size frame is shared, never copied), and stops, dropping the source
-//! and releasing any camera, as soon as the last subscription is dropped.
+//! subscription opens the source (outside the hub's lock, so a slow open blocks only its own
+//! source) and starts its capture thread; the capture runs at the highest rate its subscribers ask
+//! for and hands each subscriber frames at its own size and rate: a synthetic source draws one
+//! frame per distinct size (a still or a same-size frame is shared, never copied), a camera's one
+//! frame is fitted to each size. The capture stops, dropping the source and releasing any camera,
+//! as soon as the last subscription is dropped.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
@@ -26,7 +28,54 @@ pub struct Hub {
 
 struct Inner {
     opener: Box<dyn Opener>,
-    captures: Mutex<HashMap<String, Arc<Capture>>>,
+    captures: Mutex<HashMap<String, Entry>>,
+}
+
+/// A source's slot in the hub: being opened (by one subscriber, outside the lock) or running.
+#[derive(Clone)]
+enum Entry {
+    Opening(Arc<Gate>),
+    Running(Arc<Capture>),
+}
+
+/// Released when an open finishes, either way; subscribers to the same source wait on it.
+#[derive(Default)]
+struct Gate {
+    done: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Gate {
+    fn wait(&self) {
+        let mut done = lock(&self.done);
+        while !*done {
+            done = self.cv.wait(done).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    fn finish(&self) {
+        *lock(&self.done) = true;
+        self.cv.notify_all();
+    }
+}
+
+/// The right to open one source. Dropping it (also on a panic in the open) clears the slot if it
+/// is still the opening one, and releases the subscribers waiting for it.
+struct Claim<'a> {
+    inner: &'a Inner,
+    key: &'a str,
+    gate: Arc<Gate>,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        let mut captures = lock(&self.inner.captures);
+        if matches!(captures.get(self.key), Some(Entry::Opening(g)) if Arc::ptr_eq(g, &self.gate)) {
+            captures.remove(self.key);
+        }
+        drop(captures);
+        self.gate.finish();
+    }
 }
 
 struct Capture {
@@ -68,18 +117,34 @@ impl Hub {
     pub fn subscribe(&self, source: &SourceSpec, spec: FrameSpec) -> Result<Subscription> {
         let canonical = self.inner.opener.canonical(source)?;
         let key = canonical.to_string();
-        let mut captures = lock(&self.inner.captures);
-        if let Some(capture) = captures.get(&key).cloned() {
-            let mut state = lock(&capture.state);
-            if !state.stopped {
-                let (id, rx) = add(&mut state, spec);
-                drop(state);
-                capture.wake.notify_all();
-                return Ok(Subscription { id, spec, capture, rx });
+        let gate = loop {
+            let mut captures = lock(&self.inner.captures);
+            match captures.get(&key).cloned() {
+                Some(Entry::Running(capture)) => {
+                    let mut state = lock(&capture.state);
+                    if !state.stopped {
+                        let (id, rx) = add(&mut state, spec);
+                        drop(state);
+                        capture.wake.notify_all();
+                        return Ok(Subscription { id, spec, capture, rx });
+                    }
+                }
+                // Another subscriber is opening this source: wait, then join its capture (or open
+                // it ourselves if that failed).
+                Some(Entry::Opening(gate)) => {
+                    drop(captures);
+                    gate.wait();
+                    continue;
+                }
+                None => {}
             }
-        }
-        // Opened under the hub's lock, so a second subscriber to a source that is still opening
-        // waits and joins its capture instead of opening the camera twice.
+            let gate = Arc::new(Gate::default());
+            captures.insert(key.clone(), Entry::Opening(gate.clone()));
+            break gate;
+        };
+        let claim = Claim { inner: &self.inner, key: &key, gate };
+        // Opened without the hub's lock: a slow open (a FIFO, a stalled mount, a camera starting)
+        // holds up only subscribers to this source.
         let source = self.inner.opener.open(&canonical, spec)?;
         let capture = Arc::new(Capture {
             key: key.clone(),
@@ -87,15 +152,15 @@ impl Hub {
             wake: Condvar::new(),
         });
         let (id, rx) = add(&mut lock(&capture.state), spec);
-        captures.insert(key.clone(), capture.clone());
-        drop(captures);
+        lock(&self.inner.captures).insert(key.clone(), Entry::Running(capture.clone()));
+        drop(claim);
         let (weak, run) = (Arc::downgrade(&self.inner), capture.clone());
         // Named by kind only: the id can be long, or hold a NUL (a `qr:` text), which a thread
         // name can't.
         let name = format!("camera {}", canonical.kind());
         let spawned = thread::Builder::new().name(name).spawn(move || run_capture(weak, run, source));
         if let Err(e) = spawned {
-            lock(&self.inner.captures).remove(&key);
+            remove(&Arc::downgrade(&self.inner), &capture);
             return Err(Error::Capture(format!("can't start the capture thread: {e}")));
         }
         Ok(Subscription { id, spec, capture, rx })
@@ -106,7 +171,10 @@ impl Hub {
         let captures = lock(&self.inner.captures);
         let mut out: Vec<Active> = captures
             .values()
-            .map(|c| Active { source: c.key.clone(), subscribers: lock(&c.state).subscribers.len() })
+            .filter_map(|e| match e {
+                Entry::Running(c) => Some(Active { source: c.key.clone(), subscribers: lock(&c.state).subscribers.len() }),
+                Entry::Opening(_) => None,
+            })
             .filter(|a| a.subscribers > 0)
             .collect();
         out.sort_by(|a, b| a.source.cmp(&b.source));
@@ -176,7 +244,8 @@ impl Drop for Subscription {
     }
 }
 
-/// The capture spec for a set of subscribers: the largest frame asked for, at the highest rate.
+/// The capture spec for a set of subscribers: the largest frame asked for (what a camera is
+/// fitted from), at the highest rate.
 fn capture_spec(subscribers: &[Subscriber]) -> Option<FrameSpec> {
     let largest = subscribers.iter().map(|s| s.spec).max_by_key(FrameSpec::area)?;
     let fps = subscribers.iter().map(|s| s.spec.fps).max().unwrap_or(largest.fps);
@@ -186,11 +255,12 @@ fn capture_spec(subscribers: &[Subscriber]) -> Option<FrameSpec> {
 fn run_capture(hub: Weak<Inner>, capture: Arc<Capture>, mut source: Box<dyn Source>) {
     let started = Instant::now();
     let wall = SystemTime::now();
+    let synthetic = source.synthetic();
     let mut seq = 0u64;
     let mut next = started;
     loop {
         // Sleep until the next tick, waking early when a subscriber comes or goes.
-        let spec = {
+        let due_now = {
             let mut state = lock(&capture.state);
             loop {
                 if state.subscribers.is_empty() {
@@ -198,12 +268,12 @@ fn run_capture(hub: Weak<Inner>, capture: Arc<Capture>, mut source: Box<dyn Sour
                 }
                 let now = Instant::now();
                 if now >= next {
-                    break capture_spec(&state.subscribers);
+                    break capture_spec(&state.subscribers).map(|spec| (spec, take_due(&mut state.subscribers, now)));
                 }
                 state = capture.wake.wait_timeout(state, next - now).map(|(s, _)| s).unwrap_or_else(|p| p.into_inner().0);
             }
         };
-        let Some(spec) = spec else {
+        let Some((spec, due)) = due_now else {
             if stop_if_idle(&hub, &capture) {
                 return;
             }
@@ -212,12 +282,12 @@ fn run_capture(hub: Weak<Inner>, capture: Arc<Capture>, mut source: Box<dyn Sour
         let now = Instant::now();
         let pts = now - started;
         let tick = Tick { seq, pts, wall: wall + pts };
-        let frame = source.frame(spec, tick);
+        let frames = render(source.as_mut(), synthetic, spec, tick, &due);
         seq += 1;
         next = (next + spec.interval()).max(now);
         let mut state = lock(&capture.state);
-        match frame {
-            Ok(frame) => deliver(&mut state.subscribers, &frame, now),
+        match frames {
+            Ok(frames) => deliver(&mut state.subscribers, &frames, &due),
             Err(e) => {
                 // Dropping the senders ends every subscriber's stream; each then reads `failure`.
                 state.failure = Some(e);
@@ -231,24 +301,39 @@ fn run_capture(hub: Weak<Inner>, capture: Arc<Capture>, mut source: Box<dyn Sour
     }
 }
 
-/// Sends a frame to every subscriber that is due, at its size; drops subscribers whose
-/// subscription is gone.
-fn deliver(subscribers: &mut Vec<Subscriber>, frame: &CameraFrame, now: Instant) {
-    let mut sized: Vec<CameraFrame> = vec![frame.clone()];
-    subscribers.retain_mut(|s| {
-        if now < s.due {
-            return true;
-        }
+/// The subscribers due a frame now, as (id, size); moves their next due time on.
+fn take_due(subscribers: &mut [Subscriber], now: Instant) -> Vec<(u64, (u32, u32))> {
+    let mut due = Vec::new();
+    for s in subscribers.iter_mut().filter(|s| now >= s.due) {
         s.due = (s.due + s.spec.interval()).max(now);
-        let out = match sized.iter().find(|f| (f.width, f.height) == (s.spec.width, s.spec.height)) {
-            Some(f) => f.clone(),
-            None => {
-                let f = frame.fit(s.spec.width, s.spec.height);
-                sized.push(f.clone());
-                f
-            }
-        };
-        !matches!(s.tx.try_send(out), Err(TrySendError::Disconnected(_)))
+        due.push((s.id, (s.spec.width, s.spec.height)));
+    }
+    due
+}
+
+/// One frame per distinct size among the due subscribers. A synthetic source draws each size
+/// itself; a camera is asked for its frame once (every tick, so a stalled camera is noticed) and
+/// that frame is fitted to the other sizes.
+fn render(source: &mut dyn Source, synthetic: bool, spec: FrameSpec, tick: Tick, due: &[(u64, (u32, u32))]) -> Result<Vec<CameraFrame>> {
+    let mut sizes: Vec<(u32, u32)> = Vec::new();
+    for &(_, size) in due {
+        if !sizes.contains(&size) {
+            sizes.push(size);
+        }
+    }
+    if synthetic {
+        return sizes.into_iter().map(|(width, height)| source.frame(FrameSpec { width, height, ..spec }, tick)).collect();
+    }
+    let frame = source.frame(spec, tick)?;
+    Ok(sizes.into_iter().map(|(width, height)| frame.fit(width, height)).collect())
+}
+
+/// Sends each due subscriber the frame of its size; drops subscribers whose subscription is gone.
+fn deliver(subscribers: &mut Vec<Subscriber>, frames: &[CameraFrame], due: &[(u64, (u32, u32))]) {
+    subscribers.retain(|s| {
+        let Some(&(_, size)) = due.iter().find(|(id, _)| *id == s.id) else { return true };
+        let Some(frame) = frames.iter().find(|f| (f.width, f.height) == size) else { return true };
+        !matches!(s.tx.try_send(frame.clone()), Err(TrySendError::Disconnected(_)))
     });
 }
 
@@ -262,7 +347,7 @@ fn stop_if_idle(hub: &Weak<Inner>, capture: &Arc<Capture>) -> bool {
         return false;
     }
     state.stopped = true;
-    if captures.get(&capture.key).is_some_and(|c| Arc::ptr_eq(c, capture)) {
+    if matches!(captures.get(&capture.key), Some(Entry::Running(c)) if Arc::ptr_eq(c, capture)) {
         captures.remove(&capture.key);
     }
     true
@@ -271,7 +356,7 @@ fn stop_if_idle(hub: &Weak<Inner>, capture: &Arc<Capture>) -> bool {
 fn remove(hub: &Weak<Inner>, capture: &Arc<Capture>) {
     if let Some(inner) = hub.upgrade() {
         let mut captures = lock(&inner.captures);
-        if captures.get(&capture.key).is_some_and(|c| Arc::ptr_eq(c, capture)) {
+        if matches!(captures.get(&capture.key), Some(Entry::Running(c)) if Arc::ptr_eq(c, capture)) {
             captures.remove(&capture.key);
         }
     }
@@ -305,6 +390,10 @@ mod tests {
     }
 
     impl Source for Counted {
+        fn synthetic(&self) -> bool {
+            self.inner.synthetic()
+        }
+
         fn frame(&mut self, spec: FrameSpec, tick: Tick) -> Result<CameraFrame> {
             let n = self.counts.frames.fetch_add(1, Ordering::SeqCst);
             if self.fail_after.is_some_and(|max| n >= max) {
@@ -428,6 +517,105 @@ mod tests {
         assert_eq!((fb.width, fb.height), (640, 480));
         assert_eq!((fs.width, fs.height), (320, 240));
         assert_eq!(crate::synth::testcard_seq(&fs), Some(fs.tick.seq as u32), "scaled from the capture frame");
+    }
+
+    /// What a QR frame at `w`x`h` must be: the source drawn at exactly that size.
+    fn drawn(id: &str, w: u32, h: u32, tick: Tick) -> CameraFrame {
+        let mut source = synth::open(&parse(id)).unwrap_or_else(|e| panic!("{e}"));
+        source.frame(spec(w, h, 30), tick).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn a_qr_code_keeps_its_finder_patterns_and_quiet_zone_at_mixed_aspect_ratios() {
+        let (hub, _) = hub(None);
+        let wide = hub.subscribe(&parse("qr:hello"), spec(1280, 720, 60)).unwrap_or_else(|e| panic!("{e}"));
+        let tall = hub.subscribe(&parse("qr:hello"), spec(720, 1280, 60)).unwrap_or_else(|e| panic!("{e}"));
+        let qr = qrcodegen::QrCode::encode_text("hello", qrcodegen::QrCodeEcc::Medium).unwrap_or_else(|e| panic!("{e}"));
+        for (sub, (w, h)) in [(&wide, (1280, 720)), (&tall, (720, 1280))] {
+            let f = next(sub);
+            assert_eq!((f.width, f.height), (w, h));
+            let (module, x0, y0) = synth::qr_layout(qr.size(), w, h).unwrap_or_default();
+            let (black, white) = ([0, 0, 0, 255], [255, 255, 255, 255]);
+            let last = qr.size() - 1;
+            for (mx, my) in [(0, 0), (last, 0), (0, last)] {
+                let (px, py) = (x0 + mx as u32 * module + module / 2, y0 + my as u32 * module + module / 2);
+                assert_eq!(f.pixel(px, py), black, "finder corner {mx},{my} at {w}x{h}");
+            }
+            assert_eq!(f.pixel(x0 - module / 2, y0 + module / 2), white, "quiet zone at {w}x{h}");
+            assert_eq!(f.bgra, drawn("qr:hello", w, h, f.tick).bgra, "the code as drawn at {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn the_test_card_counter_reads_at_mixed_aspect_ratios() {
+        let (hub, _) = hub(None);
+        let wide = hub.subscribe(&parse("pattern:testcard"), spec(1280, 720, 60)).unwrap_or_else(|e| panic!("{e}"));
+        let std = hub.subscribe(&parse("pattern:testcard"), spec(640, 480, 60)).unwrap_or_else(|e| panic!("{e}"));
+        for sub in [&wide, &std] {
+            // Past the first frames, where seq's high bits matter little but its low ones do.
+            for _ in 0..3 {
+                let f = next(sub);
+                assert_eq!(synth::testcard_seq(&f), Some(f.tick.seq as u32), "{}x{}", f.width, f.height);
+            }
+        }
+    }
+
+    /// Opens block on `release` for `image:` sources; everything else opens at once.
+    struct Slow {
+        release: Mutex<Receiver<()>>,
+        opened: Arc<AtomicUsize>,
+    }
+
+    impl Opener for Slow {
+        fn open(&self, source: &SourceSpec, _spec: FrameSpec) -> Result<Box<dyn Source>> {
+            if matches!(source, SourceSpec::Image(_)) {
+                let _ = lock(&self.release).recv();
+                self.opened.fetch_add(1, Ordering::SeqCst);
+                return synth::open(&SourceSpec::Solid("blue".into()));
+            }
+            synth::open(source)
+        }
+    }
+
+    #[test]
+    fn a_slow_open_blocks_only_its_own_source() {
+        let (release, rx) = mpsc::channel();
+        let opened = Arc::new(AtomicUsize::new(0));
+        let hub = Arc::new(Hub::new(Slow { release: Mutex::new(rx), opened: opened.clone() }));
+        let slow = SourceSpec::Image("/stalled/fifo".into());
+        let joiners: Vec<_> = (0..2)
+            .map(|_| {
+                let (hub, slow) = (hub.clone(), slow.clone());
+                thread::spawn(move || hub.subscribe(&slow, FrameSpec::default()))
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(100));
+        let (done_tx, done_rx) = mpsc::channel();
+        let other = hub.clone();
+        thread::spawn(move || {
+            let r = other.subscribe(&parse("solid:red"), FrameSpec::default()).map(|s| next(&s).pixel(0, 0));
+            let _ = done_tx.send((r, other.active()));
+        });
+        let other_result = done_rx.recv_timeout(Duration::from_secs(3));
+        // Let the stalled open finish whatever happened above, so no thread is left blocked.
+        let _ = release.send(());
+        let (pixel, active) = other_result.unwrap_or_else(|_| panic!("a subscribe to another source waited on the stalled open"));
+        assert_eq!(pixel.unwrap_or_default(), [0, 0, 255, 255]);
+        assert!(active.iter().all(|a| a.source != "image:/stalled/fifo"), "{active:?}");
+        let subs: Vec<Subscription> =
+            joiners.into_iter().map(|j| j.join().unwrap_or_else(|_| panic!("panicked")).unwrap_or_else(|e| panic!("{e}"))).collect();
+        assert!(subs.iter().all(|s| s.source() == "image:/stalled/fifo"));
+        assert_eq!(opened.load(Ordering::SeqCst), 1, "the two subscribers to the slow source shared one open");
+    }
+
+    #[test]
+    fn a_failed_open_frees_the_slot_for_the_next_subscriber() {
+        let (hub, counts) = hub(None);
+        assert!(hub.subscribe(&parse("video:/x.mp4"), FrameSpec::default()).is_err());
+        assert!(hub.subscribe(&parse("video:/x.mp4"), FrameSpec::default()).is_err());
+        let ok = hub.subscribe(&parse("solid:red"), FrameSpec::default());
+        assert!(ok.is_ok());
+        assert_eq!(counts.opened.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -191,6 +191,11 @@ fn fourcc(code: u32) -> String {
 }
 
 pub(crate) fn authorization_status() -> Result<Authorization> {
+    // The calls autorelease objects: drain them here, not when this (long-lived) thread exits.
+    autoreleasepool(|_| authorization_status_inner())
+}
+
+fn authorization_status_inner() -> Result<Authorization> {
     let api = api()?;
     let device = class(c"AVCaptureDevice")?;
     // SAFETY: `+authorizationStatusForMediaType:` takes an AVMediaType string and returns an
@@ -332,13 +337,16 @@ define_class!(
         /// `AVCaptureVideoDataOutputSampleBufferDelegate`: one BGRA frame, on the output's queue.
         #[unsafe(method(captureOutput:didOutputSampleBuffer:fromConnection:))]
         fn did_output(&self, _output: *mut AnyObject, sample: *mut c_void, _connection: *mut AnyObject) {
-            let Ok(api) = api() else { return };
-            if let Some((width, height, px)) = copy_sample(api, sample) {
-                let latest = &self.ivars().latest;
-                let arrived = Arrived { width, height, bgra: px.into(), at: Instant::now() };
-                *latest.frame.lock().unwrap_or_else(|p| p.into_inner()) = Some(arrived);
-                latest.arrived.notify_all();
-            }
+            // A panic must not unwind into Objective-C (it would abort the process): drop the frame.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let Ok(api) = api() else { return };
+                if let Some((width, height, px)) = copy_sample(api, sample) {
+                    let latest = &self.ivars().latest;
+                    let arrived = Arrived { width, height, bgra: px.into(), at: Instant::now() };
+                    *latest.frame.lock().unwrap_or_else(|p| p.into_inner()) = Some(arrived);
+                    latest.arrived.notify_all();
+                }
+            }));
         }
     }
 
@@ -371,7 +379,16 @@ fn copy_sample(api: &Api, sample: *mut c_void) -> Option<(u32, u32, Vec<u8>)> {
     }
     // SAFETY: the buffer is locked, so its base address and geometry are valid until unlock.
     let (base, stride, w, h) = unsafe { ((api.base)(pb), (api.bytes_per_row)(pb), (api.width)(pb), (api.height)(pb)) };
-    let out = (!base.is_null() && stride >= w * 4).then(|| {
+    // A buffer reporting no pixels, or rows shorter than its width, is dropped, not sliced.
+    let usable = !base.is_null()
+        && w > 0
+        && h > 0
+        && w <= u32::MAX as usize
+        && h <= u32::MAX as usize
+        && stride > 0
+        && stride <= u32::MAX as usize
+        && w.checked_mul(4).is_some_and(|row| stride >= row);
+    let out = usable.then(|| {
         // SAFETY: a locked BGRA buffer holds `h` rows of `stride` bytes at `base`.
         let src = unsafe { std::slice::from_raw_parts(base.cast::<u8>(), stride * h) };
         let mut px = Vec::with_capacity(w * h * 4);
@@ -405,7 +422,13 @@ pub(crate) struct Webcam {
 unsafe impl Send for Webcam {}
 
 impl Webcam {
-    pub(crate) fn open(camera: &HostCamera, _spec: FrameSpec) -> Result<Webcam> {
+    pub(crate) fn open(camera: &HostCamera, spec: FrameSpec) -> Result<Webcam> {
+        // Session setup autoreleases objects (and the NSError out-parameter): drain them here, not
+        // when this (long-lived) thread exits.
+        autoreleasepool(|_| Self::open_inner(camera, spec))
+    }
+
+    fn open_inner(camera: &HostCamera, _spec: FrameSpec) -> Result<Webcam> {
         let api = api()?;
         let unique_id = NSString::from_str(&camera.id);
         // SAFETY: `+deviceWithUniqueID:` takes an NSString and returns a device or nil.
@@ -466,6 +489,10 @@ impl Webcam {
 
     /// Why frames aren't arriving: the permission, a disconnected camera, or neither.
     fn stalled(&self) -> Error {
+        autoreleasepool(|_| self.stalled_inner())
+    }
+
+    fn stalled_inner(&self) -> Error {
         if let Ok(status) = authorization_status()
             && let Some(fix) = status.fix()
         {
