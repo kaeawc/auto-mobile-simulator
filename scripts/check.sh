@@ -31,6 +31,14 @@ if [[ $mode == changed && -n $changed ]] && ! command grep -qvE '\.md$|^docs/|\.
   exit 0
 fi
 
+# Without zip and unzip, emu-sdk's installer tests print SKIP and return instead of running.
+if [[ $(uname -s) == Linux ]]; then
+  missing=$(for t in zip unzip; do command -v "$t" >/dev/null 2>&1 || printf '%s ' "$t"; done)
+  if [[ -n $missing ]]; then
+    echo "check: warning: ${missing}missing (apt-get install zip unzip): emu-sdk's installs_renderer_from_a_local_archive and installs_system_images_with_sparse_disks will SKIP, and CI runs them" >&2
+  fi
+fi
+
 total=$(date +%s)
 step() {
   local name=$1; shift
