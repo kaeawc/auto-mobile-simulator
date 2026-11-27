@@ -47,6 +47,8 @@ impl Telephony {
     /// The guest's radio opened `qemud:gsm` (API 30 and older): unsolicited bytes go there from
     /// now on. The modem keeps its state, as it does when the console port is reopened.
     pub fn attach_pipe(&self, ctx: PipeCtx) {
+        // Only the legacy reference RIL opens the pipe; it reads the stock modem's answers.
+        self.with(|m| m.set_reference_ril(true));
         *self.port.lock().unwrap_or_else(|e| e.into_inner()) = Some(Out::Pipe(ctx));
     }
 

@@ -71,6 +71,21 @@
 //!
 //! SIM (`RadioSim.cpp`): `+CPIN: READY`, raw `AT+CICCID` and `AT+CIMI` values, `AT+CGSN=2` ->
 //! raw 15-digit IMEI followed by a 2-digit SVN; file access is in [`sim`].
+//!
+//! # The reference RIL (API 30 and older)
+//!
+//! Older images run `rild` with the goldfish `libreference-ril`, which opens `qemud:gsm` and
+//! polls (`AT+CREG?`, `AT+CGREG?`, `AT+CTEC?`) where the HAL waits for unsolicited codes. It reads
+//! the stock modem's answers, which differ from what the HAL is given here
+//! ([`Modem::set_reference_ril`]; captured from a stock 37.2.13 emulator's radio log, API 30):
+//! - `AT+CREG?` -> `+CREG: 2,1,"0003","005b"`: no `<AcT>`. The RIL hands a fifth field to the
+//!   framework as an Android radio technology, so TS 27.007's E-UTRAN `7` read as `EVDO_0`, the
+//!   phone switched to CDMA, `VOICE_RADIO_TECH` (GPRS) switched it back, and the loop kept
+//!   `com.android.phone` and `system_server` at 150% of a host core (#83).
+//! - `AT+CGREG?`/`AT+CEREG?` -> `+CGREG: <n>,<stat>,"<lac>","<ci>","<tech hex>"` whatever `<n>`,
+//!   the last field an Android radio technology (LTE = `000e`).
+//! - `AT+CTEC?` -> `+CTEC: <index>,<preferred hex>` and `AT+CTEC=<index>,"<preferred hex>"` ->
+//!   `+CTEC: DONE` (or `+CTEC: <index>` when it changes): indices, not bit masks.
 pub mod calls;
 pub mod pdu;
 pub mod sim;
@@ -293,6 +308,9 @@ pub struct Modem {
     tz_dst: bool,
     tz_name: String,
     clock: fn() -> u64,
+
+    /// The guest is the legacy reference RIL (see the module docs), not the radio HAL.
+    reference_ril: bool,
 }
 
 fn system_clock() -> u64 {
@@ -358,6 +376,7 @@ impl Modem {
             tz_dst: false,
             tz_name: String::new(),
             clock: system_clock,
+            reference_ril: false,
         }
     }
 
@@ -413,6 +432,12 @@ impl Modem {
 
     pub fn radio_on(&self) -> bool {
         self.radio_on
+    }
+
+    /// Answers queries the way the stock modem answers the legacy reference RIL (`qemud:gsm`,
+    /// API 30 and older) rather than the radio HAL; see the module docs.
+    pub fn set_reference_ril(&mut self, on: bool) {
+        self.reference_ril = on;
     }
 
     // ---- host controls -------------------------------------------------------------------
@@ -625,6 +650,27 @@ impl Modem {
         }
     }
 
+    /// A registration query's answer in the stock modem's format, for the reference RIL.
+    fn ril_reg_line(&self, name: &str, n: u8, state: RegState) -> String {
+        let stat = if self.radio_on { state as u8 } else { 0 };
+        let loc = format!("\"{:04X}\",\"{:08X}\"", self.lac, self.cell_id);
+        match name {
+            "CREG" if n == 2 => format!("+CREG: {n},{stat},{loc}"),
+            "CREG" => format!("+CREG: {n},{stat}"),
+            _ => format!("+{name}: {n},{stat},{loc},\"{:04x}\"", self.ril_radio_tech()),
+        }
+    }
+
+    /// The Android radio technology (`RIL_RadioTechnology`) of the current technology.
+    fn ril_radio_tech(&self) -> u8 {
+        match self.tech {
+            TECH_GSM => 1,   // GPRS
+            TECH_WCDMA => 3, // UMTS
+            TECH_NR => 20,
+            _ => 14, // LTE
+        }
+    }
+
     fn csq_line(&self) -> String {
         let known = self.radio_on && self.rssi != 99;
         let (rssi, ber) = if self.radio_on { (self.rssi, self.ber) } else { (99, 99) };
@@ -761,6 +807,9 @@ impl Modem {
                 }
                 if query {
                     let n = *n;
+                    if self.reference_ril {
+                        return line(self.ril_reg_line(short, n, state));
+                    }
                     return line(self.reg_line(short, n, state, true));
                 }
                 *n = int(0).unwrap_or(0).clamp(0, 2) as u8;
@@ -1023,6 +1072,9 @@ impl Modem {
         if test {
             return line(format!("+CTEC: {SUPPORTED_TECHS}"));
         }
+        if self.reference_ril {
+            return self.ril_ctec(query, args);
+        }
         if query {
             return line(format!("+CTEC: {},{:X}", 1u32 << self.tech, self.preferred_techs));
         }
@@ -1042,6 +1094,26 @@ impl Modem {
         }
         self.tech = tech;
         line(format!("+CTEC: {}", 1u32 << tech))
+    }
+
+    /// `AT+CTEC` as the reference RIL speaks it: technology indices, not bit masks.
+    fn ril_ctec(&mut self, query: bool, args: Option<&str>) -> Res {
+        if query {
+            return line(format!("+CTEC: {},{:x}", self.tech, self.preferred_techs));
+        }
+        let mut fields = args.unwrap_or("").split(',');
+        let tech: u8 = fields.next().and_then(|f| f.trim().parse().ok()).ok_or(Fail::Cme(CME_BAD_PARAMS))?;
+        if !SUPPORTED_TECHS.split(',').any(|t| t == tech.to_string()) {
+            return Err(Fail::Cme(CME_BAD_PARAMS));
+        }
+        if let Some(mask) = fields.next().and_then(|f| u32::from_str_radix(f.trim().trim_matches('"'), 16).ok()) {
+            self.preferred_techs = mask;
+        }
+        if tech == self.tech {
+            return line("+CTEC: DONE");
+        }
+        self.tech = tech;
+        line(format!("+CTEC: {tech}"))
     }
 
     fn cops(&mut self, query: bool, test: bool, args: Option<&str>) -> Res {

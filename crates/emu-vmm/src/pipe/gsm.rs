@@ -87,6 +87,48 @@ mod tests {
         assert!(rx.try_iter().next().is_none(), "nothing sent after the close");
     }
 
+    /// `parseRegistrationState` in the reference RIL: the fields after the prefix, by comma
+    /// count, with quotes stripped; a fifth field (`<n>,<stat>,<lac>,<ci>,<x>`) is what the RIL
+    /// reports to the framework as the Android radio technology.
+    fn ril_registration(reply: &str, prefix: &str) -> (Vec<String>, Option<u32>) {
+        let l = reply.split('\r').find(|l| l.starts_with(prefix)).unwrap_or_else(|| panic!("no {prefix} in {reply:?}"));
+        let fields: Vec<String> = l[prefix.len()..].split(',').map(|f| f.trim().trim_matches('"').to_string()).collect();
+        assert!((1..=5).contains(&fields.len()), "the RIL rejects {l:?}");
+        let rat = (fields.len() == 5).then(|| u32::from_str_radix(&fields[4], 16).expect("hex technology"));
+        (fields, rat)
+    }
+
+    /// The reference RIL's polls, as a stock modem answers them (#83: emu's `+CREG` `<AcT>` 7
+    /// read as `EVDO_0` and flipped the phone between GSM and CDMA several times a second).
+    #[test]
+    fn the_reference_ril_gets_the_stock_modems_answers() {
+        let t = Arc::new(Telephony::default());
+        let svc = GsmService { telephony: t };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut p = svc.open("qemud:gsm", PipeCtx { conn: 1, events: tx }).expect("open");
+        // The reference RIL's init (stock radio log, API 30).
+        for at in ["ATE0Q0V1", "AT+CMEE=1", "AT+CREG=2", "AT+CGREG=1", "AT+CMGF=0", "AT+CFUN=1"] {
+            assert!(reply(&mut p, &format!("{at}\r")).contains("OK"), "{at}");
+        }
+        // Voice: no technology field, so the RIL never reports a CDMA one.
+        let (voice, rat) = ril_registration(&reply(&mut p, "AT+CREG?\r"), "+CREG: ");
+        assert_eq!(&voice[..2], ["2", "1"], "registered home");
+        assert_eq!(rat, None, "{voice:?}");
+        // Data: always the full form, with the Android radio technology (LTE = 14).
+        for (at, prefix) in [("AT+CGREG?\r", "+CGREG: "), ("AT+CEREG?\r", "+CEREG: ")] {
+            let (data, rat) = ril_registration(&reply(&mut p, at), prefix);
+            assert_eq!(data[1], "1", "registered home: {data:?}");
+            assert_eq!(rat, Some(14), "{data:?}");
+        }
+        // Technology: an index (LTE = 5) and a hex preferred mask; setting the current one is DONE.
+        assert!(reply(&mut p, "AT+CTEC?\r").starts_with("+CTEC: 5,"));
+        assert!(reply(&mut p, "AT+CTEC=5,\"23\"\r").starts_with("+CTEC: DONE"));
+        assert!(reply(&mut p, "AT+CTEC=0,\"201\"\r").starts_with("+CTEC: 0\r"));
+        assert!(reply(&mut p, "AT+CTEC?\r").starts_with("+CTEC: 0,201"));
+        let (_, rat) = ril_registration(&reply(&mut p, "AT+CGREG?\r"), "+CGREG: ");
+        assert_eq!(rat, Some(1), "GSM data is GPRS");
+    }
+
     #[test]
     fn a_stale_close_keeps_the_newer_pipe() {
         let t = Arc::new(Telephony::default());
