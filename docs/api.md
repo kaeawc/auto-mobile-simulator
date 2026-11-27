@@ -139,6 +139,12 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `clear_container` | iOS | device, path | Empty a container (an app's data) without deleting it |
 | `defaults_read` | iOS | device, domain | Read a preferences domain |
 | `defaults_write` | iOS | device, domain, key, value, type? | Write a preference (type: string\|int\|float\|bool) |
+| `prefs_stores` | Android, iOS | device, app | An app's preference stores, each with the id the other prefs_* methods take: Android `shared_prefs/<name>.xml` and DataStore `datastore/<name>.preferences_pb`, iOS the app's domain (its bundle id) and its app-group suites; any other iOS domain is reachable by its name |
+| `prefs_read` | Android, iOS | device, app, store? | Every key of an app's preference stores (or one) with its typed value, {type, value}: string, int, long, float, double, bool, string_set (Android), date (ISO 8601), data (base64), array and dictionary (iOS; of typed values) |
+| `prefs_write` | Android, iOS | device, app, store, key, value, type(string\|int\|long\|float\|double\|bool\|string_set\|date\|data\|array\|dictionary) | Set one key to a typed value (refused when the value isn't of its type or the store can't hold the type); visible says whether the running app sees it now or after_relaunch, with a note on why |
+| `prefs_delete` | Android, iOS | device, app, store, key | Remove one key; visible as prefs_write's |
+| `prefs_batch` | Android, iOS | device, app, store, ops([{key, type, value} \| {key, delete: true}]) | Set and remove several keys of one store, all or nothing: every op is checked first (each key once), then the store is written once or not at all |
+| `prefs_watch` | Android, iOS | device, app, store?, cursor?, wait_ms? | Changes to an app's preference stores (or one), as `logs` stream does: the first call starts a feed in this process and returns a cursor; a call with it returns the changes since, {store, key, old, new, at}, oldest first, waiting up to wait_ms (at most 60000) for one, and the next cursor (reset: the feed restarted, re-read; missed: changes dropped unread; ended: the device stopped). A feed nobody reads for 5 minutes stops |
 | `crash_reports` | iOS | device | Host crash reports for this device |
 | `info` | Android, iOS | device | Paths and identity |
 | `network_shape` | iOS | device, preset?(offline\|3g\|edge\|lte\|lossy\|very-bad\|none), offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?, port_base?, port_count?, rules?([{pattern, offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?}]), proxy?(default true), inject?(false\|true\|"launchd"\|"boot") | Shape the device's network without root. proxy: a shaping HTTP/SOCKS proxy set in the device's configd_sim. inject: an in-process socket shaper; "boot" reboots the device with it in launchd's environment so every process, WebKit included, is shaped live by the profile |
@@ -164,3 +170,81 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `remote_swipe` | iOS | device, direction(up\|down\|left\|right), duration_ms? | Swipe on the Siri Remote's touch surface (Apple TV) |
 | `pointer` | iOS | device, x, y, action?(move\|click\|down\|up), button?(primary\|secondary), hold_ms? \| x, y, to_x, to_y, button? (a drag) | The iPad's pointer (a mouse, as Simulator.app's pointer capture connects): move it to pixels and hover there, click, press or release a button there, or drag to to_x, to_y. Exact on iOS 26.5, within ~20 pt on 27.2. A button held by `down` keeps the pointer's place for the next calls on a server (`simee serve`) until a reboot. Refused: `down` without a server (the process ends with the call: use `click` or a drag), `up` with nothing held, and `move`/`up` after a failed call lost the held button (`click`, `down` or a drag lets go and starts over) |
 | `carplay` | iOS | device, on | Attach (or detach) the CarPlay display to a booted iPhone (iOS 26 runtimes); then tap/swipe/screenshot with display=carplay |
+
+## App preferences (`prefs_*`)
+
+One typed API over Android SharedPreferences and DataStore preferences and iOS user defaults,
+with no SDK in the app (`crates/sim-api/src/prefs.rs`). The iOS and Android backends are still
+being written: until a platform's lands, every `prefs_*` call on its devices checks its parameters
+and then fails with "app preferences (`prefs_*`) are not yet available on <platform> devices".
+`defaults_read` and `defaults_write` are unchanged.
+
+**Stores.** `prefs_stores {device, app}` lists the app's stores as
+`{id, kind, name, app, platform}`; the other methods name a store by its `id`:
+
+| kind | Platform | id | Holds |
+| --- | --- | --- | --- |
+| `shared_preferences` | Android | `shared_prefs/<name>.xml` | string, int, long, float, bool, string_set |
+| `datastore` | Android | `datastore/<name>.preferences_pb` | string, int, long, float, double, bool, string_set |
+| `app_domain` | iOS | the bundle id | string, int, long, float, double, bool, date, data, array, dictionary |
+| `app_group` | iOS | the suite, `group.…` | as `app_domain` |
+| `domain` | iOS | any other domain name | as `app_domain` |
+
+**Values.** Every value travels with its type, `{"type": <type>, "value": <value>}`, so an `int`
+comes back an `int` and a `long` a `long`:
+
+```text
+{"type": "string", "value": "Ada"}
+{"type": "int", "value": 3}                       32-bit
+{"type": "long", "value": 9007199254740993}       64-bit
+{"type": "float", "value": 0.1}                   32-bit; also "NaN", "Infinity", "-Infinity"
+{"type": "double", "value": 2.5}                  64-bit; the same three strings
+{"type": "bool", "value": true}
+{"type": "string_set", "value": ["a", "b"]}       sorted, each string once
+{"type": "date", "value": "2026-11-27T10:00:00.25Z"}   ISO 8601 in (any offset), UTC out, to the nanosecond
+{"type": "data", "value": "AAEC"}                 standard base64
+{"type": "array", "value": [{"type": "int", "value": 1}]}
+{"type": "dictionary", "value": {"k": {"type": "bool", "value": true}}}
+```
+
+An array's elements and a dictionary's values are typed values too, nested to any depth.
+`prefs_read {device, app, store?}` answers `[{store, values: {<key>: <typed value>}}]`, one entry
+per store (every store of the app without `store`).
+
+**Writes.** `prefs_write {device, app, store, key, type, value}` and `prefs_delete {device, app,
+store, key}` answer `{store, key, visible, note?}`. A write is refused before anything is written
+when the value isn't exactly of its type (a fraction for an `int`, a number past its range, a
+string for a `bool`, an untyped array element) or the store can't hold the type (a `double` in
+SharedPreferences, a `string_set` on iOS); errors name the value (`value[2].value`, `ops[1].value`).
+`visible` is `now` when the running app sees the write at once, or `after_relaunch` when it sees it
+only once relaunched, with `note` saying why: a platform that can't reach a running app's copy
+says so instead of failing silently.
+
+**Batches.** `prefs_batch {device, app, store, ops}` takes `{key, type, value}` sets and
+`{key, delete: true}` deletes and is all or nothing: every op is checked first (each key at most
+once), and the backend then writes the store once with all of them, or fails with none applied.
+It answers `{store, keys, visible, note?}`.
+
+**Watching.** `prefs_watch {device, app, store?, cursor?, wait_ms?}` works like `logs`' `stream`:
+the first call (no `cursor`) starts a feed of the app's stores (or one) in the process that answers
+(a `simee serve` keeps it between commands) and returns `{cursor, events: []}`. A call with that
+cursor returns the changes since, oldest first, and the next cursor:
+
+```text
+→ {"method": "prefs_watch", "params": {"device": "pixel", "app": "com.example", "cursor": "3:0", "wait_ms": 30000}}
+← {"id":null,"ok":true,"result":{"cursor":"3:2","events":[
+    {"store":"shared_prefs/com.example_preferences.xml","key":"launches","old":{"type":"int","value":3},"new":{"type":"int","value":4},"at":"2026-11-27T10:00:01Z"},
+    {"store":"shared_prefs/com.example_preferences.xml","key":"token","old":{"type":"string","value":"x"},"new":null,"at":"2026-11-27T10:00:02Z"}]}}
+```
+
+- `old` is `null` for a key that was added, `new` for one that was removed; a write that changes
+  nothing reports nothing. Changes come from whoever made them: the app, these methods, another
+  tool.
+- With nothing new, the call waits up to `wait_ms` (at most 60000) for a change.
+- `missed: <n>`: the feed keeps the latest 4096 changes, and `n` older ones went unread.
+- `reset: true`: the cursor is from a feed that has stopped; the new cursor starts now, and changes
+  in between may be lost, so read the store again.
+- `ended: true`: the device stopped; the next call starts a new feed.
+- A feed nobody reads for 5 minutes stops.
+- To follow a store from a known state: `prefs_watch` first, then `prefs_read`, then poll with the
+  cursor; a change made during the read is in the feed.

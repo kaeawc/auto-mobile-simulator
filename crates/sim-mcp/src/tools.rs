@@ -38,6 +38,8 @@ enum Effect {
 fn effect(method: &str) -> Option<Effect> {
     use Effect::*;
     Some(match method {
+        "prefs_stores" | "prefs_read" | "prefs_watch" => Read,
+        "prefs_write" | "prefs_delete" | "prefs_batch" => Destroy,
         "help" | "identity" | "form_factors" | "devices" | "runtimes" | "device_types" | "screen" | "screenshot" | "apps"
         | "ca_debug_state" | "logs" | "processes" | "connections" | "traffic" | "containers" | "ls" | "read" | "du" | "crash_reports"
         | "info" | "defaults_read" | "network_state" | "network_flows" | "network_env" | "audio_state" | "settle" | VIEW_TOOL => Read,
