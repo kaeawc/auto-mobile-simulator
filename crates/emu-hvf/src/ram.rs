@@ -1,6 +1,6 @@
 //! Guest RAM addressed by guest physical address: an anonymous host mapping, or a shared one of
 //! another process's memory fd (a vhost-user frontend's guest RAM, [`GuestRam::map_shared`]).
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::{Error, Result};
 
@@ -55,7 +55,8 @@ impl HostRange {
 /// accessors here, exactly like DMA on real hardware. Accessors copy bytes in and out and never
 /// hand out references into the mapping, so a racing guest can only produce stale or torn
 /// *values* — which virtio devices must already tolerate — never undefined behaviour in safe
-/// callers.
+/// callers. The integer accessors ([`GuestRam::read_u16`] and friends) are never torn at an
+/// aligned address: each is one atomic access there.
 pub struct GuestRam {
     ptr: *mut u8,
     len: u64,
@@ -400,29 +401,68 @@ impl GuestRam {
         Ok(())
     }
 
+    /// The host address of an aligned `T` at guest `addr`, or `None` when the host address isn't
+    /// aligned for it (the caller copies bytes instead).
+    fn aligned<T>(&self, addr: u64) -> std::result::Result<Option<*mut T>, MemError> {
+        let off = self.offset(addr, size_of::<T>())?;
+        // SAFETY: `off + size_of::<T>()` is within the mapping (checked above).
+        let p = unsafe { self.ptr.add(off) }.cast::<T>();
+        Ok(p.is_aligned().then_some(p))
+    }
+
+    // The integer accessors are single accesses where the address is aligned: virtqueue
+    // indices, flags and event words are published by one side while the other polls them, and
+    // a byte-wise copy (what `read`/`write` do for a length known only at run time) lets a
+    // reader see half of each value: `used.idx` going 0x01ff -> 0x0200 read as 0x0100. Relaxed
+    // atomics are single-copy atomic, and they're what the queues' fences order. Unaligned
+    // addresses keep the byte copy.
+
     pub fn read_u16(&self, addr: u64) -> std::result::Result<u16, MemError> {
+        if let Some(p) = self.aligned::<u16>(addr)? {
+            // SAFETY: `p` is aligned and in the mapping, which lives as long as `self`; other
+            // accesses to it are the guest's or these accessors' (see the type docs).
+            return Ok(u16::from_le(unsafe { AtomicU16::from_ptr(p) }.load(Ordering::Relaxed)));
+        }
         let mut b = [0; 2];
         self.read(addr, &mut b)?;
         Ok(u16::from_le_bytes(b))
     }
 
     pub fn read_u32(&self, addr: u64) -> std::result::Result<u32, MemError> {
+        if let Some(p) = self.aligned::<u32>(addr)? {
+            // SAFETY: as in `read_u16`.
+            return Ok(u32::from_le(unsafe { AtomicU32::from_ptr(p) }.load(Ordering::Relaxed)));
+        }
         let mut b = [0; 4];
         self.read(addr, &mut b)?;
         Ok(u32::from_le_bytes(b))
     }
 
     pub fn read_u64(&self, addr: u64) -> std::result::Result<u64, MemError> {
+        if let Some(p) = self.aligned::<u64>(addr)? {
+            // SAFETY: as in `read_u16`.
+            return Ok(u64::from_le(unsafe { AtomicU64::from_ptr(p) }.load(Ordering::Relaxed)));
+        }
         let mut b = [0; 8];
         self.read(addr, &mut b)?;
         Ok(u64::from_le_bytes(b))
     }
 
     pub fn write_u16(&self, addr: u64, v: u16) -> std::result::Result<(), MemError> {
+        if let Some(p) = self.aligned::<u16>(addr)? {
+            // SAFETY: as in `read_u16`.
+            unsafe { AtomicU16::from_ptr(p) }.store(v.to_le(), Ordering::Relaxed);
+            return Ok(());
+        }
         self.write(addr, &v.to_le_bytes())
     }
 
     pub fn write_u32(&self, addr: u64, v: u32) -> std::result::Result<(), MemError> {
+        if let Some(p) = self.aligned::<u32>(addr)? {
+            // SAFETY: as in `read_u16`.
+            unsafe { AtomicU32::from_ptr(p) }.store(v.to_le(), Ordering::Relaxed);
+            return Ok(());
+        }
         self.write(addr, &v.to_le_bytes())
     }
 }
@@ -680,5 +720,87 @@ mod tests {
         assert!(ram.read_u32(0x3fff_fffe).is_err(), "below base");
         assert!(ram.read_u32(0x4000_7ffe).is_err(), "straddles the end");
         assert!(ram.write(u64::MAX, &[0]).is_err(), "overflow");
+    }
+
+    #[test]
+    fn unaligned_integers_round_trip_little_endian() {
+        let ram = GuestRam::new(0x4000_0000, 0x8000).expect("alloc");
+        ram.write_u16(0x4000_0101, 0xbeef).expect("u16");
+        ram.write_u32(0x4000_0203, 0xdead_beef).expect("u32");
+        ram.write(0x4000_0305, &0x0102_0304_0506_0708u64.to_le_bytes()).expect("u64");
+        let mut b = [0u8; 2];
+        ram.read(0x4000_0101, &mut b).expect("bytes");
+        assert_eq!(b, [0xef, 0xbe], "little-endian in guest memory");
+        assert_eq!(ram.read_u16(0x4000_0101), Ok(0xbeef));
+        assert_eq!(ram.read_u32(0x4000_0203), Ok(0xdead_beef));
+        assert_eq!(ram.read_u64(0x4000_0305), Ok(0x0102_0304_0506_0708));
+        ram.write_u32(0x4000_0400, 0x0403_0201).expect("aligned u32");
+        assert_eq!(ram.read_u16(0x4000_0402), Ok(0x0403), "aligned writes are little-endian too");
+        assert!(ram.write_u16(0x4000_7fff, 0).is_err(), "straddles the end");
+        assert!(ram.read_u64(0x4000_7ffc).is_err(), "straddles the end");
+    }
+
+    /// A writer thread flips an aligned integer between two values that differ in every byte
+    /// lane a carry crosses (as a virtqueue index does going 0x01ff -> 0x0200) while this thread
+    /// reads it: every read is one of the two, never half of each.
+    fn never_torn<T: Copy + PartialEq + std::fmt::Debug + Send + 'static>(
+        a: T,
+        b: T,
+        write: fn(&GuestRam, u64, T),
+        read: fn(&GuestRam, u64) -> T,
+    ) {
+        const AT: u64 = 0x4000_0008;
+        let ram = std::sync::Arc::new(GuestRam::new(0x4000_0000, 0x8000).expect("alloc"));
+        write(&ram, AT, a);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (ram, stop) = (ram.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    write(&ram, AT, b);
+                    write(&ram, AT, a);
+                }
+            })
+        };
+        let start = std::time::Instant::now();
+        let mut torn = None;
+        for _ in 0..2_000_000 {
+            let v = read(&ram, AT);
+            if v != a && v != b {
+                torn = Some(v);
+                break;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(2) {
+                break;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().expect("writer");
+        assert_eq!(torn, None, "read half of {a:x?} and half of {b:x?}");
+    }
+
+    #[test]
+    fn aligned_u16_reads_and_writes_are_never_torn() {
+        never_torn(0x01ffu16, 0x0200, |r, at, v| r.write_u16(at, v).expect("w"), |r, at| r.read_u16(at).expect("r"));
+    }
+
+    #[test]
+    fn aligned_u32_reads_and_writes_are_never_torn() {
+        never_torn(0x00ff_ffffu32, 0x0100_0000, |r, at, v| r.write_u32(at, v).expect("w"), |r, at| r.read_u32(at).expect("r"));
+    }
+
+    #[test]
+    fn aligned_u64_reads_are_never_torn() {
+        // No `write_u64`: the writer stores whole words as an atomic would (a guest vCPU's `str`).
+        never_torn(
+            0x0000_0000_ffff_ffffu64,
+            0x0000_0001_0000_0000,
+            |r, at, v| {
+                let p = r.host_range(at, 8).expect("range").as_ptr().cast::<u64>();
+                // SAFETY: `p` is 8-byte aligned (`AT`, a page-aligned mapping) and in the mapping.
+                unsafe { std::sync::atomic::AtomicU64::from_ptr(p) }.store(v.to_le(), std::sync::atomic::Ordering::Relaxed);
+            },
+            |r, at| r.read_u64(at).expect("r"),
+        );
     }
 }

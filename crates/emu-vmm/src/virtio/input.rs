@@ -1649,7 +1649,12 @@ mod tests {
                 break;
             }
             finished = finished || senders.iter().all(|s| s.is_finished());
-            assert!(start.elapsed() < std::time::Duration::from_secs(20), "stalled with {} events", got.len());
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(20),
+                "stalled with {} events, about 2000 expected ({keys} of {} keys; senders done: {finished})",
+                got.len(),
+                THREADS as usize * KEYS as usize,
+            );
             std::thread::yield_now();
         }
         for s in senders {
