@@ -696,6 +696,33 @@ pub fn selection_infos(s: &mut Session) -> Result<Vec<sim_core::device::DeviceIn
     s.ctx()?.selection_infos().map_err(err)
 }
 
+/// A simulator as the camera links (`crate::camera`, #323) see it.
+fn camera_target(d: &Device) -> crate::camera::IosTarget {
+    let info = d.info();
+    crate::camera::IosTarget {
+        udid: info.udid,
+        name: info.name,
+        data_dir: std::path::PathBuf::from(d.data_path()),
+        booted: d.state() == DeviceState::Booted,
+    }
+}
+
+/// The simulator `query` names, for the camera links.
+pub(crate) fn camera_device(s: &mut Session, query: &str) -> Result<crate::camera::IosTarget, String> {
+    s.ctx()?.device(query).map(|d| camera_target(&d)).map_err(err)
+}
+
+/// Every simulator, for `camera_links` without a device.
+pub(crate) fn camera_devices(s: &mut Session) -> Result<Vec<crate::camera::IosTarget>, String> {
+    Ok(s.ctx()?.devices().map_err(err)?.iter().map(camera_target).collect())
+}
+
+/// Runs the device's own `launchctl` (the runtime's, see AGENTS.md): its stdout and stderr.
+pub(crate) fn camera_launchctl(s: &mut Session, udid: &str, args: &[String]) -> Result<(String, String), String> {
+    let out = s.ctx()?.device(udid).map_err(err)?.exec("launchctl", args, &[]).map_err(err)?;
+    Ok((out.stdout, out.stderr))
+}
+
 /// Runs an input method on its device's worker.
 fn input(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     let udid = s.udid(p)?;
@@ -1684,6 +1711,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let d = s.device(p)?;
             let udid = d.info().udid;
             s.ctx()?.delete(&d).map_err(err)?;
+            crate::camera::ios_stopped(&udid);
             // The service leaves launchd_sim's directory (its log, ~1-3 MB, and the disables)
             // behind, and the one it wrote a boot's `disabled_jobs` to (launchd's own on iOS
             // 18.0); both are keyed by the UDID, so nothing reads them again.
@@ -1700,6 +1728,8 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let d = s.device(p)?;
             let plan = boot_plan(p, 1, false, || build_shapers(&[d.info().runtime_id]))?;
             let timed = boot_device(&d, &plan)?;
+            // The device's saved camera links (#323): its feed and the device-wide injection.
+            crate::camera::ios_booted(s, &d.info().udid);
             // Without settle or a profile, `boot` answers as it always has.
             Ok(if plan.settle.is_some() || plan.profile.is_some() { timed } else { Value::Null })
         }
@@ -1757,8 +1787,13 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let d = s.ctx()?.clone_device(&template, need_str(p, "name")?).map_err(err)?;
             serde_json::to_value(d.info()).map_err(err)
         }
-        "shutdown" => ok(s.device(p)?.shutdown()),
-        "erase" => ok(s.device(p)?.erase()),
+        // A device that stops (or is erased, which removes its socket) takes its camera feed with it.
+        "shutdown" | "erase" => {
+            let d = s.device(p)?;
+            ok(if method == "shutdown" { d.shutdown() } else { d.erase() })?;
+            crate::camera::ios_stopped(&d.info().udid);
+            Ok(Value::Null)
+        }
         "screen" => {
             let (w, h) = screen_size(s, p)?;
             Ok(json!({"width": w, "height": h}))

@@ -8,6 +8,19 @@
 //! restart. A running Android device is relinked live through emu's console (`camera link`).
 //! Capture runs in emu, which shows the test card while a linked camera is unplugged; here a
 //! webcam link whose camera the host no longer lists reports `source missing`.
+//!
+//! iOS ([`ios_link`]): the same file under the simulator's data directory
+//! (`<data>/simee/cameras.ini`). A booted simulator's camera is an `ios_feed::Feed` this process
+//! serves on `<data>/cam.sock`, one per device (the shim's back and front cameras read that one
+//! socket, so a link sets both), and the shim is injected device-wide with `launchctl setenv` in
+//! the device. The feed lives as long as this process, so only a server (`simee serve`) links a
+//! booted simulator; any other process hands the call to a running server or says it needs one.
+//! A boot through simee reapplies the saved link ([`ios_booted`]); a shutdown, erase or delete
+//! stops the feed ([`ios_stopped`]).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use serde_json::{Value, json};
 use sim_android::{CAMERA_FACINGS, Device, saved_cameras, update_cameras};
@@ -24,10 +37,6 @@ pub const METHODS: &[&str] = &["camera_sources", "camera_link", "camera_unlink",
 pub fn is_method(method: &str) -> bool {
     METHODS.contains(&method)
 }
-
-// TODO(#322): link iOS device cameras once the iOS camera feed lands.
-const IOS_UNSUPPORTED: &str = "camera links on iOS devices come with the iOS camera feed (#322), not yet; \
-     Android devices link through emu's camera HAL";
 
 /// Where the host's cameras and its camera permission come from: the host, or a fake in tests.
 pub trait Host: Send {
@@ -66,16 +75,20 @@ impl Host for Fixed {
     }
 }
 
-/// The camera host a connection reads, made on first use.
+/// The camera host a connection reads, made on first use; in tests, fakes of the iOS side too.
 #[derive(Default)]
 pub struct Session {
     host: Option<Box<dyn Host>>,
+    /// The simulators and their launchctl (none: the iOS backend's).
+    ios: Option<Box<dyn IosHost>>,
+    /// The feeds, the shim, the server, and whether this process serves (none: this process's).
+    env: Option<Env>,
 }
 
 impl Session {
     #[cfg(test)]
     pub fn with(host: impl Host + 'static) -> Session {
-        Session { host: Some(Box::new(host)) }
+        Session { host: Some(Box::new(host)), ..Session::default() }
     }
 
     /// A session whose host has these cameras, (id, name, virtual) each, and whose camera
@@ -96,7 +109,7 @@ impl Session {
             })
             .collect();
         let permission = if authorized { Authorization::Authorized } else { Authorization::Denied };
-        Session { host: Some(Box::new(Fixed { cameras, permission })) }
+        Session { host: Some(Box::new(Fixed { cameras, permission })), ..Session::default() }
     }
 
     fn host(&mut self) -> &dyn Host {
@@ -116,51 +129,67 @@ pub fn call(s: &mut Calls, method: &str, p: &Value) -> Result<Value, String> {
                     let d = android.device(&info.udid)?;
                     rows.extend(link_rows(s.camera.host(), &d));
                 }
+                // Simulators too, where the host has them (none on a host without the service).
+                rows.extend(with_ios(s, |host, ios, env| {
+                    Ok(ios.targets().unwrap_or_default().iter().flat_map(|t| ios_rows(host, env, t)).collect::<Vec<_>>())
+                })?);
                 Ok(Value::Array(rows))
             }
-            Some(_) => {
-                let d = android_device(s, p)?;
-                Ok(Value::Array(link_rows(s.camera.host(), &d)))
-            }
+            Some(_) => match target(s, p)? {
+                Target::Android(d) => Ok(Value::Array(link_rows(s.camera.host(), &d))),
+                Target::Ios(q) => with_ios(s, |host, ios, env| Ok(Value::Array(ios_rows(host, env, &ios.target(&q)?)))),
+            },
         },
         "camera_link" => {
             let facings = facings(Some(need_str(p, "facing")?))?;
             let source = need_str(p, "source")?;
-            let d = android_device(s, p)?;
-            link(s.camera.host(), &d, &facings, source)
+            match target(s, p)? {
+                Target::Android(d) => link(s.camera.host(), &d, &facings, source),
+                Target::Ios(q) => with_ios(s, |host, ios, env| ios_link(host, ios, env, &q, &facings, source, p)),
+            }
         }
         "camera_unlink" => {
             let facings = facings(str_param(p, "facing"))?;
-            let d = android_device(s, p)?;
-            unlink(s.camera.host(), &d, &facings)
+            match target(s, p)? {
+                Target::Android(d) => unlink(s.camera.host(), &d, &facings),
+                Target::Ios(q) => with_ios(s, |_, ios, env| ios_unlink(ios, env, &q, &facings, p)),
+            }
         }
         other => Err(format!("unknown camera method `{other}`")),
     }
 }
 
 /// `boot`'s `camera_back` / `camera_front`: linked (and saved) before the boot, so the boot
-/// passes them to emu. Nothing when neither is given.
+/// passes them to emu (Android) or reapplies them ([`ios_booted`]). Nothing when neither is given.
 pub fn before_boot(s: &mut Calls, p: &Value) -> Result<(), String> {
     let asked: Vec<(&str, &str)> =
         [("back", "camera_back"), ("front", "camera_front")].into_iter().filter_map(|(f, k)| Some((f, str_param(p, k)?))).collect();
     if asked.is_empty() {
         return Ok(());
     }
-    let d = android_device(s, p)?;
-    for (facing, source) in asked {
-        link(s.camera.host(), &d, &[facing], source)?;
+    match target(s, p)? {
+        Target::Android(d) => {
+            for (facing, source) in asked {
+                link(s.camera.host(), &d, &[facing], source)?;
+            }
+            Ok(())
+        }
+        Target::Ios(q) => with_ios(s, |host, ios, env| ios_before_boot(host, ios, env, &q, &asked)),
     }
-    Ok(())
 }
 
-/// The Android device a call names; an iOS one is refused (#322).
-fn android_device(s: &mut Calls, p: &Value) -> Result<Device, String> {
+/// The device a call names: an Android device, or a simulator's query for the iOS side.
+enum Target {
+    Android(Box<Device>),
+    Ios(String),
+}
+
+fn target(s: &mut Calls, p: &Value) -> Result<Target, String> {
     let (platform, udid) = crate::methods::resolve(s, p)?;
-    if platform == Platform::Ios {
-        crate::methods::ios_device_exists(s, platform, str_param(p, "device").unwrap_or("booted"))?;
-        return Err(IOS_UNSUPPORTED.into());
+    match platform {
+        Platform::Ios => Ok(Target::Ios(udid)),
+        Platform::Android => s.android.backend().device(&udid).map(|d| Target::Android(Box::new(d))),
     }
-    s.android.backend().device(&udid)
 }
 
 /// `facing`: back, front or both (none: both).
@@ -435,26 +464,571 @@ fn link_rows(host: &dyn Host, d: &Device) -> Vec<Value> {
         }
         if effective == "none" {
             state = "off";
-        } else if let Some(query) = effective.strip_prefix("webcam:") {
-            let cams = cameras.get_or_insert_with(|| host.cameras().ok());
-            match cams.as_deref().map(|c| sim_camera::resolve_webcam(query, c)) {
-                Some(Ok(c)) => {
-                    row["name"] = json!(c.name);
-                    if let Ok(status) = host.permission()
-                        && let Some(fix) = status.fix()
-                    {
-                        state = "permission missing";
-                        row["fix"] = json!(fix);
-                    }
-                }
-                Some(Err(sim_camera::Error::NotFound { .. })) => {
-                    state = "source missing";
-                    row["fix"] = json!(
-                        "the host doesn't list this camera now (unplugged, or its app quit): the device shows the test card until it is back, or link another source"
-                    );
-                }
-                _ => {}
+        } else {
+            webcam_state(host, &effective, &mut cameras, &mut row, &mut state, "the device shows the test card until it is back");
+        }
+        row["state"] = json!(state);
+        rows.push(row);
+    }
+    rows
+}
+
+/// For a webcam link: the camera's name, or `source missing` / `permission missing` with the
+/// fix, into `row` and `state` (`meanwhile`: what the device shows while the camera is missing).
+/// `cameras` keeps the host's listing across rows.
+fn webcam_state(
+    host: &dyn Host,
+    effective: &str,
+    cameras: &mut Option<Option<Vec<HostCamera>>>,
+    row: &mut Value,
+    state: &mut &'static str,
+    meanwhile: &str,
+) {
+    let Some(query) = effective.strip_prefix("webcam:") else { return };
+    let cams = cameras.get_or_insert_with(|| host.cameras().ok());
+    match cams.as_deref().map(|c| sim_camera::resolve_webcam(query, c)) {
+        Some(Ok(c)) => {
+            row["name"] = json!(c.name);
+            if let Ok(status) = host.permission()
+                && let Some(fix) = status.fix()
+            {
+                *state = "permission missing";
+                row["fix"] = json!(fix);
             }
+        }
+        Some(Err(sim_camera::Error::NotFound { .. })) => {
+            *state = "source missing";
+            row["fix"] =
+                json!(format!("the host doesn't list this camera now (unplugged, or its app quit): {meanwhile}, or link another source"));
+        }
+        _ => {}
+    }
+}
+
+// ---- iOS: the simulator side of a link (#323, on #322's feed and shim) ----
+
+/// The shim the device-wide injection inserts (`shims/ios-camera/build.sh` builds it), and the
+/// hooks it loads from beside itself.
+const SHIM: &str = "libsimee-camera.dylib";
+const SHIM_HOOKS: &str = "libsimee-camera-hooks.dylib";
+
+/// Names the shim to insert instead of the one found beside the simee executable.
+pub const SHIM_ENV: &str = "SIMEE_CAMERA_SHIM";
+
+const DYLD_INSERT: &str = "DYLD_INSERT_LIBRARIES";
+
+/// What a feed serves when a reader doesn't ask for a size: a portrait phone camera at 30 fps, as
+/// #322 measured.
+const FEED_SPEC: (u32, u32, u32) = (720, 960, 30);
+
+const SHARED: &str = "an iOS device's back and front cameras read one feed (the shim reads one socket), so both are linked";
+
+const RELAUNCH: &str = "apps that were already running get the camera when relaunched (`simee terminate`, then `simee launch`), and an app \
+     needs its camera permission (`simee privacy <udid> grant camera <bundle id>`)";
+
+/// A simulator as the camera links see it.
+#[derive(Clone, Debug)]
+pub(crate) struct IosTarget {
+    pub udid: String,
+    pub name: String,
+    pub data_dir: PathBuf,
+    pub booted: bool,
+}
+
+/// The simulators, and `launchctl` inside one: the iOS backend, or a fake in tests.
+pub(crate) trait IosHost {
+    /// The simulator `query` (a UDID or name) names.
+    fn target(&mut self, query: &str) -> Result<IosTarget, String>;
+    /// Every simulator.
+    fn targets(&mut self) -> Result<Vec<IosTarget>, String>;
+    /// Runs the device's own launchctl with `args`: its stdout and stderr.
+    fn launchctl(&mut self, udid: &str, args: &[String]) -> Result<(String, String), String>;
+}
+
+/// The iOS backend's simulators.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct Backend<'a>(&'a mut crate::ios::Session);
+
+#[cfg(target_os = "macos")]
+impl IosHost for Backend<'_> {
+    fn target(&mut self, query: &str) -> Result<IosTarget, String> {
+        crate::ios::camera_device(self.0, query)
+    }
+
+    fn targets(&mut self) -> Result<Vec<IosTarget>, String> {
+        crate::ios::camera_devices(self.0)
+    }
+
+    fn launchctl(&mut self, udid: &str, args: &[String]) -> Result<(String, String), String> {
+        crate::ios::camera_launchctl(self.0, udid, args)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl IosHost for Backend<'_> {
+    fn target(&mut self, query: &str) -> Result<IosTarget, String> {
+        Err(format!("no device matches `{query}` ({})", crate::ios::REASON))
+    }
+
+    fn targets(&mut self) -> Result<Vec<IosTarget>, String> {
+        Ok(Vec::new())
+    }
+
+    fn launchctl(&mut self, _udid: &str, _args: &[String]) -> Result<(String, String), String> {
+        Err(crate::ios::REASON.into())
+    }
+}
+
+/// A running feed of one simulator: `sim_camera::ios_feed::Feed`, or a fake in tests. Dropping it
+/// stops it (and removes its socket).
+pub(crate) trait LiveFeed: Send {
+    /// The source id it serves now.
+    fn source(&self) -> String;
+    fn set_source(&self, source: SourceSpec);
+    fn path(&self) -> PathBuf;
+}
+
+#[cfg(unix)]
+impl LiveFeed for sim_camera::ios_feed::Feed {
+    fn source(&self) -> String {
+        sim_camera::ios_feed::Feed::source(self).to_string()
+    }
+
+    fn set_source(&self, source: SourceSpec) {
+        sim_camera::ios_feed::Feed::set_source(self, source);
+    }
+
+    fn path(&self) -> PathBuf {
+        sim_camera::ios_feed::Feed::path(self).to_owned()
+    }
+}
+
+type Serve = dyn Fn(&Path, SourceSpec) -> Result<Box<dyn LiveFeed>, String> + Send + Sync;
+
+/// The feeds this process serves, one per simulator (keyed by UDID).
+pub(crate) struct Feeds {
+    serve: Box<Serve>,
+    live: Mutex<HashMap<String, Box<dyn LiveFeed>>>,
+}
+
+/// This process's feeds, made on first use (a process that never links serves none).
+static FEEDS: OnceLock<Arc<Feeds>> = OnceLock::new();
+
+impl Feeds {
+    pub(crate) fn new(serve: impl Fn(&Path, SourceSpec) -> Result<Box<dyn LiveFeed>, String> + Send + Sync + 'static) -> Feeds {
+        Feeds { serve: Box::new(serve), live: Mutex::new(HashMap::new()) }
+    }
+
+    /// This process's feeds: real ones, all reading one capture hub (so two simulators linked to
+    /// one source share one capture).
+    fn host() -> Arc<Feeds> {
+        FEEDS.get_or_init(|| Arc::new(Feeds::new(serve_host_feed))).clone()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Box<dyn LiveFeed>>> {
+        self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Serves `source` to `udid`'s shim on `socket`: relinks its running feed live (every reader
+    /// moves without reconnecting), or starts one. True when a feed was started.
+    fn link(&self, udid: &str, socket: &Path, source: SourceSpec) -> Result<bool, String> {
+        let mut live = self.lock();
+        // A feed whose socket is gone (the device was erased under it) or moved is started anew.
+        if let Some(feed) = live.get(udid).filter(|f| f.path() == socket && socket.exists()) {
+            feed.set_source(source);
+            return Ok(false);
+        }
+        drop(live.remove(udid));
+        let feed = (self.serve)(socket, source)?;
+        live.insert(udid.to_owned(), feed);
+        Ok(true)
+    }
+
+    /// Stops `udid`'s feed; whether one ran.
+    fn stop(&self, udid: &str) -> bool {
+        let feed = self.lock().remove(udid);
+        feed.is_some()
+    }
+
+    /// The source `udid`'s feed serves now.
+    fn source(&self, udid: &str) -> Option<String> {
+        self.lock().get(udid).map(|f| f.source())
+    }
+}
+
+#[cfg(unix)]
+fn serve_host_feed(socket: &Path, source: SourceSpec) -> Result<Box<dyn LiveFeed>, String> {
+    static HUB: OnceLock<Arc<sim_camera::Hub>> = OnceLock::new();
+    let hub = HUB.get_or_init(|| Arc::new(sim_camera::Hub::new(sim_camera::HostOpener::new()))).clone();
+    let (w, h, fps) = FEED_SPEC;
+    let spec = sim_camera::FrameSpec::new(w, h, fps).map_err(|e| e.to_string())?;
+    let feed = sim_camera::ios_feed::Feed::serve(hub, socket, source, spec).map_err(|e| e.to_string())?;
+    Ok(Box::new(feed))
+}
+
+#[cfg(not(unix))]
+fn serve_host_feed(_socket: &Path, _source: SourceSpec) -> Result<Box<dyn LiveFeed>, String> {
+    Err("the iOS camera feed needs Unix sockets".into())
+}
+
+/// The socket a simulator's feed listens on (`sim_camera::ios_feed::socket_path`).
+#[cfg(unix)]
+fn socket_path(data_dir: &Path) -> Result<PathBuf, String> {
+    sim_camera::ios_feed::socket_path(data_dir).map_err(|e| e.to_string())
+}
+
+#[cfg(not(unix))]
+fn socket_path(data_dir: &Path) -> Result<PathBuf, String> {
+    Ok(data_dir.join("cam.sock"))
+}
+
+/// The socket variable the shim reads.
+#[cfg(unix)]
+const SOCKET_ENV: &str = sim_camera::ios_feed::SOCKET_ENV;
+#[cfg(not(unix))]
+const SOCKET_ENV: &str = "SIMEE_CAMERA_SOCKET";
+
+type Shim = dyn Fn() -> Result<PathBuf, String>;
+type Server = dyn Fn(&str, &Value) -> Option<Result<Value, String>>;
+
+/// What an iOS link needs of this process: its feeds, the shim, whether it is a server (whose
+/// feeds outlive the call), and the server to hand a call to when it isn't one.
+pub(crate) struct Env {
+    feeds: Arc<Feeds>,
+    shim: Box<Shim>,
+    serving: bool,
+    /// Calls a running server of this build (`None`: none answers).
+    server: Box<Server>,
+}
+
+impl Env {
+    /// This process's.
+    fn host() -> Env {
+        Env {
+            feeds: Feeds::host(),
+            shim: Box::new(|| find_shim(std::env::var_os(SHIM_ENV).map(PathBuf::from), std::env::current_exe().ok())),
+            serving: crate::serving(),
+            server: Box::new(|method, params| {
+                let mut client = crate::Client::handshake(&crate::default_socket(), crate::HANDSHAKE_TIMEOUT).ok()?;
+                Some(client.call(method, params))
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fake(
+        feeds: Arc<Feeds>,
+        shim: impl Fn() -> Result<PathBuf, String> + 'static,
+        serving: bool,
+        server: impl Fn(&str, &Value) -> Option<Result<Value, String>> + 'static,
+    ) -> Env {
+        Env { feeds, shim: Box::new(shim), serving, server: Box::new(server) }
+    }
+
+    /// Whether a server answers that a call can be handed to.
+    fn server_answers(&self) -> bool {
+        (self.server)("identity", &Value::Null).is_some_and(|r| r.is_ok())
+    }
+}
+
+/// Runs `f` with the camera host, the simulators (the iOS backend's, or the session's fake) and
+/// this process's environment (or the session's fake).
+fn with_ios<T>(s: &mut Calls, f: impl FnOnce(&dyn Host, &mut dyn IosHost, &Env) -> Result<T, String>) -> Result<T, String> {
+    let Calls { ios, camera, .. } = s;
+    let own;
+    let env = match &camera.env {
+        Some(env) => env,
+        None => {
+            own = Env::host();
+            &own
+        }
+    };
+    let host: &dyn Host = &**camera.host.get_or_insert_with(|| Box::new(HostCameras));
+    let mut backend;
+    let sims: &mut dyn IosHost = match camera.ios.as_deref_mut() {
+        Some(fake) => fake,
+        None => {
+            backend = Backend(ios);
+            &mut backend
+        }
+    };
+    f(host, sims, env)
+}
+
+/// The shim to insert: `explicit` (`SIMEE_CAMERA_SHIM`), else `ios-camera/` beside the simee
+/// executable or one directory up (`target/ios-camera`, where `shims/ios-camera/build.sh` puts it
+/// for `target/{debug,release}/simee`). Its hooks must be beside it. A missing shim names the
+/// build command.
+pub(crate) fn find_shim(explicit: Option<PathBuf>, exe: Option<PathBuf>) -> Result<PathBuf, String> {
+    let candidates: Vec<PathBuf> = match explicit {
+        Some(path) => vec![std::path::absolute(&path).unwrap_or(path)],
+        None => {
+            let dir = exe.as_deref().and_then(Path::parent);
+            dir.into_iter().flat_map(|d| [d.join("ios-camera").join(SHIM), d.parent().unwrap_or(d).join("ios-camera").join(SHIM)]).collect()
+        }
+    };
+    for shim in &candidates {
+        if shim.is_file() && shim.with_file_name(SHIM_HOOKS).is_file() {
+            return Ok(std::fs::canonicalize(shim).unwrap_or_else(|_| shim.clone()));
+        }
+    }
+    let looked: Vec<String> = candidates.iter().map(|c| c.display().to_string()).collect();
+    Err(format!(
+        "the iOS camera shim isn't built: run `shims/ios-camera/build.sh` (it writes target/ios-camera/{SHIM} and {SHIM_HOOKS}), or set \
+         {SHIM_ENV} to a {SHIM} with {SHIM_HOOKS} beside it; looked for {}",
+        if looked.is_empty() { "nothing (this executable's path is unknown)".to_owned() } else { looked.join(", ") }
+    ))
+}
+
+/// `DYLD_INSERT_LIBRARIES` with the camera shim (any build of it, by file name) taken out, and
+/// `shim` put in: another inserted library, the network shaper's, is kept.
+fn with_shim(current: &str, shim: Option<&Path>) -> String {
+    let mut parts: Vec<String> =
+        current.split(':').filter(|p| !p.is_empty() && Path::new(p).file_name().is_none_or(|n| n != SHIM)).map(str::to_owned).collect();
+    parts.extend(shim.map(|s| s.display().to_string()));
+    parts.join(":")
+}
+
+fn getenv(ios: &mut dyn IosHost, udid: &str, key: &str) -> Result<String, String> {
+    ios.launchctl(udid, &["getenv".to_owned(), key.to_owned()]).map(|(out, _)| out.trim().to_owned())
+}
+
+/// Injects the shim device-wide (launchd's environment, which every process started from now on
+/// inherits), keeping another inserted library. True when the environment changed (apps already
+/// running don't have the camera until relaunched); false when it was already so.
+fn inject(ios: &mut dyn IosHost, udid: &str, shim: &Path, socket: &Path) -> Result<bool, String> {
+    let dyld = getenv(ios, udid, DYLD_INSERT)?;
+    let want = with_shim(&dyld, Some(shim));
+    let want_socket = socket.display().to_string();
+    if dyld == want && getenv(ios, udid, SOCKET_ENV)? == want_socket {
+        return Ok(false);
+    }
+    let args = ["setenv", DYLD_INSERT, want.as_str(), SOCKET_ENV, want_socket.as_str()].map(str::to_owned);
+    let (_, stderr) = ios.launchctl(udid, &args)?;
+    // `exec` reports no exit status: read the environment back.
+    if getenv(ios, udid, DYLD_INSERT)? != want || getenv(ios, udid, SOCKET_ENV)? != want_socket {
+        return Err(format!("launchctl setenv in the device didn't take: {}", stderr.trim()));
+    }
+    Ok(true)
+}
+
+/// Takes the shim out of the device's launchd environment (another inserted library stays).
+fn uninject(ios: &mut dyn IosHost, udid: &str) -> Result<(), String> {
+    let dyld = getenv(ios, udid, DYLD_INSERT)?;
+    let rest = with_shim(&dyld, None);
+    if rest != dyld {
+        let args: Vec<String> =
+            if rest.is_empty() { vec!["unsetenv".into(), DYLD_INSERT.into()] } else { vec!["setenv".into(), DYLD_INSERT.into(), rest] };
+        ios.launchctl(udid, &args)?;
+    }
+    if !getenv(ios, udid, SOCKET_ENV)?.is_empty() {
+        ios.launchctl(udid, &["unsetenv".to_owned(), SOCKET_ENV.to_owned()])?;
+    }
+    Ok(())
+}
+
+/// The error for a booted simulator's link in a process whose feed would end with the call.
+fn needs_server(t: &IosTarget) -> String {
+    format!(
+        "{} is booted, and its camera feed is served by the simee server for as long as it runs, but this call runs in its own \
+         process and no server of this build answers: start `simee serve`, then link again (nothing was linked or saved)",
+        t.name
+    )
+}
+
+/// Serves `source` (an id [`resolve_source`] gave, not `none`) to booted `t` and injects the shim:
+/// whether the injection changed (running apps need a relaunch). A feed started here is stopped
+/// again when the injection fails.
+fn serve_live(ios: &mut dyn IosHost, env: &Env, t: &IosTarget, source: &str) -> Result<bool, String> {
+    let spec = SourceSpec::parse(source).map_err(|e| e.to_string())?;
+    let shim = (env.shim)()?;
+    let socket = socket_path(&t.data_dir)?;
+    let started = env.feeds.link(&t.udid, &socket, spec)?;
+    inject(ios, &t.udid, &shim, &socket).inspect_err(|_| {
+        if started {
+            env.feeds.stop(&t.udid);
+        }
+    })
+}
+
+/// `camera_link` on a simulator: checks the source (and that the shim is built), serves it live
+/// on a booted device (a server only: elsewhere the call is handed to a running server), then
+/// saves it for both cameras.
+fn ios_link(
+    host: &dyn Host,
+    ios: &mut dyn IosHost,
+    env: &Env,
+    query: &str,
+    facings: &[&str],
+    source: &str,
+    p: &Value,
+) -> Result<Value, String> {
+    let t = ios.target(query)?;
+    let resolved = resolve_source(host, source)?;
+    let on = resolved.id != "none";
+    if on {
+        (env.shim)()?;
+    }
+    let mut notes: Vec<&str> = Vec::new();
+    if facings.len() == 1 {
+        notes.push(SHARED);
+    }
+    let applied = if t.booted {
+        if !env.serving {
+            let mut p = p.clone();
+            p["device"] = json!(t.udid);
+            return (env.server)("camera_link", &p).unwrap_or_else(|| Err(needs_server(&t)));
+        }
+        if on {
+            if serve_live(ios, env, &t, &resolved.id)? {
+                notes.push(RELAUNCH);
+            }
+        } else {
+            env.feeds.stop(&t.udid);
+            uninject(ios, &t.udid)?;
+        }
+        "live"
+    } else {
+        if !env.serving {
+            notes.push(
+                "the boot hands the link to the simee server, which serves the camera feed: have `simee serve` running when it boots",
+            );
+        }
+        "at_boot"
+    };
+    update_cameras(&t.data_dir, |links| {
+        links.clear();
+        links.extend(CAMERA_FACINGS.iter().map(|f| ((*f).to_owned(), resolved.id.clone())));
+    })?;
+    let mut out = json!({"device": t.udid, "applied": applied, "links": ios_rows(host, env, &t)});
+    if let Some(name) = resolved.name {
+        out["name"] = json!(name);
+    }
+    if !notes.is_empty() {
+        out["note"] = json!(notes.join("; "));
+    }
+    Ok(out)
+}
+
+/// `camera_unlink` on a simulator: stops its feed and takes the shim out of its environment
+/// (both cameras: they share the feed), then removes the saved links.
+fn ios_unlink(ios: &mut dyn IosHost, env: &Env, query: &str, facings: &[&str], p: &Value) -> Result<Value, String> {
+    let t = ios.target(query)?;
+    if t.booted {
+        if env.serving {
+            env.feeds.stop(&t.udid);
+        } else {
+            // The server holds the feed: it stops it. With none, there is no feed to stop.
+            let mut p = p.clone();
+            p["device"] = json!(t.udid);
+            if let Some(r) = (env.server)("camera_unlink", &p) {
+                return r;
+            }
+        }
+        uninject(ios, &t.udid)?;
+    }
+    let unlinked: Vec<String> = saved_cameras(&t.data_dir).into_iter().map(|(f, _)| f).collect();
+    update_cameras(&t.data_dir, Vec::clear)?;
+    let now: Vec<Value> = CAMERA_FACINGS.iter().map(|f| json!({"facing": f, "source": "none"})).collect();
+    let applied = if t.booted { "live" } else { "at_boot" };
+    // No camera rows are left; `links` stays in the shape the method returns.
+    let mut out = json!({"device": t.udid, "unlinked": unlinked, "now": now, "applied": applied, "links": []});
+    if facings.len() == 1 {
+        out["note"] = json!("an iOS device's back and front cameras read one feed, so both are unlinked");
+    }
+    Ok(out)
+}
+
+/// `boot`'s camera flags on a simulator: one source (its cameras share one feed), checked and
+/// saved like `camera_link`, for the boot to reapply. A boot outside a server needs a running
+/// one to hand the link to, so without one the boot is refused before it starts.
+fn ios_before_boot(host: &dyn Host, ios: &mut dyn IosHost, env: &Env, query: &str, asked: &[(&str, &str)]) -> Result<(), String> {
+    let source = asked[0].1;
+    if asked.iter().any(|(_, s)| *s != source) {
+        return Err(format!("{SHARED}: give camera_back and camera_front the same source, or one of them"));
+    }
+    if !env.serving && !env.server_answers() {
+        return Err(
+            "an iOS device's camera feed is served by the simee server, and no server of this build answers: start `simee serve`, \
+             then boot again (nothing was linked or saved)"
+                .into(),
+        );
+    }
+    let p = json!({"device": query, "facing": "both", "source": source});
+    ios_link(host, ios, env, query, CAMERA_FACINGS.as_slice(), source, &p).map(drop)
+}
+
+/// After a simulator booted through simee: serves its saved link and injects the shim, here on a
+/// server, or by handing the link to a running server. A failure is reported on stderr (the boot
+/// itself succeeded; `camera_links` shows the link as not served).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn ios_booted(ios: &mut crate::ios::Session, udid: &str) {
+    if let Err(e) = reapply(&mut Backend(ios), &Env::host(), udid) {
+        eprintln!("simee: {udid}'s saved camera link wasn't applied: {e}");
+    }
+}
+
+/// [`ios_booted`]'s work: what was applied (`None`: no saved link).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn reapply(ios: &mut dyn IosHost, env: &Env, udid: &str) -> Result<Option<Value>, String> {
+    let t = ios.target(udid)?;
+    let Some((_, source)) = saved_cameras(&t.data_dir).into_iter().next() else { return Ok(None) };
+    if source == "none" || !t.booted {
+        return Ok(None);
+    }
+    if env.serving {
+        let injected = serve_live(ios, env, &t, &source)?;
+        return Ok(Some(json!({"device": t.udid, "source": source, "injected": injected})));
+    }
+    let p = json!({"device": t.udid, "facing": "both", "source": source});
+    match (env.server)("camera_link", &p) {
+        Some(r) => r.map(Some),
+        None => Err("no simee server (`simee serve`) of this build answers to serve its feed: start one, then link again".into()),
+    }
+}
+
+/// After a simulator shut down, was erased or deleted: its feed (if this process serves one) stops.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn ios_stopped(udid: &str) {
+    if let Some(feeds) = FEEDS.get() {
+        feeds.stop(udid);
+    }
+}
+
+/// One row per saved camera link of simulator `t`, with what its feed serves when this process
+/// serves one.
+fn ios_rows(host: &dyn Host, env: &Env, t: &IosTarget) -> Vec<Value> {
+    let saved = saved_cameras(&t.data_dir);
+    let live = if t.booted { env.feeds.source(&t.udid) } else { None };
+    let mut cameras: Option<Option<Vec<HostCamera>>> = None;
+    let mut rows = Vec::new();
+    for facing in CAMERA_FACINGS {
+        let Some((_, source)) = saved.iter().find(|(f, _)| f == facing) else { continue };
+        let mut row = json!({"device": t.udid, "platform": "ios", "facing": facing, "source": source});
+        let mut state = if source == "none" {
+            "off"
+        } else if !t.booted {
+            "saved"
+        } else {
+            match &live {
+                Some(l) => {
+                    row["live"] = json!(l);
+                    if l == source { "linked" } else { "relinked" }
+                }
+                None => {
+                    row["fix"] = json!(if env.serving {
+                        "no feed is served for it now (the device booted outside simee, or the server restarted): link it again, or \
+                         reboot it with `simee boot`"
+                    } else {
+                        "its feed is served by `simee serve`, and this call didn't run on one: start the server, then link again"
+                    });
+                    "saved"
+                }
+            }
+        };
+        if state != "off" {
+            let effective = row["live"].as_str().unwrap_or(source.as_str()).to_owned();
+            webcam_state(host, &effective, &mut cameras, &mut row, &mut state, "its apps get no frames until it is back");
         }
         row["state"] = json!(state);
         rows.push(row);
@@ -790,14 +1364,346 @@ mod tests {
     }
 
     #[test]
-    fn camera_links_are_android_methods_until_the_ios_feed() {
-        // An iOS device is refused with IOS_UNSUPPORTED (reaching one needs the simulator service,
-        // which unit tests don't start).
-        assert!(super::IOS_UNSUPPORTED.contains("#322"));
+    fn camera_sources_needs_no_device() {
         use sim_core::platform::Platform;
         assert_eq!(crate::platforms("camera_sources"), Platform::ALL);
-        for m in ["camera_link", "camera_unlink", "camera_links"] {
-            assert_eq!(crate::platforms(m), [Platform::Android], "{m}");
+    }
+
+    // ---- iOS: a fake simulator (its launchd environment) and fake feeds ----
+
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    use super::{Env, Feeds, IosHost, IosTarget, LiveFeed};
+
+    const UDID: &str = "0053A2F9-1FD0-4409-BCF1-6D32F934C172";
+    const SHAPER: &str = "/opt/netshape/libsimee-netshape.dylib";
+
+    /// One simulator: its state, and the environment its launchd holds; every launchctl call.
+    #[derive(Clone)]
+    struct FakeIos {
+        target: Arc<Mutex<IosTarget>>,
+        env: Arc<Mutex<HashMap<String, String>>>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl IosHost for FakeIos {
+        fn target(&mut self, query: &str) -> Result<IosTarget, String> {
+            let t = self.target.lock().expect("target").clone();
+            if query == t.udid || query == t.name { Ok(t) } else { Err(format!("no device matches `{query}`")) }
         }
+        fn targets(&mut self) -> Result<Vec<IosTarget>, String> {
+            Ok(vec![self.target.lock().expect("target").clone()])
+        }
+        fn launchctl(&mut self, udid: &str, args: &[String]) -> Result<(String, String), String> {
+            assert_eq!(udid, UDID);
+            let mut env = self.env.lock().expect("env");
+            let out = match args[0].as_str() {
+                "getenv" => env.get(&args[1]).map(|v| format!("{v}\n")).unwrap_or_default(),
+                "setenv" => {
+                    for kv in args[1..].chunks(2) {
+                        env.insert(kv[0].clone(), kv[1].clone());
+                    }
+                    String::new()
+                }
+                "unsetenv" => {
+                    env.remove(&args[1]);
+                    String::new()
+                }
+                other => panic!("launchctl {other}"),
+            };
+            if args[0] != "getenv" {
+                self.calls.lock().expect("calls").push(args.join(" "));
+            }
+            Ok((out, String::new()))
+        }
+    }
+
+    /// A feed that makes its socket file, and logs serve, relink and stop.
+    struct FakeFeed {
+        path: PathBuf,
+        source: Mutex<String>,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl LiveFeed for FakeFeed {
+        fn source(&self) -> String {
+            self.source.lock().expect("source").clone()
+        }
+        fn set_source(&self, source: sim_camera::SourceSpec) {
+            self.log.lock().expect("log").push(format!("relink {source}"));
+            *self.source.lock().expect("source") = source.to_string();
+        }
+        fn path(&self) -> PathBuf {
+            self.path.clone()
+        }
+    }
+
+    impl Drop for FakeFeed {
+        fn drop(&mut self) {
+            self.log.lock().expect("log").push("stop".into());
+            std::fs::remove_file(&self.path).ok();
+        }
+    }
+
+    type Forwarded = Arc<Mutex<Vec<(String, Value)>>>;
+
+    struct Ios {
+        f: Fixture,
+        sim: FakeIos,
+        feeds: Arc<Feeds>,
+        log: Arc<Mutex<Vec<String>>>,
+        shim: PathBuf,
+        forwarded: Forwarded,
+    }
+
+    impl Ios {
+        fn new(tag: &str, booted: bool) -> Ios {
+            let f = Fixture::new(&format!("ios-{tag}"));
+            let data_dir = f.root.join("ios/data");
+            std::fs::create_dir_all(&data_dir).expect("data dir");
+            let shim = f.root.join("ios-camera/libsimee-camera.dylib");
+            let target = IosTarget { udid: UDID.into(), name: "iPhone 17".into(), data_dir, booted };
+            let sim = FakeIos { target: Arc::new(Mutex::new(target)), env: Arc::default(), calls: Arc::default() };
+            let log: Arc<Mutex<Vec<String>>> = Arc::default();
+            let feed_log = log.clone();
+            let feeds = Arc::new(Feeds::new(move |path: &Path, source: sim_camera::SourceSpec| {
+                std::fs::write(path, b"").map_err(|e| e.to_string())?;
+                feed_log.lock().expect("log").push(format!("serve {source} on {}", path.display()));
+                Ok(Box::new(FakeFeed { path: path.to_owned(), source: Mutex::new(source.to_string()), log: feed_log.clone() })
+                    as Box<dyn LiveFeed>)
+            }));
+            Ios { f, sim, feeds, log, shim, forwarded: Arc::default() }
+        }
+
+        fn socket(&self) -> String {
+            self.sim.target.lock().expect("target").data_dir.join("cam.sock").display().to_string()
+        }
+
+        /// The environment: serving or not, a server that answers or none, the shim built or not.
+        fn env(&self, serving: bool, server: bool, shim: bool) -> Env {
+            let path = self.shim.clone();
+            let forwarded = self.forwarded.clone();
+            Env::fake(
+                self.feeds.clone(),
+                move || {
+                    if shim { Ok(path.clone()) } else { Err("the iOS camera shim isn't built: run `shims/ios-camera/build.sh`".into()) }
+                },
+                serving,
+                move |method, p| {
+                    server.then(|| {
+                        forwarded.lock().expect("forwarded").push((method.to_owned(), p.clone()));
+                        Ok(json!({"forwarded": method}))
+                    })
+                },
+            )
+        }
+
+        fn session(&self, env: Env) -> Session {
+            let camera =
+                super::Session { host: Some(Box::new(self.f.host.clone())), ios: Some(Box::new(self.sim.clone())), env: Some(env) };
+            Session { camera, ..Session::with_android(self.f.android.clone()) }
+        }
+
+        fn saved(&self) -> String {
+            let dir = self.sim.target.lock().expect("target").data_dir.clone();
+            std::fs::read_to_string(dir.join("simee/cameras.ini")).unwrap_or_default()
+        }
+
+        fn take_log(&self) -> Vec<String> {
+            std::mem::take(&mut *self.log.lock().expect("log"))
+        }
+
+        fn take_calls(&self) -> Vec<String> {
+            std::mem::take(&mut *self.sim.calls.lock().expect("calls"))
+        }
+
+        fn launchd(&self, key: &str) -> Option<String> {
+            self.sim.env.lock().expect("env").get(key).cloned()
+        }
+    }
+
+    #[test]
+    fn an_ios_link_serves_a_feed_injects_the_shim_relinks_live_and_unlinks() {
+        let ios = Ios::new("live", true);
+        // The network shaper is injected already: the camera joins it.
+        ios.sim.env.lock().expect("env").insert("DYLD_INSERT_LIBRARIES".into(), SHAPER.into());
+        let mut s = ios.session(ios.env(true, false, true));
+        let r = run(&mut s, "camera_link", json!({"device": UDID, "facing": "back", "source": "qr:hello"})).expect("link");
+        assert_eq!(r["applied"], "live");
+        let note = r["note"].as_str().expect("note");
+        assert!(note.contains("both are linked") && note.contains("relaunched") && note.contains("simee privacy"), "{note}");
+        assert_eq!(ios.take_log(), [format!("serve qr:hello on {}", ios.socket())]);
+        let dyld = format!("{SHAPER}:{}", ios.shim.display());
+        assert_eq!(ios.take_calls(), [format!("setenv DYLD_INSERT_LIBRARIES {dyld} SIMEE_CAMERA_SOCKET {}", ios.socket())]);
+        assert_eq!(ios.saved(), "back=qr:hello\nfront=qr:hello\n", "both cameras: they read one feed");
+        let rows = r["links"].as_array().expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            json!({"device": UDID, "platform": "ios", "facing": "back", "source": "qr:hello", "live": "qr:hello", "state": "linked"})
+        );
+
+        // A relink moves the running feed: no new feed, no launchctl, no relaunch note.
+        let r = run(&mut s, "camera_link", json!({"device": UDID, "facing": "both", "source": "emulated"})).expect("relink");
+        assert_eq!(ios.take_log(), ["relink pattern:testcard"]);
+        assert!(ios.take_calls().is_empty());
+        assert!(r.get("note").is_none(), "{r}");
+        assert_eq!(ios.saved(), "back=pattern:testcard\nfront=pattern:testcard\n");
+
+        // The device was erased under the feed (its socket is gone): the next link starts one anew.
+        std::fs::remove_file(ios.socket()).expect("socket");
+        run(&mut s, "camera_link", json!({"device": UDID, "facing": "both", "source": "solid:red"})).expect("after erase");
+        assert_eq!(ios.take_log(), ["stop".to_owned(), format!("serve solid:red on {}", ios.socket())]);
+
+        // Unlinking one camera unlinks both; the shaper stays inserted.
+        let r = run(&mut s, "camera_unlink", json!({"device": UDID, "facing": "front"})).expect("unlink");
+        assert_eq!(r["unlinked"], json!(["back", "front"]));
+        assert_eq!(r["now"], json!([{"facing": "back", "source": "none"}, {"facing": "front", "source": "none"}]));
+        assert_eq!(ios.take_log(), ["stop"]);
+        assert_eq!(ios.take_calls(), [format!("setenv DYLD_INSERT_LIBRARIES {SHAPER}"), "unsetenv SIMEE_CAMERA_SOCKET".to_owned()]);
+        assert_eq!((ios.launchd("DYLD_INSERT_LIBRARIES"), ios.launchd("SIMEE_CAMERA_SOCKET")), (Some(SHAPER.into()), None));
+        assert_eq!(ios.saved(), "");
+        assert_eq!(run(&mut s, "camera_links", json!({"device": UDID})).expect("links"), json!([]));
+
+        // `none` turns the camera off: no feed, no injection, saved as off.
+        let r = run(&mut s, "camera_link", json!({"device": UDID, "facing": "both", "source": "none"})).expect("none");
+        assert_eq!(r["links"][0]["state"], "off");
+        assert!(ios.take_log().is_empty());
+        assert_eq!(ios.launchd("DYLD_INSERT_LIBRARIES"), Some(SHAPER.into()));
+    }
+
+    #[test]
+    fn a_saved_ios_link_is_reapplied_when_the_device_boots() {
+        let ios = Ios::new("boot", false);
+        let mut s = ios.session(ios.env(true, false, true));
+        let r = run(&mut s, "camera_link", json!({"device": UDID, "facing": "both", "source": "obs"})).expect("link");
+        assert_eq!((r["applied"].clone(), r["name"].clone()), (json!("at_boot"), json!("OBS Virtual Camera")));
+        assert!(ios.take_log().is_empty() && ios.take_calls().is_empty(), "nothing runs for a shut-down device");
+        drop(s);
+        // A server restart: the link is read back from the device's data directory.
+        let mut s = ios.session(ios.env(true, false, true));
+        let rows = run(&mut s, "camera_links", json!({})).expect("every device");
+        let ios_rows: Vec<&Value> = rows.as_array().expect("rows").iter().filter(|r| r["platform"] == "ios").collect();
+        assert_eq!(ios_rows.len(), 2);
+        assert_eq!((ios_rows[0]["state"].clone(), ios_rows[0]["name"].clone()), (json!("saved"), json!("OBS Virtual Camera")));
+
+        // The device boots: on a server, the feed starts and the shim is injected.
+        ios.sim.target.lock().expect("target").booted = true;
+        let env = ios.env(true, false, true);
+        let mut sim = ios.sim.clone();
+        let r = super::reapply(&mut sim, &env, UDID).expect("reapply").expect("a saved link");
+        assert_eq!(r["injected"], true);
+        assert_eq!(ios.take_log(), [format!("serve webcam:OBS-VCAM on {}", ios.socket())]);
+        assert_eq!(ios.launchd("SIMEE_CAMERA_SOCKET"), Some(ios.socket()));
+        assert_eq!(run(&mut s, "camera_links", json!({"device": UDID})).expect("links")[0]["state"], "linked");
+        // Booted again (a `boot` of a booted device): the same feed, nothing to inject.
+        let r = super::reapply(&mut sim, &env, UDID).expect("again").expect("link");
+        assert_eq!(r["injected"], false);
+        assert_eq!(ios.take_log(), ["relink webcam:OBS-VCAM"]);
+
+        // A boot outside a server hands the link to a running one, or says it needs one.
+        let r = super::reapply(&mut sim, &ios.env(false, true, true), UDID).expect("forwarded").expect("link");
+        assert_eq!(r, json!({"forwarded": "camera_link"}));
+        let forwarded = ios.forwarded.lock().expect("forwarded").clone();
+        assert_eq!(forwarded, [("camera_link".to_owned(), json!({"device": UDID, "facing": "both", "source": "webcam:OBS-VCAM"}))]);
+        let err = super::reapply(&mut sim, &ios.env(false, false, true), UDID).expect_err("no server");
+        assert!(err.contains("simee serve"), "{err}");
+        // A device with no saved link: nothing to do.
+        run(&mut s, "camera_unlink", json!({"device": UDID})).expect("unlink");
+        assert_eq!(super::reapply(&mut sim, &env, UDID), Ok(None));
+    }
+
+    #[test]
+    fn a_booted_ios_link_outside_a_server_goes_to_the_server_or_needs_one() {
+        let ios = Ios::new("client", true);
+        // No server: refused, and nothing changes.
+        let mut s = ios.session(ios.env(false, false, true));
+        let err = run(&mut s, "camera_link", json!({"device": UDID, "facing": "back", "source": "qr:x"})).expect_err("no server");
+        assert!(err.contains("start `simee serve`") && err.contains("nothing was linked or saved"), "{err}");
+        assert!(ios.take_log().is_empty() && ios.take_calls().is_empty());
+        assert_eq!(ios.saved(), "");
+        // A running server of this build gets the call, with the device by its UDID.
+        let mut s = ios.session(ios.env(false, true, true));
+        let r = run(&mut s, "camera_link", json!({"device": UDID, "facing": "back", "source": "qr:x"})).expect("forwarded");
+        assert_eq!(r, json!({"forwarded": "camera_link"}));
+        let forwarded = ios.forwarded.lock().expect("forwarded").clone();
+        assert_eq!(forwarded, [("camera_link".to_owned(), json!({"device": UDID, "facing": "back", "source": "qr:x"}))]);
+        assert_eq!(ios.saved(), "", "the server saves it");
+        // A shut-down device's link is only saved, so it needs no server; the note says the boot will.
+        ios.sim.target.lock().expect("target").booted = false;
+        let mut s = ios.session(ios.env(false, false, true));
+        let r = run(&mut s, "camera_link", json!({"device": UDID, "facing": "both", "source": "qr:x"})).expect("saved");
+        assert!(r["note"].as_str().expect("note").contains("`simee serve` running when it boots"), "{r}");
+        assert_eq!(ios.saved(), "back=qr:x\nfront=qr:x\n");
+        // Unlinking a booted device with no server takes the shim out of its environment itself.
+        ios.sim.target.lock().expect("target").booted = true;
+        ios.sim.env.lock().expect("env").insert("SIMEE_CAMERA_SOCKET".into(), ios.socket());
+        run(&mut s, "camera_unlink", json!({"device": UDID})).expect("unlink");
+        assert_eq!(ios.take_calls(), ["unsetenv SIMEE_CAMERA_SOCKET"]);
+        assert_eq!(ios.saved(), "");
+    }
+
+    #[test]
+    fn a_missing_shim_names_the_build_command() {
+        let ios = Ios::new("shim", true);
+        let mut s = ios.session(ios.env(true, false, false));
+        let err = run(&mut s, "camera_link", json!({"device": UDID, "facing": "both", "source": "qr:x"})).expect_err("no shim");
+        assert!(err.contains("shims/ios-camera/build.sh"), "{err}");
+        assert!(ios.take_log().is_empty() && ios.take_calls().is_empty());
+        assert_eq!(ios.saved(), "");
+        // Turning the camera off needs no shim.
+        run(&mut s, "camera_link", json!({"device": UDID, "facing": "both", "source": "none"})).expect("off");
+
+        // Where the shim is looked for: beside the executable, one directory up (target/ios-camera
+        // for target/release/simee), or the path SIMEE_CAMERA_SHIM gives; its hooks must be beside it.
+        let root = ios.f.root.join("find");
+        let exe = root.join("target/release/simee");
+        let err = super::find_shim(None, Some(exe.clone())).expect_err("not built");
+        assert!(err.contains("shims/ios-camera/build.sh") && err.contains("SIMEE_CAMERA_SHIM"), "{err}");
+        assert!(err.contains(&root.join("target/ios-camera/libsimee-camera.dylib").display().to_string()), "{err}");
+        let built = root.join("target/ios-camera");
+        std::fs::create_dir_all(&built).expect("dir");
+        std::fs::write(built.join("libsimee-camera.dylib"), b"").expect("shim");
+        assert!(super::find_shim(None, Some(exe.clone())).is_err(), "the hooks must be beside it");
+        std::fs::write(built.join("libsimee-camera-hooks.dylib"), b"").expect("hooks");
+        let found = super::find_shim(None, Some(exe)).expect("found");
+        assert!(found.is_absolute() && found.ends_with("target/ios-camera/libsimee-camera.dylib"), "{}", found.display());
+        assert_eq!(super::find_shim(Some(built.join("libsimee-camera.dylib")), None).ok(), Some(found));
+        assert!(super::find_shim(Some(root.join("nope.dylib")), None).is_err());
+        assert!(super::find_shim(None, None).expect_err("no exe").contains("unknown"));
+    }
+
+    #[test]
+    fn boot_flags_on_ios_give_one_source_and_need_a_server() {
+        let ios = Ios::new("flags", false);
+        let mut s = ios.session(ios.env(true, false, true));
+        let p = json!({"device": UDID, "camera_back": "qr:a", "camera_front": "qr:b"});
+        let err = super::before_boot(&mut s, &p).expect_err("two sources");
+        assert!(err.contains("read one feed"), "{err}");
+        super::before_boot(&mut s, &json!({"device": UDID, "camera_front": "qr:a"})).expect("one");
+        assert_eq!(ios.saved(), "back=qr:a\nfront=qr:a\n");
+        // A boot that runs outside a server needs one to hand the link to at boot.
+        let mut s = ios.session(ios.env(false, false, true));
+        let err = super::before_boot(&mut s, &json!({"device": UDID, "camera_back": "qr:c"})).expect_err("no server");
+        assert!(err.contains("simee serve"), "{err}");
+        assert_eq!(ios.saved(), "back=qr:a\nfront=qr:a\n", "unchanged");
+        let mut s = ios.session(ios.env(false, true, true));
+        super::before_boot(&mut s, &json!({"device": UDID, "camera_back": "qr:c"})).expect("a server answers");
+        assert_eq!(ios.saved(), "back=qr:c\nfront=qr:c\n");
+    }
+
+    #[test]
+    fn the_shim_joins_another_inserted_library_and_leaves_it_behind() {
+        let shim = Path::new("/b/libsimee-camera.dylib");
+        assert_eq!(super::with_shim("", Some(shim)), "/b/libsimee-camera.dylib");
+        assert_eq!(super::with_shim(SHAPER, Some(shim)), format!("{SHAPER}:/b/libsimee-camera.dylib"));
+        // An older build's path is replaced, not added to.
+        assert_eq!(
+            super::with_shim(&format!("/a/libsimee-camera.dylib:{SHAPER}"), Some(shim)),
+            format!("{SHAPER}:/b/libsimee-camera.dylib")
+        );
+        assert_eq!(super::with_shim(&format!("{SHAPER}:/b/libsimee-camera.dylib"), None), SHAPER);
+        assert_eq!(super::with_shim("/b/libsimee-camera.dylib", None), "");
     }
 }
