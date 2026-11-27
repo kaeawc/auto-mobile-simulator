@@ -4,8 +4,9 @@
 //! and deletes (one key or a batch), and a feed of changes.
 //!
 //! Each platform implements [`Backend`]; the methods here parse and check every parameter (types,
-//! what a store can hold, a batch's keys) before a backend sees it. Until a platform's backend
-//! lands, [`Unavailable`] answers its devices with a clear error.
+//! what a store can hold, a batch's keys) before a backend sees it. iOS devices are answered by
+//! [`ios::Ios`] on a macOS host (docs/ios.md "App preferences"); until a platform's backend lands,
+//! [`Unavailable`] answers its devices with a clear error.
 //!
 //! - A **batch** (`prefs_batch`) is all or nothing: every op is checked first, and the backend
 //!   applies them as one write of the store or none at all. Its result has one visibility.
@@ -20,16 +21,25 @@
 //!   cursor answer the changes since, waiting up to `wait_ms` for one. A feed's thread takes the
 //!   backend's changes into a ring of at most 16 MiB as they come, waiting callers sleep on a
 //!   condition variable (never holding the feed's lock, so callers don't hold each other up), and
-//!   a feed nobody reads for 5 minutes stops on its own.
+//!   a feed nobody reads for 5 minutes stops on its own. A backend sends a feed's changes into a
+//!   [`Sink`], which says when the feed has ended (`is_open`), so a backend's watcher stops then
+//!   even if nothing changes. A backend's `watch` starts outside the lock on the process's feeds
+//!   (it may take a moment: an iOS feed reads every store first), and at most [`MAX_FEEDS`] run
+//!   at once.
+//! - **`prefs_read {fresh: true}`** asks the backend for the values as the platform's preferences
+//!   service has them now, where a plain read may see a file the service hasn't written yet (iOS:
+//!   cfprefsd keeps a write in memory for up to about 10 s).
 
+pub mod ios;
+mod plist;
 mod value;
 
 #[cfg(test)]
 pub(crate) mod fake;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -38,7 +48,7 @@ use sim_core::platform::Platform;
 
 pub use value::{Date, PrefValue, Type};
 
-use crate::params::need_str;
+use crate::params::{need_str, opt_bool};
 
 /// The kinds of preference store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -290,6 +300,13 @@ pub trait Backend {
     /// Every key of `store` with its value.
     fn read(&mut self, device: &str, store: &Store) -> Result<Entries, String>;
 
+    /// Every key of `store` with its value as the platform's preferences service has it now
+    /// (`prefs_read {fresh: true}`): for a backend whose plain read may see a file the service
+    /// hasn't written yet. Otherwise a plain read.
+    fn read_fresh(&mut self, device: &str, store: &Store) -> Result<Entries, String> {
+        self.read(device, store)
+    }
+
     /// Applies `ops` in order, all or nothing: one write of the store, or an error and no change.
     fn write_batch(&mut self, device: &str, store: &Store, ops: &[Op]) -> Result<WriteResult, String>;
 
@@ -301,10 +318,49 @@ pub trait Backend {
         self.write_batch(device, store, &[Op::Delete { key: key.to_owned() }])
     }
 
-    /// Starts a feed of the changes to `store` (every store of the app when `None`), from whoever
-    /// makes them (the app, this API, another tool), in the order they happen. The backend stops
-    /// it when the receiver is dropped (a send fails) and closes it when the device stops.
-    fn watch(&mut self, device: &str, app: &str, store: Option<&Store>) -> Result<Receiver<Change>, String>;
+    /// Starts sending the changes to `store` (every store of the app when `None`) into `sink`,
+    /// from whoever makes them (the app, this API, another tool), in the order they happen. The
+    /// backend stops when the feed ends (`sink.is_open()` turns false, or a send fails), and drops
+    /// the sink when the device stops, which ends the feed.
+    fn watch(&mut self, device: &str, app: &str, store: Option<&Store>, sink: Sink) -> Result<(), String>;
+}
+
+/// Where a backend sends a feed's changes.
+pub struct Sink {
+    tx: Sender<Change>,
+    open: Arc<AtomicBool>,
+}
+
+impl Sink {
+    /// Sends one change; false once the feed has ended (stop watching then).
+    pub fn send(&self, change: Change) -> bool {
+        self.is_open() && self.tx.send(change).is_ok()
+    }
+
+    /// Whether the feed still takes changes. A backend that waits for changes checks it as it
+    /// wakes, so it stops when the feed ends even if nothing changes.
+    pub fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+}
+
+/// A feed's end of a [`Sink`]: dropping it (the feed's thread ending) closes the sink.
+struct Source {
+    rx: Receiver<Change>,
+    open: Arc<AtomicBool>,
+}
+
+impl Drop for Source {
+    fn drop(&mut self) {
+        self.open.store(false, Ordering::Release);
+    }
+}
+
+/// A connected sink and source.
+fn sink() -> (Sink, Source) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let open = Arc::new(AtomicBool::new(true));
+    (Sink { tx, open: open.clone() }, Source { rx, open })
 }
 
 /// The backend of a platform whose preferences haven't landed yet: every call says so.
@@ -329,7 +385,7 @@ impl Backend for Unavailable {
         self.refuse()
     }
 
-    fn watch(&mut self, _: &str, _: &str, _: Option<&Store>) -> Result<Receiver<Change>, String> {
+    fn watch(&mut self, _: &str, _: &str, _: Option<&Store>, _: Sink) -> Result<(), String> {
         self.refuse()
     }
 }
@@ -342,7 +398,11 @@ pub struct Session {
 
 impl Default for Session {
     fn default() -> Session {
-        Session { ios: Box::new(Unavailable(Platform::Ios)), android: Box::new(Unavailable(Platform::Android)) }
+        #[cfg(target_os = "macos")]
+        let ios: Box<dyn Backend> = Box::new(ios::Ios::default());
+        #[cfg(not(target_os = "macos"))]
+        let ios: Box<dyn Backend> = Box::new(Unavailable(Platform::Ios));
+        Session { ios, android: Box::new(Unavailable(Platform::Android)) }
     }
 }
 
@@ -439,15 +499,19 @@ pub(crate) fn call(backend: &mut dyn Backend, platform: Platform, device: &str, 
         "prefs_read" => {
             // One store: its values or the call's error. Every store: each one's values or its own
             // error, so one unreadable store doesn't hide the rest.
+            let fresh = opt_bool(p, "fresh")?.unwrap_or(false);
+            let read = |backend: &mut dyn Backend, store: &Store| {
+                if fresh { backend.read_fresh(device, store) } else { backend.read(device, store) }
+            };
             if let Some(id) = opt_string(p, "store")? {
                 let store = Store::parse(platform, app, id)?;
-                let entries = backend.read(device, &store)?;
+                let entries = read(backend, &store)?;
                 return Ok(json!([{"store": store.to_json(), "values": entries_json(&entries)}]));
             }
             let stores = backend.stores(device, app)?;
             Ok(stores
                 .iter()
-                .map(|store| match backend.read(device, store) {
+                .map(|store| match read(backend, store) {
                     Ok(entries) => json!({"store": store.to_json(), "values": entries_json(&entries)}),
                     Err(error) => json!({"store": store.to_json(), "error": error}),
                 })
@@ -490,7 +554,7 @@ pub(crate) fn call(backend: &mut dyn Backend, platform: Platform, device: &str, 
                 }
             };
             let key = FeedKey { platform, device: device.to_owned(), app: app.to_owned(), store: store.as_ref().map(Store::id) };
-            let feed = with_feeds(|feeds| feeds.get(key, feed_id, || backend.watch(device, app, store.as_ref())))?;
+            let feed = feed_for(&FEEDS, key, feed_id, |sink| backend.watch(device, app, store.as_ref(), sink))?;
             Ok(feed.poll(cursor, wait.min(MAX_WAIT)))
         }
         other => Err(format!("`{other}` isn't a preferences method")),
@@ -504,12 +568,34 @@ const FEED_IDLE: Duration = Duration::from_secs(300);
 /// as `logs` keeps 16 MiB of lines); the oldest go first and are counted as `missed`.
 const FEED_BYTES: usize = 16 << 20;
 
+/// The most feeds one process runs at once (each has a thread, and an iOS one a watcher thread
+/// and a few descriptors); a call that would start another is refused until one ends.
+pub const MAX_FEEDS: usize = 64;
+
 static FEEDS: Mutex<Option<Feeds>> = Mutex::new(None);
 static NEXT_FEED: AtomicU64 = AtomicU64::new(1);
 
-fn with_feeds<T>(f: impl FnOnce(&mut Feeds) -> T) -> T {
-    let mut guard = FEEDS.lock().unwrap_or_else(PoisonError::into_inner);
-    f(guard.get_or_insert_with(|| Feeds::new(FEED_BYTES, FEED_IDLE)))
+fn with_feeds<T>(feeds: &Mutex<Option<Feeds>>, f: impl FnOnce(&mut Feeds) -> T) -> T {
+    let mut guard = feeds.lock().unwrap_or_else(PoisonError::into_inner);
+    f(guard.get_or_insert_with(|| Feeds::new(FEED_BYTES, FEED_IDLE, MAX_FEEDS)))
+}
+
+/// The feed for `key` in `feeds`, started with `start` when there is none ([`Feeds::find`]).
+/// `start` (the backend's `watch`) runs without the lock, so a backend that takes a moment to
+/// start doesn't hold up every other feed's callers; when two calls start the same feed at once,
+/// the first one in is kept and the other's sink closes.
+fn feed_for(
+    feeds: &Mutex<Option<Feeds>>,
+    key: FeedKey,
+    id: Option<u64>,
+    start: impl FnOnce(Sink) -> Result<(), String>,
+) -> Result<Arc<Feed>, String> {
+    if let Some(feed) = with_feeds(feeds, |f| f.find(&key, id))? {
+        return Ok(feed);
+    }
+    let (sink, source) = sink();
+    start(sink)?;
+    with_feeds(feeds, |f| f.insert(key, id, source))
 }
 
 /// What a feed follows.
@@ -527,38 +613,51 @@ struct Feeds {
     feeds: HashMap<FeedKey, Arc<Feed>>,
     capacity: usize,
     idle: Duration,
+    /// The most feeds running (not ended) at once.
+    most: usize,
 }
 
 impl Feeds {
-    fn new(capacity: usize, idle: Duration) -> Feeds {
-        Feeds { feeds: HashMap::new(), capacity, idle }
+    fn new(capacity: usize, idle: Duration, most: usize) -> Feeds {
+        Feeds { feeds: HashMap::new(), capacity, idle, most }
     }
 
-    /// The feed for `key`, started with `start` when there is none. An ended feed is kept for a
-    /// caller holding its cursor (`id`), who reads what it had and that it ended; a call without
-    /// one starts a new feed. Ended feeds nobody has read for `idle` are let go.
-    fn get(
-        &mut self,
-        key: FeedKey,
-        id: Option<u64>,
-        start: impl FnOnce() -> Result<Receiver<Change>, String>,
-    ) -> Result<Arc<Feed>, String> {
+    /// The feed for `key` a caller gets: a running one, or an ended one when the caller holds
+    /// its cursor (`id`: it reads what the feed had and that it ended). `None`: start one, which
+    /// is refused when `most` are running. Ended feeds nobody has read for `idle` are let go.
+    fn find(&mut self, key: &FeedKey, id: Option<u64>) -> Result<Option<Arc<Feed>>, String> {
         let idle = self.idle;
         self.feeds.retain(|_, feed| {
             let state = feed.state();
             !state.ended || state.used.elapsed() < idle
         });
-        if let Some(feed) = self.feeds.get(&key) {
+        if let Some(feed) = self.feeds.get(key) {
             let mut state = feed.state();
             if !state.ended || id == Some(feed.id) {
                 // Used now, under its lock: the idle stop can't end it between this lookup and
                 // the caller's poll (a first call would otherwise get `ended` and retry).
                 state.used = Instant::now();
                 drop(state);
-                return Ok(feed.clone());
+                return Ok(Some(feed.clone()));
             }
         }
-        let feed = Feed::start(start()?, self.capacity, self.idle)?;
+        let running = self.feeds.values().filter(|feed| !feed.state().ended).count();
+        if running >= self.most {
+            return Err(format!(
+                "{running} preference feeds are running in this process, the most it runs: poll one with its cursor, or let one \
+                 end (a feed nobody reads stops after 5 minutes)"
+            ));
+        }
+        Ok(None)
+    }
+
+    /// Adds the feed a backend started for `key` (its `source`), unless another call added one
+    /// while it started: then that one is the caller's, and `source` is dropped (its sink closes).
+    fn insert(&mut self, key: FeedKey, id: Option<u64>, source: Source) -> Result<Arc<Feed>, String> {
+        if let Some(feed) = self.find(&key, id)? {
+            return Ok(feed);
+        }
+        let feed = Feed::start(source, self.capacity, self.idle)?;
         self.feeds.insert(key, feed.clone());
         Ok(feed)
     }
@@ -600,13 +699,14 @@ impl FeedState {
 }
 
 impl Feed {
-    fn start(rx: Receiver<Change>, capacity: usize, idle: Duration) -> Result<Arc<Feed>, String> {
+    fn start(source: Source, capacity: usize, idle: Duration) -> Result<Arc<Feed>, String> {
         let state = FeedState { events: VecDeque::new(), bytes: 0, capacity, head: 0, used: Instant::now(), waiting: 0, ended: false };
         let feed = Arc::new(Feed { id: NEXT_FEED.fetch_add(1, Ordering::Relaxed), state: Mutex::new(state), changed: Condvar::new() });
         let reading = feed.clone();
         std::thread::Builder::new()
             .name("simee-prefs-feed".into())
-            .spawn(move || reading.run(&rx, idle))
+            // The source drops when the thread ends, which closes the backend's sink.
+            .spawn(move || reading.run(&source.rx, idle))
             .map_err(|e| format!("can't start a preferences feed: {e}"))?;
         Ok(feed)
     }
@@ -617,7 +717,7 @@ impl Feed {
 
     /// The feed's thread: takes each change as the backend sends it, and ends the feed when the
     /// backend closes it or nobody has read (or waited on) it for `idle`. It wakes at least every
-    /// `tick` for that, and returning drops the receiver, which tells the backend to stop.
+    /// `tick` for that, and returning drops the source, which closes the backend's sink.
     fn run(&self, rx: &Receiver<Change>, idle: Duration) {
         let tick = (idle / 4).clamp(Duration::from_millis(5), Duration::from_secs(1));
         loop {

@@ -61,7 +61,7 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         | "ticks" | "pressure" | "level" | "wifi_bars" | "cellular_bars" | "battery_level" | "state" | "port_base" | "port_count"
         | "settle_ms" => Int,
         "booted" | "on" | "suppressed" | "undo" | "shaped" | "settle" | "settle_foreground" | "audio" | "mute" | "sizes" | "offline"
-        | "proxy" | "face" | "foreground" | "eraser" | "folded" | "restart" | "stream" | "all" | "allow_mismatch" => Bool,
+        | "proxy" | "face" | "foreground" | "eraser" | "folded" | "restart" | "stream" | "all" | "allow_mismatch" | "fresh" => Bool,
         "env" => StrMap,
         "payload" | "region" => Obj,
         "rules" => Objects,

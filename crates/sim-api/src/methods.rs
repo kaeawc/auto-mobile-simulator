@@ -239,11 +239,12 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "prefs_read",
-        "device, bundle_id, store?",
+        "device, bundle_id, store?, fresh?",
         "Every key of an app's preference stores (or one) with its typed value, {type, value}: string, int, long, float, double, \
          bool, string_set (Android), date (ISO 8601), data (base64), array and dictionary (iOS; of typed values), and the \
          read-only unsupported {native, raw} for what no type holds exactly. iOS reads integers as long and reals as double. \
-         Without store, each store answers {store, values} or {store, error}",
+         Without store, each store answers {store, values} or {store, error}. fresh (iOS): read through cfprefsd, one \
+         in-device call, for writes it hasn't flushed to disk yet (it flushes about every 10 s)",
     ),
     (
         "prefs_write",

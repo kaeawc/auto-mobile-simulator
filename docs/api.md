@@ -147,10 +147,10 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `defaults_read` | iOS | device, domain | Read a preferences domain |
 | `defaults_write` | iOS | device, domain, key, value, type? | Write a preference (type: string\|int\|float\|bool) |
 | `prefs_stores` | Android, iOS | device, bundle_id | An app's preference stores, each with the id the other prefs_* methods take: Android `shared_prefs/<name>.xml` and DataStore `datastore/<name>.preferences_pb`, iOS the app's domain (its bundle id) and its app-group suites; any other iOS domain is reachable by its name |
-| `prefs_read` | Android, iOS | device, bundle_id, store? | Every key of an app's preference stores (or one) with its typed value, {type, value}: string, int, long, float, double, bool, string_set (Android), date (ISO 8601), data (base64), array and dictionary (iOS; of typed values), and the read-only unsupported {native, raw} for what no type holds exactly. iOS reads integers as long and reals as double. Without store, each store answers {store, values} or {store, error} |
+| `prefs_read` | Android, iOS | device, bundle_id, store?, fresh? | Every key of an app's preference stores (or one) with its typed value, {type, value}: string, int, long, float, double, bool, string_set (Android), date (ISO 8601), data (base64), array and dictionary (iOS; of typed values), and the read-only unsupported {native, raw} for what no type holds exactly. iOS reads integers as long and reals as double. Without store, each store answers {store, values} or {store, error}. fresh (iOS): read through cfprefsd, one in-device call, for writes it hasn't flushed to disk yet (it flushes about every 10 s) |
 | `prefs_write` | Android, iOS | device, bundle_id, store, key, value, type(string\|int\|long\|float\|double\|bool\|string_set\|date\|data\|array\|dictionary) | Set one key to a typed value (refused when the value isn't of its type or the store can't hold the type); visible says whether the app sees it now or after_relaunch, app what was done to the app for it (untouched, stopped, relaunched: a running Android app writes its old values back over the file), with a note on why |
 | `prefs_delete` | Android, iOS | device, bundle_id, store, key | Remove one key; visible and app as prefs_write's |
-| `prefs_batch` | Android, iOS | device, bundle_id, store, ops([{key, type, value} \| {key, delete: true}]) | Set and remove several keys of one store, all or nothing: every op is checked first (each key once), then the store is written once or not at all |
+| `prefs_batch` | Android, iOS | device, bundle_id, store, ops([{key, type, value} \| {key, delete: true}]) | Set and remove several keys of one store, all or nothing: every op is checked first (each key once), then the store is written once or not at all (iOS: a batch refused up front changes nothing, but cfprefsd applies an accepted one key by key, so a reader at that moment can see part of it; if the final synchronize fails after the keys were handed over, the error names them and says some may already be live in the running app) |
 | `prefs_watch` | Android, iOS | device, bundle_id, store?, cursor?, wait_ms? | Changes to an app's preference stores (or one), as `logs` stream does: the first call starts a feed in this process and returns a cursor; a call with it returns the changes since, {store, key, old, new, at}, oldest first, waiting up to wait_ms (at most 60000) for one, and the next cursor (reset: the feed restarted, re-read; missed: changes dropped unread past its 16 MiB; ended: the device stopped or nobody read it for 5 minutes, and a call without a cursor starts anew) |
 | `crash_reports` | iOS | device | Host crash reports for this device |
 | `info` | Android, iOS | device | Paths and identity |
@@ -220,9 +220,9 @@ that these aren't available there.
 ## App preferences (`prefs_*`)
 
 One typed API over Android SharedPreferences and DataStore preferences and iOS user defaults,
-with no SDK in the app (`crates/sim-api/src/prefs.rs`). The iOS and Android backends are still
-being written: until a platform's lands, every `prefs_*` call on its devices checks its parameters
-and then fails with "app preferences (`prefs_*`) are not yet available on <platform> devices".
+with no SDK in the app (`crates/sim-api/src/prefs.rs`). The iOS backend is implemented; the
+Android backend is not yet: every `prefs_*` call on an Android device checks its parameters and
+then fails with "app preferences (`prefs_*`) are not yet available on android devices".
 `defaults_read` and `defaults_write` are unchanged.
 
 **Stores.** `prefs_stores {device, bundle_id}` lists the app's stores as
@@ -268,7 +268,7 @@ An array's elements and a dictionary's values are typed values too, nested to an
 
 `prefs_read {device, bundle_id, store?}` answers `[{store, values: {<key>: <typed value>}}]`. With
 `store`, an unreadable store fails the call. Without it, every store of the app answers on its own,
-`{store, values}` or `{store, error}`, so one unreadable store doesn't hide the others.
+`{store, values}` or `{store, error}`, so one unreadable store doesn't hide the others. On iOS a read decodes the store's plist on the host (well under a millisecond, no spawn); cfprefsd writes an app's own changes to disk about every 10 s, so `fresh: true` asks cfprefsd instead (one in-device call, about 180 ms).
 
 **Writes.** `prefs_write {device, bundle_id, store, key, type, value}` and `prefs_delete {device,
 bundle_id, store, key}` answer `{store, key, visible, app, note?}`. A write is refused before
@@ -293,6 +293,8 @@ writes, and says whether it relaunched it.
 **Batches.** `prefs_batch {device, bundle_id, store, ops}` takes `{key, type, value}` sets and
 `{key, delete: true}` deletes and is all or nothing: every op is checked first (each key at most
 once), and the backend then writes the store once with all of them, or fails with none applied.
+On iOS, if cfprefsd's final synchronize fails after the keys were handed to it, the error names the
+keys sent and says some may already be live in the running app.
 It answers `{store, keys, visible, app, note?}`.
 
 **Watching.** `prefs_watch {device, bundle_id, store?, cursor?, wait_ms?}` works like `logs`'

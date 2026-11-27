@@ -1,10 +1,9 @@
 //! A preferences backend in memory, for tests: stores and values set up by the test, batches
 //! applied all or nothing, and a change feed that reports this backend's own writes in order.
 
-use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use super::{AppState, Backend, Change, Date, Entries, Op, Store, Visibility, WriteResult};
+use super::{AppState, Backend, Change, Date, Entries, Op, Sink, Store, Visibility, WriteResult};
 
 /// Clones share one state, so a test keeps a handle on what the session's copy does.
 #[derive(Clone, Default)]
@@ -21,7 +20,7 @@ struct State {
     /// A store whose read fails (a file it can't parse).
     unreadable: Option<Store>,
     /// Each feed: the app, the store it follows (`None`: every one of the app's), its sender.
-    watchers: Vec<(String, Option<Store>, Sender<Change>)>,
+    watchers: Vec<(String, Option<Store>, Sink)>,
     /// Seconds after 2027-01-15T08:00:00Z of the next change, so `at` is known and increasing.
     tick: i64,
 }
@@ -115,15 +114,14 @@ impl Backend for Fake {
             sent.push(Change { store: store.clone(), key, old, new, at });
         }
         state.watchers.retain(|(app, only, tx)| {
-            *app != store.app || only.as_ref().is_some_and(|s| s != store) || sent.iter().all(|change| tx.send(change.clone()).is_ok())
+            *app != store.app || only.as_ref().is_some_and(|s| s != store) || sent.iter().all(|change| tx.send(change.clone()))
         });
         Ok(state.visible.clone().unwrap_or(WriteResult { visible: Visibility::Now, app: AppState::Untouched, note: None }))
     }
 
-    fn watch(&mut self, _: &str, app: &str, store: Option<&Store>) -> Result<std::sync::mpsc::Receiver<Change>, String> {
-        let (tx, rx) = channel();
-        self.state().watchers.push((app.to_owned(), store.cloned(), tx));
-        Ok(rx)
+    fn watch(&mut self, _: &str, app: &str, store: Option<&Store>, sink: Sink) -> Result<(), String> {
+        self.state().watchers.push((app.to_owned(), store.cloned(), sink));
+        Ok(())
     }
 }
 
