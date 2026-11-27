@@ -359,7 +359,8 @@ thread_local! {
 /// Runs `f` (one method call) with this thread taking raw bytes: the first bytes field its result
 /// would carry as base64 (`png_result`'s `png`) holds `{"binary": <len>}` instead, and the bytes
 /// come back beside the result. Only results built on this thread are taken; any other caller
-/// (MCP, a call on another thread) gets base64 as before.
+/// (MCP, a call on another thread) gets base64 as before. Not reentrant: a nested call would end
+/// the outer one's taking (nothing nests today).
 pub fn taking_bytes<R>(f: impl FnOnce() -> R) -> (R, Option<Vec<u8>>) {
     /// Stops the thread taking bytes however `f` ends, a panic included.
     struct Stop;

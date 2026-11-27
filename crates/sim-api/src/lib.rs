@@ -59,9 +59,10 @@ struct Request {
     #[serde(default)]
     params: Value,
     /// The client takes a result's bytes raw, after the response line (docs/api.md, "Binary
-    /// replies"); otherwise they are base64 in the line.
+    /// replies"); otherwise they are base64 in the line. Only `true` asks: any other value is
+    /// ignored, as the key was before binary replies existed.
     #[serde(default)]
-    binary: bool,
+    binary: Value,
 }
 
 /// A response line, serialized straight from the method's result (no copy into a new `Value`).
@@ -102,7 +103,7 @@ fn reply(line: &str, binary: bool, out: &mut Vec<u8>, call: impl FnOnce(&str, &V
             return None;
         }
     };
-    let (outcome, bytes) = match req.binary && binary {
+    let (outcome, bytes) = match req.binary == Value::Bool(true) && binary {
         true => params::taking_bytes(|| call(&req.method, &req.params)),
         false => (call(&req.method, &req.params), None),
     };
