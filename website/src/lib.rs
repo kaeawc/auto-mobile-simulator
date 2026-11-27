@@ -31,7 +31,7 @@ use tokens::*;
 /// The widths each page's static HTML is laid out at (`--html-widths`).
 pub const EXPORT_WIDTHS: &str = tokens::Bp::EXPORT;
 
-pub const TITLE: &str = "simee · iOS simulators and Android emulators from one Rust core";
+pub const TITLE: &str = "simee · Rust iOS sim and Android emu - Fast & Feature Rich";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {

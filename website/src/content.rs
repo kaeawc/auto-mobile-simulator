@@ -90,7 +90,13 @@ pub fn readme_lede() -> String {
 /// [`readme_lede`] with its inline code still in backticks, for text that sets code in mono.
 pub fn readme_lede_code() -> String {
     let start = README.find('\n').map_or(0, |i| i + 1);
-    README[start..].trim_start().split("\n\n").next().unwrap_or("").replace('\n', " ")
+    // Skip HTML blocks (the README's `<img>` mark) and images: the lede is the first prose paragraph.
+    README[start..]
+        .split("\n\n")
+        .map(str::trim)
+        .find(|p| !p.is_empty() && !p.starts_with('<') && !p.starts_with("!["))
+        .unwrap_or("")
+        .replace('\n', " ")
 }
 
 fn section(md: &str, heading: &str) -> String {

@@ -10,6 +10,9 @@ use crate::tokens::*;
 use crate::ui::{caption, centered, link_text, markdown, prose, section};
 use crate::{State, angle};
 
+/// The line under the title (owner's words, 2026-11-27).
+pub const SUBTITLE: &str = "Rust iOS sim and Android emu - Fast & Feature Rich";
+
 /// The README sections the page quotes.
 pub const README_SECTIONS: [&str; 2] = ["Performance", "Quick start"];
 
@@ -24,9 +27,8 @@ fn title_block(angle: f32, width: f32, bp: Bp) -> El {
         .w_full()
         .items_center()
         .pt(if bp.phone() { 28.0 } else { 44.0 })
-        .child(
-            centered("title", "simee: iOS Simulators and Android Emulators from One Rust Core", bp.title(), fg()).role("heading").level(1),
-        )
+        .child(centered("title", "simee", bp.display(), fg()).role("heading").level(1))
+        .child(centered("subtitle", SUBTITLE, bp.title(), fg2()).mt(4.0))
         .child(link_text("byline", "github.com/kaeawc/simee", REPO, SMALL).mt(10.0))
         .child(
             col()

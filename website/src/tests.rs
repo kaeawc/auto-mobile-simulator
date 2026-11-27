@@ -117,6 +117,8 @@ fn the_readme_sections_the_home_page_shows_exist() {
         assert!(md.lines().count() > 2, "README has no ## {heading}");
     }
     assert!(content::readme_lede().starts_with("iOS simulators and Android emulators"));
+    // The abstract is prose, never the README's HTML (its `<img>` mark showed as text).
+    assert!(content::readme_lede_code().starts_with("iOS simulators and Android emulators"), "{}", content::readme_lede_code());
 }
 
 #[test]

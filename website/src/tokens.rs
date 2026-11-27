@@ -92,6 +92,10 @@ impl Bp {
     pub fn gutter(self) -> f32 {
         if self.phone() { 16.0 } else { 32.0 }
     }
+    /// The home page's one-word name: "simee".
+    pub fn display(self) -> TextStyle {
+        if self.phone() { TextStyle::new(44.0, 700.0).lh(52.0) } else { TextStyle::new(64.0, 700.0).lh(72.0) }
+    }
     /// The paper's title.
     pub fn title(self) -> TextStyle {
         if self.phone() { TextStyle::new(24.0, 700.0).lh(30.0) } else { TextStyle::new(30.0, 700.0).lh(38.0) }
