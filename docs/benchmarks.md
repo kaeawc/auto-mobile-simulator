@@ -461,6 +461,25 @@ judged on all CPU (`--settle-cpu all`), as until this change; the mechanism is i
 | 4 clones at once: CPU-s each device used until settled, median (not like for like: "before" waited on all CPU, "after" on foreground CPU only, so its wait ends earlier and background work keeps running after it; docs/farm.md) | 167 | 76 |
 | The slim profile's own time in that, 4 at once, median of 12 | 42.9 s | 5.4 s |
 
+The slim profile with the disables also passed as the boot's `disabled_jobs` and read back from
+launchd's own overrides file instead of `launchctl` ([farm.md](farm.md#the-slim-profile)): one
+fresh clone at a time of a booted-once template, `simee boot <clone> --profile slim --settle`,
+2026-11-27, M3 Max, 16 CPUs, macOS 26.6, CoreSimulator 1174.21, median of 3 interleaved runs,
+1-minute load 11-29. "Before" is origin/main (690cd99) built the same way.
+
+| Measure | before | after |
+| --- | --- | --- |
+| iPhone 17 Pro, iOS 27.2: the slim profile's own time (runs) | 1.2 s (1.1, 1.3, 1.2) | 0.0 s (0.0, 0.0, 0.0) |
+| iPhone 17 Pro, iOS 27.2: booted until settled (runs) | 21.2 s (20.2, 22.4, 21.2) | 22.6 s (22.6, 21.1, 31.3) |
+| iPhone 16 Pro, iOS 18.0: the slim profile's own time (runs) | 13.7 s (14.1, 13.7, 13.6) | 0.0 s (0.0, 0.0, 0.0) |
+| iPhone 16 Pro, iOS 18.0: booted until settled (runs) | 27.5 s (28.0, 27.5, 27.3) | 22.6 s (20.9, 22.7, 22.6) |
+| iPhone 16 Pro, iOS 18.0: CPU-s until settled, processes at settle | 47.8, 103-107 | 38.6, 95 |
+
+On iOS 27.2 the 1.2 s was 5 `launchctl` spawns (the preset already kept every job off), and one
+device's settle time doesn't show it: the runs spread more than that. On iOS 18.0, whose launchd
+ignores the preset's file, "before" ran ~127 spawns to disable and stop all 62 jobs after they
+had started, and left one running in 2 of 3 runs; "after" they never start.
+
 Time per automation step on one booted iPhone 17 (iOS 27.2) through `simee serve`, one persistent
 connection, `python3 scripts/ios-step-bench.py <socket> <udid> 20` (medians of 20 calls; the
 median of 3 interleaved runs), 2026-11-26, same host, 48 AVDs and 100 simulators on it, 1-minute

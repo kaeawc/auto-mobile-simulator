@@ -78,6 +78,103 @@ fn open_simulator_kit(developer_dir: &str) -> Result<Library> {
         .ok_or_else(|| Error::Unavailable(format!("cannot load SimulatorKit (tried {})", candidates.join(", "))))
 }
 
+/// What a boot hands the service besides the device ([`Device::boot_with`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BootOptions<'a> {
+    /// Extra environment for the device's launchd (the `env` option).
+    pub env: &'a [(String, String)],
+    /// launchd labels to disable (`true`) or enable (`false`) for this boot (`disabled_jobs`, what
+    /// `simctl boot --disabledJob=`/`--enabledJob=` pass). CoreSimulator writes them, as they are,
+    /// to [`sim_core::launchd::boot_plist_path`], replacing that file (and deletes it on a boot
+    /// without them); only a runtime whose launchd_sim reads that directory (iOS 18.0) applies them.
+    pub jobs: &'a [(String, bool)],
+}
+
+/// The options dictionary for `bootWithOptions:`, its `disabled_jobs` under `jobs_key`.
+fn boot_options(opts: &BootOptions<'_>, jobs_key: &str) -> Obj {
+    let options = rt::mutable_dictionary();
+    if !opts.env.is_empty() {
+        rt::dict_set(&options, "env", &rt::string_dictionary(opts.env));
+    }
+    if !opts.jobs.is_empty() {
+        rt::dict_set(&options, jobs_key, &rt::bool_dictionary(opts.jobs));
+    }
+    options
+}
+
+/// CoreSimulator's key for the disabled jobs (its exported `SimDeviceBootKeyDisabledJobs`).
+fn disabled_jobs_key() -> String {
+    jobs_key_or_default(
+        rt::string_symbol(c"SimDeviceBootKeyDisabledJobs").ok().and_then(|k| k.downcast::<NSString>().ok()).map(|s| s.to_string()),
+    )
+}
+
+/// The exported key, else the literal CoreSimulator 1174 uses (a service that doesn't know the key
+/// ignores it).
+fn jobs_key_or_default(exported: Option<String>) -> String {
+    exported.filter(|k| !k.is_empty()).unwrap_or_else(|| "disabled_jobs".to_owned())
+}
+
+#[cfg(test)]
+mod boot_options_tests {
+    use objc2::class;
+
+    use super::*;
+
+    /// `obj` as an XML property list, as CoreSimulator writes the jobs to disk.
+    fn xml_plist(obj: &AnyObject) -> String {
+        let mut error: *mut NSError = ptr::null_mut();
+        // SAFETY: takes a property-list object, a format (100: XML), options (0) and an NSError**;
+        // returns nil on failure.
+        let data: Option<Obj> = unsafe {
+            msg_send![class!(NSPropertyListSerialization), dataWithPropertyList: obj, format: 100usize, options: 0usize, error: &mut error]
+        };
+        let data = data.expect("serialised");
+        // SAFETY: `length` returns NSUInteger and `bytes` a pointer to that many bytes, alive while `data` is.
+        let bytes = unsafe {
+            let len: usize = msg_send![&*data, length];
+            let ptr: *const std::ffi::c_void = msg_send![&*data, bytes];
+            std::slice::from_raw_parts(ptr.cast::<u8>(), len).to_vec()
+        };
+        String::from_utf8(bytes).expect("utf-8")
+    }
+
+    #[test]
+    fn the_jobs_go_in_as_a_dictionary_of_booleans_beside_the_environment() {
+        let env = [("SIMEE".to_owned(), "1".to_owned())];
+        let jobs = [("com.apple.PosterBoard".to_owned(), true), ("com.apple.example".to_owned(), false)];
+        let xml = xml_plist(&boot_options(&BootOptions { env: &env, jobs: &jobs }, "disabled_jobs"));
+        let compact: String = xml.split_whitespace().collect();
+        assert!(
+            compact.contains(
+                "<key>disabled_jobs</key><dict><key>com.apple.PosterBoard</key><true/><key>com.apple.example</key><false/></dict>"
+            ),
+            "{xml}"
+        );
+        assert!(compact.contains("<key>env</key><dict><key>SIMEE</key><string>1</string></dict>"), "{xml}");
+    }
+
+    #[test]
+    fn without_jobs_or_environment_the_options_are_empty() {
+        let compact: String = xml_plist(&boot_options(&BootOptions::default(), "disabled_jobs")).split_whitespace().collect();
+        assert!(compact.contains("<dict/>"), "{compact}");
+        let env = [("A".to_owned(), "b".to_owned())];
+        let compact: String = xml_plist(&boot_options(&BootOptions { env: &env, jobs: &[] }, "k")).split_whitespace().collect();
+        assert!(!compact.contains("<key>k</key>"), "no jobs key without jobs: {compact}");
+    }
+
+    #[test]
+    fn the_jobs_key_is_coresimulators_export_or_its_literal() {
+        assert_eq!(jobs_key_or_default(Some("disabled_jobs_v2".into())), "disabled_jobs_v2");
+        assert_eq!(jobs_key_or_default(None), "disabled_jobs", "the symbol is missing");
+        assert_eq!(jobs_key_or_default(Some(String::new())), "disabled_jobs");
+        // With CoreSimulator loaded the export is the literal (1174.21).
+        if Library::open(CORE_SIMULATOR).is_ok() {
+            assert_eq!(disabled_jobs_key(), "disabled_jobs");
+        }
+    }
+}
+
 #[cfg(test)]
 mod developer_dir_tests {
     use std::path::PathBuf;
@@ -557,10 +654,12 @@ impl Device {
 
     /// Boots the device with extra environment for its launchd (`env` boot option).
     pub fn boot_with_env(&self, env: &[(String, String)]) -> Result<()> {
-        let options = rt::mutable_dictionary();
-        if !env.is_empty() {
-            rt::dict_set(&options, "env", &rt::string_dictionary(env));
-        }
+        self.boot_with(&BootOptions { env, jobs: &[] })
+    }
+
+    /// Boots the device with `opts` (see [`BootOptions`]).
+    pub fn boot_with(&self, opts: &BootOptions<'_>) -> Result<()> {
+        let options = boot_options(opts, &disabled_jobs_key());
         device_call!(self, "boot", bootWithOptions: &*options)
     }
 

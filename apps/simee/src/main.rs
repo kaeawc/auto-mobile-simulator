@@ -870,6 +870,9 @@ fn boot_line(d: &Value) -> String {
                 if let Some(a) = p.get("already") {
                     line.push_str(&format!(" already={a}"));
                 }
+                if let Some(v) = p.get("verified") {
+                    line.push_str(&format!(" verified={}", text(v)));
+                }
             }
         }
         line.push_str(&format!(" profile_s={}", p["took_s"]));
@@ -1234,6 +1237,10 @@ mod tests {
             "device=U boot_s=1.5 settled=true settle_s=9.0 procs=117 cpu_pct=5.6 foreground_cpu_pct=2.6 background_cpu_pct=3.0 \
              profile=slim disabled=1 failed=0 already=57 profile_s=1.1"
         );
+        // Read back from the overrides file launchd used: no launchctl ran.
+        let held = json!({"device": "U", "boot_s": 1.5,
+            "profile": {"name": "slim", "disabled": 62, "already": 62, "failed": [], "not_loaded": [], "verified": "file", "took_s": 0.0}});
+        assert_eq!(boot_line(&held), "device=U boot_s=1.5 profile=slim disabled=62 failed=0 already=62 verified=file profile_s=0.0");
         assert_eq!(boot_line(&json!({"device": "V", "error": "no device matches `V`"})), "device=V error=no device matches `V`");
         let avd = json!({"device": "farm-1", "boot_s": 12.3, "console_port": 5556, "serial": "emulator-5556"});
         assert_eq!(boot_line(&avd), "device=farm-1 boot_s=12.3 console_port=5556 serial=emulator-5556");

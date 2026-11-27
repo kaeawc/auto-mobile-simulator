@@ -903,7 +903,9 @@ pub struct Profile {
 
 /// Profiles `boot {profile}` applies. Each job is disabled in the device's own launchd database
 /// and booted out (stopped now). `boot` of a shut-down device writes the disables into that
-/// database before the boot ([`preset_profile`]), so the jobs never start. A plain reboot keeps
+/// database before the boot ([`preset_profile`], and the boot's `disabled_jobs` for a runtime
+/// that reads them, [`boot_jobs`]), so the jobs never start, and when launchd read them all
+/// ([`preset_held`]) nothing is spawned after the boot. A plain reboot keeps
 /// the disables and a clone of the device keeps none (a new UDID, a new database): apply the
 /// profile on every boot. Again it touches only the jobs that came back, and `profile {undo}`
 /// enables the jobs.
@@ -1080,19 +1082,29 @@ fn boot_device(device: &Device, plan: &BootPlan) -> Result<Value, String> {
     }
     let was_booted = device.state() == DeviceState::Booted;
     // Before the boot, so this boot never starts the profile's jobs (a clone starts with no
-    // disables of its own).
+    // disables of its own): the preset for a runtime whose launchd reads `/private/var/tmp`, the
+    // boot option for one that reads `/private/tmp` (see `sim_core::launchd`).
     let preset = plan.profile.filter(|_| !was_booted).map(|profile| preset_profile(&udid, profile));
-    if !was_booted && !env.is_empty() {
-        device.boot_with_env(&env).map_err(err)?;
+    let jobs = plan.profile.filter(|_| !was_booted).map(|profile| boot_jobs(&udid, profile)).unwrap_or_default();
+    let boot_started = std::time::SystemTime::now();
+    if !was_booted && (!env.is_empty() || !jobs.is_empty()) {
+        device.boot_with(&sim_coresim::BootOptions { env: &env, jobs: &jobs }).map_err(err)?;
     }
     boot(device, plan.timeout)?;
     let boot_s = start.elapsed().as_secs_f64();
     let mut result = json!({"device": udid, "boot_s": round(boot_s), "was_booted": was_booted});
     if let Some(profile) = plan.profile {
         let t = std::time::Instant::now();
-        let mut r = match apply_profile(device, profile, false) {
-            Ok(applied) => applied.to_json(false),
-            Err(e) => json!({"error": e}),
+        // launchd read every disable as it started: nothing of the profile's was loaded, and
+        // nothing to spawn. Otherwise (a device booted already, a runtime that keeps its overrides
+        // elsewhere, a label enabled since) launchctl does it.
+        let held = if was_booted { None } else { preset_held(&udid, profile, boot_started) };
+        let mut r = match held {
+            Some(n) => json!({"disabled": n, "already": n, "failed": [], "not_loaded": [], "verified": "file"}),
+            None => match apply_profile(device, profile, false) {
+                Ok(applied) => applied.to_json(false),
+                Err(e) => json!({"error": e}),
+            },
         };
         r["name"] = json!(profile.name);
         r["took_s"] = json!(round(t.elapsed().as_secs_f64()));
@@ -1217,13 +1229,36 @@ fn loaded_labels(text: &str) -> std::collections::HashSet<&str> {
 /// (`disabled`) doesn't list disabled, and those `launchctl list` (`loaded`) shows loaded. The
 /// rest are off already and are left alone, so applying a profile again on a later boot costs a
 /// spawn or two per job that came back, not two per job. Without either listing, all of them.
+/// A job in [`LOADED_WHEN_DISABLED`] that is disabled and loaded but not running is left alone too.
 fn still_on<'a>(labels: &[&'a str], loaded: &str, disabled: &str) -> Vec<&'a str> {
     let loaded_set = loaded_labels(loaded);
     if loaded_set.is_empty() || !disabled.contains("=>") {
         return labels.to_vec();
     }
+    let running = running_labels(loaded);
     let disabled = disabled_labels(disabled);
-    labels.iter().copied().filter(|l| !disabled.contains(l) || loaded_set.contains(l)).collect()
+    labels
+        .iter()
+        .copied()
+        .filter(|l| !disabled.contains(l) || (loaded_set.contains(l) && (running.contains(l) || !LOADED_WHEN_DISABLED.contains(l))))
+        .collect()
+}
+
+/// Jobs launchd_sim loads whatever the overrides say ("created the implicit endpoint upfront")
+/// and re-creates within 0.25 s of a bootout (measured, iOS 27.2): disabled and not running, they
+/// are as off as they get, and stopping them again costs two spawns on every boot for nothing.
+const LOADED_WHEN_DISABLED: &[&str] = &["com.apple.siri.context.service"];
+
+/// The labels a `launchctl list` shows running (a PID, not `-`).
+fn running_labels(text: &str) -> std::collections::HashSet<&str> {
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let pid = f.next()?;
+            let label = f.nth(1)?;
+            pid.parse::<i64>().is_ok().then_some(label)
+        })
+        .collect()
 }
 
 /// Disables and stops each of the profile's jobs, or with `undo` enables them again (they run
@@ -1263,10 +1298,46 @@ fn apply_profile(device: &Device, profile: &Profile, undo: bool) -> Result<Appli
 /// [`sim_core::launchd`]) before it boots, so that boot never loads the profile's jobs: a clone's
 /// first boot then skips starting ~60 daemons and the disable and bootout spawns that would stop
 /// them (measured, docs/farm.md). Keeps the file's other overrides; returns how many labels it
-/// newly disabled. [`apply_profile`] still runs after the boot and does whatever this couldn't
-/// (a runtime whose launchd keeps the file elsewhere).
+/// newly disabled. After the boot [`preset_held`] reads back what launchd used, and
+/// [`apply_profile`] does whatever neither this nor the boot option did.
 fn preset_profile(udid: &str, profile: &Profile) -> Result<usize, String> {
     preset_disables(&sim_core::launchd::disabled_plist_path(udid), profile.disabled)
+}
+
+/// The `disabled_jobs` for a boot of the shut-down device `udid` with `profile`: every label
+/// disabled, over the overrides CoreSimulator's file for the device holds from its last boot (on
+/// a runtime whose launchd_sim reads that file, iOS 18.0, they are launchd's own, and the boot
+/// replaces the file with what it is given). Passed on every such boot: CoreSimulator deletes the
+/// file on a boot without it.
+fn boot_jobs(udid: &str, profile: &Profile) -> Vec<(String, bool)> {
+    boot_jobs_from(&sim_core::launchd::boot_plist_path(udid), profile.disabled)
+}
+
+fn boot_jobs_from(path: &Path, labels: &[&str]) -> Vec<(String, bool)> {
+    let entries = std::fs::read_to_string(path).ok().and_then(|t| sim_core::launchd::parse(&t)).unwrap_or_default();
+    sim_core::launchd::with(&entries, labels, true)
+}
+
+/// Whether this boot's launchd_sim (started after `boot_started`) read every one of `profile`'s
+/// labels disabled: then none of its jobs was loaded and [`apply_profile`]'s spawns can be
+/// skipped. Reads the overrides file in the directory launchd_sim used, the preset's
+/// (`/private/var/tmp`) or the boot option's (`/private/tmp`), found by where it logged since the
+/// boot. `Some(labels)` when it holds them all; `None` otherwise (a label enabled, no such file
+/// or log: a runtime that keeps them elsewhere), and the caller spawns as before.
+fn preset_held(udid: &str, profile: &Profile, boot_started: std::time::SystemTime) -> Option<usize> {
+    let var_tmp = sim_core::launchd::disabled_plist_path(udid);
+    let tmp = sim_core::launchd::boot_plist_path(udid);
+    preset_held_in(&var_tmp, &tmp, profile.disabled, boot_started)
+}
+
+fn preset_held_in(var_tmp: &Path, tmp: &Path, labels: &[&str], boot_started: std::time::SystemTime) -> Option<usize> {
+    let logged = |plist: &Path| std::fs::metadata(plist.with_file_name("launchd.log")).and_then(|m| m.modified()).ok();
+    let read = match sim_core::launchd::data_dir_in_use(logged(var_tmp), logged(tmp), boot_started)? {
+        sim_core::launchd::DataDir::VarTmp => var_tmp,
+        sim_core::launchd::DataDir::Tmp => tmp,
+    };
+    let entries = sim_core::launchd::parse(&std::fs::read_to_string(read).ok()?)?;
+    sim_core::launchd::all_disabled(&entries, labels).then_some(labels.len())
 }
 
 /// Disables `labels` in the launchd overrides file at `path` (made, with its directory, when
@@ -1442,9 +1513,14 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let udid = d.info().udid;
             s.ctx()?.delete(&d).map_err(err)?;
             // The service leaves launchd_sim's directory (its log, ~1-3 MB, and the disables)
-            // behind; it is keyed by the UDID, so nothing reads it again.
-            if let Some(dir) = sim_core::launchd::disabled_plist_path(&udid).parent().filter(|_| !udid.is_empty()) {
-                let _ = std::fs::remove_dir_all(dir);
+            // behind, and the one it wrote a boot's `disabled_jobs` to (launchd's own on iOS
+            // 18.0); both are keyed by the UDID, so nothing reads them again.
+            if !udid.is_empty() {
+                for plist in [sim_core::launchd::disabled_plist_path(&udid), sim_core::launchd::boot_plist_path(&udid)] {
+                    if let Some(dir) = plist.parent() {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
+                }
             }
             Ok(Value::Null)
         }
@@ -2963,6 +3039,95 @@ mod tests {
                 let _ = std::fs::remove_file(&tmp);
             }
         }
+    }
+
+    /// The two overrides directories of one device under a scratch root: (`/private/var/tmp`'s
+    /// file, `/private/tmp`'s file).
+    fn overrides_dirs(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("simee-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let var = root.join("var").join("disabled.plist");
+        let tmp = root.join("tmp").join("disabled.plist");
+        for f in [&var, &tmp] {
+            std::fs::create_dir_all(f.parent().expect("dir")).expect("dir");
+        }
+        (root, var, tmp)
+    }
+
+    /// launchd_sim's log beside `plist`, last written `at`.
+    fn launchd_log(plist: &Path, at: std::time::SystemTime) {
+        let f = std::fs::File::create(plist.with_file_name("launchd.log")).expect("log");
+        f.set_modified(at).expect("mtime");
+    }
+
+    #[test]
+    fn a_boot_whose_launchd_read_every_disable_is_held_without_a_spawn() {
+        let (root, var, tmp) = overrides_dirs("held");
+        let labels = ["com.apple.a", "com.apple.b"];
+        let started = std::time::SystemTime::now() - Duration::from_secs(2);
+        let earlier = started - Duration::from_secs(60);
+        let file = |entries: &[(&str, bool)]| {
+            sim_core::launchd::render(&entries.iter().map(|(l, d)| ((*l).to_owned(), *d)).collect::<Vec<_>>(), &[], true)
+        };
+        // A runtime that logs in neither directory: the spawns, as before.
+        std::fs::write(&var, file(&[("com.apple.a", true), ("com.apple.b", true)])).expect("write");
+        assert_eq!(preset_held_in(&var, &tmp, &labels, started), None, "no log: can't tell which file launchd read");
+        launchd_log(&var, earlier);
+        assert_eq!(preset_held_in(&var, &tmp, &labels, started), None, "only an earlier boot's log");
+        // iOS 18.6-27.2: launchd logged beside the preset this boot.
+        launchd_log(&var, std::time::SystemTime::now());
+        assert_eq!(preset_held_in(&var, &tmp, &labels, started), Some(2), "all disabled");
+        std::fs::write(&var, file(&[("com.apple.a", true), ("com.apple.b", false), ("com.apple.c", true)])).expect("write");
+        assert_eq!(preset_held_in(&var, &tmp, &labels, started), None, "some: b enabled (nanoregistrylaunchd)");
+        std::fs::write(&var, file(&[("com.apple.a", false)])).expect("write");
+        assert_eq!(preset_held_in(&var, &tmp, &labels, started), None, "none");
+        std::fs::write(&var, "bplist00").expect("write");
+        assert_eq!(preset_held_in(&var, &tmp, &labels, started), None, "a file simee can't read");
+        std::fs::remove_file(&var).expect("rm");
+        assert_eq!(preset_held_in(&var, &tmp, &labels, started), None, "missing");
+        // iOS 18.0: launchd read the boot option's file; an all-disabled preset beside an earlier
+        // log is the file it ignored.
+        std::fs::write(&var, file(&[("com.apple.a", true), ("com.apple.b", true)])).expect("write");
+        launchd_log(&var, earlier);
+        assert_eq!(preset_held_in(&var, &tmp, &labels, started), None, "no log this boot, and no option file");
+        launchd_log(&tmp, std::time::SystemTime::now());
+        assert_eq!(preset_held_in(&var, &tmp, &labels, started), None, "the option's file is missing");
+        std::fs::write(&tmp, file(&[("com.apple.b", true), ("com.apple.a", true), ("com.apple.nano", false)])).expect("write");
+        assert_eq!(preset_held_in(&var, &tmp, &labels, started), Some(2));
+        // Both logged this boot: neither file is trusted.
+        launchd_log(&var, std::time::SystemTime::now());
+        assert_eq!(preset_held_in(&var, &tmp, &labels, started), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_boot_option_keeps_the_last_boots_overrides_and_disables_the_profile() {
+        let (root, _, tmp) = overrides_dirs("boot-jobs");
+        // A clone: no file.
+        assert_eq!(boot_jobs_from(&tmp, &["a", "b"]), [("a".to_owned(), true), ("b".to_owned(), true)]);
+        // An iOS 18.0 reboot: the file launchd wrote, with an `enable` of its own and of a profile label.
+        std::fs::write(&tmp, sim_core::launchd::render(&[("nano".into(), false), ("b".into(), false)], &["a"], true)).expect("write");
+        assert_eq!(boot_jobs_from(&tmp, &["a", "b"]), [("nano".to_owned(), false), ("b".to_owned(), true), ("a".to_owned(), true)]);
+        // Unreadable: the profile alone.
+        std::fs::write(&tmp, "bplist00").expect("write");
+        assert_eq!(boot_jobs_from(&tmp, &["a"]), [("a".to_owned(), true)]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_disabled_job_launchd_loads_anyway_is_left_alone_unless_it_runs() {
+        // launchd_sim loads siri.context.service though it's disabled and re-creates it 0.25 s
+        // after a bootout (iOS 27.2): stopping it again is two spawns for nothing.
+        let labels = ["com.apple.siri.context.service", "com.apple.a"];
+        let disabled = "\t\"com.apple.siri.context.service\" => disabled\n\t\"com.apple.a\" => disabled\n";
+        let idle = "PID\tStatus\tLabel\n-\t0\tcom.apple.siri.context.service\n-\t0\tcom.apple.a\n12\t0\tcom.apple.SpringBoard\n";
+        assert_eq!(still_on(&labels, idle, disabled), ["com.apple.a"], "another loaded job is still stopped");
+        let running = "PID\tStatus\tLabel\n77\t0\tcom.apple.siri.context.service\n12\t0\tcom.apple.SpringBoard\n";
+        assert_eq!(still_on(&labels, running, disabled), ["com.apple.siri.context.service"], "running: stopped");
+        let enabled = "\t\"com.apple.siri.context.service\" => enabled\n\t\"com.apple.a\" => disabled\n";
+        assert_eq!(still_on(&labels, idle, enabled), labels, "not disabled yet: disabled");
+        let r = profile_outcome(&labels, idle, &["com.apple.siri.context.service"], &[], disabled, false);
+        assert_eq!(r, Applied { changed: 2, failed: vec![], not_loaded: vec![], already: 1 });
     }
 
     #[test]

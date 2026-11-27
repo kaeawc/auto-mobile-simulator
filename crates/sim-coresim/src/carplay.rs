@@ -137,11 +137,7 @@ fn set_power(screen: &AnyObject, on: bool) -> Result<()> {
 
 /// The NSString behind one of CoreSimDeviceIO's exported CarPlay property keys.
 fn property_key(name: &CStr) -> Result<Obj> {
-    let symbol = rt::default_symbol(name)?;
-    // SAFETY: the symbol is an `NSString *const` data symbol; read the pointer it holds.
-    let key = unsafe { symbol.as_ptr().cast::<*mut AnyObject>().read() };
-    // SAFETY: the key is a constant string (or nil), valid for the process' lifetime.
-    unsafe { Retained::retain(key) }.ok_or_else(|| Error::Unavailable(format!("{} has no value", name.to_string_lossy())))
+    rt::string_symbol(name)
 }
 
 fn set_carplay_mode(screen: &AnyObject) -> Result<()> {
