@@ -143,7 +143,15 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("notify", "device, name, state?", "Post a Darwin notification (optionally setting its state)"),
     ("biometric", "device, action(match|nomatch|enroll|unenroll), face?", "Touch ID / Face ID"),
     ("exec", "device, program, args?, env?", "Run a program inside the device; returns stdout/stderr"),
-    ("logs", "device, last?, predicate?", "Unified log lines (default last 1m)"),
+    (
+        "logs",
+        "device, last?, predicate?, stream?(false)",
+        "Unified log lines (default last 1m), as `log show --style compact` prints them. stream: the first call starts one in-device \
+         `log stream` for the device's boot, and later calls answer the window from it without spawning (log show answers a window \
+         reaching back before the stream started, a predicate, and a `last` other than <n>s|m|h|d); the stream stops after 5 idle \
+         minutes or a reboot. It omits launchd_sim's lines, signpost state dumps and `Last log repeated` lines (iOS 27.2: 12% of a \
+         settled device's lines, 1% of a just-booted one's), and its timestamps are often 1 ms later",
+    ),
     ("processes", "device", "Device processes with CPU and memory"),
     ("kill", "device, pid, signal?", "Signal a device process"),
     ("connections", "device", "Open sockets of device processes"),

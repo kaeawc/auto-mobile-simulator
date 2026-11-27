@@ -1511,20 +1511,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let out = s.device(p)?.exec(need_str(p, "program")?, &strings(p, "args"), &pairs(p, "env")).map_err(err)?;
             Ok(json!({"pid": out.pid, "stdout": out.stdout, "stderr": out.stderr}))
         }
-        "logs" => {
-            let mut args = vec![
-                "show".to_owned(),
-                "--style".into(),
-                "compact".into(),
-                "--last".into(),
-                str_param(p, "last").unwrap_or("1m").to_owned(),
-            ];
-            if let Some(pred) = str_param(p, "predicate") {
-                args.extend(["--predicate".to_owned(), pred.to_owned()]);
-            }
-            let out = s.device(p)?.exec("log", &args, &[]).map_err(err)?;
-            Ok(out.stdout.lines().map(str::to_owned).collect())
-        }
+        "logs" => logs(s, p),
         "processes" => serde_json::to_value(sim_debug::process::collect(&s.device(p)?.info().udid)?).map_err(err),
         "kill" => {
             let pid = p.get("pid").and_then(Value::as_i64).ok_or("missing number parameter `pid`")?;
@@ -1731,6 +1718,298 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     }
 }
 
+/// `logs`: the device's unified log for the window `last`, as `log show --style compact` prints it.
+///
+/// With `stream`, the first call starts one in-device `log stream --style compact` for the
+/// device's boot and later calls answer from what it has read ([`LogStreams`]), without spawning:
+/// a window that reaches back before the stream started (or past what its ring still holds), a
+/// `last` other than `<n>s|m|h|d`, a `predicate` and a device whose boots can't be told apart
+/// are answered by `log show`, as without `stream`. The stream doesn't carry everything `log show`
+/// does (iOS 27.2): launchd_sim's lines (0 of 271 over an app launch and terminate; 48 of 396
+/// lines, 12%, in 28 s of a settled device), signpost state dumps (`Sd`) and `Last log repeated`
+/// lines (with launchd_sim's, 195 of 18,476 lines, 1%, in 12 s of a just-booted device); and its
+/// timestamps are often 1 ms later (within ±1 ms on 99% of lines).
+fn logs(s: &mut Session, p: &Value) -> Result<Value, String> {
+    let last = str_param(p, "last").unwrap_or("1m");
+    let predicate = str_param(p, "predicate");
+    let device = s.device(p)?;
+    let source = DeviceLog(&device);
+    let streamed = if opt_bool(p, "stream")?.unwrap_or(false) {
+        let key = BootKey::of(device.state() == DeviceState::Booted, None, device.last_booted_at());
+        let udid = device.udid();
+        with_log_streams(|streams| streams.window(&udid, key, last, predicate, &source))
+    } else {
+        None
+    };
+    let lines = match streamed {
+        Some(lines) => lines,
+        None => source.show(last, predicate)?,
+    };
+    Ok(lines.into_iter().map(Value::String).collect())
+}
+
+/// The bytes of log lines a device's stream keeps: about half a minute of a device that has just
+/// booted (~3,000 lines/s), an hour or more of a settled one.
+const LOG_RING_BYTES: usize = 16 << 20;
+
+/// How long a log stream nobody reads keeps running.
+const LOG_IDLE: Duration = Duration::from_secs(300);
+
+/// Each device's log stream (by UDID), owned by this (long-running) process.
+static LOG_STREAMS: std::sync::Mutex<Option<LogStreams>> = std::sync::Mutex::new(None);
+
+fn with_log_streams<T>(f: impl FnOnce(&mut LogStreams) -> T) -> T {
+    let mut guard = LOG_STREAMS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(guard.get_or_insert_with(|| LogStreams::new(LOG_RING_BYTES, LOG_IDLE, Arc::new(std::time::Instant::now))))
+}
+
+/// Where a device's log comes from: a running stream, or one window read from the log store.
+trait LogSource {
+    /// Starts `log stream --style compact`.
+    fn stream(&self) -> Result<LogPipe, String>;
+    /// `log show --style compact --last <last>`, filtered by `predicate`.
+    fn show(&self, last: &str, predicate: Option<&str>) -> Result<Vec<String>, String>;
+}
+
+/// A running stream: its output, and how to stop it.
+struct LogPipe {
+    reader: Box<dyn std::io::Read + Send>,
+    stop: Box<dyn FnOnce() + Send>,
+}
+
+/// The log of a device of this host.
+struct DeviceLog<'a>(&'a Device);
+
+impl LogSource for DeviceLog<'_> {
+    fn stream(&self) -> Result<LogPipe, String> {
+        let args = ["stream", "--style", "compact"].map(str::to_owned);
+        let (pid, reader) = self.0.exec_stream("log", &args, &[]).map_err(err)?;
+        // The device's programs are host processes; a stopped stream is only signalled while its
+        // output is open (it hasn't exited), so the pid is still its own.
+        let stop = move || {
+            let _ = std::process::Command::new("/bin/kill").arg(pid.to_string()).status();
+        };
+        Ok(LogPipe { reader: Box::new(reader), stop: Box::new(stop) })
+    }
+
+    fn show(&self, last: &str, predicate: Option<&str>) -> Result<Vec<String>, String> {
+        let mut args = vec!["show".to_owned(), "--style".into(), "compact".into(), "--last".into(), last.to_owned()];
+        if let Some(pred) = predicate {
+            args.extend(["--predicate".to_owned(), pred.to_owned()]);
+        }
+        let out = self.0.exec("log", &args, &[]).map_err(err)?;
+        Ok(out.stdout.lines().map(str::to_owned).collect())
+    }
+}
+
+/// The `last` windows a stream can answer: `<n>s`, `<n>m`, `<n>h` or `<n>d`.
+fn log_window(last: &str) -> Option<Duration> {
+    let unit = match last.chars().last()? {
+        's' => 1,
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        _ => return None,
+    };
+    // `log show --last 0s` prints the whole store, not an empty window.
+    let n: u64 = last[..last.len() - 1].parse().ok().filter(|&n| n > 0)?;
+    Some(Duration::from_secs(n.checked_mul(unit)?))
+}
+
+type Clock = Arc<dyn Fn() -> std::time::Instant + Send + Sync>;
+
+/// The lines a stream has read, each with when it arrived, up to a byte budget: the oldest go
+/// first, and the window it can answer starts after the last one dropped.
+struct LogRing {
+    lines: std::collections::VecDeque<(std::time::Instant, String)>,
+    bytes: usize,
+    capacity: usize,
+    /// The earliest time from which every line is kept: when the stream started, then just after
+    /// the last line dropped.
+    complete_from: std::time::Instant,
+}
+
+impl LogRing {
+    fn new(capacity: usize, started: std::time::Instant) -> Self {
+        Self { lines: Default::default(), bytes: 0, capacity, complete_from: started }
+    }
+
+    fn push(&mut self, at: std::time::Instant, line: String) {
+        self.bytes += line.len();
+        self.lines.push_back((at, line));
+        while self.bytes > self.capacity {
+            let Some((dropped, line)) = self.lines.pop_front() else { break };
+            self.bytes -= line.len();
+            self.complete_from = self.complete_from.max(dropped + Duration::from_nanos(1));
+        }
+    }
+
+    /// The lines that arrived in the `last` before `now`, oldest first; `None` when the window
+    /// reaches back past what the ring holds.
+    fn window(&self, now: std::time::Instant, last: Duration) -> Option<Vec<String>> {
+        let since = now.checked_sub(last)?;
+        if since < self.complete_from {
+            return None;
+        }
+        let first = self.lines.partition_point(|(at, _)| *at < since);
+        Some(self.lines.range(first..).filter(|(at, _)| *at <= now).map(|(_, l)| l.clone()).collect())
+    }
+}
+
+/// A stream's state, shared with the thread reading it and the one stopping it when idle.
+struct Tail {
+    ring: LogRing,
+    /// The stream's column header (`log show` prints the same one first).
+    header: Option<String>,
+    /// Its output closed (the device shut down, or it was stopped).
+    ended: bool,
+    used: std::time::Instant,
+    stop: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Tail {
+    fn end(&mut self) {
+        if !self.ended
+            && let Some(stop) = self.stop.take()
+        {
+            stop();
+        }
+        self.ended = true;
+        self.ring.lines.clear();
+        self.ring.bytes = 0;
+    }
+}
+
+type SharedTail = Arc<std::sync::Mutex<Tail>>;
+
+fn lock(tail: &SharedTail) -> std::sync::MutexGuard<'_, Tail> {
+    tail.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// One log stream per device, kept for the boot it started in, stopped when it is idle for `idle`.
+struct LogStreams {
+    kept: std::collections::HashMap<String, (BootKey, SharedTail)>,
+    capacity: usize,
+    idle: Duration,
+    clock: Clock,
+}
+
+impl LogStreams {
+    fn new(capacity: usize, idle: Duration, clock: Clock) -> Self {
+        Self { kept: Default::default(), capacity, idle, clock }
+    }
+
+    /// The lines of the window `last` from `udid`'s stream, starting it (and stopping one from an
+    /// earlier boot) as needed; `None` when `log show` answers instead.
+    fn window(
+        &mut self,
+        udid: &str,
+        key: Option<BootKey>,
+        last: &str,
+        predicate: Option<&str>,
+        source: &impl LogSource,
+    ) -> Option<Vec<String>> {
+        let Some(key) = key else {
+            self.stop(udid);
+            return None;
+        };
+        // A predicate is NSPredicate over fields the compact lines don't all carry: `log show`
+        // filters, and no stream starts for it.
+        if predicate.is_some() {
+            return None;
+        }
+        let tail = match self.kept.get(udid) {
+            Some((kept, tail)) if *kept == key && !lock(tail).ended => tail.clone(),
+            _ => {
+                self.stop(udid);
+                let tail = self.start(source).ok()?;
+                self.kept.insert(udid.to_owned(), (key, tail.clone()));
+                tail
+            }
+        };
+        let now = (self.clock)();
+        let mut tail = lock(&tail);
+        // It may have ended (idle, or the device shut down) since the check above released the
+        // lock: its ring is empty then, so `log show` answers rather than a bare header.
+        if tail.ended {
+            return None;
+        }
+        tail.used = now;
+        let header = tail.header.clone()?;
+        let lines = tail.ring.window(now, log_window(last)?)?;
+        Some(std::iter::once(header).chain(lines).collect())
+    }
+
+    fn stop(&mut self, udid: &str) {
+        if let Some((_, tail)) = self.kept.remove(udid) {
+            lock(&tail).end();
+        }
+    }
+
+    fn start(&self, source: &impl LogSource) -> Result<SharedTail, String> {
+        let LogPipe { reader, stop } = source.stream()?;
+        let now = (self.clock)();
+        let tail = Arc::new(std::sync::Mutex::new(Tail {
+            ring: LogRing::new(self.capacity, now),
+            header: None,
+            ended: false,
+            used: now,
+            stop: Some(stop),
+        }));
+        let (reading, clock) = (tail.clone(), self.clock.clone());
+        std::thread::Builder::new().name("simee-logs".into()).spawn(move || read_log(reader, &reading, &*clock)).map_err(err)?;
+        let (watched, clock, idle) = (tail.clone(), self.clock.clone(), self.idle);
+        std::thread::Builder::new()
+            .name("simee-logs-idle".into())
+            .spawn(move || {
+                let every = (idle / 4).min(Duration::from_secs(15));
+                loop {
+                    sleep(every);
+                    let mut tail = lock(&watched);
+                    if tail.ended {
+                        return;
+                    }
+                    if clock().saturating_duration_since(tail.used) >= idle {
+                        tail.end();
+                        return;
+                    }
+                }
+            })
+            .map_err(err)?;
+        Ok(tail)
+    }
+}
+
+/// Reads a stream's lines into its ring until its output closes.
+fn read_log(reader: Box<dyn std::io::Read + Send>, tail: &SharedTail, clock: &dyn Fn() -> std::time::Instant) {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let line = text.trim_end_matches(['\n', '\r']).to_owned();
+        let now = clock();
+        let mut tail = lock(tail);
+        if tail.ended {
+            return;
+        }
+        if tail.header.is_none() && line.starts_with("Timestamp ") {
+            tail.header = Some(line);
+        } else {
+            tail.ring.push(now, line);
+        }
+    }
+    // It exited by itself: nothing to stop.
+    let mut tail = lock(tail);
+    tail.stop = None;
+    tail.end();
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1743,6 +2022,210 @@ mod tests {
     }
 
     use super::*;
+
+    mod log_streams {
+        use std::cell::{Cell, RefCell};
+        use std::io::Write;
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Instant;
+
+        use super::*;
+
+        const HEADER: &str = "Timestamp               Ty Process[PID:TID]";
+
+        fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+            m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        /// One stream the fake started: where its lines are written, and whether it was stopped.
+        struct Started {
+            writer: Arc<Mutex<Option<std::io::PipeWriter>>>,
+            stopped: Arc<AtomicBool>,
+        }
+
+        impl Started {
+            fn write(&self, line: &str) {
+                let mut w = held(&self.writer);
+                writeln!(w.as_mut().expect("stream open"), "{line}").expect("write");
+            }
+            fn close(&self) {
+                held(&self.writer).take();
+            }
+            fn stopped(&self) -> bool {
+                self.stopped.load(Ordering::Acquire)
+            }
+        }
+
+        /// A device log: streams the test writes, and a `log show` that says it was asked.
+        #[derive(Default)]
+        struct FakeLog {
+            started: RefCell<Vec<Started>>,
+            shown: Cell<u32>,
+        }
+
+        impl LogSource for FakeLog {
+            fn stream(&self) -> Result<LogPipe, String> {
+                let (reader, writer) = std::io::pipe().map_err(err)?;
+                let writer = Arc::new(Mutex::new(Some(writer)));
+                let stopped = Arc::new(AtomicBool::new(false));
+                let (w, s) = (writer.clone(), stopped.clone());
+                let stop = move || {
+                    s.store(true, Ordering::Release);
+                    held(&w).take();
+                };
+                self.started.borrow_mut().push(Started { writer, stopped });
+                Ok(LogPipe { reader: Box::new(reader), stop: Box::new(stop) })
+            }
+
+            fn show(&self, last: &str, _: Option<&str>) -> Result<Vec<String>, String> {
+                self.shown.set(self.shown.get() + 1);
+                Ok(vec![format!("shown {last}")])
+            }
+        }
+
+        /// A clock the test moves.
+        fn clock() -> (Arc<Mutex<Instant>>, Clock) {
+            let at = Arc::new(Mutex::new(Instant::now()));
+            let read = at.clone();
+            (at, Arc::new(move || *held(&read)))
+        }
+
+        fn advance(at: &Mutex<Instant>, by: Duration) {
+            *held(at) += by;
+        }
+
+        fn key(n: u64) -> Option<BootKey> {
+            BootKey::of(true, Some(n), None)
+        }
+
+        /// What `logs` answers: the stream's window, else `log show`.
+        fn logs(streams: &mut LogStreams, source: &FakeLog, key: Option<BootKey>, last: &str, predicate: Option<&str>) -> Vec<String> {
+            streams.window("UDID", key, last, predicate, source).unwrap_or_else(|| source.show(last, predicate).expect("shown"))
+        }
+
+        /// Waits (up to 2 s) until `done`.
+        fn until(mut done: impl FnMut() -> bool) {
+            for _ in 0..200 {
+                if done() {
+                    return;
+                }
+                sleep(Duration::from_millis(10));
+            }
+            panic!("timed out");
+        }
+
+        fn kept_lines(streams: &LogStreams) -> usize {
+            streams.kept.get("UDID").map_or(0, |(_, t)| lock(t).ring.lines.len())
+        }
+
+        fn ring(capacity: usize) -> (Instant, LogRing) {
+            let t0 = Instant::now();
+            (t0, LogRing::new(capacity, t0))
+        }
+
+        #[test]
+        fn the_ring_answers_windows_since_it_started() {
+            let (t0, mut ring) = ring(1 << 20);
+            for (s, line) in [(1, "a"), (2, "b"), (3, "c")] {
+                ring.push(t0 + Duration::from_secs(s), line.into());
+            }
+            let now = t0 + Duration::from_secs(3);
+            assert_eq!(ring.window(now, Duration::from_millis(1_500)), Some(vec!["b".into(), "c".into()]));
+            assert_eq!(ring.window(now, Duration::from_secs(3)), Some(vec!["a".into(), "b".into(), "c".into()]));
+            assert_eq!(ring.window(now, Duration::ZERO), Some(vec!["c".into()]));
+            assert_eq!(ring.window(now, Duration::from_secs(4)), None, "reaches back before the stream started");
+            assert_eq!(ring.window(t0 + Duration::from_secs(2), Duration::from_secs(1)), Some(vec!["a".into(), "b".into()]));
+        }
+
+        #[test]
+        fn the_ring_drops_its_oldest_lines_past_its_budget_and_no_longer_answers_their_window() {
+            let (t0, mut ring) = ring(6);
+            for (s, line) in [(1, "aa"), (2, "bb"), (3, "cc"), (4, "dd")] {
+                ring.push(t0 + Duration::from_secs(s), line.into());
+            }
+            assert_eq!(ring.bytes, 6);
+            assert_eq!(ring.lines.len(), 3, "the oldest went");
+            let now = t0 + Duration::from_secs(4);
+            assert_eq!(ring.window(now, Duration::from_secs(3)), None, "would include the dropped line's time");
+            assert_eq!(ring.window(now, Duration::from_secs(2)), Some(vec!["bb".into(), "cc".into(), "dd".into()]));
+            assert_eq!(ring.window(now, Duration::from_millis(1_500)), Some(vec!["cc".into(), "dd".into()]));
+        }
+
+        #[test]
+        fn a_stream_window_is_a_count_and_a_unit() {
+            assert_eq!(log_window("10s"), Some(Duration::from_secs(10)));
+            assert_eq!(log_window("1m"), Some(Duration::from_secs(60)));
+            assert_eq!(log_window("2h"), Some(Duration::from_secs(7_200)));
+            assert_eq!(log_window("1d"), Some(Duration::from_secs(86_400)));
+            for other in ["boot", "10", "", "m", "0s", "1.5m", "-1s", "99999999999999999999d"] {
+                assert_eq!(log_window(other), None, "{other}: log show answers");
+            }
+        }
+
+        #[test]
+        fn later_calls_answer_from_the_stream_the_first_started() {
+            let (at, clock) = clock();
+            let (source, mut streams) = (FakeLog::default(), LogStreams::new(1 << 20, Duration::from_secs(300), clock));
+            assert_eq!(logs(&mut streams, &source, key(1), "10s", None), ["shown 10s"], "nothing streamed before the first call");
+            assert_eq!(source.started.borrow().len(), 1);
+            advance(&at, Duration::from_secs(20));
+            for line in [HEADER, "2026-11-26 21:35:04.478 Df a[1:2] one", "  continued", "2026-11-26 21:35:04.479 Df a[1:2] two"] {
+                source.started.borrow()[0].write(line);
+            }
+            until(|| kept_lines(&streams) == 3);
+            advance(&at, Duration::from_secs(1));
+            let lines = logs(&mut streams, &source, key(1), "10s", None);
+            assert_eq!(lines, [HEADER, "2026-11-26 21:35:04.478 Df a[1:2] one", "  continued", "2026-11-26 21:35:04.479 Df a[1:2] two"]);
+            advance(&at, Duration::from_secs(2));
+            assert_eq!(logs(&mut streams, &source, key(1), "1s", None), [HEADER], "an empty window keeps the header, as log show does");
+            assert_eq!((source.shown.get(), source.started.borrow().len()), (1, 1), "answered without spawning");
+        }
+
+        #[test]
+        fn windows_before_the_stream_and_filtered_calls_go_to_log_show() {
+            let (at, clock) = clock();
+            let (source, mut streams) = (FakeLog::default(), LogStreams::new(1 << 20, Duration::from_secs(300), clock));
+            logs(&mut streams, &source, key(1), "1m", None);
+            source.started.borrow()[0].write(HEADER);
+            advance(&at, Duration::from_secs(30));
+            assert_eq!(logs(&mut streams, &source, key(1), "1m", None), ["shown 1m"], "the stream has run for 30 s of the minute");
+            assert_eq!(logs(&mut streams, &source, key(1), "boot", None), ["shown boot"]);
+            assert_eq!(logs(&mut streams, &source, key(1), "10s", Some("process == \"a\"")), ["shown 10s"]);
+            assert_eq!(logs(&mut streams, &source, None, "10s", None), ["shown 10s"], "boots can't be told apart");
+            assert!(source.started.borrow()[0].stopped(), "and the stream from before is stopped");
+            assert_eq!(source.shown.get(), 5);
+        }
+
+        #[test]
+        fn a_new_boot_or_a_closed_stream_starts_another() {
+            let (at, clock) = clock();
+            let (source, mut streams) = (FakeLog::default(), LogStreams::new(1 << 20, Duration::from_secs(300), clock));
+            logs(&mut streams, &source, key(1), "10s", None);
+            logs(&mut streams, &source, key(2), "10s", None);
+            assert!(source.started.borrow()[0].stopped(), "the earlier boot's stream is stopped");
+            assert_eq!(source.started.borrow().len(), 2);
+            source.started.borrow()[1].close();
+            until(|| lock(&streams.kept["UDID"].1).ended);
+            advance(&at, Duration::from_secs(1));
+            logs(&mut streams, &source, key(2), "10s", None);
+            assert_eq!(source.started.borrow().len(), 3);
+            assert!(!source.started.borrow()[1].stopped(), "a stream that exited isn't signalled");
+        }
+
+        #[test]
+        fn an_idle_stream_stops() {
+            let (at, clock) = clock();
+            let (source, mut streams) = (FakeLog::default(), LogStreams::new(1 << 20, Duration::from_millis(40), clock));
+            logs(&mut streams, &source, key(1), "10s", None);
+            sleep(Duration::from_millis(100));
+            assert!(!source.started.borrow()[0].stopped(), "no time passed on its clock");
+            advance(&at, Duration::from_millis(40));
+            until(|| source.started.borrow()[0].stopped());
+            logs(&mut streams, &source, key(1), "10s", None);
+            assert_eq!(source.started.borrow().len(), 2, "the next call starts another");
+        }
+    }
 
     #[test]
     fn launch_restarts_unless_restart_is_false() {
