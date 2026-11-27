@@ -614,6 +614,17 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   dm-default-key metadata encryption, which passes discard through but not write-zeroes, and
   zeroes it writes land as ciphertext. So discard is the only way to free space, and a fresh
   first boot (about 610 MB allocated) has only about 2 MB left to trim.
+- **AVD disks are copy-on-write clones (#203).** Every disk an AVD is made from (a golden's,
+  `-clone-avd`'s, `boot.prop`) goes through one helper, `emu_avd::clone::clone_file`:
+  `clonefile(2)` on APFS, `FICLONE` on Linux file systems with reflinks, else a copy of only the
+  data extents (`SEEK_DATA`/`SEEK_HOLE`), keeping the source's mode and extended attributes. On
+  one APFS volume it was already a clone (`std::fs::copy` tries `fclonefileat` first):
+  `-clone-avd` of an AVD with a 6 GiB userdata takes 11 ms and no disk before and after, and
+  `-create-avd ... -no-golden` 11 ms and 20 KiB (only the ini files; median of 5, M3 Max, macOS
+  26.6.2, 2026-11-27, host load about 7). What changed is the fallback: from an AVD whose disks
+  are on another APFS volume (`EXDEV`; a 6 GiB userdata holding 1 GiB of data), `std::fs::copy`'s
+  `fcopyfile` filled the holes, 2.97 s and 6.1 GiB per clone; the extent copy takes 0.57 s and
+  1.0 GiB (median of 5, same host and day).
 - **Screenshots: fast PNG, no re-encode, no needless copies.** Automation takes a screenshot
   after nearly every step. On a 2480×1740 screen (`cargo run --release -p simee-core --example
   frame_bench`), PNG encoding at the `png` crate's default level took 74 ms and BGRA→RGBA
