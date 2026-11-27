@@ -280,8 +280,8 @@ impl Instance {
             // Images without bootconfig have no ANGLE: their GLES is the encoder, on the host's GL.
             vulkan_only: guest_egl(&self.avd) == "angle" && takes_bootconfig(&self.avd),
             virtual_queue: virtual_queue(&guest_egl(&self.avd), AngleImage::of(&self.avd)),
-            // Their GLES encoder's transport (see `legacy_cmdline`).
-            pipe_gles: !takes_bootconfig(&self.avd),
+            // Their GLES encoder's transport (see `pipe_gles`).
+            pipe_gles: pipe_gles(&self.avd),
         })
     }
 
@@ -685,7 +685,7 @@ pub struct BootPlan {
     /// display glasses), as stock adds it.
     pub dual_mode_mouse: bool,
     /// The GLES encoder goes over the goldfish `opengles` pipe and the board has no virtio-gpu
-    /// (images without bootconfig: API 30 and older).
+    /// (API 32 and older, see [`pipe_gles`]).
     pub pipe_gles: bool,
     /// An x86_64 image: stock's x86 board under QEMU's TCG (software mode, #55).
     pub x86: bool,
@@ -733,7 +733,7 @@ impl BootPlan {
             touch_screen: avd.touch_screen(),
             touchpad: avd.touchpad(),
             dual_mode_mouse: xr && avd.image_feature("VirtioDualModeMouse").unwrap_or(true),
-            pipe_gles: !takes_bootconfig(avd),
+            pipe_gles: pipe_gles(avd),
             x86: avd.is_x86_64(),
         };
         let bc = bootconfig(avd, opts, plan.renderer.is_some());
@@ -883,9 +883,19 @@ fn bootconfig(avd: &Avd, opts: &Opts, graphics: bool) -> BootConfig {
         .set("androidboot.qemu.settings.system.screen_off_timeout", "2147483647")
         .set("androidboot.opengles.version", "196609");
     if graphics {
-        // gfxstream over virtio-gpu: GLES through the pipe stream, Vulkan and ANGLE through
-        // address-space graphics, both on the host renderer.
-        bc.set("androidboot.hardware.gltransport", "virtio-gpu-asg").set("androidboot.hardware.vulkan", "ranchu");
+        if pipe_gles(avd) {
+            // The GLES encoder over the goldfish pipe, no virtio-gpu (see `pipe_gles`), with
+            // stock's bootconfig for it. Images without bootconfig get it as `qemu.gltransport`.
+            bc.set("androidboot.hardware.gltransport", "pipe");
+            if takes_bootconfig(avd) {
+                bc.set("androidboot.qemu.gltransport.name", "pipe").set("androidboot.qemu.gltransport.drawFlushInterval", "800");
+            }
+        } else {
+            // gfxstream over virtio-gpu: GLES through the pipe stream, Vulkan and ANGLE through
+            // address-space graphics, both on the host renderer.
+            bc.set("androidboot.hardware.gltransport", "virtio-gpu-asg");
+        }
+        bc.set("androidboot.hardware.vulkan", "ranchu");
         // API 34+: guest GLES through ANGLE on the guest's Vulkan, so every context uses
         // address-space graphics: with `emulation` GLES rides the virtio-gpu pipe stream,
         // whose blocking reads serialize all processes on one queue (API 34+ boots took
@@ -926,6 +936,17 @@ fn takes_bootconfig(avd: &Avd) -> bool {
     avd.image_feature("AndroidbootProps2") == Some(true) || avd.api_level().is_none_or(|api| api >= 31)
 }
 
+/// Whether the guest's GLES encoder goes over the goldfish `opengles` pipe and the board has no
+/// virtio-gpu, as stock runs every image (`gltransport=pipe`): images without bootconfig (API 30
+/// and older, whose kernels oops on virtio-gpu), and API 31 and 32. On those two the gralloc
+/// mapper inside `media.swcodec` opens the transport for its CPU reads of color buffers, and
+/// their SELinux policy denies `mediaswcodec` the render node (`gpu_device`) while it allows the
+/// goldfish pipe (`qemu_device`): over virtio-gpu, `screenrecord`'s encoder crashed (#64). API 33
+/// and newer allow the render node and keep virtio-gpu.
+fn pipe_gles(avd: &Avd) -> bool {
+    !takes_bootconfig(avd) || avd.api_level().is_some_and(|api| (31..=32).contains(&api))
+}
+
 /// The host ANGLE backend for a boot that can't use Metal, if any: SwiftShader for an API 29
 /// image's first boot. There a guest `glClear` reaches ANGLE's Metal clear with a color
 /// attachment whose texture is gone and faults; gfxstream's exception handler retries the load
@@ -939,8 +960,8 @@ fn first_boot_angle(api: Option<u32>, first_boot: bool) -> Option<&'static str> 
 
 /// Why emu can't run this AVD's image yet, if it can't: images below API 29, which emu has never
 /// been brought up on. emu refuses them up front with the reason; `EMU_ALLOW_OLD_IMAGES=1` boots
-/// them anyway, to work on them. (API 29–30 guests draw through the goldfish `opengles` pipe,
-/// `emu_vmm::pipe::opengles`; API 31–33 guests set up address-space graphics the old way, which
+/// them anyway, to work on them. (API 29–32 guests draw through the goldfish `opengles` pipe,
+/// `emu_vmm::pipe::opengles`; API 33 guests set up address-space graphics the old way, which
 /// the GPU translates, `virtio/legacy_asg.rs`.)
 pub fn unsupported(avd: &Avd) -> Option<String> {
     let api = avd.api_level()?;
@@ -1332,7 +1353,7 @@ mod tests {
         let why = |n: &str| unsupported(&s.env.load(n).expect("load"));
         let w = why("p").unwrap_or_default();
         assert!(w.starts_with("p: API 28 images") && w.contains("API 29 and newer"), "{w}");
-        // API 29–30 draw through the opengles pipe (#38); API 31–33 through translated ASG (#39).
+        // API 29–32 draw through the opengles pipe (#38, #64); API 33 through translated ASG (#39).
         assert_eq!((why("q"), why("r"), why("s"), why("u")), (None, None, None, None));
         assert_eq!(why("phone"), None, "no API level: not refused");
     }
@@ -1342,13 +1363,29 @@ mod tests {
         let s = sdk("pipe-gles");
         add_image(&s, "q", 29, "");
         add_image(&s, "s", 31, "AndroidbootProps2 = on\n");
+        add_image(&s, "s2", 32, "AndroidbootProps2 = on\n");
+        add_image(&s, "t", 33, "AndroidbootProps2 = on\n");
         let gpu = Some(PathBuf::from("/renderer/lib64"));
-        let q = BootPlan::new(&s.env.load("q").expect("load"), &Opts::default(), gpu.clone());
-        let s31 = BootPlan::new(&s.env.load("s").expect("load"), &Opts::default(), gpu);
-        assert!(q.pipe_gles && !s31.pipe_gles);
+        let with = |n: &str| BootPlan::new(&s.env.load(n).expect("load"), &Opts::default(), gpu.clone());
+        let transport = |p: &BootPlan| p.bootconfig.get("androidboot.hardware.gltransport").map(str::to_string);
+        let q = with("q");
+        assert!(q.pipe_gles);
         assert!(q.devices().iter().any(|d| d.starts_with("goldfish pipe (opengles")), "{:?}", q.devices());
         assert!(!q.devices().iter().any(|d| d.contains("virtio-gpu")), "{:?}", q.devices());
-        assert!(s31.devices().iter().any(|d| d.starts_with("virtio-gpu")), "{:?}", s31.devices());
+        // API 31 and 32 (#64): their media.swcodec may not open the GPU render node, so the
+        // GLES encoder in it (the gralloc mapper's CPU reads) goes over the pipe, as stock's.
+        for n in ["s", "s2"] {
+            let p = with(n);
+            assert!(p.pipe_gles, "{n}");
+            assert!(!p.devices().iter().any(|d| d.contains("virtio-gpu")), "{n}: {:?}", p.devices());
+            assert_eq!(transport(&p).as_deref(), Some("pipe"), "{n}");
+            assert_eq!(p.bootconfig.get("androidboot.qemu.gltransport.name"), Some("pipe"), "{n}");
+        }
+        // API 33 keeps virtio-gpu: its policy lets media.swcodec open the render node.
+        let t = with("t");
+        assert!(!t.pipe_gles);
+        assert!(t.devices().iter().any(|d| d.starts_with("virtio-gpu")), "{:?}", t.devices());
+        assert_eq!(transport(&t).as_deref(), Some("virtio-gpu-asg"));
     }
 
     #[test]

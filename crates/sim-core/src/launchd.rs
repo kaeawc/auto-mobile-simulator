@@ -59,11 +59,11 @@ pub fn disabled(entries: &[(String, bool)]) -> impl Iterator<Item = &str> {
     entries.iter().filter(|e| e.1).map(|e| e.0.as_str())
 }
 
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-fn unescape(s: &str) -> Option<String> {
+pub(crate) fn unescape(s: &str) -> Option<String> {
     if s.contains('<') {
         return None;
     }

@@ -75,6 +75,27 @@ impl Env {
         names
     }
 
+    /// Whether [`Env::list_avds`] lists `name`, from one stat of its pointer `<name>.ini` instead
+    /// of listing (and stating) the whole home: a UDID that names no AVD, what every iOS call
+    /// asks, costs a failed stat. Exact case, as the listing compares: on a case-insensitive
+    /// filesystem (APFS) `Pixel.ini` opens `pixel.ini`, so a found pointer must be stored under
+    /// that very name; one that isn't (another case, a link to another name) is settled by the
+    /// listing.
+    pub fn has_avd(&self, name: &str) -> bool {
+        if name.is_empty() || name.contains('/') {
+            return false;
+        }
+        let file = format!("{name}.ini");
+        let pointer = self.avd_home.join(&file);
+        if !pointer.is_file() {
+            return false;
+        }
+        match std::fs::canonicalize(&pointer) {
+            Ok(stored) if stored.file_name() == Some(file.as_ref()) => true,
+            _ => self.list_avds().iter().any(|n| n == name),
+        }
+    }
+
     pub fn load(&self, name: &str) -> Result<Avd> {
         let content_dir = self.content_dir(name)?;
         let config = parse_ini(&read(&content_dir.join("config.ini"))?);
@@ -1074,6 +1095,30 @@ mod tests {
         assert_eq!(Running::parse("pid_1.ini", "avd.name=x\n"), None);
         let me = Running { pid: std::process::id() as i32, ..r };
         assert!(me.alive());
+    }
+
+    #[test]
+    fn has_avd_stats_one_pointer_instead_of_listing_the_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::env::temp_dir().join(format!("emu-avd-has-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("pixel.avd")).expect("mkdir");
+        std::fs::write(home.join("pixel.ini"), "path.rel=avd/pixel.avd\n").expect("write");
+        std::fs::create_dir_all(home.join("dir.ini")).expect("a directory, not a pointer");
+        let env = Env { sdk_root: None, avd_home: home.clone() };
+        let names = env.list_avds();
+        assert_eq!(names, ["pixel"]);
+        for name in ["pixel", "Pixel", "pix", "", "dir", "../avd/pixel", "pixel/", "/pixel", "C45634B5-6C9D-4C35-89BE-586942279DFA"] {
+            assert_eq!(env.has_avd(name), names.iter().any(|n| n == name), "{name:?} as list_avds says");
+        }
+        // A home that can be searched but not read: a listing finds nothing, one stat still works.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+        let unlisted = env.list_avds();
+        let (found, not) = (env.has_avd("pixel"), env.has_avd("pix"));
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).expect("chmod back");
+        assert!(unlisted.is_empty(), "the home can't be listed: {unlisted:?}");
+        assert!(found, "found by its pointer alone");
+        assert!(!not);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

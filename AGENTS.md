@@ -136,8 +136,9 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   or external), `Hid` (touch, buttons, keyboard, the Digital Crown, watch gestures, the Siri
   Remote's touch surface, CarPlay touches), `carplay.rs` (attaching the CarPlay display). `rt.rs`
   holds the Objective-C runtime helpers.
-- `crates/sim-debug` — host-side introspection (no FFI): device process tree (`ps`), sockets
-  (`lsof`), traffic (`nettop`), containers and files (confined to the device data dir), crash reports.
+- `crates/sim-debug` — host-side introspection (no FFI): the device's process tree and sockets
+  from libproc data the caller reads (`sim_coresim::procs`) and passes in, traffic (`nettop`),
+  containers and files (confined to the device data dir), crash reports.
 - `crates/sim-netshape` — no-root network shaping: `native/netshape.c` (the injected socket/DNS
   shaper, built on demand with Xcode's simulator clang and cached by source hash; its portable
   core is tested on the host by `native/netshape_test.c` through `tests/native.rs`),

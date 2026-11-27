@@ -181,7 +181,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
         // The emulator's own PNG, passed through: with `path` it writes the file itself.
         "screenshot" => match str_param(p, "path") {
             Some(path) => d.screenshot_png_to(std::path::Path::new(path)).map(|(w, h)| json!({"path": path, "width": w, "height": h})),
-            None => d.screenshot_png().and_then(|(w, h, png)| png_result(w, h, &png, p)),
+            None => d.screenshot_png().and_then(|(w, h, png)| png_result(w, h, png, p)),
         },
         "tap" => null(d.play(&tap_samples(p)?)),
         "swipe" => null(d.play(&swipe_samples(p)?)),

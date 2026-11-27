@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -128,16 +128,85 @@ fn device_proxy(device: &Device, args: &[&str]) -> Result<(), String> {
 }
 
 /// Whether the device was booted with the current shaper build in its environment: its
-/// SpringBoard (Apple TV: PineBoard) maps that exact dylib. An older build counts as not injected
-/// (so it gets rebooted).
+/// SpringBoard (Apple TV: PineBoard) was started with that exact dylib in
+/// `DYLD_INSERT_LIBRARIES` (dyld stops a process whose inserted library doesn't load, so a running
+/// SpringBoard has it mapped). An older build counts as not injected (so it gets rebooted).
 fn boot_injected(device: &Device) -> bool {
     let Ok(dylib) = shaper_sdk(device).and_then(sim_netshape::dylib) else { return false };
-    let Ok(procs) = sim_debug::process::collect(&device.info().udid) else { return false };
-    let Some(sb) = procs.iter().find(|p| p.name == "SpringBoard" || p.name == "PineBoard") else { return false };
-    std::process::Command::new("/usr/sbin/lsof")
-        .args(["-p", &sb.pid.to_string(), "-Fn"])
-        .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&*dylib.display().to_string()))
+    device_tree(&device.info().udid).is_ok_and(|tree| springboard_inserts(&tree, &dylib.display().to_string()))
+}
+
+/// Whether the SpringBoard (or PineBoard) among `tree` was started with `dylib` inserted, read
+/// from its `KERN_PROCARGS2` environment.
+fn springboard_inserts(tree: &[i32], dylib: &str) -> bool {
+    let springboard =
+        tree.iter().copied().find(|&pid| sim_coresim::procs::proc(pid).is_some_and(|p| matches!(p.name(), "SpringBoard" | "PineBoard")));
+    springboard
+        .and_then(sim_coresim::procs::procargs)
+        .and_then(|buf| sim_debug::process::ProcArgs::parse(&buf))
+        .is_some_and(|args| args.inserts(dylib))
+}
+
+/// The pid of the device's `launchd_sim` (the root of its process tree).
+fn launchd_sim(udid: &str) -> Result<i32, String> {
+    sim_coresim::procs::launchd_sim(udid).ok_or_else(|| format!("no launchd_sim for {udid}; is the device booted?"))
+}
+
+/// The device's process tree: its `launchd_sim`, then every descendant (read through libproc).
+fn device_tree(udid: &str) -> Result<Vec<i32>, String> {
+    Ok(sim_coresim::procs::tree(launchd_sim(udid)?))
+}
+
+/// `processes`: each process of `tree` as `ps` showed it (read through libproc; a process that
+/// exits meanwhile is left out, and so is a zombie, which has no task left to read, where `ps`
+/// listed it).
+fn processes_in(tree: &[i32]) -> Vec<sim_debug::process::Process> {
+    let samples: Vec<sim_debug::process::Sample> = tree.iter().filter_map(|&pid| sample(pid)).collect();
+    let now_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    sim_debug::process::tree(&samples, now_s)
+}
+
+fn sample(pid: i32) -> Option<sim_debug::process::Sample> {
+    let task = sim_coresim::procs::task(pid)?;
+    Some(sim_debug::process::Sample {
+        pid,
+        ppid: task.ppid,
+        cpu_usage: task.cpu_usage,
+        resident_bytes: task.resident_bytes,
+        start_s: task.start_s,
+        path: sim_coresim::procs::path(pid).unwrap_or(task.name),
+    })
+}
+
+/// `connections`: the internet sockets of the processes of `tree`, as `lsof -i` showed them.
+fn connections_in(tree: &[i32]) -> Vec<sim_debug::net::Connection> {
+    let mut sockets = Vec::new();
+    for &pid in tree {
+        let found = sim_coresim::procs::sockets(pid);
+        if found.is_empty() {
+            continue;
+        }
+        let process = sim_coresim::procs::name(pid).unwrap_or_default();
+        sockets.extend(found.into_iter().map(|s| sim_debug::net::Socket {
+            pid,
+            process: process.clone(),
+            fd: s.fd,
+            protocol: s.protocol,
+            local: s.local,
+            remote: s.remote,
+            tcp_state: s.tcp_state,
+        }));
+    }
+    sim_debug::net::connections(&sockets)
+}
+
+/// `kill`: sends `signal` to `pid` if it is one of `tree`'s processes.
+fn kill_in(tree: &[i32], pid: i64, signal: i64) -> Result<Value, String> {
+    let Some(pid32) = i32::try_from(pid).ok().filter(|p| tree.contains(p)) else {
+        return Err(format!("pid {pid} is not a process of this device"));
+    };
+    let signal = i32::try_from(signal).map_err(|_| format!("kill {pid} failed: bad signal {signal}"))?;
+    sim_coresim::procs::signal(pid32, signal).map(|()| Value::Null).map_err(|e| format!("kill {pid} failed: {e}"))
 }
 
 /// Reboots the device with the shaper in its launchd environment, so every process (including
@@ -300,7 +369,20 @@ struct Input {
 struct Screens {
     main: Display,
     inner: Option<Display>,
+    /// Each one's framebuffer size once read (main, inner), with the [`TURNS`] it was read at.
+    /// Reading it fetches the surface through a remote proxy (~0.15 ms, most of a `screen` call);
+    /// a port keeps its surface's size for the boot (rotating turns the picture, not the surface:
+    /// 1206x2622 in all four orientations on an iPhone 17 Pro, iOS 27.2), and these displays are
+    /// found again, `updateIOPorts` and all, in every new boot.
+    sizes: [std::cell::Cell<Option<SizeAt>>; 2],
 }
+
+/// A framebuffer size (width, height) and the [`TURNS`] it was read at.
+type SizeAt = (u64, (u32, u32));
+
+/// Rotations and folds this process has sent, on any device: a framebuffer size read before one
+/// is read again.
+static TURNS: AtomicU64 = AtomicU64::new(0);
 
 /// A screen a touch lands on: its size, and the screen ID whose digitizer takes it (`None`: the
 /// main digitizer, as before).
@@ -315,7 +397,22 @@ fn inner_for<T>(device_type_id: &str, second: Option<T>) -> Option<T> {
 impl Screens {
     fn open(device: &Device) -> Result<Self, String> {
         let (main, inner) = device.builtin_displays().map_err(err)?;
-        Ok(Self { main, inner: inner_for(&device.info().device_type_id, inner) })
+        Ok(Self { main, inner: inner_for(&device.info().device_type_id, inner), sizes: Default::default() })
+    }
+
+    /// The framebuffer size of `display`, one of these: read once, then kept until a rotation or
+    /// fold ([`TURNS`]). A display with no surface yet is an error, and nothing is kept.
+    fn size(&self, display: &Display) -> Result<(u32, u32), String> {
+        let slot = &self.sizes[usize::from(!std::ptr::eq(display, &self.main))];
+        let turns = TURNS.load(Ordering::Acquire);
+        if let Some((at, size)) = slot.get()
+            && at == turns
+        {
+            return Ok(size);
+        }
+        let size = display.size().map_err(err)?;
+        slot.set(Some((turns, size)));
+        Ok(size)
     }
 
     /// The display `which` names and, on a device with two built-in screens, the screen ID of its
@@ -378,9 +475,14 @@ impl Input {
         result
     }
 
-    /// Runs `with` on the built-in display `which` names, reused like the HID client (and dropped,
-    /// with the device, on any failure).
-    fn display<R>(&mut self, udid: &str, which: duo::Display, with: impl FnOnce(&Display) -> Result<R, String>) -> Result<R, String> {
+    /// Runs `with` on the built-in display `which` names (and the screens it is one of), reused like
+    /// the HID client (and dropped, with the device, on any failure).
+    fn display<R>(
+        &mut self,
+        udid: &str,
+        which: duo::Display,
+        with: impl FnOnce(&Screens, &Display) -> Result<R, String>,
+    ) -> Result<R, String> {
         let result = self.try_display(udid, which, with);
         if result.is_err() {
             self.device = None;
@@ -389,10 +491,15 @@ impl Input {
         result
     }
 
-    fn try_display<R>(&mut self, udid: &str, which: duo::Display, with: impl FnOnce(&Display) -> Result<R, String>) -> Result<R, String> {
+    fn try_display<R>(
+        &mut self,
+        udid: &str,
+        which: duo::Display,
+        with: impl FnOnce(&Screens, &Display) -> Result<R, String>,
+    ) -> Result<R, String> {
         let Self { ctx, device, changes, watch, screens, .. } = self;
         let (device, key) = connect(ctx, device, changes, watch, udid)?;
-        screens.with(key, || Screens::open(device), |s| with(s.pick(which)?.0))
+        screens.with(key, || Screens::open(device), |s| with(s, s.pick(which)?.0))
     }
 
     fn try_run<R>(
@@ -409,7 +516,7 @@ impl Input {
                 || Screens::open(device),
                 |s| {
                     let (display, id) = s.pick(which)?;
-                    let (w, h) = display.size().map_err(err)?;
+                    let (w, h) = s.size(display)?;
                     Ok((Size::new(f64::from(w), f64::from(h)), id))
                 },
             )?),
@@ -456,7 +563,7 @@ fn on_display<R: Send + 'static>(
     s: &mut Session,
     p: &Value,
     which: duo::Display,
-    with: impl FnOnce(&Display) -> Result<R, String> + Send + 'static,
+    with: impl FnOnce(&Screens, &Display) -> Result<R, String> + Send + 'static,
 ) -> Result<R, String> {
     let udid = s.udid(p)?;
     let result = INPUT.run(&udid.clone(), move |input| sim_coresim::autoreleasepool(|| input.display(&udid, which, with)))?;
@@ -479,14 +586,14 @@ fn as_typed(error: String, p: &Value) -> String {
 fn screen_size(s: &mut Session, p: &Value) -> Result<(u32, u32), String> {
     match display(p)? {
         duo::Display::CarPlay => s.device(p)?.external_display().and_then(|d| d.size()).map_err(err),
-        which => on_display(s, p, which, |d| d.size().map_err(err)),
+        which => on_display(s, p, which, |screens, d| screens.size(d)),
     }
 }
 
 fn capture(s: &mut Session, p: &Value) -> Result<sim_core::frame::Frame, String> {
     match display(p)? {
         duo::Display::CarPlay => s.device(p)?.external_display().and_then(|d| d.capture()).map_err(err),
-        which => on_display(s, p, which, |d| d.capture().map_err(err)),
+        which => on_display(s, p, which, |_, d| d.capture().map_err(err)),
     }
 }
 
@@ -607,63 +714,61 @@ fn play_on(input: &mut Input, udid: &str, p: &Value, samples: &[Sample], edge: O
 }
 
 /// `pointer`: brings the iPad's pointer to a point (pixels) and hovers, clicks, presses or releases
-/// a button there, or drags from it to another. The pointer only moves relatively, so it is homed
-/// against the screen's edges first (`sim_core::pointer`), unless a button is held from an earlier
-/// call on this server in this boot (`down`), which moves on from there. A `down` that no later
-/// call could see (an in-process run), an `up` with nothing held, and a `move` or `up` after a
-/// failed call lost what was held are refused ([`pointer::check`]).
+/// a button there, or drags from it to another. The pointer only moves relatively, so it moves on
+/// from where the last call on this server in this boot left it, or from where a held button
+/// (`down`) keeps it, and is homed against the screen's edges first (`sim_core::pointer`) when
+/// neither is known: the first call, after a failure or a rotation, and every
+/// [`pointer::REHOME_EVERY`] calls (touches, the only other input, don't move the pointer). A
+/// `down` that no later call could see (an in-process run), an `up` with nothing held, and a
+/// `move` or `up` after a failed call lost what was held are refused ([`pointer::check`]).
 fn pointer_on(input: &mut Input, udid: &str, p: &Value) -> Result<Value, String> {
     let PointerRequest { at, action, button, hold, drag_to } = pointer_request(p)?;
     let boot = input.boot(udid)?;
     let held = input.pointer.get(boot);
     pointer::check(action, drag_to.is_some(), held, crate::serving())?;
+    let turns = TURNS.load(Ordering::Acquire);
+    let from = input.pointer.start(boot, turns);
     let result = input.run(udid, true, |hid, screen| {
         let screen = screen.ok_or("no screen size")?;
         let scale = if hid.scale() > 0.0 { hid.scale() } else { 1.0 };
         let points = Size::new(screen.width / scale, screen.height / scale);
         let in_points = |p: Point| Point::new(p.x.clamp(0.0, screen.width) / scale, p.y.clamp(0.0, screen.height) / scale);
         let to = in_points(at);
-        let (from, mut buttons) = match held {
-            Held::Down { at, buttons } => (Some(at), buttons),
-            Held::Nothing => (None, 0),
+        let mut buttons = match held {
+            Held::Down { buttons, .. } => buttons,
+            Held::Nothing => 0,
             Held::Lost => {
                 // Let go of whatever the guest may hold, where the pointer is, before homing: a
                 // held button would drag along the edges.
                 for b in [PointerButton::Primary, PointerButton::Secondary] {
                     hid.pointer_button(b, false, 0).map_err(err)?;
                 }
-                (None, 0)
+                0
             }
         };
-        let glide = |from: Option<Point>, to: Point, buttons: u32| -> Result<(), String> {
-            let from = match from {
-                Some(from) => from,
-                None => {
-                    // Home, then let the Dock the push into the bottom showed hide again.
-                    for (dx, dy) in pointer::home() {
-                        hid.pointer_motion(dx, dy, buttons).map_err(err)?;
-                        sleep(pointer::INTERVAL);
-                    }
-                    sleep(pointer::SETTLE);
-                    pointer::homed(points)
-                }
-            };
-            for (dx, dy) in pointer::path(Some(from), to, points) {
-                hid.pointer_motion(dx, dy, buttons).map_err(err)?;
-                sleep(pointer::INTERVAL);
-            }
-            Ok(())
+        // Against deadlines from the first report, so a busy host doesn't stretch the call; whether
+        // a report went out late (a stall), after which where the pointer stopped isn't known.
+        let glide = |from: Option<Point>, to: Point, buttons: u32| -> Result<bool, String> {
+            let plan = pointer::plan(from, to, points);
+            let started = Instant::now();
+            let late =
+                pointer::send_paced(&plan, || started.elapsed(), sleep, |(dx, dy)| hid.pointer_motion(dx, dy, buttons).map_err(err))?;
+            sleep(pointer::INTERVAL);
+            Ok(late)
         };
-        glide(from, to, buttons)?;
+        // Where the pointer is known to be after the call: not after a stall, nor on an edge or in
+        // a corner, where the guest may stop it short.
+        let known = |at: Point, late: bool| (!late && pointer::lands_at(at, points)).then_some(at);
+        let late = glide(from, to, buttons)?;
         let mask = button.mask();
         let left = |at: Point, buttons: u32| if buttons == 0 { Held::Nothing } else { Held::Down { at, buttons } };
         if let Some(end) = drag_to.map(in_points) {
             sleep(pointer::INTERVAL * 3);
             hid.pointer_button(button, true, buttons | mask).map_err(err)?;
-            glide(Some(to), end, buttons | mask)?;
+            let late = glide(Some(to), end, buttons | mask)? || late;
             sleep(pointer::INTERVAL * 3);
             hid.pointer_button(button, false, buttons).map_err(err)?;
-            return Ok(left(end, buttons));
+            return Ok((left(end, buttons), known(end, late)));
         }
         match action {
             PointerAction::Move => {}
@@ -683,10 +788,10 @@ fn pointer_on(input: &mut Input, udid: &str, p: &Value) -> Result<Value, String>
                 hid.pointer_button(button, false, buttons).map_err(err)?;
             }
         }
-        Ok(left(to, buttons))
+        Ok((left(to, buttons), known(to, late)))
     });
     match result {
-        Ok(next) => input.pointer.set(boot, next),
+        Ok((next, at)) => input.pointer.set(boot, next, at, from.is_none(), turns),
         Err(e) => {
             input.pointer.failed(boot, held, drag_to.is_some() || matches!(action, PointerAction::Click | PointerAction::Down));
             return Err(e);
@@ -703,7 +808,12 @@ fn rotate(device: &Device, wanted: Option<Orientation>) -> Result<Value, String>
     let mut guard = ORIENTATIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let known = guard.get_or_insert_with(Default::default);
     let next = wanted.unwrap_or_else(|| known.get(&udid).copied().unwrap_or(Orientation::Portrait).clockwise());
-    device.set_orientation(next).map_err(err)?;
+    // Counted before and after: a pointer call that starts while the device turns, or reads the
+    // count before it, doesn't move on from where the pointer was before.
+    TURNS.fetch_add(1, Ordering::AcqRel);
+    let sent = device.set_orientation(next);
+    TURNS.fetch_add(1, Ordering::AcqRel);
+    sent.map_err(err)?;
     known.insert(udid, next);
     Ok(json!({"orientation": next.as_str()}))
 }
@@ -1273,10 +1383,6 @@ fn boot_many(udids: &[String], concurrency: usize, plan: &BootPlan) -> Vec<Value
     results.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn pids(udid: &str) -> Result<Vec<i32>, String> {
-    Ok(sim_debug::process::collect(udid)?.iter().map(|p| p.pid).collect())
-}
-
 /// Rejects a `create` whose device type isn't the requested form factor. CarPlay (auto) is valid
 /// for iOS but isn't a device type of its own.
 fn check_form_factor(ctx: &Context, device_type: &str, form_factor: FormFactor) -> Result<(), String> {
@@ -1398,7 +1504,13 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "screenshot" => screenshot_result(&capture(s, p)?, p),
         m if INPUT_METHODS.contains(&m) => input(s, m, p),
         "rotate" => rotate(&s.device(p)?, opt_orientation(p)?),
-        "fold" => crate::duo::fold(&s.device(p)?, p),
+        "fold" => {
+            let device = s.device(p)?;
+            TURNS.fetch_add(1, Ordering::AcqRel);
+            let folded = crate::duo::fold(&device, p);
+            TURNS.fetch_add(1, Ordering::AcqRel);
+            folded
+        }
         "carplay" => {
             let on = need_bool(p, "on")?;
             s.device(p)?.set_carplay(on).map_err(err)?;
@@ -1512,19 +1624,14 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             Ok(json!({"pid": out.pid, "stdout": out.stdout, "stderr": out.stderr}))
         }
         "logs" => logs(s, p),
-        "processes" => serde_json::to_value(sim_debug::process::collect(&s.device(p)?.info().udid)?).map_err(err),
+        "processes" => serde_json::to_value(processes_in(&device_tree(&s.device(p)?.info().udid)?)).map_err(err),
         "kill" => {
             let pid = p.get("pid").and_then(Value::as_i64).ok_or("missing number parameter `pid`")?;
             let signal = p.get("signal").and_then(Value::as_i64).unwrap_or(15);
-            let udid = s.device(p)?.info().udid;
-            if !pids(&udid)?.contains(&(pid as i32)) {
-                return Err(format!("pid {pid} is not a process of this device"));
-            }
-            let status = std::process::Command::new("/bin/kill").arg(format!("-{signal}")).arg(pid.to_string()).status().map_err(err)?;
-            if status.success() { Ok(Value::Null) } else { Err(format!("kill {pid} failed")) }
+            kill_in(&device_tree(&s.device(p)?.info().udid)?, pid, signal)
         }
-        "connections" => serde_json::to_value(sim_debug::net::connections(&pids(&s.device(p)?.info().udid)?)?).map_err(err),
-        "traffic" => serde_json::to_value(sim_debug::net::traffic(&pids(&s.device(p)?.info().udid)?)?).map_err(err),
+        "connections" => serde_json::to_value(connections_in(&device_tree(&s.device(p)?.info().udid)?)).map_err(err),
+        "traffic" => serde_json::to_value(sim_debug::net::traffic(&device_tree(&s.device(p)?.info().udid)?)?).map_err(err),
         "containers" => {
             let root = s.device(p)?.data_path();
             serde_json::to_value(sim_debug::storage::apps(Path::new(&root), p.get("sizes").and_then(Value::as_bool).unwrap_or(false)))
@@ -1682,7 +1789,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         }
         "audio_capture_start" => {
             let udid = s.device(p)?.info().udid;
-            let pid = sim_debug::process::launchd_sim_pid(&udid)?;
+            let pid = launchd_sim(&udid)?;
             let path = str_param(p, "path").map(std::path::PathBuf::from);
             let mute = p.get("mute").and_then(Value::as_bool).unwrap_or(false);
             let cap = sim_audio::Capture::start(pid, path.as_deref(), mute)?;
@@ -1703,7 +1810,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
                 if with_captures(|m| m.contains_key(&key)) {
                     return Ok(json!({"muted": true}));
                 }
-                let pid = sim_debug::process::launchd_sim_pid(&udid)?;
+                let pid = launchd_sim(&udid)?;
                 let cap = sim_audio::Capture::start(pid, None, true)?;
                 with_captures(|m| m.insert(key, cap));
             } else if let Some(cap) = with_captures(|m| m.remove(&key)) {
@@ -2022,6 +2129,285 @@ mod tests {
     }
 
     use super::*;
+
+    /// A session that stays open (as `simee serve`'s does) finds a device by UDID and name, then
+    /// misses it under its old name once another process renames it and under its UDID once that
+    /// deletes it: the lookup reads the service's live device set, never a copy of its own.
+    /// `SIMEE_E2E_CREATE=1 cargo test -p sim-api renamed_or_deleted -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "creates, renames and deletes a simulator (SIMEE_E2E_CREATE=1)"]
+    fn a_renamed_or_deleted_device_misses_the_session_lookup() {
+        if std::env::var_os("SIMEE_E2E_CREATE").is_none() {
+            return;
+        }
+        /// Deletes the test's simulator however the test ends.
+        struct Spare(String);
+        impl Drop for Spare {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("xcrun").args(["simctl", "delete", &self.0]).output();
+            }
+        }
+        let simctl = |args: &[&str]| {
+            let out = std::process::Command::new("xcrun").arg("simctl").args(args).output().expect("simctl");
+            assert!(out.status.success(), "simctl {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        /// How long `ok` held after the change, polling: the service tells this process about
+        /// another's change asynchronously.
+        fn settles(mut ok: impl FnMut() -> bool) -> Duration {
+            let start = std::time::Instant::now();
+            while !ok() {
+                assert!(start.elapsed() < Duration::from_secs(10), "still stale after 10 s");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            start.elapsed()
+        }
+        let mut s = Session::default();
+        let ctx = s.ctx().expect("service");
+        let ty = ctx.device_types().expect("types").into_iter().find(|t| t.product_family == "iPhone").expect("an iPhone type");
+        let runtime = ctx.runtimes().expect("runtimes").into_iter().rfind(|r| r.available && r.identifier.contains(".iOS-")).expect("iOS");
+        let (name, renamed) = (format!("simee-lookup-{}", std::process::id()), format!("simee-lookup-{}-renamed", std::process::id()));
+        let udid = ctx.create(&name, &ty.identifier, &runtime.identifier).expect("create").udid();
+        let _spare = Spare(udid.clone());
+        let lookup = |s: &mut Session, q: &str| s.device(&json!({"device": q})).map(|d| d.info());
+        let as_named = |s: &mut Session, q: &str| lookup(s, q).map(|i| (i.udid, i.name));
+        assert_eq!(as_named(&mut s, &udid), Ok((udid.clone(), name.clone())));
+        assert_eq!(as_named(&mut s, &udid.to_ascii_lowercase()), Ok((udid.clone(), name.clone())), "any case");
+        assert_eq!(as_named(&mut s, &name), Ok((udid.clone(), name.clone())));
+
+        simctl(&["rename", &udid, &renamed]);
+        let took = settles(|| lookup(&mut s, &name).is_err());
+        assert_eq!(lookup(&mut s, &name).map(|i| i.udid), Err(format!("no device matches `{name}`")));
+        assert_eq!(as_named(&mut s, &renamed), Ok((udid.clone(), renamed.clone())));
+        assert_eq!(as_named(&mut s, &udid), Ok((udid.clone(), renamed.clone())), "by UDID, the new name");
+        eprintln!("rename seen after {took:?}");
+
+        simctl(&["delete", &udid]);
+        let took = settles(|| lookup(&mut s, &udid).is_err());
+        assert_eq!(lookup(&mut s, &udid).map(|i| i.udid), Err(format!("no device matches `{udid}`")));
+        assert!(lookup(&mut s, &renamed).is_err());
+        eprintln!("delete seen after {took:?}");
+    }
+
+    /// `processes`, `connections`, `kill`, `network_state`'s `boot_injected` check and the audio
+    /// settings spawn nothing on the host. Measured in a process of its own (every child any test
+    /// thread reaps counts), by the summed lifetime of the children it waited for.
+    #[test]
+    fn device_introspection_spawns_nothing() {
+        let out = std::process::Command::new(std::env::current_exe().expect("exe"))
+            .args(["ios::tests::device_introspection_spawns_nothing_here", "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("SIMEE_SPAWN_CHECK", "1")
+            .output()
+            .expect("run the check");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    #[ignore = "run by device_introspection_spawns_nothing in a process of its own"]
+    fn device_introspection_spawns_nothing_here() {
+        if std::env::var_os("SIMEE_SPAWN_CHECK").is_none() {
+            return;
+        }
+        let me = std::process::id() as i32;
+        let reaped = || sim_coresim::procs::usage(me).expect("own usage").reaped_children_ns;
+        let before = reaped();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+        let port = listener.local_addr().expect("addr").port();
+        // This process as a device's tree: it is its root and has no children.
+        let tree = sim_coresim::procs::tree(me);
+        assert_eq!(tree, vec![me]);
+
+        let rows = processes_in(&tree);
+        assert_eq!(rows.len(), 1);
+        let exe = std::env::current_exe().expect("exe").canonicalize().expect("canonical");
+        assert_eq!((rows[0].pid, rows[0].ppid, Path::new(&rows[0].path)), (me, std::os::unix::process::parent_id() as i32, exe.as_path()));
+        assert!(rows[0].rss_kb > 0);
+        let conns = connections_in(&tree);
+        assert!(
+            conns.iter().any(|c| c.pid == me && c.protocol == "TCP" && c.local == format!("127.0.0.1:{port}") && c.state == "LISTEN"),
+            "{conns:?}"
+        );
+        assert_eq!(kill_in(&tree, i64::from(me), 0), Ok(Value::Null));
+        assert_eq!(kill_in(&tree, 1, 0), Err("pid 1 is not a process of this device".into()));
+        assert_eq!(kill_in(&tree, 1 << 40, 0), Err(format!("pid {} is not a process of this device", 1i64 << 40)));
+        assert!(kill_in(&tree, i64::from(me), 1 << 40).expect_err("bad signal").starts_with(&format!("kill {me} failed")));
+        assert!(!springboard_inserts(&tree, "/x/netshape.dylib"));
+        assert!(device_tree("00000000-0000-0000-0000-000000000000").expect_err("no device").contains("is the device booted?"));
+        let data = std::env::temp_dir().join(format!("simee-spawn-check-{me}"));
+        let settings = sim_audio::settings_path(&data);
+        std::fs::create_dir_all(settings.parent().expect("parent")).expect("dir");
+        std::fs::write(&settings, "<plist version=\"1.0\"><dict><key>sim_volume</key><integer>60</integer></dict></plist>").expect("write");
+        sim_audio::set_volume(&data, 30).expect("volume");
+        assert_eq!(sim_audio::settings(&data).expect("read")["sim_volume"], 30);
+        std::fs::remove_dir_all(&data).ok();
+
+        assert_eq!(reaped(), before, "a child was spawned and waited for");
+        assert!(sim_coresim::procs::children(me).is_empty(), "a child is still running");
+        // The check sees a spawn: one short child moves it.
+        std::process::Command::new("/usr/bin/true").status().expect("true");
+        assert!(reaped() > before);
+    }
+
+    /// The kernel's own records, for executable paths of every length mod 8 and an empty argv[0]:
+    /// the padding after the path is skipped exactly, so "" stays argv[0] and FOO stays in the
+    /// environment.
+    #[test]
+    fn procargs_of_live_processes_keep_an_empty_argv0() {
+        use std::os::unix::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!("simee-procargs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        for n in 1..=8 {
+            let link = dir.join("s".repeat(n));
+            std::os::unix::fs::symlink("/bin/sleep", &link).expect("symlink");
+            let mut child = std::process::Command::new(&link).arg0("").arg("30").env_clear().env("FOO", "bar").spawn().expect("spawn");
+            let pid = child.id() as i32;
+            // Read once exec has replaced the forked image (its path is the link's).
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let args = loop {
+                let a = sim_coresim::procs::procargs(pid).and_then(|b| sim_debug::process::ProcArgs::parse(&b));
+                if a.as_ref().is_some_and(|a| a.exec_path == link.to_str().expect("utf-8")) || std::time::Instant::now() > deadline {
+                    break a.expect("procargs");
+                }
+                sleep(Duration::from_millis(5));
+            };
+            child.kill().ok();
+            child.wait().ok();
+            assert_eq!(args.exec_path, link.to_str().expect("utf-8"));
+            assert_eq!(args.argv, vec![String::new(), "30".into()], "path of {} bytes", args.exec_path.len());
+            assert_eq!(args.var("FOO"), Some("bar"), "{args:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Records sim-debug's libproc fixtures from a booted device: its tree read through libproc
+    /// with `ps` (processes), and its sockets with `lsof` (connections), each between two reads
+    /// that agree. The user's home and every non-loopback address are rewritten.
+    /// `SIMEE_FIXTURE_UDID=<udid> SIMEE_FIXTURE_DIR=crates/sim-debug/fixtures cargo test -p sim-api
+    /// record_libproc_fixtures -- --ignored`; with `SIMEE_FIXTURE_INJECTED=1`, SpringBoard's
+    /// `KERN_PROCARGS2` record too (on a device booted with `network_shape {inject:"boot"}`).
+    #[test]
+    #[ignore = "records fixtures from a booted device (SIMEE_FIXTURE_UDID, SIMEE_FIXTURE_DIR)"]
+    fn record_libproc_fixtures() {
+        let (Ok(udid), Ok(dir)) = (std::env::var("SIMEE_FIXTURE_UDID"), std::env::var("SIMEE_FIXTURE_DIR")) else { return };
+        let dir = Path::new(&dir);
+        let home = std::env::var("HOME").expect("HOME");
+        let private = |s: &str| s.replace(&format!("{home}/"), "/Users/user/");
+        let run = |program: &str, args: &[&str]| {
+            String::from_utf8(std::process::Command::new(program).args(args).output().expect(program).stdout).expect("utf-8")
+        };
+
+        let read = || {
+            let tree = device_tree(&udid).expect("tree");
+            let samples: Vec<_> = tree.iter().filter_map(|&pid| sample(pid)).collect();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("now").as_secs();
+            (now, samples)
+        };
+        let pids = |s: &[sim_debug::process::Sample]| s.iter().map(|x| x.pid).collect::<std::collections::BTreeSet<_>>();
+        let (now, samples, ps) = (0..20)
+            .find_map(|_| {
+                let (now, a) = read();
+                let ps = run("/bin/ps", &["-Ao", "pid=,ppid=,pcpu=,rss=,etime=,comm="]);
+                let (_, b) = read();
+                (pids(&a) == pids(&b)).then_some((now, a, ps))
+            })
+            .expect("two reads agreed");
+        let tree = pids(&samples);
+        let mut tsv = format!("now {now}\n");
+        for s in &samples {
+            tsv.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\n", s.pid, s.ppid, s.cpu_usage, s.resident_bytes, s.start_s, private(&s.path)));
+        }
+        let ps: String = ps
+            .lines()
+            .filter(|l| l.split_whitespace().next().and_then(|p| p.parse().ok()).is_some_and(|p: i32| tree.contains(&p)))
+            .map(|l| format!("{}\n", private(l)))
+            .collect();
+        std::fs::write(dir.join("ios27.2-processes.libproc.tsv"), tsv).expect("write");
+        std::fs::write(dir.join("ios27.2-processes.ps.txt"), ps).expect("write");
+
+        let raw = || {
+            let tree = device_tree(&udid).expect("tree");
+            let mut out = Vec::new();
+            for &pid in &tree {
+                let name = sim_coresim::procs::name(pid).unwrap_or_default();
+                out.extend(sim_coresim::procs::sockets(pid).into_iter().map(|s| (pid, name.clone(), s)));
+            }
+            (tree, out)
+        };
+        let (sockets, lsof) = (0..20)
+            .find_map(|_| {
+                let (tree, a) = raw();
+                let list = tree.iter().map(i32::to_string).collect::<Vec<_>>().join(",");
+                let lsof = run("/usr/sbin/lsof", &["-nP", "-a", "-i", "-p", &list, "-F", "pcPnT"]);
+                let (_, b) = raw();
+                (a == b).then_some((a, lsof))
+            })
+            .expect("two reads agreed");
+        // Every address but loopback and unspecified ones, to documentation ranges, the same way
+        // in both files.
+        let mut map: std::collections::HashMap<std::net::IpAddr, std::net::IpAddr> = std::collections::HashMap::new();
+        let mut hide = |ip: std::net::IpAddr| {
+            if ip.is_loopback() || ip.is_unspecified() {
+                return ip;
+            }
+            let n = map.len() as u16 + 1;
+            *map.entry(ip).or_insert_with(|| match ip {
+                std::net::IpAddr::V4(_) => std::net::IpAddr::from([192, 0, 2, n as u8]),
+                std::net::IpAddr::V6(_) => std::net::IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, n]),
+            })
+        };
+        let mut hide_addr = |a: std::net::SocketAddr| std::net::SocketAddr::new(hide(a.ip()), a.port());
+        let mut tsv = String::new();
+        for (pid, name, s) in &sockets {
+            let (local, remote) = (hide_addr(s.local), hide_addr(s.remote));
+            tsv.push_str(&format!("{pid}\t{name}\t{}\t{}\t{local}\t{remote}\t{}\n", s.fd, s.protocol, s.tcp_state.unwrap_or(-1)));
+        }
+        let hide_endpoint = |e: &str, map: &std::collections::HashMap<std::net::IpAddr, std::net::IpAddr>| {
+            let (host, port) = e.rsplit_once(':').expect("host:port");
+            let ip: Option<std::net::IpAddr> = host.trim_start_matches('[').trim_end_matches(']').parse().ok();
+            match ip.and_then(|ip| map.get(&ip)) {
+                Some(std::net::IpAddr::V6(v6)) => format!("[{v6}]:{port}"),
+                Some(v4) => format!("{v4}:{port}"),
+                None => e.to_owned(),
+            }
+        };
+        let lsof: String = lsof
+            .lines()
+            .map(|l| match l.strip_prefix('n') {
+                Some(n) => format!("n{}\n", n.split("->").map(|e| hide_endpoint(e, &map)).collect::<Vec<_>>().join("->")),
+                None => format!("{l}\n"),
+            })
+            .collect();
+        std::fs::write(dir.join("ios27.2-connections.libproc.tsv"), tsv).expect("write");
+        std::fs::write(dir.join("ios27.2-connections.lsof.txt"), lsof).expect("write");
+
+        if std::env::var_os("SIMEE_FIXTURE_INJECTED").is_some() {
+            let tree = device_tree(&udid).expect("tree");
+            let sb = tree
+                .iter()
+                .copied()
+                .find(|&p| sim_coresim::procs::proc(p).is_some_and(|p| p.name() == "SpringBoard"))
+                .expect("SpringBoard");
+            let buf = sim_coresim::procs::procargs(sb).expect("procargs");
+            let args = sim_debug::process::ProcArgs::parse(&buf).expect("parse");
+            // The record's own layout, with only the variables the check reads (and the user's home
+            // rewritten): argc, the path, padding, argv, the environment, then apple[] dropped.
+            let mut out = (args.argv.len() as i32).to_ne_bytes().to_vec();
+            let path = private(&args.exec_path);
+            out.extend_from_slice(path.as_bytes());
+            // Its NUL and the kernel's padding to a multiple of 8 bytes.
+            out.resize(4 + (path.len() + 1).next_multiple_of(8), 0);
+            let keep = ["DYLD_INSERT_LIBRARIES=", "SIMEE_NETSHAPE=", "HOME=", "CFFIXED_USER_HOME=", "SIMULATOR_UDID="];
+            let env = args.env.iter().filter(|e| keep.iter().any(|k| e.starts_with(k)));
+            for s in args.argv.iter().chain(env) {
+                out.extend_from_slice(private(s).as_bytes());
+                out.push(0);
+            }
+            out.push(0);
+            std::fs::write(dir.join("ios27.2-springboard-injected.procargs"), out).expect("write");
+            eprintln!("SpringBoard {sb}: {:?}", args.var("DYLD_INSERT_LIBRARIES"));
+        }
+        eprintln!("{} processes, {} sockets recorded", samples.len(), sockets.len());
+    }
 
     mod log_streams {
         use std::cell::{Cell, RefCell};

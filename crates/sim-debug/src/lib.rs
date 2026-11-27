@@ -3,8 +3,9 @@
 //! host can see far more than the device's own tools expose: per-process CPU, memory, sockets and
 //! traffic, every app container, and crash reports.
 //!
-//! Parsers are pure and unit-tested; the `collect_*` functions run host tools (`ps`, `lsof`,
-//! `nettop`, `plutil`).
+//! Processes and sockets are built from what the caller read of the kernel through libproc
+//! (`sim_coresim::procs`): this crate has no FFI, and they spawn nothing. Traffic still runs the
+//! host's `nettop`, and app containers its `plutil`. Parsers and conversions are pure and unit-tested against recorded data.
 
 pub mod net;
 pub mod process;
