@@ -498,3 +498,89 @@ fn serving_lines_answers_each_and_drains_before_returning() {
     assert!(lines.iter().any(|l| l["id"] == 2 && l["result"]["structuredContent"].is_array()));
     assert!(lines.iter().any(|l| l["id"].is_null() && l["error"]["code"] == rpc::PARSE_ERROR));
 }
+
+#[test]
+fn response_lines_are_pinned_byte_for_byte() {
+    let fake = Arc::new(Fake::with_devices());
+    fake.answer("screen", Ok(json!({"width": 2, "height": 1})));
+    fake.answer("tap", Err("no device matches `nope`".into()));
+    let (tx, rx) = channel::<String>();
+    let tx = Mutex::new(tx);
+    let sink: Sink = Arc::new(move |line| drop(tx.lock().expect("tx").send(line)));
+    let meta = format!(r#"{{"{META_VERSION}":"{MODERN}"}}"#);
+    let input = [
+        format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"screen","arguments":{{"device":"phone"}},"_meta":{meta}}}}}"#),
+        format!(r#"{{"jsonrpc":"2.0","id":"b","method":"tools/call","params":{{"name":"tap","arguments":{{"x":1,"y":2}},"_meta":{meta}}}}}"#),
+        format!(r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"identity","_meta":{meta}}}}}"#),
+        r#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#.to_owned(),
+        "not json".to_owned(),
+    ]
+    .join("\n");
+    crate::serve(fake, std::io::Cursor::new(input), sink).expect("served");
+    let mut lines: Vec<String> = rx.try_iter().collect();
+    lines.sort();
+    let info = format!(r#""_meta":{{"{META_SERVER_INFO}":{{"name":"simee","version":"{}"}}}}"#, env!("CARGO_PKG_VERSION"));
+    let parse_error = serde_json::from_str::<Value>("not json").expect_err("bad").to_string();
+    let mut expected = vec![
+        format!(r#"{{"error":{{"code":-32700,"message":"parse error: {parse_error}"}},"id":null,"jsonrpc":"2.0"}}"#),
+        format!(
+            r#"{{"id":"b","jsonrpc":"2.0","result":{{{info},"content":[{{"text":"no device matches `nope`","type":"text"}}],"isError":true,"resultType":"complete"}}}}"#
+        ),
+        format!(
+            r#"{{"id":1,"jsonrpc":"2.0","result":{{{info},"content":[{{"text":"{{\"height\":1,\"width\":2}}","type":"text"}}],"resultType":"complete","structuredContent":{{"height":1,"width":2}}}}}}"#
+        ),
+        format!(r#"{{"id":3,"jsonrpc":"2.0","result":{{{info},"content":[{{"text":"ok","type":"text"}}],"resultType":"complete"}}}}"#),
+        r#"{"id":4,"jsonrpc":"2.0","result":{}}"#.to_owned(),
+    ];
+    expected.sort();
+    assert_eq!(lines, expected);
+}
+
+/// The median of 5 rounds of the mean microseconds per call of `f` (up to 20 000 calls or 300 ms a
+/// round).
+fn per_call_us(mut f: impl FnMut()) -> f64 {
+    let mut rounds: Vec<f64> = (0..5)
+        .map(|_| {
+            let start = Instant::now();
+            let mut n = 0;
+            while n < 20_000 && (n < 20 || start.elapsed() < Duration::from_millis(300)) {
+                f();
+                n += 1;
+            }
+            start.elapsed().as_secs_f64() * 1e6 / n as f64
+        })
+        .collect();
+    rounds.sort_by(f64::total_cmp);
+    rounds[2]
+}
+
+/// Where a `tools/call`'s time goes in this process, with `sim-api`'s real methods: parsing the
+/// line, the method, shaping its `CallToolResult`, writing the response line; then the whole
+/// request through the server (dispatch to a worker, reply through the sink).
+///     cargo test --release -p sim-mcp tool_call_overhead -- --ignored --nocapture
+#[test]
+#[ignore = "benchmark"]
+fn tool_call_overhead() {
+    let backend: Arc<dyn Backend> = Arc::new(crate::ApiBackend::new());
+    let (tx, rx) = channel::<String>();
+    let tx = Mutex::new(tx);
+    let sink: Sink = Arc::new(move |line| drop(tx.lock().expect("tx").send(line)));
+    let server = Server::new(backend.clone(), sink);
+    let meta = Rig::meta(false);
+    println!("{:<13} {:>8} {:>8} {:>8} {:>8} {:>8}  µs per call", "tool", "parse", "method", "result", "write", "server");
+    for tool in ["identity", "help", "form_factors"] {
+        let line = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": {}, "_meta": meta}})
+            .to_string();
+        let parse = per_call_us(|| drop(std::hint::black_box(rpc::parse(&line).expect("parse"))));
+        let method = per_call_us(|| drop(std::hint::black_box(backend.call(tool, &json!({})))));
+        let outcome = backend.call(tool, &json!({}));
+        let result = per_call_us(|| drop(std::hint::black_box(tools::result(tool, outcome.clone(), Era::Modern))));
+        let shaped = tools::result(tool, outcome.clone(), Era::Modern);
+        let write = per_call_us(|| drop(std::hint::black_box(json!({"jsonrpc": "2.0", "id": 1, "result": shaped}).to_string())));
+        let whole = per_call_us(|| {
+            server.handle_line(&line);
+            drop(rx.recv_timeout(WAIT).expect("reply"));
+        });
+        println!("{tool:<13} {parse:>8.2} {method:>8.2} {result:>8.2} {write:>8.2} {whole:>8.2}");
+    }
+}
