@@ -12,10 +12,14 @@
 //! - [`publisher`]: [`Publisher`], which drives str0m (sans-IO WebRTC: ICE, DTLS-SRTP, NACK/RTX,
 //!   TWCC) on one thread with one UDP socket and reports keyframe requests and bandwidth
 //!   estimates to the encoder through a callback.
+//! - [`datachannel`]: the `simee-input` data channel protocol: touch, keys, text, buttons,
+//!   rotation, fold posture and wheel from the viewer, validated, rate limited and coalesced, to
+//!   an [`InputSink`], with acks that echo the viewer's timestamp for latency measurement.
 //!
 //! No async runtime: the WHIP requests block the caller, and the media path is one thread per
 //! publisher that sleeps on its socket. Design notes and the plan: `docs/streaming.md`.
 
+pub mod datachannel;
 pub mod h264;
 pub mod http;
 pub mod publisher;
@@ -24,6 +28,7 @@ pub mod sdp;
 pub mod url;
 pub mod whip;
 
+pub use datachannel::{DisplayMap, InputConfig, InputEvent, InputSession, InputSink};
 pub use h264::{Profile, ProfileLevelId};
 pub use publisher::{BitrateSource, KeyframeKind, Publisher, PublisherConfig, PublisherEvent, Sent, crypto_available};
 pub use url::Url;

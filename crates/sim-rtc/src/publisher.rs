@@ -14,6 +14,11 @@
 //! estimation; keyframe requests (PLI/FIR, throttled) and estimates reach the encoder through the
 //! event callback, on the publisher's thread: keep it short.
 //!
+//! With [`Publisher::connect_with_input`] the offer also carries a reliable, ordered data channel
+//! labelled `simee-input` (a peer that opens one with that label is accepted too): the thread
+//! hands its messages to an [`InputSession`], which delivers events to the session's sink and
+//! answers on the channel (`docs/streaming.md`, "Input over a data channel").
+//!
 //! Dropping a publisher (or `close`) stops the thread and sends DELETE for the WHIP resource.
 
 use std::collections::hash_map::RandomState;
@@ -27,11 +32,13 @@ use std::time::{Duration, Instant};
 
 use str0m::bwe::{Bitrate, BweKind};
 use str0m::change::SdpAnswer;
+use str0m::channel::ChannelId;
 use str0m::media::{Direction, KeyframeRequestKind, MediaKind, Mid, Pt};
 use str0m::net::{Protocol, Receive};
 use str0m::rtp::RtpWrite;
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 
+use crate::datachannel::{self, InputSession, Reply};
 use crate::h264::{self, ParameterSets, ProfileLevelId};
 use crate::rtp::{self, Payload};
 use crate::sdp;
@@ -167,6 +174,22 @@ impl Publisher {
     /// Offer, POST, answer, connect. Returns once media can flow; on any failure after the POST
     /// the WHIP resource is deleted again.
     pub fn connect(config: PublisherConfig, on_event: impl FnMut(PublisherEvent) + Send + 'static) -> Result<Publisher> {
+        Self::open(config, None, Box::new(on_event))
+    }
+
+    /// [`connect`](Self::connect), with the `simee-input` data channel in the offer: the viewer's
+    /// input reaches `input`'s sink on the publisher's thread, and its replies go back on the
+    /// channel. A server must carry the channel to the viewer for this to do anything (a direct
+    /// peer does; MediaMTX relays media only).
+    pub fn connect_with_input(
+        config: PublisherConfig,
+        input: InputSession,
+        on_event: impl FnMut(PublisherEvent) + Send + 'static,
+    ) -> Result<Publisher> {
+        Self::open(config, Some(input), Box::new(on_event))
+    }
+
+    fn open(config: PublisherConfig, input: Option<InputSession>, on_event: Box<dyn FnMut(PublisherEvent) + Send>) -> Result<Publisher> {
         if config.mtu <= 2 {
             return Err(Error::InvalidInput(format!("MTU {} is too small", config.mtu)));
         }
@@ -192,6 +215,10 @@ impl Publisher {
         }
         let mut changes = rtc.sdp_api();
         let mid = changes.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        if input.is_some() {
+            // Reliable and ordered (str0m's default): a lost or reordered touch-up is a stuck finger.
+            changes.add_channel(datachannel::LABEL.into());
+        }
         let (offer, pending) = changes.apply().ok_or_else(|| Error::Rtc("str0m produced no offer".into()))?;
 
         let session = whip.publish(&offer.to_sdp_string())?;
@@ -216,7 +243,10 @@ impl Publisher {
             mid,
             pt: PT_H264.into(),
             seq: u64::from(random_u32() as u16),
-            on_event: Box::new(on_event),
+            on_event,
+            input,
+            input_channel: None,
+            replies: Vec::new(),
             keyframes: Throttle::new(config.keyframe_interval),
             max_bitrate: config.max_bitrate_bps,
             bwe: config.start_bitrate_bps.is_some(),
@@ -442,6 +472,11 @@ struct Driver {
     pt: Pt,
     seq: u64,
     on_event: Box<dyn FnMut(PublisherEvent) + Send>,
+    input: Option<InputSession>,
+    /// The open `simee-input` channel.
+    input_channel: Option<ChannelId>,
+    /// Replies waiting to be written to it.
+    replies: Vec<Reply>,
     keyframes: Throttle,
     max_bitrate: u64,
     bwe: bool,
@@ -467,6 +502,7 @@ impl Driver {
                     Err(TryRecvError::Empty) => break,
                 }
             }
+            self.poll_input(Instant::now());
             let Ok(mut deadline) = self.drain(&mut connected) else { break };
             if !self.rtc.is_alive() {
                 break;
@@ -476,6 +512,9 @@ impl Driver {
                 (self.on_event)(PublisherEvent::KeyframeRequested(kind));
             }
             if let Some(due) = self.keyframes.due() {
+                deadline = deadline.min(due);
+            }
+            if let Some(due) = self.input.as_ref().and_then(InputSession::next_due) {
                 deadline = deadline.min(due);
             }
             let wait = deadline.saturating_duration_since(now);
@@ -530,6 +569,27 @@ impl Driver {
         }
     }
 
+    /// Deliver coalesced moves that are due, and write their replies.
+    fn poll_input(&mut self, now: Instant) {
+        if let Some(input) = self.input.as_mut() {
+            input.poll(now, &mut self.replies);
+        }
+        self.write_replies();
+    }
+
+    /// Write the pending replies to the input channel. One the channel can't buffer is dropped:
+    /// replies are acks and errors, and a viewer that floods the channel loses its own.
+    fn write_replies(&mut self) {
+        if self.replies.is_empty() {
+            return;
+        }
+        let replies = std::mem::take(&mut self.replies);
+        let Some(mut channel) = self.input_channel.and_then(|id| self.rtc.channel(id)) else { return };
+        for reply in replies {
+            let _ = channel.write(false, reply.to_json().as_bytes());
+        }
+    }
+
     /// Send what str0m has queued and handle its events, until it wants time to pass.
     fn drain(&mut self, connected: &mut bool) -> Result<Instant, ()> {
         loop {
@@ -577,6 +637,21 @@ impl Driver {
             Event::EgressBitrateEstimate(BweKind::Remb { estimate, .. }) => {
                 (self.on_event)(PublisherEvent::BitrateEstimate { bps: estimate.as_u64(), source: BitrateSource::Remb });
             }
+            // Ours (str0m reports the channels it opened too) or one the peer opened with the label.
+            Event::ChannelOpen(id, label) if label == datachannel::LABEL && self.input_channel.is_none() => {
+                if let Some(input) = self.input.as_ref() {
+                    self.input_channel = Some(id);
+                    self.replies.push(input.hello());
+                    self.write_replies();
+                }
+            }
+            Event::ChannelData(data) if Some(data.id) == self.input_channel => {
+                if let Some(input) = self.input.as_mut() {
+                    input.receive(Instant::now(), data.binary, &data.data, &mut self.replies);
+                    self.write_replies();
+                }
+            }
+            Event::ChannelClose(id) if Some(id) == self.input_channel => self.input_channel = None,
             _ => {}
         }
     }

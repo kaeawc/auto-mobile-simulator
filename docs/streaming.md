@@ -30,6 +30,7 @@ publisher.send(&access_unit, pts)?; // Annex B, one picture
 | `rtp` | RFC 6184 packetization mode 1: single NAL unit packets and FU-A fragments at the MTU (1200 by default), the marker on each access unit's last packet, 90 kHz timestamps from the PTS; a depacketizer (also STAP-A) for tests and receivers |
 | `sdp` | The `profile-level-id` the answer settled on; trickle ICE fragments |
 | `publisher` | `Publisher`: str0m in RTP mode with one send-only H.264 format, one host candidate, the media thread, the keyframe-request throttle and the encoder callback |
+| `datachannel` | The `simee-input` data channel protocol: viewer input decoded and validated, rate limited, moves coalesced, handed to an `InputSink`; acks that echo the viewer's timestamp (see "Input over a data channel") |
 
 Rules it enforces:
 
@@ -153,6 +154,92 @@ env:
 Cache `$RUNNER_TEMP/mediamtx` with `actions/cache`, keyed on the version and the asset, restoring
 before the step and re-checking the hash after. The `linux` job needs `--features rust-crypto` for
 the publisher tests to run rather than skip (see "Linux in CI" below).
+
+### Input over a data channel (#271)
+
+`Publisher::connect_with_input(config, InputSession::new(sink, InputConfig::default()), on_event)`
+adds a reliable, ordered data channel labelled `simee-input` to the offer (an `m=application`
+section beside the video); a peer that opens a channel with that label itself is accepted too.
+Plain `connect` offers no channel. The channel's messages go to an `InputSession` on the
+publisher's thread, which hands validated events to an `InputSink` (`fn input(&mut self, &InputEvent)
+-> Result<(), String>`, also implemented for closures) and writes its replies back. Keep the sink
+short: it runs where the media is sent. Wiring a sink to a simee device (Android display-socket
+`touch`/`key`/`wheel`, iOS HID) is #266's.
+
+The channel only reaches a viewer whose peer connection ends at the publisher. MediaMTX relays
+tracks between WHIP and WHEP and, as far as its documentation says, not data channels; whether it
+accepts an offer with an `m=application` section at all hasn't been run against it yet (the
+MediaMTX harness publishes with plain `connect`). Input for a MediaMTX viewer likely needs a
+direct peer connection or a relay of its own: #266 decides.
+
+**Messages** are one compact JSON object per text frame. Every message has `"v":1` (the version)
+and a `kind`; `seq` (an integer) and `t` (the viewer's time in milliseconds, any clock, e.g.
+`performance.now()`) are optional and echoed back. Unknown fields are ignored, so a minor
+addition stays readable by this version.
+
+| `kind` | Fields | Notes |
+| --- | --- | --- |
+| `touch` | `phase` (`down`, `move`, `up`, `cancel`), `id` (pointer id), `x`, `y`, `w`, `h` | Multi-touch by `id` (up to 10 down). `x`/`y` in `0..=1` of the frame, `w`/`h` the frame size the viewer saw; `up`/`cancel` may omit the point and lift where the pointer last was |
+| `key` | `phase` (`down`, `up`), `usage` or `key` | `usage`: a USB HID keyboard-page usage (`0x04..=0xe7`). `key`: a browser name, a `KeyboardEvent.code` (`KeyA`, `Digit1`, `ArrowLeft`, `ShiftLeft`, `F5`) or a layout-free `KeyboardEvent.key` (`Enter`, `Escape`, `Backspace`, `Tab`, `" "`, `Shift`); turned into the usage |
+| `text` | `text` | Typed as it is (an IME commit, a paste) |
+| `button` | `button` (`home`, `power`, `volume_up`, `volume_down`, `back`, `app_switch`, `menu`, `assistant`), `phase` (`down`, `up`, `press`; default `press`) | The sink refuses buttons its device lacks |
+| `rotate` | `orientation` (`portrait`, `landscape_left`, `landscape_right`, `portrait_upside_down`) | |
+| `fold` | `posture` (`closed`, `half_open`, `open`, `flipped`, `tent`) | The Android emulator's postures |
+| `wheel` | `x`, `y`, `w`, `h`, `dx`, `dy` | Deltas in pixels of the frame the viewer saw (a `WheelEvent` in pixel mode), positive right and down |
+| `ping` | | Answered with `pong` at once |
+
+```json
+{"v":1,"seq":7,"t":5123.4,"kind":"touch","phase":"down","id":0,"x":0.5,"y":0.25,"w":590,"h":1280}
+```
+
+**Replies**, the same shape:
+
+| `kind` | Fields | When |
+| --- | --- | --- |
+| `hello` | `protocol` (`simee-input`), `versions` (`[1]`) | Once, when the channel opens |
+| `ack` | `seq`, `t`, `rx`, `done` | An input message that carried `t`, once the sink took it: `rx` is its arrival and `done` the sink's return, Unix milliseconds on the server's clock |
+| `pong` | `seq`, `t`, `rx` | Every `ping` |
+| `error` | `seq` (when readable), `code`, `message` | A refused message; the session carries on |
+
+Error codes: `encoding` (a binary frame or not UTF-8), `json`, `size` (over 4096 bytes), `version`
+(no `v`, or not 1), `kind`, `field` (missing, wrong type or out of range: a coordinate outside
+`0..=1`, a frame side of 0 or over 16384, a usage outside the keyboard page), `pointer` (a move or
+lift for a pointer that isn't down, a second down, an eleventh pointer), `rate`, `sink` (the sink's
+own refusal: a button the device lacks, a stale frame). Nothing a viewer sends panics the session:
+the JSON reader is the crate's own (sim-rtc has no serde), bounded in depth and size.
+
+**Rate limits and coalescing.** Messages pass a token bucket (1000 per second, bursts of 200);
+beyond it they are dropped with one `rate` error per second. At most one move per pointer per
+`min_move_interval` (8 ms) reaches the sink; moves inside it are replaced by the latest, which is
+delivered when the interval ends or before any other event, so order is kept: a lift always
+follows the last position. A move replaced before delivery is not acked; the one that replaced it
+is. The pointer is freed on `up`/`cancel` even when the sink refuses it, so a finger never sticks.
+
+**Coordinates.** A point is normalised to the stream frame and carries the size the viewer saw, so
+the encoder's downscale (the longest side capped, e.g. at 1280: an iPhone's 1179x2556 is streamed
+as 590x1280) and the size the page shows the video at don't matter. `DisplayMap::new(w, h)` (the
+device's framebuffer size) maps it: `to_device(&point)` is the device pixel, clamped inside the
+display, and refuses a point from a frame of another shape (`StaleFrame`: the device rotated while
+the input was in flight) rather than stretching it; `delta_to_device` scales wheel deltas;
+`stream_size(Some(1280))` predicts the encoder's frame (the rule of `simee-encode`'s
+`output_size`).
+
+**Latency.** `t` echoed with `rx` and `done` gives the viewer the channel's round trip (`pong`) and
+when its input reached the device's input path (`ack`), on the server's clock. Input-to-photon is
+that plus the time to the first frame showing the change, which needs the video side: #268 and
+#270.
+
+**Tests.** `src/datachannel.rs` unit tests: every kind round-trips through JSON, browser-written
+JSON decodes (named keys, surrogate pairs, exponents), every refusal has its code and `seq`, the
+mapping through the downscale and the stale-frame refusal, coalescing per pointer with order kept,
+acks and pongs, the rate limit, and a refused lift still freeing its pointer. `tests/datachannel.rs`
+runs the publisher (the offerer) against a str0m answerer behind the fake WHIP server over loopback
+UDP: the answerer sees the channel open and the `hello`, sends a script of touches, keys, text,
+buttons, rotation, fold and wheel plus refused messages and a `ping`, and the fake sink gets the
+events in order (moves coalesced) while each `t` comes back in an `ack` or the `pong` (a few
+milliseconds round trip on loopback), with video flowing beside the channel. A plain `connect`
+offers no channel. The Chromium test (a real browser tapping a button through the channel and
+seeing the result in the video, with input-to-photon measured) belongs with #268.
 
 ## `sim-encode`: the encoder
 
@@ -306,4 +393,4 @@ read by `simee-rtc`'s parser.
 | #268 | Chromium WHEP playback tests: first frame, pixel change, late join, stage timings |
 | #269 | WHEP tests on every form factor |
 | #270 | Latency, encode cost and bitrate per form factor, against AutoMobile |
-| #271 | Input from the browser over a data channel |
+| #271 | Input from the browser over a data channel: the `simee-input` protocol and `InputSink` in `sim-rtc` (wiring to devices is #266, the browser test #268) |
