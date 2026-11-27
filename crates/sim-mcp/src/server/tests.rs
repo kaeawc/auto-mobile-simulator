@@ -29,7 +29,13 @@ impl Rig {
     }
 
     fn serving(toolsets: Toolsets) -> Rig {
+        Rig::over(toolsets, |fake| fake)
+    }
+
+    /// A server of every tool whose backend is `wrap` of the fake.
+    fn over(toolsets: Toolsets, wrap: impl FnOnce(Arc<Fake>) -> Arc<dyn Backend>) -> Rig {
         let fake = Arc::new(Fake::with_devices());
+        let backend = wrap(fake.clone());
         let timing = Timing { watch: Duration::from_millis(20), heartbeat: Duration::from_millis(40) };
         let (tx, rx) = channel::<String>();
         let tx = Mutex::new(tx);
@@ -44,7 +50,7 @@ impl Rig {
             });
             vrx
         };
-        Rig { server: Server::with_timing(fake.clone(), sink, timing, toolsets), fake, rx, notes: RefCell::default(), next: Cell::new(1) }
+        Rig { server: Server::with_timing(backend, sink, timing, toolsets), fake, rx, notes: RefCell::default(), next: Cell::new(1) }
     }
 
     fn meta(tasks: bool) -> Value {
@@ -450,6 +456,181 @@ fn no_progress_follows_the_response() {
     let lines = lock(&lines).clone();
     assert!(lines.first().is_some_and(|l| l.contains("notifications/progress")), "{lines:?}");
     assert_eq!(lines.last().map(String::as_str), Some("response"), "no progress after the response: {lines:?}");
+}
+
+/// A backend that reports steps as `sim-api`'s long methods do: `before` as the call starts, then
+/// the fake (and its gate), then `after`.
+struct Stepping {
+    fake: Arc<Fake>,
+    before: Vec<(u64, u64, &'static str)>,
+    after: Vec<(u64, u64, &'static str)>,
+}
+
+impl Backend for Stepping {
+    fn call(&self, method: &str, params: &Value) -> Result<Value, String> {
+        for (done, total, message) in &self.before {
+            sim_api::call_step("booting", *done, *total, *message);
+        }
+        let r = self.fake.call(method, params);
+        if !sim_api::call_cancelled() {
+            for (done, total, message) in &self.after {
+                sim_api::call_step("booted", *done, *total, *message);
+            }
+        }
+        r
+    }
+}
+
+fn stepping_rig() -> Rig {
+    Rig::over(Toolsets::all(), |fake| {
+        Arc::new(Stepping {
+            fake,
+            before: vec![(0, 8, "booting d0, d1, d2, d3; 0 of 8 done")],
+            after: vec![(4, 8, "4 of 8 done"), (8, 8, "8 of 8 done")],
+        })
+    })
+}
+
+/// Every progress before `id`'s response, and the response; none may follow it.
+fn progress_until(rig: &Rig, id: u64) -> (Vec<Value>, Value) {
+    let response = rig.response(id);
+    let progress: Vec<Value> = rig.notes.take().into_iter().filter(|n| n["method"] == "notifications/progress").collect();
+    assert!(rig.quiet(), "no progress after the response: {:?}", rig.notes.borrow());
+    (progress, response)
+}
+
+#[test]
+fn a_long_calls_steps_are_its_progress_with_a_total_and_beats_between_them_only_increase() {
+    let rig = stepping_rig();
+    let gate = rig.fake.gate("boot_many");
+    let mut params = json!({"name": "boot_many", "arguments": {"devices": ["d0", "d1", "d2", "d3"]}});
+    params["_meta"] = Rig::meta(false);
+    params["_meta"]["progressToken"] = json!("t1");
+    let id = rig.send_raw("tools/call", params);
+    // The first step at once, then heartbeats partway to the next device while the wave boots.
+    let first = rig.notification("notifications/progress");
+    assert_eq!((first["params"]["progress"].as_f64(), first["params"]["total"].as_u64()), (Some(0.0), Some(8)), "{first}");
+    assert_eq!(first["params"]["message"], "boot_many: booting d0, d1, d2, d3; 0 of 8 done");
+    let beat = rig.notification("notifications/progress");
+    let between = beat["params"]["progress"].as_f64().expect("progress");
+    assert!(between > 0.0 && between < 1.0 && beat["params"]["total"] == 8, "{beat}");
+    assert!(
+        beat["params"]["message"].as_str().is_some_and(|m| m.starts_with("boot_many is still running (") && m.ends_with("0 of 8 done"))
+    );
+    gate.release();
+    let (progress, response) = progress_until(&rig, id);
+    assert_eq!(response["result"]["resultType"], "complete");
+    let values: Vec<f64> = progress.iter().map(|p| p["params"]["progress"].as_f64().expect("progress")).collect();
+    assert!(values.windows(2).all(|w| w[0] < w[1]) && values.first().is_none_or(|v| *v > between), "{values:?}");
+    assert_eq!(values.last(), Some(&8.0), "{values:?}");
+    assert!(progress.iter().all(|p| p["params"]["total"] == 8 && p["params"]["progressToken"] == "t1"), "{progress:?}");
+    // With no token, no progress at all.
+    rig.fake.gates.lock().expect("gates").clear();
+    rig.modern("tools/call", json!({"name": "boot_many", "arguments": {"devices": ["d0"]}}));
+    assert!(rig.quiet(), "{:?}", rig.notes.borrow());
+}
+
+#[test]
+fn an_older_clients_long_call_hears_the_same_progress() {
+    let rig = stepping_rig();
+    let id = rig.send_raw("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    rig.response(id);
+    let id = rig.send_raw("tools/call", json!({"name": "boot_many", "arguments": {"devices": ["d0"]}, "_meta": {"progressToken": 7}}));
+    let (progress, response) = progress_until(&rig, id);
+    assert_eq!(response["result"].get("resultType"), None, "the older shape");
+    // The steps (a heartbeat may fall between them on a slow host, partway to the next).
+    let counts: Vec<(f64, u64)> = progress
+        .iter()
+        .map(|p| (p["params"]["progress"].as_f64().unwrap_or(-1.0), p["params"]["total"].as_u64().unwrap_or(0)))
+        .filter(|(p, _)| p.fract() == 0.0)
+        .collect();
+    assert_eq!(counts, [(0.0, 8), (4.0, 8), (8.0, 8)]);
+}
+
+#[test]
+fn a_tasks_status_says_its_step_and_a_cancelled_boot_many_keeps_the_devices_done() {
+    let rig = stepping_rig();
+    let gate = rig.fake.gate("boot_many");
+    // What boot_many returns once it has stopped: the devices done, the rest cancelled.
+    let partial =
+        json!({"cancelled": true, "failed": 4, "devices": [{"device": "d0", "boot_s": 9.0}, {"device": "d4", "error": "cancelled"}]});
+    rig.fake.answer("boot_many", Ok(partial));
+    let created = rig.with_tasks("tools/call", json!({"name": "boot_many", "arguments": {"devices": ["d0", "d4"]}}));
+    let id = created["result"]["taskId"].as_str().expect("task id").to_owned();
+    let deadline = Instant::now() + WAIT;
+    let message = loop {
+        let m = rig.modern("tasks/get", json!({"taskId": id}))["result"]["statusMessage"].as_str().unwrap_or("").to_owned();
+        if m.ends_with("0 of 8 done") || Instant::now() > deadline {
+            break m;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        message.starts_with("boot_many has been running for ") && message.ends_with(": booting d0, d1, d2, d3; 0 of 8 done"),
+        "{message}"
+    );
+    rig.modern("tasks/cancel", json!({"taskId": id}));
+    gate.release();
+    let task = loop {
+        let task = rig.modern("tasks/get", json!({"taskId": id}))["result"].clone();
+        if task.get("result").is_some() || Instant::now() > deadline {
+            break task;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(task["status"], "cancelled");
+    assert_eq!(task["result"]["structuredContent"]["devices"][0]["device"], "d0", "the device done is returned: {task}");
+    assert!(task["statusMessage"].as_str().is_some_and(|m| m.contains("returned what it had done")), "{task}");
+}
+
+#[test]
+fn progress_values_only_increase_whichever_comes_first() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink: Sink = {
+        let lines = lines.clone();
+        Arc::new(move |line| lock(&lines).push(line))
+    };
+    let values = |lines: &Mutex<Vec<String>>| -> Vec<(f64, Option<u64>)> {
+        lock(lines)
+            .iter()
+            .map(|l| serde_json::from_str::<Value>(l).expect("json"))
+            .map(|v| (v["params"]["progress"].as_f64().unwrap_or(-1.0), v["params"]["total"].as_u64()))
+            .collect()
+    };
+    let step = |done, total| crate::tasks::Note { done, total: Some(total), message: format!("{done} of {total} done"), counted: true };
+    // Seconds first (a long admission wait): it stays in seconds, so a step can't go backwards.
+    let beat = heartbeat_with(sink.clone(), json!("a"), "boot_many".into(), Duration::from_secs(3600), || {});
+    {
+        let mut r = lock(&beat.report);
+        r.start -= Duration::from_secs(30);
+        r.beat(None);
+        r.step(&step(1, 8));
+        r.beat(Some("1 of 8 done".into()));
+    }
+    drop(beat);
+    assert_eq!(values(&lines), [(30.0, None)], "the step and a beat in the same second aren't sent");
+    lock(&lines).clear();
+    // A step first: counted, beats move partway to the next unit, the next step jumps past them.
+    let beat = heartbeat_with(sink, json!("b"), "boot_many".into(), Duration::from_secs(3600), || {});
+    {
+        let mut r = lock(&beat.report);
+        r.step(&step(0, 2));
+        for _ in 0..3 {
+            r.beat(None);
+        }
+        r.step(&step(1, 2));
+        r.beat(None);
+        r.step(&step(1, 2));
+    }
+    let steps = beat.steps();
+    drop(beat);
+    steps(&step(2, 2));
+    let v = values(&lines);
+    assert_eq!(v.iter().map(|(_, t)| *t).collect::<Vec<_>>(), vec![Some(2); 6], "{v:?}");
+    let p: Vec<f64> = v.iter().map(|(p, _)| *p).collect();
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    assert!(near(p[0], 0.0) && near(p[1], 0.45) && near(p[4], 1.0) && near(p[5], 1.45), "{p:?}");
+    assert!(p.windows(2).all(|w| w[0] < w[1]) && p[3] < 0.9, "{p:?}");
 }
 
 #[test]

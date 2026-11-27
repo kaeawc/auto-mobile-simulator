@@ -276,23 +276,52 @@ A client that declares `io.modelcontextprotocol/tasks` gets a task, instead of a
 has `resultType: "task"`, a `taskId`, `pollIntervalMs` (1 s) and `ttlMs` (an hour). The methods are
 a list in `crates/sim-mcp/src/tools.rs`; every other tool answers inline.
 
-- `tasks/get` returns the task: `working` (with `statusMessage` saying how long it has run),
-  then `completed` with the tool's result in `result`, or `failed` with a JSON-RPC `error`.
-  `failed` is for the server's own failures; a tool that returns `isError: true` completes, as the
-  extension specifies.
-- `notifications/tasks` carries the whole task when it ends, to a client that listened for its id
-  (`subscriptions/listen` with `taskIds`).
-- `tasks/cancel` is cooperative, as the extension allows. The task is `cancelled` at once and its
-  result is discarded, but the API can't interrupt a device call that is already running, so a
-  cancelled `boot` still finishes booting the device in the background. The status message says
-  so. A call that is only waiting for the host to admit its devices (`admission: "wait"`) does
-  stop: it sees the cancel within a second and starts nothing. While it waits, the task's status
-  message (and a progress message, for a client without tasks) says what it waits on.
+- `tasks/get` returns the task: `working` (with `statusMessage` saying how long it has run and
+  the call's last step, below), then `completed` with the tool's result in `result`, or `failed`
+  with a JSON-RPC `error`. `failed` is for the server's own failures; a tool that returns
+  `isError: true` completes, as the extension specifies.
+- `notifications/tasks` carries the whole task when it ends, and at each step while it works, to a
+  client that listened for its id (`subscriptions/listen` with `taskIds`).
+- `tasks/cancel` (and `notifications/cancelled`, for a blocked call) is cooperative, as the
+  extension allows: the task is `cancelled` at once, and the call stops at its next safe point,
+  undoing what it had half done:
+  - `boot_many` starts no more devices and shuts down, within a second, those it was booting that
+    it had started (one that was running already is left running). Its result has the devices that
+    finished, a reason for every other one and `cancelled: true`, and the cancelled task keeps it
+    as its `result`.
+  - `boot` shuts down the device it was booting, if it started it.
+  - `create`, `clone` and `import` delete the device they made, if the cancel came while they ran.
+  - A call waiting for the host to admit its devices (`admission: "wait"`) stops waiting and starts
+    nothing.
+  - `install`, `erase`, `settle`, `shutdown`, `export` and the memory tools stop only before they
+    start (an install after measuring its bundle): once running they can't be interrupted, finish
+    in the background, and their result is discarded.
+
+  The status message says which applies.
+
+### Progress
+
+A long call reports its steps as `sim-api` reaches them: `boot_many` the devices done of all
+(`booting d0, d1; 2 of 8 done`), `boot`, `create`, `clone` and the other long methods their phases
+(`install`: checking, then installing with the bundle's size, 0 to 2). A client that gave a
+progress token on a blocked call gets each step as `notifications/progress` with `progress` and
+`total` in those units (devices, phases), at once; between steps a heartbeat every 2 s keeps it
+informed (and its timeout reset) with a value partway to the next unit, so the value only
+increases. A call that counts nothing, or whose first progress was a heartbeat, reports seconds
+instead (`progress` is the seconds it has run, no `total`). Nothing is sent after the response. A
+task's steps are its `statusMessage`. The older revisions get the same notifications.
+
+`boot_many` with a watcher (an MCP client) boots in waves of `concurrency`, one backend
+`boot_many` per wave, so it can report each wave and stop between them; a wave waits for its
+slowest device before the next starts, where an unwatched call (the CLI, the socket API) starts
+the next device as soon as any finishes. Per-device steps inside a wave (settled, created), bytes
+for `install`, `export` and `import`, and stopping a `settle` or a memory tool mid-run need hooks
+in the backends (`ios.rs`, `sim-android`, `memtools.rs`) and are not here yet.
 - A `boot`, `boot_many`, `create` or `clone` result carries `admission` (and `pacing`) in
   `structuredContent` only; the text is one line, such as `ok (admit)`, so it doesn't repeat them.
 - At most 8 task calls run at once; a ninth is refused with a tool error until one ends. A
-  cancelled task's call keeps running, so it still counts: cancelling doesn't make room. Finished
-  tasks are kept for an hour.
+  cancelled task's call counts until it has stopped (an install until it ends), so cancelling
+  makes room only as calls stop. Finished tasks are kept for an hour.
 - `tasks/update` only acknowledges: nothing a simee task does needs the client's input.
 
 `provision` (SDK downloads) and recording are not API methods, so they are not tools or tasks yet;
@@ -419,7 +448,9 @@ takes milliseconds). Reproduce: `cargo test --release -p simee-mcp http_call_ove
 
 - Completions, logging, sampling and elicitation are not offered; the specification deprecates
   three of them.
-- Cancelling a task doesn't stop a running device call (above).
+- Cancelling stops `boot`, `boot_many`, `create`, `clone` and `import` at their next safe point
+  and undoes what they half did; it doesn't stop an install, erase, settle or memory tool already
+  running (above).
 - The change notifications are polled, once a second, and only for what a client subscribed to.
 - Over HTTP: no TLS, no OAuth (a bearer token from a file is the only authentication; both are
   tracked in a follow-up issue), no resumable streams, and an `Origin` allowlist beyond loopback
