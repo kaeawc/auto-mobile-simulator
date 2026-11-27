@@ -127,3 +127,45 @@ right-hand panel has five debug tabs (Device, Network, Storage, Processes, Logs)
 stream from the emulator's display socket, and the panel shows the device and its live guest
 console.
 
+## Panes and settings
+
+The device list (left) and the panel (right) each have a drag handle on their inner edge:
+drag it to resize (180–420 points for the list, 280–600 for the panel, always leaving the
+screen at least 420), double-click it for the default width. ⌘⌥S hides and shows the list,
+⌘⌥I the panel. The headless scenes `sidebar-hidden`, `inspector-hidden`, `panes-hidden` and
+`panes-wide` show them.
+
+The window keeps its layout in a small versioned JSON file (`desktop/src/settings.rs`):
+`~/Library/Application Support/simee/desktop.json` on macOS, `$XDG_CONFIG_HOME/simee/` (or
+`~/.config/simee/`) on Linux, `%APPDATA%\simee\` on Windows; `SIMEE_DESKTOP_SETTINGS` names
+another file. It holds the panes' widths and visibility, the last selected device and debug tab,
+the window's size and position, the screenshot folder (`screenshot_dir`; the Desktop when unset
+or missing), and the device list's collapsed groups, hidden devices and tools, order and
+favorites for the organization work that follows. It is read at start and written half a second
+after changes stop, and again as the window closes, through a temporary file renamed over it.
+A file that can't be read, isn't valid, or comes from a newer version falls back to the
+defaults with one line in the status bar. It is copied aside first
+(`desktop.json.<why>-<secs>.bak`) and never deleted; if even the copy fails, nothing is saved
+that session. Headless runs never read or write it.
+
+## Screenshot preview
+
+⌘S, or the toolbar's Screenshot button, saves the device's screen to the Desktop as a PNG, as
+before, on iOS and Android alike. ⌘S works wherever the focus is in the window. A thumbnail of
+the shot then slides up into the window's bottom-right corner, as the macOS screenshot preview
+does (`desktop/src/shot_preview.rs`):
+
+| Do | What happens |
+| --- | --- |
+| Nothing | It stays 5 s, then slides off to the right. The file stays saved |
+| Hover over it | It stays while the pointer is there, and for at least 1.5 s after |
+| Take more shots | They stack leftwards, newest in the corner, up to four. A fifth sends the oldest away |
+| Drag it into Finder, Mail, Slack, a browser upload… | It drops as the PNG file. The drag carries the file and the PNG data (Rune's `drag_out`). A drop the other app accepts dismisses the preview |
+| Click it | Opens the file in its default app (Preview) |
+| Right-click it | Open, Copy (the PNG to the pasteboard), Show in Finder, Delete (removes the file) |
+| Swipe right on it with two fingers | Dismisses it early |
+
+Under the system's reduced motion it appears and leaves without sliding. The window asks for
+frames only while a preview moves, plus one wake when the next one is due to leave. The
+`screenshot` and `android-screenshot` headless scenes show it settled.
+
