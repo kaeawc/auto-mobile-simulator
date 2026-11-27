@@ -119,8 +119,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95e45cf2980b2d467be49a9ed942c9179b701063a7ca3d037de7ee9bd67f8d66"
 dependencies = [
  "find-msvc-tools",
- "jobserver",
- "libc",
  "shlex",
 ]
 
@@ -458,17 +456,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "getrandom"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
-dependencies = [
- "cfg-if",
- "libc",
- "r-efi",
-]
-
-[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -574,16 +561,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jobserver"
-version = "0.1.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
-dependencies = [
- "getrandom",
- "libc",
-]
-
-[[package]]
 name = "js-sys"
 version = "0.3.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -622,16 +599,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
-name = "libzstd-rs-sys"
-version = "0.0.1-prerelease.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3d32cb930247d5359c4229b1a4c9244536a5402c9e9ed86451803450a47b25c"
-dependencies = [
- "cc",
- "libc",
-]
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -642,6 +609,12 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
+name = "lz4_flex"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f56455fff36934a9500d69062aec1c77037179b6f0669e4d5d6b72b84722d6a3"
 
 [[package]]
 name = "mach2"
@@ -895,12 +868,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "r-efi"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
-
-[[package]]
 name = "roxmltree"
 version = "0.21.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1046,11 +1013,11 @@ name = "sim-bundle"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "lz4_flex",
  "serde",
  "serde_json",
  "sim-core",
  "thiserror 2.0.21",
- "zstd",
 ]
 
 [[package]]
@@ -1481,32 +1448,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[package]]
-name = "zstd"
-version = "0.14.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "465cb081cac3a28a84ef547702dba1fe0f4a9f22e4e57a0b675ceee028c2af80"
-dependencies = [
- "zstd-safe",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "8.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b09bddd92c53b91833f4df03e0ea07e02d8367cfcd15a3b9acda94fc273f793"
-dependencies = [
- "zstd-sys",
-]
-
-[[package]]
-name = "zstd-sys"
-version = "2.2.0+zstd.1.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3f4089cda6dda4dc43c43dd9f8964140064fd2f752f3da46c3a483c3c175160"
-dependencies = [
- "cc",
- "libzstd-rs-sys",
- "pkg-config",
-]

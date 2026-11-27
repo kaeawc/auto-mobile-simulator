@@ -37,6 +37,21 @@ pub struct Imported {
     pub sysdir: String,
     pub extracted: Extracted,
     pub manifest: Manifest,
+    /// The bundle's `config.ini` keys the import left out because they hold host paths
+    /// (`sdcard.path`, which the stock emulator would attach read-write).
+    pub dropped: Vec<String>,
+    /// With `allow_mismatch`: the installed revision used instead of the bundle's.
+    pub mismatch: Option<String>,
+}
+
+/// The system image an import uses ([`Env::find_image`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoundImage {
+    pub dir: PathBuf,
+    /// Relative to the SDK root, with a trailing `/` (`image.sysdir.1`).
+    pub rel: String,
+    /// Set when only the revision matched (allowed by `allow_mismatch`): what differs.
+    pub mismatch: Option<String>,
 }
 
 /// The paths an AVD bundle may hold: its config, its boot properties and the simee disks.
@@ -106,8 +121,10 @@ impl Env {
 
     /// The installed system image that is `want` by content, as its directory and its path
     /// relative to the SDK root. Images of another API level, tag, ABI or revision aren't hashed.
-    /// None installed: an error naming the package and revision to install.
-    pub fn find_image(&self, want: &AndroidImage) -> Result<(PathBuf, String)> {
+    /// With `allow_mismatch`, an image that differs only in revision (same API level, tag and
+    /// ABI; the highest such revision) is used when none matches, and the result says so. None
+    /// installed: an error naming the package and revision to install.
+    pub fn find_image(&self, want: &AndroidImage, allow_mismatch: bool) -> Result<FoundImage> {
         let root = self.sdk_root.as_deref().ok_or_else(|| Error::Config("no Android SDK (set ANDROID_HOME)".into()))?;
         let dirs = |p: &Path| -> Vec<PathBuf> {
             let mut v: Vec<PathBuf> =
@@ -116,6 +133,8 @@ impl Env {
             v
         };
         let mut near = Vec::new();
+        // Same API level, tag and ABI, another revision: (revision, dir, rel).
+        let mut other_revisions: Vec<(String, PathBuf, String)> = Vec::new();
         for sysdir in dirs(&root.join("system-images")).iter().flat_map(|a| dirs(a)).flat_map(|t| dirs(&t)) {
             let Ok(text) = std::fs::read_to_string(sysdir.join("source.properties")) else { continue };
             let props = parse_ini(&text);
@@ -125,14 +144,26 @@ impl Env {
             }
             let rel = sysdir.strip_prefix(root).map(|p| p.display().to_string()).unwrap_or_default();
             if !is("Pkg.Revision", &want.revision) {
-                near.push(format!("{} is revision {}", package_of(&rel), props.get("Pkg.Revision").map_or("?", String::as_str)));
+                let revision = props.get("Pkg.Revision").cloned().unwrap_or_else(|| "?".into());
+                near.push(format!("{} is revision {revision}", package_of(&rel)));
+                other_revisions.push((revision, sysdir.clone(), rel));
                 continue;
             }
             let have = self.image_identity(&sysdir)?;
             if have.files == want.files && have.fingerprint == want.fingerprint {
-                return Ok((sysdir, format!("{rel}/")));
+                return Ok(FoundImage { dir: sysdir, rel: format!("{rel}/"), mismatch: None });
             }
             near.push(format!("{} is revision {} but its files differ", package_of(&rel), want.revision));
+        }
+        let numeric = |r: &str| r.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+        let another_revision = !other_revisions.is_empty();
+        if allow_mismatch && let Some((revision, dir, rel)) = other_revisions.into_iter().max_by_key(|(r, ..)| numeric(r)) {
+            let mismatch = format!(
+                "the bundle was made on {} revision {}; this host has revision {revision}, used instead",
+                package_of(&rel),
+                want.revision
+            );
+            return Ok(FoundImage { dir, rel: format!("{rel}/"), mismatch: Some(mismatch) });
         }
         let package = if want.package.is_empty() {
             format!("system-images;android-{};{};{}", want.api, want.tag, want.abi)
@@ -140,8 +171,9 @@ impl Env {
             want.package.clone()
         };
         let near = if near.is_empty() { String::new() } else { format!(" ({})", near.join("; ")) };
+        let allow = if another_revision && !allow_mismatch { "; or allow_mismatch to use the installed revision" } else { "" };
         Err(Error::Config(format!(
-            "no installed system image matches the bundle's (API {} {} {} revision {}, {}); install {package} revision {}{near}",
+            "no installed system image matches the bundle's (API {} {} {} revision {}, {}); install {package} revision {}{near}{allow}",
             want.api, want.tag, want.abi, want.revision, want.fingerprint, want.revision
         )))
     }
@@ -211,13 +243,18 @@ impl Env {
     }
 
     /// Imports the bundle at `from` as a new AVD `name`. The system image is found by identity
-    /// ([`Env::find_image`]) before anything is written; a bundle that isn't an AVD's (another
-    /// platform, a path outside `config.ini`, `boot.prop` and the simee disks) is refused. The
-    /// new `config.ini` names the AVD and points `image.sysdir.1` at the image relative to the
-    /// SDK root; the pointer `<name>.ini` is written last. Anything written is removed on an error.
+    /// ([`Env::find_image`], with `allow_mismatch` for a revision-only difference) before
+    /// anything is written; a bundle that isn't an AVD's (another platform, a path outside
+    /// `config.ini`, `boot.prop` and the simee disks) is refused. The bundle's `config.ini` is
+    /// untrusted: keys holding host paths are dropped ([`portable_config`]) and reported, it is
+    /// renamed to `name`, and `image.sysdir.1` points at the image relative to the SDK root.
+    ///
+    /// Everything is written into `<avd home>/.<name>.avd.partial` (a stale one from an
+    /// interrupted import is removed first), verified, then renamed to `<name>.avd`; the pointer
+    /// `<name>.ini` comes last. A failure at any step leaves nothing behind.
     ///
     /// The import keeps the guest identity of the AVD it came from ([`DUPLICATED_IDENTITY`]).
-    pub fn import_avd(&self, from: &Path, name: &str) -> Result<Imported> {
+    pub fn import_avd(&self, from: &Path, name: &str, allow_mismatch: bool) -> Result<Imported> {
         if !valid_avd_name(name) {
             return Err(Error::Config(format!("invalid AVD name '{name}' (letters, digits, . _ -)")));
         }
@@ -238,16 +275,22 @@ impl Env {
         if !m.files.iter().any(|f| f.path == "config.ini") {
             return Err(Error::Config("the bundle has no config.ini".into()));
         }
-        let (_, sysdir) = self.find_image(image)?;
+        let found = self.find_image(image, allow_mismatch)?;
+        let sysdir = found.rel.clone();
         let io = |p: &Path, e| Error::Io(p.to_path_buf(), e);
         std::fs::create_dir_all(&self.avd_home).map_err(|e| io(&self.avd_home, e))?;
-        std::fs::create_dir(&dir).map_err(|e| io(&dir, e))?;
-        let made = (|| -> Result<Extracted> {
-            let extracted = reader.extract(&dir)?;
-            let cfg = dir.join("config.ini");
-            let config: String = read(&cfg)?
+        let partial = self.avd_home.join(format!(".{name}.avd.partial"));
+        if partial.exists() {
+            std::fs::remove_dir_all(&partial).map_err(|e| io(&partial, e))?;
+        }
+        std::fs::create_dir(&partial).map_err(|e| io(&partial, e))?;
+        let mut placed = false;
+        let made = (|| -> Result<(Extracted, Vec<String>)> {
+            let extracted = reader.extract(&partial)?;
+            let cfg = partial.join("config.ini");
+            let (config, dropped) = portable_config(&read(&cfg)?);
+            let config: String = config
                 .lines()
-                .filter(|l| l.split_once('=').is_none_or(|(k, _)| !k.trim().starts_with("image.sysdir.")))
                 .map(|l| match l.split_once('=').map(|(k, _)| k.trim()) {
                     Some("AvdId") => format!("AvdId={name}\n"),
                     Some("avd.ini.displayname") => format!("avd.ini.displayname={name}\n"),
@@ -255,17 +298,28 @@ impl Env {
                 })
                 .collect();
             std::fs::write(&cfg, format!("{config}image.sysdir.1={sysdir}\n")).map_err(|e| io(&cfg, e))?;
+            // rename(2) replaces an empty directory: check again right before it.
+            if dir.exists() || pointer.exists() {
+                return Err(Error::Config(format!("AVD '{name}' already exists")));
+            }
+            std::fs::rename(&partial, &dir).map_err(|e| io(&dir, e))?;
+            placed = true;
             let target = format!("android-{}", image.api);
             let body = format!("avd.ini.encoding=UTF-8\npath={}\npath.rel=avd/{name}.avd\ntarget={target}\n", dir.display());
             std::fs::write(&pointer, body).map_err(|e| io(&pointer, e))?;
             self.load(name)?;
-            Ok(extracted)
+            Ok((extracted, dropped))
         })();
         match made {
-            Ok(extracted) => Ok(Imported { name: name.to_owned(), dir, sysdir, extracted, manifest: m }),
+            Ok((extracted, dropped)) => {
+                Ok(Imported { name: name.to_owned(), dir, sysdir, extracted, manifest: m, dropped, mismatch: found.mismatch })
+            }
             Err(e) => {
-                let _ = std::fs::remove_file(&pointer);
-                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_dir_all(&partial);
+                if placed {
+                    let _ = std::fs::remove_file(&pointer);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
                 Err(e)
             }
         }
@@ -365,7 +419,7 @@ mod tests {
             assert_eq!(ex.summary.zero_bytes, (1 << 20) + (1 << 20), "userdata's middle chunk and all of cache.img");
 
             let name = format!("copy-{}", to.replace('.', "-"));
-            let im = env.import_avd(&bundle, &name).expect("import");
+            let im = env.import_avd(&bundle, &name, false).expect("import");
             assert_eq!(im.sysdir, "system-images/android-36/google_apis/arm64-v8a/");
             let avd = env.load(&name).expect("load import");
             assert_eq!((avd.get("AvdId"), avd.get("avd.ini.displayname")), (Some(name.as_str()), Some(name.as_str())));
@@ -383,7 +437,7 @@ mod tests {
             assert!(!state_dir(&avd.dir).join("console.log").exists() && !avd.dir.join("userdata-qemu.img.qcow2").exists());
             let pointer = std::fs::read_to_string(env.avd_home.join(format!("{name}.ini"))).expect("pointer");
             assert!(pointer.contains(&format!("path.rel=avd/{name}.avd")) && pointer.contains("target=android-36"), "{pointer}");
-            assert!(env.import_avd(&bundle, &name).expect_err("twice").to_string().contains("already exists"));
+            assert!(env.import_avd(&bundle, &name, false).expect_err("twice").to_string().contains("already exists"));
         }
         let _ = std::fs::remove_dir_all(tmp);
     }
@@ -409,16 +463,72 @@ mod tests {
         // The image changes: same API, tag, ABI and revision, other contents.
         let sys = tmp.join("sdk/system-images/android-36/google_apis/arm64-v8a");
         std::fs::write(sys.join("system.img"), b"rebuilt").expect("write");
-        let err = env.import_avd(&tmp.join("b.tar"), "copy").expect_err("mismatch").to_string();
+        let err = env.import_avd(&tmp.join("b.tar"), "copy", false).expect_err("mismatch").to_string();
         assert!(err.contains("install system-images;android-36;google_apis;arm64-v8a revision 7") && err.contains("files differ"), "{err}");
         // Another revision installed instead.
         std::fs::write(sys.join("system.img"), b"system.img").expect("restore");
         let props = std::fs::read_to_string(sys.join("source.properties")).expect("props");
         std::fs::write(sys.join("source.properties"), props.replace("Pkg.Revision=7", "Pkg.Revision=8")).expect("props");
-        let err = env.import_avd(&tmp.join("b.tar"), "copy").expect_err("revision").to_string();
-        assert!(err.contains("revision 7") && err.contains("is revision 8"), "{err}");
+        let err = env.import_avd(&tmp.join("b.tar"), "copy", false).expect_err("revision").to_string();
+        assert!(err.contains("revision 7") && err.contains("is revision 8") && err.contains("allow_mismatch"), "{err}");
         assert!(!env.avd_home.join("copy.avd").exists() && !env.avd_home.join("copy.ini").exists(), "nothing written");
-        assert!(env.import_avd(&tmp.join("b.tar"), "../evil").is_err());
+        assert!(env.import_avd(&tmp.join("b.tar"), "../evil", false).is_err());
+        // allow_mismatch takes the other revision of the same API, tag and ABI, and says so.
+        let im = env.import_avd(&tmp.join("b.tar"), "copy", true).expect("revision allowed");
+        let mismatch = im.mismatch.expect("recorded");
+        assert!(mismatch.contains("revision 7") && mismatch.contains("revision 8"), "{mismatch}");
+        assert_eq!(env.load("copy").expect("load").get("image.sysdir.1"), Some("system-images/android-36/google_apis/arm64-v8a/"));
+        // ...but never another ABI (or API level, or tag).
+        std::fs::write(sys.join("source.properties"), props.replace("SystemImage.Abi=arm64-v8a", "SystemImage.Abi=x86_64")).expect("props");
+        assert!(env.import_avd(&tmp.join("b.tar"), "copy2", true).is_err());
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// The AVD home's entries other than `keep`, sorted.
+    fn home_entries(env: &Env, keep: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(&env.avd_home)
+            .expect("home")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !keep.contains(&n.as_str()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_failed_import_leaves_nothing_and_untrusted_config_loses_host_paths() {
+        let (tmp, env) = setup("atomic");
+        let keep = ["golden.avd", "golden.ini"];
+        let bundle = tmp.join("b");
+        env.export_avd("golden", &bundle, &Options::default()).expect("export");
+        // Corrupt one stored chunk of userdata: the import fails on its hash and leaves nothing,
+        // neither the AVD, its pointer nor the partial directory it extracted into.
+        let m = Reader::open(&bundle).expect("open").manifest().clone();
+        let h = m.disks[0].extents[0].hash.clone().expect("a stored chunk");
+        std::fs::write(bundle.join(sim_bundle::chunk_name(&h)), sim_bundle::compress(b"tampered")).expect("tamper");
+        let err = env.import_avd(&bundle, "copy", false).expect_err("corrupt");
+        assert!(err.to_string().contains("doesn't match its hash"), "{err}");
+        assert_eq!(home_entries(&env, &keep), Vec::<String>::new());
+        // A stale partial from an interrupted import doesn't block the next one.
+        let _ = std::fs::remove_dir_all(&bundle);
+        std::fs::create_dir_all(env.avd_home.join(".copy.avd.partial/simee")).expect("stale");
+        std::fs::write(env.avd_home.join(".copy.avd.partial/simee/userdata.img"), b"half").expect("stale");
+
+        // A bundle whose config.ini attaches a host file: dropped on import, and reported.
+        let crafted = tmp.join("crafted");
+        let cfg = tmp.join("avd/golden.avd/config.ini");
+        let text = std::fs::read_to_string(&cfg).expect("config");
+        let mut contents = Contents { disks: Vec::new(), files: Vec::new() };
+        contents.files.push(("config.ini".into(), format!("{text}sdcard.path=/etc/hosts\n").into_bytes()));
+        contents.disks.push(("simee/userdata.img".into(), state_dir(&tmp.join("avd/golden.avd")).join("userdata.img")));
+        let header = env.export_avd("golden", &tmp.join("plain.tar"), &Options::default()).expect("export").manifest;
+        sim_bundle::export(header, &contents, &crafted, &Options::default()).expect("crafted bundle");
+        let im = env.import_avd(&crafted, "copy", false).expect("import");
+        assert!(im.dropped.iter().any(|d| d.contains("sdcard.path")), "{:?}", im.dropped);
+        let avd = env.load("copy").expect("load");
+        assert!(avd.config.values().all(|v| !host_path(v)), "{:?}", avd.config);
+        assert_eq!(home_entries(&env, &keep), ["copy.avd", "copy.ini"], "the stale partial is gone");
         let _ = std::fs::remove_dir_all(tmp);
     }
 

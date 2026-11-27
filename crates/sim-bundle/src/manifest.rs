@@ -16,8 +16,9 @@ pub const FORMAT: u32 = 1;
 /// same boundaries, and a small chunk limits what one dirty block drags into a bundle.
 pub const CHUNK_SIZE: u64 = 1 << 20;
 
-/// The only chunk compression in format 1: each chunk is one zstd frame.
-pub const COMPRESSION: &str = "zstd";
+/// The only chunk compression in format 1: each chunk is one LZ4 block (no frame or size header;
+/// the manifest gives each chunk's length).
+pub const COMPRESSION: &str = "lz4";
 
 /// What `resume` means in format 1: the receiver boots the disks cold (no RAM state).
 pub const COLD_BOOT: &str = "cold-boot";
@@ -181,13 +182,19 @@ impl Manifest {
     /// Parses and [validates](Manifest::validate) `manifest.json`. The format is checked before
     /// anything else, so a newer major is refused as such rather than as malformed.
     pub fn parse(bytes: &[u8]) -> Result<Manifest> {
-        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| Error::Manifest(e.to_string()))?;
-        match value.get("format").and_then(serde_json::Value::as_u64) {
+        /// Only `format`: serde skips everything else without building it, so a hostile manifest
+        /// costs no more than its own bytes before it is refused.
+        #[derive(Deserialize)]
+        struct FormatOnly {
+            format: Option<u64>,
+        }
+        let only: FormatOnly = serde_json::from_slice(bytes).map_err(|e| Error::Manifest(e.to_string()))?;
+        match only.format {
             Some(f) if f == u64::from(FORMAT) => {}
             Some(f) => return Err(Error::Format(f)),
             None => return Err(Error::Manifest("no `format`".into())),
         }
-        let m: Manifest = serde_json::from_value(value).map_err(|e| Error::Manifest(e.to_string()))?;
+        let m: Manifest = serde_json::from_slice(bytes).map_err(|e| Error::Manifest(e.to_string()))?;
         m.validate()?;
         Ok(m)
     }

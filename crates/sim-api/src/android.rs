@@ -150,23 +150,18 @@ pub fn boot_many(s: &mut Session, p: &Value, udids: &[String]) -> Result<Value, 
         "unsettled": 0, "devices": devices}))
 }
 
-/// `export`'s `level`: zstd's, 1 (fastest) to 19 (smallest); default 3.
-fn zstd_level(p: &Value) -> Result<i32, String> {
-    match opt_u64(p, "level") {
-        None => Ok(3),
-        Some(n @ 1..=19) => Ok(n as i32),
-        Some(n) => Err(format!("level {n}: give a zstd level from 1 (fastest) to 19 (smallest)")),
-    }
-}
-
-/// `import`: the bundle at `from` as a new AVD `name`, its system image found by content. The
-/// result says that the import keeps the exported device's guest identity.
+/// `import`: the bundle at `from` as a new AVD `name`, its system image found by content (with
+/// `allow_mismatch`, another revision of it). The result says that the import keeps the exported
+/// device's guest identity, which `config.ini` keys it dropped, and any revision mismatch.
 pub fn import(s: &mut Session, p: &Value) -> Result<Value, String> {
     let (from, name) = (need_str(p, "from")?, need_str(p, "name")?);
-    let (info, im) = s.backend().import_avd(std::path::Path::new(from), name)?;
+    let allow_mismatch = opt_bool(p, "allow_mismatch")?.unwrap_or(false);
+    let (info, im) = s.backend().import_avd(std::path::Path::new(from), name, allow_mismatch)?;
     Ok(json!({
         "device": info,
         "system_image": im.sysdir,
+        "mismatch": im.mismatch,
+        "dropped": im.dropped,
         "extracted": im.extracted,
         "exported_as": im.manifest.device.name,
         "guest_identity": im.manifest.guest_identity,
@@ -206,7 +201,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
         }
         "export" => {
             let to = need_str(p, "to")?;
-            let ex = android.export_avd(&d, std::path::Path::new(to), zstd_level(p)?)?;
+            let ex = android.export_avd(&d, std::path::Path::new(to))?;
             let m = &ex.manifest;
             Ok(json!({
                 "device": d.info.udid,

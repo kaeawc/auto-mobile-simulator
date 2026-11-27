@@ -72,19 +72,21 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "export",
-        "device, to, level?",
+        "device, to",
         "Pack a shut-down device into a portable bundle at `to` (a .tar file, else a new directory) with no host path in it: \
-         manifest.json and content-addressed chunks (1 MiB, BLAKE3, each zstd at level 1-19, default 3; zero ranges stored as \
-         extents). Android: an AVD that has booted under simee (its simee disks, config.ini without host paths, boot.prop) and \
+         manifest.json and content-addressed chunks (1 MiB, BLAKE3, each LZ4-compressed; zero ranges stored as extents). \
+         Android: an AVD that has booted under simee (its simee disks, config.ini without host paths, boot.prop) and \
          its system image's identity; captures disks, not RAM (resume is a cold boot). Returns sizes, the identity and the \
          secrets inventory. iOS simulators: not yet (the next step of #170)",
     ),
     (
         "import",
-        "from, name",
+        "from, name, allow_mismatch?(false)",
         "Create device `name` from a bundle `export` wrote. Android: finds the system image by content (API, tag, ABI, revision, \
-         BLAKE3 of its images, fingerprint) and refuses, naming what to install, when none matches; checks every chunk and \
-         disk hash. The import keeps the exported device's guest identity (ro.serialno, android_id). iOS: not yet",
+         BLAKE3 of its images, fingerprint) and refuses, naming what to install, when none matches (allow_mismatch: use another \
+         installed revision of the same API, tag and ABI, named in `mismatch`); checks every chunk and disk hash; drops \
+         config.ini keys holding host paths (listed in `dropped`); writes nothing unless it all succeeds. The import keeps the \
+         exported device's guest identity (ro.serialno, android_id). iOS: not yet",
     ),
     ("shutdown", "device", "Shut down"),
     ("erase", "device", "Erase content and settings (shut down first)"),
@@ -937,15 +939,16 @@ mod tests {
         let disks = emu_avd::state_dir(&root.join("avd/golden.avd"));
         std::fs::create_dir_all(&disks).expect("simee");
         std::fs::write(disks.join("userdata.img"), b"settled").expect("userdata");
-        let bad = call(&mut s, "export", &json!({"device": "golden", "to": to, "level": 30})).expect_err("level");
-        assert!(bad.contains("level 30"), "{bad}");
-        let ex = call(&mut s, "export", &json!({"device": "golden", "to": to, "level": 19})).expect("export");
-        assert_eq!((ex["summary"]["form"].as_str(), ex["summary"]["level"].as_i64()), (Some("tar"), Some(19)));
+        let ex = call(&mut s, "export", &json!({"device": "golden", "to": to})).expect("export");
+        assert_eq!(ex["summary"]["form"].as_str(), Some("tar"));
         assert_eq!(ex["identity"]["android"]["api"], "36");
         assert_eq!((ex["captures"]["ram"].as_bool(), ex["resume"].as_str()), (Some(false), Some("cold-boot")));
         let im = call(&mut s, "import", &json!({"from": to, "name": "copy"})).expect("import");
         assert_eq!((im["device"]["udid"].as_str(), im["device"]["platform"].as_str()), (Some("copy"), Some("android")));
         assert_eq!((im["exported_as"].as_str(), im["guest_identity"]["on_import"].as_str()), (Some("golden"), Some("duplicated")));
+        assert_eq!((im["mismatch"].is_null(), im["dropped"].as_array().map(Vec::len)), (true, Some(0)));
+        let bad = call(&mut s, "import", &json!({"from": to, "name": "copy3", "allow_mismatch": "yes"})).expect_err("bool");
+        assert!(bad.contains("allow_mismatch"), "{bad}");
         assert_eq!(std::fs::read(emu_avd::state_dir(&root.join("avd/copy.avd")).join("userdata.img")).expect("imported"), b"settled");
         let err = call(&mut s, "import", &json!({"from": to, "name": "copy2", "platform": "ios"})).expect_err("ios");
         assert!(err.contains("Android bundles"), "{err}");

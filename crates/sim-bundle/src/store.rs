@@ -1,7 +1,8 @@
-//! The content-addressed chunk store: `chunks/<aa>/<blake3>`, each chunk one zstd frame of the
+//! The content-addressed chunk store: `chunks/<aa>/<blake3>`, each chunk one LZ4 block of the
 //! data whose BLAKE3 names it. Identical data is stored once, and a reader checks every chunk
 //! against its name.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::{Error, Result};
@@ -19,17 +20,49 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(h.finalize().to_hex().to_string())
 }
 
-pub fn compress(data: &[u8], level: i32) -> Result<Vec<u8>> {
-    zstd::bulk::compress(data, level).map_err(Error::Write)
+/// The most a chunk of `len` bytes takes compressed (LZ4's bound for data that doesn't compress).
+pub fn max_compressed(len: u64) -> u64 {
+    lz4_flex::block::get_maximum_output_size(len as usize) as u64
 }
 
-/// Decompresses chunk `hash` (at most `max` bytes) and checks it is what its name says.
+/// `data` as one LZ4 block (no size header: the manifest gives each chunk's length).
+pub fn compress(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; max_compressed(data.len() as u64) as usize];
+    // The buffer is LZ4's own bound for this input, so the block always fits.
+    let n = lz4_flex::block::compress_into(data, &mut out).unwrap_or(0);
+    out.truncate(n);
+    out
+}
+
+/// Decompresses chunk `hash` into at most `max` bytes (a block that would decompress past it is
+/// refused) and checks it is what its name says.
 pub fn decompress_verified(hash_hex: &str, compressed: &[u8], max: u64) -> Result<Vec<u8>> {
-    let data = zstd::bulk::decompress(compressed, max as usize).map_err(|_| Error::ChunkHash(hash_hex.to_owned()))?;
+    let mut data = vec![0u8; max as usize];
+    let n = lz4_flex::block::decompress_into(compressed, &mut data).map_err(|_| Error::ChunkHash(hash_hex.to_owned()))?;
+    data.truncate(n);
     if hash(&data) != hash_hex {
         return Err(Error::ChunkHash(hash_hex.to_owned()));
     }
     Ok(data)
+}
+
+/// Reads bundle file `path` whole: a regular file (not a symlink, a device or a FIFO) of at most
+/// `limit` bytes, so a directory bundle can't make a reader follow a link to `/dev/zero`.
+pub fn read_regular(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| Error::Io(path.to_path_buf(), e))?;
+    if !meta.file_type().is_file() {
+        return Err(Error::Unsupported(format!("{} isn't a regular file", path.display())));
+    }
+    if meta.len() > limit {
+        return Err(Error::Unsupported(format!("{} is {} bytes, more than {limit}", path.display(), meta.len())));
+    }
+    let f = std::fs::File::open(path).map_err(|e| Error::Io(path.to_path_buf(), e))?;
+    let mut v = Vec::with_capacity(meta.len() as usize);
+    f.take(limit + 1).read_to_end(&mut v).map_err(|e| Error::Io(path.to_path_buf(), e))?;
+    if v.len() as u64 > limit {
+        return Err(Error::Unsupported(format!("{} grew past {limit} bytes", path.display())));
+    }
+    Ok(v)
 }
 
 /// The name a chunk has in a bundle: `chunks/<first two hex digits>/<hash>`.
@@ -81,10 +114,12 @@ impl ChunkStore {
     /// Chunk `hash`, decompressed (at most `max` bytes) and checked against its name.
     pub fn get(&self, hash: &str, max: u64) -> Result<Vec<u8>> {
         let path = self.path(hash);
-        let compressed = std::fs::read(&path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => Error::Missing { first: hash.to_owned(), count: 1 },
-            _ => Error::Io(path.clone(), e),
-        })?;
+        let compressed = match read_regular(&path, max_compressed(max)) {
+            Err(Error::Io(_, e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::Missing { first: hash.to_owned(), count: 1 });
+            }
+            r => r?,
+        };
         decompress_verified(hash, &compressed, max)
     }
 }
@@ -100,8 +135,11 @@ mod tests {
         let store = ChunkStore::new(&root);
         let data = vec![42u8; 100_000];
         let h = hash(&data);
-        let z = compress(&data, 3).expect("compress");
+        let z = compress(&data);
         assert!(z.len() < 1000, "a run compresses");
+        // A block that decompresses past what the chunk may hold is refused, not grown into.
+        assert!(matches!(decompress_verified(&h, &z, 99_999), Err(Error::ChunkHash(_))));
+        assert_eq!(decompress_verified(&h, &z, 100_000).expect("exact"), data);
         assert!(store.put(&h, &z).expect("put"));
         assert!(!store.put(&h, &z).expect("put again"), "already stored");
         assert_eq!(std::fs::read_dir(root.join("chunks")).expect("chunks").count(), 1);
@@ -112,10 +150,14 @@ mod tests {
         assert_eq!(store.get(&h, 1 << 20).expect("get"), data);
         assert!(store.get(&h, 10).is_err(), "longer than allowed");
         // A chunk whose content isn't what its name says.
-        let other = compress(b"other", 3).expect("compress");
-        std::fs::write(store.path(&h), other).expect("overwrite");
+        std::fs::write(store.path(&h), compress(b"other")).expect("overwrite");
         assert!(matches!(store.get(&h, 1 << 20), Err(Error::ChunkHash(_))));
         assert!(matches!(store.get(&hash(b"absent"), 1 << 20), Err(Error::Missing { .. })));
+        // A chunk that is a link (to /dev/zero, which would read forever) is refused unread.
+        std::fs::remove_file(store.path(&h)).expect("rm");
+        std::os::unix::fs::symlink("/dev/zero", store.path(&h)).expect("symlink");
+        assert!(matches!(store.get(&h, 1 << 20), Err(Error::Unsupported(m)) if m.contains("regular file")));
+        assert!(read_regular(Path::new("/dev/zero"), 1 << 20).is_err(), "a device");
         let _ = std::fs::remove_dir_all(root);
     }
 }

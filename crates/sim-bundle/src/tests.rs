@@ -103,7 +103,7 @@ fn identical_chunks_are_stored_once_and_zeros_never() {
 fn both_forms_unpack_to_the_same_bytes_with_holes_kept() {
     let tmp = scratch("unpack");
     let (disk, data) = sample_disk(&tmp);
-    let (m, s) = export(header(), &contents(&disk), &tmp.join("b.tar"), &Options { level: 19, threads: 2 }).expect("export tar");
+    let (m, s) = export(header(), &contents(&disk), &tmp.join("b.tar"), &Options { threads: 2 }).expect("export tar");
     assert_eq!(s.form, "tar");
     assert_eq!(fs::metadata(tmp.join("b.tar")).expect("tar").len(), s.bundle_bytes);
     export(header(), &contents(&disk), &tmp.join("b"), &Options::default()).expect("export dir");
@@ -159,7 +159,7 @@ fn damaged_bundles_are_refused() {
 
     // A chunk whose data isn't what its name says.
     let mut swapped = chunks.clone();
-    swapped[0].1 = compress(b"not the chunk", 3).expect("compress");
+    swapped[0].1 = compress(b"not the chunk");
     archive(&tmp.join("bad-chunk.tar"), &m.to_json(), &swapped);
     assert!(matches!(extract("bad-chunk.tar"), Err(Error::ChunkHash(_))));
 
@@ -173,7 +173,7 @@ fn damaged_bundles_are_refused() {
     archive(&tmp.join("missing.tar"), &m.to_json(), &chunks[1..]);
     assert!(matches!(extract("missing.tar"), Err(Error::Missing { count: 1, .. })));
     let mut extra = chunks.clone();
-    extra.push((chunk_name(&hash(b"x")), compress(b"x", 3).expect("compress")));
+    extra.push((chunk_name(&hash(b"x")), compress(b"x")));
     archive(&tmp.join("extra.tar"), &m.to_json(), &extra);
     assert!(matches!(extract("extra.tar"), Err(Error::Tar(_))));
     let mut twice = chunks.clone();
@@ -200,6 +200,36 @@ fn damaged_bundles_are_refused() {
     archive(&tmp.join("v2.tar"), &serde_json::to_vec(&v).expect("json"), &chunks);
     assert!(matches!(extract("v2.tar"), Err(Error::Format(2))));
     assert!(Error::Format(2).to_string().contains("update simee"));
+    // A huge manifest is refused by size, and a bulky field isn't built before `format` is read.
+    let mut bulky: serde_json::Value = serde_json::from_slice(&m.to_json()).expect("json");
+    bulky["format"] = 9.into();
+    bulky["padding"] = serde_json::Value::Array(vec![0.into(); 100_000]);
+    assert!(matches!(Manifest::parse(&serde_json::to_vec(&bulky).expect("json")), Err(Error::Format(9))));
+    archive(&tmp.join("huge.tar"), &vec![b' '; MAX_MANIFEST as usize + 1], &chunks);
+    assert!(matches!(Reader::open(&tmp.join("huge.tar")), Err(Error::Tar(_))));
+
+    // A chunk that decompresses past chunk_size (its data is 2 MiB of zeros under a hash of
+    // that) is refused, not decompressed into a larger buffer.
+    let big = vec![0u8; 2 * CHUNK_SIZE as usize];
+    let mut grown = m.clone();
+    grown.disks[0].extents[0].hash = Some(hash(&big));
+    let mut grown_chunks = chunks.clone();
+    grown_chunks.push((chunk_name(&hash(&big)), compress(&big)));
+    archive(&tmp.join("grown.tar"), &grown.to_json(), &grown_chunks);
+    assert!(matches!(extract("grown.tar"), Err(Error::ChunkHash(h)) if h == hash(&big)));
+
+    // A directory bundle whose manifest or chunk is a link is refused before it is read.
+    let linked = tmp.join("linked");
+    fs::create_dir_all(linked.join("chunks")).expect("dir");
+    std::os::unix::fs::symlink(tmp.join("b/manifest.json"), linked.join(MANIFEST)).expect("symlink");
+    assert!(matches!(Reader::open(&linked), Err(Error::Unsupported(_))));
+    fs::remove_file(linked.join(MANIFEST)).expect("rm");
+    fs::copy(tmp.join("b/manifest.json"), linked.join(MANIFEST)).expect("copy");
+    for h in m.chunk_hashes() {
+        fs::create_dir_all(linked.join(chunk_name(h)).parent().expect("parent")).expect("dir");
+        std::os::unix::fs::symlink("/dev/zero", linked.join(chunk_name(h))).expect("symlink");
+    }
+    assert!(matches!(extract("linked"), Err(Error::Unsupported(_))));
 
     // A base delta (#171) is reserved: a format 1 reader refuses it before writing.
     let mut delta = m.clone();

@@ -298,18 +298,18 @@ impl Android {
     }
 
     /// Exports `device`, which must be shut down, to a bundle at `to` (`emu_avd::Env::export_avd`):
-    /// a `.tar` file, else a new directory, its chunks compressed at zstd `level`.
-    pub fn export_avd(&self, device: &Device, to: &Path, level: i32) -> Result<emu_avd::bundle::Exported, String> {
+    /// a `.tar` file, else a new directory.
+    pub fn export_avd(&self, device: &Device, to: &Path) -> Result<emu_avd::bundle::Exported, String> {
         if device.running.is_some() {
             return Err(format!("{} must be shut down to export it", device.info.name));
         }
-        let opts = emu_avd::bundle::Options { level, ..Default::default() };
-        self.env.export_avd(&device.info.udid, to, &opts).map_err(|e| e.to_string())
+        self.env.export_avd(&device.info.udid, to, &emu_avd::bundle::Options::default()).map_err(|e| e.to_string())
     }
 
-    /// Imports the bundle at `from` as a new AVD `name` (`emu_avd::Env::import_avd`).
-    pub fn import_avd(&self, from: &Path, name: &str) -> Result<(DeviceInfo, emu_avd::bundle::Imported), String> {
-        let imported = self.env.import_avd(from, name).map_err(|e| e.to_string())?;
+    /// Imports the bundle at `from` as a new AVD `name` (`emu_avd::Env::import_avd`; with
+    /// `allow_mismatch`, onto another revision of the same system image).
+    pub fn import_avd(&self, from: &Path, name: &str, allow_mismatch: bool) -> Result<(DeviceInfo, emu_avd::bundle::Imported), String> {
+        let imported = self.env.import_avd(from, name, allow_mismatch).map_err(|e| e.to_string())?;
         Ok((self.describe(name, &[]).info, imported))
     }
 

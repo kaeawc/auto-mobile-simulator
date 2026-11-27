@@ -1,7 +1,7 @@
 //! Portable device bundles (#170).
 //!
 //! A bundle describes a device with no host path in it: a [`Manifest`] (`manifest.json`) and
-//! content-addressed chunks (`chunks/<aa>/<blake3>`, each compressed alone with zstd). Disk images
+//! content-addressed chunks (`chunks/<aa>/<blake3>`, each compressed alone with LZ4). Disk images
 //! are cut at fixed [`CHUNK_SIZE`] boundaries; all-zero chunks and holes are recorded as extents
 //! and never stored. It is a directory, or the same as one plain uncompressed tar with the
 //! manifest first, so an import streams it and checks each chunk as it arrives.
@@ -25,14 +25,14 @@ pub use manifest::{
     AndroidImage, Base, CHUNK_SIZE, COLD_BOOT, COMPRESSION, Captures, Device, Disk, Extent, FORMAT, File, GuestIdentity, Identity,
     Manifest, Secret, is_hash, safe_path,
 };
-pub use store::{ChunkStore, chunk_name, compress, decompress_verified, hash, hash_file, parse_chunk_name};
+pub use store::{ChunkStore, chunk_name, compress, decompress_verified, hash, hash_file, max_compressed, parse_chunk_name, read_regular};
 pub use tar::{TarReader, TarWriter};
 
 /// A bundle directory's manifest file, and a bundle archive's first entry.
 pub const MANIFEST: &str = "manifest.json";
 
-/// The largest manifest a reader accepts (a 64 GiB disk in 1 MiB chunks is ~10 MB of JSON).
-const MAX_MANIFEST: u64 = 256 << 20;
+/// The largest manifest a reader accepts: a 64 GiB disk in 1 MiB chunks is ~7 MB of JSON.
+pub const MAX_MANIFEST: u64 = 32 << 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -67,18 +67,10 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// How to write a bundle.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Options {
-    /// zstd level for every chunk (3: fast; 19: smallest).
-    pub level: i32,
     /// Chunks compressed at once (0: one per CPU, at most 8).
     pub threads: usize,
-}
-
-impl Default for Options {
-    fn default() -> Options {
-        Options { level: 3, threads: 0 }
-    }
 }
 
 /// What goes into a bundle: disk images read from host files, and small files given whole, each
@@ -111,7 +103,6 @@ pub struct Summary {
     pub compressed_bytes: u64,
     /// The whole bundle: the archive, or the directory's manifest and chunk files.
     pub bundle_bytes: u64,
-    pub level: i32,
     pub seconds: f64,
 }
 
@@ -229,7 +220,7 @@ pub fn export(mut manifest: Manifest, contents: &Contents, to: &Path, opts: &Opt
     manifest.disks = contents.disks.iter().map(|(p, f)| plan_disk(p, f, CHUNK_SIZE)).collect::<Result<_>>()?;
     manifest.files = contents.files.iter().map(|(p, d)| plan_file(p, d, CHUNK_SIZE)).collect();
     manifest.validate()?;
-    let mut summary = Summary { form: if is_archive(to) { "tar" } else { "dir" }.into(), level: opts.level, ..Summary::default() };
+    let mut summary = Summary { form: if is_archive(to) { "tar" } else { "dir" }.into(), ..Summary::default() };
     for ((_, file), d) in contents.disks.iter().zip(&manifest.disks) {
         summary.disk_bytes += d.size;
         summary.allocated_bytes += fs::metadata(file).map(|m| m.blocks() * 512).unwrap_or(0);
@@ -281,11 +272,10 @@ pub fn export(mut manifest: Manifest, contents: &Contents, to: &Path, opts: &Opt
                 };
                 raw.push(data);
             }
-            let level = opts.level;
             let packed: Vec<Result<Vec<u8>>> = std::thread::scope(|s| {
                 let per = raw.len().div_ceil(threads).max(1);
                 let handles: Vec<_> =
-                    raw.chunks(per).map(|group| s.spawn(move || group.iter().map(|d| compress(d, level)).collect::<Vec<_>>())).collect();
+                    raw.chunks(per).map(|group| s.spawn(move || group.iter().map(|d| Ok(compress(d))).collect::<Vec<_>>())).collect();
                 handles
                     .into_iter()
                     .flat_map(|h| h.join().unwrap_or_else(|_| vec![Err(Error::Unsupported("a compression thread panicked".into()))]))
@@ -353,8 +343,7 @@ impl Reader {
     /// is written.
     pub fn open(path: &Path) -> Result<Reader> {
         let (manifest, source) = if path.is_dir() {
-            let mpath = path.join(MANIFEST);
-            let bytes = fs::read(&mpath).map_err(|e| Error::Io(mpath, e))?;
+            let bytes = read_regular(&path.join(MANIFEST), MAX_MANIFEST)?;
             (Manifest::parse(&bytes)?, Source::Dir(path.to_path_buf()))
         } else {
             let f = fs::File::open(path).map_err(|e| Error::Io(path.to_path_buf(), e))?;
@@ -437,7 +426,7 @@ impl Reader {
             }
             Source::Tar(mut tar) => {
                 // A chunk that doesn't compress is a little larger than itself.
-                let max = m.chunk_size + m.chunk_size / 64 + 4096;
+                let max = max_compressed(m.chunk_size);
                 while let Some((name, z)) = tar.next_entry(max)? {
                     let h = parse_chunk_name(&name).ok_or_else(|| Error::Tar(format!("unexpected entry `{name}`")))?;
                     let data = decompress_verified(h, &z, m.chunk_size)?;

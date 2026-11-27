@@ -431,40 +431,40 @@ device yet ([#29](https://github.com/kaeawc/simee/issues/29)).
 
 ## Android: device bundles
 
-`simee export` / `simee import` ([#170](https://github.com/kaeawc/simee/issues/170)) on one API 36
+`simee export` / `simee import` ([#170](https://github.com/kaeawc/simee/issues/170)) on an API 36
 `google_apis` arm64 AVD (revision 7, 4 GB data partition) after its first boot under emu, 100 s of
 uptime and a file written to `/data/local/tmp`; M3 Max, macOS 26.6.2, 2026-11-27, host load 5–50.
-One run each with zstd's C library; a second AVD exported with the shipped Rust backend
-(`rust-backend`) gave the same times (7.7 s, 17.5 s, import 7.0 s) and a 1183 MB bundle for its
-1206 MB allocated. No stock tool exports an AVD, so there is no comparison column.
+Chunks are LZ4 (`lz4_flex`, pure Rust). The zstd column is the same recipe on another fresh AVD
+the same day, with zstd's C library at level 3 (level 19 gave 1193 MB, no smaller, in 16.4 s).
+One run each. No stock tool exports an AVD, so there is no comparison with one.
 
 ```bash
-simee export <avd> <dir>                 # zstd level 3, the default
-simee export <avd> <file>.tar --level 19
+simee export <avd> <dir-or-file.tar>
 simee import <file>.tar <new-name>       # then boot it: the file and settings are there
 ```
 
-| Measure | Value |
-| --- | --- |
-| Disks' logical size (userdata, cache, encryptionkey) | 4383 MB |
-| Disks' allocated size on the host | 1219 MB |
-| Bundle, zstd 3 (directory) | 1192 MB (98% of allocated) |
-| Bundle, zstd 19 (tar) | 1193 MB: no smaller than level 3 |
-| userdata in stored 1 MiB chunks / compressed | 1178 MiB / 1137 MiB (96.5%) |
-| `/data` used, as the guest's `df` reports it | 861 MB |
-| Export, zstd 3 / zstd 19 (8 threads) | 7.6 s / 16.4 s wall |
-| Import from the tar (streamed, every hash checked) | 7.0 s wall, 18 MB peak RSS |
-| Two clones of that golden, each booted once for 100 s: chunks shared | 981 of ~1210 (81%) |
-| The second clone's new chunks, given the first's, compressed | 200 MiB |
+| Measure | LZ4 (shipped) | zstd 3 |
+| --- | --- | --- |
+| Disks' logical size (userdata, cache, encryptionkey) | 4383 MB | 4383 MB |
+| Disks' allocated size on the host | 1243 MB | 1219 MB |
+| Bundle (tar) | 1225 MB (98.5% of allocated) | 1192 MB (97.8%) |
+| userdata in stored 1 MiB chunks / compressed | 1202 MiB / 1166 MiB (97.0%) | 1178 MiB / 1137 MiB (96.5%) |
+| Export (8 threads), wall | 7.2 s | 7.6 s |
+| Import from the tar (streamed, every hash checked), wall | 6.7 s, 15 MB peak RSS | 7.0 s, 18 MB peak RSS |
+| `/data` used, as the guest's `df` reports it | | 861 MB |
+| Two clones of one golden, each booted once for 100 s: chunks shared | | 981 of ~1210 (81%) |
+| The second clone's new chunks, given the first's, compressed | | 200 MiB |
 
 User data is ciphertext (`/data` sits on dm-default-key, keyed from `encryptionkey.img`), so its
-chunks don't compress: zstd's gain is the zero 4 KiB blocks inside 1 MiB chunks. The bundle stores
-~1.14 GB of non-zero user data for 861 MB of files, which suggests freed blocks that were never
-discarded still hold ciphertext. Between clones of one golden, a boot dirties about 200 MiB of
-chunks. Shrinking bundles (deltas against the golden, discarding freed blocks before export) is
+chunks don't compress: either codec's gain is the zero 4 KiB blocks inside 1 MiB chunks, and LZ4
+gives up half a point for no zstd dependency. Hashing (BLAKE3 of the disks and of the 4.4 GB system
+image) dominates both directions, so the codec doesn't move the times. The bundle stores ~1.14 GB
+of non-zero user data for 861 MB of files, which suggests freed blocks that were never discarded
+still hold ciphertext. Between clones of one golden, a boot dirties about 200 MiB of chunks.
+Shrinking bundles (deltas against the golden, discarding freed blocks before export) is
 [#171](https://github.com/kaeawc/simee/issues/171). An import leaves zero ranges as holes, but
-APFS fills a hole shorter than ~16 MiB between written blocks with zeros (measured), so the
-imported userdata took 1258 MB on the host against the source's 1204 MB.
+APFS fills a hole shorter than ~16 MiB between written blocks with zeros (measured), so an
+imported userdata takes ~4% more host space than its source (1260 MB against 1228 MB).
 
 ## iOS: simee against `simctl`
 

@@ -186,16 +186,16 @@ enum Cmd {
     Clone { template: String, name: String },
     /// Android: pack a shut-down AVD into a portable bundle (a .tar file, else a new directory)
     /// with no host path in it; prints its sizes. iOS: not yet.
-    Export {
-        device: String,
-        to: String,
-        /// zstd level for every chunk: 1 (fastest) to 19 (smallest).
-        #[arg(long)]
-        level: Option<u64>,
-    },
+    Export { device: String, to: String },
     /// Android: create AVD `name` from a bundle, its system image found by content; prints its
     /// name. The import keeps the exported device's guest identity (ro.serialno, android_id).
-    Import { from: String, name: String },
+    Import {
+        from: String,
+        name: String,
+        /// Use another installed revision of the same system image (API level, tag, ABI).
+        #[arg(long)]
+        allow_mismatch: bool,
+    },
     /// Shut a device down.
     Shutdown { device: String },
     /// Erase all content and settings (device must be shut down).
@@ -702,8 +702,8 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             let d = call("clone", json!({"device": template, "name": name}))?;
             writeln!(out, "{}", text(&d["udid"]))?;
         }
-        Cmd::Export { device, to, level } => {
-            let r = call("export", json!({"device": device, "to": to, "level": level}))?;
+        Cmd::Export { device, to } => {
+            let r = call("export", json!({"device": device, "to": absolute(&to)}))?;
             let s = &r["summary"];
             writeln!(
                 out,
@@ -722,10 +722,16 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
                 writeln!(err, "simee: left out {}", text(d))?;
             }
         }
-        Cmd::Import { from, name } => {
-            let r = call("import", json!({"from": from, "name": name}))?;
+        Cmd::Import { from, name, allow_mismatch } => {
+            let r = call("import", json!({"from": absolute(&from), "name": name, "allow_mismatch": allow_mismatch}))?;
             writeln!(out, "{}", text(&r["device"]["udid"]))?;
             writeln!(err, "simee: {}", text(&r["note"]))?;
+            if r["mismatch"].is_string() {
+                writeln!(err, "simee: {}", text(&r["mismatch"]))?;
+            }
+            for d in items(&r["dropped"]) {
+                writeln!(err, "simee: left out {}", text(d))?;
+            }
         }
         Cmd::Shutdown { device } => drop(call("shutdown", json!({"device": device}))?),
         Cmd::Erase { device } => drop(call("erase", json!({"device": device}))?),

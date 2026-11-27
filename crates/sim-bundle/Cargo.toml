@@ -16,7 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 sim-core.workspace = true
 thiserror.workspace = true
-zstd.workspace = true
+lz4_flex.workspace = true
 
 [lints]
 workspace = true
