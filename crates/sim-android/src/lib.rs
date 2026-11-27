@@ -17,6 +17,7 @@ pub mod testing;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -799,10 +800,19 @@ impl Device {
     /// The current screen as the emulator encodes it: width, height and PNG bytes, with no
     /// decode and re-encode on the way.
     pub fn screenshot_png(&self) -> Result<(u32, u32, Vec<u8>), String> {
-        let path = std::env::temp_dir().join(format!("sim-android-{}-{}.png", std::process::id(), self.info.udid));
-        let size = self.screenshot_png_to(&path);
-        let png = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()));
-        let _ = std::fs::remove_file(&path);
+        // Removes the file on every path out, a panic included.
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        // Unique per call: calls can run at once on one device.
+        static SHOTS: AtomicU64 = AtomicU64::new(0);
+        let n = SHOTS.fetch_add(1, Ordering::Relaxed);
+        let scratch = Scratch(std::env::temp_dir().join(format!("sim-android-{}-{}-{n}.png", std::process::id(), self.info.udid)));
+        let size = self.screenshot_png_to(&scratch.0);
+        let png = std::fs::read(&scratch.0).map_err(|e| format!("{}: {e}", scratch.0.display()));
         let (w, h) = size?;
         Ok((w, h, png?))
     }
@@ -1483,6 +1493,22 @@ mod tests {
         assert_eq!(wait_for(&fake.display, 2), ["touch 100 200 down", "touch 100 200 up"]);
         assert!(d.rotary(1).expect_err("not a watch").starts_with("rotary input needs a device with Rotary input"));
         assert!(f.android.delete(&d).expect_err("running").contains("is running"));
+    }
+
+    #[test]
+    fn concurrent_screenshots_of_one_device_each_get_their_own_file() {
+        let f = fixture("shots");
+        f.android.create("shots", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let _fake = fake_emulator(&f.android, "shots");
+        let d = f.android.device("booted").expect("running");
+        let results: Vec<_> = std::thread::scope(|s| {
+            let jobs: Vec<_> = (0..2).map(|_| s.spawn(|| d.screenshot_png())).collect();
+            jobs.into_iter().map(|j| j.join().expect("thread")).collect()
+        });
+        for r in results {
+            let (w, h, png) = r.expect("each screenshot succeeds");
+            assert_eq!((w, h, sim_core::frame::png_size(&png)), (2, 1, Some((2, 1))));
+        }
     }
 
     /// Adds an installed system image under the fixture's SDK.
