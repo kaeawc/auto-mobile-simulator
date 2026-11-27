@@ -8,6 +8,10 @@
 //! ← {"id": 2, "ok": false, "error": "no device matches `nope`"}
 //! ```
 //!
+//! A request with `"binary": true` takes a result's bytes (`screenshot`'s PNG) raw instead of as
+//! base64: the response line says `"binary": <len>` and exactly that many bytes follow it
+//! ([`Client::call_binary`], docs/api.md).
+//!
 //! `{"method": "help"}` lists every method with its parameters. Each connection gets its own
 //! thread and its own service connection. Device methods need the iOS backend, which exists on
 //! macOS hosts; elsewhere they fail with a clear reason.
@@ -54,12 +58,19 @@ struct Request {
     method: String,
     #[serde(default)]
     params: Value,
+    /// The client takes a result's bytes raw, after the response line (docs/api.md, "Binary
+    /// replies"); otherwise they are base64 in the line.
+    #[serde(default)]
+    binary: bool,
 }
 
 /// A response line, serialized straight from the method's result (no copy into a new `Value`).
 /// Fields in the order `json!` wrote them (sorted), so the bytes on the wire are unchanged.
 #[derive(Serialize)]
 struct Response<'a> {
+    /// How many raw bytes follow the line (a binary reply); absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binary: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
     id: &'a Value,
@@ -68,40 +79,74 @@ struct Response<'a> {
     result: Option<&'a Value>,
 }
 
-/// Appends one method's response line (with its newline) to `out`.
-fn respond(id: &Value, outcome: &Result<Value, String>, out: &mut Vec<u8>) {
+/// Appends one method's response line (with its newline) to `out`, saying that `binary` raw bytes
+/// follow it when there are some.
+fn respond(id: &Value, outcome: &Result<Value, String>, binary: Option<usize>, out: &mut Vec<u8>) {
     let response = match outcome {
-        Ok(result) => Response { error: None, id, ok: true, result: Some(result) },
-        Err(error) => Response { error: Some(error), id, ok: false, result: None },
+        Ok(result) => Response { binary, error: None, id, ok: true, result: Some(result) },
+        Err(error) => Response { binary: None, error: Some(error), id, ok: false, result: None },
     };
     // Serializing a `Value` and plain fields into memory cannot fail.
     serde_json::to_writer(&mut *out, &response).ok();
     out.push(b'\n');
 }
 
-/// Handles one request line, appending its response line (newline included) to `out`.
+/// Answers one request line with `call`, appending the response line to `out`; returns the raw
+/// bytes to send after it, when the request asked for them (and `binary` allows it) and the
+/// result has some.
+fn reply(line: &str, binary: bool, out: &mut Vec<u8>, call: impl FnOnce(&str, &Value) -> Result<Value, String>) -> Option<Vec<u8>> {
+    let req = match serde_json::from_str::<Request>(line) {
+        Ok(req) => req,
+        Err(e) => {
+            respond(&Value::Null, &Err(format!("bad request: {e}")), None, out);
+            return None;
+        }
+    };
+    let (outcome, bytes) = match req.binary && binary {
+        true => params::taking_bytes(|| call(&req.method, &req.params)),
+        false => (call(&req.method, &req.params), None),
+    };
+    let bytes = bytes.filter(|_| outcome.is_ok());
+    respond(&req.id, &outcome, bytes.as_ref().map(Vec::len), out);
+    bytes
+}
+
+/// Handles one request line, appending its whole reply to `out`: the response line (newline
+/// included) and, for a binary reply, its raw bytes.
 pub fn handle_line_into(session: &mut methods::Session, line: &str, out: &mut Vec<u8>) {
-    match serde_json::from_str::<Request>(line) {
-        Ok(req) => respond(&req.id, &methods::call(session, &req.method, &req.params), out),
-        Err(e) => respond(&Value::Null, &Err(format!("bad request: {e}")), out),
+    if let Some(bytes) = reply(line, true, out, |m, p| methods::call(session, m, p)) {
+        out.extend_from_slice(&bytes);
     }
 }
 
-/// Handles one request line; always returns a response line.
+/// Handles one request line; always returns one response line (bytes as base64, whatever the
+/// request asks).
 pub fn handle_line(session: &mut methods::Session, line: &str) -> String {
     let mut out = Vec::new();
-    handle_line_into(session, line, &mut out);
+    reply(line, false, &mut out, |m, p| methods::call(session, m, p));
     out.pop();
     String::from_utf8(out).unwrap_or_default()
+}
+
+/// Calls `method` in this process taking a result's bytes raw: the result, with its bytes field
+/// (`screenshot`'s `png`) holding `{"binary": <len>}`, and those bytes; `None` when it has none.
+pub fn call_method_binary(session: &mut methods::Session, method: &str, params: &Value) -> Result<(Value, Option<Vec<u8>>), String> {
+    let (outcome, bytes) = params::taking_bytes(|| methods::call(session, method, params));
+    outcome.map(|result| (result, bytes))
 }
 
 /// Requests are read through a buffer this large, and responses read back through one too.
 const IO_BUFFER: usize = 64 * 1024;
 
 fn serve_connection(stream: UnixStream, make: &(dyn Fn() -> methods::Session + Send + Sync)) {
+    let mut session = make();
+    serve_stream(stream, |m, p| methods::call(&mut session, m, p));
+}
+
+/// Answers the requests on `stream` with `call`, one at a time, until it closes.
+fn serve_stream(stream: UnixStream, mut call: impl FnMut(&str, &Value) -> Result<Value, String>) {
     let Ok(reader) = stream.try_clone() else { return };
     let mut writer = stream;
-    let mut session = make();
     let mut out = Vec::new();
     for line in BufReader::with_capacity(IO_BUFFER, reader).lines() {
         let Ok(line) = line else { break };
@@ -109,8 +154,9 @@ fn serve_connection(stream: UnixStream, make: &(dyn Fn() -> methods::Session + S
             continue;
         }
         out.clear();
-        handle_line_into(&mut session, &line, &mut out);
-        if writer.write_all(&out).is_err() {
+        let bytes = reply(&line, true, &mut out, &mut call);
+        // The bytes go out from the result's own buffer, not copied after the line.
+        if writer.write_all(&out).and_then(|()| bytes.map_or(Ok(()), |b| writer.write_all(&b))).is_err() {
             break;
         }
         // Don't hold a multi-megabyte screenshot's buffer between requests.
@@ -184,6 +230,8 @@ struct Outgoing<'a> {
     id: u64,
     method: &'a str,
     params: &'a Value,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    binary: bool,
 }
 
 impl Client {
@@ -197,9 +245,21 @@ impl Client {
         Client { stream: BufReader::with_capacity(IO_BUFFER, stream), next_id: 1, line: Vec::new() }
     }
 
-    /// Calls one method; its result, or the server's error.
+    /// Calls one method; its result, or the server's error. Bytes in the result are base64.
     pub fn call(&mut self, method: &str, params: &Value) -> Result<Value, String> {
-        let mut request = serde_json::to_vec(&Outgoing { id: self.next_id, method, params }).map_err(|e| e.to_string())?;
+        self.exchange(method, params, false).map(|(result, _)| result)
+    }
+
+    /// Calls one method taking a result's bytes raw (a binary reply, docs/api.md): the result,
+    /// with its bytes field (`screenshot`'s `png`) holding `{"binary": <len>}`, and those bytes.
+    /// A method with no bytes field answers as [`Client::call`] does, with `None`; so does a server
+    /// from before binary replies, which leaves the bytes base64 in the result.
+    pub fn call_binary(&mut self, method: &str, params: &Value) -> Result<(Value, Option<Vec<u8>>), String> {
+        self.exchange(method, params, true)
+    }
+
+    fn exchange(&mut self, method: &str, params: &Value, binary: bool) -> Result<(Value, Option<Vec<u8>>), String> {
+        let mut request = serde_json::to_vec(&Outgoing { id: self.next_id, method, params, binary }).map_err(|e| e.to_string())?;
         self.next_id += 1;
         request.push(b'\n');
         self.stream.get_mut().write_all(&request).map_err(|e| e.to_string())?;
@@ -209,7 +269,27 @@ impl Client {
         if self.line.capacity() > IO_BUFFER {
             self.line = Vec::new();
         }
-        if value["ok"] == true { Ok(value["result"].take()) } else { Err(value["error"].as_str().unwrap_or("error").to_owned()) }
+        // Read a binary reply's bytes whatever the outcome, so the next reply starts in place.
+        let bytes = match value.get("binary").and_then(Value::as_u64) {
+            Some(len) => Some(self.read_bytes(len)?),
+            None => None,
+        };
+        match value["ok"] == true {
+            true => Ok((value["result"].take(), bytes)),
+            false => Err(value["error"].as_str().unwrap_or("error").to_owned()),
+        }
+    }
+
+    /// The `len` raw bytes after a binary reply's line; an error if the stream ends first.
+    fn read_bytes(&mut self, len: u64) -> Result<Vec<u8>, String> {
+        use std::io::Read as _;
+        // Grown as the bytes arrive past 64 MB, rather than allocated to whatever a reply names.
+        let mut bytes = Vec::with_capacity(len.min(64 << 20) as usize);
+        (&mut self.stream).take(len).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if (bytes.len() as u64) < len {
+            return Err(format!("the reply ended after {} of {len} bytes", bytes.len()));
+        }
+        Ok(bytes)
     }
 }
 
@@ -272,7 +352,7 @@ mod tests {
         ];
         for (id, outcome) in &cases {
             let mut out = Vec::new();
-            respond(id, outcome, &mut out);
+            respond(id, outcome, None, &mut out);
             assert_eq!(String::from_utf8(out).expect("utf-8"), old_response(id, outcome) + "\n");
         }
         let mut s = methods::Session::default();
@@ -303,7 +383,7 @@ mod tests {
                             writer.write_all(line.as_bytes()).expect("write");
                         } else {
                             out.clear();
-                            respond(&req.id, &outcome, &mut out);
+                            respond(&req.id, &outcome, None, &mut out);
                             writer.write_all(&out).expect("write");
                         }
                     }
@@ -348,6 +428,152 @@ mod tests {
         assert!(Client::connect(&path).is_err(), "the listener is gone");
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         std::fs::remove_file(&path).ok();
+    }
+
+    /// PNG-like bytes with every byte a JSON line could trip on: newlines, quotes, invalid UTF-8.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\"\\\xff\xfe binary \n bytes\n";
+
+    /// A method table for tests: `screenshot` returns `PNG` through the real result builder,
+    /// `screen` a result with no bytes field, anything else an error.
+    fn fake_method(method: &str, p: &Value) -> Result<Value, String> {
+        match method {
+            "screenshot" => params::png_result(2, 1, PNG, p),
+            "screen" => Ok(json!({"width": 2, "height": 1})),
+            _ => Err("it failed".to_owned()),
+        }
+    }
+
+    /// A client on one end of a socket pair whose other end the real serve loop answers with
+    /// `fake_method`.
+    fn fake_pair() -> Client {
+        let (ours, theirs) = UnixStream::pair().expect("pair");
+        std::thread::spawn(move || serve_stream(theirs, fake_method));
+        Client::from_stream(ours)
+    }
+
+    #[test]
+    fn a_binary_reply_reads_back_byte_identical() {
+        use base64::Engine as _;
+        let mut client = fake_pair();
+        for _ in 0..2 {
+            let (result, bytes) = client.call_binary("screenshot", &json!({"device": "booted"})).expect("binary");
+            assert_eq!(result, json!({"width": 2, "height": 1, "png": {"binary": PNG.len()}}));
+            assert_eq!(bytes.as_deref(), Some(PNG));
+            // An old-style request on the same connection: base64 in the line, as before.
+            let old = client.call("screenshot", &json!({})).expect("base64");
+            assert_eq!(old["png"], base64::engine::general_purpose::STANDARD.encode(PNG));
+            // Binary asked of a method with no bytes field, or one that fails: the normal reply.
+            assert_eq!(client.call_binary("screen", &json!({})), Ok((json!({"width": 2, "height": 1}), None)));
+            assert_eq!(client.call_binary("fail", &Value::Null), Err("it failed".to_owned()));
+        }
+    }
+
+    #[test]
+    fn a_binary_reply_is_the_json_line_then_exactly_its_bytes() {
+        use base64::Engine as _;
+        let (mut ours, theirs) = UnixStream::pair().expect("pair");
+        std::thread::spawn(move || serve_stream(theirs, fake_method));
+        ours.write_all(b"{\"id\":1,\"method\":\"screenshot\",\"binary\":true}\n{\"id\":2,\"method\":\"screenshot\"}\n").expect("write");
+        ours.write_all(b"{\"id\":3,\"method\":\"screen\",\"binary\":true}\n").expect("write");
+        ours.shutdown(std::net::Shutdown::Write).expect("shutdown");
+        let mut wire = Vec::new();
+        std::io::Read::read_to_end(&mut ours, &mut wire).expect("read");
+        let n = PNG.len();
+        let mut expected =
+            format!(r#"{{"binary":{n},"id":1,"ok":true,"result":{{"height":1,"png":{{"binary":{n}}},"width":2}}}}"#).into_bytes();
+        expected.push(b'\n');
+        expected.extend(PNG);
+        let base64 = json!({"width": 2, "height": 1, "png": base64::engine::general_purpose::STANDARD.encode(PNG)});
+        expected.extend((old_response(&json!(2), &Ok(base64)) + "\n").as_bytes());
+        expected.extend((old_response(&json!(3), &Ok(json!({"width": 2, "height": 1}))) + "\n").as_bytes());
+        assert_eq!(String::from_utf8_lossy(&wire), String::from_utf8_lossy(&expected));
+        assert_eq!(wire, expected);
+    }
+
+    #[test]
+    fn a_truncated_binary_reply_is_an_error_not_a_hang() {
+        let (ours, theirs) = UnixStream::pair().expect("pair");
+        std::thread::spawn(move || {
+            let mut writer = theirs.try_clone().expect("clone");
+            let mut line = String::new();
+            BufReader::new(theirs).read_line(&mut line).expect("request");
+            // Ten bytes promised, four sent, then the connection closes.
+            writer.write_all(b"{\"binary\":10,\"id\":1,\"ok\":true,\"result\":{\"png\":{\"binary\":10}}}\n\x89PNG").expect("write");
+        });
+        // A guard only: a hang fails the test with a timeout error instead of stalling the run.
+        ours.set_read_timeout(Some(std::time::Duration::from_secs(10))).expect("timeout");
+        let start = std::time::Instant::now();
+        let err = Client::from_stream(ours).call_binary("screenshot", &Value::Null).expect_err("truncated");
+        assert_eq!(err, "the reply ended after 4 of 10 bytes");
+        assert!(start.elapsed() < std::time::Duration::from_secs(1), "{:?}", start.elapsed());
+    }
+
+    #[test]
+    fn binary_is_asked_per_request_and_other_servers_answer_as_before() {
+        // A server from before binary replies ignores the field: base64 comes back, no bytes.
+        let shot = json!({"width": 2, "height": 1, "png": "iVBOR"});
+        let path = fixed_server("binary-old", shot.clone(), true);
+        let mut client = Client::connect(&path).expect("connect");
+        assert_eq!(client.call_binary("screenshot", &Value::Null), Ok((shot, None)));
+        std::fs::remove_file(&path).ok();
+        // The real server, a method with no bytes: its JSON, then the next call on the connection.
+        let path = crate::test_socket(&format!("simee-api-binary-{}.sock", std::process::id()));
+        serve_in_background(path.clone()).expect("bind");
+        let mut client = Client::connect(&path).expect("connect");
+        let (help, bytes) = client.call_binary("help", &Value::Null).expect("help");
+        assert!(help.as_array().is_some_and(|m| m.len() > 40) && bytes.is_none());
+        assert_eq!(client.call("help", &Value::Null), Ok(help));
+        std::fs::remove_file(path).ok();
+        // In this process: a result's bytes come back beside it only when asked for.
+        let mut s = methods::Session::default();
+        assert!(call_method_binary(&mut s, "help", &Value::Null).is_ok_and(|(_, bytes)| bytes.is_none()));
+        // `handle_line` gives one JSON line, so a binary request there gets base64.
+        let line = handle_line(&mut s, r#"{"id":4,"method":"help","binary":true}"#);
+        assert!(line.starts_with(r#"{"id":4,"ok":true,"result":[{"#), "{}", &line[..40]);
+    }
+
+    /// A 4.4 MB PNG through the socket on a kept connection, median of 50 each, interleaved: base64
+    /// in the line against a binary reply, and the server writing `path` against a binary reply
+    /// the client writes to the same file.
+    ///     cargo test --release -p sim-api binary_reply_round_trip -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn binary_reply_round_trip() {
+        const LEN: usize = 4_400_000;
+        let png: std::sync::Arc<Vec<u8>> =
+            std::sync::Arc::new((0..LEN as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect());
+        let (ours, theirs) = UnixStream::pair().expect("pair");
+        let served = png.clone();
+        std::thread::spawn(move || serve_stream(theirs, move |_, p| params::png_result(1206, 2622, served.as_slice(), p)));
+        let mut client = Client::from_stream(ours);
+        let file = std::env::temp_dir().join(format!("simee-binary-bench-{}.png", std::process::id()));
+        let to_file = json!({"path": file.to_str()});
+        let mut runs: [Vec<f64>; 4] = Default::default();
+        let mut time = |i: usize, f: &mut dyn FnMut()| {
+            let t = std::time::Instant::now();
+            f();
+            runs[i].push(t.elapsed().as_secs_f64() * 1000.0);
+        };
+        for _ in 0..50 {
+            time(0, &mut || {
+                assert_eq!(client.call("screenshot", &Value::Null).expect("base64")["png"].as_str().map(str::len), Some(5_866_668))
+            });
+            time(1, &mut || assert_eq!(client.call_binary("screenshot", &Value::Null).expect("binary").1.map(|b| b.len()), Some(LEN)));
+            time(2, &mut || drop(client.call("screenshot", &to_file).expect("server writes")));
+            time(3, &mut || {
+                let bytes = client.call_binary("screenshot", &Value::Null).expect("binary").1.expect("bytes");
+                std::fs::write(&file, bytes).expect("client writes");
+            });
+        }
+        let [base64, binary, server_file, client_file] = runs.map(|mut v| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        });
+        println!(
+            "4.4 MB screenshot, median of 50: base64 {base64:.2} ms, binary {binary:.2} ms; to a file: server writes {server_file:.2} ms, \
+             binary then client writes {client_file:.2} ms"
+        );
+        std::fs::remove_file(file).ok();
     }
 
     /// A 3 MB screenshot response's round trip over the socket, old path against new (server
