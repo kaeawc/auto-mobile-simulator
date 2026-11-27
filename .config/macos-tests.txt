@@ -1,9 +1,10 @@
-# The crates CI tests on macOS (the `lint-test` job, `cargo nextest run -p <each>`): those whose
-# own code can behave differently there. The `linux` job tests the whole workspace, and
-# `lint-test` lints the whole workspace on macOS; tests of crates not listed here run only on
-# Linux. `scripts/ci-scope.py check` (CI's fmt job, scripts/check.sh) fails when a crate with
-# macOS-specific code is missing; `scripts/ci-scope.py macos-crates` says why each one is in.
-# A crate without macOS code may stay with a reason in a comment after its name.
+# The crates CI tests on macOS (the `lint-test` job, `cargo nextest run -p <each>`): those that can
+# behave differently there, because their own code is macOS-specific or because they depend on a
+# crate that is. The `linux` job tests the whole workspace, and `lint-test` lints the whole
+# workspace on macOS; tests of crates not listed here run only on Linux.
+# `scripts/ci-scope.py check` (CI's fmt job, scripts/check.sh) fails when a crate is missing;
+# `scripts/ci-scope.py macos-crates` says why each one is in. A crate that needn't be here may
+# stay with a reason in a comment after its name.
 emu
 emu-avd
 emu-gfxstream
@@ -14,4 +15,6 @@ sim-android
 sim-api
 sim-audio
 sim-coresim
+sim-mcp
 sim-netshape
+simee

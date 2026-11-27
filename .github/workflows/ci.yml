@@ -34,7 +34,8 @@ jobs:
       emu: ${{ steps.scope.outputs.emu }}
       macos: ${{ steps.scope.outputs.macos }}
     steps:
-      # A pull request's checkout is its merge commit; its first parent is the base branch.
+      # A pull request's checkout is its merge commit; its first parent is the base branch. A
+      # rename lists both paths (--no-renames): moving a file CI uses away counts.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -43,7 +44,7 @@ jobs:
         run: |
           set -o pipefail
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            git diff --name-only HEAD^1 HEAD | python3 scripts/ci-scope.py changes >> "$GITHUB_OUTPUT"
+            git diff --no-renames --name-only HEAD^1 HEAD | python3 scripts/ci-scope.py changes >> "$GITHUB_OUTPUT"
           else
             python3 scripts/ci-scope.py changes --all >> "$GITHUB_OUTPUT"
           fi

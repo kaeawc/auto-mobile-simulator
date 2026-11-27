@@ -1,47 +1,48 @@
 name: Rust toolchain
 description: >-
-  Puts rust-toolchain.toml's pinned toolchain in place from the Actions cache, so a job doesn't
-  download and unpack it with rustup (8-11 s a job). On a miss rustup installs it, and a push to
-  main saves it for the pull requests after.
+  Installs rust-toolchain.toml's pinned toolchain, plus any extra components. On macOS runners,
+  where rustup's download takes 8-11 s a job and runner time is scarce, it comes from one Actions
+  cache entry instead (saved by main). Linux jobs keep rustup's ~7 s install: Linux runners are
+  plentiful and the repository's 10 GB cache is full, so a Linux entry would only evict
+  rust-cache targets.
 inputs:
   components:
-    description: Extra rustup components this job needs (space-separated); part of the cache key.
+    description: Extra rustup components this job needs (space-separated), added after the toolchain.
     required: false
     default: ""
 runs:
   using: composite
   steps:
     - id: pin
+      if: runner.os == 'macOS'
       shell: bash
-      env:
-        COMPONENTS: ${{ inputs.components }}
       run: |
         channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
-        case "$RUNNER_OS-$RUNNER_ARCH" in
-          macOS-ARM64) host=aarch64-apple-darwin ;;
-          macOS-X64) host=x86_64-apple-darwin ;;
-          Linux-X64) host=x86_64-unknown-linux-gnu ;;
-          Linux-ARM64) host=aarch64-unknown-linux-gnu ;;
-          *) echo "no host triple for $RUNNER_OS-$RUNNER_ARCH" >&2; exit 1 ;;
+        case "$RUNNER_ARCH" in
+          ARM64) host=aarch64-apple-darwin ;;
+          X64) host=x86_64-apple-darwin ;;
+          *) echo "no host triple for macOS $RUNNER_ARCH" >&2; exit 1 ;;
         esac
-        extra=$(echo "$COMPONENTS" | tr -s ' ' '+')
         {
           echo "dir=${RUSTUP_HOME:-$HOME/.rustup}/toolchains/$channel-$host"
-          echo "key=rustup-$channel-$host-${extra:-base}"
+          echo "key=rustup-$channel-$host"
         } >> "$GITHUB_OUTPUT"
     - id: restore
+      if: runner.os == 'macOS'
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.pin.outputs.dir }}
         key: ${{ steps.pin.outputs.key }}-${{ hashFiles('rust-toolchain.toml') }}
     - shell: bash
-      env:
-        COMPONENTS: ${{ inputs.components }}
-      run: |
-        rustup show active-toolchain || rustup toolchain install
-        if [ -n "$COMPONENTS" ]; then rustup component add $COMPONENTS; fi
-    - if: steps.restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      run: rustup show active-toolchain || rustup toolchain install
+    - if: runner.os == 'macOS' && steps.restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.pin.outputs.dir }}
         key: ${{ steps.restore.outputs.cache-primary-key }}
+    # After the save, so the cached toolchain stays the one every job shares.
+    - if: inputs.components != ''
+      shell: bash
+      env:
+        COMPONENTS: ${{ inputs.components }}
+      run: rustup component add $COMPONENTS

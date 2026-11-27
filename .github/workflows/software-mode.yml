@@ -138,13 +138,44 @@ jobs:
           target/release/emu -provision 36 -tag default -abi x86_64
       - run: target/release/emu -create-avd ci -sysdir system-images/android-36/default/x86_64
       - run: target/release/emu -avd ci -dry-run
-      # A pull request's check ends at `sys.boot_completed`, one screenshot (the display's size)
-      # and one tap, which prove the path works; main and manual runs also wait for the launcher,
-      # check it was drawn, and stop the guest through the console.
+      # Every run checks `sys.boot_completed`, a screenshot of the display's size that isn't one
+      # solid colour (polled: the first frame after boot can still be blank), a tap and a clean
+      # stop through the console. Main and manual runs also give the launcher 30 s and want a
+      # screenshot of it (over 20 kB); a pull request goes on as soon as something is drawn.
       - name: Boot, screenshot, tap, stop
         env:
           FULL: ${{ github.event_name != 'pull_request' }}
         run: |
+          # Exits 0 when the PNG is 720x1280, over $2 bytes and not one solid colour.
+          cat > "$RUNNER_TEMP/drawn.py" <<'EOF'
+          import struct, sys, zlib
+          d = open(sys.argv[1], "rb").read()
+          w, h, depth, ctype = struct.unpack(">IIBB", d[16:26])
+          bpp = {0: 1, 2: 3, 4: 2, 6: 4}[ctype] * depth // 8
+          data, i = b"", 8
+          while i < len(d):
+              n, kind = struct.unpack(">I4s", d[i:i + 8])
+              data += d[i + 8:i + 8 + n] if kind == b"IDAT" else b""
+              i += 12 + n
+          raw, stride = zlib.decompress(data), w * bpp
+          prev, first, solid = bytearray(stride), None, True
+          for y in range(h):
+              f, line = raw[y * (stride + 1)], bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+              for x in range(stride) if f else ():
+                  a, b = line[x - bpp] if x >= bpp else 0, prev[x]
+                  c = prev[x - bpp] if x >= bpp else 0
+                  if f == 4:
+                      p = a + b - c
+                      a = a if abs(p - a) <= abs(p - b) and abs(p - a) <= abs(p - c) else b if abs(p - b) <= abs(p - c) else c
+                  line[x] = (line[x] + (a if f in (1, 4) else b if f == 2 else (a + b) // 2)) & 255
+              first = first or line[:bpp]
+              if line != first * w:
+                  solid = False
+                  break
+              prev = line
+          print(w, h, len(d), "one solid colour" if solid else "drawn")
+          sys.exit(0 if (w, h) == (720, 1280) and len(d) > int(sys.argv[2]) and not solid else 1)
+          EOF
           adb="$ANDROID_HOME/platform-tools/adb"
           "$adb" start-server
           target/release/emu -avd ci -verbose > emu.log 2>&1 &
@@ -158,10 +189,14 @@ jobs:
           grep "boot completed" emu.log
           test "$("$adb" -s emulator-5554 shell getprop sys.boot_completed | tr -d '\r')" = 1
           if [ "$FULL" = true ]; then sleep 30; min=20000; else min=0; fi
-          target/release/simee screenshot ci shot.png
-          python3 -c "import struct,sys; d=open('shot.png','rb').read(); w,h=struct.unpack('>II',d[16:24]); print(w,h,len(d)); sys.exit(0 if (w,h)==(720,1280) and len(d)>$min else 1)"
+          drawn=
+          for _ in $(seq 1 40); do
+            target/release/simee screenshot ci shot.png
+            python3 "$RUNNER_TEMP/drawn.py" shot.png "$min" && { drawn=1; break; }
+            sleep 2
+          done
+          test -n "$drawn"
           target/release/simee tap ci 360 600
-          [ "$FULL" = true ] || exit 0
           "$adb" -s emulator-5554 emu kill
           for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
           ! kill -0 "$pid" 2>/dev/null

@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """What CI has to run on macOS, derived from the code.
 
-    scripts/ci-scope.py macos-crates     # the crates with macOS-specific code, and why
+    scripts/ci-scope.py macos-crates     # the crates that can behave differently on macOS, and why
     scripts/ci-scope.py check            # .config/macos-tests.txt names exactly those crates
     scripts/ci-scope.py changes < files  # which jobs a change list needs (key=value lines)
 
 The `linux` job runs the whole workspace's tests; the macOS `lint-test` job lints the whole
 workspace (cfg(macos) code only compiles there) but tests only the crates in
-`.config/macos-tests.txt`: those whose own code can behave differently on macOS. A crate is in
-when one of its compiled files (on macOS) has a `cfg` that differs between aarch64 macOS and
-x86_64 Linux (`#[cfg]`, `#![cfg]`, `cfg!`, `cfg_attr` other than lint levels), when its Cargo.toml
-has a macOS-only dependency, or when it carries Objective-C, Swift or C with `__APPLE__`. Code
-gated off on macOS (`#[cfg(target_os = "linux")] mod soft;`, emu-kvm) doesn't count. `check`
-fails when a crate is missing from the list (or listed without reason), so the macOS test run
-can't silently drop a crate that gains macOS code.
+`.config/macos-tests.txt`: those that can behave differently on macOS. A crate is in when one of
+its compiled files (on macOS) has a `cfg` that differs between aarch64 macOS and x86_64 Linux
+(`#[cfg]`, `#![cfg]`, `cfg!`, `cfg_attr` other than lint levels), when its Cargo.toml has a
+macOS-only dependency, when it carries Objective-C, Swift or C with `__APPLE__`, or when it builds
+on macOS and depends (normal or dev) on a crate that is in. Code gated off on macOS
+(`#[cfg(target_os = "linux")] mod soft;`, emu-kvm) doesn't count. `check` fails when a crate is
+missing from the list (or listed without reason), so the macOS test run can't silently drop one.
 
-`changes` reads changed paths (one per line) and prints `lint`, `desktop`, `emu` and `macos`
-(desktop or emu) as true/false: whether the change can affect the macOS lint-test job, the
-desktop workspace (macOS and Linux), or the macOS release build of emu. Docs, Linux-only Rust
-files, scripts CI doesn't run and other workflows affect none of them; anything it doesn't know
-affects all. Stdlib only; runs on Python 3.8+.
+`changes` reads changed paths (one per line; renames as both paths) and prints `lint`,
+`desktop`, `emu` and `macos` (desktop or emu) as true/false: whether the change can affect the
+macOS lint-test job, the desktop workspace (macOS and Linux), or the macOS release build of emu.
+Docs, Linux-only Rust files, scripts no CI job runs and other workflows affect none of them; a
+script counts for the jobs whose config or code names it (and the scripts it names, in turn).
+Anything it doesn't know affects all. Stdlib only; runs on Python 3.8+.
 """
 
 import os
@@ -286,7 +287,7 @@ class Crate:
         self.name = next(re.match(r'name\s*=\s*"([^"]+)"', ln).group(1)
                          for h, lines in self.sections if h == "package" for ln in lines if ln.startswith("name"))
         self.bins = [re.match(r'path\s*=\s*"([^"]+)"', ln).group(1)
-                     for h, lines in self.sections if h == "[bin]" for ln in lines if ln.startswith("path")]
+                     for h, lines in self.sections if h == "bin" for ln in lines if ln.startswith("path")]
 
     def deps(self, dev=False):
         """[(dependency name, target cfg or None)] from the build, normal (and dev) sections."""
@@ -466,18 +467,39 @@ def read_list():
     return out
 
 
+def macos_crates(crates):
+    """{crate: reasons} for every crate the macOS job tests: those with macOS-specific code of
+    their own, and those that build on macOS and depend (normal or dev, directly or through
+    another such crate) on one: a dependency's macOS behaviour reaches them at run time without a
+    cfg of theirs (simee's socket paths, sim-mcp through sim-api)."""
+    derived = {n: macos_reasons(c) for n, c in crates.items()}
+    derived = {n: r for n, r in derived.items() if r}
+    builds = {n: any(on for f, on in compiled(c, MAC, kinds=("lib", "bin", "test")).items())
+              for n, c in crates.items()}
+    grew = True
+    while grew:
+        grew = False
+        for n, c in sorted(crates.items()):
+            if n in derived or not builds[n]:
+                continue
+            via = sorted({d for d, _ in c.deps(dev=True) if d in derived})
+            if via:
+                derived[n] = ["depends on %s" % ", ".join(via)]
+                grew = True
+    return derived
+
+
 def cmd_macos_crates():
-    for name, c in sorted(workspace().items()):
-        r = macos_reasons(c)
-        if r:
-            print("%-14s %s%s" % (name, r[0], " (+%d)" % (len(r) - 1) if len(r) > 1 else ""))
+    for name, r in sorted(macos_crates(workspace()).items()):
+        print("%-14s %s%s" % (name, r[0], " (+%d)" % (len(r) - 1) if len(r) > 1 else ""))
     return 0
 
 
 def cmd_check():
     crates = workspace()
     listed = read_list()
-    derived = {n: macos_reasons(c) for n, c in crates.items()}
+    found = macos_crates(crates)
+    derived = {n: found.get(n, []) for n in crates}
     errors = []
     for n in sorted(listed):
         if n not in crates:
@@ -486,12 +508,12 @@ def cmd_check():
             errors.append("%s: %s has no macOS-specific code; drop it, or say why it stays in a comment" % (LIST, n))
     for n in sorted(derived):
         if derived[n] and n not in listed:
-            errors.append("%s: %s has macOS-specific code (%s) but the macOS job doesn't test it: add it"
+            errors.append("%s: %s can behave differently on macOS (%s) but the macOS job doesn't test it: add it"
                           % (LIST, n, "; ".join(derived[n][:3])))
     for e in errors:
         print("ci-scope: " + e, file=sys.stderr)
     if not errors:
-        print("ci-scope: %s matches the %d crates with macOS-specific code" % (LIST, sum(1 for v in derived.values() if v)))
+        print("ci-scope: %s matches the %d crates that can behave differently on macOS" % (LIST, sum(1 for v in derived.values() if v)))
     return 1 if errors else 0
 
 
@@ -525,13 +547,45 @@ def desktop_deps(crates):
 
 REFERENCED = re.compile(r'"(?:\.\./)*((?:docs|scripts)/[A-Za-z0-9_./-]+)"')
 
-# Paths no job here reads: docs, other workflows, local tooling.
+# Paths no job here reads: docs, other workflows, local tooling, and scripts nothing below names.
 NONE = re.compile(r"^(docs/|\.github/workflows/software-mode\.yml$|\.githooks/|\.local/|LICENSE$|\.gitignore$"
                   r"|Makefile$|bacon\.toml$|rustfmt\.toml$)|\.md$|^scripts/")
 EVERYTHING = re.compile(r"^(\.github/workflows/ci\.yml|\.github/actions/|\.cargo/|rust-toolchain\.toml$|Cargo\.toml$"
                         r"|scripts/ci-scope\.py$)")
-# The cargo runner CI's macOS tests (and desktop's) run through.
-RUNNER = re.compile(r"^scripts/(sign-run\.sh|hypervisor\.entitlements)$")
+# What runs scripts in these jobs: the workflow and its actions (every job), and cargo's config
+# (its runner, scripts/sign-run.sh, runs the macOS tests and the desktop's).
+SCRIPT_USERS = ((".github/workflows/ci.yml", {"lint", "desktop", "emu"}), (".github/actions", {"lint", "desktop", "emu"}),
+                (".cargo/config.toml", {"lint", "desktop"}))
+
+
+def script_scopes(rust_refs):
+    """{scripts/<file>: jobs} for the scripts a job runs: those the workflow, its actions or
+    cargo's config name, those the tests name (rust_refs), and those a used script names in turn
+    (sign-run.sh's hypervisor.entitlements)."""
+    scripts = [f for f in walk_files("scripts") if os.path.isfile(os.path.join(ROOT, f))]
+    named = lambda text, f: re.search(r"(?<![\w.-])%s(?![\w.-])" % re.escape(os.path.basename(f)), text)
+    out = {}
+    for user, jobs in SCRIPT_USERS:
+        texts = [read(f) for f in (walk_files(user) if os.path.isdir(os.path.join(ROOT, user)) else [user])
+                 if os.path.isfile(os.path.join(ROOT, f))]
+        for f in scripts:
+            if any(re.search(r"(?<![\w.-])%s(?![\w.-])" % re.escape(f), t) for t in texts):
+                out.setdefault(f, set()).update(jobs)
+    for f in rust_refs:
+        if f in scripts:
+            out.setdefault(f, set()).add("lint")
+    grew = True
+    while grew:
+        grew = False
+        for user in sorted(out):
+            text = read(user)
+            if not re.match(r"#!\s*/\S*(sh|bash)\b|#!\s*/usr/bin/env\s+(sh|bash)\b", text):
+                continue  # only shell scripts run what they name; this one merely mentions some
+            for f in scripts:
+                if f != user and named(text, f) and not out[user] <= out.get(f, set()):
+                    out.setdefault(f, set()).update(out[user])
+                    grew = True
+    return out
 
 
 def scopes(paths):
@@ -552,6 +606,7 @@ def scopes(paths):
         if on:
             for m in REFERENCED.finditer(scan(f)[2]):
                 refs.setdefault(m.group(1), set()).add(f)
+    used_scripts = script_scopes(refs)
     need = {"lint": [], "desktop": [], "emu": []}
     for p in paths:
         p = p.strip()
@@ -565,8 +620,8 @@ def scopes(paths):
             hit |= {"lint", "desktop", "emu"}
         elif p == "Cargo.lock" or p.startswith(".config/"):
             hit |= {"lint", "emu"} if p == "Cargo.lock" else {"lint"}
-        elif RUNNER.match(p):
-            hit |= {"lint", "desktop"}
+        elif p in used_scripts:
+            hit |= used_scripts[p]
         elif p.startswith("desktop/"):
             if not p.endswith(".md"):
                 hit.add("desktop")
