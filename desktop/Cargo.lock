@@ -3387,6 +3387,7 @@ dependencies = [
  "sim-coresim",
  "sim-debug",
  "sim-netshape",
+ "wgpu",
 ]
 
 [[package]]
