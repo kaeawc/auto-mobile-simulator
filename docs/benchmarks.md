@@ -963,6 +963,28 @@ tables (latency p95, picture step, output rate, IDR sizes) and what the numbers 
 | Android API 36, 576x1280, 30 | 22.1 | 5.80 | 6.9 |
 | Android API 36, 576x1280, 60 | 37.3 | 5.77 | 8.1 |
 
+## Video encode (H.264, OpenH264 on Linux)
+
+`simee-encode`'s Linux encoder (OpenH264 built from source, `--features openh264`) on synthetic
+phone screens, no device: an app drawer scrolling on a 1080x2400 screen presented at 60 fps,
+encoded through the real loop, 10 s per run, medians of 3 rounds, defaults (Constrained Baseline,
+4 Mbit/s average, IDR every 2 s), OpenH264 built with `nasm`, 2026-11-27. Host: a Linux VM,
+Intel Xeon @ 2.20 GHz, 4 vCPUs, 3.8 GB, Ubuntu 22.04, kernel 6.1.189. Reproduce:
+`scripts/bench/encode-linux.sh` (`OPENH264_NO_ASM=1` for the no-`nasm` row). Latency includes the
+colour conversion and scaling. The method, PSNR, bitrate and IDR sizes, and what the numbers say
+are in [streaming.md](streaming.md#encode-cost-on-linux). Synthetic screens, so a real device's
+bitrate will differ; this VM's numbers are not comparable with the Apple M3 Max rows above, and
+aarch64 speed is not measured.
+
+| Screen, size, fps cap | Encoded, fps | Encode latency p50, ms | Process CPU, % of a core |
+| --- | --- | --- | --- |
+| 1080x2400, 30 | 28.8 | 26.12 | 82 |
+| 1080x2400, 60 | 28.4 | 36.54 | 99 |
+| 1080x2400 capped at 1280 (576x1280), 30 | 29.8 | 22.39 | 68 |
+| 1080x2400 capped at 1280 (576x1280), 60 | 58.7 | 14.17 | 86 |
+| 1080x2400, 30, built without `nasm` | 13.6 | 61.82 | 100 |
+| 1080x2400 capped at 1280, 30, built without `nasm` | 24.6 | 35.00 | 98 |
+
 ## MCP server
 
 What the MCP server's protocol layer costs to build, against the official Rust SDK. Linux VM,

@@ -4,6 +4,8 @@
 //! consumer) wants start codes, with the SPS and PPS in front of every IDR so a viewer that joins
 //! late or recovers from loss can decode it. [`ParameterSets`] caches the latest pair and
 //! [`ParameterSets::access_unit`] builds each Annex B access unit.
+//! An encoder that writes Annex B itself (OpenH264) goes through
+//! [`ParameterSets::annex_b_access_unit`], which only adds what an IDR came without.
 
 use crate::{Error, Result};
 
@@ -135,8 +137,24 @@ impl ParameterSets {
     /// PPS in front unless it carries its own before its first slice; one with none cached is
     /// [`Error::InvalidInput`] (a viewer couldn't decode it).
     pub fn access_unit(&self, sample: &[u8], len_size: u8, keyframe: bool) -> Result<Vec<u8>> {
-        let units = length_prefixed_units(sample, len_size)?;
-        let mut out = Vec::with_capacity(sample.len() + 64);
+        self.assemble(&length_prefixed_units(sample, len_size)?, keyframe, sample.len())
+    }
+
+    /// One Annex B access unit from an encoder that writes Annex B itself (OpenH264): the SPS and
+    /// PPS it wrote with an IDR are cached, and an IDR that came without them gets the cached
+    /// ones in front. Returns the unit and whether it holds an IDR slice; an IDR with no
+    /// parameter sets anywhere is [`Error::InvalidInput`].
+    pub fn annex_b_access_unit(&mut self, stream: &[u8]) -> Result<(Vec<u8>, bool)> {
+        let units = annex_b_units(stream);
+        let keyframe = units.iter().any(|n| nal_type(n) == NAL_IDR);
+        if keyframe {
+            self.update(&units);
+        }
+        Ok((self.assemble(&units, keyframe, stream.len())?, keyframe))
+    }
+
+    fn assemble(&self, units: &[&[u8]], keyframe: bool, size_hint: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(size_hint + 64);
         let first_slice = units.iter().position(|n| (1..=5).contains(&nal_type(n)));
         let before = &units[..first_slice.unwrap_or(units.len())];
         let has = |t| before.iter().any(|n| nal_type(n) == t);
@@ -231,5 +249,22 @@ mod tests {
         assert!(sets.update(&[&sps2[..], PPS]));
         assert_eq!((sets.sps(), sets.pps(), sets.changes()), (Some(&sps2[..]), Some(PPS), 2));
         assert_eq!(annex_b_units(&sets.access_unit(&prefixed(&[IDR], 4), 4, true).expect("idr")), vec![&sps2[..], PPS, IDR]);
+    }
+
+    #[test]
+    fn annex_b_encoder_output_gets_parameter_sets_before_every_idr() {
+        let mut sets = ParameterSets::default();
+        let annex_b = |units: &[&[u8]]| units.iter().flat_map(|u| [&START_CODE[..], u].concat()).collect::<Vec<u8>>();
+        // An IDR that brings its own SPS and PPS is passed through, and they are cached.
+        let own = annex_b(&[SPS, PPS, IDR]);
+        assert_eq!(sets.annex_b_access_unit(&own).expect("idr"), (own.clone(), true));
+        assert_eq!((sets.sps(), sets.pps()), (Some(SPS), Some(PPS)));
+        // A P frame is left alone, and isn't a keyframe.
+        let p = annex_b(&[P]);
+        assert_eq!(sets.annex_b_access_unit(&p).expect("p"), (p, false));
+        // An IDR without them (an encoder that wrote them once) gets the cached pair in front.
+        assert_eq!(sets.annex_b_access_unit(&annex_b(&[SEI, IDR])).expect("idr"), (annex_b(&[SPS, PPS, SEI, IDR]), true));
+        // An IDR with no parameter sets cached or carried can't be decoded by a late viewer.
+        assert!(ParameterSets::default().annex_b_access_unit(&annex_b(&[IDR])).is_err());
     }
 }
