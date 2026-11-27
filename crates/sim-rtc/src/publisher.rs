@@ -14,7 +14,7 @@
 //! estimation; keyframe requests (PLI/FIR, throttled) and estimates reach the encoder through the
 //! event callback, on the publisher's thread: keep it short.
 //!
-//! Dropping a publisher (or `close`) stops the thread and DELETEs the WHIP resource.
+//! Dropping a publisher (or `close`) stops the thread and sends DELETE for the WHIP resource.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
