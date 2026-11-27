@@ -220,7 +220,7 @@
         "readOnlyHint": false,
         "title": "shutdown"
       },
-      "description": "Shut down. Destructive: deletes, stops or overwrites something, and it can't be undone. Can take a while (seconds to minutes): a client with the tasks extension gets a task to poll.\n\nPlatforms: Android, iOS. Parameters: device. Toolsets: core, lifecycle.",
+      "description": "Shut down. Destructive: deletes, stops or overwrites something; deleted or overwritten data is not recovered, and a stopped device or app can be started again. Can take a while (seconds to minutes): a client with the tasks extension gets a task to poll.\n\nPlatforms: Android, iOS. Parameters: device. Toolsets: core, lifecycle.",
       "inputSchema": {
         "properties": {
           "device": {
@@ -655,7 +655,7 @@
         "readOnlyHint": false,
         "title": "uninstall"
       },
-      "description": "Uninstall an app (Android: the package name; `pm uninstall`). Destructive: deletes, stops or overwrites something, and it can't be undone.\n\nPlatforms: Android, iOS. Parameters: device, bundle_id. Toolsets: core, apps.",
+      "description": "Uninstall an app (Android: the package name; `pm uninstall`). Destructive: deletes, stops or overwrites something; deleted or overwritten data is not recovered, and a stopped device or app can be started again.\n\nPlatforms: Android, iOS. Parameters: device, bundle_id. Toolsets: core, apps.",
       "inputSchema": {
         "properties": {
           "bundle_id": {
@@ -758,7 +758,7 @@
         "readOnlyHint": false,
         "title": "terminate"
       },
-      "description": "Terminate an app (Android: `am force-stop`). Destructive: deletes, stops or overwrites something, and it can't be undone.\n\nPlatforms: Android, iOS. Parameters: device, bundle_id. Toolsets: core, apps.",
+      "description": "Terminate an app (Android: `am force-stop`). Destructive: deletes, stops or overwrites something; deleted or overwritten data is not recovered, and a stopped device or app can be started again.\n\nPlatforms: Android, iOS. Parameters: device, bundle_id. Toolsets: core, apps.",
       "inputSchema": {
         "properties": {
           "bundle_id": {

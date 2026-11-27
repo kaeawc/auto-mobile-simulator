@@ -359,6 +359,9 @@ fn toolsets_pick_the_tools_and_a_hidden_one_says_where_it_is() {
     assert_eq!(Toolsets::parse("").expect("empty"), Toolsets::default());
     assert_eq!(Toolsets::all().label(), "all");
     assert_eq!(list(&Toolsets::all(), &modern()).len(), METHODS.len() + 1);
+    for bad in ["all,bogus", "bogus,all"] {
+        assert!(Toolsets::parse(bad).expect_err(bad).contains("unknown toolset `bogus`"), "{bad}");
+    }
     let err = Toolsets::parse("core,streaming").expect_err("unknown");
     assert!(err.contains("unknown toolset `streaming`") && err.contains("debug") && err.contains(TOOLSETS_ENV), "{err}");
     // Every tool is in one group, so `all` is every group.
@@ -499,5 +502,28 @@ fn only_long_methods_for_task_clients_become_tasks() {
     assert!(!as_task("tap", &tasks) && !as_task("boot", &plain) && !as_task("boot", &legacy));
     for name in LONG_RUNNING {
         assert!(METHODS.iter().any(|(m, ..)| m == name), "{name} is not a method");
+    }
+}
+
+#[test]
+fn snapshots_are_bounded_and_a_crafted_cursor_is_refused() {
+    let pages = Pages::default();
+    let v = json!([1, 2, 3]);
+    let ids: Vec<u64> = (0..6).map(|_| pages.keep_within("processes", &v, 3, usize::MAX)).collect();
+    assert!(pages.find("processes", ids[0]).is_none() && pages.find("processes", ids[2]).is_none());
+    assert!(pages.find("processes", ids[3]).is_some() && pages.find("processes", ids[5]).is_some());
+    // By bytes: each is 7 bytes of JSON, so 15 holds two.
+    let by_bytes = Pages::default();
+    let ids: Vec<u64> = (0..4).map(|_| by_bytes.keep_within("processes", &v, 16, 15)).collect();
+    assert!(by_bytes.find("processes", ids[1]).is_none() && by_bytes.find("processes", ids[2]).is_some());
+    assert!(by_bytes.find("processes", ids[3]).is_some());
+    // One alone over the cap is still kept.
+    assert!(by_bytes.find("processes", by_bytes.keep_within("processes", &v, 16, 1)).is_some());
+    // A hand-made cursor with a page size out of range is refused, not looped on.
+    let fake = Fake::default();
+    let id = pages.keep_within("processes", &json!([1, 2, 3]), 3, usize::MAX);
+    for size in [0, MAX_LIMIT + 1] {
+        let err = run(&fake, &pages, "processes", &json!({"cursor": format!("{id}.0.{size}")})).expect_err("range");
+        assert!(err.contains("`cursor`"), "{err}");
     }
 }

@@ -41,7 +41,9 @@ impl Effect {
             Effect::Set => "Sets a value on the device; repeating it changes nothing more.",
             Effect::Act => "Acts on the device each time it is called.",
             Effect::Danger => "Caution: runs code, restarts or replaces state, or writes files; repeating it can differ.",
-            Effect::Destroy => "Destructive: deletes, stops or overwrites something, and it can't be undone.",
+            Effect::Destroy => {
+                "Destructive: deletes, stops or overwrites something; deleted or overwritten data is not recovered, and a stopped device or app can be started again."
+            }
         }
     }
 }

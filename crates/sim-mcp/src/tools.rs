@@ -59,9 +59,10 @@ impl Toolsets {
             return Ok(Toolsets::default());
         }
         let mut sets = Toolsets { core: false, groups: Vec::new() };
+        let mut all = false;
         for name in names {
             match name {
-                "all" => return Ok(Toolsets::all()),
+                "all" => all = true,
                 CORE => sets.core = true,
                 _ => match Group::from_name(name) {
                     Some(g) if !sets.groups.contains(&g) => sets.groups.push(g),
@@ -70,7 +71,7 @@ impl Toolsets {
                 },
             }
         }
-        Ok(sets)
+        Ok(if all { Toolsets::all() } else { sets })
     }
 
     /// The toolsets `SIMEE_MCP_TOOLSETS` names.
@@ -365,7 +366,9 @@ pub fn arguments(params: &Value) -> Result<Value, RpcError> {
 
 /// Snapshots of long lists a client is paging through: the first page's call is the list's
 /// snapshot, and each cursor names one, so the pages after it are the same list (a process list or
-/// a log window doesn't shift under the client). Kept [`Pages::TTL`]; at most [`Pages::KEPT`].
+/// a log window doesn't shift under the client). Kept [`Pages::TTL`]; at most [`Pages::KEPT`] of them
+/// and [`Pages::MAX_BYTES`] of JSON in all (the oldest go first), and none for a first page that
+/// holds the whole list.
 #[derive(Default)]
 pub struct Pages {
     kept: Mutex<(u64, VecDeque<Snapshot>)>,
@@ -377,25 +380,34 @@ struct Snapshot {
     at: Instant,
     /// The whole result.
     value: Value,
+    /// Its size as JSON text.
+    bytes: usize,
 }
 
 impl Pages {
     pub const TTL: Duration = Duration::from_secs(600);
-    pub const KEPT: usize = 16;
+    pub const KEPT: usize = 4;
+    pub const MAX_BYTES: usize = 32 << 20;
 
     fn lock(&self) -> std::sync::MutexGuard<'_, (u64, VecDeque<Snapshot>)> {
         self.kept.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn keep(&self, tool: &str, value: &Value) -> u64 {
+        self.keep_within(tool, value, Pages::KEPT, Pages::MAX_BYTES)
+    }
+
+    fn keep_within(&self, tool: &str, value: &Value, entries: usize, max_bytes: usize) -> u64 {
+        let bytes = value.to_string().len();
         let mut kept = self.lock();
         kept.0 += 1;
         let id = kept.0;
         kept.1.retain(|s| s.at.elapsed() < Pages::TTL);
-        if kept.1.len() >= Pages::KEPT {
+        // Make room: the oldest go until this one fits both caps (it is kept even when alone over).
+        while !kept.1.is_empty() && (kept.1.len() >= entries || kept.1.iter().map(|s| s.bytes).sum::<usize>() + bytes > max_bytes) {
             kept.1.pop_front();
         }
-        kept.1.push_back(Snapshot { id, tool: tool.to_owned(), at: Instant::now(), value: value.clone() });
+        kept.1.push_back(Snapshot { id, tool: tool.to_owned(), at: Instant::now(), value: value.clone(), bytes });
         id
     }
 
@@ -430,6 +442,9 @@ impl Pages {
                 let (Some(Ok(id)), Some(Ok(offset)), Some(Ok(was)), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
                     return Err(expired());
                 };
+                if !(1..=MAX_LIMIT).contains(&was) {
+                    return Err(expired());
+                }
                 (self.find(tool, id).ok_or_else(expired)?, offset, limit.unwrap_or(was))
             }
             Some(other) => return Err(format!("`cursor` is a previous page's `next_cursor`, not {other}")),

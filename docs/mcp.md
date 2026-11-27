@@ -132,7 +132,7 @@ crate:
   1000) the result is a page, `{items, next_cursor, total}` (`devices_usage` keeps its shape, with
   `devices` cut to the page and `next_cursor` and `total` beside it); pass `next_cursor` back as
   `cursor` for the next page, until it is `null`. The pages after the first come from a snapshot
-  of the first call's list, kept 10 minutes (16 at most), so a process list or a log window doesn't
+  of the first call's list, kept 10 minutes (4 at most, and 32 MiB of JSON in all: the oldest go first, and a first page that holds the whole list keeps none), so a process list or a log window doesn't
   shift between pages. Without `limit` or `cursor` the result is the whole list, as before.
 - A failing method is a tool result with `isError: true` and its message, so the agent can correct
   itself; protocol errors are for unknown tools and malformed requests.
