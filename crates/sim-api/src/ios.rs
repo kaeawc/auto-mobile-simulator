@@ -209,6 +209,45 @@ fn kill_in(tree: &[i32], pid: i64, signal: i64) -> Result<Value, String> {
     sim_coresim::procs::signal(pid32, signal).map(|()| Value::Null).map_err(|e| format!("kill {pid} failed: {e}"))
 }
 
+/// The pid `p` names among `tree`'s processes: `pid` itself (it must be one of the device's), or
+/// the running app whose launchd label (`XPC_SERVICE_NAME`, read through `KERN_PROCARGS2`) is
+/// `bundle_id`'s.
+fn app_pid(tree: &[i32], p: &Value) -> Result<i32, String> {
+    match (str_param(p, "bundle_id"), p.get("pid").and_then(Value::as_i64)) {
+        (Some(_), Some(_)) => Err("give `bundle_id` or `pid`, not both".into()),
+        (None, Some(pid)) => {
+            i32::try_from(pid).ok().filter(|p| tree.contains(p)).ok_or_else(|| format!("pid {pid} is not a process of this device"))
+        }
+        (Some(bundle_id), None) => tree
+            .iter()
+            .copied()
+            .find(|&pid| {
+                sim_coresim::procs::procargs(pid)
+                    .and_then(|buf| sim_debug::process::ProcArgs::parse(&buf))
+                    .is_some_and(|a| a.var("XPC_SERVICE_NAME").is_some_and(|l| crate::memtools::is_app_label(l, bundle_id)))
+            })
+            .ok_or_else(|| format!("`{bundle_id}` isn't running on this device; launch it first")),
+        (None, None) => Err("give `bundle_id` or `pid`".into()),
+    }
+}
+
+/// `mem_leaks`, `mem_heap`, `mem_vmmap`, `mem_history`: the host's tool on one app of the device,
+/// within `timeout_s`.
+fn mem_tool(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
+    use crate::memtools::{self, Tool};
+    let tool = Tool::for_method(method).ok_or_else(|| format!("`{method}` isn't a memory tool"))?;
+    let address = if tool == Tool::History { Some(memtools::address(need_str(p, "address")?)?) } else { None };
+    let raw = opt_bool(p, "raw")?.unwrap_or(false);
+    let deadline = opt_u64(p, "timeout_s").map_or(memtools::DEFAULT_TIMEOUT, Duration::from_secs);
+    let pid = app_pid(&device_tree(&s.device(p)?.info().udid)?, p)?;
+    let out = memtools::run(&tool.program(), &tool.args(pid, address.as_deref()), deadline)?;
+    let mut result = memtools::finish(tool, pid, &out, raw)?;
+    if let Some(address) = address {
+        result["address"] = address.into();
+    }
+    Ok(result)
+}
+
 /// Reboots the device with the shaper in its launchd environment, so every process (including
 /// WebKit's networking extension and system daemons) is shaped by the device's profile.
 fn boot_inject(device: &Device) -> Result<(), String> {
@@ -1669,6 +1708,9 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             if p.get("shaped").and_then(Value::as_bool).unwrap_or(false) {
                 env.extend(shaper_env(&d)?);
             }
+            if opt_bool(p, "malloc_stack_logging")?.unwrap_or(false) {
+                env.push(("MallocStackLogging".into(), "1".into()));
+            }
             let pid = d.launch_with(need_str(p, "bundle_id")?, &strings(p, "args"), &env, launch_restart(p)?).map_err(err)?;
             Ok(json!({"pid": pid}))
         }
@@ -1775,6 +1817,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         }
         "connections" => serde_json::to_value(connections_in(&device_tree(&s.device(p)?.info().udid)?)).map_err(err),
         "traffic" => serde_json::to_value(sim_debug::net::traffic(&device_tree(&s.device(p)?.info().udid)?)?).map_err(err),
+        "mem_leaks" | "mem_heap" | "mem_vmmap" | "mem_history" => mem_tool(s, method, p),
         "containers" => {
             let root = s.device(p)?.data_path();
             serde_json::to_value(sim_debug::storage::apps(Path::new(&root), p.get("sizes").and_then(Value::as_bool).unwrap_or(false)))

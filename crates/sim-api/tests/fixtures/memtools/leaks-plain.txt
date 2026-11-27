@@ -1,0 +1,46 @@
+Process:         Leaky [6329]
+Path:            /Users/me/Library/Developer/CoreSimulator/Devices/AB009E7A-8DB1-4D6F-AD2C-3D4232FEFEF4/data/Containers/Bundle/Application/2D565585-DC46-415B-A816-ABCEC8649234/Leaky.app/Leaky
+Load Address:    0x102b38000
+Identifier:      dev.simee.leaky
+Version:         1.0 (1)
+Code Type:       ARM64
+Platform:        iOS Simulator
+Parent Process:  launchd_sim [96592]
+Target Type:     corpse
+
+Date/Time:       2026-11-27 05:13:54.805 -0600
+Launch Time:     2026-11-27 05:13:51.391 -0600
+OS Version:      macOS 26.6.2 (25G83)
+Report Version:  7
+Analysis Tool:   /Library/Developer/CoreSimulator/Volumes/iOS_23F77/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.5.simruntime/Contents/Resources/RuntimeRoot/usr/bin/leaks
+Analysis Tool Version:  iOS Simulator 26.5 (23F77)
+
+Physical footprint:         10.8M
+Physical footprint (peak):  14.5M
+Idle exit:                  untracked
+----
+
+leaks Report Version: 3.0
+Process 6329: 13130 nodes malloced for 1574 KB
+Process 6329: 20 leaks for 68208 total leaked bytes.
+
+Leak: 0x103c403c0  size=48  zone: DefaultMallocZone_0x10316c000   NSConcreteMutableData  ObjC  Foundation
+Leak: 0x103eed3a0  size=32  zone: DefaultMallocZone_0x10316c000   LeakyNode  ObjC  Leaky
+Leak: 0x103eed400  size=32  zone: DefaultMallocZone_0x10316c000   LeakyNode  ObjC  Leaky
+Leak: 0x103f18000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f19000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f1a000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f1b000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f1c000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f1d000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f1e000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f1f000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f20000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f21000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f22000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f23000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f24000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f25000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f26000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f27000  size=4096  zone: DefaultMallocZone_0x10316c000
+Leak: 0x103f28000  size=2560  zone: DefaultMallocZone_0x10316c000   NSConcreteMutableData (Bytes Storage)  C  Foundation

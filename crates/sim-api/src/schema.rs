@@ -46,6 +46,9 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         "store" | "cursor" => Str,
         "wait_ms" => Int,
         "ops" => Objects,
+        // mem_* (and launch's stack logging for them)
+        "address" => Str,
+        "raw" | "malloc_stack_logging" => Bool,
         "device" | "platform" | "form_factor" | "name" | "device_type" | "runtime" | "system_image" | "path" | "url" | "bundle_id"
         | "text" | "base64" | "domain" | "key" | "language" | "uid" | "capture_id" | "program" | "command" | "predicate" | "last"
         | "preset" | "direction" | "gesture" | "button" | "phase" | "action" | "service" | "scope" | "display" | "orientation"

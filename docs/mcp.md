@@ -9,7 +9,7 @@ look at their screens, read their logs, and watch them change.
 | Tools | One per method in `sim-api`'s table, generated from it, and `device_view` |
 | Resources | Devices, runtimes, form factors, and each device's info, screenshot, logs and apps |
 | Subscriptions | Change notifications for those resources, by re-reading them while subscribed |
-| Tasks | `boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase`, `shutdown`, `export`, `import` as pollable, cancellable tasks |
+| Tasks | `boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase`, `shutdown`, `export`, `import`, `mem_leaks`, `mem_heap` as pollable, cancellable tasks |
 | App | `device_view`: a device's screen with tap, swipe, type and button controls, in the conversation |
 
 Transport is stdio only: there is no HTTP or SSE listener, so nothing on the network can reach it.
@@ -136,6 +136,7 @@ reverse):
 | `console`, `fold`, `xr`, `vehicle`, `touchpad`, `export`, `import` | Android (iOS bundles: the next step of #170) |
 | `prefs_stores`, `prefs_read`, `prefs_write`, `prefs_delete`, `prefs_batch`, `prefs_watch` | Android, iOS (each answers "not yet available" until its platform's backend lands) |
 | `device_types`, `settle`, `profile`, `erase`, `appearance`, `privacy`, `push`, `status_bar`, `clear_status_bar`, `content_size`, `increase_contrast`, `dynamic_island`, `backlight`, `keyboard_language`, `hardware_keyboard`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `memory_warning`, `notify`, `biometric`, `exec`, `logs`, `processes`, `kill`, `connections`, `traffic`, `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container`, `defaults_read`, `defaults_write`, `crash_reports`, `network_shape`, `network_state`, `network_flows`, `network_clear`, `network_env`, `audio_state`, `audio_volume`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `audio_mute`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
+| `mem_leaks`, `mem_heap`, `mem_vmmap`, `mem_history` | iOS (the host's memory tools on one app; Android answers that they aren't available there) |
 
 A test keeps this page honest: it fails if a tool isn't named here.
 
@@ -172,7 +173,8 @@ doesn't offer `toolsListChanged`.
 ## Tasks
 
 A client that declares `io.modelcontextprotocol/tasks` gets a task, instead of a blocked call, for
-`boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase`, `shutdown`, `export` and `import`: the result
+`boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase`, `shutdown`, `export`, `import`, `mem_leaks` and
+`mem_heap` (seconds each; see their notes in docs/api.md): the result
 has `resultType: "task"`, a `taskId`, `pollIntervalMs` (1 s) and `ttlMs` (an hour). The methods are
 a list in `crates/sim-mcp/src/tools.rs`; every other tool answers inline.
 

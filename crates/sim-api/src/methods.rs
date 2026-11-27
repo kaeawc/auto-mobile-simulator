@@ -149,8 +149,9 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("uninstall", "device, bundle_id", "Uninstall an app (Android: the package name; `pm uninstall`)"),
     (
         "launch",
-        "device, bundle_id, restart?; iOS: args?, env?, shaped?",
-        "Launch (iOS: with arguments and environment, shaped injecting the network shaper; Android: the package's launcher activity); \
+        "device, bundle_id, restart?; iOS: args?, env?, shaped?, malloc_stack_logging?",
+        "Launch (iOS: with arguments and environment, shaped injecting the network shaper, malloc_stack_logging setting \
+         MallocStackLogging=1 for mem_leaks' stacks and mem_history; Android: the package's launcher activity); \
          restart: terminate a running instance first, default true (Android: `am start -S`); false brings a running app to the \
          front; returns pid (Android: and the activity it started)",
     ),
@@ -192,6 +193,34 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("kill", "device, pid, signal?", "Signal a device process"),
     ("connections", "device", "Open sockets of device processes"),
     ("traffic", "device", "Bytes in/out per device process"),
+    // Memory tools on one app (#183): the host's leaks, heap, vmmap and malloc_history on its pid.
+    (
+        "mem_leaks",
+        "device, bundle_id | pid, raw?, timeout_s?(120)",
+        "Leaked memory of a running app (the host's `leaks`): totals, and the leaks grouped by type and allocation stack, \
+         most bytes first, each with its instances and stack (innermost frame first; launch with malloc_stack_logging for \
+         stacks). raw adds the report as printed",
+    ),
+    (
+        "mem_heap",
+        "device, bundle_id | pid, raw?, timeout_s?(120)",
+        "A running app's heap by class (the host's `heap`): zones, node and byte totals, and every class with its count, \
+         bytes and average size, most instances first. raw adds the report as printed",
+    ),
+    (
+        "mem_vmmap",
+        "device, bundle_id | pid, raw?, timeout_s?(120)",
+        "A running app's memory regions (the host's `vmmap --summary`): each region type's virtual, resident, dirty, \
+         swapped, volatile and empty bytes and count, the malloc zones with allocations and fragmentation, and the \
+         totals. raw adds the report as printed",
+    ),
+    (
+        "mem_history",
+        "device, bundle_id | pid, address, raw?, timeout_s?(120)",
+        "The allocation stack of an address in a running app (the host's `malloc_history`), as events with their stacks; \
+         needs the app launched with malloc_stack_logging (MallocStackLogging=1 logs live allocations only). raw adds \
+         the report as printed",
+    ),
     ("containers", "device, sizes?", "App data and bundle containers"),
     ("ls", "device, path?", "List a directory under the device data dir"),
     ("read", "device, path", "Read a file (base64)"),
@@ -1395,6 +1424,31 @@ mod tests {
         assert!(ios_arm_reads(source, "launch").contains(&"bundle_id".to_owned()));
         assert!(ios_arm_reads(source, "defaults_write").contains(&"domain".to_owned()));
         assert!(scanned >= 20, "{scanned} methods with reads");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The memory tools (#183) are iOS methods: listed for iOS, refused on an Android device with
+    /// the platform they work on, and each takes an app by bundle id or pid.
+    #[test]
+    fn memory_tools_are_ios_methods_that_take_an_app() {
+        let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
+        let (mut s, root) = android_session("mem");
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        call(&mut s, "create", &json!({"platform": "android", "name": "phone", "system_image": mobile})).expect("phone");
+        for method in ["mem_leaks", "mem_heap", "mem_vmmap", "mem_history"] {
+            let row = help.as_array().and_then(|a| a.iter().find(|m| m["method"] == method)).unwrap_or_else(|| panic!("{method}"));
+            assert_eq!(row["platforms"], json!(["ios"]), "{method}");
+            let err = call(&mut s, method, &json!({"device": "phone", "bundle_id": "com.example"})).expect_err(method);
+            assert_eq!(err, format!("`{method}` isn't available on Android devices (it works on iOS)"));
+            let schema = crate::input_schema(method).expect("schema");
+            assert_eq!(crate::schema::one_of(method), [["bundle_id", "pid"]], "{method}");
+            assert_eq!(schema["properties"]["pid"]["type"], "integer", "{method}");
+            assert_eq!(schema["properties"]["raw"]["type"], "boolean", "{method}");
+        }
+        let history = crate::input_schema("mem_history").expect("schema");
+        assert_eq!(history["required"], json!(["device", "address"]));
+        let launch = crate::input_schema("launch").expect("schema");
+        assert_eq!(launch["properties"]["malloc_stack_logging"]["type"], "boolean");
         std::fs::remove_dir_all(root).ok();
     }
 }

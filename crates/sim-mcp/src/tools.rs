@@ -14,7 +14,8 @@ pub const VIEW_TOOL: &str = "device_view";
 /// Methods that can run for many seconds: a client that declares the Tasks extension gets a task
 /// handle for these, and everything else a progress heartbeat while the call blocks. A method not
 /// listed runs inline. (`provision` and `record` aren't API methods, so they aren't tools.)
-pub const LONG_RUNNING: &[&str] = &["boot", "boot_many", "create", "clone", "install", "settle", "erase", "shutdown", "export", "import"];
+pub const LONG_RUNNING: &[&str] =
+    &["boot", "boot_many", "create", "clone", "install", "settle", "erase", "shutdown", "export", "import", "mem_leaks", "mem_heap"];
 
 /// What a method does to a device or the host, for the annotations a client's approval prompts
 /// read. Every method in the table is classified here on purpose (a test fails for one that isn't),
@@ -40,6 +41,8 @@ fn effect(method: &str) -> Option<Effect> {
     Some(match method {
         "prefs_stores" | "prefs_read" | "prefs_watch" => Read,
         "prefs_write" | "prefs_delete" | "prefs_batch" => Destroy,
+        // Read a corpse of the app: nothing on the device changes.
+        "mem_leaks" | "mem_heap" | "mem_vmmap" | "mem_history" => Read,
         "help" | "identity" | "form_factors" | "devices" | "runtimes" | "device_types" | "screen" | "screenshot" | "apps"
         | "ca_debug_state" | "logs" | "processes" | "connections" | "traffic" | "containers" | "ls" | "read" | "du" | "crash_reports"
         | "info" | "defaults_read" | "network_state" | "network_flows" | "network_env" | "audio_state" | "settle" | VIEW_TOOL => Read,

@@ -1,0 +1,68 @@
+Process:         Leaky [2572]
+Path:            /Users/me/Library/Developer/CoreSimulator/Devices/AB009E7A-8DB1-4D6F-AD2C-3D4232FEFEF4/data/Containers/Bundle/Application/2D565585-DC46-415B-A816-ABCEC8649234/Leaky.app/Leaky
+Load Address:    0x1023c8000
+Identifier:      dev.simee.leaky
+Version:         1.0 (1)
+Code Type:       ARM64
+Platform:        iOS Simulator
+Parent Process:  launchd_sim [96592]
+Target Type:     corpse
+
+Date/Time:       2026-11-27 05:13:05.997 -0600
+Launch Time:     2026-11-27 05:11:57.757 -0600
+OS Version:      macOS 26.6.2 (25G83)
+Report Version:  7
+Analysis Tool:   /Library/Developer/CoreSimulator/Volumes/iOS_23F77/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.5.simruntime/Contents/Resources/RuntimeRoot/usr/bin/vmmap
+Analysis Tool Version:  iOS Simulator 26.5 (23F77)
+
+Physical footprint:         15.5M
+Physical footprint (peak):  16.0M
+Idle exit:                  untracked
+----
+
+ReadOnly portion of Libraries: Total=1.3G resident=1.2G(99%) swapped_out_or_unallocated=12.0M(1%)
+Writable regions: Total=31.6M written=1394K(4%) resident=10.6M(33%) swapped_out=0K(0%) unallocated=21.0M(67%)
+
+                                VIRTUAL RESIDENT    DIRTY  SWAPPED VOLATILE   NONVOL    EMPTY   REGION 
+REGION TYPE                        SIZE     SIZE     SIZE     SIZE     SIZE     SIZE     SIZE    COUNT (non-coalesced) 
+===========                     ======= ========    =====  ======= ========   ======    =====  ======= 
+Activity Tracing                   256K      32K      32K       0K       0K      32K       0K        1 
+Foundation                          16K      16K      16K       0K       0K       0K       0K        1 
+Kernel Alloc Once                   32K      16K      16K       0K       0K       0K       0K        1 
+MALLOC guard page                   32K       0K       0K       0K       0K       0K       0K        2 
+MALLOC metadata                   1040K     432K     432K       0K       0K       0K       0K        5 
+MALLOC_NANO metadata                32K      16K      16K       0K       0K       0K       0K        1         see MALLOC ZONE table below
+MALLOC_SMALL                      4416K    4032K    2368K       0K       0K       0K       0K       26         see MALLOC ZONE table below
+MALLOC_SMALL (empty)              7872K     512K       0K       0K       0K       0K       0K       15         see MALLOC ZONE table below
+MALLOC_TINY                       4096K      32K      32K       0K       0K       0K       0K        1         see MALLOC ZONE table below
+Performance tool data             4208K    4208K    4208K       0K       0K       0K       0K        7         not counted in TOTAL below
+STACK GUARD                       56.0M       0K       0K       0K       0K       0K       0K        3 
+Stack                             9264K     192K     192K       0K       0K       0K       0K        3 
+__AUTH_CONST                        32K      32K      32K       0K       0K       0K       0K        1 
+__DATA                            22.3M    21.7M    3147K       0K       0K       0K       0K      442 
+__DATA_CONST                      65.5M    65.0M    4627K       0K       0K       0K       0K      465 
+__DATA_DIRTY                       155K     155K     155K       0K       0K       0K       0K       13 
+__FONT_DATA                        2352     2352       0K       0K       0K       0K       0K        1 
+__LINKEDIT                       707.6M   706.8M       0K       0K       0K       0K       0K        8 
+__OBJC_RO                         55.6M    55.6M       0K       0K       0K       0K       0K        1 
+__OBJC_RW                         2332K    2332K      28K       0K       0K       0K       0K        1 
+__TEXT                           582.5M   571.4M       0K       0K       0K       0K       0K      477 
+__TPRO_CONST                       164K      52K      52K       0K       0K       0K       0K        3 
+dyld private memory                3.0G     720K     720K       0K       0K       0K       0K       11 
+mapped file                       34.1M     672K       0K       0K       0K       0K       0K        5 
+page table in kernel              1394K    1394K    1394K       0K       0K       0K       0K        1 
+shared memory                       48K      16K      16K       0K       0K       0K       0K        2 
+unused but dirty shlib __DATA     16.4M    16.1M    2358K       0K       0K       0K       0K      357 
+===========                     ======= ========    =====  ======= ========   ======    =====  ======= 
+TOTAL                              4.5G     1.4G    15.3M       0K       0K      32K       0K     1847 
+
+                                                  VIRTUAL   RESIDENT      DIRTY    SWAPPED ALLOCATION      BYTES DIRTY+SWAP          REGION
+MALLOC ZONE                                          SIZE       SIZE       SIZE       SIZE      COUNT  ALLOCATED  FRAG SIZE  % FRAG   COUNT
+===========                                       =======  =========  =========  =========  =========  =========  =========  ======  ======
+DefaultMallocZone_0x102934000                       12.6M       928K       272K         0K        285        13K       259K     96%      17
+MallocStackLoggingLiteZone_0x1029f8000              3920K      3584K      2144K         0K      12557      1790K       354K     17%      19
+QuartzCore_0x103264000                               320K       272K       192K         0K        189        24K       168K     88%       9
+MallocStackLoggingLiteZone_Wrapper_0x1023dc000         0K         0K         0K         0K          0         0K         0K      0%       0
+===========                                       =======  =========  =========  =========  =========  =========  =========  ======  ======
+TOTAL                                               16.8M      4784K      2608K         0K      13031      1827K       781K     30%      45
+

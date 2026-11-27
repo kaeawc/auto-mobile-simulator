@@ -1,0 +1,91 @@
+Process:         Leaky [2572]
+Path:            /Users/me/Library/Developer/CoreSimulator/Devices/AB009E7A-8DB1-4D6F-AD2C-3D4232FEFEF4/data/Containers/Bundle/Application/2D565585-DC46-415B-A816-ABCEC8649234/Leaky.app/Leaky
+Load Address:    0x1023c8000
+Identifier:      dev.simee.leaky
+Version:         1.0 (1)
+Code Type:       ARM64
+Platform:        iOS Simulator
+Parent Process:  launchd_sim [96592]
+Target Type:     corpse
+
+Date/Time:       2026-11-27 05:12:45.720 -0600
+Launch Time:     2026-11-27 05:11:57.757 -0600
+OS Version:      macOS 26.6.2 (25G83)
+Report Version:  7
+Analysis Tool:   /Library/Developer/CoreSimulator/Volumes/iOS_23F77/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.5.simruntime/Contents/Resources/RuntimeRoot/usr/bin/heap
+Analysis Tool Version:  iOS Simulator 26.5 (23F77)
+
+Physical footprint:         15.5M
+Physical footprint (peak):  16.0M
+Idle exit:                  untracked
+----
+
+Process 2572: 4 zones
+
+All zones: 13031 nodes malloced - Sizes: 28KB[3] 20KB[3] 12KB[2] 10KB[3] 8KB[3] 6KB[2] 5KB[36] 4KB[1] 3.5KB[3] 3KB[68] 2.5KB[15] 2KB[6] 1.75KB[5] 1.5KB[4] 1.25KB[42] 1KB[3] 896[3] 768[29] 640[105] 512[8] 448[19] 384[47] 320[258] 256[131] 224[86] 192[199] 160[681] 128[575] 112[213] 96[807] 80[1496] 64[2146] 48[4576] 32[1269] 16[184] 
+
+Found:  996 ObjC classes  195 Swift classes  4 C++ classes  98 CFTypes
+Derived 171 type names for non-objects from allocation backtraces
+
+-----------------------------------------------------------------------
+All zones: 13031 nodes (1870800 bytes)
+
+   COUNT      BYTES       AVG   CLASS_NAME                                        TYPE    BINARY
+   =====      =====       ===   ==========                                        ====    ======
+    2276     105440      46.3   Class.data (class_rw_t)                           C       libobjc.A.dylib
+    1957     137008      70.0   CFString                                          ObjC    CoreFoundation
+    1189     242528     204.0   Class.methodCache._buckets (bucket_t)             C       libobjc.A.dylib
+     354      33984      96.0   _TIPreference                                     ObjC    TextInput
+     320      19424      60.7   __NSMallocBlock__                                 ObjC    libsystem_blocks.dylib
+     277      41568     150.1   malloc_with_options_outlined in cache_t::insert(objc_selector*, void (*)(), objc_object*)  C++     libobjc.A.dylib
+     266      26048      97.9   non-object from libsystem_notify.dylib            C       libsystem_notify.dylib
+     185      21936     118.6   non-object in zone QuartzCore_0x103264000                 <unknown>
+     184      17968      97.7   Swift.StringStorage                               Swift   libswiftCore.dylib
+     176       8448      48.0   NSMutableDictionary                               ObjC    CoreFoundation
+     162      10368      64.0   NSMutableArray                                    ObjC    CoreFoundation
+     151      19328     128.0   BSObjCValue                                       ObjC    BaseBoard
+     150       5152      34.3   malloc in addMethods(objc_class*, objc_selector* const*, void (* const*)(), char const**, unsigned int, bool, unsigned int*)  C       libobjc.A.dylib
+     134     118720     886.0   NSMutableDictionary (Storage)                     C       CoreFoundation
+     134      16528     123.3   NSMutableArray (Storage)                          C       CoreFoundation
+     114      18240     160.0   NSMapTable                                        ObjC    Foundation
+     112       9152      81.7   Class.data.methods.lists (method_list_t)          C       libobjc.A.dylib
+     110      23104     210.0   NSMapTable (Key Storage)                          C       Foundation
+     108       8016      74.2   xpc_dictionary_t (Storage)                        C       libxpc.dylib
+     107      22144     207.0   NSMapTable (Value Storage)                        C       Foundation
+     105       8080      77.0   NSArray                                           ObjC    CoreFoundation
+      95      24320     256.0   UIKeyCommand                                      ObjC    UIKitCore
+      95       6080      64.0   _UIMenuLeafKeyCombination                         ObjC    UIKitCore
+      95       6080      64.0   _UIMenuLeafKeyboardShortcut                       ObjC    UIKitCore
+      87      16704     192.0   UIMenu                                            ObjC    UIKitCore
+      87       2784      32.0   UIMenuDisplayPreferences                          ObjC    UIKitCore
+      82       6560      80.0   Class.data.readonly (class_ro_t)                  C       libobjc.A.dylib
+      79       7952     100.7   NSPathStore2                                      ObjC    Foundation
+      75       9600     128.0   FBSSetting                                        ObjC    FrontBoardServices
+      75       2400      32.0   NSArray                                           ObjC    CoreFoundation
+      75       2400      32.0   NSSet                                             ObjC    CoreFoundation
+      70       5600      80.0   OS_os_log                                         ObjC    libsystem_trace.dylib
+      69       3312      48.0   NSMutableSet                                      ObjC    CoreFoundation
+      68       3264      48.0   _UICommandIdentifier                              ObjC    UIKitCore
+      61       3840      63.0   Class.data.extended (class_rw_ext_t)              C       libobjc.A.dylib
+      60      12848     214.1   malloc in objc_setAssociatedObject                C       libobjc.A.dylib
+      58       7424     128.0   memalign in id2data(objc_object*, SyncKind, usage)  C       libobjc.A.dylib
+      57     175104    3072.0   calloc in weak_resize(weak_table_t*, unsigned long)  C       libobjc.A.dylib
+      50       4064      81.3   malloc in swift::ConcurrentReadableHashMap<swift::HashMapElementWrapper<swift::GenericCacheEntry>, swift::Mutex>::getOrInsertExternallyLocked<swift::MetadataCacheKey, std::pair<swift::GenericCacheEntry*, bool> swift::StableAddressConcurrentReadableHashMap<swift::GenericCacheEntry, swift::TaggedMetadataAllocator<(unsigned short)14>, swift::Mutex>::getOrInsert<swift::MetadataCacheKey, swift::MetadataWaitQueue::Worker&, swift::MetadataRequest&, swift::TargetTypeContextDescriptor<swift::InProcess> const*&, void const* const*&>(swift::MetadataCacheKey, swift::MetadataWaitQueue::Worker&, swift::MetadataRequest&, swift::TargetTypeContextDescriptor<swift::InProcess> const*&, void const* const*&)::'lambda'(swift::HashMapElementWrapper<swift::GenericCacheEntry>*, bool)>(swift::MetadataCacheKey, std::pair<swift::GenericCacheEntry*, bool> swift::StableAddressConcurrentReadableHashMap<swift::GenericCacheEntry, swift::TaggedMetadataAllocator<(unsigned short)14>, swift::Mutex>::getOrInsert<swift::MetadataCacheKey, swift::MetadataWaitQueue::Worker&, swift::MetadataRequest&, swift::TargetTypeContextDescriptor<swift::InProcess> const*&, void const* const*&>(swift::MetadataCacheKey, swift::MetadataWaitQueue::Worker&, swift::MetadataRequest&, swift::TargetTypeContextDescriptor<swift::InProcess> const*&, void const* const*&)::'lambda'(swift::HashMapElementWrapper<swift::GenericCacheEntry>*, bool) const&)  C++     libswiftCore.dylib
+      48       1536      32.0   Class.data.protocols.lists (protocol_list_t)      C       libobjc.A.dylib
+      47       2256      48.0   BSMutableIntegerMap                               ObjC    BaseBoard
+       1         32      32.0   malloc in _os_trace_init_slow                     C       libsystem_trace.dylib
+       1         32      32.0   malloc in swift::StableAddressConcurrentReadableHashMap<(anonymous namespace)::FunctionCacheEntry, swift::TaggedMetadataAllocator<(unsigned short)3>, swift::LazyMutex>::getOrInsert<(anonymous namespace)::FunctionCacheEntry::Key>((anonymous namespace)::FunctionCacheEntry::Key)  C++     libswiftCore.dylib
+       1         32      32.0   malloc in swift_getMetatypeMetadata               C       libswiftCore.dylib
+       1         32      32.0   malloc in uprv_getDefaultLocaleID                 C       libicucore.A.dylib
+       1         32      32.0   non-object from libMobileGestalt.dylib            C       libMobileGestalt.dylib
+       1         16      16.0   NSMutableArray.cow (struct __cow_state_t)         C       CoreFoundation
+       1         16      16.0   _UISwiftTraits.UnfairLock._lock (malloc)                  UIKitCore
+       1         16      16.0   calloc in getIsCurrentThreadInLSContextInitReference()  C       CoreServices
+       1         16      16.0   malloc in CA::Context::did_connect()              C++     QuartzCore
+       1         16      16.0   malloc in __si_module_cache_byname_block_invoke   C       libsystem_info.dylib
+       1         16      16.0   malloc in __si_module_static_file_block_invoke    C       libsystem_info.dylib
+       1         16      16.0   malloc in __si_module_static_mdns_block_invoke    C       libsystem_info.dylib
+       1         16      16.0   malloc in __si_module_static_search_block_invoke  C       libsystem_info.dylib
+       1         16      16.0   malloc in cache_create                            C       libcache.dylib
+       1         16      16.0   malloc in std::vector<CA::WindowServer::Display::Mode>::__vallocate[abi:nqn210106](unsigned long)  C++     QuartzCore
+
