@@ -18,6 +18,48 @@ and behaves the same on both, but wgpu costs a little more:
 [benchmarks.md](benchmarks.md#desktop-runes-native-metal-backend-against-wgpu). Rune's own
 `RUNE_GPU_BACKEND` overrides it.
 
+## 3D device view
+
+⌘3 switches the screen to a 3D view: the device's body (`sim_core::body`: phones, tablets,
+foldables and watches) in perspective, lit, with its live screen on the screen face. It is drawn
+with a depth buffer and 4x MSAA. `SIMEE_VIEW=3d` starts the window with it on. The 3D view needs
+the wgpu backend (`SIMEE_GPU_BACKEND=wgpu`). Rune's native Metal backend can't draw a depth
+buffer or MSAA yet (anomalyco/rune#2547, #193), so on it ⌘3 only says so in the status line. A TV,
+head unit or headset has no body and stays flat. With the 3D view off, the window is exactly the
+flat one: screenshots are byte-identical to the build without it on both backends.
+
+The camera is fixed: a 3/4 view from the right and above. `SIMEE_SCENE_CAMERA=front` or `side`
+picks the straight-on view or the edge-on view (thickness, keys, camera bump) for screenshots.
+Orbit, pan and zoom come with #155. When a screen is on the back of the device (a folded book's
+cover screen), the camera looks at the back. A turned device rolls the body with its panel, so
+the screen reads as the flat view shows it. A foldable lies flat while it streams its inner
+screen. When it streams its cover screen, emu has folded it, so the body is shown shut. The
+desktop doesn't know a half-open angle (#154). Clicks on the 3D view don't reach the device yet
+(#156). The toolbar, the keyboard and the panel work as usual.
+
+The live screen on the body is the flat view's own picture, with no CPU copy. The flat screen
+stays laid out under an effect slot that asks Rune for a backdrop copy, and the compositor
+samples the screen's rect of that copy. That costs one GPU texture copy of the window per drawn
+frame. Rune can't yet hand a compositor a `NativeSurface`'s texture (anomalyco/rune#2546,
+#192). The window draws only when something changes, so a still 3D view costs nothing.
+
+What the 3D view costs, against the flat view on the same wgpu backend (M3 Max, 2026-11-27):
+
+| | flat | 3D |
+| --- | --- | --- |
+| Headless, iPhone 17 scene (`--frames 300`, median of 3): frame CPU p50 | 0.25 ms | 0.43 ms |
+| Headless, iPhone 17 scene: encode and submit | 0.16 ms | 0.32 ms |
+| Headless, iPhone 17 scene: GPU per frame (includes the frame readback) | 1.56 ms | 1.81 ms |
+| Headless, Pixel Fold scene: frame CPU p50 / GPU per frame | 0.22 / 1.59 ms | 0.40 / 1.90 ms |
+| Live iPhone 17 Pro, iOS 26.5, 20 s of swipes (one run each): CPU / GPU, % of a core | 6.0 / 5.5 | 8.3 / 6.3 |
+| Live, same run: frames drawn, frame time p50 / p95 | 775, 0.54 / 0.62 ms | 786, 0.79 / 0.94 ms |
+| Live, idle 20 s: CPU / GPU % | 1.25 / 0.65 | 1.40 / 0.68 |
+
+The live rows are a single run each, taken as #215 took them (`--window-script`, `RUNE_FRAME_LOG`,
+the AGX client's GPU time). A second run of each stopped drawing because its window was covered
+on a desktop in use (Rune draws nothing while a window is occluded), so there is no median yet.
+The headless rows render offscreen and don't depend on window visibility.
+
 Rune's headless flags (`--snap`, `--tree`, `--script`, `--video`) are always in debug builds; a
 release build has them only with the `tooling` feature. The shipped release build leaves it off:
 it adds 1,338,496 B to the stripped binary (32,950,904 → 34,289,400 B, Linux x86_64, 2026-11-26)
@@ -25,7 +67,8 @@ and no measurable startup time.
 
 Devices are listed under iOS and Android, each with its sub-platform. Pick one (boot it if
 needed): click and drag on the screen for touches; type to use the device keyboard. ⌘⇧H is Home,
-⌘L Lock/Power, ⌘S saves a screenshot to the Desktop. The toolbar follows the form factor:
+⌘L Lock/Power, ⌘S saves a screenshot to the Desktop, ⌘3 switches the [3D view](#3d-device-view)
+on and off. The toolbar follows the form factor:
 
 | Device | Controls |
 | --- | --- |

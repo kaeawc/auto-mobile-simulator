@@ -205,7 +205,10 @@ fn placeholder(s: &State, t: Theme) -> El {
 fn screen(s: &State) -> El {
     let (w, h) = s.screen_size();
     let ratio = w as f32 / h.max(1) as f32;
-    let corners = screen_radius(s.shape, 10_000.0);
+    // Under the 3D view the flat screen is only the scene's texture: square, so its corners hold
+    // no stage colour for the body's rounded screen to show.
+    let scene = crate::scene::active(s).is_some();
+    let corners = if scene { 0.0 } else { screen_radius(s.shape, 10_000.0) };
     let device = el().key("device-screen").aspect_fit(ratio).radius(corners);
     let turn = s.screen_rotation();
     let device = match (&s.live, &s.screen) {
@@ -263,7 +266,13 @@ fn screen(s: &State) -> El {
             .on_drag(|s: &mut State, d: &mut Drag, _: &mut Tx| crate::bezel::on_drag(s, d)),
         None => stage,
     };
-    stage.child(device)
+    let stage = stage.child(device);
+    if scene {
+        let inset = if s.selected_info().and_then(crate::controls::bezel).is_some() { crate::bezel::BAND } else { 0.0 };
+        stage.child(crate::scene::slot(inset, ratio))
+    } else {
+        stage
+    }
 }
 
 /// `pixels` as a turned device's panel lies, drawn turned clockwise by `turn` to fill `device`,
