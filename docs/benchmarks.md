@@ -506,6 +506,27 @@ CASE=2480,1080,true cargo test --release -p emu frame_path_latency -- --ignored 
 The injected network shaper's cost per call is measured in
 [research/netshape-overhead.md](research/netshape-overhead.md).
 
+### `launch`, with and without `restart`
+
+iPhone 17 Pro, iOS 27.2 (24B8117), `com.apple.Preferences`, through a release `simee serve`,
+median of 10, host load 9–18 (2026-11-27, M3 Max).
+
+| Case | ms |
+| --- | --- |
+| Not running (1 s after `terminate`), `restart` true or false | 32 |
+| Right after `terminate` | 122 |
+| Right after `terminate`, after waiting for the old PID to exit | 121 |
+| Running, `restart: true` (killed and cold-started, new PID) | 136 |
+| Running in the background, `restart: false` (same PID, brought forward) | 29 |
+| Running in front and settled, `restart: false` | 17 |
+| 1 s after a cold launch, `restart: false` | 2120 |
+
+The old process has already exited when `terminate` returns, so waiting on its PID saves
+nothing. The service instead holds a launch for about 100 ms after a terminate (129 ms at a 0 ms
+gap, 73 ms at 50 ms, 32 ms from 100 ms on). `restart: false` waits for a launch or activation
+still in progress: about 3.15 s after a cold launch began, up to ~0.8 s after one brought the app
+forward.
+
 ## MCP server
 
 What the MCP server's protocol layer costs to build, against the official Rust SDK. Linux VM,

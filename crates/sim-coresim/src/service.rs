@@ -818,14 +818,15 @@ impl Device {
         Ok(ExecOutput { pid, stdout: String::from_utf8_lossy(&stdout).into_owned(), stderr: String::from_utf8_lossy(&stderr).into_owned() })
     }
 
-    /// Launches an app with launch arguments and environment variables, terminating a running
-    /// instance first. Returns its pid.
-    pub fn launch_with(&self, bundle_id: &str, args: &[String], env: &[(String, String)]) -> Result<i32> {
+    /// Launches an app with launch arguments and environment variables. Returns its pid.
+    /// `restart`: a running instance is terminated first and the app cold-starts; otherwise
+    /// the service's `terminate_running_process` is false and a running app is left as it is.
+    pub fn launch_with(&self, bundle_id: &str, args: &[String], env: &[(String, String)], restart: bool) -> Result<i32> {
         rt::require(&self.obj, sel!(launchApplicationWithID:options:error:))?;
         let options = rt::mutable_dictionary();
         rt::dict_set(&options, "arguments", &rt::string_array(args));
         rt::dict_set(&options, "environment", &rt::string_dictionary(env));
-        rt::dict_set(&options, "terminate_running_process", &rt::nsbool(true));
+        rt::dict_set(&options, "terminate_running_process", &rt::nsbool(restart));
         let mut error: *mut NSError = ptr::null_mut();
         // SAFETY: the method exists (checked) and takes (NSString, NSDictionary, NSError**), returning int.
         let pid: i32 =

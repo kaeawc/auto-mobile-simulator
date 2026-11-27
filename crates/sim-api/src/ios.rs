@@ -897,6 +897,12 @@ fn settle_rule(p: &Value, prefix: &str) -> Result<crate::settle::Rule, String> {
     Ok(rule)
 }
 
+/// `launch`'s `restart`: true (the default) terminates a running instance and cold-starts the
+/// app; false leaves a running app as it is.
+fn launch_restart(p: &Value) -> Result<bool, String> {
+    Ok(opt_bool(p, "restart")?.unwrap_or(true))
+}
+
 /// The plan for `p`, booting `concurrent` devices at once (1 for `boot`); `settle_default` when
 /// `settle` isn't given. `shapers` resolves the network shapers the devices need (built on first
 /// use), called at most once, here on the caller's thread.
@@ -1396,7 +1402,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             if p.get("shaped").and_then(Value::as_bool).unwrap_or(false) {
                 env.extend(shaper_env(&d)?);
             }
-            let pid = d.launch_with(need_str(p, "bundle_id")?, &strings(p, "args"), &env).map_err(err)?;
+            let pid = d.launch_with(need_str(p, "bundle_id")?, &strings(p, "args"), &env, launch_restart(p)?).map_err(err)?;
             Ok(json!({"pid": pid}))
         }
         "terminate" => ok(s.device(p)?.terminate(need_str(p, "bundle_id")?)),
@@ -1725,6 +1731,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn launch_restarts_unless_restart_is_false() {
+        assert_eq!(launch_restart(&json!({"bundle_id": "com.example"})), Ok(true));
+        assert_eq!(launch_restart(&json!({"restart": null})), Ok(true));
+        assert_eq!(launch_restart(&json!({"restart": true})), Ok(true));
+        assert_eq!(launch_restart(&json!({"restart": false})), Ok(false));
+        assert_eq!(launch_restart(&json!({"restart": "no"})), Err("`restart` must be true or false, not \"no\"".to_owned()));
+        assert!(launch_restart(&json!({"restart": 0})).is_err());
+    }
 
     #[test]
     fn the_slim_profile_keeps_what_automobile_needs() {
