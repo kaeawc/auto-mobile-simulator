@@ -12,6 +12,8 @@
 //!   (YUYV and Motion JPEG to BGRA) on Linux.
 //! - [`hotplug`]: [`Hub::events`] streams cameras added and removed (host notifications, debounced)
 //!   and captures whose source went missing.
+//! - [`ios_feed`] serves one iOS simulator's linked source to the capture shim injected into its
+//!   apps (`shims/ios-camera`): BGRA frames with their size and number over a Unix socket.
 //! - [`tcc`] reads the host camera permission (never prompting) and turns a missing grant into an
 //!   error that names the fix, instead of black frames.
 //!
@@ -30,6 +32,8 @@ pub mod frame;
 pub mod hotplug;
 pub mod hub;
 pub mod id;
+#[cfg(unix)]
+pub mod ios_feed;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 mod select;
 pub mod source;

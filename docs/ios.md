@@ -87,3 +87,80 @@ Reproduce: build a test app that shows its `UserDefaults` and logs its writes an
 wall-clock times, entitled to an app group through `-Xlinker -sectcreate -Xlinker __TEXT -Xlinker
 __entitlements`; run `simee serve`, then time `prefs_*` calls over the socket and match `prefs_watch`
 events against the app's log.
+
+## Camera
+
+A simulator has no camera: AVFoundation finds no video device, and nothing in CoreSimulator or
+SimulatorKit carries frames ([research/audio-camera.md](research/audio-camera.md) §3). simee gives
+apps one by injecting a capture shim (`shims/ios-camera`) and feeding it live from a camera source
+(`crates/sim-camera`, [camera.md](camera.md)).
+
+**Pieces.**
+
+- The feed (`simee_camera::ios_feed::Feed`) serves one device's linked source on a Unix socket:
+  `cam.sock` in the device's data directory, or a name in the host's temp directory when that path
+  is over the 103-byte socket limit (`ios_feed::socket_path`, which creates and checks a private 0700 per-user directory there; the socket itself is 0600). Each reader says the size and rate it
+  wants and is sent BGRA frames, each with its size, the source's frame number and the link's
+  generation, as the source produces them. Readers of one source share one capture. Relinking
+  (`Feed::set_source`) moves every reader to the new source without a reconnect.
+- `libsimee-camera.dylib` is the library to insert. It links only libSystem and does nothing unless
+  `SIMEE_CAMERA_SOCKET` is set and the process is a user-installed app (its executable is under
+  `Containers/Bundle/Application`, not in an `.appex`). Then it loads `libsimee-camera-hooks.dylib`
+  from beside itself, which checks the bundle id again and skips `com.apple.*`.
+- The hooks give AVFoundation a back and a front camera ("simee Back Camera", "simee Front
+  Camera"): discovery sessions, `defaultDeviceWithMediaType:`,
+  `defaultDeviceWithDeviceType:mediaType:position:`, `deviceWithUniqueID:`, `AVCaptureDeviceInput`,
+  `AVCaptureSession` (with the `running` KVO and the start and stop notifications), video data
+  output sample buffers, preview layer content, QR codes through `AVCaptureMetadataOutput` (read from
+  the live frames about twice a second) and `AVCapturePhotoOutput` stills of the latest frame. A
+  process holds one connection to the feed while a session runs, and reconnects if the feed restarts.
+- `CameraFixture.app` (`dev.simee.camerafixture`) shows the preview and reports the test card's frame
+  number read back from each sample buffer's pixels, the frame rate and QR codes, on screen and in
+  `Documents/camera-report.json`. `-position front` in its launch arguments opens the front camera.
+
+`shims/ios-camera/build.sh [OUT_DIR]` builds all three for the simulator with `xcrun clang`.
+
+**Per app**: grant the camera the usual way, then launch through the API with the shim and the
+socket in the environment (simee passes `env` straight to the launch, no `SIMCTL_CHILD_` prefix):
+
+```bash
+simee privacy <udid> grant camera <bundle id>
+simee call launch '{"device":"<udid>","bundle_id":"<bundle id>","env":{"DYLD_INSERT_LIBRARIES":"<out>/libsimee-camera.dylib","SIMEE_CAMERA_SOCKET":"<data dir>/cam.sock"}}'
+```
+
+**Device-wide**: set both variables in the device's launchd and relaunch the apps that should see
+the camera; apps started afterwards, from the home screen too, get it. Join an existing
+`DYLD_INSERT_LIBRARIES` (the network shaper's) with `:` rather than replacing it, and unset both
+when the device is unlinked:
+
+```bash
+simee exec <udid> launchctl setenv DYLD_INSERT_LIBRARIES <out>/libsimee-camera.dylib
+simee exec <udid> launchctl setenv SIMEE_CAMERA_SOCKET <data dir>/cam.sock
+simee exec <udid> launchctl unsetenv DYLD_INSERT_LIBRARIES   # and SIMEE_CAMERA_SOCKET, to unlink
+```
+
+Measured 2026-11-27 on an iPhone 17 simulator (iOS 26.5), `pattern:testcard` at 720x960@30 from
+`cargo run -p simee-camera --example ios-feed`: the fixture received 30-31 fps on the back and the
+front camera with the decoded frame number advancing, both when launched through `launch` with `env`
+and when tapped on the home screen after `launchctl setenv`. Relinking to `qr:hello` reached the
+app's sample buffers in 0.17-0.27 s and its metadata output in 0.43-0.51 s (n=2). Settings, launched
+after the device-wide `setenv`, did not load the hooks.
+
+**Limits.**
+
+- Apple's apps and daemons (`com.apple.*`, and anything in the runtime root) are never injected:
+  Camera, and system camera UI such as `UIImagePickerController`'s camera and VisionKit's
+  `DataScannerViewController`, stay without a camera.
+- ExtensionKit and app extension processes (WebKit's among them) get a sanitized environment or are
+  skipped, so `getUserMedia` in a web view and app extensions have no camera.
+- Security: the socket is mode 0600, but any process running as the same user (any app in any
+  simulator on the host) can connect to a linked feed and read its frames, including a host webcam,
+  without a camera permission of its own. The shim stops reading and disconnects as soon as no
+  session runs, reconnects with a 250 ms to 5 s backoff, and the dylibs are universal (arm64 and
+  x86_64, built with `lipo`; not run on an x86_64 simulator here).
+- Already-running processes need a relaunch to pick up a device-wide `setenv`.
+- Frames are BGRA, upright and unmirrored, at the size the app's connection asked for (the feed's
+  default, or `SIMEE_CAMERA_SIZE=WxH@FPS`). Orientation, mirroring, zoom, focus, exposure and frame
+  duration settings are accepted and ignored; there is no torch or flash, and `formats` is empty.
+- While the shim is active every `AVCaptureSession` in the app is simulated: an audio input added to
+  a session records nothing.
