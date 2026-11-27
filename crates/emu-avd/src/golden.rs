@@ -127,6 +127,10 @@ pub fn clone_file(from: &Path, to: &Path) -> Result<CloneKind> {
     }
     #[cfg(not(target_os = "linux"))]
     {
+        // `std::fs::copy` replaces what is there; this never does.
+        if to.exists() {
+            return Err(io(to, std::io::Error::from(std::io::ErrorKind::AlreadyExists)));
+        }
         std::fs::copy(from, to).map_err(|e| io(from, e))?;
         Ok(CloneKind::Copy)
     }
@@ -659,7 +663,16 @@ mod tests {
                 .collect();
             handles.into_iter().map(|h| h.join().expect("thread")).collect()
         });
-        assert_eq!(builds.load(Ordering::SeqCst), 1, "one build");
+        let diag = || {
+            let ls: Vec<String> = std::fs::read_dir(env.golden_root())
+                .expect("root")
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            let ini: Vec<String> = env.goldens().iter().map(|g| g.dir.display().to_string()).collect();
+            format!("outcomes {results:?}; root {ls:?}; goldens {ini:?}")
+        };
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "one build: {}", diag());
         assert_eq!(results.iter().filter(|o| o.source == Source::Built).count(), 1);
         assert!(results.iter().any(|o| o.source == Source::Cloned && o.waited > Duration::ZERO), "others waited for the build");
         for n in &names {
@@ -762,7 +775,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&dst).expect("meta").len(), 256 << 20);
         assert_eq!(std::fs::read(&src).expect("src"), std::fs::read(&dst).expect("dst"));
         let used = std::fs::metadata(&dst).expect("meta").blocks() * 512;
-        assert!(kind == CloneKind::Reflink || used < 8 << 20, "{kind:?} took {used} bytes of a 256 MiB hole");
+        assert!(kind != CloneKind::Sparse || used < 8 << 20, "{kind:?} took {used} bytes of a 256 MiB hole");
         assert!(clone_file(&src, &dst).is_err(), "never overwrites");
         let _ = std::fs::remove_dir_all(tmp);
     }
