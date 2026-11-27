@@ -337,13 +337,17 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The directory a token file lives in: a bare relative name lives in the current directory.
+fn token_dir(path: &Path) -> &Path {
+    path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."))
+}
+
 /// Makes `path` hold a token, readable only by its owner: an existing file is checked (and
 /// refused if others can read it, if it is a link, or if its directory is not private); a missing
 /// one is written with a new random token.
 pub fn ensure_token_file(path: &Path) -> io::Result<()> {
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        ensure_private_dir(dir)?;
-    }
+    // A bare relative name lives in the current directory, which is checked like any other.
+    ensure_private_dir(token_dir(path))?;
     match std::fs::symlink_metadata(path) {
         Ok(_) => return read_tokens(path).map(drop),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -784,9 +788,23 @@ impl Shared {
 // ---- Connections ----
 
 /// Holds one of the connection slots, and one of its peer's.
-struct Slot(Arc<Shared>, IpAddr);
+struct Slot(Arc<Shared>, Option<IpAddr>);
 
 impl Slot {
+    /// Gives back the peer's share (the global slot stays held): the address cap bounds only
+    /// connections that have not authenticated.
+    fn release_peer(&mut self) {
+        if let Some(peer) = self.1.take() {
+            let mut peers = lock(&self.0.peers);
+            if let Some(open) = peers.get_mut(&peer) {
+                *open -= 1;
+                if *open == 0 {
+                    peers.remove(&peer);
+                }
+            }
+        }
+    }
+
     /// A slot, or why there is none.
     fn take(shared: &Arc<Shared>, peer: IpAddr) -> Result<Slot, &'static str> {
         let limits = shared.config.limits;
@@ -801,19 +819,19 @@ impl Slot {
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < max).then_some(n + 1))
             .map_err(|_| "too many connections; retry shortly")?;
         peers.insert(peer, open + 1);
-        Ok(Slot(shared.clone(), peer))
+        let mut slot = Slot(shared.clone(), Some(peer));
+        if shared.tokens.is_none() {
+            // No authentication (loopback only): nothing to wait for.
+            drop(peers);
+            slot.release_peer();
+        }
+        Ok(slot)
     }
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        let mut peers = lock(&self.0.peers);
-        if let Some(open) = peers.get_mut(&self.1) {
-            *open -= 1;
-            if *open == 0 {
-                peers.remove(&self.1);
-            }
-        }
+        self.release_peer();
         self.0.connections.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -845,8 +863,9 @@ fn accept_loop(shared: &Arc<Shared>, listener: &TcpListener) {
             }
         };
         let spawned = std::thread::Builder::new().name("simee-mcp-conn".into()).spawn(move || {
+            let mut slot = slot;
             let shared = slot.0.clone();
-            connection(&shared, stream, accepted);
+            connection(&shared, &mut slot, stream, accepted);
             drop(slot);
         });
         if let Err(e) = spawned {
@@ -1119,7 +1138,7 @@ fn peer_state(stream: &TcpStream) -> Peer {
     state
 }
 
-fn connection(shared: &Arc<Shared>, stream: TcpStream, accepted: Instant) {
+fn connection(shared: &Arc<Shared>, slot: &mut Slot, stream: TcpStream, accepted: Instant) {
     let limits = shared.config.limits;
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(limits.write_timeout));
@@ -1144,7 +1163,7 @@ fn connection(shared: &Arc<Shared>, stream: TcpStream, accepted: Instant) {
                 break;
             }
         };
-        let keep = Exchange { shared, reader: &mut reader, head: &head, principal: None }.serve() && head.keep_alive();
+        let keep = Exchange { shared, slot, reader: &mut reader, head: &head, principal: None }.serve() && head.keep_alive();
         if !keep || shared.stopping.load(Ordering::SeqCst) {
             break;
         }
@@ -1173,6 +1192,7 @@ fn linger(mut stream: &TcpStream) {
 /// One request on a connection. Each method returns whether the connection can carry another.
 struct Exchange<'a> {
     shared: &'a Arc<Shared>,
+    slot: &'a mut Slot,
     reader: &'a mut BufReader<TcpStream>,
     head: &'a Head,
     /// The token the request carried (`None` without authentication).
@@ -1249,7 +1269,10 @@ impl Exchange<'_> {
         }
         if let Some(tokens) = &self.shared.tokens {
             match tokens.check(head.header("authorization")) {
-                Some(token) => self.principal = Some(token),
+                Some(token) => {
+                    self.principal = Some(token);
+                    self.slot.release_peer();
+                }
                 None => {
                     let challenge = [("WWW-Authenticate", "Bearer realm=\"simee\"".to_owned())];
                     return self.fail(401, INVALID_REQUEST, "a valid bearer token is required", &challenge);

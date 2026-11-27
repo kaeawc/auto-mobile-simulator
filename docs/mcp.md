@@ -344,8 +344,9 @@ This is the Streamable HTTP transport: one endpoint, `/mcp`.
   A connection's first request head must be in within 10 s of the connection opening, and a later
   one within 10 s of its first byte (at most 8 blank lines may come before a request line); the
   deadline is never extended by what arrives. A body then has 10 s of its own. An idle kept-alive
-  connection closes after 15 s. At most 64 connections are served at once and 8 from one address
-  (503 past either; behind a proxy every client shares the proxy's address), each on its own thread
+  connection closes after 15 s. At most 64 connections are served at once, and 8 from one address that
+  have not yet authenticated (a connection gives its address slot back with its first request that
+  carries a valid token, or at once with `--no-auth`); 503 past either, each on its own thread
   (no async runtime), and 32 sessions. A session with no request for an hour is closed, its `GET`
   stream with it (the stream's pings don't count as use).
 - A waiting response checks every 15 s that its client is still there (an event stream sends a

@@ -11,7 +11,7 @@ use crate::rpc::{EXT_TASKS, META_CLIENT_CAPS, META_VERSION};
 const WAIT: Duration = Duration::from_secs(10);
 
 fn limits() -> Limits {
-    Limits { max_body: 64 << 10, max_connections: 16, max_connections_per_peer: 16, ping: Duration::from_millis(100), ..Limits::default() }
+    Limits { max_body: 64 << 10, max_connections: 16, ping: Duration::from_millis(100), ..Limits::default() }
 }
 
 fn timing() -> Timing {
@@ -499,16 +499,35 @@ fn every_bind_requires_a_token_unless_no_auth_on_loopback() {
     assert!(prepare_auth(&config, from_state_dir).is_err());
 }
 
-#[test]
-fn connections_past_the_per_peer_limit_get_503() {
-    let rig = Rig::with(|c| c.limits.max_connections_per_peer = 2);
-    let held: Vec<Client> = (0..2).map(|_| rig.client()).collect();
+/// A rig that requires a token, and the token.
+fn authed_rig(scratch: &Scratch) -> (Rig, String) {
+    let path = scratch.0.join("state/mcp-token");
+    let rig = Rig::with(|c| {
+        c.no_auth = false;
+        c.token_file = Some(path.clone());
+    });
+    let token = std::fs::read_to_string(&path).expect("token").trim().to_owned();
+    (rig, token)
+}
+
+fn wait_for_connections(rig: &Rig, n: usize) {
     let deadline = Instant::now() + WAIT;
-    while rig.running.shared.connections.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+    while rig.running.shared.connections.load(Ordering::SeqCst) < n && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
-    let mut third = rig.client();
-    let reply = third.read_reply();
+}
+
+#[test]
+fn unauthenticated_connections_past_the_per_peer_limit_get_503() {
+    let scratch = Scratch::new("peer-unauth");
+    let (rig, _) = authed_rig(&scratch);
+    let cap = rig.running.shared.config.limits.max_connections_per_peer;
+    assert_eq!(cap, 8, "the default cap");
+    // Slow connections: open, and silent.
+    let held: Vec<Client> = (0..cap).map(|_| rig.client()).collect();
+    wait_for_connections(&rig, cap);
+    let mut ninth = rig.client();
+    let reply = ninth.read_reply();
     assert_eq!(reply.status, 503, "{reply:?}");
     assert!(reply.body.contains("from this address"), "{reply:?}");
     drop(held);
@@ -517,7 +536,34 @@ fn connections_past_the_per_peer_limit_get_503() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(lock(&rig.running.shared.peers).is_empty(), "every slot was given back");
-    assert_eq!(rig.client().call("server/discover", json!({}))["id"], 1);
+}
+
+#[test]
+fn authenticated_connections_are_not_bounded_by_the_per_peer_limit() {
+    let scratch = Scratch::new("peer-auth");
+    let (rig, token) = authed_rig(&scratch);
+    let cap = rig.running.shared.config.limits.max_connections_per_peer;
+    assert_eq!(cap, 8, "the default cap, not a raised one");
+    // More kept-alive connections than the cap, all from this address, all served and all open.
+    // Each authenticates on its first request, before the next one connects.
+    let mut clients: Vec<Client> = Vec::new();
+    for _ in 0..cap + 4 {
+        let mut c = rig.client();
+        c.token = Some(token.clone());
+        assert_eq!(c.call("server/discover", json!({}))["id"], 1);
+        clients.push(c);
+    }
+    for c in &mut clients {
+        assert_eq!(c.call("server/discover", json!({}))["id"], 2, "still served on its kept-alive connection");
+    }
+    assert!(lock(&rig.running.shared.peers).is_empty(), "authenticated connections hold no address slot");
+}
+
+#[test]
+fn a_bare_relative_token_file_still_checks_its_directory() {
+    assert_eq!(token_dir(Path::new("mcp-token")), Path::new("."));
+    assert_eq!(token_dir(Path::new("./mcp-token")), Path::new("."));
+    assert_eq!(token_dir(Path::new("a/b/mcp-token")), Path::new("a/b"));
 }
 
 /// Two tokens in one file: two principals.
@@ -1157,8 +1203,6 @@ fn http_call_overhead() {
     let mut config = Config::new("127.0.0.1:0".parse().expect("addr"));
     config.toolsets = Toolsets::all();
     config.no_auth = true;
-    // A connection per call, faster than closed ones are counted out.
-    config.limits.max_connections_per_peer = config.limits.max_connections;
     let running = start(backend, config).expect("start");
     let mut client = Client::connect(running.addr());
     let kept_us = median_us(|| {
