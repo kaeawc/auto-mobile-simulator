@@ -167,523 +167,173 @@
       },
       "name": "boot",
       "outputSchema": {
-        "anyOf": [
-          {
-            "maxProperties": 0,
-            "type": "object"
-          },
-          {
+        "properties": {
+          "admission": {
             "properties": {
-              "admission": {
+              "predicted": {
                 "properties": {
-                  "predicted": {
-                    "properties": {
-                      "admissible": {
-                        "type": "number"
-                      },
-                      "boot_cpu_pct": {
-                        "type": "number"
-                      },
-                      "boot_memory_bytes": {
-                        "type": "number"
-                      },
-                      "costs": {
-                        "items": {
-                          "properties": {
-                            "boot_cpu_pct": {
-                              "type": "number"
-                            },
-                            "boot_memory_bytes": {
-                              "type": "number"
-                            },
-                            "count": {
-                              "type": "number"
-                            },
-                            "form_factor": {
-                              "type": [
-                                "string",
-                                "null"
-                              ]
-                            },
-                            "idle_cpu_pct": {
-                              "type": "number"
-                            },
-                            "idle_memory_bytes": {
-                              "type": "number"
-                            },
-                            "platform": {
-                              "enum": [
-                                "ios",
-                                "android"
-                              ],
-                              "type": "string"
-                            },
-                            "source": {
-                              "type": "string"
-                            }
-                          },
-                          "required": [
-                            "platform",
-                            "form_factor",
-                            "count",
-                            "idle_cpu_pct",
-                            "boot_cpu_pct",
-                            "idle_memory_bytes",
-                            "boot_memory_bytes",
-                            "source"
-                          ],
-                          "type": "object"
-                        },
-                        "type": "array"
-                      },
-                      "devices": {
-                        "type": "number"
-                      },
-                      "idle_cpu_pct": {
-                        "type": "number"
-                      },
-                      "idle_memory_bytes": {
-                        "type": "number"
-                      },
-                      "load": {
-                        "properties": {
-                          "after": {
-                            "type": "number"
-                          },
-                          "limit": {
-                            "type": "number"
-                          },
-                          "now": {
-                            "type": "number"
-                          }
-                        },
-                        "required": [
-                          "now",
-                          "after",
-                          "limit"
-                        ],
-                        "type": [
-                          "object",
-                          "null"
-                        ]
-                      },
-                      "memory_available_bytes": {
-                        "properties": {
-                          "after": {
-                            "type": "number"
-                          },
-                          "now": {
-                            "type": "number"
-                          }
-                        },
-                        "required": [
-                          "now",
-                          "after"
-                        ],
-                        "type": [
-                          "object",
-                          "null"
-                        ]
-                      },
-                      "memory_used_pct": {
-                        "properties": {
-                          "after": {
-                            "type": "number"
-                          },
-                          "now": {
-                            "type": "number"
-                          }
-                        },
-                        "required": [
-                          "now",
-                          "after"
-                        ],
-                        "type": [
-                          "object",
-                          "null"
-                        ]
-                      },
-                      "subject": {
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "subject",
-                      "devices",
-                      "admissible",
-                      "costs",
-                      "boot_cpu_pct",
-                      "idle_cpu_pct",
-                      "boot_memory_bytes",
-                      "idle_memory_bytes",
-                      "memory_used_pct",
-                      "memory_available_bytes",
-                      "load"
-                    ],
-                    "type": "object"
+                  "admissible": {
+                    "type": "number"
                   },
-                  "reasons": {
-                    "items": {
-                      "type": "string"
-                    },
-                    "type": "array"
+                  "boot_cpu_pct": {
+                    "type": "number"
                   },
-                  "verdict": {
-                    "enum": [
-                      "admit",
-                      "hold",
-                      "backoff"
-                    ],
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "verdict",
-                  "reasons",
-                  "predicted"
-                ],
-                "type": "object"
-              },
-              "pacing": {
-                "properties": {
-                  "steps": {
+                  "boot_memory_bytes": {
+                    "type": "number"
+                  },
+                  "costs": {
                     "items": {
-                      "properties": {
-                        "at_s": {
-                          "type": "number"
-                        },
-                        "reason": {
-                          "type": "string"
-                        },
-                        "started": {
-                          "type": "number"
-                        },
-                        "verdict": {
-                          "enum": [
-                            "admit",
-                            "hold",
-                            "backoff"
-                          ],
-                          "type": "string"
-                        },
-                        "waiting": {
-                          "type": "number"
-                        }
-                      },
-                      "required": [
-                        "at_s",
-                        "started",
-                        "waiting",
-                        "verdict",
-                        "reason"
-                      ],
                       "type": "object"
                     },
                     "type": "array"
                   },
-                  "timed_out": {
-                    "type": "boolean"
-                  },
-                  "waited_s": {
+                  "devices": {
                     "type": "number"
+                  },
+                  "idle_cpu_pct": {
+                    "type": "number"
+                  },
+                  "idle_memory_bytes": {
+                    "type": "number"
+                  },
+                  "load": {
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "memory_available_bytes": {
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "memory_used_pct": {
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "subject": {
+                    "type": "string"
                   }
                 },
                 "required": [
-                  "waited_s",
-                  "timed_out",
-                  "steps"
+                  "subject",
+                  "devices",
+                  "admissible",
+                  "costs",
+                  "boot_cpu_pct",
+                  "idle_cpu_pct",
+                  "boot_memory_bytes",
+                  "idle_memory_bytes",
+                  "memory_used_pct",
+                  "memory_available_bytes",
+                  "load"
                 ],
                 "type": "object"
+              },
+              "reasons": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "verdict": {
+                "enum": [
+                  "admit",
+                  "hold",
+                  "backoff"
+                ],
+                "type": "string"
               }
             },
             "required": [
-              "admission"
+              "verdict",
+              "reasons",
+              "predicted"
             ],
             "type": "object"
           },
-          {
+          "background_cpu_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "background_cpu_s": {
+            "type": "number"
+          },
+          "boot_s": {
+            "type": "number"
+          },
+          "cpu_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cpu_s": {
+            "type": "number"
+          },
+          "device": {
+            "type": "string"
+          },
+          "foreground_cpu_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "pacing": {
             "properties": {
-              "admission": {
-                "properties": {
-                  "predicted": {
-                    "properties": {
-                      "admissible": {
-                        "type": "number"
-                      },
-                      "boot_cpu_pct": {
-                        "type": "number"
-                      },
-                      "boot_memory_bytes": {
-                        "type": "number"
-                      },
-                      "costs": {
-                        "items": {
-                          "properties": {
-                            "boot_cpu_pct": {
-                              "type": "number"
-                            },
-                            "boot_memory_bytes": {
-                              "type": "number"
-                            },
-                            "count": {
-                              "type": "number"
-                            },
-                            "form_factor": {
-                              "type": [
-                                "string",
-                                "null"
-                              ]
-                            },
-                            "idle_cpu_pct": {
-                              "type": "number"
-                            },
-                            "idle_memory_bytes": {
-                              "type": "number"
-                            },
-                            "platform": {
-                              "enum": [
-                                "ios",
-                                "android"
-                              ],
-                              "type": "string"
-                            },
-                            "source": {
-                              "type": "string"
-                            }
-                          },
-                          "required": [
-                            "platform",
-                            "form_factor",
-                            "count",
-                            "idle_cpu_pct",
-                            "boot_cpu_pct",
-                            "idle_memory_bytes",
-                            "boot_memory_bytes",
-                            "source"
-                          ],
-                          "type": "object"
-                        },
-                        "type": "array"
-                      },
-                      "devices": {
-                        "type": "number"
-                      },
-                      "idle_cpu_pct": {
-                        "type": "number"
-                      },
-                      "idle_memory_bytes": {
-                        "type": "number"
-                      },
-                      "load": {
-                        "properties": {
-                          "after": {
-                            "type": "number"
-                          },
-                          "limit": {
-                            "type": "number"
-                          },
-                          "now": {
-                            "type": "number"
-                          }
-                        },
-                        "required": [
-                          "now",
-                          "after",
-                          "limit"
-                        ],
-                        "type": [
-                          "object",
-                          "null"
-                        ]
-                      },
-                      "memory_available_bytes": {
-                        "properties": {
-                          "after": {
-                            "type": "number"
-                          },
-                          "now": {
-                            "type": "number"
-                          }
-                        },
-                        "required": [
-                          "now",
-                          "after"
-                        ],
-                        "type": [
-                          "object",
-                          "null"
-                        ]
-                      },
-                      "memory_used_pct": {
-                        "properties": {
-                          "after": {
-                            "type": "number"
-                          },
-                          "now": {
-                            "type": "number"
-                          }
-                        },
-                        "required": [
-                          "now",
-                          "after"
-                        ],
-                        "type": [
-                          "object",
-                          "null"
-                        ]
-                      },
-                      "subject": {
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "subject",
-                      "devices",
-                      "admissible",
-                      "costs",
-                      "boot_cpu_pct",
-                      "idle_cpu_pct",
-                      "boot_memory_bytes",
-                      "idle_memory_bytes",
-                      "memory_used_pct",
-                      "memory_available_bytes",
-                      "load"
-                    ],
-                    "type": "object"
-                  },
-                  "reasons": {
-                    "items": {
-                      "type": "string"
-                    },
-                    "type": "array"
-                  },
-                  "verdict": {
-                    "enum": [
-                      "admit",
-                      "hold",
-                      "backoff"
-                    ],
-                    "type": "string"
-                  }
+              "cancelled": {
+                "type": "boolean"
+              },
+              "steps": {
+                "items": {
+                  "type": "object"
                 },
-                "required": [
-                  "verdict",
-                  "reasons",
-                  "predicted"
-                ],
-                "type": "object"
+                "type": "array"
               },
-              "background_cpu_pct": {
-                "type": [
-                  "number",
-                  "null"
-                ]
-              },
-              "background_cpu_s": {
-                "type": "number"
-              },
-              "boot_s": {
-                "type": "number"
-              },
-              "cpu_pct": {
-                "type": [
-                  "number",
-                  "null"
-                ]
-              },
-              "cpu_s": {
-                "type": "number"
-              },
-              "device": {
-                "type": "string"
-              },
-              "foreground_cpu_pct": {
-                "type": [
-                  "number",
-                  "null"
-                ]
-              },
-              "pacing": {
-                "properties": {
-                  "steps": {
-                    "items": {
-                      "properties": {
-                        "at_s": {
-                          "type": "number"
-                        },
-                        "reason": {
-                          "type": "string"
-                        },
-                        "started": {
-                          "type": "number"
-                        },
-                        "verdict": {
-                          "enum": [
-                            "admit",
-                            "hold",
-                            "backoff"
-                          ],
-                          "type": "string"
-                        },
-                        "waiting": {
-                          "type": "number"
-                        }
-                      },
-                      "required": [
-                        "at_s",
-                        "started",
-                        "waiting",
-                        "verdict",
-                        "reason"
-                      ],
-                      "type": "object"
-                    },
-                    "type": "array"
-                  },
-                  "timed_out": {
-                    "type": "boolean"
-                  },
-                  "waited_s": {
-                    "type": "number"
-                  }
-                },
-                "required": [
-                  "waited_s",
-                  "timed_out",
-                  "steps"
-                ],
-                "type": "object"
-              },
-              "procs": {
-                "type": "number"
-              },
-              "profile": {
-                "type": "object"
-              },
-              "settle_error": {
-                "type": "string"
-              },
-              "settle_s": {
-                "type": "number"
-              },
-              "settled": {
+              "timed_out": {
                 "type": "boolean"
               },
               "waited_s": {
                 "type": "number"
-              },
-              "was_booted": {
-                "type": "boolean"
               }
             },
             "required": [
-              "device",
-              "boot_s",
-              "was_booted"
+              "waited_s",
+              "timed_out",
+              "cancelled",
+              "steps"
             ],
             "type": "object"
+          },
+          "procs": {
+            "type": "number"
+          },
+          "profile": {
+            "type": "object"
+          },
+          "settle_error": {
+            "type": "string"
+          },
+          "settle_s": {
+            "type": "number"
+          },
+          "settled": {
+            "type": "boolean"
+          },
+          "waited_s": {
+            "type": "number"
+          },
+          "was_booted": {
+            "type": "boolean"
           }
-        ]
+        },
+        "type": "object"
       },
       "title": "boot"
     },

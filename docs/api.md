@@ -214,13 +214,14 @@ start (#275), from `simee-host`'s `admission`. `admission_check` asks the same q
 ```
 
 - **Cost per device**, by platform and form factor: CPU (percent of one core) and memory while it
-  boots and once it is idle. Until this process has seen idle devices of the kind, the numbers are
-  docs/benchmarks.md's: Android (emu, API 36) boots at 250% of a core and 3764 MB and idles at 5.9%
+  boots and once it is idle. Until this process has seen idle devices of the kind (three
+  observations at least), the numbers are docs/benchmarks.md's: Android (emu, API 36) boots at 250% of a core and 3764 MB and idles at 5.9%
   and 2.8 GB; iOS (iPhone 17, default profile) boots at 280% and idles at 10% (the settle limit,
   not a measurement), 2176 MB either way. Only phones are measured: other form factors take their
   platform's phone numbers, and `source` says so. A device under 50% of a core over a minute in
-  `devices_usage` refines its kind's idle CPU and memory (a rolling average kept in memory; booting
-  memory keeps the measured ratio to idle). A server (`simee serve`) learns across calls; a CLI
+  `devices_usage` refines its kind's idle CPU and memory: a rolling average that starts at the
+  published numbers and moves a fifth of the way to each observation (kept in memory), so one
+  slim device doesn't replace them; booting memory keeps the measured ratio to idle. A server (`simee serve`) learns across calls; a CLI
   call runs alone, so it uses the published numbers.
 - **The verdict** is the worse of the `host` verdict now (thermal, power, memory pressure, load)
   and the prediction: hold when memory used would reach 85%, available memory (Linux) would drop
@@ -228,13 +229,26 @@ start (#275), from `simee-host`'s `admission`. `admission_check` asks the same q
   back off at 95% used or under 4 GiB. `predicted` has the numbers (`memory_used_pct`,
   `memory_available_bytes`, `load` now and after), each kind's cost and `admissible`, how many
   of the devices (in order) the host takes now. A device that is already booted costs nothing.
+  At most `concurrency` (`boot_many`'s, `-j`) devices boot at once, so the prediction counts that
+  many at their booting cost and the rest at their idle cost, not every device booting together
+  (`admission_check` has no concurrency: all `count` boot together, the worst case).
 - **`admission`**: `ignore` (the default) only reports it; nothing waits on it. `refuse` fails
   fast, doing nothing, when the verdict isn't admit, with every reason. `wait` (`boot`,
   `boot_many`) waits until the host admits the devices, asking every 5 s, for at most
   `admission_timeout_s` (600): `boot_many` starts as many as are admissible at a time, each chunk
   booted as `boot_many` boots, and returns `pacing` (`waited_s`, `timed_out`, each start and each
   wait with its reason); devices not admitted in time are not started and fail with the reason.
-  Each wait is also a line on stderr.
+  `admission_timeout_s` is time spent waiting for the host: the time the started chunks take to
+  boot is not counted, and `waited_s` and the error say how long it actually waited. A chunk
+  that fails as a whole (no ports left, a plan error) fails its own devices and leaves the chunks
+  booted before it in the result. Each wait is a line on stderr and, over MCP, the task's status
+  message or the progress message, with the reason; a cancelled call stops waiting within a
+  second and boots nothing more (`pacing.cancelled`, the devices not started say so).
+- **Known limits.** Callers don't reserve: each judges the host as it is, so several callers
+  admitted at the same moment (parallel `simee boot` processes, several agents) can together go
+  past a limit (#275). A CLI boot runs in the caller, so it always uses the published numbers
+  and has no `--admission` flag; its text output doesn't show the verdict, `--json` and the API
+  do.
 
 ## Memory tools (`mem_*`)
 

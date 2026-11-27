@@ -327,6 +327,63 @@ fn a_task_can_be_cancelled_and_stays_cancelled() {
     assert_eq!(rig.modern("tasks/get", json!({}))["error"]["code"], rpc::INVALID_PARAMS);
 }
 
+const WAITING: &str = "boot: 3 waiting at 5 s, admission hold: memory: 3 more iOS phone devices would take memory used from 60% to 90%";
+
+impl Rig {
+    /// Waits until the call to `method` that was gated saw whether it was cancelled.
+    fn saw_cancel(&self, method: &str) -> bool {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some((_, c)) = self.fake.saw_cancel.lock().expect("saw_cancel").iter().find(|(m, _)| m == method) {
+                return *c;
+            }
+            assert!(Instant::now() < deadline, "the call never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[test]
+fn cancelling_a_task_reaches_the_call_that_waits_and_its_status_says_what_it_waits_on() {
+    let rig = Rig::new();
+    let gate = rig.fake.gate("boot");
+    rig.fake.says.lock().expect("says").insert("boot".into(), WAITING.into());
+    let created = rig.with_tasks("tools/call", json!({"name": "boot", "arguments": {"device": "phone", "admission": "wait"}}));
+    let id = created["result"]["taskId"].as_str().expect("task id").to_owned();
+    let deadline = Instant::now() + WAIT;
+    let message = loop {
+        let m = rig.modern("tasks/get", json!({"taskId": id}))["result"]["statusMessage"].as_str().unwrap_or("").to_owned();
+        if m.contains("admission hold") || Instant::now() > deadline {
+            break m;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(message.starts_with("boot has been running for ") && message.ends_with("from 60% to 90%"), "{message}");
+    rig.modern("tasks/cancel", json!({"taskId": id}));
+    gate.release();
+    assert!(rig.saw_cancel("boot"), "the waiting call sees the cancel");
+}
+
+#[test]
+fn cancelling_a_request_reaches_the_call_and_progress_says_what_it_waits_on() {
+    let rig = Rig::new();
+    let gate = rig.fake.gate("boot");
+    rig.fake.says.lock().expect("says").insert("boot".into(), WAITING.into());
+    let mut params = json!({"name": "boot", "arguments": {"device": "phone", "admission": "wait"}});
+    params["_meta"] = Rig::meta(false);
+    params["_meta"]["progressToken"] = json!("t1");
+    let id = rig.send_raw("tools/call", params);
+    let progress = rig.notification("notifications/progress");
+    let message = progress["params"]["message"].as_str().expect("message");
+    assert!(
+        message.starts_with("boot is still running (") && message.contains("): boot: 3 waiting at 5 s, admission hold: memory"),
+        "{message}"
+    );
+    rig.send(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id}}));
+    gate.release();
+    assert!(rig.saw_cancel("boot"), "the waiting call sees the cancel");
+}
+
 #[test]
 fn a_client_without_the_extension_waits_and_hears_progress() {
     let rig = Rig::new();

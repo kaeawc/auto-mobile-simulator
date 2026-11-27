@@ -243,7 +243,11 @@ a list in `crates/sim-mcp/src/tools.rs`; every other tool answers inline.
 - `tasks/cancel` is cooperative, as the extension allows. The task is `cancelled` at once and its
   result is discarded, but the API can't interrupt a device call that is already running, so a
   cancelled `boot` still finishes booting the device in the background. The status message says
-  so.
+  so. A call that is only waiting for the host to admit its devices (`admission: "wait"`) does
+  stop: it sees the cancel within a second and starts nothing. While it waits, the task's status
+  message (and a progress message, for a client without tasks) says what it waits on.
+- A `boot`, `boot_many`, `create` or `clone` result carries `admission` (and `pacing`) in
+  `structuredContent` only; the text is one line, such as `ok (admit)`, so it doesn't repeat them.
 - At most 8 task calls run at once; a ninth is refused with a tool error until one ends. A
   cancelled task's call keeps running, so it still counts: cancelling doesn't make room. Finished
   tasks are kept for an hour.

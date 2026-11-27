@@ -528,7 +528,8 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "admission_check" => {
             let (platform, form_factor, count) = check_params(p)?;
             let items = vec![Item { platform, form_factor: Some(form_factor) }; count];
-            serde_json::to_value(judge_now(s, &items)).map_err(|e| e.to_string())
+            // Nothing says how many boot at once: all of them, the worst case.
+            serde_json::to_value(judge_now(s, &items, count)).map_err(|e| e.to_string())
         }
         _ => dispatch(s, method, p),
     }
@@ -594,15 +595,16 @@ fn gate(mode: Mode, a: &Admission) -> Result<(), String> {
 
 /// The admission verdict on starting `items` on this host now. Each call first lets the
 /// estimate learn from the idle devices running.
-fn judge_now(s: &mut Session, items: &[Item]) -> Admission {
+/// At most `concurrency` of them boot at once.
+fn judge_now(s: &mut Session, items: &[Item], concurrency: usize) -> Admission {
     #[cfg(test)]
     if let Some(h) = &s.fake_host {
-        return admit(h, items, sim_host::admission::seed, &Limits::default());
+        return admit(h, items, concurrency, sim_host::admission::seed, &Limits::default());
     }
     observe_running(s);
     let host = HostState::from_report(&sim_host::global().report(sim_host::Thresholds::default()));
     let est = sim_host::admission::estimator().lock().unwrap_or_else(|e| e.into_inner()).clone();
-    admit(&host, items, |p, f| est.cost(p, f), &Limits::default())
+    admit(&host, items, concurrency, |p, f| est.cost(p, f), &Limits::default())
 }
 
 /// Feeds the running devices' CPU and footprint (labelled with their platform and form factor
@@ -661,20 +663,55 @@ fn with_admission(result: Value, a: &Admission, pacing: Option<Value>) -> Value 
 }
 
 fn pacing_json<R>(p: &Paced<R>) -> Value {
-    json!({"waited_s": p.waited_s, "timed_out": p.timed_out, "steps": p.steps})
+    json!({"waited_s": p.waited_s, "timed_out": p.timed_out, "cancelled": p.cancelled, "steps": p.steps})
 }
 
-/// What a waiting call says while it waits (stderr: stdout is `simee mcp`'s protocol).
+/// What the caller of a call on this thread hands it: a cancel flag the call polls while it
+/// waits, and where it says what it waits on (MCP's progress and task status).
+pub struct CallHooks {
+    pub cancelled: Box<dyn Fn() -> bool>,
+    pub progress: Box<dyn Fn(&str)>,
+}
+
+thread_local! {
+    static HOOKS: std::cell::RefCell<Option<CallHooks>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` (calls on this thread) with `hooks` in place; the previous ones come back after.
+pub fn with_call_hooks<R>(hooks: CallHooks, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<CallHooks>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HOOKS.with(|h| *h.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(HOOKS.with(|h| h.borrow_mut().replace(hooks)));
+    f()
+}
+
+/// Whether the caller of the call on this thread cancelled it.
+pub fn call_cancelled() -> bool {
+    HOOKS.with(|h| h.borrow().as_ref().is_some_and(|h| (h.cancelled)()))
+}
+
+/// What a waiting call says while it waits: a line on stderr (stdout is `simee mcp`'s protocol)
+/// and the caller's progress hook.
 fn progress(method: &str, step: &Step) {
     if step.started == 0 {
-        eprintln!(
-            "simee: {method}: {} waiting at {} s, admission {}: {}",
-            step.waiting,
-            step.at_s,
-            verdict_name(step.verdict),
-            step.reason
-        );
+        let line =
+            format!("{method}: {} waiting at {} s, admission {}: {}", step.waiting, step.at_s, verdict_name(step.verdict), step.reason);
+        eprintln!("simee: {line}");
+        call_progress(&line);
     }
+}
+
+/// Tells the caller of the call on this thread what it is waiting on.
+pub fn call_progress(message: &str) {
+    HOOKS.with(|h| {
+        if let Some(h) = h.borrow().as_ref() {
+            (h.progress)(message);
+        }
+    });
 }
 
 /// `boot`, `create` and `clone` with their admission: judged before the call (a device already
@@ -700,16 +737,26 @@ fn admitted(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             Err(_) => return dispatch(s, method, p),
         },
     };
-    let mut a = judge_now(s, &items);
+    let mut a = judge_now(s, &items, 1);
     gate(mode, &a)?;
     let mut pacing = None;
     if mode == Mode::Wait && !items.is_empty() {
         let wait = wait_options(p)?;
-        let paced = pace(&items, |_| true, &SystemClock::start(), wait, |rest| judge_now(s, rest), |_| (), |step| progress(method, step));
-        if paced.timed_out {
+        let paced = pace(
+            &items,
+            |_| true,
+            &SystemClock::start(),
+            wait,
+            call_cancelled,
+            |rest| judge_now(s, rest, 1),
+            |_| (),
+            |step| progress(method, step),
+        );
+        if paced.timed_out || paced.cancelled {
             let last = paced.last.as_ref().unwrap_or(&a);
+            let what = if paced.cancelled { "cancelled after waiting" } else { "the host didn't admit the boot within" };
             return Err(format!(
-                "admission: the host didn't admit the boot within {} s ({}: {}); nothing was booted",
+                "admission: {what} {} s ({}: {}); nothing was booted",
                 paced.waited_s,
                 verdict_name(last.verdict),
                 last.reasons.join("; ")
@@ -723,7 +770,7 @@ fn admitted(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     if method == "create" {
         let made = result["form_factor"].as_str().and_then(FormFactor::parse);
         if made.is_some() && items.first().is_some_and(|i| i.form_factor != made) {
-            a = judge_now(s, &[Item { platform: items[0].platform, form_factor: made }]);
+            a = judge_now(s, &[Item { platform: items[0].platform, form_factor: made }], 1);
         }
     }
     Ok(with_admission(result, &a, pacing))
@@ -740,47 +787,78 @@ fn boot_many_admitted(s: &mut Session, p: &Value, mode: Mode) -> Result<Value, S
         _ => return dispatch(s, "boot_many", p),
     };
     let new = |ts: &[Target]| -> Vec<Item> { ts.iter().filter(|t| !t.running).map(|t| t.item).collect() };
-    let a = judge_now(s, &new(&targets));
+    let concurrency = crate::params::concurrency(p)?;
+    let a = judge_now(s, &new(&targets), concurrency);
     gate(mode, &a)?;
     if mode != Mode::Wait {
         return Ok(with_admission(dispatch(s, "boot_many", p)?, &a, None));
     }
     let wait = wait_options(p)?;
-    let concurrency = crate::params::concurrency(p)?;
     let clock = SystemClock::start();
     let platform = targets[0].item.platform.as_str();
     let session = std::cell::RefCell::new(s);
+    let chunks = std::cell::RefCell::new(Vec::<Vec<String>>::new());
     let paced = pace(
         &targets,
         |t| !t.running,
         &clock,
         wait,
-        |rest| judge_now(&mut session.borrow_mut(), &new(rest)),
+        call_cancelled,
+        |rest| judge_now(&mut session.borrow_mut(), &new(rest), concurrency),
         |chunk| {
+            let ids: Vec<String> = chunk.iter().map(|t| t.udid.clone()).collect();
             let mut q = p.clone();
-            q["devices"] = chunk.iter().map(|t| Value::String(t.udid.clone())).collect();
+            q["devices"] = ids.iter().cloned().map(Value::String).collect();
             q["platform"] = json!(platform);
+            chunks.borrow_mut().push(ids);
             dispatch(&mut session.borrow_mut(), "boot_many", &q)
         },
         |step| progress("boot_many", step),
     );
-    let (mut devices, mut failed, mut unsettled) = (Vec::new(), 0, 0);
-    for r in &paced.results {
-        let r = r.as_ref().map_err(Clone::clone)?;
-        devices.extend(r["devices"].as_array().cloned().unwrap_or_default());
-        failed += r["failed"].as_u64().unwrap_or(0);
-        unsettled += r["unsettled"].as_u64().unwrap_or(0);
-    }
+    let (mut devices, mut failed, unsettled) = merge_chunks(&paced.results, &chunks.borrow())?;
     let last = paced.last.as_ref().unwrap_or(&a);
     for t in &targets[targets.len() - paced.not_started..] {
         let why = last.reasons.first().map_or("", String::as_str);
-        let error = format!("not started: the host didn't admit it within {} s ({}: {why})", paced.waited_s, verdict_name(last.verdict));
+        let error = if paced.cancelled {
+            format!(
+                "not started: cancelled while waiting for the host to admit it, after {} s ({}: {why})",
+                paced.waited_s,
+                verdict_name(last.verdict)
+            )
+        } else {
+            format!("not started: the host didn't admit it within {} s of waiting ({}: {why})", paced.waited_s, verdict_name(last.verdict))
+        };
         devices.push(json!({"device": t.udid, "error": error}));
         failed += 1;
     }
     let all_s = (clock.elapsed().as_secs_f64() * 10.0).round() / 10.0;
     let result = json!({"concurrency": concurrency, "all_s": all_s, "failed": failed, "unsettled": unsettled, "devices": devices});
     Ok(with_admission(result, &a, Some(pacing_json(&paced))))
+}
+
+/// The devices, failed and unsettled counts of the chunks `boot_many` booted one after another
+/// (`ids` are each chunk's devices). A chunk that fails as a whole (no ports left, a plan error)
+/// fails its own devices and the chunks before it stay in the result, running; only when every
+/// chunk failed is it the call's error.
+fn merge_chunks(results: &[Result<Value, String>], ids: &[Vec<String>]) -> Result<(Vec<Value>, u64, u64), String> {
+    if let Some(Err(e)) = results.first().filter(|_| results.iter().all(Result::is_err)) {
+        return Err(e.clone());
+    }
+    let (mut devices, mut failed, mut unsettled) = (Vec::new(), 0, 0);
+    for (r, ids) in results.iter().zip(ids) {
+        match r {
+            Ok(r) => {
+                devices.extend(r["devices"].as_array().cloned().unwrap_or_default());
+                failed += r["failed"].as_u64().unwrap_or(0);
+                unsettled += r["unsettled"].as_u64().unwrap_or(0);
+            }
+            Err(e) => {
+                devices.extend(ids.iter().map(|id| json!({"device": id, "error": format!("boot_many failed for its chunk: {e}")})));
+                failed += ids.len() as u64;
+            }
+        }
+    }
+    Ok((devices, failed, unsettled))
 }
 
 /// Dispatches one method, past admission.
@@ -1390,7 +1468,7 @@ mod tests {
     fn the_admission_modes() {
         use sim_host::admission::seed;
         let judged = |total_gib, thermal| {
-            admit(&fake_host(total_gib, thermal), &[Item { platform: Platform::Android, form_factor: None }], seed, &Limits::default())
+            admit(&fake_host(total_gib, thermal), &[Item { platform: Platform::Android, form_factor: None }], 1, seed, &Limits::default())
         };
         let (admits, holds) = (judged(64, None), judged(64, SERIOUS));
         assert_eq!((admits.verdict, holds.verdict), (Verdict::Admit, Verdict::Hold));
@@ -1469,7 +1547,7 @@ mod tests {
         let r = call(&mut s, "boot_many", &many(json!({"admission": "wait", "admission_timeout_s": 0}))).expect("paced");
         assert_eq!((r["failed"].as_u64(), r["pacing"]["timed_out"].as_bool()), (Some(1), Some(true)), "{r}");
         let e = r["devices"][0]["error"].as_str().expect("error");
-        assert!(e.starts_with("not started: the host didn't admit it within 0 s (hold: thermal: "), "{e}");
+        assert!(e.starts_with("not started: the host didn't admit it within 0 s of waiting (hold: thermal: "), "{e}");
         assert_eq!(r["pacing"]["steps"][0]["started"], 0);
         assert!(s.android.backend().device("pixel").expect("pixel").running.is_none(), "nothing was started");
         // A device that runs already costs nothing: admitted on the same busy host, at once.
@@ -1481,6 +1559,66 @@ mod tests {
         let b = call(&mut s, "boot", &json!({"device": "pixel", "timeout_s": 20, "admission": "refuse"})).expect("running");
         assert_eq!((b["admission"]["verdict"].as_str(), b["admission"]["predicted"]["devices"].as_u64()), (Some("admit"), Some(0)), "{b}");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_cancelled_wait_stops_promptly_boots_nothing_and_says_what_it_waited_on() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (mut s, root) = short_android_session("adm-cancel");
+        fake_adb(&root);
+        s.fake_host = Some(fake_host(64, SERIOUS));
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        call(&mut s, "create", &json!({"platform": "android", "name": "pixel", "system_image": mobile})).expect("pixel");
+        let heard = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        // The caller cancels as soon as it hears what the call waits on.
+        let hooks = || {
+            let (flag, heard) = (Arc::new(AtomicBool::new(false)), heard.clone());
+            let seen = flag.clone();
+            CallHooks {
+                cancelled: Box::new(move || seen.load(Ordering::Relaxed)),
+                progress: Box::new(move |m| {
+                    heard.lock().expect("heard").push(m.to_owned());
+                    flag.store(true, Ordering::Relaxed);
+                }),
+            }
+        };
+        let t = std::time::Instant::now();
+        let err =
+            with_call_hooks(hooks(), || call(&mut s, "boot", &json!({"device": "pixel", "admission": "wait"}))).expect_err("cancelled");
+        assert!(err.starts_with("admission: cancelled after waiting 0.") && err.ends_with("nothing was booted"), "{err}");
+        let r =
+            with_call_hooks(hooks(), || call(&mut s, "boot_many", &json!({"devices": ["pixel"], "timeout_s": 20, "admission": "wait"})))
+                .expect("a result");
+        assert!(t.elapsed() < Duration::from_secs(3), "stopped between polls, not at the 5 s poll or the 600 s timeout: {:?}", t.elapsed());
+        let e = r["devices"][0]["error"].as_str().expect("error");
+        assert!(e.starts_with("not started: cancelled while waiting"), "{e}");
+        assert_eq!((r["failed"].as_u64(), r["pacing"]["timed_out"].as_bool()), (Some(1), Some(false)), "{r}");
+        assert!(s.android.backend().device("pixel").expect("pixel").running.is_none(), "nothing was booted");
+        let heard = heard.lock().expect("heard");
+        assert!(heard.len() >= 2 && heard.iter().all(|m| m.contains("waiting at") && m.contains("hold: thermal: ")), "{heard:?}");
+        // The hooks are gone after the call: a later call on this thread is not cancelled.
+        assert!(!call_cancelled());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_failed_chunk_fails_its_devices_and_keeps_the_ones_already_booted() {
+        let ok = json!({"devices": [{"device": "a", "boot_s": 1.0}], "failed": 0, "unsettled": 1});
+        let ids = vec![vec!["a".to_owned()], vec!["b".to_owned(), "c".to_owned()]];
+        let (devices, failed, unsettled) = merge_chunks(&[Ok(ok.clone()), Err("no console ports left".into())], &ids).expect("partial");
+        assert_eq!((failed, unsettled), (2, 1));
+        assert_eq!(devices[0]["device"], "a");
+        assert_eq!(
+            devices[1..]
+                .iter()
+                .map(|d| (d["device"].as_str(), d["error"].as_str().is_some_and(|e| e.contains("no console ports left"))))
+                .collect::<Vec<_>>(),
+            [(Some("b"), true), (Some("c"), true)]
+        );
+        // Every chunk failing is still the call's error; none started is an empty result.
+        assert_eq!(merge_chunks(&[Err("plan".into()), Err("later".into())], &ids), Err("plan".into()));
+        assert_eq!(merge_chunks(&[], &[]), Ok((vec![], 0, 0)));
     }
 
     /// Whether `v` fits `schema`, as far as [`crate::output_schema`] writes them (type, enum,

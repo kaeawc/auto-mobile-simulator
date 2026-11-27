@@ -143,6 +143,10 @@ pub mod fake {
         pub answers: Mutex<HashMap<String, Result<Value, String>>>,
         pub calls: Mutex<Vec<(String, Value)>>,
         pub gates: Mutex<HashMap<String, std::sync::Arc<Gate>>>,
+        /// What a method tells its caller it waits on (as admission does), before its gate.
+        pub says: Mutex<HashMap<String, String>>,
+        /// Whether the caller had cancelled each call once its gate opened: (method, cancelled).
+        pub saw_cancel: Mutex<Vec<(String, bool)>>,
     }
 
     impl Fake {
@@ -178,10 +182,15 @@ pub mod fake {
     impl Backend for Fake {
         fn call(&self, method: &str, params: &Value) -> Result<Value, String> {
             self.calls.lock().expect("calls").push((method.to_owned(), params.clone()));
+            let says = self.says.lock().expect("says").get(method).cloned();
+            if let Some(says) = says {
+                sim_api::call_progress(&says);
+            }
             let gate = self.gates.lock().expect("gates").get(method).cloned();
             if let Some(gate) = gate {
                 gate.wait();
             }
+            self.saw_cancel.lock().expect("saw_cancel").push((method.to_owned(), sim_api::call_cancelled()));
             self.answers.lock().expect("answers").get(method).cloned().unwrap_or(Ok(Value::Null))
         }
     }

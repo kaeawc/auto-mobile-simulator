@@ -74,8 +74,11 @@ pub fn seed(platform: Platform, form_factor: FormFactor) -> Cost {
 /// A device under this much CPU (1-minute, percent of one core) counts as idle: its CPU and
 /// footprint refine the idle estimate. A busier one may still be booting or running a test.
 pub const IDLE_CPU_PCT: f64 = 50.0;
-/// The weight of each new observation in the rolling estimate.
+/// The weight of each new observation in the rolling estimate, which starts from the seed.
 const WEIGHT: f64 = 0.2;
+/// Observations of a kind before the estimate replaces the seed: one idle device, or the same
+/// one polled twice, says little about the kind.
+pub const MIN_SAMPLES: u64 = 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Seen {
@@ -84,7 +87,8 @@ struct Seen {
     memory_bytes: f64,
 }
 
-/// A rolling estimate of what idle devices of each kind cost on this host, from what it has seen.
+/// A rolling estimate of what idle devices of each kind cost on this host: an average that starts
+/// at the seed and moves a fifth of the way to each observation, used from [`MIN_SAMPLES`] on.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Estimator {
     seen: HashMap<(Platform, FormFactor), Seen>,
@@ -95,10 +99,12 @@ impl Estimator {
     /// Only an idle device counts; one without a rate yet may be booting, so it doesn't either.
     pub fn observe(&mut self, platform: Platform, form_factor: FormFactor, cpu_1m: Option<f64>, footprint_bytes: u64) {
         let Some(cpu) = cpu_1m.filter(|c| *c < IDLE_CPU_PCT && footprint_bytes > 0) else { return };
-        let s = self.seen.entry((platform, form_factor)).or_default();
-        let w = if s.n == 0 { 1.0 } else { WEIGHT };
-        s.idle_cpu_pct += w * (cpu - s.idle_cpu_pct);
-        s.memory_bytes += w * (footprint_bytes as f64 - s.memory_bytes);
+        let s = self.seen.entry((platform, form_factor)).or_insert_with(|| {
+            let seed = seed(platform, form_factor);
+            Seen { n: 0, idle_cpu_pct: seed.idle_cpu_pct, memory_bytes: seed.idle_memory_bytes as f64 }
+        });
+        s.idle_cpu_pct += WEIGHT * (cpu - s.idle_cpu_pct);
+        s.memory_bytes += WEIGHT * (footprint_bytes as f64 - s.memory_bytes);
         s.n += 1;
     }
 
@@ -106,7 +112,7 @@ impl Estimator {
     /// booting memory keeps the seed's ratio to idle memory; booting CPU stays the seed's.
     pub fn cost(&self, platform: Platform, form_factor: FormFactor) -> Cost {
         let s = seed(platform, form_factor);
-        let Some(seen) = self.seen.get(&(platform, form_factor)) else { return s };
+        let Some(seen) = self.seen.get(&(platform, form_factor)).filter(|x| x.n >= MIN_SAMPLES) else { return s };
         let idle = seen.memory_bytes.round() as u64;
         let ratio = s.boot_memory_bytes as f64 / s.idle_memory_bytes.max(1) as f64;
         Cost {
@@ -115,8 +121,8 @@ impl Estimator {
             idle_memory_bytes: idle,
             boot_memory_bytes: (idle as f64 * ratio).round() as u64,
             source: format!(
-                "this host: {} samples of idle {} {} devices (idle CPU and memory; booting memory at the measured ratio); \
-                 booting CPU from {}",
+                "this host: {} samples of idle {} {} devices blended with the published numbers (idle CPU and memory; booting memory \
+                 at the measured ratio); booting CPU from {}",
                 seen.n,
                 platform.label(),
                 form_factor.as_str(),
@@ -217,6 +223,7 @@ pub struct Predicted {
     /// How many of them (in order) the host admits now.
     pub admissible: usize,
     pub costs: Vec<KindCost>,
+    /// At the worst: at most the call's `concurrency` of them booting at once, the rest idle.
     pub boot_cpu_pct: f64,
     pub idle_cpu_pct: f64,
     pub boot_memory_bytes: u64,
@@ -284,10 +291,19 @@ struct Judged {
     load: Option<LoadSpan>,
 }
 
-fn judge(host: &HostState, subject: &str, costs: &[&Cost], limits: &Limits) -> Judged {
-    let boot_mem: u64 = costs.iter().map(|c| c.boot_memory_bytes).sum();
-    let boot_cpu: f64 = costs.iter().map(|c| c.boot_cpu_pct).sum();
+/// What `costs` take at their worst: at most `concurrency` of them (the first) boot at once, the
+/// rest are already idle by then. Bytes and percent of one core.
+fn peak(costs: &[&Cost], concurrency: usize) -> (u64, f64) {
+    let (booting, idle) = costs.split_at(costs.len().min(concurrency.max(1)));
+    let mem = booting.iter().map(|c| c.boot_memory_bytes).sum::<u64>() + idle.iter().map(|c| c.idle_memory_bytes).sum::<u64>();
+    let cpu = booting.iter().map(|c| c.boot_cpu_pct).sum::<f64>() + idle.iter().map(|c| c.idle_cpu_pct).sum::<f64>();
+    (mem, cpu)
+}
+
+fn judge(host: &HostState, subject: &str, costs: &[&Cost], concurrency: usize, limits: &Limits) -> Judged {
+    let (boot_mem, boot_cpu) = peak(costs, concurrency);
     let each = match costs.first() {
+        _ if costs.len() > concurrency => format!(" (at most {concurrency} booting at once)"),
         Some(c) if costs.iter().all(|x| x.boot_memory_bytes == c.boot_memory_bytes) => {
             format!(" ({:.1} GB each while booting)", c.boot_memory_bytes as f64 / 1e9)
         }
@@ -351,8 +367,15 @@ fn judge(host: &HostState, subject: &str, costs: &[&Cost], limits: &Limits) -> J
 
 /// The verdict on starting `items` now: the prediction judged on `host` (memory used against
 /// [`Limits`], available memory and load against the host thresholds), and the host's own verdict
-/// (thermal, power, pressure), whichever is worse, with every reason.
-pub fn admit(host: &HostState, items: &[Item], cost: impl Fn(Platform, FormFactor) -> Cost, limits: &Limits) -> Admission {
+/// (thermal, power, pressure), whichever is worse, with every reason. At most `concurrency` of the
+/// items boot at once (`boot_many`'s), so the rest cost what they do idle, not what they do booting.
+pub fn admit(
+    host: &HostState,
+    items: &[Item],
+    concurrency: usize,
+    cost: impl Fn(Platform, FormFactor) -> Cost,
+    limits: &Limits,
+) -> Admission {
     let each: Vec<Cost> = items.iter().map(|i| cost(i.platform, i.form_factor.unwrap_or(FormFactor::Phone))).collect();
     let mut costs: Vec<KindCost> = Vec::new();
     for (i, c) in items.iter().zip(&each) {
@@ -373,7 +396,7 @@ pub fn admit(host: &HostState, items: &[Item], cost: impl Fn(Platform, FormFacto
     let Judged { mut verdict, mut reasons, used, avail, load } = if items.is_empty() {
         Judged { verdict: Verdict::Admit, reasons: vec!["no new device: nothing to admit".to_owned()], used: None, avail: None, load: None }
     } else {
-        judge(host, &subject, &refs, limits)
+        judge(host, &subject, &refs, concurrency, limits)
     };
     if !items.is_empty() && host_blocks {
         if verdict == Verdict::Admit {
@@ -387,7 +410,7 @@ pub fn admit(host: &HostState, items: &[Item], cost: impl Fn(Platform, FormFacto
     let admissible = if host_blocks {
         0
     } else {
-        (1..=items.len()).take_while(|k| judge(host, &subject, &refs[..*k], limits).verdict == Verdict::Admit).count()
+        (1..=items.len()).take_while(|k| judge(host, &subject, &refs[..*k], concurrency, limits).verdict == Verdict::Admit).count()
     };
     Admission {
         verdict,
@@ -396,9 +419,9 @@ pub fn admit(host: &HostState, items: &[Item], cost: impl Fn(Platform, FormFacto
             subject,
             devices: items.len(),
             admissible: if items.is_empty() { 0 } else { admissible },
-            boot_cpu_pct: round1(each.iter().map(|c| c.boot_cpu_pct).sum()),
+            boot_cpu_pct: round1(peak(&refs, concurrency).1),
             idle_cpu_pct: round1(each.iter().map(|c| c.idle_cpu_pct).sum()),
-            boot_memory_bytes: each.iter().map(|c| c.boot_memory_bytes).sum(),
+            boot_memory_bytes: peak(&refs, concurrency).0,
             idle_memory_bytes: each.iter().map(|c| c.idle_memory_bytes).sum(),
             costs,
             memory_used_pct: used,
@@ -446,6 +469,9 @@ impl Wait {
     pub const POLL: Duration = Duration::from_secs(5);
 }
 
+/// How often [`pace`] looks at its cancel flag while it waits.
+const CANCEL_SLICE: Duration = Duration::from_millis(250);
+
 /// One thing [`pace`] did: started `started` items, or (`started` 0) waited on the verdict.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Step {
@@ -464,9 +490,12 @@ pub struct Paced<R> {
     pub results: Vec<R>,
     /// Each start, and each change of what it waited on.
     pub steps: Vec<Step>,
+    /// Time spent waiting for the host to admit work (not the time the started chunks took).
     pub waited_s: f64,
     pub timed_out: bool,
-    /// Items never started (the timeout came first): the last ones.
+    /// The caller cancelled: nothing more was started.
+    pub cancelled: bool,
+    /// Items never started (the timeout or a cancel came first): the last ones.
     pub not_started: usize,
     /// The last verdict it judged by.
     pub last: Option<Admission>,
@@ -475,19 +504,27 @@ pub struct Paced<R> {
 /// Starts `items` in order, in chunks the host admits: `check` judges the items not started yet,
 /// and as many as its `admissible` (counting only those `counts` says are new devices: one
 /// already running costs nothing) go to `start` together. When none may start, it waits `poll`
-/// and asks again, until `timeout`; `progress` hears every judgement.
+/// and asks again, until it has waited `timeout` in all (the time `start` takes doesn't count);
+/// `progress` hears every judgement. `cancelled` is asked before each judgement and between short
+/// slices of every wait: once it says yes, nothing more starts.
+#[allow(clippy::too_many_arguments)]
 pub fn pace<T, R>(
     items: &[T],
     counts: impl Fn(&T) -> bool,
     clock: &dyn Clock,
     wait: Wait,
+    cancelled: impl Fn() -> bool,
     mut check: impl FnMut(&[T]) -> Admission,
     mut start: impl FnMut(&[T]) -> R,
     mut progress: impl FnMut(&Step),
 ) -> Paced<R> {
-    let (mut next, mut results, mut steps, mut waited, mut timed_out, mut last) =
-        (0, Vec::new(), Vec::<Step>::new(), Duration::ZERO, false, None);
+    let (mut next, mut results, mut steps, mut waited, mut timed_out, mut was_cancelled, mut last) =
+        (0, Vec::new(), Vec::<Step>::new(), Duration::ZERO, false, false, None);
     while next < items.len() {
+        if cancelled() {
+            was_cancelled = true;
+            break;
+        }
         let rest = &items[next..];
         let a = check(rest);
         let mut take = 0;
@@ -521,16 +558,32 @@ pub fn pace<T, R>(
             steps.push(step);
         }
         last = Some(a);
-        let left = wait.timeout.saturating_sub(clock.elapsed());
+        let left = wait.timeout.saturating_sub(waited);
         if left.is_zero() {
             timed_out = true;
             break;
         }
-        let nap = wait.poll.min(left);
-        clock.sleep(nap);
-        waited += nap;
+        let mut nap = wait.poll.min(left);
+        while !nap.is_zero() && !was_cancelled {
+            let slice = nap.min(CANCEL_SLICE);
+            clock.sleep(slice);
+            waited += slice;
+            nap -= slice;
+            was_cancelled = cancelled();
+        }
+        if was_cancelled {
+            break;
+        }
     }
-    Paced { results, steps, waited_s: round1(waited.as_secs_f64()), timed_out, not_started: items.len() - next, last }
+    Paced {
+        results,
+        steps,
+        waited_s: round1(waited.as_secs_f64()),
+        timed_out,
+        cancelled: was_cancelled,
+        not_started: items.len() - next,
+        last,
+    }
 }
 
 #[cfg(test)]
@@ -569,7 +622,7 @@ mod tests {
     }
 
     fn judged(h: &HostState, it: &[Item]) -> Admission {
-        admit(h, it, seed, &Limits::default())
+        admit(h, it, usize::MAX, seed, &Limits::default())
     }
 
     #[test]
@@ -686,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn the_host_estimate_refines_idle_costs() {
+    fn the_host_estimate_blends_in_idle_costs_after_a_few_samples() {
         let mut e = Estimator::default();
         let (ios, phone) = (Platform::Ios, FormFactor::Phone);
         assert_eq!(e.cost(ios, phone), seed(ios, phone), "nothing seen: the seed");
@@ -694,18 +747,61 @@ mod tests {
         e.observe(ios, phone, Some(300.0), 900 * MB);
         e.observe(ios, phone, None, 900 * MB);
         assert_eq!(e.cost(ios, phone), seed(ios, phone));
-        // A slim-profile device: 1158 MB idle at 3% of a core.
+        // A slim-profile device (1158 MB idle at 3% of a core) seen once or twice doesn't replace the seed.
+        for _ in 1..MIN_SAMPLES {
+            e.observe(ios, phone, Some(3.0), 1158 * MB);
+            assert_eq!(e.cost(ios, phone), seed(ios, phone), "too few samples to trust");
+        }
+        // From MIN_SAMPLES on it is the seed blended a fifth of the way per sample towards the device.
         e.observe(ios, phone, Some(3.0), 1158 * MB);
         let c = e.cost(ios, phone);
-        assert_eq!((c.idle_cpu_pct, c.idle_memory_bytes, c.boot_memory_bytes, c.boot_cpu_pct), (3.0, 1158 * MB, 1158 * MB, 280.0));
-        assert!(c.source.starts_with("this host: 1 samples of idle iOS phone devices"), "{}", c.source);
-        // Later samples move it a fifth of the way; Android keeps its boot/idle memory ratio.
-        e.observe(ios, phone, Some(13.0), 2158 * MB);
-        assert_eq!((e.cost(ios, phone).idle_cpu_pct, e.cost(ios, phone).idle_memory_bytes), (5.0, 1358 * MB));
-        e.observe(Platform::Android, phone, Some(4.0), 1400 * MB);
+        let blend = |seed: f64, seen: f64| seen + (seed - seen) * (1.0 - WEIGHT).powi(MIN_SAMPLES as i32);
+        let mem = blend(2176.0, 1158.0) * 1e6;
+        assert!((c.idle_memory_bytes as f64 - mem).abs() < 1e3, "{} vs {mem}", c.idle_memory_bytes);
+        assert!(c.idle_memory_bytes > 1158 * MB && c.idle_memory_bytes < 2176 * MB, "between the device and the seed");
+        assert_eq!(c.boot_memory_bytes, c.idle_memory_bytes, "iOS boots at its idle footprint");
+        assert!((c.idle_cpu_pct - (blend(10.0, 3.0) * 10.0).round() / 10.0).abs() < 1e-9, "{}", c.idle_cpu_pct);
+        assert_eq!(c.boot_cpu_pct, 280.0);
+        assert!(c.source.starts_with("this host: 3 samples of idle iOS phone devices blended with"), "{}", c.source);
+        // Many samples converge on what the host measures.
+        for _ in 0..40 {
+            e.observe(ios, phone, Some(3.0), 1158 * MB);
+        }
+        assert!(e.cost(ios, phone).idle_memory_bytes.abs_diff(1158 * MB) < 5 * MB);
+        // Android keeps its boot/idle memory ratio; kinds are separate.
+        for _ in 0..MIN_SAMPLES {
+            e.observe(Platform::Android, phone, Some(4.0), 1400 * MB);
+        }
         let a = e.cost(Platform::Android, phone);
-        assert_eq!((a.idle_memory_bytes, a.boot_memory_bytes), (1400 * MB, 1882 * MB));
-        assert_eq!(e.cost(ios, FormFactor::Tablet), seed(ios, FormFactor::Tablet), "kinds are separate");
+        assert!((a.boot_memory_bytes as f64 / a.idle_memory_bytes as f64 - 3764.0 / 2800.0).abs() < 1e-3);
+        assert_eq!(e.cost(ios, FormFactor::Tablet), seed(ios, FormFactor::Tablet));
+    }
+
+    #[test]
+    fn at_most_k_devices_boot_at_once_and_the_rest_cost_their_idle() {
+        use FormFactor::Phone;
+        use Platform::Android;
+        // 16 CPUs at load 2 (limit 24), 256 GiB: 20 phones at 2.5 booting cores each.
+        let h = host(256, 80.0, false, 16, 2.0, None);
+        let twenty = items(20, Android, Some(Phone));
+        let all_at_once = judged(&h, &twenty);
+        assert_eq!((all_at_once.predicted.admissible, all_at_once.verdict), (8, Verdict::Hold), "N x boot: 2 + 8 x 2.5 = 22");
+        // At most 4 at a time: 4 x 2.5 booting + 16 x 0.059 idle = 10.94 over the load of 2.
+        let four = admit(&h, &twenty, 4, seed, &Limits::default());
+        assert_eq!((four.predicted.admissible, four.verdict), (20, Verdict::Admit), "{:?}", four.reasons);
+        let load = four.predicted.load.expect("load");
+        assert_eq!((load.now, load.after), (2.0, 12.94));
+        assert_eq!(four.predicted.boot_memory_bytes, 4 * 3764 * MB + 16 * 2800 * MB);
+        assert_eq!(four.predicted.boot_cpu_pct, 1094.4, "{}", four.predicted.boot_cpu_pct);
+        // Fewer devices than slots cost what they do booting, as before.
+        let two = admit(&h, &items(2, Android, Some(Phone)), 4, seed, &Limits::default());
+        assert_eq!(two.predicted.boot_memory_bytes, 2 * 3764 * MB);
+        // Memory: 32 GiB at 42% used, 6 phones with K = 2: 2 x 3.764 + 4 x 2.8 = 18.7 GB = 54% more.
+        let small = host(32, 58.0, false, 16, 2.0, None);
+        let six = admit(&small, &items(6, Android, Some(Phone)), 2, seed, &Limits::default());
+        assert_eq!(six.predicted.memory_used_pct.map(|u| u.after), Some(96.5), "{:?}", six.reasons);
+        assert_eq!(six.verdict, Verdict::Backoff);
+        assert!(six.reasons[0].contains("at most 2 booting at once"), "{:?}", six.reasons);
     }
 
     struct FakeClock(Cell<Duration>);
@@ -750,6 +846,7 @@ mod tests {
             |_| true,
             &clock,
             wait,
+            || false,
             |rest| allowing(room(clock.elapsed()).saturating_sub(running.get()), rest.len()),
             |chunk: &[i32]| {
                 running.set(running.get() + chunk.len());
@@ -774,7 +871,7 @@ mod tests {
         let clock = FakeClock(Cell::new(Duration::ZERO));
         let wait = Wait { timeout: Duration::from_secs(12), poll: Duration::from_secs(5) };
         // Items 0 are already running (no cost): they start at once; the new ones never get room.
-        let paced = pace(&[0, 0, 1, 1], |t| *t == 1, &clock, wait, |rest| allowing(0, rest.len()), |c: &[i32]| c.len(), |_| {});
+        let paced = pace(&[0, 0, 1, 1], |t| *t == 1, &clock, wait, || false, |rest| allowing(0, rest.len()), |c: &[i32]| c.len(), |_| {});
         assert_eq!(paced.results, [2]);
         assert_eq!((paced.timed_out, paced.not_started, paced.waited_s), (true, 2, 12.0), "slept 5, 5 and the 2 s left");
         assert_eq!(clock.elapsed(), Duration::from_secs(12));
@@ -782,7 +879,100 @@ mod tests {
         // A zero timeout judges once and doesn't sleep.
         let clock = FakeClock(Cell::new(Duration::ZERO));
         let none = Wait { timeout: Duration::ZERO, poll: Duration::from_secs(5) };
-        let paced = pace(&[1], |_| true, &clock, none, |rest| allowing(0, rest.len()), |c: &[i32]| c.len(), |_| {});
+        let paced = pace(&[1], |_| true, &clock, none, || false, |rest| allowing(0, rest.len()), |c: &[i32]| c.len(), |_| {});
         assert_eq!((paced.results.len(), paced.timed_out, clock.elapsed()), (0, true, Duration::ZERO));
+    }
+
+    #[test]
+    fn the_wait_budget_is_time_spent_waiting_not_time_spent_booting() {
+        // Room for one now; the chunk takes 600 s to boot (more than the whole budget); then the
+        // host is full for 20 s more. Only those 20 s count against the 30 s.
+        let clock = FakeClock(Cell::new(Duration::ZERO));
+        let booted = Cell::new(None::<Duration>);
+        let wait = Wait { timeout: Duration::from_secs(30), poll: Duration::from_secs(5) };
+        let paced = pace(
+            &[1, 2],
+            |_| true,
+            &clock,
+            wait,
+            || false,
+            |rest| match booted.get() {
+                None => allowing(1, rest.len()),
+                Some(t) if clock.elapsed() >= t + Duration::from_secs(20) => allowing(rest.len(), rest.len()),
+                Some(_) => allowing(0, rest.len()),
+            },
+            |chunk: &[i32]| {
+                clock.sleep(Duration::from_secs(600));
+                booted.set(Some(clock.elapsed()));
+                chunk.len()
+            },
+            |_| {},
+        );
+        assert_eq!((paced.results.clone(), paced.timed_out, paced.not_started), (vec![1, 1], false, 0));
+        assert_eq!(paced.waited_s, 20.0, "only the waiting");
+        // Out of budget: the time reported is the time waited, whatever the chunks took.
+        let clock = FakeClock(Cell::new(Duration::ZERO));
+        let paced = pace(
+            &[1, 2],
+            |_| true,
+            &clock,
+            wait,
+            || false,
+            |rest| if clock.elapsed() < Duration::from_secs(600) { allowing(1, rest.len()) } else { allowing(0, rest.len()) },
+            |chunk: &[i32]| {
+                clock.sleep(Duration::from_secs(600));
+                chunk.len()
+            },
+            |_| {},
+        );
+        assert_eq!((paced.results.len(), paced.timed_out, paced.not_started, paced.waited_s), (1, true, 1, 30.0));
+    }
+
+    #[test]
+    fn a_cancel_stops_the_wait_between_polls_and_starts_nothing_more() {
+        let clock = FakeClock(Cell::new(Duration::ZERO));
+        let wait = Wait { timeout: Duration::from_secs(600), poll: Duration::from_secs(5) };
+        let started = Cell::new(0usize);
+        let cancel_at = Duration::from_secs(7);
+        let paced = pace(
+            &[1, 2, 3],
+            |_| true,
+            &clock,
+            wait,
+            || clock.elapsed() >= cancel_at,
+            |rest| allowing(0, rest.len()),
+            |c: &[i32]| {
+                started.set(started.get() + c.len());
+                c.len()
+            },
+            |_| {},
+        );
+        assert!(paced.cancelled && !paced.timed_out);
+        assert_eq!((started.get(), paced.not_started), (0, 3));
+        assert!(
+            clock.elapsed() < Duration::from_secs(8),
+            "stopped within a slice of the flag, not at the next 5 s poll or the timeout: {:?}",
+            clock.elapsed()
+        );
+        // Cancelled before the first judgement: nothing judged, nothing started.
+        let paced = pace(&[1], |_| true, &clock, wait, || true, |_| panic!("no judgement"), |_: &[i32]| panic!("no start"), |_| {});
+        assert!(paced.cancelled && paced.last.is_none());
+        // Cancelled after one chunk: the rest never start.
+        let clock = FakeClock(Cell::new(Duration::ZERO));
+        let first = Cell::new(false);
+        let paced = pace(
+            &[1, 2, 3],
+            |_| true,
+            &clock,
+            wait,
+            || first.get(),
+            |_| allowing(1, 3),
+            |c: &[i32]| {
+                first.set(true);
+                c.len()
+            },
+            |_| {},
+        );
+        assert_eq!((paced.results.len(), paced.not_started, paced.cancelled), (1, 2, true));
     }
 }
