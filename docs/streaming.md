@@ -101,6 +101,59 @@ ffmpeg -f lavfi -i testsrc=size=96x64:rate=10 -frames:v 10 -c:v libx264 -profile
 `publishes_to_a_local_mediamtx` (ignored) publishes the fixture to a running MediaMTX
 (`SIMEE_WHIP_URL`, default `http://127.0.0.1:8889/simee-test/whip`).
 
+### The MediaMTX harness (#267)
+
+`tests/mediamtx/mediamtx.yml` is the test config: WHIP and WHEP on loopback, the control API on,
+`webrtcTrackGatherTimeout: 30s` (AutoMobile measured first frames up to 15 s on a device; the 2 s
+default closes the publisher first), host candidates only (no STUN), RTSP, RTMP, HLS, SRT, MoQ,
+metrics and pprof off, and anonymous publish, read and API from loopback only. It is valid on its
+own (ports 8889, 9997 and 8189); the harness and the script start it on free ports through
+MediaMTX's `MTX_*` environment overrides instead.
+
+- **Finding MediaMTX.** `$MEDIAMTX_BIN`, else `mediamtx` on PATH. Nothing is downloaded by the
+  tests or the script; with no binary the MediaMTX tests print `SKIP: no MediaMTX ...` and pass.
+- **Rust.** `crates/sim-rtc/tests/common/mod.rs` has `MediaMtx`: it writes the config to a temp dir,
+  starts the server on free ports, waits for `GET /v3/config/global/get` (failing with the log when
+  the process dies or stalls), exposes `api_get` and `ready_path`, and on drop kills the child by
+  the PID it spawned, removes the temp dir and, if the test is panicking, prints the server log.
+  `tests/mediamtx.rs` publishes both fixtures (Constrained Baseline and Main) with the publisher
+  and checks through the API that the path is `ready` with an `H264` track.
+- **By hand.** `scripts/mediamtx.sh start` prints `WHIP_URL`, `WHEP_URL`, `API_URL`, the PID and
+  the log path; `stop` kills the recorded PID; `status` reports it. `MEDIAMTX_STATE` moves its
+  state dir. Like the Rust tests, the script exits 3 with a message when there is no binary.
+
+Run it: `MEDIAMTX_BIN=/path/to/mediamtx cargo test -p simee-rtc --test mediamtx` (on Linux add
+`--features rust-crypto`, or the publisher tests skip for lack of DTLS; the harness test still runs).
+
+#### CI step to add
+
+Not wired yet (this change touches no workflow). The step for the macOS and Linux jobs, with the
+binary verified by hash and cached; fill in the SHA-256 of each archive from the release's
+`checksums.sha256` before merging:
+
+```yaml
+env:
+  MEDIAMTX_VERSION: v1.19.2   # pinned; bump with the hashes below
+- name: MediaMTX
+  run: |
+    case "$RUNNER_OS-$RUNNER_ARCH" in
+      Linux-X64)    asset=linux_amd64;  sha=<SHA256_LINUX_AMD64> ;;
+      macOS-ARM64)  asset=darwin_arm64; sha=<SHA256_DARWIN_ARM64> ;;
+      *) echo "no MediaMTX pin for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
+    esac
+    f="mediamtx_${MEDIAMTX_VERSION}_${asset}.tar.gz"
+    dir="$RUNNER_TEMP/mediamtx"
+    mkdir -p "$dir"
+    curl -fsSL -o "$dir/$f" "https://github.com/bluenviron/mediamtx/releases/download/${MEDIAMTX_VERSION}/$f"
+    echo "$sha  $dir/$f" | shasum -a 256 -c -
+    tar -xzf "$dir/$f" -C "$dir" mediamtx
+    echo "MEDIAMTX_BIN=$dir/mediamtx" >> "$GITHUB_ENV"
+```
+
+Cache `$RUNNER_TEMP/mediamtx` with `actions/cache`, keyed on the version and the asset, restoring
+before the step and re-checking the hash after. The `linux` job needs `--features rust-crypto` for
+the publisher tests to run rather than skip (see "Linux in CI" below).
+
 ## `sim-encode`: the encoder
 
 `crates/sim-encode` (published as `simee-encode`) turns a device's frames into what the publisher
