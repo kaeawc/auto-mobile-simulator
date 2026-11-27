@@ -319,3 +319,23 @@ guest); the guest's kernel could show which of its context switches are the peri
 renderer's cost was measured with SwiftShader only. The API 36 `google_apis` image, arm64 guests
 and a host with more than 4 cores weren't run. The per-symbol profile (`perf`) and the
 per-thread one come from different boots.
+
+## 6. Could Android run in a container on this host's kernel?
+
+A five-minute check of whether a container backend (an Android userspace on the host's kernel, no
+VM) is possible here, run on the same host as section 1 on 2026-11-27 as root. Android's binder
+IPC is the gate: a container needs it in the host kernel, as `binder_linux` or built in.
+
+| Check | Result |
+| --- | --- |
+| Kernel config (`/proc/config.gz`; no `/boot/config-*`) | `# CONFIG_ANDROID_BINDER_IPC is not set`; `# CONFIG_MODULES is not set`; `CONFIG_MEMFD_CREATE=y`. No `BINDERFS`, `ANDROID` (other than the binder line) or `ASHMEM` lines at all: with binder off their options are hidden |
+| `binder` in `/proc/filesystems` | no |
+| `/lib/modules/$(uname -r)` | does not exist (`/lib/modules` is absent), so no `binder_linux`; the kernel has no module support, so none could be loaded |
+| `mkdir /tmp/binderfs-test; unshare -Urm mount -t binder binder /tmp/binderfs-test` | `mount: /tmp/binderfs-test: unknown filesystem type 'binder'.`, exit 32. `unshare -Urm true` alone exits 0, so user and mount namespaces work; binderfs is what's missing. Nothing was mounted; the directory was removed |
+| `docker` / `podman` | neither installed |
+
+What it means: this host's kernel has no binder and can't load it, so a container backend can't run
+here, and no container runtime was installed or tried. Anything that wants one needs a kernel built
+with `CONFIG_ANDROID_BINDER_IPC` and `CONFIG_ANDROID_BINDERFS` (the Firecracker guest kernel here
+is the host's to change, not simee's), and the result would be an x86_64 Android on the host's
+kernel, so it says nothing about arm64 images.
