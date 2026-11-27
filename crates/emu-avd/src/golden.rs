@@ -92,7 +92,19 @@ impl CloneKind {
 
 /// Copies `from` to the new file `to`: a reflink where the file system has them, else a copy
 /// that keeps the file's holes (a user data image is mostly one), else `std::fs::copy`.
+///
+/// `to` must not exist (on any platform: `std::fs::copy` would replace it), and a failed clone
+/// leaves no half-written file behind.
 pub fn clone_file(from: &Path, to: &Path) -> Result<CloneKind> {
+    if to.symlink_metadata().is_ok() {
+        return Err(Error::Io(to.to_path_buf(), std::io::ErrorKind::AlreadyExists.into()));
+    }
+    clone_new_file(from, to).inspect_err(|_| {
+        let _ = std::fs::remove_file(to);
+    })
+}
+
+fn clone_new_file(from: &Path, to: &Path) -> Result<CloneKind> {
     let io = |p: &Path, e| Error::Io(p.to_path_buf(), e);
     #[cfg(target_os = "linux")]
     {
@@ -127,10 +139,6 @@ pub fn clone_file(from: &Path, to: &Path) -> Result<CloneKind> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // `std::fs::copy` replaces what is there; this never does.
-        if to.exists() {
-            return Err(io(to, std::io::Error::from(std::io::ErrorKind::AlreadyExists)));
-        }
         std::fs::copy(from, to).map_err(|e| io(from, e))?;
         Ok(CloneKind::Copy)
     }
@@ -257,7 +265,11 @@ impl Env {
         let h = sim_bundle::hash_file(path)?;
         // Best effort: a read-only AVD home just hashes every time.
         if std::fs::create_dir_all(&dir).is_ok() {
-            let tmp = dir.join(format!(".{}.{}", std::process::id(), now_unix()));
+            // Unique per write: threads of one process (and processes) hash the same file at once.
+            static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp =
+                dir.join(format!(".{}.{}.{n}", entry.file_name().map(|f| f.to_string_lossy()).unwrap_or_default(), std::process::id()));
             if std::fs::write(&tmp, &h).is_ok() && std::fs::rename(&tmp, &entry).is_err() {
                 let _ = std::fs::remove_file(&tmp);
             }
@@ -455,6 +467,7 @@ fn apply(golden: &Golden, avd: &Avd) -> Result<CloneKind> {
     if result.is_err() {
         for f in CLONED_DISKS {
             let _ = std::fs::remove_file(dst.join(f));
+            let _ = std::fs::remove_file(dst.join(format!(".{f}.partial")));
         }
     }
     result
@@ -777,6 +790,49 @@ mod tests {
         let used = std::fs::metadata(&dst).expect("meta").blocks() * 512;
         assert!(kind != CloneKind::Sparse || used < 8 << 20, "{kind:?} took {used} bytes of a 256 MiB hole");
         assert!(clone_file(&src, &dst).is_err(), "never overwrites");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn threads_hashing_the_same_image_at_once_agree_on_the_key() {
+        let (tmp, env) = sdk("hashrace", "2");
+        avd(&env, "a");
+        let a = env.load("a").expect("a");
+        let keys: Vec<GoldenKey> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8).map(|_| s.spawn(|| env.golden_key(&a).expect("key"))).collect();
+            hs.into_iter().map(|h| h.join().expect("thread")).collect()
+        });
+        assert!(keys.windows(2).all(|w| w[0] == w[1]), "{keys:?}");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn a_failed_clone_leaves_no_partial_file() {
+        let (tmp, env) = sdk("partial", "2");
+        avd(&env, "a");
+        let a = env.load("a").expect("a");
+        // clone_file: a missing source leaves no destination.
+        let to = tmp.join("out.img");
+        assert!(clone_file(&tmp.join("missing.img"), &to).is_err());
+        assert!(!to.exists());
+        // apply: a golden that lists a disk it doesn't have fails with nothing half-written.
+        let dir = tmp.join("g");
+        std::fs::create_dir_all(&dir).expect("g");
+        std::fs::write(dir.join("userdata.img"), b"data").expect("userdata");
+        let golden = Golden {
+            dir,
+            key: GoldenKey { name: "g".into(), package: String::new(), image: String::new(), shape: String::new() },
+            disks: vec![("userdata.img".into(), 4), ("cache.img".into(), 5)],
+            built_unix: 0,
+        };
+        assert!(apply(&golden, &a).is_err());
+        let left: Vec<String> = std::fs::read_dir(state_dir(&a.dir))
+            .expect("simee")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "instance.lock")
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
         let _ = std::fs::remove_dir_all(tmp);
     }
 

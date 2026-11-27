@@ -29,7 +29,9 @@ const SETTLE_LIMIT: Duration = Duration::from_secs(10 * 60);
 const NO_ADB_DWELL: Duration = Duration::from_secs(120);
 /// The guest counts as idle below this share of its CPU time busy, twice in a row.
 const IDLE_BELOW: f64 = 0.25;
-/// How long a stopped emu may take to exit before it is killed.
+/// How long the guest gets to power itself off (`reboot -p`) before the console stops emu instead.
+const POWEROFF_LIMIT: Duration = Duration::from_secs(120);
+/// How long emu may take to exit after the console's `kill`.
 const STOP_LIMIT: Duration = Duration::from_secs(60);
 
 /// `-create-avd`'s second half: starts AVD `name` (just made) from its image's golden user data,
@@ -209,7 +211,7 @@ fn drive(
     say(&format!("boot completed after {:.0} s; waiting for the launcher and an idle guest", started.elapsed().as_secs_f64()));
     let adb = env.sdk_root.as_ref().map(|r| r.join("platform-tools/adb")).filter(|p| p.is_file());
     match &adb {
-        Some(adb) => settle(adb, port, booted_at, say),
+        Some(adb) => settle(adb, port, booted_at, say).map_err(|why| Error::Config(format!("{why}; see {}", log_path.display())))?,
         None => {
             say(&format!("no adb in the SDK (emu -provision installs it): giving the guest {} s instead", NO_ADB_DWELL.as_secs()));
             std::thread::sleep(NO_ADB_DWELL);
@@ -218,19 +220,42 @@ fn drive(
     if child.try_wait().ok().flatten().is_some() {
         return Err(died(child, "exited while settling"));
     }
-    // Dirty pages in the guest's page cache are lost when emu stops; the journal handles the rest.
     if let Some(adb) = &adb {
-        let _ = adb_shell(adb, port, "sync", Duration::from_secs(60));
+        // The guest syncs, unmounts user data and powers off; emu exits when it does.
+        let _ = adb_shell(adb, port, "reboot -p", Duration::from_secs(30));
+        match wait_exit(child, POWEROFF_LIMIT)? {
+            Some(status) if status.success() => {
+                say("stopped by the guest's own power-off (adb shell reboot -p)");
+                return Ok(());
+            }
+            Some(status) => {
+                return Err(Error::Config(format!("emu exited with {status} after the guest's power-off; see {}", log_path.display())));
+            }
+            None => {
+                say(&format!("the guest didn't power off within {} s; stopping through emu's console instead", POWEROFF_LIMIT.as_secs()))
+            }
+        }
+    } else {
+        say("stopping through emu's console (without adb the guest isn't shut down first)");
     }
     console_kill(port).map_err(|e| Error::Config(format!("stopping emu through its console on port {port}: {e}")))?;
-    let stopped = Instant::now();
+    match wait_exit(child, STOP_LIMIT)? {
+        Some(status) if status.success() => {
+            say("stopped through emu's console (kill)");
+            Ok(())
+        }
+        Some(status) => Err(Error::Config(format!("emu exited with {status} after the console stop; see {}", log_path.display()))),
+        None => Err(died(child, "didn't exit after the console stop")),
+    }
+}
+
+/// The child's exit status, None if it is still running after `limit`.
+fn wait_exit(child: &mut Child, limit: Duration) -> emu_avd::Result<Option<std::process::ExitStatus>> {
+    let until = Instant::now() + limit;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => {
-                return Err(Error::Config(format!("emu exited with {status} after the console stop; see {}", log_path.display())));
-            }
-            Ok(None) if stopped.elapsed() > STOP_LIMIT => return Err(died(child, "didn't exit after the console stop")),
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) if Instant::now() > until => return Ok(None),
             Ok(None) => std::thread::sleep(Duration::from_millis(200)),
             Err(e) => return Err(Error::Config(format!("waiting for emu: {e}"))),
         }
@@ -252,21 +277,24 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Waits (up to [`SETTLE_LIMIT`] after `since`) for the launcher to be the resumed activity and
-/// the guest's CPUs to be idle in two samples in a row.
-fn settle(adb: &Path, port: u16, since: Instant, say: &mut dyn FnMut(&str)) {
-    // /proc/stat before and after a pause, then the resumed activity: one round trip.
-    let probe =
-        "head -1 /proc/stat; sleep 5; head -1 /proc/stat; dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'";
-    let mut quiet = 0;
+/// Waits (up to [`SETTLE_LIMIT`] after `since`) for the home app to be the resumed activity and
+/// the guest's CPUs to be idle in two samples in a row. Err when it never got there, or adb never
+/// answered: a guest that didn't settle isn't a golden.
+fn settle(adb: &Path, port: u16, since: Instant, say: &mut dyn FnMut(&str)) -> Result<(), String> {
+    // /proc/stat before and after a pause, the home activity, then the resumed activity: one round trip.
+    let probe = "head -1 /proc/stat; sleep 5; head -1 /proc/stat; \
+         echo HOME=$(cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME | tail -1); \
+         dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'";
+    let (mut quiet, mut answered) = (0, false);
     while since.elapsed() < SETTLE_LIMIT {
         if let Some(out) = adb_shell(adb, port, probe, Duration::from_secs(180)) {
+            answered = true;
             let (busy, launcher) = (busy_share(&out), launcher_resumed(&out));
             if launcher && busy.is_some_and(|b| b < IDLE_BELOW) {
                 quiet += 1;
                 if quiet >= 2 {
                     say(&format!("launcher resumed, guest {:.0}% busy", busy.unwrap_or(0.0) * 100.0));
-                    return;
+                    return Ok(());
                 }
             } else {
                 quiet = 0;
@@ -274,7 +302,11 @@ fn settle(adb: &Path, port: u16, since: Instant, say: &mut dyn FnMut(&str)) {
         }
         std::thread::sleep(Duration::from_secs(5));
     }
-    say(&format!("the guest didn't go quiet within {} s of boot completed; stopping it anyway", SETTLE_LIMIT.as_secs()));
+    Err(if answered {
+        format!("the guest didn't settle (launcher resumed, CPUs idle) within {} s of boot completed", SETTLE_LIMIT.as_secs())
+    } else {
+        format!("adb never answered within {} s of boot completed", SETTLE_LIMIT.as_secs())
+    })
 }
 
 /// `adb -s emulator-PORT shell CMD`'s stdout, None when it failed or took longer than `limit`.
@@ -322,9 +354,21 @@ fn busy_share(text: &str) -> Option<f64> {
     Some(1.0 - (idle.min(total) as f64 / total as f64))
 }
 
-/// Whether `dumpsys activity activities` names a launcher as the resumed activity.
+/// Whether the resumed activity in the probe's output (`dumpsys activity activities`) is the home
+/// app: the package of the `HOME=<package>/<activity>` line the probe prints (what
+/// `cmd package resolve-activity` finds for the HOME category), or, when that is missing or says
+/// the resolver activity, any resumed activity whose name has "launcher" in it.
 fn launcher_resumed(text: &str) -> bool {
-    text.lines().any(|l| (l.contains("ResumedActivity")) && l.to_ascii_lowercase().contains("launcher"))
+    let home = text
+        .lines()
+        .find_map(|l| l.strip_prefix("HOME="))
+        .and_then(|c| c.trim().split_once('/'))
+        .map(|(pkg, _)| pkg.trim())
+        .filter(|pkg| !pkg.is_empty() && !pkg.contains(' ') && *pkg != "android");
+    text.lines().filter(|l| l.contains("ResumedActivity")).any(|l| match home {
+        Some(pkg) => l.contains(&format!("{pkg}/")),
+        None => l.to_ascii_lowercase().contains("launcher"),
+    })
 }
 
 /// `kill` on emu's console at `port`, the stock text protocol: the greeting, `auth <token>` from
@@ -407,6 +451,21 @@ mod tests {
         assert!(!launcher_resumed("  topResumedActivity=ActivityRecord{ab u0 com.android.settings/.Settings t7}\n"));
         assert!(!launcher_resumed("  Launcher is mentioned here but nothing is resumed\n"));
         assert!(!launcher_resumed(""));
+    }
+
+    #[test]
+    fn the_home_app_the_guest_names_is_the_one_that_must_be_resumed() {
+        let resumed = "  topResumedActivity=ActivityRecord{ab u0 com.google.android.wearable.app/.HomeActivity t4}\n";
+        // A home app with no "launcher" in its name counts once the guest says it is home...
+        assert!(!launcher_resumed(resumed));
+        assert!(launcher_resumed(&format!("HOME=com.google.android.wearable.app/.HomeActivity\n{resumed}")));
+        // ...and another app resumed over it doesn't, even if its name says launcher.
+        let other = "  topResumedActivity=ActivityRecord{ab u0 com.example.launcherish/.Main t9}\n";
+        assert!(!launcher_resumed(&format!("HOME=com.google.android.wearable.app/.HomeActivity\n{other}")));
+        // No answer or a chooser (several homes): the name decides.
+        let nexus = "  topResumedActivity=ActivityRecord{ab u0 com.google.android.apps.nexuslauncher/.NexusLauncherActivity t4}\n";
+        assert!(launcher_resumed(&format!("HOME=No activity found\n{nexus}")));
+        assert!(launcher_resumed(&format!("HOME=android/com.android.internal.app.ResolverActivity\n{nexus}")));
     }
 
     #[test]
