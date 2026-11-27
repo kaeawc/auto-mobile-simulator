@@ -5,6 +5,8 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -233,4 +235,141 @@ fn run_receiver(mut rtc: Rtc, socket: UdpSocket, local: SocketAddr, frames: &Sen
             return;
         }
     }
+}
+
+/// The MediaMTX test config; the harness starts the server on free ports through MTX_* overrides.
+const MEDIAMTX_CONFIG: &str = include_str!("../../../../tests/mediamtx/mediamtx.yml");
+
+/// A MediaMTX child process on free loopback ports with the test config. It is killed (by the PID
+/// this struct recorded) and its temp dir removed on drop; when the test is panicking, the drop
+/// prints the server's log first.
+pub struct MediaMtx {
+    pub webrtc_port: u16,
+    pub api_port: u16,
+    child: Child,
+    dir: PathBuf,
+}
+
+static MEDIAMTX_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+impl MediaMtx {
+    /// The binary to run: `$MEDIAMTX_BIN`, else `mediamtx` on PATH. Nothing is downloaded.
+    pub fn find() -> Option<PathBuf> {
+        if let Some(bin) = std::env::var_os("MEDIAMTX_BIN") {
+            let bin = PathBuf::from(bin);
+            return bin.is_file().then_some(bin);
+        }
+        std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join("mediamtx")).find(|p| p.is_file())
+    }
+
+    /// `find`, or print why the test is skipped.
+    pub fn find_or_skip() -> Option<PathBuf> {
+        let bin = Self::find();
+        if bin.is_none() {
+            eprintln!("SKIP: no MediaMTX (set MEDIAMTX_BIN or put mediamtx on PATH; see docs/streaming.md)");
+        }
+        bin
+    }
+
+    /// Start it and wait until its API answers; `Err` carries the log when it dies or stalls.
+    pub fn start(bin: &Path) -> Result<MediaMtx, String> {
+        let dir =
+            std::env::temp_dir().join(format!("simee-mediamtx-{}-{}", std::process::id(), MEDIAMTX_RUNS.fetch_add(1, Ordering::SeqCst)));
+        std::fs::create_dir_all(&dir).map_err(|e| format!("temp dir: {e}"))?;
+        let config = dir.join("mediamtx.yml");
+        std::fs::write(&config, MEDIAMTX_CONFIG).map_err(|e| format!("config: {e}"))?;
+        let log = std::fs::File::create(dir.join("mediamtx.log")).map_err(|e| format!("log: {e}"))?;
+        let log2 = log.try_clone().map_err(|e| format!("log: {e}"))?;
+        let [webrtc_port, api_port, media_port] = free_ports();
+        let child = Command::new(bin)
+            .arg(&config)
+            .env("MTX_WEBRTCADDRESS", format!("127.0.0.1:{webrtc_port}"))
+            .env("MTX_APIADDRESS", format!("127.0.0.1:{api_port}"))
+            .env("MTX_WEBRTCLOCALUDPADDRESS", format!("127.0.0.1:{media_port}"))
+            .env("MTX_WEBRTCLOCALTCPADDRESS", format!("127.0.0.1:{media_port}"))
+            .stdin(Stdio::null())
+            .stdout(log)
+            .stderr(log2)
+            .spawn()
+            .map_err(|e| format!("spawn {}: {e}", bin.display()))?;
+        let mut mtx = MediaMtx { webrtc_port, api_port, child, dir };
+        let end = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(Some(status)) = mtx.child.try_wait() {
+                return Err(format!("mediamtx exited during startup ({status}):\n{}", mtx.log()));
+            }
+            if matches!(mtx.api_get("/v3/config/global/get"), Some((200, _))) {
+                return Ok(mtx);
+            }
+            if Instant::now() > end {
+                return Err(format!("mediamtx API not ready after 15s:\n{}", mtx.log()));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The WHIP endpoint for a stream name.
+    pub fn whip_url(&self, name: &str) -> String {
+        format!("http://127.0.0.1:{}/{name}/whip", self.webrtc_port)
+    }
+
+    /// The server's log so far.
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.join("mediamtx.log")).unwrap_or_default()
+    }
+
+    /// GET on the control API: status and body, `None` when nothing answers.
+    pub fn api_get(&self, path: &str) -> Option<(u16, String)> {
+        let mut conn = TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], self.api_port)), Duration::from_secs(2)).ok()?;
+        conn.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        conn.write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").as_bytes()).ok()?;
+        let mut raw = Vec::new();
+        conn.read_to_end(&mut raw).ok()?;
+        let raw = String::from_utf8_lossy(&raw).into_owned();
+        let (head, body) = raw.split_once("\r\n\r\n")?;
+        let status = head.split(' ').nth(1)?.parse().ok()?;
+        Some((status, body.to_owned()))
+    }
+
+    /// The API's description of a path, whitespace stripped so `"ready":true` matches, once the
+    /// path exists and is ready (a publisher is connected and its tracks are known).
+    pub fn ready_path(&self, name: &str) -> Option<String> {
+        let (status, body) = self.api_get(&format!("/v3/paths/get/{name}"))?;
+        let body: String = body.split_whitespace().collect();
+        (status == 200 && body.contains("\"ready\":true")).then_some(body)
+    }
+
+    /// Poll `ready_path` until `timeout`.
+    pub fn wait_ready_path(&self, name: &str, timeout: Duration) -> Option<String> {
+        let end = Instant::now() + timeout;
+        while Instant::now() < end {
+            if let Some(body) = self.ready_path(name) {
+                return Some(body);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+}
+
+impl Drop for MediaMtx {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            eprintln!("--- mediamtx log ({}) ---\n{}\n--- end mediamtx log ---", self.dir.display(), self.log());
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Three ports nothing listens on right now (TCP, held until all three are chosen).
+fn free_ports() -> [u16; 3] {
+    let listeners: Vec<TcpListener> = (0..3).map(|_| TcpListener::bind("127.0.0.1:0").expect("bind")).collect();
+    let port = |i: usize| listeners[i].local_addr().expect("addr").port();
+    [port(0), port(1), port(2)]
 }

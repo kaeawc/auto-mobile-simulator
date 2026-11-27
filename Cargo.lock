@@ -1897,7 +1897,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "simee"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1913,7 +1913,7 @@ dependencies = [
 
 [[package]]
 name = "simee-android"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "png",
  "simee-core",
@@ -1922,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "simee-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "serde",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "simee-audio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1948,7 +1948,7 @@ dependencies = [
 
 [[package]]
 name = "simee-bundle"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "lz4_flex",
@@ -1960,7 +1960,7 @@ dependencies = [
 
 [[package]]
 name = "simee-camera"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "block2",
  "font8x8",
@@ -1978,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "simee-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "png",
  "serde",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "simee-coresim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "block2",
  "libc",
@@ -1999,14 +1999,14 @@ dependencies = [
 
 [[package]]
 name = "simee-debug"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "simee-emu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -2023,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "simee-emu-avd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rustix",
  "simee-bundle",
@@ -2033,15 +2033,15 @@ dependencies = [
 
 [[package]]
 name = "simee-emu-ext4"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "simee-emu-fdt"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "simee-emu-gfxstream"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "simee-core",
@@ -2051,7 +2051,7 @@ dependencies = [
 
 [[package]]
 name = "simee-emu-hvf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "rustix",
@@ -2060,7 +2060,7 @@ dependencies = [
 
 [[package]]
 name = "simee-emu-kvm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
@@ -2072,7 +2072,7 @@ dependencies = [
 
 [[package]]
 name = "simee-emu-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "roxmltree",
@@ -2084,7 +2084,7 @@ dependencies = [
 
 [[package]]
 name = "simee-emu-vmm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cpal",
@@ -2101,7 +2101,7 @@ dependencies = [
 
 [[package]]
 name = "simee-encode"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "simee-android",
  "simee-core",
@@ -2112,7 +2112,7 @@ dependencies = [
 
 [[package]]
 name = "simee-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rustix",
  "serde",
@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "simee-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "simee-android",
@@ -2132,14 +2132,14 @@ dependencies = [
 
 [[package]]
 name = "simee-netshape"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "simee-rtc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "str0m",
 ]

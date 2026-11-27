@@ -156,24 +156,31 @@ fn strings(value: &Value, key: &str) -> Vec<String> {
     value.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default()
 }
 
-/// Reports a blocking call's progress until dropped.
+/// Reports a blocking call's progress until dropped. Dropping it waits out a progress being sent,
+/// and none is sent after, so a call's progress never follows its response (which MCP forbids).
 struct Heartbeat {
-    stop: Arc<AtomicBool>,
+    /// Set once the call has returned. A progress is checked against it and sent under its lock.
+    stopped: Arc<Mutex<bool>>,
 }
 
 impl Drop for Heartbeat {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        *lock(&self.stopped) = true;
     }
 }
 
 fn heartbeat(sink: Sink, token: Value, tool: String, every: Duration) -> Heartbeat {
-    let stop = Arc::new(AtomicBool::new(false));
-    let flag = stop.clone();
+    heartbeat_with(sink, token, tool, every, || {})
+}
+
+/// [`heartbeat`], calling `before_send` just before each progress goes out (tests pause there).
+fn heartbeat_with(sink: Sink, token: Value, tool: String, every: Duration, before_send: impl Fn() + Send + 'static) -> Heartbeat {
+    let stopped = Arc::new(Mutex::new(false));
+    let flag = stopped.clone();
     let spawned = std::thread::Builder::new().name("simee-mcp-progress".into()).spawn(move || {
         let start = Instant::now();
         let mut next = start + every;
-        while !flag.load(Ordering::Relaxed) {
+        while !*lock(&flag) {
             std::thread::sleep(Duration::from_millis(10));
             if Instant::now() < next {
                 continue;
@@ -181,19 +188,23 @@ fn heartbeat(sink: Sink, token: Value, tool: String, every: Duration) -> Heartbe
             next += every;
             let secs = start.elapsed().as_secs_f64();
             let message = format!("{tool} is still running ({} s)", secs.round());
-            if !flag.load(Ordering::Relaxed) {
-                sink(
-                    json!({"jsonrpc": "2.0", "method": "notifications/progress",
-                    "params": {"progressToken": token, "progress": secs.round(), "message": message}})
-                    .to_string(),
-                );
+            // Checked and sent under the one lock the drop takes, so a stop can't fall in between.
+            let stopped = lock(&flag);
+            if *stopped {
+                return;
             }
+            before_send();
+            sink(
+                json!({"jsonrpc": "2.0", "method": "notifications/progress",
+                "params": {"progressToken": token, "progress": secs.round(), "message": message}})
+                .to_string(),
+            );
         }
     });
     if let Err(e) = spawned {
         eprintln!("simee mcp: cannot start a progress thread: {e}");
     }
-    Heartbeat { stop }
+    Heartbeat { stopped }
 }
 
 impl Inner {

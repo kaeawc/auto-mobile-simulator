@@ -28,6 +28,10 @@ fn shaper_core_passes_its_tests() {
     let bin = build("netshape_core");
     let out = Command::new(&bin).env("TMPDIR", env!("CARGO_TARGET_TMPDIR")).output().expect("run netshape_test");
     assert!(out.status.success(), "{}", text(&out));
+    // The C test skips its IPv6 cases where the host has no IPv6; say so in this test's output.
+    for line in text(&out).lines().filter(|l| l.starts_with("SKIPPED:")) {
+        println!("{line}");
+    }
 }
 
 #[test]
