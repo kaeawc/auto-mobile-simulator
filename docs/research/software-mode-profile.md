@@ -149,8 +149,8 @@ came 166.0 s after the start, 10 s after the guest's last milestone):
 | screen enabled | 132.1 s | 12.9 s |
 | boot animation stops (`sf_stop_bootanim`) | 155.1 s | 23.0 s |
 
-Busiest guest processes (`dumpsys cpuinfo`, percent of one guest CPU): the 14 s ending about 74 s
-after boot completes: system_server 86%, the ranchu composer HAL 69% (59% user),
+Busiest guest processes (`dumpsys cpuinfo`, percent of one guest CPU): the 14 s from 16 to 30 s
+after boot completes (load average 17): system_server 86%, the ranchu composer HAL 69% (59% user),
 Settings 47%, SurfaceFlinger 30%, SystemUI 24%, the launcher 20%. In the idle window: system_server
 30%, SystemUI 12%, the composer HAL 10%, SurfaceFlinger 8.3%, the sensors HAL 6.2%, the launcher 4.3%.
 One guest thread's speed is what it waits on: system_server's boot is serial.
