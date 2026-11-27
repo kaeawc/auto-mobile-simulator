@@ -759,15 +759,7 @@ fn device_row(s: &State, r: &Row, sort: Sort, t: Theme) -> El {
             "Shut down",
             false,
             t,
-            move |s: &mut State| {
-                // The device the window shows shuts down as the toolbar's button does, so its
-                // screen and connection close with it.
-                if s.selected.as_deref() == Some(udid.as_str()) && s.showing_screen() {
-                    s.actions.push(Action::Shutdown);
-                } else {
-                    s.resources.queued.push(Job::Shutdown { device: udid.clone(), platform: platform.clone(), name: name.clone() });
-                }
-            },
+            move |s: &mut State| shut_down(s, &udid, &platform, &name),
         ));
     }
     col()
@@ -803,6 +795,20 @@ fn device_row(s: &State, r: &Row, sort: Sort, t: Theme) -> El {
                 )
                 .child(actions),
         )
+}
+
+/// A row's Shut down. The device the window shows shuts down as the toolbar's button does, so its
+/// screen and connection close with it; any other goes through the API. One out in its own window
+/// lets go of its connection at once, so no frame of it outlives the shutdown.
+pub fn shut_down(s: &mut State, udid: &str, platform: &str, name: &str) {
+    if s.popouts.is_open(udid) {
+        s.popouts.hub.borrow_mut().stop(udid);
+        s.resources.queued.push(Job::Shutdown { device: udid.to_owned(), platform: platform.to_owned(), name: name.to_owned() });
+    } else if s.selected.as_deref() == Some(udid) && s.showing_screen() {
+        s.actions.push(Action::Shutdown);
+    } else {
+        s.resources.queued.push(Job::Shutdown { device: udid.to_owned(), platform: platform.to_owned(), name: name.to_owned() });
+    }
 }
 
 fn section(title: &str, t: Theme) -> El {
