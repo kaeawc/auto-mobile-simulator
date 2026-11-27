@@ -40,6 +40,9 @@ fn celsius(milli: i64) -> f64 {
     milli as f64 / 1000.0
 }
 
+/// Trip temperatures outside this range (degrees) are unset or bogus and ignored.
+const PLAUSIBLE_TRIP_C: std::ops::RangeInclusive<f64> = 1.0..=150.0;
+
 /// A trip within this many degrees of `critical`/`hot` is `critical`.
 pub const CRITICAL_MARGIN_C: f64 = 2.0;
 /// Within this many degrees of a `passive` trip, the kernel is about to (or does) throttle: `serious`.
@@ -96,7 +99,12 @@ pub fn thermal(root: &Path) -> Thermal {
         let name = read(&dir.join("type")).or_else(|| dir.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default();
         let mut trips = Vec::new();
         for n in 0..32 {
-            let Some(at) = read_num(&dir.join(format!("trip_point_{n}_temp"))).map(celsius) else { break };
+            // An unreadable trip is skipped, not the end of the list: zones can have gaps.
+            let Some(at) = read_num(&dir.join(format!("trip_point_{n}_temp"))).map(celsius) else { continue };
+            // Unset trips read 0 (x86_pkg_temp's passive) or -274000 (iwlwifi): not thresholds.
+            if !PLAUSIBLE_TRIP_C.contains(&at) {
+                continue;
+            }
             let kind = read(&dir.join(format!("trip_point_{n}_type"))).unwrap_or_default();
             if matches!(kind.as_str(), "passive" | "hot" | "critical") {
                 trips.push(Trip { kind, temp_c: at, margin_c: at - temp_c });
@@ -332,6 +340,27 @@ mod tests {
             zone(&r, 0, "x86_pkg_temp", milli, &[("passive", 95_000), ("critical", 105_000)]);
             assert_eq!(thermal(&r).state, Some(want), "{milli}");
         }
+        let _ = fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn unset_trips_are_ignored_and_a_gap_does_not_end_the_list() {
+        let r = root("unset");
+        // x86_pkg_temp reports an unset passive trip as 0; iwlwifi's is -274000 (absolute zero).
+        zone(&r, 0, "x86_pkg_temp", 50_000, &[("passive", 0), ("critical", 105_000)]);
+        zone(&r, 1, "iwlwifi_1", 45_000, &[("passive", -274_000)]);
+        // Trip 0 is unreadable; trip 1 is real.
+        put(&r, "class/thermal/thermal_zone2/type", "acpitz\n");
+        put(&r, "class/thermal/thermal_zone2/temp", "92000\n");
+        put(&r, "class/thermal/thermal_zone2/trip_point_1_type", "passive\n");
+        put(&r, "class/thermal/thermal_zone2/trip_point_1_temp", "95000\n");
+        let t = thermal(&r);
+        assert_eq!(t.zones[0].trips.len(), 1, "the 0 C passive trip is unset");
+        assert!(t.zones[1].trips.is_empty(), "-274 C is not a trip");
+        assert_eq!(t.zones[2].trips.len(), 1, "a gap in the numbering is skipped, not the end");
+        assert_eq!(t.state, Some(ThermalState::Serious), "92 C is 3 C from acpitz's real passive trip");
+        let _ = fs::remove_dir_all(r.join("class/thermal/thermal_zone2"));
+        assert_eq!(thermal(&r).state, Some(ThermalState::Nominal), "unset trips alone never raise the state");
         let _ = fs::remove_dir_all(&r);
     }
 

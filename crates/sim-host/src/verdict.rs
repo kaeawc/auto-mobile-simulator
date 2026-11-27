@@ -99,6 +99,12 @@ pub struct Decision {
     pub load_limit: f64,
 }
 
+/// Who reports the level: Linux (a byte count is known) derives it from PSI stalls, macOS is the
+/// kernel's own memorystatus verdict.
+fn pressure_source(m: &MemReading) -> &'static str {
+    if m.available_bytes.is_some() { "PSI stalls report" } else { "the kernel reports" }
+}
+
 const GIB: f64 = (1u64 << 30) as f64;
 
 /// Backoff first, then hold, then admit; a reading exactly at a threshold passes it. A missing
@@ -115,8 +121,8 @@ pub fn decide(r: &Reading, t: &Thresholds) -> Decision {
     if let Some(a) = avail_gb.filter(|a| *a < t.backoff_free_gb) {
         back.push(format!("memory: available memory {a:.1} GiB is below the backoff threshold {:.1} GiB", t.backoff_free_gb));
     }
-    if r.mem.is_some_and(|m| m.level == Level::Critical) {
-        back.push("memory: the kernel reports critical memory pressure".to_owned());
+    if let Some(m) = r.mem.filter(|m| m.level == Level::Critical) {
+        back.push(format!("memory: {} critical memory pressure", pressure_source(&m)));
     }
     if r.thermal == Some(ThermalState::Critical) {
         back.push("thermal: the host is at a critical thermal state and throttling hard".to_owned());
@@ -138,7 +144,7 @@ pub fn decide(r: &Reading, t: &Thresholds) -> Decision {
         (Some(_), Some(a)) if a < t.min_free_gb && a >= t.backoff_free_gb => {
             hold.push(format!("memory: available memory {a:.1} GiB is below the minimum {:.1} GiB", t.min_free_gb))
         }
-        (Some(m), _) if m.level == Level::Warning => hold.push("memory: the kernel reports memory pressure (warning)".to_owned()),
+        (Some(m), _) if m.level == Level::Warning => hold.push(format!("memory: {} memory pressure (warning)", pressure_source(&m))),
         _ => {}
     }
     if r.thermal == Some(ThermalState::Serious) {
@@ -169,23 +175,21 @@ pub fn decide(r: &Reading, t: &Thresholds) -> Decision {
     Decision { verdict, reason: reasons[0].clone(), reasons, load_limit: limit }
 }
 
-// Linux pressure (spectra internal/memstate/linux.go).
-const LINUX_AVAIL_WARN_PCT: f64 = 15.0;
-const LINUX_AVAIL_CRIT_PCT: f64 = 5.0;
+// Linux pressure: PSI stalls (spectra internal/memstate/linux.go's PSI rules).
 const PSI_SOME_WARN_PCT: f64 = 10.0;
 const PSI_FULL_WARN_PCT: f64 = 1.0;
 const PSI_FULL_CRIT_PCT: f64 = 10.0;
 
-/// Linux has no kernel pressure level like macOS's memorystatus, so this combines how much memory
-/// is available with how long tasks stalled waiting for it (PSI), in spectra's order.
+/// Linux has no kernel pressure level like macOS's memorystatus, so the level comes from how long
+/// tasks stalled waiting for memory (PSI). `MemAvailable` is reported (`avail_pct`) but never
+/// drives the level: a low percentage on a big host with no stalls is not pressure (spectra's
+/// verdict does not hold on it either). Absolute free GiB is judged separately, by the verdict's
+/// `min_free_gb`/`backoff_free_gb` (spectra's defaults, kept). Without PSI the level is normal.
 pub fn linux_pressure(avail_pct: f64, mem: Option<&PsiResource>) -> (Level, String) {
     let full10 = mem.and_then(|m| m.full).map(|f| f.avg10);
     let some10 = mem.map(|m| m.some.avg10);
     if let Some(f) = full10.filter(|f| *f >= PSI_FULL_CRIT_PCT) {
         return (Level::Critical, format!("all tasks stalled on memory {f:.1}% of the last 10s"));
-    }
-    if avail_pct < LINUX_AVAIL_CRIT_PCT {
-        return (Level::Critical, format!("{avail_pct:.1}% of memory available"));
     }
     if let Some(f) = full10.filter(|f| *f >= PSI_FULL_WARN_PCT) {
         return (Level::Warning, format!("all tasks stalled on memory {f:.1}% of the last 10s"));
@@ -193,10 +197,7 @@ pub fn linux_pressure(avail_pct: f64, mem: Option<&PsiResource>) -> (Level, Stri
     if let Some(s) = some10.filter(|s| *s >= PSI_SOME_WARN_PCT) {
         return (Level::Warning, format!("some tasks stalled on memory {s:.1}% of the last 10s"));
     }
-    if avail_pct < LINUX_AVAIL_WARN_PCT {
-        return (Level::Warning, format!("{avail_pct:.1}% of memory available"));
-    }
-    (Level::Normal, format!("{avail_pct:.1}% of memory available"))
+    (Level::Normal, format!("{avail_pct:.1}% of memory available, no stalls"))
 }
 
 /// A conclusion drawn from PSI (spectra `internal/pressure/assess.go`).
@@ -293,14 +294,15 @@ mod tests {
             (Some(1.0), 4, mem(None, Level::Normal), Verdict::Admit, "memory pressure is normal"),
             (Some(1.0), 4, mem(Some(3), Level::Normal), Verdict::Backoff, "below the backoff threshold 4.0 GiB"),
             (Some(99.0), 4, mem(Some(3), Level::Normal), Verdict::Backoff, "backoff"), // backoff outranks hold
-            (Some(1.0), 4, mem(None, Level::Critical), Verdict::Backoff, "critical memory pressure"),
-            (Some(1.0), 4, mem(Some(16), Level::Critical), Verdict::Backoff, "critical memory pressure"),
+            (Some(1.0), 4, mem(None, Level::Critical), Verdict::Backoff, "the kernel reports critical memory pressure"),
+            (Some(1.0), 4, mem(Some(16), Level::Critical), Verdict::Backoff, "PSI stalls report critical memory pressure"),
             (Some(6.0), 4, mem(Some(16), Level::Normal), Verdict::Hold, "at or above the limit 6.00 (1.5 x 4 CPUs)"),
             (Some(5.99), 4, mem(Some(16), Level::Normal), Verdict::Admit, "below the limit"),
             (Some(1.0), 4, mem(Some(6), Level::Normal), Verdict::Hold, "below the minimum 8.0 GiB"),
             (Some(1.0), 4, mem(Some(8), Level::Normal), Verdict::Admit, "at least 8.0 GiB"), // exactly at a threshold passes
             (Some(1.0), 4, mem(Some(4), Level::Normal), Verdict::Hold, "below the minimum"), // 4 GiB is not below backoff
-            (Some(1.0), 4, mem(None, Level::Warning), Verdict::Hold, "memory pressure (warning)"),
+            (Some(1.0), 4, mem(None, Level::Warning), Verdict::Hold, "the kernel reports memory pressure (warning)"),
+            (Some(1.0), 4, mem(Some(16), Level::Warning), Verdict::Hold, "PSI stalls report memory pressure (warning)"),
             (Some(1.0), 4, None, Verdict::Hold, "memory could not be read"),
             (None, 4, mem(Some(16), Level::Normal), Verdict::Hold, "load could not be read"),
             (Some(0.0), 0, mem(Some(16), Level::Normal), Verdict::Admit, "limit 1.50"), // zero CPUs count as one
@@ -375,20 +377,21 @@ mod tests {
     }
 
     #[test]
-    fn linux_pressure_rules_in_spectras_order() {
+    fn linux_pressure_is_driven_by_psi_stalls() {
         let lvl = |avail, m: Option<PsiResource>| linux_pressure(avail, m.as_ref()).0;
         assert_eq!(lvl(50.0, None), Level::Normal);
         assert_eq!(lvl(50.0, Some(psi(0.0, Some(0.0)))), Level::Normal);
-        assert_eq!(lvl(14.9, None), Level::Warning);
-        assert_eq!(lvl(15.0, None), Level::Normal);
-        assert_eq!(lvl(4.9, None), Level::Critical);
+        // MemAvailable alone never drives the level, however low.
+        assert_eq!(lvl(14.9, None), Level::Normal);
+        assert_eq!(lvl(4.9, None), Level::Normal);
+        assert_eq!(lvl(1.0, Some(psi(0.0, Some(0.0)))), Level::Normal);
         assert_eq!(lvl(50.0, Some(psi(10.0, None))), Level::Warning);
         assert_eq!(lvl(50.0, Some(psi(9.9, Some(0.99)))), Level::Normal);
         assert_eq!(lvl(50.0, Some(psi(0.0, Some(1.0)))), Level::Warning);
         assert_eq!(lvl(50.0, Some(psi(0.0, Some(10.0)))), Level::Critical);
         // The PSI full stall outranks plenty of memory; low memory outranks a mild stall.
         assert_eq!(lvl(90.0, Some(psi(0.0, Some(12.0)))), Level::Critical);
-        assert_eq!(lvl(4.0, Some(psi(0.0, Some(1.5)))), Level::Critical);
+        assert_eq!(lvl(4.0, Some(psi(0.0, Some(1.5)))), Level::Warning);
     }
 
     #[test]

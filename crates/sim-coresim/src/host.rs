@@ -31,17 +31,21 @@ pub fn sysctl(name: &str) -> Option<Vec<u8>> {
 /// `NSProcessInfo.processInfo.thermalState`: 0 nominal, 1 fair, 2 serious, 3 critical. `None`
 /// when the class or selector is missing (never a crash).
 pub fn thermal_state() -> Option<i64> {
-    let info = process_info()?;
-    // SAFETY: `info` is a live NSProcessInfo (a process-lifetime singleton); `thermalState` takes
-    // no arguments and returns an NSInteger.
-    Some(unsafe { msg_send![info, thermalState] })
+    objc2::rc::autoreleasepool(|_| {
+        let info = process_info()?;
+        // SAFETY: `info` is a live NSProcessInfo (a process-lifetime singleton); `thermalState`
+        // takes no arguments and returns an NSInteger.
+        Some(unsafe { msg_send![info, thermalState] })
+    })
 }
 
 /// `NSProcessInfo.processInfo.isLowPowerModeEnabled` (macOS 12+), `None` when unavailable.
 pub fn low_power_mode() -> Option<bool> {
-    let info = process_info()?;
-    // SAFETY: as `thermal_state`; `isLowPowerModeEnabled` returns a BOOL.
-    Some(unsafe { msg_send![info, isLowPowerModeEnabled] })
+    objc2::rc::autoreleasepool(|_| {
+        let info = process_info()?;
+        // SAFETY: as `thermal_state`; `isLowPowerModeEnabled` returns a BOOL.
+        Some(unsafe { msg_send![info, isLowPowerModeEnabled] })
+    })
 }
 
 fn process_info() -> Option<&'static AnyObject> {
@@ -78,6 +82,10 @@ unsafe extern "C" {
     fn CFStringGetCString(s: CfRef, buf: *mut c_char, size: isize, enc: u32) -> u8;
     fn CFNumberGetValue(n: CfRef, ty: isize, out: *mut c_void) -> u8;
     fn CFBooleanGetValue(b: CfRef) -> u8;
+    fn CFGetTypeID(cf: CfRef) -> usize;
+    fn CFStringGetTypeID() -> usize;
+    fn CFNumberGetTypeID() -> usize;
+    fn CFBooleanGetTypeID() -> usize;
 }
 
 #[link(name = "IOKit", kind = "framework")]
@@ -93,7 +101,8 @@ const NUMBER_SINT64: isize = 4;
 
 /// A CFString as a Rust string.
 fn cf_string(s: CfRef) -> Option<String> {
-    if s.is_null() {
+    // SAFETY: `s` is non-null when `CFGetTypeID` is called; the type check guards the cast.
+    if s.is_null() || unsafe { CFGetTypeID(s) != CFStringGetTypeID() } {
         return None;
     }
     let mut buf = [0 as c_char; 128];
@@ -120,7 +129,8 @@ fn dict_get(dict: CfRef, key: &CStr) -> CfRef {
 
 fn dict_int(dict: CfRef, key: &CStr) -> Option<i64> {
     let n = dict_get(dict, key);
-    if n.is_null() {
+    // SAFETY: `n` is non-null when `CFGetTypeID` is called; the type check guards the cast.
+    if n.is_null() || unsafe { CFGetTypeID(n) != CFNumberGetTypeID() } {
         return None;
     }
     let mut out: i64 = 0;
@@ -131,8 +141,12 @@ fn dict_int(dict: CfRef, key: &CStr) -> Option<i64> {
 
 fn dict_bool(dict: CfRef, key: &CStr) -> Option<bool> {
     let b = dict_get(dict, key);
-    // SAFETY: `b` is a CFBoolean (the power source keys used here are booleans).
-    if b.is_null() { None } else { Some(unsafe { CFBooleanGetValue(b) } != 0) }
+    // SAFETY: `b` is non-null when `CFGetTypeID` is called; the type check guards the cast.
+    if b.is_null() || unsafe { CFGetTypeID(b) != CFBooleanGetTypeID() } {
+        return None;
+    }
+    // SAFETY: `b` is a CFBoolean, checked above.
+    Some(unsafe { CFBooleanGetValue(b) } != 0)
 }
 
 /// Power sources from IOKit; the default (no battery, nothing known) when IOKit gives nothing.
