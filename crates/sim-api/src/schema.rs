@@ -55,6 +55,10 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         // boot, boot_many, create and clone's admission, and admission_check (#275)
         "admission" => Str,
         "admission_timeout_s" | "count" => Int,
+        // stream_* (#266)
+        "whip_url" | "token" | "stream_id" => Str,
+        "fps" | "max_size" | "bitrate" => Int,
+        "input" => Bool,
         "device" | "platform" | "form_factor" | "name" | "device_type" | "runtime" | "system_image" | "path" | "url" | "bundle_id"
         | "text" | "base64" | "domain" | "key" | "language" | "uid" | "capture_id" | "program" | "command" | "predicate" | "last"
         | "preset" | "direction" | "gesture" | "button" | "phase" | "action" | "service" | "scope" | "display" | "orientation"
@@ -491,6 +495,7 @@ mod tests {
                 p
             })),
             (_, "contrast_check") => text(crate::contrast::sweep_options(p)),
+            (_, "stream_start") => text(crate::stream::settings(p)),
             #[cfg(target_os = "macos")]
             (Platform::Ios, "boot") => text(crate::ios::boot_plan_text(p, false)),
             #[cfg(target_os = "macos")]

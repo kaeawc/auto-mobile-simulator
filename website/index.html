@@ -51,6 +51,12 @@
         :root:not([data-theme="light"]) [data-rune-static] :is(img, svg[viewBox="0 0 440 300"], #brand svg) { filter: invert(1) hue-rotate(180deg); }
       }
       body { margin: 0; }
+      /* Rune's export sets every element flex and only a text's own children back to inline, so a
+         link's text inside a paragraph (an <a> holding styled spans) stood on a line of its own. */
+      [data-rune-static] .t a span { display: inline; position: static; }
+      /* A path or key in code longer than a phone's line breaks, as Rune breaks it, instead of
+         widening the page. */
+      [data-rune-static] .t { overflow-wrap: break-word; }
       :focus-visible { outline: 2px solid var(--rune-focus); outline-offset: 2px; border-radius: 4px; }
       ::selection { background: var(--rune-selection); }
     </style>

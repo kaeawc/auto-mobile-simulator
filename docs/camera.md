@@ -4,9 +4,13 @@
 cameras and the synthetic sources, one source id scheme for all of them, and a capture hub that
 feeds any number of consumers from one capture per source. `emu`'s Android camera HAL service
 ([below](#android-the-goldfish-camera-hal)) links it, and the API, CLI and MCP tools
-([below](#linking-a-device-camera-api-cli-mcp), #323) link a device camera to a source; the iOS
-capture shim (#322) builds on it next. The plan is epic #319; the iOS background is
-[research/audio-camera.md](research/audio-camera.md) §3.
+([below](#linking-a-device-camera-api-cli-mcp), #323) link a device camera to a source, on
+Android and on iOS through the simulator capture shim (#322). The plan is epic #319; the iOS
+background is [research/audio-camera.md](research/audio-camera.md) §3.
+
+The iOS feed (`ios_feed`, #322) serves a linked source to the simulator shim over
+`<data>/cam.sock`: BGRA frames with size, frame number and link generation, paced by the source;
+`Feed::set_source` relinks live. See [ios.md "Camera"](ios.md#camera).
 
 ## What exists
 
@@ -136,7 +140,66 @@ the MCP server's `camera` toolset (docs/mcp.md):
   before a webcam is linked), an ambiguous or unknown name (with the matches, or what exists and
   the synthetic sources), a device the stock emulator runs (boot it with `simee boot`), and an emu
   built before its camera console (#321: rebuild it and reboot).
-- **iOS:** the methods answer that iOS camera links come with the iOS camera feed (#322).
+- **iOS** ([below](#ios-simulators)): the same methods and flags, served by the simee server.
+
+### iOS simulators
+
+A simulator has no camera of its own: simee injects its capture shim (`shims/ios-camera`, see
+[ios.md "Camera"](ios.md#camera)) into the device's apps and feeds it from the linked source.
+
+- **One feed per device.** The shim's back and front cameras read one socket, so a link sets
+  both cameras (`--back` or `--front` alone links both, and `note` says so); `--camera-back` and
+  `--camera-front` on `boot` must give the same source. Unlinking one camera unlinks both.
+- **The server owns the feed.** A booted simulator's feed (`ios_feed::Feed` on `<data>/cam.sock`)
+  runs inside the simee server (`simee serve`) for as long as it runs, one per device, and a
+  relink moves every connected app to the new source without a reconnect. A command that runs in
+  its own process (`simee camera link` with no server running, or an MCP server) hands the call to
+  a running server of the same build, or fails naming `simee serve` and saves nothing. Linking a
+  shut-down simulator only saves the link, so it needs no server.
+- **Injection** is device-wide: `launchctl setenv DYLD_INSERT_LIBRARIES <shim> SIMEE_CAMERA_SOCKET
+  <socket>` in the device's launchd, joined with `:` to a library already inserted (the network
+  shaper's), and taken out again on unlink. Apps started afterwards get the camera; apps that were
+  already running need a relaunch (`simee terminate`, then `simee launch`), and the first link's
+  `note` says so. An app still needs its camera permission: `simee privacy <udid> grant camera
+  <bundle id>`.
+- **The shim** is found at `$SIMEE_CAMERA_SHIM`, else in `ios-camera/` beside the simee
+  executable or one directory up (`target/ios-camera/`, where `shims/ios-camera/build.sh` writes
+  it for `target/{debug,release}/simee`), with `libsimee-camera-hooks.dylib` beside it. A link
+  fails naming the build command when it is missing, and refuses a path with a `:` or a line
+  break (dyld would split it). The link copies the shim and its hooks to
+  `<data>/simee/camera-<hash>/` in the device's data directory and inserts that copy, so a
+  rebuild, `cargo clean` or a removed worktree can't leave the device inserting a missing
+  library; an erase removes the copy with the link. Before the `setenv`, a `launchctl` runs with
+  the shim inserted, and a dyld failure refuses the link with nothing injected. A `launchctl` that
+  prints anything on stderr is an error (never "unset"), and an unlink succeeds only once the
+  device's environment no longer holds the shim. A link and an unlink of one device run one at a
+  time.
+- **The injection outlives the server.** `DYLD_INSERT_LIBRARIES` lives in the device's launchd
+  for the rest of that boot. When `simee serve` exits, or the device is shut down outside simee
+  (`simctl`, Simulator.app, an in-process shutdown), nothing takes it out: every app launched
+  afterwards gets the hooks and a simulated camera with no frames. Clear it with `simee camera
+  unlink <udid>` (needs the device booted) or by rebooting the device. A device shut down
+  outside simee also keeps its feed thread in the server until the device is linked again.
+- **Saved** like Android's, in the simulator's data directory (`<data>/simee/cameras.ini`; an
+  erase removes it). A boot through simee (`simee boot`, the `boot` method) reapplies the saved
+  link: on a server it starts the feed and injects the shim; elsewhere it hands the link to a
+  running server. A shutdown, erase or delete through simee stops the feed.
+- **States:** `linked` (served as saved), `relinked` (the feed serves something else; `live` says
+  what), `shim missing` (a feed serves it, but `network_shape` or `network_clear` replaced the
+  device's `DYLD_INSERT_LIBRARIES`: link again), `saved` (shut down; or booted with no feed in this server, after a boot outside simee or a
+  server restart, with a `fix`: link again), `off` (`none`), and a webcam's `source missing` (its
+  apps get no frames until the camera is back) or `permission missing`. A webcam source is
+  captured by the server, so it is the server's camera permission (the table below).
+
+```bash
+simee serve &                                   # owns the feeds
+shims/ios-camera/build.sh                       # once: target/ios-camera/libsimee-camera.dylib
+simee privacy <udid> grant camera <bundle id>
+simee camera link <udid> qr:hello               # both cameras; relaunch running apps
+simee camera link <udid> pattern:testcard       # live: no relaunch
+simee boot <udid> --camera-back solid:orange    # saved, then applied at the boot
+simee camera unlink <udid>
+```
 
 ```bash
 simee camera sources
@@ -279,7 +342,11 @@ Tracked in #335:
 
 Camera links (#323):
 
-- iOS devices: the methods refuse them until the iOS camera feed (#322).
+- iOS: `help` and docs/api.md still list `camera_link`, `camera_unlink` and `camera_links` as
+  Android methods (the method table changes after #266). A server doesn't serve the feeds of
+  simulators booted before it started (or booted outside simee) until they are linked again;
+  `boot_many` doesn't reapply saved links; separate back and front sources need a shim with one
+  socket per camera. Not yet run on a device: the checks are in docs/ios.md "Camera".
 - `fps` and `size` on `camera_link`: an Android guest picks its camera's size itself (from the
   sizes `list` offers) and its rate, so they are not taken yet.
 - The source list as an MCP resource: the `camera_sources` tool only.

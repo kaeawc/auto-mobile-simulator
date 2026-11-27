@@ -123,12 +123,13 @@ crate:
 - Annotations follow what the method does, from one table in `crates/sim-api/src/catalog.rs` that
   classifies every method (a test fails for one that isn't listed). Read-only means it changes
   nothing on the device or the host: listings, reads, `screenshot`. Settings are idempotent;
-  `exec`, `launch`, `push`, `network_shape`, `console`, `kill`, `export` and `audio_capture_start`
-  are marked destructive (they run code, reboot or restart things, or write a file), and so are
+  `exec`, `launch`, `push`, `network_shape`, `console`, `kill`, `export`, `audio_capture_start` and
+  `stream_start` are marked destructive (they run code, reboot or restart things, write a file, or
+  send the screen elsewhere), and so are
   `delete`, `erase`, `shutdown`, `rm`, `uninstall`, `terminate`, `clear_container`,
   `reset_keychain`, `write`, `defaults_write`, `prefs_write`, `prefs_delete`, `prefs_batch` and
-  the other overwrites. `openWorldHint` is true for `open_url` alone (the device may fetch the URL
-  from anywhere). A method nobody has classified gets the specification's defaults (writes, may
+  the other overwrites. `openWorldHint` is true for `open_url` (the device may fetch the URL
+  from anywhere) and `stream_start` (it publishes to a WHIP server you name). A method nobody has classified gets the specification's defaults (writes, may
   destroy), not a claim of safety.
 - `processes`, `logs`, `connections` and `devices_usage` (its `devices`) page: with `limit` (1 to
   1000) the result is a page, `{items, next_cursor, total}` (`devices_usage` keeps its shape, with
@@ -167,6 +168,7 @@ in `SIMEE_MCP_TOOLSETS` (commas between names; `all` for every tool). Unset, it 
 | `prefs` | `prefs_stores`, `prefs_read`, `prefs_write`, `prefs_delete`, `prefs_batch`, `prefs_watch` |
 | `network` | `network_shape`, `network_state`, `network_flows`, `network_clear`, `network_env` |
 | `audio` | `audio_state`, `audio_volume`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `audio_mute` |
+| `stream` | `stream_start`, `stream_status`, `stream_stop`, `streams` |
 | `camera` | `camera_sources`, `camera_link`, `camera_unlink`, `camera_links` |
 | `host` | `help`, `identity`, `host`, `devices_usage` |
 | `all` | Every tool |
@@ -193,8 +195,9 @@ reverse):
 | --- | --- |
 | `help`, `identity`, `host`, `devices_usage`, `form_factors`, `devices`, `runtimes`, `create`, `delete`, `boot`, `boot_many`, `admission_check`, `clone`, `shutdown`, `screen`, `screenshot`, `contrast_check`, `tap`, `swipe`, `touch`, `button`, `type`, `key`, `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `location`, `info`, `rotate`, `rotary`, `stylus`, `device_view` | Android, iOS |
 | `console`, `fold`, `xr`, `vehicle`, `touchpad`, `export`, `import` | Android (iOS bundles: the next step of #170) |
+| `stream_start`, `stream_status`, `stream_stop`, `streams` | Android, iOS (macOS hosts only for now: no Linux encoder, #263) |
 | `camera_sources` | Android, iOS (the host's cameras and the synthetic sources; needs no device) |
-| `camera_link`, `camera_unlink`, `camera_links` | Android (iOS devices: with the iOS camera feed, #322) |
+| `camera_link`, `camera_unlink`, `camera_links` | Android, iOS (iOS: device-wide shim injection, needs `simee serve`; see [camera.md](camera.md)) |
 | `prefs_stores`, `prefs_read`, `prefs_write`, `prefs_delete`, `prefs_batch`, `prefs_watch` | Android, iOS (iOS is implemented; Android answers "not yet available") |
 | `device_types`, `settle`, `profile`, `erase`, `appearance`, `privacy`, `push`, `status_bar`, `clear_status_bar`, `content_size`, `increase_contrast`, `dynamic_island`, `backlight`, `keyboard_language`, `hardware_keyboard`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `memory_warning`, `notify`, `biometric`, `exec`, `logs`, `processes`, `kill`, `connections`, `traffic`, `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container`, `defaults_read`, `defaults_write`, `crash_reports`, `network_shape`, `network_state`, `network_flows`, `network_clear`, `network_env`, `audio_state`, `audio_volume`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `audio_mute`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
 | `mem_leaks`, `mem_heap`, `mem_vmmap`, `mem_history` | iOS (the host's memory tools on one app; Android answers that they aren't available there) |

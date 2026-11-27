@@ -8,7 +8,7 @@ use crate::content::{self, REPO};
 use crate::gem;
 use crate::theme::Theme;
 use crate::tokens::*;
-use crate::{Route, State};
+use crate::{Pictures, Route, State};
 
 /// `s` with each `` `code` `` in mono.
 pub fn prose(key: &str, s: &str, style: TextStyle, color: rune::Color) -> El {
@@ -24,9 +24,15 @@ pub fn prose(key: &str, s: &str, style: TextStyle, color: rune::Color) -> El {
     rich(content, spans).key(key).font(style).color(color).wrap().selectable(true)
 }
 
-/// A link in running text or a list: the gem's green, underlined under the pointer.
+/// A link in running text or a list: the gem's green, underlined under the pointer. A label
+/// longer than its line wraps (a contents entry on a phone).
 pub fn link_text(key: &str, label: &str, href: &str, style: TextStyle) -> El {
-    row().key(key).href(href).hover_group().child(text(label.to_owned()).font(style).color(link()).group_color(fg()))
+    row()
+        .key(key)
+        .href(href)
+        .hover_group()
+        .shrink()
+        .child(text(label.to_owned()).font(style).color(link()).group_color(fg()).wrap().shrink())
 }
 
 /// The running head: the mark and name, then the pages and the theme toggle, over a rule.
@@ -47,6 +53,8 @@ pub fn topbar(route: &Route, theme: Theme, angle: f32) -> El {
         .gap(16.0)
         .flex_wrap()
         .center_y()
+        // Narrower than its items (a phone), it wraps them instead of widening the page.
+        .shrink()
         .child(item("nav-benchmarks", "Benchmarks", "/benchmarks/", here(|r| matches!(r, Route::Benchmarks))))
         .child(item("nav-debugging", "Debugging", "/debugging/", here(|r| matches!(r, Route::Debugging))))
         .child(item("nav-devices", "Devices", "/devices/", here(|r| matches!(r, Route::Devices))))
@@ -168,13 +176,28 @@ pub fn markdown_style() -> MarkdownStyle {
         .table_full_width(true)
 }
 
-/// `md` as the site draws Markdown: headings keyed by their GitHub anchors, links that open in
-/// this tab when they are the site's own and in a new one otherwise.
-pub fn markdown(key: &str, md: &str) -> El {
+/// What the site's Markdown needs from the view ([`crate::md_cx`]).
+#[derive(Clone)]
+pub struct MdCx {
+    /// The images it can draw.
+    pub pictures: Pictures,
+    /// The width of the column it lays out in.
+    pub column: f32,
+}
+
+/// `md` as the site draws Markdown: headings keyed by their anchors, images drawn from the
+/// site's `/img/`, tables sized in the column as a browser sizes them and scrolling sideways
+/// where even their narrowest is wider (a phone), code wrapping, and links that open in this
+/// tab when they are the site's own and in a new one otherwise.
+pub fn markdown(key: &str, md: &str, mc: &MdCx) -> El {
+    let pictures = mc.pictures.clone();
     Markdown::new(md)
         .block_keys(content::block_keys(md))
+        .images(move |src| pictures.src(src))
+        .scroll_wide(true)
+        .wrap_code(true)
         .on_link_tx(|_: &mut State, url: &str, tx: &mut Tx| follow(url, tx))
-        .render(&markdown_style())
+        .render(&markdown_style().text_width(mc.column))
         .key(key.to_owned())
         .w_full()
 }

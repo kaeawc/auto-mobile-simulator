@@ -80,7 +80,7 @@ simee shutdown Pixel
 Camera links are saved with the device and passed to emu on every boot, so they survive a reboot
 and a server restart. A source is a source id (`qr:TEXT`, `text:TEXT`, `image:PATH`,
 `solid:COLOUR`, `pattern:testcard`, `webcam:ID`, `none`) or part of a host camera's name; a name
-that matches several cameras fails and lists them. iOS devices get camera links with #322. See
+that matches several cameras fails and lists them. iOS devices get camera links too, through a running `simee serve` (see [camera.md](camera.md)). See
 [docs/camera.md](camera.md).
 
 The form factor comes from the image (Wear OS, TV and Automotive images) or `--form-factor`
