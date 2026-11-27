@@ -807,7 +807,7 @@ impl Device {
                 eprintln!("{warning}");
             }
             for (facing, source) in saved_cameras(&avd.dir) {
-                cmd.arg(format!("-camera-{facing}")).arg(source);
+                cmd.arg(format!("-camera-{facing}")).arg(camera_arg(&avd.dir, &facing, &source));
             }
         }
         cmd
@@ -1297,8 +1297,70 @@ pub fn saved_cameras_warnings(avd_dir: &Path) -> Vec<String> {
     read_cameras(avd_dir).1
 }
 
+/// What a boot passes emu for a saved link: the link itself, except another device's screen
+/// (`device:`), which emu never captures: the simee server does, and serves it to this camera on
+/// [`camera_feed_socket`], which emu reads as `feed:<socket>` (the test card stands in until the
+/// server serves it).
+fn camera_arg(avd_dir: &Path, facing: &str, source: &str) -> String {
+    match source.split_once(':') {
+        Some((kind, _)) if kind.eq_ignore_ascii_case("device") => format!("feed:{}", camera_feed_socket(avd_dir, facing).display()),
+        _ => source.to_owned(),
+    }
+}
+
+/// The longest path a Unix socket takes (`sun_path` is 104 bytes on macOS, NUL included).
+const MAX_SOCKET_PATH: usize = 103;
+
+/// The socket the simee server serves camera `facing` of the AVD in `avd_dir` on when it is linked
+/// to another device's screen: `cam-<facing>.sock` in the AVD's state directory, or, when that is
+/// too long for a Unix socket, `<hash of the state directory>-cam-<facing>.sock` in
+/// `/tmp/simee-<uid>` (named by the user id, never `$USER` or `$TMPDIR`, so a boot run with another
+/// environment than the server's agrees with it; short enough for any AVD home). The same path as
+/// `sim_camera::feed::socket_path_in` gives (which also makes that directory private): the server
+/// serves it, the boot hands it to emu.
+pub fn camera_feed_socket(avd_dir: &Path, facing: &str) -> PathBuf {
+    let dir = emu_avd::state_dir(avd_dir);
+    let name = format!("cam-{facing}.sock");
+    let path = dir.join(&name);
+    if path.as_os_str().len() <= MAX_SOCKET_PATH {
+        return path;
+    }
+    let hash = dir
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3));
+    // No user id (no writable /tmp): a directory nothing serves, so the camera shows the test card;
+    // the server can't serve there either, and its link says why.
+    let uid = own_uid().map_or_else(|| "unknown".to_owned(), |u| u.to_string());
+    Path::new("/tmp").join(format!("simee-{uid}")).join(format!("{hash:016x}-{name}"))
+}
+
+/// This process's user id, read once off a file it creates (exclusively) in `/tmp`, as
+/// `sim_camera::feed` does: no `libc` call (unsafe) and no environment variable.
+#[cfg(unix)]
+fn own_uid() -> Option<u32> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    static UID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *UID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let probe = Path::new("/tmp").join(format!(".simee-uid-{}-{nanos}", std::process::id()));
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&probe).ok()?;
+        let uid = file.metadata().map(|m| m.uid()).ok();
+        drop(file);
+        let _ = std::fs::remove_file(&probe);
+        uid
+    })
+}
+
+#[cfg(not(unix))]
+fn own_uid() -> Option<u32> {
+    None
+}
+
 /// Whether `v` is a camera source emu takes (`-camera-back`): none, a stock value, `webcamN`, or
-/// `<kind>:<rest>` of a simee source kind. emu checks the rest (a colour, a path) itself.
+/// `<kind>:<rest>` of a simee source kind (`device:` is passed as its feed, [`camera_arg`]). emu
+/// checks the rest (a colour, a path) itself.
 fn camera_source_ok(v: &str) -> bool {
     if matches!(v, "none" | "emulated" | "virtualscene") {
         return true;
@@ -1307,7 +1369,7 @@ fn camera_source_ok(v: &str) -> bool {
         return true;
     }
     v.split_once(':').is_some_and(|(kind, rest)| {
-        ["webcam", "pattern", "qr", "text", "image", "video", "solid"].contains(&kind) && !rest.trim().is_empty()
+        ["webcam", "pattern", "qr", "text", "image", "video", "solid", "device"].contains(&kind) && !rest.trim().is_empty()
     })
 }
 
@@ -1972,6 +2034,17 @@ mod tests {
         assert_eq!(a[at + 1], "qr:hello world");
         let at = a.iter().position(|x| x == "-camera-front").expect("-camera-front");
         assert_eq!(a[at + 1], "solid:orange");
+        // Another device's screen is saved as it was linked, and emu gets the feed the server
+        // serves it on.
+        save_cameras(&dir, &[("back".into(), "device:tablet:0,0,540,960".into())]).expect("save");
+        assert_eq!(saved_cameras(&dir), [("back".to_owned(), "device:tablet:0,0,540,960".to_owned())]);
+        let a = args(&d);
+        let at = a.iter().position(|x| x == "-camera-back").expect("-camera-back");
+        let feed = camera_feed_socket(&dir, "back");
+        assert_eq!(a[at + 1], format!("feed:{}", feed.display()));
+        assert_eq!(feed, emu_avd::state_dir(&dir).join("cam-back.sock"), "a short AVD path: in its state directory");
+        assert_ne!(camera_feed_socket(&dir, "front"), feed);
+        save_cameras(&dir, &[("back".into(), "qr:hello world".into()), ("front".into(), "solid:orange".into())]).expect("save");
         assert!(save_cameras(&dir, &[("side".into(), "qr:x".into())]).is_err());
         assert!(save_cameras(&dir, &[("back".into(), "qr:a\nfront=x".into())]).is_err(), "one line per link");
         assert_eq!(saved_cameras(&dir), saved, "a refused save keeps what was there");
@@ -1998,9 +2071,18 @@ mod tests {
         let at = args.iter().position(|a| a == "-camera-front").expect("-camera-front");
         assert_eq!(args[at + 1], "qr:hello");
         // Every kind of source emu takes stays valid.
-        for ok in
-            ["none", "emulated", "virtualscene", "webcam0", "webcam:OBS-1", "pattern:testcard", "text:a b", "image:/x.png", "solid:red"]
-        {
+        for ok in [
+            "none",
+            "emulated",
+            "virtualscene",
+            "webcam0",
+            "webcam:OBS-1",
+            "pattern:testcard",
+            "text:a b",
+            "image:/x.png",
+            "solid:red",
+            "device:A",
+        ] {
             std::fs::write(state.join(CAMERAS_FILE), format!("back={ok}\n")).expect("write");
             assert!(saved_cameras_warnings(&dir).is_empty(), "{ok}");
             assert_eq!(saved_cameras(&dir).len(), 1, "{ok}");

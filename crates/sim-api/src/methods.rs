@@ -847,6 +847,11 @@ fn boot_many_admitted(s: &mut Session, p: &Value, mode: Mode) -> Result<Value, S
         Ok(t) if !t.is_empty() && t.iter().all(|x| x.item.platform == t[0].item.platform) => t,
         _ => return dispatch(s, "boot_many", p),
     };
+    if targets[0].item.platform == Platform::Android {
+        // Saved `device:` links' feeds are served first, as `boot`'s are.
+        let udids: Vec<String> = targets.iter().map(|t| t.udid.clone()).collect();
+        crate::camera::before_boot_many(s, &udids);
+    }
     let new = |ts: &[Target]| -> Vec<Item> { ts.iter().filter(|t| !t.running).map(|t| t.item).collect() };
     let concurrency = crate::params::concurrency(p)?;
     let tally = std::cell::RefCell::new(Tally { done: 0, failed: 0, total: targets.len() as u64 });
@@ -1444,7 +1449,11 @@ fn boot_many_hooked(s: &mut Session, p: &Value, hook: &dyn crate::progress::Boot
         udids.push(udid);
     }
     match first.map(|(platform, _)| platform) {
-        Some(Platform::Android) => crate::android::boot_many(&mut s.android, p, &udids, hook),
+        Some(Platform::Android) => {
+            // Saved `device:` links' feeds are served first, as `boot`'s are.
+            crate::camera::before_boot_many(s, &udids);
+            crate::android::boot_many(&mut s.android, p, &udids, hook)
+        }
         _ => {
             let mut p = p.clone();
             p["devices"] = udids.into_iter().map(Value::String).collect();

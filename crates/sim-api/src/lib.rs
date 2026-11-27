@@ -19,6 +19,7 @@
 
 mod android;
 mod camera;
+mod camera_device;
 pub mod catalog;
 mod contrast;
 #[cfg(target_os = "macos")]
