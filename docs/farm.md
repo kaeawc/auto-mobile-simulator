@@ -150,10 +150,11 @@ that has done its first boot skips the data migration and indexing storm.
 ### The `slim` profile
 
 `boot --profile slim` (or `simee profile <device> slim` on a booted one) disables (in the
-device's own launchd database) and stops 62 daemons no AutoMobile tool and no simee method needs: PosterBoard and the
+device's own launchd database) and stops 74 daemons no AutoMobile tool and no simee method needs: PosterBoard and the
 ~15 poster extensions it keeps alive (~30-45 MB footprint each), widgets (chronod), Siri and
 suggestions, photo and media analysis, Health, Home, fitness, the Store, iCloud sync, Mail, News,
-Weather, Wallet, Game Center, Screen Time, watch and Find My companions, experiments and ML hosts.
+Weather, Wallet, Game Center, Screen Time, watch and Find My companions, experiments and ML hosts,
+App Intents (linkd), account sync, Focus status, Memoji and Apple Intelligence's model catalog.
 The list and what was kept on purpose is `SLIM` in `crates/sim-api/src/ios.rs`.
 
 | per device | fresh | clone | slim clone |
@@ -250,6 +251,72 @@ Kept: SpringBoard, backboardd, InputUI (keyboard), the accessibility server and 
 usernotificationsd, locationd, sharingd, webbookmarksd (Safari), assetsd, sleepd, logging, configd_sim,
 nsurlsessiond. AutoMobile's tools pass on a slim device (getApple, observe, pressButton, listApps,
 launchApp, tapOn, swipeOn, terminateApp, openLink, homeScreen, getLogs).
+
+#### What a slim clone still spent its boot on
+
+With the first 62 jobs off, a fresh slim clone still used 115 CPU-s (iOS 27.2) and 54 CPU-s (iOS
+18.6) in its first 120 s, spread over ~110 processes, none above 10 CPU-s. Measured per process
+(libproc task times, sampled once a second from the boot, each process mapped to its launchd label
+by `launchctl list` and the runtime's launchd plists), median of 3 clones of a booted-once
+template, 2026-11-27, this host at 1-minute load 5-16. The top of iOS 27.2's list (CPU-s; — : not seen running on 18.6):
+
+| job | 27.2 | 18.6 | |
+| --- | --- | --- | --- |
+| SpringBoard | 9.4 | 4.3 | kept |
+| diagnosticd | 5.6 | 6.1 | kept: the log stream (`logs`) |
+| nanotimekitcompaniond | 5.0 | 1.6 | **off**: watch faces, no watch |
+| dataaccessd | 4.7 | 0.4 | **off**: Exchange/CalDAV/CardDAV sync, no accounts |
+| AuthenticationServicesAgent | 4.5 | — | kept: password AutoFill, passkeys |
+| sharingd | 3.1 | 0.8 | kept |
+| Calendar (app) | 2.9 | 0.7 | gone with linkd (below) |
+| Spotlight (app) | 2.9 | 0.7 | SpringBoard starts it; not a launchd job |
+| mobileassetd | 2.7 | 1.4 | kept: keyboard and font assets |
+| callservicesd | 2.6 | 0.5 | kept: CallKit; SpringBoard starts it |
+| WidgetRenderer_Default (app) | 2.4 | 0.4 | SpringBoard starts it; not a launchd job |
+| MTLCompilerService | 2.4 | — | kept |
+| InputUI | 2.2 | — | kept: the keyboard |
+| MercuryPosterExtension | 2.2 | 0.3 | an extension SpringBoard hosts; not a launchd job |
+| donotdisturbd | 2.2 | 0.4 | kept: notification delivery and Focus |
+
+Most of it is start-up: on iOS 27.2 ~106 of the 115 CPU-s fall in the first 15 s. The rest was one
+burst 13-38 s after the boot (a different moment each boot): donotdisturbd's Focus-filter
+first-launch task asks linkd (App Intents) to run each app's default Focus action, which starts
+the Calendar, Safari and Messages intents extensions and Calendar itself, ~8 CPU-s, and lands
+inside or just before the 10 s settle window. With linkd off the task finds no extensions and
+nothing starts. The profile also turns off nanotimekitcompaniond, nanoprefsyncd (watch),
+dataaccessd, Safari's passwordbreachd, activitysharingd, activityawardsd and fitcore (Fitness;
+healthd was off already), StatusKitAgent (Focus status sharing: 2.8 CPU-s on 18.6, most of it
+after 20 s), avatarsd (Memoji), modelcatalogd and familynotification: 74 jobs in all. In the
+first 120 s a clone then used 86 CPU-s on iOS 27.2 (96 processes) and 40 on 18.6, with no CPU after
+15 s beyond trustd and the kept daemons' trickle (N=1 each).
+
+Kept though heavy, because app flows reach them: donotdisturbd and liveactivitiesd (notification
+delivery, Live Activities), AuthenticationServicesAgent, callservicesd, calaccessd (EventKit),
+mobileassetd, identityservicesd and diagnosticd. Spotlight, WidgetRenderer and the poster
+extension are started by SpringBoard as apps, not by launchd label, so a profile can't stop them.
+
+`boot --profile slim --settle`, fresh clones of a booted-once template, the 62-job profile against
+the 74-job one, 3 interleaved rounds each (2026-11-27, this host at 1-minute load 8-21), median
+(runs):
+
+| runtime, settle judged on | | settled | CPU-s to settle | background CPU-s | processes |
+| --- | --- | --- | --- | --- | --- |
+| iOS 27.2, foreground (default) | 62 jobs | 33.2 s (40.3, 32.2, 33.2) | 112.0 | 25.1 | 114 |
+| | 74 jobs | 20.1 s (20.1, 20.1, 22.3) | 82.3 | 8.6 | 95-96 |
+| iOS 27.2, all CPU | 62 jobs | 38.9 s (38.9, 26.2, 39.5) | 114.6 | 26.2 | 108-113 |
+| | 74 jobs | 30.2 s (20.0, 30.3, 30.2) | 82.0 | 10.3 | 93-94 |
+| iOS 18.6, foreground (default) | 62 jobs | 25.5 s (20.8, 30.6, 25.5) | 42.1 | 13.3 | 91-97 |
+| | 74 jobs | 19.7 s (29.3, 19.7, 17.5) | 36.6 | 9.4 | 79-84 |
+| iOS 18.6, all CPU | 62 jobs | 31.5 s (30.7, 31.5, 31.6) | 44.0 | 14.5 | 97-102 |
+| | 74 jobs | 19.4 s (19.4, 19.6, 18.5) | 33.2 | 8.2 | 79 |
+
+On a lean clone of both runtimes an app installed with `install` launched, took typed text from the
+keyboard, got location from `location` (37.3349, -122.0090), received a `simctl push` while in the
+foreground (banner and delegate), and picked an image added with `simctl addmedia` through
+the photos picker (PHPicker), after the notification and location prompts were allowed. The
+AutoMobile harness (`scripts/automobile-harness.sh`: getApple, observe, pressButton) passed on
+both, and a reboot of the iOS 27.2 device with `--profile slim` settled in 20 s on all CPU (no
+spinning client, unlike sleepd).
 
 ### Forwarding to `simee serve`
 
