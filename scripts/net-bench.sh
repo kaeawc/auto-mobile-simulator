@@ -15,27 +15,31 @@
 #
 # Uses target/release/emu (built and signed here) on PORT (5600). BOOT_WRAP, if set, prefixes each
 # boot (a host-wide boot gate, say); the boot returns once the guest has booted. Each instance is
-# stopped by its PID (kill -INT). Results go to stdout and bench/net-<mode>.result.
+# stopped by its PID (kill -INT). Results go to stdout and $OUT/net-<mode>.result (OUT defaults to
+# bench/); the PID file is per run ($OUT/net-bench-<run>.pid), so runs on other ports are independent.
 set -uo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 sdk=${ANDROID_HOME:-$HOME/Library/Android/sdk}
 adb="$sdk/platform-tools/adb"
 port=${PORT:-5600}; serial="emulator-$port"
 emu="$repo/target/release/emu"
-out="$repo/bench"; mkdir -p "$out"
-pidfile="$out/net-bench.pid"
+# OUT: where the log, result and pid files go (default bench/). The pidfile is named for this run
+# (NET_BENCH_RUN, exported so the _boot child shares it), so two runs never read each other's PID.
+out=${OUT:-$repo/bench}; mkdir -p "$out"
+NET_BENCH_RUN=${NET_BENCH_RUN:-$$}; export NET_BENCH_RUN
+pidfile="$out/net-bench-$NET_BENCH_RUN.pid"
 
 # Internal: start emu (arm: nat or link) and return once the guest has booted, its PID in $pidfile.
 if [ "${1:-}" = _boot ]; then
   arm=$2 avd=$3
-  net=""; [ "$arm" = link ] && net=link
+  net=""; if [ "$arm" = link ]; then net="link"; fi
   env -i HOME="$HOME" USER="$USER" TMPDIR="$TMPDIR" PATH="/usr/bin:/bin:/usr/sbin:/sbin" ANDROID_HOME="$sdk" \
     ANDROID_SDK_ROOT="$sdk" EMU_NET="$net" \
-    "$emu" -avd "$avd" -port "$port" -no-window -no-audio -no-boot-anim -no-snapshot-save > "$out/net-bench-$arm.log" 2>&1 &
+    "$emu" -avd "$avd" -port "$port" -no-window -no-audio -no-boot-anim -no-snapshot-save > "$out/net-bench-$NET_BENCH_RUN-$arm.log" 2>&1 &
   echo $! > "$pidfile"
   deadline=$(( SECONDS + ${BOOT_TIMEOUT:-600} ))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    kill -0 "$(cat "$pidfile")" 2>/dev/null || { echo "emu exited; see $out/net-bench-$arm.log" >&2; exit 1; }
+    kill -0 "$(cat "$pidfile")" 2>/dev/null || { echo "emu exited; see $out/net-bench-$NET_BENCH_RUN-$arm.log" >&2; exit 1; }
     [ "$("$adb" -s "$serial" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && exit 0
     sleep 1
   done
@@ -58,7 +62,7 @@ stop() {
   for _ in $(seq 60); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
   pid=""
 }
-trap stop EXIT
+trap 'stop; rm -f "$pidfile"' EXIT
 boot() {
   # BOOT_WRAP is a command prefix: split on purpose.
   # shellcheck disable=SC2086

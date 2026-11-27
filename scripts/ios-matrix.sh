@@ -12,12 +12,15 @@ sim=${2:-target/debug/simee}
 tmp=$(mktemp -d)
 sock="$tmp/s.sock"
 server=
-cleanup() { [ -n "$server" ] && kill "$server" 2>/dev/null; rm -rf "$tmp"; }
+cleanup() {
+  [ -n "$server" ] && kill "$server" 2>/dev/null
+  rm -rf "$tmp"
+}
 trap cleanup EXIT
 
 app="$tmp/Tiny.app"
 mkdir -p "$app"
-cat > "$tmp/main.swift" <<'EOF'
+cat >"$tmp/main.swift" <<'EOF'
 import UIKit
 class D: UIResponder, UIApplicationDelegate {
   var window: UIWindow?
@@ -40,24 +43,43 @@ plutil -insert CFBundleSupportedPlatforms -json '["iPhoneSimulator"]' "$app/Info
 plutil -insert UILaunchScreen -json '{}' "$app/Info.plist"
 codesign -s - -f "$app" 2>/dev/null
 
-"$sim" serve --socket "$sock" > "$tmp/serve.log" 2>&1 &
+"$sim" serve --socket "$sock" >"$tmp/serve.log" 2>&1 &
 server=$!
-for _ in $(seq 50); do [ -S "$sock" ] && break; sleep 0.1; done
+for _ in $(seq 50); do
+  [ -S "$sock" ] && break
+  sleep 0.1
+done
 
 fails=0
 line() { printf '%-20s %s\n' "$1" "$2"; }
 run() { # name, then a simee command line
-  local name=$1 out; shift
-  if out=$("$sim" --in-process "$@" 2>&1); then line "$name" pass; else line "$name" "fail: $(echo "$out" | head -1)"; fails=$((fails + 1)); fi
+  local name=$1 out
+  shift
+  if out=$("$sim" --in-process "$@" 2>&1); then
+    line "$name" pass
+  else
+    line "$name" "fail: $(echo "$out" | head -1)"
+    fails=$((fails + 1))
+  fi
 }
 call() { # name method params
   local out
-  if out=$("$sim" call --socket "$sock" "$2" "$3" 2>&1); then line "$1" pass; else line "$1" "fail: $(echo "$out" | head -1)"; fails=$((fails + 1)); fi
+  if out=$("$sim" call --socket "$sock" "$2" "$3" 2>&1); then
+    line "$1" pass
+  else
+    line "$1" "fail: $(echo "$out" | head -1)"
+    fails=$((fails + 1))
+  fi
   LAST=$out
 }
 d="\"device\":\"$udid\""
 
-if out=$("$(dirname "$0")/parity.sh" "$udid" "$sim" 2>&1); then line parity pass; else line parity "fail: $(echo "$out" | grep FAIL | head -1)"; fails=$((fails + 1)); fi
+if out=$("$(dirname "$0")/parity.sh" "$udid" "$sim" 2>&1); then
+  line parity pass
+else
+  line parity "fail: $(echo "$out" | grep FAIL | head -1)"
+  fails=$((fails + 1))
+fi
 run screenshot screenshot "$udid" "$tmp/shot.png"
 run tap tap "$udid" 100 100
 run swipe swipe "$udid" 600 1800 600 1200 --duration 200

@@ -41,6 +41,16 @@ SETTLE_CPU=${SETTLE_CPU:-10}; SETTLE_WINDOW=${SETTLE_WINDOW:-10}; TIMEOUT=${TIME
 [ -x "$SIMEE" ] || { echo "no simee at $SIMEE (cargo build --release -p simee)" >&2; exit 2; }
 out="$repo/bench"; mkdir -p "$out"
 work=$(mktemp -d "${TMPDIR:-/tmp}/farm-bench.XXXXXX")
+udids=()
+# However the run ends (EXIT, Ctrl-C, TERM): stop the simee processes this shell started, shut
+# down and delete the simulators it created (udids), nothing else. KEEP=1 leaves the devices.
+on_exit() {
+  trap - EXIT INT TERM
+  local j
+  for j in $(jobs -p); do kill -INT "$j" 2>/dev/null; done
+  wait 2>/dev/null
+  cleanup_devices >&2
+}
 
 now() { perl -MTime::HiRes=time -e 'printf "%.3f\n", time'; }
 since() { awk -v a="$(now)" -v b="$1" 'BEGIN { printf "%.1f\n", a - b }'; }
@@ -88,10 +98,10 @@ footprint_mb() {
   footprint --noCategories $p 2>/dev/null | awk '/Summary Footprint:/ { v = $3; if ($4 == "GB") v *= 1024; if ($4 == "KB") v /= 1024; printf "%d\n", v }'
 }
 shutdown_all() {
-  for u in "${udids[@]}"; do
+  for u in ${udids[@]+"${udids[@]}"}; do
     "$SIMEE" shutdown "$u" 2>&1 | grep -v 'current state: Shutdown' | tail -1
   done
-  for u in "${udids[@]}"; do
+  for u in ${udids[@]+"${udids[@]}"}; do
     for _ in $(seq 1 30); do
       "$SIMEE" list --platform ios | grep -qF "($u) (Shutdown)" && break
       sleep 1
@@ -101,10 +111,14 @@ shutdown_all() {
 cleanup_devices() {
   shutdown_all
   [ "${KEEP:-0}" = 1 ] && return
-  for u in "${udids[@]}"; do
+  for u in ${udids[@]+"${udids[@]}"}; do
     if "$SIMEE" delete "$u"; then echo "deleted $u"; else echo "delete $u FAILED"; fi
   done
 }
+
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Boots every device in udids, waits until all are settled (or TIMEOUT), measures; prints the line.
 measure() {
@@ -207,4 +221,5 @@ for n in "$@"; do
     [ "$round" -lt "$ROUNDS" ] && shutdown_all >&2
   done
   cleanup_devices >&2
+  udids=()
 done

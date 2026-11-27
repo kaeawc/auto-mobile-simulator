@@ -29,14 +29,14 @@ for p in json.load(sys.stdin)["packages"]:
 
 args=()
 while read -r name version; do
-  if curl -fsS "https://index.crates.io/$(index_path "$name")" 2>/dev/null \
-      | python3 -c 'import json,sys; v=sys.argv[1]; sys.exit(0 if any(json.loads(l)["vers"]==v for l in sys.stdin if l.strip()) else 1)' "$version"; then
+  if curl -fsS "https://index.crates.io/$(index_path "$name")" 2>/dev/null |
+    python3 -c 'import json,sys; v=sys.argv[1]; sys.exit(0 if any(json.loads(l)["vers"]==v for l in sys.stdin if l.strip()) else 1)' "$version"; then
     echo "skip    $name $version (already on crates.io)"
   else
     echo "publish $name $version"
     args+=(-p "$name")
   fi
-done <<< "$crates"
+done <<<"$crates"
 
 if [ ${#args[@]} -eq 0 ]; then
   echo "nothing to publish"

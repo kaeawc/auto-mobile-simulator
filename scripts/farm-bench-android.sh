@@ -5,10 +5,13 @@
 #
 #   scripts/farm-bench-android.sh <label> <golden-avd> <N> [emu args...]
 #
-# Devices are AVDs named perffarm-1..N, made for the run and deleted after it (KEEP=1 leaves them):
-#   MODE=clone (default)  `emu -clone-avd perffarm-<i> -from <golden>`: APFS clones of the golden
+# Devices are AVDs named $PREFIX1..N (PREFIX defaults to perffarm-$$-, unique per run), made for the
+# run and deleted when it ends, however it ends: an EXIT, INT or TERM trap stops the emu PIDs it
+# started, then deletes only the AVDs this run made (KEEP=1 leaves them). Leftover fixed-name
+# perffarm-<i> AVDs of older runs are reported once and never deleted here:
+#   MODE=clone (default)  `emu -clone-avd $PREFIX<i> -from <golden>`: APFS clones of the golden
 #                         AVD's settled simee disks, so no device pays first boot
-#   MODE=fresh            `emu -create-avd perffarm-<i> -sysdir <golden's image>`: a first boot each
+#   MODE=fresh            `emu -create-avd $PREFIX<i> -sysdir <golden's image> -no-golden`: a first boot each
 #   MODE=existing         boot the AVDs named in AVDS (space-separated) as they are; never deleted
 # Other knobs: K (devices started at once, default N; the next starts when one settles), BASE_PORT
 # (default 5600; device i gets console BASE_PORT+2(i-1), adb +1), EMU (the emu binary, default
@@ -97,10 +100,35 @@ idle_wakeups() {
 # Sum of vCPU runs (= exits) and of PL011 accesses in an EMU_EXIT_PROFILE snapshot.
 exits() { awk '$1=="C" {c+=$3} $1=="R" && $2=="pl011" {p+=$4+$5} END {printf "%d %d\n", c, p}' "$1" 2>/dev/null; }
 
-names=()
+names=(); made=(); pids=()
+stop_all() {
+  for i in ${!pids[@]+"${!pids[@]}"}; do kill -INT "${pids[i]}" 2>/dev/null; done
+  for i in ${!pids[@]+"${!pids[@]}"}; do
+    for _ in $(seq 1 100); do kill -0 "${pids[i]}" 2>/dev/null || break; sleep 0.1; done
+  done
+}
+# Deletes only the AVDs this run made (names recorded just before each create), never the golden.
+delete_made() {
+  [ "${KEEP:-}" ] && return
+  for name in ${made[@]+"${made[@]}"}; do
+    [ -e "$avd_home/$name.avd" ] || [ -e "$avd_home/$name.ini" ] || continue
+    "$tool" -delete-avd "$name" 2>&1 | tail -1 >&2
+  done
+}
+# Installed before the first AVD is made, so a failed clone or Ctrl-C at any point cleans up.
+cleanup() { trap - EXIT INT TERM; stop_all; delete_made; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 case "$mode" in
   existing) read -r -a names <<< "${AVDS:?MODE=existing needs AVDS}" ;;
-  clone | fresh) for i in $(seq 1 "$n"); do names+=("perffarm-$i"); done ;;
+  clone | fresh)
+    prefix=${PREFIX:-perffarm-$$-}
+    for i in $(seq 1 "$n"); do names+=("$prefix$i"); done
+    # Older runs used the fixed names perffarm-1..8 and leaked them on an interrupt. Not ours to delete.
+    # shellcheck disable=SC2012 # fixed, plain names
+    old=$(cd "$avd_home" 2>/dev/null && ls -d perffarm-[0-9].avd perffarm-[0-9][0-9].avd 2>/dev/null | sed 's/\.avd$//' | tr '\n' ' ')
+    [ -z "$old" ] || echo "note: AVDs from older runs remain (${old% }); delete with: $tool -delete-avd <name>. Not touching them." >&2 ;;
   *) echo "MODE must be clone, fresh or existing" >&2; exit 2 ;;
 esac
 n=${#names[@]}
@@ -112,10 +140,11 @@ if [ "$mode" != existing ]; then
   df0=$(df -k "$avd_home" | awk 'NR==2 {print $3}')
   for name in "${names[@]}"; do
     if [ -e "$avd_home/$name.avd" ]; then echo "$name already exists; delete it first" >&2; exit 2; fi
+    made+=("$name")
     if [ "$mode" = clone ]; then
       "$tool" -clone-avd "$name" -from "$golden" > "$run/make-$name.log" 2>&1 || { cat "$run/make-$name.log" >&2; exit 1; }
     else
-      "$tool" -create-avd "$name" -sysdir "$sysdir" > "$run/make-$name.log" 2>&1 || { cat "$run/make-$name.log" >&2; exit 1; }
+      "$tool" -create-avd "$name" -sysdir "$sysdir" -no-golden > "$run/make-$name.log" 2>&1 || { cat "$run/make-$name.log" >&2; exit 1; }
     fi
   done
   df1=$(df -k "$avd_home" | awk 'NR==2 {print $3}')
@@ -141,13 +170,6 @@ launch() {
   echo "$name pid=${pids[i]} port=$port" >> "$run/pids"
   started=$((started + 1))
 }
-stop_all() {
-  for i in "${!pids[@]}"; do kill -INT "${pids[i]}" 2>/dev/null; done
-  for i in "${!pids[@]}"; do
-    for _ in $(seq 1 100); do kill -0 "${pids[i]}" 2>/dev/null || break; sleep 0.1; done
-  done
-}
-trap 'stop_all' EXIT INT TERM
 
 while [ "$started" -lt "$n" ] && [ "$started" -lt "$k" ]; do launch "$started" "$@"; done
 failures=0
@@ -221,7 +243,6 @@ for i in "${!pids[@]}"; do
   fps+=" $(footprint_mb "${pids[i]}")"
 done
 stop_all
-trap - EXIT INT TERM
 
 line="label=$label mode=$mode n=$n k=$k make_s=$t_make all_settled_s=$t_all"
 line+=" boot_med_s=$(echo "$boots" | med) settle_med_s=$(echo "$settles" | med) failures=$failures"
@@ -232,6 +253,3 @@ line+=" idle_wakeups_s_med=$(echo "$wakes" | med) idle_wakeups_s=[${wakes# }] fo
 line+=" load_start=$load0 load_end=$(load1)"
 echo "$line" | tee -a "$out/farm.results"
 
-if [ "$mode" != existing ] && [ -z "${KEEP:-}" ]; then
-  for name in "${names[@]}"; do "$tool" -delete-avd "$name" 2>&1 | tail -1; done
-fi

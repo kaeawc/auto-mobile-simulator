@@ -5,7 +5,7 @@
 //! from the emulator's display socket. Clicks and drags become touches, typing goes to the device
 //! keyboard, and the toolbar has the controls the device's form factor has (Back/Home/Recents, a
 //! foldable's hinge, a watch's rotary input, a TV's D-pad). ⌘⇧H is Home, ⌘L Lock, ⌘S saves a
-//! screenshot to the Desktop.
+//! screenshot to the Desktop, ⌘3 switches the 3D device view on and off ([`scene`], wgpu only).
 //!
 //! Handlers only queue [`Action`]s and [`Input`]s; `poll` performs them. That keeps handlers pure,
 //! so the headless tests drive the real view without a device. Rune runs `poll` at the start of a
@@ -30,6 +30,7 @@ mod icons;
 mod ios;
 mod keys;
 mod scan;
+mod scene;
 mod stylus;
 #[cfg(target_os = "macos")]
 mod surface;
@@ -71,6 +72,8 @@ pub enum Action {
     Xr(sim_core::xr::XrCommand),
     /// Android tablets: the pointer becomes a stylus, or a finger again.
     ToggleStylus,
+    /// ⌘3: the 3D device view on or off ([`scene`]).
+    ToggleView3d,
     Debug(debug::DebugAction),
 }
 
@@ -154,6 +157,8 @@ pub struct State {
     pub screen_view: (f32, f32),
     /// Where the screen and its bezel are, and the edge touch in progress.
     pub bezel: bezel::Bezel,
+    /// The 3D device view's switch.
+    pub view3d: scene::Toggle,
 }
 
 /// An Android screen switched away from, with what the window showed it with.
@@ -373,6 +378,7 @@ impl State {
 }
 
 fn init() -> State {
+    let (view3d, view3d_status) = scene::Toggle::from_process();
     State {
         devices: Vec::new(),
         selected: std::env::var("SIMEE_DEVICE").ok(),
@@ -385,7 +391,7 @@ fn init() -> State {
         shape: Shape::Rounded,
         held: None,
         busy: None,
-        status: None,
+        status: view3d_status,
         debug: debug::Debug::default(),
         socket: None,
         actions: vec![Action::Refresh],
@@ -411,6 +417,7 @@ fn init() -> State {
         pen: None,
         screen_view: (0.0, 0.0),
         bezel: bezel::Bezel::default(),
+        view3d,
     }
 }
 
@@ -714,6 +721,10 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     }
     for action in std::mem::take(&mut s.actions) {
         changed = true;
+        if action == Action::ToggleView3d {
+            toggle_view3d(s);
+            continue;
+        }
         if s.offline {
             if let Action::Select(udid) = action {
                 s.selected = Some(udid);
@@ -790,6 +801,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             }
             Action::Xr(command) => android_action(s, move |d| d.xr(&command).map(drop)),
             Action::ToggleStylus => toggle_stylus(s),
+            Action::ToggleView3d => {}
             Action::Debug(a) => {
                 if let Some(udid) = s.live.as_ref().map(|l| l.udid.clone())
                     && let Some(msg) = s.debug.perform(&udid, a)
@@ -852,6 +864,27 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
         changed = true;
     }
     changed
+}
+
+/// ⌘3: the 3D view on or off, or the reason it can't be (a backend without depth buffers, a
+/// device with no body).
+fn toggle_view3d(s: &mut State) {
+    s.status = s.view3d.flip();
+    if s.view3d.on && s.showing_screen() && scene::body_for(s).is_none() {
+        s.status = Some(scene::NO_BODY.into());
+    } else if s.view3d.on {
+        s.status = Some(scene::ON.into());
+    }
+}
+
+/// Window shortcuts the focused control left alone: ⌘3 toggles the 3D view.
+fn on_key(s: &mut State, k: &rune::KeyEvent, tx: &mut Tx) -> bool {
+    if k.key == rune::Key::Command('3') && !k.mods.shift {
+        s.actions.push(Action::ToggleView3d);
+        tx.request_poll();
+        return true;
+    }
+    false
 }
 
 /// The toolbar's Stylus button (Android tablets): the pointer becomes a pen (what stock's gRPC
@@ -1008,6 +1041,7 @@ fn main() {
         ],
         setup: Some(setup),
         poll: Some(poll),
+        on_key: Some(on_key),
         min_size: Some((1000.0, 560.0)),
         ..AppSpec::new("simee", (1240.0, 870.0), init, view::view)
     };
@@ -1016,8 +1050,12 @@ fn main() {
     rune::run(spec);
     #[cfg(not(feature = "hot"))]
     {
+        let setting = std::env::var("SIMEE_GPU_BACKEND").ok();
+        // Before the window's state is made: it reads whether the 3D view can draw.
+        let wgpu = scene::wgpu_backend(std::env::var("RUNE_GPU_BACKEND").ok().as_deref(), setting.as_deref(), cfg!(target_os = "macos"));
+        scene::set_supported(wgpu);
         let app = rune::App::new(spec).on_visibility(on_visibility);
-        let app = match gpu_backend(std::env::var("SIMEE_GPU_BACKEND").ok().as_deref()) {
+        let app = match gpu_backend(setting.as_deref()) {
             Ok(Some(backend)) => app.gpu_backend(backend),
             Ok(None) => app,
             Err(e) => {
@@ -1025,6 +1063,9 @@ fn main() {
                 app
             }
         };
+        // Only a backend that can draw the scene gets its compositor; with the view off it draws
+        // Rune's default frame.
+        let app = if wgpu { app.compositor(scene::Scene::default()) } else { app };
         app.run();
     }
 }
@@ -1079,6 +1120,89 @@ mod tests {
             assert!(rt.find(key).is_some(), "{key} rendered");
         }
         assert!(rt.find("placeholder").is_none());
+        // The 3D view is off unless asked for: the window is the flat one.
+        assert!(rt.find("scene-3d").is_none());
+    }
+
+    fn three_d(s: &mut State) {
+        demo(s);
+        s.view3d = scene::Toggle { on: true, supported: true, ..scene::Toggle::default() };
+    }
+
+    fn cmd(c: char) -> KeyEvent {
+        KeyEvent { key: Key::Command(c), mods: rune::Mods { cmd: true, ..rune::Mods::default() } }
+    }
+
+    /// The 3D view lays its slot over the stage only: the toolbar and the panel still take
+    /// clicks, the flat screen stays laid out beneath (it is the scene's texture) and a drag
+    /// there sends no touch.
+    #[test]
+    fn three_d_view_covers_the_stage_and_leaves_the_controls_working() {
+        let mut rt = runtime(three_d);
+        let ([sx, sy, sw, sh], _) = rt.presented("scene-3d").expect("the 3D slot is drawn");
+        let ([x, y, w, h], _) = rt.presented("device-screen").expect("the flat screen stays laid out");
+        assert!(sx <= x && sy <= y && sx + sw >= x + w && sy + sh >= y + h, "the slot covers the screen");
+        let (_, hy) = rt.find("home-button").unwrap();
+        assert!(hy < sy, "the toolbar is above the slot");
+        press(&mut rt, "home-button");
+        assert_eq!(rt.state.actions, vec![Action::Button(Button::Home)]);
+        rt.state.actions.clear();
+        rt.pointer_down(x + w / 2.0, y + h / 2.0);
+        rt.pointer_up(x + w / 2.0, y + h / 2.0);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.inputs.is_empty(), "no touch through the 3D view: {:?}", rt.state.inputs);
+        press(&mut rt, "device-1");
+        assert_eq!(rt.state.actions, vec![Action::Select("B2".into())]);
+    }
+
+    /// One click on the 3D view must not blur the device: keys still reach it.
+    #[test]
+    fn keys_still_reach_the_device_after_a_click_on_the_3d_view() {
+        let mut rt = runtime(three_d);
+        press(&mut rt, "scene-3d");
+        rt.state.inputs.clear();
+        rt.key(KeyEvent::from(Key::Text("a".into())));
+        rt.key(KeyEvent::from(Key::Enter));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.inputs.len(), 2, "{:?}", rt.state.inputs);
+        assert!(matches!(&rt.state.inputs[0], Input::Key(KeyAction::Strokes(s)) if s[0].usage == 0x04));
+    }
+
+    #[test]
+    fn cmd_3_toggles_the_3d_view_where_the_backend_draws_it() {
+        let mut rt = polled_runtime(demo);
+        rt.on_key = Some(on_key);
+        rt.state.view3d.supported = true;
+        rt.key(cmd('3'));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.view3d.on);
+        assert!(rt.find("scene-3d").is_some());
+        assert_eq!(rt.state.status.as_deref(), Some(scene::ON));
+        rt.key(cmd('3'));
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.view3d.on);
+        assert!(rt.find("scene-3d").is_none());
+        assert_eq!(rt.state.status, None, "off says nothing");
+        // Rune's native Metal backend: the toggle says why it does nothing.
+        rt.state.view3d.supported = false;
+        rt.key(cmd('3'));
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.view3d.on);
+        assert_eq!(rt.state.status.as_deref(), Some(scene::UNAVAILABLE));
+        assert!(rt.find("scene-3d").is_none());
+    }
+
+    #[test]
+    fn a_device_with_no_body_stays_flat_and_says_so() {
+        let mut rt = polled_runtime(tv_scene);
+        rt.on_key = Some(on_key);
+        rt.state.view3d.supported = true;
+        rt.key(cmd('3'));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.view3d.on);
+        assert_eq!(rt.state.status.as_deref(), Some(scene::NO_BODY));
+        assert!(rt.find("scene-3d").is_none());
+        assert!(rt.find("device-screen").is_some());
     }
 
     fn text_of(rt: &Runtime<State>, key: &str) -> String {

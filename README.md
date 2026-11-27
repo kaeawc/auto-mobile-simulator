@@ -7,6 +7,31 @@ harnesses drive it unchanged.
 
 ![The desktop window with iOS and Android devices](docs/desktop.png)
 
+## Performance
+
+Measured against the stock tools on the same host and day, medians of 3 or more; each links its
+row and the script that reruns it (it creates and deletes its own devices).
+
+- **Android boots 4.9× faster warm, 2.4× cold:** 3.5 s against the SDK emulator's 17.1 s to
+  `sys.boot_completed`, 9.5 s against 22.9 s for a new AVD, with 45% less peak memory warm (2.09 against
+  3.78 GB; 25% cold). M3 Max, 2026-11-24. [Row](docs/benchmarks.md#android-emu-against-the-sdk-emulator),
+  `scripts/bench/android-boot.sh`.
+- **Fewer janky frames:** 0% of the frames swiping a Pixel Tablet's launcher against 5.6%, though
+  emu drew about 530 frames to stock's 1350 there; 0.25% against 6.2% on a phone, where both drew
+  about 790. M3 Max, 2026-11-25. [Row](docs/benchmarks.md#frame-pacing),
+  `scripts/bench/android-frames.sh`.
+- **Cheaper idle devices:** an idle API 29 device costs 2.9% of a host core against 5.4%; API 30
+  2.1% against 3.7%. M3 Max, 2026-11-26.
+  [Row](docs/benchmarks.md#api-29-and-30-first-boots-and-idle-host-cpu), `scripts/bench/android-idle.sh`.
+- **Android on Linux without KVM:** a warm boot in 168 s against `-accel off`'s 2302 s (one of its
+  3 boots never finished in 40 minutes). 4-vCPU Xeon VM, 2026-11-26.
+  [Row](docs/benchmarks.md#boot-to-sysboot_completed-with-emus-devices), `scripts/bench/software-mode.sh`.
+- **iOS screenshots 17× faster as a command:** 36 ms through `simee serve` against 601 ms for
+  `simctl io screenshot` (a loaded host, 1-minute load 13-69). M3 Max, 2026-11-26.
+  [Row](docs/benchmarks.md#ios-simee-against-simctl), `scripts/bench/ios-command.sh`.
+
+`scripts/bench/run-all.sh --list` names every benchmark behind the numbers on this page.
+
 ## Compared with the stock tools
 
 ### Android: emu against the SDK emulator
@@ -62,8 +87,8 @@ Everything is drawn on the CPU, so the launcher draws about 7 frames a second.
 
 Every row on the left is a CLI command, an API method and a control in the desktop window.
 
-How each number was measured, and what has not been measured yet:
-[docs/benchmarks.md](docs/benchmarks.md). The full comparison:
+How each number was measured, the `scripts/bench/` command that reruns it, and what has not been
+measured yet: [docs/benchmarks.md](docs/benchmarks.md). The full comparison:
 [docs/comparison.md](docs/comparison.md).
 
 ## Quick start

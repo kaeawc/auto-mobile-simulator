@@ -3370,6 +3370,7 @@ dependencies = [
  "simee-coresim",
  "simee-debug",
  "simee-netshape",
+ "wgpu",
 ]
 
 [[package]]

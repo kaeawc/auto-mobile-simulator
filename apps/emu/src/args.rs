@@ -7,6 +7,8 @@ usage: emu -avd NAME [options]
        emu -avd NAME -dry-run   (print the boot plan without booting; any host)
        emu -list-avds | -version | -accel-check
        emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a [-lcd 720x1280@320] [-cores N] [-memory MB]
+                  (-create-avd boots the first AVD of an image once and keeps its settled user data to
+                   start the image's later AVDs from; -no-golden skips that for a pristine first boot)
        emu -clone-avd NAME -from GOLDEN   (copy-on-write clone of a stopped AVD's settled simee disks)
        emu -delete-avd NAME               (refused while any emulator, simee or stock, runs it)
        emu -provision API [-tag google_apis] [-abi arm64-v8a] [-no-renderer] [-dry-run] [-create-avd NAME [-lcd WxH@DPI] [-cores N] [-memory MB]]
@@ -21,6 +23,8 @@ provisioning (no Java or sdkmanager; SDK at $ANDROID_HOME, default ~/Library/And
                     $ANDROID_HOME/simee/renderer/<revision>; both then initialize the renderer
                     once, so its Metal shaders are cached before the first boot
   -no-renderer      with -provision: skip the renderer (emu then boots without graphics)
+  -no-golden        with -create-avd: don't boot the image once to keep a settled golden user data
+                    (the new AVD first-boots fresh, as stock's does)
   -tag TAG          default, google_apis (default), google_apis_playstore, android-wear, ...
   -abi ABI          default arm64-v8a
   -dry-run          resolve and print URL, size and sha1 without downloading; with -avd, print
@@ -149,6 +153,8 @@ pub struct Opts {
     pub provision_renderer: bool,
     /// `-no-renderer`: `-provision` without the renderer.
     pub no_renderer: bool,
+    /// `-no-golden`: `-create-avd` neither builds nor clones the image's golden user data.
+    pub no_golden: bool,
     pub list_images: bool,
     pub tag: Option<String>,
     pub abi: Option<String>,
@@ -224,6 +230,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
             "provision" => o.provision = Some(value(flag)?),
             "provision-renderer" => o.provision_renderer = true,
             "no-renderer" => o.no_renderer = true,
+            "no-golden" => o.no_golden = true,
             "list-images" => o.list_images = true,
             "tag" => o.tag = Some(value(flag)?),
             "abi" => o.abi = Some(value(flag)?),
@@ -303,6 +310,8 @@ mod tests {
         let o = p("-clone-avd farm-1 -from golden");
         assert_eq!((o.clone_avd.as_deref(), o.from.as_deref()), (Some("farm-1"), Some("golden")));
         assert_eq!(p("-delete-avd farm-1").delete_avd.as_deref(), Some("farm-1"));
+        assert!(!o.no_golden && p("-create-avd small -sysdir x -no-golden").no_golden);
+        assert!(p("-provision 36 -create-avd small -no-golden").no_golden);
     }
 
     #[test]

@@ -916,24 +916,32 @@ mod tests {
     fn guest_bytes_for_a_stalled_client_queue_without_blocking_and_drain_in_order() {
         let (mut f, mut client, from_host) = forwarder();
         // Until the socket is full, bytes go straight in; then they queue, each call returning at once.
+        // How much the queue holds at any instant depends on how far the writer thread got (and on
+        // how far the kernel grew the socket buffer), so keep sending until it holds a few chunks
+        // rather than sampling it once. The client doesn't read, so nothing drains it from here on.
+        // A call that really blocks waits on a client that never reads, i.e. forever: a scheduling
+        // stall on a loaded host must not read as one.
+        const BLOCKED: Duration = Duration::from_secs(5);
         let chunk = 64 * 1024;
+        let want = 4 * chunk;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut sent = 0;
-        while f.backlog() == 0 {
-            assert!(sent < 256 << 20, "the socket never filled");
+        let held = loop {
+            let held = f.backlog();
+            if held >= want {
+                break held;
+            }
+            assert!(sent < 256 << 20 && std::time::Instant::now() < deadline, "the queue never reached {want} bytes (holds {held})");
             let start = std::time::Instant::now();
             assert!(f.guest_data(&numbered(sent, chunk), &mut Vec::new()));
-            assert!(start.elapsed() < Duration::from_millis(100), "guest_data blocked");
+            assert!(start.elapsed() < BLOCKED, "guest_data blocked");
             sent += chunk;
+        };
+        assert!(held <= MAX_BACKLOG);
+        // Progress reports (Drained) are fine while the socket takes bytes; nothing else is delivered.
+        while let Ok(event) = from_host.try_recv() {
+            assert!(matches!(event, WorkerEvent::Drained { conn: 1 }), "nothing delivered");
         }
-        for _ in 0..4 {
-            let start = std::time::Instant::now();
-            assert!(f.guest_data(&numbered(sent, chunk), &mut Vec::new()));
-            assert!(start.elapsed() < Duration::from_millis(100), "guest_data blocked");
-            sent += chunk;
-        }
-        let held = f.backlog();
-        assert!(held > 0 && held <= MAX_BACKLOG);
-        assert!(from_host.try_recv().is_err(), "nothing delivered, nothing to report");
 
         // The client reads again: every byte, in order, and the worker hears the backlog shrink.
         assert_eq!(read_exactly(&mut client, sent), numbered(0, sent));

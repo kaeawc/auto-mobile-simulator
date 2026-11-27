@@ -4,6 +4,68 @@ Every number the README and [comparison.md](comparison.md) quote comes from this
 says what was run, on what, and when. The rules for keeping it current are in
 [AGENTS.md](../AGENTS.md#benchmarks-and-public-docs).
 
+## Reproducing a number
+
+Every benchmark below names the script that reproduces it, under `scripts/bench/`. Each one:
+
+- takes `--help`, `--rounds N` (default 3; the tables report medians), `--quick` (one short round:
+  a smoke test, not a number to publish) and `--out DIR`;
+- creates the AVDs and simulators it uses and deletes them at the end (AVDs with
+  `emu -delete-avd`, simulators by UDID); it never touches another device, never opens or quits
+  Simulator.app, never runs `adb kill-server`, and stops only the processes it started;
+- alternates simee and the stock tool from round to round where it compares them;
+- records the host (model, CPU, macOS or Linux version, CPU count, memory, the 1-minute load
+  average from `spectra load` when installed, else the kernel's) and simee's commit at the start
+  and the end, writes every sample to `bench/results/<name>-<time>.json`, and prints the result
+  as a Markdown table in the shape the sections below use.
+
+A benchmark that creates an AVD says how (`AVD created fresh`): its first boot is a real first
+boot, with `-no-golden` passed wherever `emu -create-avd` would otherwise start the AVD from a
+settled golden userdata.
+
+```bash
+scripts/bench/run-all.sh --list                    # every benchmark, what it needs, its command
+scripts/bench/run-all.sh --only android-boot       # one of them
+scripts/bench/run-all.sh --kind host --quick       # the device-free ones, one short round each
+```
+
+Before/after rows compare two builds of simee: build the "before" commit into its own target
+directory (`CARGO_TARGET_DIR=<dir> cargo build --release --bin simee --bin emu` in a checkout of that
+commit; sign its `emu`) and pass it with `--baseline` (`--emu` for `android-reset.sh`); the
+scripts then alternate the builds. Rows marked "no script" say why: their method isn't
+recoverable from what was recorded, or they need something the repository doesn't hold.
+
+| Benchmark | simee | Baseline (stock tool, unless it says simee) | Host, date | Reproduce |
+| --- | --- | --- | --- | --- |
+| [Android boot, API 36](#android-emu-against-the-sdk-emulator) | 9.5 s cold, 3.5 s warm, 2.09 GB | SDK emulator 22.9 s, 17.1 s, 3.78 GB | M3 Max, 2026-11-24 | `scripts/bench/android-boot.sh --snapshot` |
+| [Android boot, API 29](#api-29-gles-over-the-goldfish-pipe) | 4.8 s warm | SDK emulator 6.4 s | M3 Max, 2026-11-26 | `scripts/bench/android-boot.sh --image …android-29/default…` |
+| [First boots and idle CPU, API 29/30](#api-29-and-30-first-boots-and-idle-host-cpu) | 2.9% / 2.1% of a core idle | SDK emulator 5.4% / 3.7% | M3 Max, 2026-11-26 | `scripts/bench/android-idle.sh` |
+| [Idle host CPU, the NAT](#idle-host-cpu) | 5.9% of a core | not measured | M3 Max, 2026-11-25 | `scripts/bench/android-net.sh --mode idle` |
+| [NAT throughput](#idle-host-cpu) | 610 MB/s up, 2.1 GB/s down | not measured | M3 Max, 2026-11-25 | `scripts/bench/android-net.sh --mode throughput` |
+| [Frame pacing](#frame-pacing) | 0% / 0.25% janky | SDK emulator 5.6% / 6.2% | M3 Max, 2026-11-25 | `scripts/bench/android-frames.sh --device tablet\|phone` |
+| [Software mode, CPU model](#android-software-mode-linux-without-kvm) | zygote 49.4 s | | 4-vCPU Xeon VM, 2026-11-26 | `scripts/bench/software-mode.sh --arms "tcg:…"` |
+| [Software mode, boot](#boot-to-sysboot_completed-with-emus-devices) | 168 s, 0.75 cores idle | SDK emulator `-accel off` 2302 s, 1.09 cores | 4-vCPU Xeon VM, 2026-11-26 | `scripts/bench/software-mode.sh --arms "emu stock"` |
+| [Software mode, `emu -avd`](#software-mode-through-emu--avd) | 161 s, tap 60.8 ms, screenshot 36.9 ms | SDK emulator unusable | 4-vCPU Xeon VM, 2026-11-26 | `android-frames.sh`, `api-steps.sh --android` |
+| [Android farm](#android-farm) | 8 settled in 266 s | not measured | not recorded, before 2026-11-24 | `scripts/bench/android-farm.sh` |
+| [Device bundles](#android-device-bundles) | 1225 MB, 7.2 s export, 6.7 s import | no stock tool | M3 Max, 2026-11-27 | `scripts/bench/android-bundle.sh` |
+| [iOS boot](#ios-simee-against-simctl) | 15.5 s first, 2.3 s later | `simctl` 18.9 s, 2.3 s | M3 Max, 2026-11-24 | `scripts/bench/ios-boot.sh` |
+| [iOS farm, default and slim](#ios-simee-against-simctl) | slim: 8 of 8 in 392 s, 1158 MB | simee default profile: 5 of 8, 2176 MB | M3 Max, 2026-11-24 | `scripts/bench/ios-farm.sh` |
+| [iOS settle, slim profile](#ios-simee-against-simctl) | 4 clones in 43 s | simee before: 229 s | M3 Max, 2026-11-26/27 | `scripts/bench/ios-settle.sh`, `ios-farm.sh` |
+| [iOS slim profile, 62 or 74 jobs](#ios-the-slim-profiles-jobs-62-against-74) | 20.1 s settled | simee, 62-job profile: 33.2 s | M3 Max, 2026-11-27 | `scripts/bench/ios-settle.sh --baseline …` |
+| [Time per automation step](#ios-simee-against-simctl) | tap 63.4 ms, screenshot 24.5 ms | simee before: 137.5, 99.7 ms | M3 Max, 2026-11-26 | `scripts/bench/api-steps.sh` |
+| [Screenshot as a command](#ios-simee-against-simctl) | 36 ms via `simee serve` | `simctl io screenshot` 601 ms | M3 Max, 2026-11-26 | `scripts/bench/ios-command.sh` |
+| [Emulator internals](#emulator-internals) | before/after rows | | various | see the section |
+| [`launch` with and without restart](#launch-with-and-without-restart) | 17–136 ms | | M3 Max, 2026-11-27 | `scripts/bench/ios-api.py --suite launch` |
+| [Per-call device lookup](#per-call-device-lookup-on-a-crowded-host) | 0.66 / 0.04 ms | simee before: 1.54 / 0.34 ms | M3 Max, 2026-11-26 | `ios-api.py --suite lookup` |
+| [Introspection](#introspection-processes-connections-kill-network_state) | 2.5–3.5 ms | `ps`/`lsof`/`kill`: 126–191 ms | M3 Max, 2026-11-27 | `ios-api.py --suite introspection` |
+| [iPad pointer click](#ipad-pointer-click) | 408 ms later click | simee before: 3641 ms | M3 Max, 2026-11-27 | `ios-api.py --suite pointer` (timings) |
+| [iOS input defaults](#ios-input-defaults) | tap 12.6 ms, type 20 chars 121 ms | simee before: 64.5, 749 ms | M3 Max, 2026-11-27 | `ios-api.py --suite input` (timings) |
+| [iOS app preferences](#ios-app-preferences) | read 0.11 ms | | M3 Max, 2026-11-27 | `ios-api.py --suite prefs` (reads) |
+| [iOS memory tools](#ios-memory-tools) | `mem_vmmap` 0.60 s … `mem_leaks` 2.30 s | | M3 Max, 2026-11-27 | `ios-api.py --suite mem` |
+| [Desktop: Metal against wgpu](#desktop-runes-native-metal-backend-against-wgpu) | | | M3 Max, 2026-11-27 | no script (below) |
+| [MCP server](#mcp-server) | 1 crate | `rmcp`: 75 crates, 41 s build | Linux VM, 2026-11-26 | `scripts/bench/mcp-build.sh` |
+| [Build times](#build-times-local) | 74–77 CPU s | simee before: 131–136 | Apple silicon, 2026-11-26 | `scripts/bench/build-times.sh` |
+
 ## Android: emu against the SDK emulator
 
 One API 36 `google_apis` arm64 AVD (4 vCPU, 2 GB) on an M3 Max (macOS 26.6.2), 2026-11-24, SDK
@@ -18,6 +80,7 @@ a rerun with it.
 - **Snapshot:** the SDK emulator restoring its quickboot snapshot, for reference.
 
 ```bash
+scripts/bench/android-boot.sh --snapshot          # new AVD per round: cold and warm, both tools, stock's snapshot
 scripts/android-bench.sh <label> <avd> emu|stock [-no-snapshot-load]   # one boot, one result line
 ```
 
@@ -44,7 +107,8 @@ One API 29 `default` arm64 AVD (2 GB, 720x1280), same host (Apple silicon Mac, 1
 medians of 3, emu and stock alternating; host load average 21–30 during the runs.
 
 ```bash
-PORT=5610 scripts/android-bench.sh a29-emu-N <avd> emu
+scripts/bench/android-boot.sh --image system-images/android-29/default/arm64-v8a --lcd 720x1280@320
+PORT=5610 scripts/android-bench.sh a29-emu-N <avd> emu        # the single boots it runs
 PORT=5612 scripts/android-bench.sh a29-stock-N <avd> stock
 ```
 
@@ -63,6 +127,13 @@ launcher has focus (`dumpsys window`), polled once a second, so whole seconds. O
 boot never reaches the launcher (1 of 1 that day, 4 of 4 earlier: the renderer fault in
 [android.md](android.md#performance-notes)); emu now runs a first boot on SwiftShader. Not yet
 compared with stock's first boot.
+
+```bash
+scripts/bench/android-idle.sh --arms "emu emu:ANGLE_DEFAULT_PLATFORM=metal" --launcher --window 0          # first boots
+scripts/bench/android-idle.sh --warm --arms "emu emu:ANGLE_DEFAULT_PLATFORM=swiftshader" --launcher --window 0  # warm
+```
+
+By hand, as these rows were run:
 
 ```bash
 target/release/emu -avd <avd> -port 5620 -wipe-data   # first boot; without -wipe-data: warm
@@ -92,6 +163,9 @@ during the boots and idle windows (one idle window ended at 109; its numbers are
 others).
 
 ```bash
+scripts/bench/android-idle.sh                                                     # API 29 default
+scripts/bench/android-idle.sh --image system-images/android-30/google_apis/arm64-v8a   # API 30
+# by hand, as run:
 emu -avd <avd> -port 5640 -no-window -no-audio -no-boot-anim -no-snapshot-save -wipe-data
 emulator -avd <avd> -port 5644 -no-window -no-audio -no-boot-anim -no-snapshot-save -wipe-data
 # then adb -s emulator-<port> shell getprop sys.boot_completed every 0.5 s; 120 s later,
@@ -104,6 +178,10 @@ emulator -avd <avd> -port 5644 -no-window -no-audio -no-boot-anim -no-snapshot-s
 | API 30 first boot until `sys.boot_completed` | 18.0 s (31.3, 17.4, 18.0) | 17.0 s (20.5, 17.0, 16.3) |
 | API 29 idle host CPU | 2.9% of a core (2.2, 2.9, 3.0) | 5.4% (4.1, 8.2, 5.4) |
 | API 30 idle host CPU | 2.1% of a core (2.1, 2.5, 2.0) | 3.7% (3.5, 3.7, 3.8) |
+
+The "before the modem fix" numbers below are a build before #148: pass it as an arm's emu
+(`--arms` takes `emu` only for this checkout's build, so run the script from a checkout of that
+commit).
 
 Before the modem fix, emu from `main` idled at 149% of a core on API 29 (141.8, 149.3, 161.7)
 and 156% on API 30 (156.3, 163.5, 156.1), with `com.android.phone` at 68% of a guest core and
@@ -127,14 +205,18 @@ runs.
 | Link-only virtio-net | 6.0% of a core (5.7, 6.0, 6.6) | 0 |
 
 Without an `eth0`, the guest's telephony retries the data call without a delay; with one, the
-call succeeds once and the guest goes idle.
+call succeeds once and the guest goes idle. No script: the "no network device" arm is a build
+before #29 (emu has had a network device since), and these runs' command wasn't recorded beyond
+the description above; `EMU_NET=link` (the link-only row) is what `scripts/net-bench.sh idle`
+measures today.
 
 With the user-mode NAT behind it (#36): one fresh API 36 google_apis AVD and one emu build, the
 NAT on and off (`EMU_NET=link`), 3 warm boots each, alternating after one uncounted first boot,
 M3 Max (16 CPUs), 2026-11-25. Each waits 60 s after `sys.boot_completed`, then takes emu's CPU
 time over 60 s (`ps -o time`). `scripts/net-bench.sh idle <avd>`. Other lanes' work on the host
 put the 1-minute load between 4.5 and 77 across the runs (each run's load at its start and end
-below); the first link-only run had 65–77, the rest 4.5–15.6.
+below); the first link-only run had 65–77, the rest 4.5–15.6. Reproduce:
+`scripts/bench/android-net.sh --mode idle`.
 
 | emu | Idle host CPU, median (runs, 1-minute load) | Guest internet |
 | --- | --- | --- |
@@ -148,7 +230,8 @@ Throughput through the NAT on the same AVD, build and day, after the boot above:
 the guest's toybox `nc` and a Python socket server on the host's loopback (the guest's
 10.0.2.2), one uncounted warm-up transfer then 3 runs each way, all timed on the host by the
 server (from accept to the guest's last byte, or to the guest's close after the host's last
-byte); the 1-minute load was 6.5–7.5. `scripts/net-bench.sh throughput <avd>`.
+byte); the 1-minute load was 6.5–7.5. `scripts/net-bench.sh throughput <avd>`; with its own
+AVD: `scripts/bench/android-net.sh --mode throughput`.
 
 | Direction | Time for 200 MiB, median (runs) | Rate |
 | --- | --- | --- |
@@ -168,8 +251,12 @@ the Vulkan-only renderer. Host CPU is emu's process over the run; the stock emul
 child process the script doesn't track.
 
 ```bash
-scripts/android-jank.sh emulator-<port> [emulator pid]   # one key=value line
+scripts/bench/android-frames.sh --device tablet          # and --device phone: both tools, warm boots; 3 alternating runs each
+scripts/android-jank.sh emulator-<port> [emulator pid]     # one run on a booted device, one key=value line
 ```
+
+The "emu with GL" rows can't be rerun at this commit: emu no longer has `EMU_RENDERER_GL`, so they
+need a build from before the Vulkan-only renderer (2026-11-25) as the emu arm.
 
 | Device | Emulator | Janky frames, median (runs) | Frame time p90 / p99 | Host CPU |
 | --- | --- | --- | --- | --- |
@@ -199,8 +286,12 @@ guest CPU microbenchmarks run. Medians of 3 warm boots after one uncounted first
 microbenchmarks are the median of 3 rounds.
 
 ```bash
+scripts/bench/software-mode.sh --qemu <qemu-system-x86_64> --arms "tcg:max,-erms,-fsrm,-fzrm,-fsrs,-fsrc tcg:max"
 scripts/tcg-bench.py <sysdir> <workdir> --qemu <qemu-system-x86_64|aarch64> [--cpu MODEL] [--boots 3]
 ```
+
+The wrapper runs x86_64 images only; the arm64 rows and the single-boot configurations
+(`--tb-size`, `--threads`) run `scripts/tcg-bench.py` directly.
 
 | Guest | CPU model | Shell | Zygote starts | 100k shell loop | 4× md5 of 64 MiB | QEMU peak RSS |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -264,6 +355,9 @@ transfers of 64 MiB each way per round, two rounds alternating, every transfer b
 | QEMU's user network to adbd's TCP port | 134, 125 ms | 38 to 45 MiB/s | 13 to 18 MiB/s |
 | emu's vsock, every queue called on each raise (before) | 157, 171 ms | 38 to 48 MiB/s | 47 to 66 MiB/s |
 
+No script for this table: the guest was wired to `crates/emu-vmm/examples/vhost_user_vsock.rs`
+by hand on a QEMU command line that wasn't recorded.
+
 Calling every queue on each raise cost the guest a spurious interrupt per completion, because
 vsock's queues share one MSI vector: 14 vsock interrupts per round trip before, 9 after
 (`/proc/interrupts`, 20 round trips). emu's vsock server used 0.53 s of CPU for a whole boot plus
@@ -283,6 +377,7 @@ each. Before this, `-provision-renderer` fetched Apple silicon's archive on ever
 had no renderer it could load.
 
 ```bash
+scripts/bench/host-paths.sh --only renderer --lib64 <lib64>     # on the Linux host
 cargo run --release -p simee-emu-gfxstream --example renderer_caps -- -vulkan-only <lib64>
 ```
 
@@ -307,6 +402,7 @@ over 60–120 s after boot complete (the window the Mac rows use) and over 240�
 each process's `VmHWM`.
 
 ```bash
+scripts/bench/software-mode.sh --qemu <qemu-system-x86_64> --arms "emu stock" --rounds 5
 scripts/tcg-bench.py <sysdir> <workdir> --qemu <qemu-system-x86_64> --emu-devices target/release/examples/soft_devices \
   --lib64 <renderer lib64> --icd swiftshader --boots 5
 ```
@@ -360,6 +456,9 @@ launcher swipes up and down, then the launcher's `dumpsys gfxinfo`; host CPU cov
 QEMU), and `scripts/ios-step-bench.py <socket> x86_36 20 360 600` through `simee serve` (20 calls
 of each step on an empty spot of the workspace, after a warm-up). Boot times are emu's own `boot
 completed` line. Medians of the 3 boots, the 9 jank runs, and the 3 step runs' medians.
+Reproduce on the same kind of host: `scripts/bench/android-frames.sh --image
+system-images/android-36/default/x86_64 --arms "emu stock" --runs 3` and `scripts/bench/api-steps.sh
+--android --image system-images/android-36/default/x86_64`.
 
 | Measure | emu, software mode | The SDK emulator, `-accel off` (one boot) |
 | --- | --- | --- |
@@ -383,7 +482,8 @@ frame emu already holds.
 
 `kfence.sample_interval=0` (#106, the `int3` panics) against the image's KFENCE sampling (every
 500 ms), through `scripts/tcg-bench.py --emu-devices ... --append`, four alternating rounds, one
-boot of each per round:
+boot of each per round (`scripts/bench/software-mode.sh --arms
+"emu:--append,kfence.sample_interval=0 emu:--append,kfence.sample_interval=500" --rounds 4`):
 
 | Arm | Boot, median (runs) | Host CPU 60–120 s after | 240–300 s after | Panics |
 | --- | --- | --- | --- | --- |
@@ -397,7 +497,8 @@ on 2 cores during the 184.6 s run.
 
 The guest display's refresh rate, 30 Hz against 60 (`androidboot.qemu.vsync`, which emu takes
 from the AVD's `hw.lcd.vsync`), through `scripts/tcg-bench.py --emu-devices ... --vsync N`, three
-alternating rounds, one boot of each per round. The ranchu composer marks its present fences
+alternating rounds, one boot of each per round (`scripts/bench/software-mode.sh --arms
+"emu:--vsync,30 emu:--vsync,60"`). The ranchu composer marks its present fences
 unreliable, so SurfaceFlinger keeps hardware vsync on even when nothing draws. On an idle
 software-mode guest, Perfetto showed 60 composer callbacks a second, each a binder call that
 SurfaceFlinger handles: 3.2 s of guest CPU per 14.5 s.
@@ -413,12 +514,19 @@ default, and an AVD opts in with `hw.lcd.vsync=30`.
 
 On GitHub's `ubuntu-latest` (4 vCPUs, `.github/workflows/software-mode.yml`), the first boot of
 a fresh userdata reached `sys.boot_completed` in 243.9 s (one run). This host's first boot took
-381.4 s.
+381.4 s. The CI number is that workflow's own run; it has no other script.
+
+Where software mode spends its time, phase by phase, with its own reproduction steps:
+[research/software-mode-profile.md](research/software-mode-profile.md) (a profile on a
+Firecracker VM, 2026-11-27, not a comparison).
 
 ## Android farm
 
 Clones of one settled golden AVD booted together, each until it is settled (boot complete and
-idle), same host and day. `scripts/farm-bench-android.sh`.
+idle), same host and day. `scripts/farm-bench-android.sh`. The host and date weren't recorded
+with this table; it predates emu's network device (#29, 2026-11-24). Reproduce, with a golden it
+creates and deletes: `scripts/bench/android-farm.sh --sizes "1 4 8"`. More farm numbers, with
+their commands: [farm-android.md](farm-android.md).
 
 | Devices | All settled | Failures | Host memory used per device |
 | --- | --- | --- | --- |
@@ -439,9 +547,13 @@ the same day, with zstd's C library at level 3 (level 19 gave 1193 MB, no smalle
 One run each. No stock tool exports an AVD, so there is no comparison with one.
 
 ```bash
+scripts/bench/android-bundle.sh --verify   # new AVD per round: boot 100 s, export, import, boot the import
 simee export <avd> <dir-or-file.tar>
 simee import <file>.tar <new-name>       # then boot it: the file and settings are there
 ```
+
+The zstd column was a build with zstd's C library, not shipped; it has no script. The two-clone
+chunk sharing rows were measured by hand on two clones' exports.
 
 | Measure | LZ4 (shipped) | zstd 3 |
 | --- | --- | --- |
@@ -470,14 +582,16 @@ imported userdata takes ~4% more host space than its source (1260 MB against 122
 
 One new iPhone per run under each tool, same host, 2026-11-24, 3 runs each; the
 boot returns once the device has finished booting (`simctl bootstatus` for `simctl`). Load on
-this host varied during these runs, so treat them as a rough comparison.
+this host varied during these runs, so treat them as a rough comparison. Reproduce:
+`scripts/bench/ios-boot.sh`.
 
 | Measure | simee | `simctl` |
 | --- | --- | --- |
 | First boot of a new device, median | 15.5 s | 18.9 s |
 | Later boot, median | 2.3 s | 2.3 s |
 
-`scripts/farm-bench-ios.sh`, 8 clones booted 4 at a time, same day:
+`scripts/farm-bench-ios.sh`, 8 clones booted 4 at a time, same day (`scripts/bench/ios-farm.sh
+--n 8 --k 4`, which makes and deletes the template):
 
 | Profile | Settled | Footprint per device | Processes per device |
 | --- | --- | --- | --- |
@@ -489,7 +603,9 @@ through `simee boot-many <clones> -j K --profile slim --json`, 2026-11-26, M3 Ma
 26.6, 3 interleaved runs of each with other work on the host (1-minute load 25-550: read the
 ranges). "Before" is the same build with the slim disables applied after the boot and settle
 judged on all CPU (`--settle-cpu all`), as until this change; the mechanism is in
-[farm.md](farm.md#the-slim-profile).
+[farm.md](farm.md#the-slim-profile). Reproduce: `scripts/bench/ios-farm.sh --n 4 --k 4 --profiles
+slim` with this checkout and with the build before #60 (run from its checkout); one clone at a
+time: `scripts/bench/ios-settle.sh --baseline <before build> --settle-cpu all`.
 
 | Measure | before | after |
 | --- | --- | --- |
@@ -502,7 +618,9 @@ The slim profile with the disables also passed as the boot's `disabled_jobs` and
 launchd's own overrides file instead of `launchctl` ([farm.md](farm.md#the-slim-profile)): one
 fresh clone at a time of a booted-once template, `simee boot <clone> --profile slim --settle`,
 2026-11-27, M3 Max, 16 CPUs, macOS 26.6, CoreSimulator 1174.21, median of 3 interleaved runs,
-1-minute load 11-29. "Before" is origin/main (690cd99) built the same way.
+1-minute load 11-29. "Before" is origin/main (690cd99) built the same way. Reproduce:
+`scripts/bench/ios-settle.sh --baseline <690cd99 build>` (and `--runtime
+com.apple.CoreSimulator.SimRuntime.iOS-18-0 --device-type "iPhone 16 Pro"`).
 
 | Measure | before | after |
 | --- | --- | --- |
@@ -520,7 +638,9 @@ had started, and left one running in 2 of 3 runs; "after" they never start.
 Time per automation step on one booted iPhone 17 (iOS 27.2) through `simee serve`, one persistent
 connection, `python3 scripts/ios-step-bench.py <socket> <udid> 20` (medians of 20 calls; the
 median of 3 interleaved runs), 2026-11-26, same host, 48 AVDs and 100 simulators on it, 1-minute
-load 21-32. "Before" routed every call by listing both platforms' devices:
+load 21-32. "Before" routed every call by listing both platforms' devices. Reproduce:
+`scripts/bench/api-steps.sh --baseline <before build>` (it makes its own device; the published
+host also held 48 AVDs and 100 simulators):
 
 | Measure | before | after |
 | --- | --- | --- |
@@ -531,12 +651,32 @@ load 21-32. "Before" routed every call by listing both platforms' devices:
 
 One screenshot as a command (a process per call), same device and hour, median of 7 interleaved
 (load 13-69): `simee screenshot` forwarded to `simee serve` 36 ms, `simee screenshot` in its own
-process (`SIMEE_IN_PROCESS=1`) 173 ms, `xcrun simctl io <udid> screenshot` 601 ms.
+process (`SIMEE_IN_PROCESS=1`) 173 ms, `xcrun simctl io <udid> screenshot` 601 ms. Reproduce:
+`scripts/bench/ios-command.sh --rounds 7 --calls 1`, which also times `simee tap` both ways
+([farm.md](farm.md#forwarding-to-simee-serve)'s 321 against 83 ms).
 
 ## Emulator internals
 
 These explain the table above. Each is a before and after of emu itself, with the mechanism
-in [android.md](android.md#performance-notes).
+in [android.md](android.md#performance-notes). Reproducing them:
+
+- Device-free rows (the screenshot's convert and encode, the frame store, vsock and adb
+  throughput, the renderer's warm init and readback): `scripts/bench/host-paths.sh` runs them on
+  this host. The vsock, adb and display-stream rows were measured on a 4-core Linux VM; a Mac
+  gives other absolute numbers.
+- Interrupt kicks (`EMU_VCPU_WAKE`): `scripts/bench/android-boot.sh --arms
+  "emu:EMU_VCPU_WAKE=targeted emu:EMU_VCPU_WAKE=none"` (its cold rows are the first boots;
+  `vcpu0_runs` and `cpu_s` are in android-bench.sh's per-boot lines in `bench/`).
+- Resets: `scripts/bench/android-reset.sh --baseline <before emu>`.
+- Launcher swipes after a change: `scripts/bench/android-frames.sh --arms emu` with each build's
+  checkout.
+- Metal's shader cache cold: no script. A cold run needs the bundle's Metal cache removed (or a
+  new bundle id per run), which a script shouldn't do to the host's caches unasked.
+- The Vulkan-only renderer rows need `EMU_RENDERER_GL`, which emu no longer has.
+- No recorded method: first-boot `/data` encryption with kicks (22 to 8 s), `fsync` and APEX
+  decompression (270 to 70 s) and whole-disk FITRIM (90 ms), all "an M-series Mac" on an earlier
+  macOS; and the display stream's CPU per frame (12.8 / 7.1 to 2.0 / 0 ms). They stay as
+  history; rerun them before quoting them.
 
 | Change | Before | After | Measured on |
 | --- | --- | --- | --- |
@@ -606,7 +746,8 @@ The injected network shaper's cost per call is measured in
 ### `launch`, with and without `restart`
 
 iPhone 17 Pro, iOS 27.2 (24B8117), `com.apple.Preferences`, through a release `simee serve`,
-median of 10, host load 9–18 (2026-11-27, M3 Max).
+median of 10, host load 9–18 (2026-11-27, M3 Max). Reproduce:
+`python3 -I scripts/bench/ios-api.py --suite launch`.
 
 | Case | ms |
 | --- | --- |
@@ -633,7 +774,8 @@ load 10-23 (2026-11-26, M3 Max, macOS 26.6). "Before" sorted every simulator
 (`-[SimDeviceSet devices]`) to find one by UDID, listed the AVD home to route each call, and read
 the framebuffer size through a remote proxy on every `screen` and tap; "after" looks the UDID up
 in the set's dictionary (`devicesByUDID`), stats one `<name>.ini`, and keeps the size per boot
-until a rotation or fold.
+until a rotation or fold. Reproduce: `python3 -I scripts/bench/ios-api.py --suite lookup --calls 20
+--baseline <before build>` (the crowded host's 90 simulators and 112 AVDs are not created for you).
 
 | Method | before (ms) | after (ms) |
 | --- | --- | --- |
@@ -649,7 +791,9 @@ iPhone 17 Pro, iOS 27.2 (24B8117), freshly booted (~205 device processes, ~1200 
 through a release `simee serve`, median of 10 round trips over the socket, the build before and
 after #118 against the same device back to back, host load 19–34 (2026-11-27, M3 Max, macOS
 26.6.2). `kill` is of a just-launched `com.apple.Preferences`. Host children counted by polling
-the server's `proc_listchildpids` every 0.2 ms over 5 calls.
+the server's `proc_listchildpids` every 0.2 ms over 5 calls. Reproduce the times:
+`python3 -I scripts/bench/ios-api.py --suite introspection --baseline <before build>`; the spawn
+counts were polled by hand and have no script.
 
 | Method | `ps`/`lsof`/`kill` (ms) | libproc (ms) | Host spawns per call, before → after |
 | --- | --- | --- | --- |
@@ -674,7 +818,9 @@ same tree into separate target dirs, against the same device back to back (2026-
 macOS 26.6.2). Quiet is host load 9-37 from other work; loaded adds 32 `yes` processes (load
 14-96). Before #122 every call homed the pointer; now a server moves on from where its last call
 left it, in steps of up to 120 pt instead of 10 pt, and homes on its first call, after a failure
-or rotation, and every 100 calls.
+or rotation, and every 100 calls. Reproduce the times: `python3 -I scripts/bench/ios-api.py --suite
+pointer --baseline <before build>` (targets spread over the screen with Settings in front). The
+placement column needs the InputProbe test app, which isn't in the repository: no script.
 
 | Case | before (ms) | after (ms) |
 | --- | --- | --- |
@@ -696,7 +842,10 @@ CPUs), macOS 26.6. The test app has a UIKit button, a SwiftUI button, a link in 
 UITableView and a UITextField; it logs each one that fires, every touch its window sees (with the
 touch's timestamp) and when it goes to the background. "Loaded" adds `yes` processes: 32 for
 recognition (1-minute load 20-78), 48 for the timings (load 94-117, above 3x the CPUs); quiet
-is load 5-60 from other work while the load average decayed.
+is load 5-60 from other work while the load average decayed. The recognition and typing tables
+need that test app (not in the repository): no script. The per-call timings:
+`python3 -I scripts/bench/ios-api.py --suite input --baseline <before build>` (tap, `button
+home`, `key`, `type` and `swipe`, with Settings in front instead of the test app).
 
 Recognition, 20 taps or presses per cell, every cell the same quiet and loaded:
 
@@ -790,6 +939,10 @@ from the first frame: idle from 10 to 30 s, a screenshot at 31 s, then swipes fr
 drag on `device-screen` a second (iOS left and right, Android up and down). The shipped build
 without `frame-profile` was not measured.
 
+No script: the runs open the desktop window on the host's display with a device booted, drive it
+with a Rune `--window-script` file and read Rune's per-frame log and `ioreg`; the script files and
+the log parser used weren't checked in. The setup above is what to rebuild.
+
 ## MCP server
 
 What the MCP server's protocol layer costs to build, against the official Rust SDK. Linux VM,
@@ -803,7 +956,8 @@ What the MCP server's protocol layer costs to build, against the official Rust S
 `rmcp` was built from a scratch package with `rmcp = { version = "3.11", default-features = false,
 features = ["server", "transport-io"] }` and `tokio` with `rt`, `macros` and `io-std`; the crate
 count is `cargo tree --prefix none -e normal | sort -u | wc -l` in it (145 with its dev
-dependencies). `Cargo.lock` has 140 packages in all. Why this decides the protocol layer:
+dependencies). `Cargo.lock` has 140 packages in all. Reproduce: `scripts/bench/mcp-build.sh`
+(it downloads `rmcp` into cargo's cache; nothing is added to this repository). Why this decides the protocol layer:
 [mcp.md](mcp.md#why-the-protocol-layer-is-hand-written).
 
 ## Build times (local)
@@ -821,6 +975,9 @@ were 20 to 34 s before and 10 to 14 s after for the workspace, 114 s before and 
 | Desktop test build, clean | 614 CPU s | 147 CPU s | `cd desktop && cargo test --no-run` |
 | Workspace test run, warm | 12.5 to 13.7 s | 13.0 to 13.9 s | `cargo test --workspace` |
 | Desktop test run, warm | 0.55 to 0.99 s | 1.06 to 1.41 s | `cd desktop && cargo test` |
+
+Reproduce the clean builds: `scripts/bench/build-times.sh --only "workspace desktop"` ("before" is
+#57's parent, from its own checkout).
 
 What changed: the workspace's `dev` profile built every dependency at opt-level 2; it now builds
 them at 0 and keeps 2 or 3 only for the ones on a runtime path (zlib-rs and flate2 for the kernel's
@@ -840,6 +997,98 @@ Measured and left alone:
 
 The incremental loop is already a few seconds, so no profile change helps it; the clean-build wins
 are what a fresh checkout, a CI cache miss or a Rune bump pays.
+
+## iOS: the slim profile's jobs (62 against 74)
+
+Moved from [farm.md](farm.md#the-slim-profile), which explains which jobs and why.
+`boot --profile slim --settle`, fresh clones of a booted-once template, the 62-job profile against
+the 74-job one (#222), 3 interleaved rounds each, 2026-11-27, M3 Max (16 CPUs, macOS 26.6), 1-minute
+load 8-21, median (runs):
+
+| runtime, settle judged on | | settled | CPU-s to settle | background CPU-s | processes |
+| --- | --- | --- | --- | --- | --- |
+| iOS 27.2, foreground (default) | 62 jobs | 33.2 s (40.3, 32.2, 33.2) | 112.0 | 25.1 | 114 |
+| | 74 jobs | 20.1 s (20.1, 20.1, 22.3) | 82.3 | 8.6 | 95-96 |
+| iOS 27.2, all CPU | 62 jobs | 38.9 s (38.9, 26.2, 39.5) | 114.6 | 26.2 | 108-113 |
+| | 74 jobs | 30.2 s (20.0, 30.3, 30.2) | 82.0 | 10.3 | 93-94 |
+| iOS 18.6, foreground (default) | 62 jobs | 25.5 s (20.8, 30.6, 25.5) | 42.1 | 13.3 | 91-97 |
+| | 74 jobs | 19.7 s (29.3, 19.7, 17.5) | 36.6 | 9.4 | 79-84 |
+| iOS 18.6, all CPU | 62 jobs | 31.5 s (30.7, 31.5, 31.6) | 44.0 | 14.5 | 97-102 |
+| | 74 jobs | 19.4 s (19.4, 19.6, 18.5) | 33.2 | 8.2 | 79 |
+
+```bash
+scripts/bench/ios-settle.sh --baseline <62-job build> --settle-cpu foreground   # and --settle-cpu all
+scripts/bench/ios-settle.sh --baseline <62-job build> --runtime com.apple.CoreSimulator.SimRuntime.iOS-18-6
+```
+
+The settle tables of [farm.md](farm.md) (fresh devices and clones at N = 1 to 8, the K sweep,
+warm reboots) were measured with `scripts/farm-bench-ios.sh` as farm.md's "Benchmark" section
+gives; `scripts/bench/ios-farm.sh` runs its clone mode with a template it creates.
+
+## iOS: app preferences
+
+Moved from [ios.md](ios.md#app-preferences) (#178), which describes the backend. iPhone 17
+Pro, iOS 27.2, M3 Max, 2026-11-27, a test app reading and writing an app-group suite, through
+`simee serve`, round trips over the socket:
+
+| Call | Median |
+| --- | --- |
+| `prefs_read` of one store | 0.11 ms (n=20) |
+| `prefs_read` of every store (3) | 0.27 ms (n=10) |
+| `prefs_stores`, warm | 0.13 ms (n=10) |
+| `prefs_stores`, first call in a process | 133 ms (n=1) |
+| `prefs_read {fresh: true}` (one in-device spawn) | 182 ms (n=5) |
+| A 10-key write batch | 180-187 ms; the running app had every key 1.7 ms after the call returned |
+| Feed: cfprefsd writes the file to the feed's event | 1.0 ms (0.8–1.1, n=6) |
+| Feed: an in-app write to the event | 1.5 s from the newest write a flush covers, 8.5 s from the oldest (n=6): cfprefsd flushes about every 10 s |
+| Feed end after `simctl shutdown` begins | 3.5 s |
+
+Reproduce the reads: `python3 -I scripts/bench/ios-api.py --suite prefs --bundle <app>` (default
+Settings, whose stores differ from the test app's). The writes and the feed need the test app
+ios.md describes, which isn't in the repository: no script.
+
+## iOS: memory tools
+
+Moved from [api.md](api.md) (#183). Apple M3 Max, 16 CPUs, macOS 26.6.2, iOS 26.5 iPhone 17
+simulator, 2026-11-27; a small test app with 20 leaks, 13 k heap nodes and 1.8 MB malloced,
+launched with stack logging; median of 3 warm-server calls; wall from `/usr/bin/time` on `simee
+call`, CPU the server's user and system time including the tool it reaped:
+
+| Method | Wall | CPU |
+| --- | --- | --- |
+| `mem_leaks` | 2.30 s | 2.28 s |
+| `mem_heap` | 1.75 s | 1.73 s |
+| `mem_vmmap` | 0.60 s | 0.58 s |
+| `mem_history` | 0.73 s | 0.71 s |
+
+The time grows with the app's heap. Reproduce on Settings (a bigger heap than the test app, so
+slower): `python3 -I scripts/bench/ios-api.py --suite mem`; `mem_history` needs a leaked address
+from the test app and has no script.
+
+## Research measurements
+
+These have their own methods in their own pages and aren't comparisons with the stock tools:
+[research/software-mode-profile.md](research/software-mode-profile.md) (where software mode's
+time goes, §2 reproduces it) and [research/netshape-overhead.md](research/netshape-overhead.md)
+(the injected shaper's cost per call, its "Reproduce with" block). The mechanism numbers in
+[android.md](android.md#performance-notes) are measured where they are stated.
+
+## Numbers only in pull requests
+
+Measured in a pull request and not carried into the docs; none is quoted anywhere. Each is the
+PR's own before/after, with no script unless named:
+
+- [#143](https://github.com/kaeawc/simee/pull/143): a screenshot through the socket as base64,
+  binary and a `path` the server writes (8.8, 3.9, 1.5 ms). `scripts/ios-step-bench.py` times the
+  base64 and `path` forms.
+- [#138](https://github.com/kaeawc/simee/pull/138): `logs` with `stream: true`, 1.3 ms after the
+  first call against ~760 ms.
+- [#134](https://github.com/kaeawc/simee/pull/134): an in-process `simee tap` / `key` (307.5 /
+  291.6 to 199.6 / 190.4 ms). `scripts/bench/ios-command.sh` times the in-process tap.
+- [#132](https://github.com/kaeawc/simee/pull/132): `encode_png` before and after (6.26 to 2.91 ms
+  at 2480x1740). `scripts/bench/host-paths.sh --only frame` prints both encoders.
+- The first performance rounds, #9 to #16 and #26 to #28 (2026-11-23 and 24): superseded by the
+  tables above where they overlap.
 
 ## Not yet measured
 

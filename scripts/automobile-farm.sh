@@ -12,10 +12,17 @@ set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 targets=()
 while [ $# -gt 0 ]; do
-  [ "$1" = -- ] && { shift; break; }
-  targets+=("$1"); shift
+  [ "$1" = -- ] && {
+    shift
+    break
+  }
+  targets+=("$1")
+  shift
 done
-[ ${#targets[@]} -gt 0 ] || { echo "usage: scripts/automobile-farm.sh <target>... [-- <auto-mobile checkout>]" >&2; exit 2; }
+[ ${#targets[@]} -gt 0 ] || {
+  echo "usage: scripts/automobile-farm.sh <target>... [-- <auto-mobile checkout>]" >&2
+  exit 2
+}
 am_dir=$(cd "${1:-$repo/../auto-mobile}" && pwd)
 
 # AVDs that AutoMobile boots itself must find simee as "emulator": the daemon keeps the
@@ -29,13 +36,14 @@ for t in "${targets[@]}"; do
   fi
 done
 
+# shellcheck source=automobile-daemon.sh
 . "$repo/scripts/automobile-daemon.sh"
 log=$(mktemp -d "${TMPDIR:-/tmp}/simee-am-farm.XXXXXX")
 pids=()
 cleanup() {
   # A harness started here exits on its own once it finishes; on an interrupt, stop exactly those.
-  for p in "${pids[@]}"; do kill "$p" 2> /dev/null || true; done
-  wait 2> /dev/null || true
+  for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
+  wait 2>/dev/null || true
   am_daemon_down
   echo "logs: $log"
 }
@@ -48,14 +56,19 @@ for t in "${targets[@]}"; do
     emulator-* | @*) script=automobile-harness-android.sh ;;
     *) script=automobile-harness.sh ;;
   esac
-  "$repo/scripts/$script" "$t" "$am_dir" > "$log/${t#@}.log" 2>&1 &
+  "$repo/scripts/$script" "$t" "$am_dir" >"$log/${t#@}.log" 2>&1 &
   pids+=("$!")
 done
 
 failed=0
 for i in "${!targets[@]}"; do
   t=${targets[$i]}
-  if wait "${pids[$i]}"; then result=pass; else result=fail; failed=$((failed + 1)); fi
+  if wait "${pids[$i]}"; then
+    result=pass
+  else
+    result=fail
+    failed=$((failed + 1))
+  fi
   summary=$(grep -E '^== [0-9]+ passed' "$log/${t#@}.log" | tail -1 || true)
   printf '%-40s %s %s\n' "$t" "$result" "${summary#== }"
 done

@@ -6,12 +6,21 @@
 #   scripts/release.sh 0.2.0
 set -euo pipefail
 new="${1:?usage: scripts/release.sh <version>}"
-[[ "$new" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "not a semver version: $new" >&2; exit 1; }
+[[ "$new" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+  echo "not a semver version: $new" >&2
+  exit 1
+}
 cd "$(dirname "$0")/.."
-[ -z "$(git status --porcelain)" ] || { echo "working tree not clean" >&2; exit 1; }
+[ -z "$(git status --porcelain)" ] || {
+  echo "working tree not clean" >&2
+  exit 1
+}
 
 git fetch -q origin main --tags
-git rev-parse -q --verify "refs/tags/v$new" > /dev/null && { echo "v$new already exists" >&2; exit 1; }
+git rev-parse -q --verify "refs/tags/v$new" >/dev/null && {
+  echo "v$new already exists" >&2
+  exit 1
+}
 branch="release/v$new"
 git switch -q -c "$branch" origin/main
 
@@ -21,7 +30,7 @@ sed -i.bak -e "s/^version = \"$old\"$/version = \"$new\"/" -e "s/version = \"=$o
 rm Cargo.toml.bak
 cargo update --workspace --offline
 # The desktop workspace depends on the crates by path: resolving it records their new version.
-(cd desktop && cargo metadata --offline --format-version 1 > /dev/null)
+(cd desktop && cargo metadata --offline --format-version 1 >/dev/null)
 
 # "## [Unreleased]" keeps its heading; its entries move under the new version.
 python3 - "$new" "$(date +%Y-%m-%d)" <<'EOF'

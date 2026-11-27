@@ -5,6 +5,7 @@
 
 mod bootconfig;
 pub mod bundle;
+pub mod golden;
 pub mod gpu;
 mod ini;
 pub mod sdk_device;
@@ -552,8 +553,9 @@ impl Env {
     }
 
     /// Creates AVD `name` as a copy of `golden` whose simee disks (`<golden>/simee/`: userdata,
-    /// cache, metadata) are copy-on-write clones: on APFS `std::fs::copy` clones the file
-    /// (`fclonefileat`), so a clone takes no space until either side writes, and it boots warm
+    /// cache, metadata) are copy-on-write clones ([`golden::clone_file`]: APFS's `fclonefileat`, a
+    /// reflink on Linux file systems that have them, else a copy that keeps the image's holes), so a
+    /// clone takes no space until either side writes, and it boots warm
     /// (no first-boot formatting, encryption or dexopt) from the state the golden was settled in.
     /// The clone runs persistent, with its own state from then on.
     ///
@@ -603,7 +605,7 @@ impl Env {
             for f in CLONED_DISKS {
                 let from = src_disks.join(f);
                 if from.is_file() {
-                    std::fs::copy(&from, disks.join(f)).map_err(|e| io(&from, e))?;
+                    golden::clone_file(&from, &disks.join(f))?;
                 }
             }
             Ok(())

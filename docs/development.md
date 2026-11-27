@@ -110,3 +110,28 @@ one is):
    origin v0.1.0`): the Release workflow builds the binaries and creates the GitHub release, and
    its `scripts/publish.sh` skips every crate, now that each one is up.
 
+## Linters
+
+Scripts, docs and workflows have their own linters, each configured by a file at the root.
+`scripts/lint.sh` runs them: CI's `docs-scripts` job does, and so does `scripts/check.sh`, first,
+before its docs-only exit. A linter that isn't installed prints a skip line (`--require` makes it
+fail, as in CI). Name tools to run just those: `scripts/lint.sh shfmt shellcheck`.
+
+| Tool | Checks | Config |
+| --- | --- | --- |
+| [shellcheck](https://www.shellcheck.net) | every shell script in the tree (`*.sh`, `.githooks/*`, sh and bash shebangs), with a few optional checks on | `.shellcheckrc` |
+| [shfmt](https://github.com/mvdan/sh) | the same scripts' formatting: 2-space indents, `case` branches indented (`shfmt -w <file>` fixes it) | `.editorconfig` |
+| [lychee](https://lychee.cli.rs) | every Markdown link to a file in the tree, and the heading it points at; offline, so web links aren't fetched | `lychee.toml` |
+| [typos](https://github.com/crate-ci/typos) | misspellings in code, docs and file names (`typos -w` fixes them) | `_typos.toml` |
+| [actionlint](https://github.com/rhysd/actionlint) | the workflows, with shellcheck over their `run:` blocks | none |
+| [yamllint](https://yamllint.readthedocs.io) | every YAML file | `.yamllint.yml` |
+
+On macOS: `brew install shellcheck shfmt lychee typos-cli actionlint yamllint`. CI installs pinned
+versions in `.github/workflows/ci.yml`'s `docs-scripts` job; bump them there.
+
+Fix what a linter reports rather than silencing it. A word spelled that way on purpose goes in
+`_typos.toml` with the reason; a shellcheck finding that is wrong for one line gets a
+`# shellcheck disable=SCxxxx` directive on that line with a comment saying why. A file excluded
+in a config while another branch owns it carries a TODO naming that branch: drop the exclusion
+when it merges.
+
