@@ -800,7 +800,7 @@ def desktop_deps(crates):
             for ln in lines:
                 m = re.match(r'([A-Za-z0-9_-]+)\s*=\s*\{[^}]*path\s*=', ln)
                 if m:
-                    names.add(m.group(1))
+                    names.add(package_of(m.group(1), ln))
     out = set()
     for n in names:
         out |= closure(crates, n)
