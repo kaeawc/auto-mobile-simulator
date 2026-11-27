@@ -2,7 +2,7 @@
 
 Research for [#55](https://github.com/kaeawc/simee/issues/55): `emu -avd` on a Linux host with no
 hardware virtualization and no GPU, profiled phase by phase so the next performance work goes to
-the biggest cost. Status: in progress; sections are added as each step lands (1 environment, 2 reproduction, 3 profile done).
+the biggest cost. Status: in progress; sections are added as each step lands (1 environment, 2 reproduction, 3 profile done; 4 ranking in progress).
 
 ## 1. Environment
 
@@ -154,3 +154,74 @@ after boot completes (load average 17): system_server 86%, the ranchu composer H
 Settings 47%, SurfaceFlinger 30%, SystemUI 24%, the launcher 20%. In the idle window: system_server
 30%, SystemUI 12%, the composer HAL 10%, SurfaceFlinger 8.3%, the sensors HAL 6.2%, the launcher 4.3%.
 One guest thread's speed is what it waits on: system_server's boot is serial.
+
+## 4. Why the vCPUs are slow, and what was tried
+
+### The cause: every guest context switch flushes QEMU's TLB
+
+Section 3 puts about 50% of the vCPUs' busy time in finding the next translated block and in the
+soft TLB, and 30% in the guest's own code. QEMU's monitor (`info jit`, through an `emu` run whose
+QEMU is a wrapper script that adds `-monitor unix:...`) says why. Guest `/proc/stat` and QEMU's TLB
+counters, read together over the same 60 s of an idle guest, 4 minutes after boot complete:
+
+| Over 60 s, idle | Guest context switches (`ctxt`) | QEMU "TLB partial flushes" | "TLB elided flushes" |
+| --- | --- | --- | --- |
+| Count | 34,143 (564 a second) | 34,172 (570 a second) | 107,956 |
+
+One QEMU TLB flush per guest context switch, to within 0.1%, while "TLB full flushes" stays 0. Over
+31 s of launcher swipes (display socket): 64,319 context switches (2,111 a second) and about 136,000
+partial flushes. An x86 guest reloads CR3 when it switches address space; QEMU's TCG doesn't
+implement PCID (`-cpu max,+pcid` on QEMU 11.1.3: `warning: TCG doesn't support requested feature:
+CPUID[eax=01h].ECX.pcid`; the guest's `/proc/cpuinfo` has no `pcid` or `invpcid`), so each switch
+drops the vCPU's soft TLB, and with it the per-vCPU jump cache that `helper_lookup_tb_ptr` consults
+first. The next few hundred guest instructions refill both: `tlb_set_page_full`, `mmu_translate`,
+`probe_access_internal` and `qht_lookup_custom` are the symbols that fill the vCPU rows of section
+3. The guest isn't to blame either: its kernel reports `meltdown: Not affected`, so no page-table
+isolation adds CR3 writes on every syscall, and `mitigations=off` changed nothing in earlier
+measurements (docs/benchmarks.md).
+
+Two more `info jit` readings: the translation cache held 622 MB of its 1,053 MB 4 minutes after
+boot complete (1.00 M translated blocks) and 695 MB (1.12 M) after 31 s of swipes, and its flush
+count was 1 throughout: translating is a one-off cost after boot, and the cache has room for the
+workload of a short session. The guest's x86 CPU model is `QEMU TCG CPU version 2.5+` and
+the `max` model's features reach it as `-cpu` sets them.
+
+### What was tried
+
+Every run: the same AVD and image as section 2 (4 vCPUs, 1.5 GB, 720×1280), one boot per row unless
+said, the same swipe scripts. The baseline is the six boots of sections 2 and 3: boot 171.7 s median
+(161.0 to 179.3), launcher 186.6 s (176.2 to 197.2), idle 0.57 to 0.60 cores. Boot-to-boot spread
+is ±9 s, so a difference under about 10 s is not a result.
+
+| Configuration | Boot / launcher | Idle, 240–300 s | Launcher swipes over adb: frames, p90, janky | Result |
+| --- | --- | --- | --- | --- |
+| 3 vCPUs (`hw.cpu.ncore=3`) | 199.3 s / 226.1 s | 0.59 | 174, 200 ms, 98.3% | boot 16% later |
+| 2 vCPUs | 434.7 s / 518.5 s | 0.58 | 161, 150 ms, 98.1% | boot 2.5× longer |
+| QEMU confined to 3 cores (`taskset -c 0-2`), the renderer and emu on the 4th | 180.5 s / 203.0 s | 0.60 | 181, 200 ms, 97.2% | no change (within noise) |
+| `hw.lcd.vsync=30` | 180.8 s / 204.4 s | 0.55 | 175, 150 ms, 89.7% | idle 0.04 lower; fewer janky frames because there are fewer deadlines |
+| 540×960 at 240 dpi | 166.2 s / 196.4 s | 0.59 | 194, 150 ms, 94.3% | boot 3% earlier (noise); 8% more frames |
+| Animations off (window, transition, animator scales 0) | 166.0 s / 191.7 s | 0.59 | 110, 150 ms, 98.2% | no gain: fewer frames because nothing animates |
+| QEMU rebuilt with a 16× larger jump cache (`TB_JMP_CACHE_BITS` 12 → 16), 2 boots | 187.8 / 178.2 s; launcher 220.0 / 199.3 s | 0.82, 0.57 | 173, 150 ms, 97.1% and 182, 150 ms, 98.9% | slower: `tcg_flush_jmp_cache` took 0.13 to 0.17 cores (each flush clears 512 KB), the lookup share didn't fall (0.79 against 0.60 cores in boot) |
+| `-gpu lavapipe` (`LP_NUM_THREADS` 0 and 2) | emu exited 138 s and 66 s in | | | no boot, as docs/benchmarks.md records for the SDK's lavapipe |
+
+The first two rows say the guest is bound by single-thread speed, not by cores: 4 vCPUs are 54–65%
+busy, and still taking one away costs 16% and two cost 150%. The larger jump cache is the direct
+test of the flush explanation: more entries make each flush dearer and don't reduce the misses,
+because the flushes empty it either way.
+
+### savevm and loadvm
+
+On the software-mode VM (emu's devices attached, the guest at the launcher), the QEMU monitor's
+`savevm snap1` answers at once:
+
+```
+Error: State blocked by non-migratable device '0000:00:02.0/vhost-user-vsock'
+```
+
+`info snapshots`: "There is no snapshot available." QEMU names the first blocker; emu serves the
+vsock, the console, net, touch, keyboard, rotary and GPU devices over vhost-user and the goldfish
+address space and pipe over vfio-user, and the host-side state behind them (the renderer's
+contexts and resources, open pipe connections, adb sessions) lives in emu, not in QEMU. So a booted
+snapshot does not restore, and making one restore is work in emu, not a flag. Its payoff would be
+the largest of anything in this document: the 172 s boot would become the time to map and
+restore 1.5 GB.
