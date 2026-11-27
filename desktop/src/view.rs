@@ -18,14 +18,12 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let t = tok::theme(DARK);
     // The mark's clock: none under the system's reduced motion, so every mark rests.
     let clock = (!cx.system_reduced_motion()).then_some(s.mark_t);
-    let mut root = row().w_full().h_full().fill(t.bg).child(sidebar(s, t, clock)).child(stage(s, t, clock));
-    if s.showing_screen() {
-        root = root.child(match s.selected_info().map(|d| d.platform) {
-            Some(Platform::Android) => android_panel(s, t),
-            _ => crate::debug::panel(s, t),
-        });
-    }
-    root
+    let panel = s.showing_screen().then(|| match s.selected_info().map(|d| d.platform) {
+        Some(Platform::Android) => android_panel(s, t),
+        _ => crate::debug::panel(s, t),
+    });
+    // The panes' widths and visibility, and their drag handles.
+    crate::panes::layout(s, t, sidebar(s, t, clock), stage(s, t, clock), panel)
 }
 
 /// A toolbar button: an icon (labelled for accessibility), with visible text only for the primary

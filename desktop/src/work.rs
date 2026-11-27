@@ -99,9 +99,11 @@ impl<T> Drop for Worker<T> {
     }
 }
 
-/// Where a screenshot taken now is saved: the Desktop, or the temp dir without a home.
-pub fn screenshot_path() -> PathBuf {
-    let dir = std::env::var("HOME").map(|h| PathBuf::from(h).join("Desktop")).unwrap_or_else(|_| std::env::temp_dir());
+/// Where a screenshot taken now is saved: in `folder` (the settings' screenshot folder) while it
+/// is a directory, else the Desktop, or the temp dir without a home.
+pub fn screenshot_path(folder: Option<&std::path::Path>) -> PathBuf {
+    let desktop = || std::env::var("HOME").map(|h| PathBuf::from(h).join("Desktop")).unwrap_or_else(|_| std::env::temp_dir());
+    let dir = folder.filter(|f| f.is_dir()).map_or_else(desktop, std::path::Path::to_path_buf);
     let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
     unique_path(&dir, &format!("simee-{millis}"))
 }

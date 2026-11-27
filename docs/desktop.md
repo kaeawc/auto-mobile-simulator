@@ -127,6 +127,27 @@ right-hand panel has five debug tabs (Device, Network, Storage, Processes, Logs)
 stream from the emulator's display socket, and the panel shows the device and its live guest
 console.
 
+## Panes and settings
+
+The device list (left) and the panel (right) each have a drag handle on their inner edge:
+drag it to resize (180–420 points for the list, 280–600 for the panel, always leaving the
+screen at least 420), double-click it for the default width. ⌘⌥S hides and shows the list,
+⌘⌥I the panel. The headless scenes `sidebar-hidden`, `inspector-hidden`, `panes-hidden` and
+`panes-wide` show them.
+
+The window keeps its layout in a small versioned JSON file (`desktop/src/settings.rs`):
+`~/Library/Application Support/simee/desktop.json` on macOS, `$XDG_CONFIG_HOME/simee/` (or
+`~/.config/simee/`) on Linux, `%APPDATA%\simee\` on Windows; `SIMEE_DESKTOP_SETTINGS` names
+another file. It holds the panes' widths and visibility, the last selected device and debug tab,
+the window's size and position, the screenshot folder (`screenshot_dir`; the Desktop when unset
+or missing), and the device list's collapsed groups, hidden devices and tools, order and
+favorites for the organization work that follows. It is read at start and written half a second
+after changes stop, and again as the window closes, through a temporary file renamed over it.
+A file that can't be read, isn't valid, or comes from a newer version falls back to the
+defaults with one line in the status bar. It is copied aside first
+(`desktop.json.<why>-<secs>.bak`) and never deleted; if even the copy fails, nothing is saved
+that session. Headless runs never read or write it.
+
 ## Screenshot preview
 
 ⌘S, or the toolbar's Screenshot button, saves the device's screen to the Desktop as a PNG, as
