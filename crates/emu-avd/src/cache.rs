@@ -112,21 +112,24 @@ fn read_text(path: &Path, len: u64) -> std::io::Result<String> {
 /// The names `make` lists in the directory `dir`, from memory while the directory's stamp is
 /// unchanged. Creating, deleting or renaming an entry changes its mtime and ctime, which is all a
 /// listing of names depends on; a directory changed within [`SETTLE`] of the read isn't remembered.
-pub(crate) fn listing(dir: &Path, make: impl FnOnce() -> Vec<String>) -> Vec<String> {
+/// `make` says with its names whether they can be remembered: a read that failed in any way, or a
+/// listing of something the directory's stamp doesn't cover, is used once and forgotten, as an
+/// unreadable file is.
+pub(crate) fn listing(dir: &Path, make: impl FnOnce() -> (Vec<String>, bool)) -> Vec<String> {
     listing_at(dir, SystemTime::now, make)
 }
 
-fn listing_at(dir: &Path, clock: impl FnOnce() -> SystemTime, make: impl FnOnce() -> Vec<String>) -> Vec<String> {
-    let Some(now) = std::fs::metadata(dir).ok().filter(std::fs::Metadata::is_dir).as_ref().and_then(stamp) else { return make() };
+fn listing_at(dir: &Path, clock: impl FnOnce() -> SystemTime, make: impl FnOnce() -> (Vec<String>, bool)) -> Vec<String> {
+    let Some(now) = std::fs::metadata(dir).ok().filter(std::fs::Metadata::is_dir).as_ref().and_then(stamp) else { return make().0 };
     if let Some(known) = listings().get(dir).filter(|(s, _)| *s == now) {
         return known.1.to_vec();
     }
     let read_at = clock();
     #[cfg(test)]
     reads::count(dir);
-    let names = make();
+    let (names, cacheable) = make();
     let mut table = listings();
-    if now.settled(read_at) {
+    if cacheable && now.settled(read_at) {
         if table.len() >= MAX_ENTRIES {
             table.clear();
         }
@@ -280,8 +283,9 @@ mod tests {
             assert_eq!(get_at(&f, newest + SETTLE).as_deref(), Some("1"));
         }
         assert_eq!(reads::of(&f), 4, "one more read, then remembered");
-        // A same-size edit that puts the old mtime back moved the ctime: the 5th read, which sees
-        // it and, the ctime being within the grain of the read, doesn't remember it.
+        // A same-size rewrite with its mtime set 10 s earlier than the rewrite's own changes the
+        // mtime and the ctime: the 5th read sees it and, the ctime being within the grain of the
+        // read (the real clock), doesn't remember it.
         std::fs::write(&f, "a=2\n").expect("rewrite");
         set_mtime(&f, mtime(&f) - Duration::from_secs(10));
         assert_eq!(get_at(&f, SystemTime::now()).as_deref(), Some("2"));
@@ -309,7 +313,7 @@ mod tests {
                         .map(|e| e.file_name().to_string_lossy().into_owned())
                         .collect();
                     names.sort();
-                    names
+                    (names, true)
                 },
             )
         };
@@ -334,6 +338,30 @@ mod tests {
         assert_eq!(list(later()), Vec::<String>::new());
     }
 
+    /// A read that failed (out of file handles, say) lists nothing this time: the directory's stamp
+    /// didn't change, so remembering it would make it nothing until the directory does.
+    #[test]
+    fn a_listing_whose_read_failed_is_not_remembered() {
+        let d = dir("listing-failed");
+        std::fs::write(d.join("a.ini"), "").expect("a");
+        let failed = std::cell::Cell::new(true);
+        let list = || {
+            listing_at(&d, later, || {
+                // The injected failure: the same stamp, no names, `cacheable` false.
+                if failed.get() { (Vec::new(), false) } else { (vec!["a".to_owned()], true) }
+            })
+        };
+        for _ in 0..3 {
+            assert!(list().is_empty());
+        }
+        assert_eq!(reads::of(&d), 3, "asked again each time");
+        failed.set(false);
+        assert_eq!(list(), ["a"], "the next read isn't answered with the failure");
+        assert_eq!(list(), ["a"]);
+        assert_eq!(reads::of(&d), 4, "then remembered");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     /// Changed within two seconds of the read: not remembered, whatever the runner's speed.
     #[test]
     fn a_directory_changed_within_two_seconds_of_the_read_is_listed_every_time() {
@@ -341,7 +369,7 @@ mod tests {
         std::fs::write(d.join("a.ini"), "").expect("a");
         let meta = std::fs::metadata(&d).expect("meta");
         let changed = SystemTime::UNIX_EPOCH + Duration::new(meta.ctime() as u64, meta.ctime_nsec() as u32);
-        let list = |now: SystemTime| listing_at(&d, || now, || vec!["a".to_owned()]);
+        let list = |now: SystemTime| listing_at(&d, || now, || (vec!["a".to_owned()], true));
         for _ in 0..3 {
             list(changed.max(mtime(&d)) + Duration::from_secs(1));
         }

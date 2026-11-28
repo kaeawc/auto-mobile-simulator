@@ -2569,6 +2569,42 @@ mod tests {
         assert_eq!(f.android.device("Pixel").map(|d| d.info.udid), Ok("pixel".into()), "the scan still matches names loosely");
     }
 
+    /// Where a listing's time goes, in this process: `scripts/bench/android-resolve.py --make-home`
+    /// says how to run it (docs/benchmarks.md "Android device resolution").
+    #[test]
+    #[ignore = "a benchmark: needs SIMEE_BENCH_SDK and SIMEE_BENCH_AVD_HOME"]
+    fn listing_cost() {
+        let (Some(sdk), Some(home)) = (std::env::var_os("SIMEE_BENCH_SDK"), std::env::var_os("SIMEE_BENCH_AVD_HOME")) else {
+            panic!("set SIMEE_BENCH_SDK and SIMEE_BENCH_AVD_HOME (scripts/bench/android-resolve.py --make-home DIR)");
+        };
+        let android = Android::new(Env { sdk_root: Some(sdk.into()), avd_home: home.into() });
+        let measure = |label: &str, f: &dyn Fn()| {
+            f();
+            let mut ms: Vec<f64> = (0..1000)
+                .map(|_| {
+                    let start = Instant::now();
+                    f();
+                    start.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect();
+            ms.sort_by(f64::total_cmp);
+            println!("{label}: p50 {:.3} ms, p95 {:.3} ms", ms[500], ms[950]);
+        };
+        let avds = android.listed();
+        let running = android.running_among(&avds);
+        println!("{} AVDs", avds.len());
+        measure("list the home", &|| drop(android.env.list_avds()));
+        measure("resolve each AVD's directory", &|| drop(android.listed()));
+        measure("look at each AVD's lock", &|| drop(android.running_among(&avds)));
+        measure("describe each AVD", &|| {
+            for (name, dir) in &avds {
+                drop(android.describe_in(name, dir.as_deref(), &running));
+            }
+        });
+        measure("devices (all of it)", &|| drop(android.devices()));
+        measure("candidates of booted", &|| drop(android.candidates("booted")));
+    }
+
     #[test]
     fn booted_loads_only_the_running_avds_and_any_named_like_it() {
         let f = fixture("candidates");

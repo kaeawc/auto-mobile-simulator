@@ -104,7 +104,8 @@ is asked about again; an emulator is never listed from memory alone, as every ca
 and checks the PID is alive. The parsed pointer and `config.ini` of each AVD are remembered by
 (path, mtime, ctime, size, inode) in `emu-avd` (the change time catches a same-size file put back with its old mtime), except files changed in the last 2 s, so resolving a
 device reads no AVD file that hasn't changed. The listing of the AVD home is remembered too, by the
-directory's own stamp, which an entry that comes, goes or is renamed over changes.
+directory's own stamp, which an entry that comes, goes or is renamed over changes; a listing
+with a link among the pointers or a failed read is not remembered.
 `simee info` shows `running.emulator` (`stock` or `simee`), the serial, ports and PID. What needs
 simee's `emu` (touch, keys, wheel and frames over `display.sock`, the touchpad) says so and names
 the fix instead of failing on a missing socket. `shutdown` interrupts the qemu process

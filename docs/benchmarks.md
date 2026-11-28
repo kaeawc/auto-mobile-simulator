@@ -861,17 +861,25 @@ exact name is one `stat` of its pointer instead of listing the home; `booted` lo
 running AVDs' configs.
 
 What is left, measured. Kept `devices` is still about 2 ms (p50 2.01 ms with nothing running and
-1.93 with 2 running, p95 2.4 and 2.6; it was 2.01 and 2.20 before the listing work below). Where
-the time goes, in the server process on the same VM (p50 over 1000 calls): `devices` took 0.60 ms
-and takes 0.45 ms now; its 44 AVDs cost ~0.17 ms to resolve (pointer and directory, 2 `stat`s
-each), ~0.07 ms for the lock of each (an `open`), and ~0.24 ms to describe (config `stat`, image
-`stat`, the profile and the `DeviceInfo`). The rest of the 2 ms is the 10.7 KB reply: a call that
-does the same work and returns `[]` (`devices` with `booted`) takes 0.6–0.7 ms over the socket,
-and `help`, which computes in 0.1 ms, takes ~0.9 ms to arrive on this VM. So the listing is under
-1 ms of server work and the call is not; getting the call under 1 ms here is a matter of the
-connection's reply path (`crates/sim-api/src/lib.rs`), which was not changed. The listing's
-floor with exact validation is 5 system calls per AVD (pointer, directory, config, image, lock).
-`devices` with `booted` is 0.63 / 0.74 ms (none / 2 running), and `info` of `booted` 0.44 / 0.35 ms.
+1.93 with 2 running, p95 2.4 and 2.6; 2.01 and 2.20 on the build before the listing work below,
+which is no difference at this sample size: the per-round p50s of the same build range over
+0.5–2.3 ms, so none of the kept-connection rows moved by more than noise). Where the time goes in
+the server process on the same VM, p50 over 1000 calls, from the `listing_cost` test
+(`python3 -I scripts/bench/android-resolve.py --make-home DIR`, wait 3 s, then
+`SIMEE_BENCH_SDK=DIR/sdk SIMEE_BENCH_AVD_HOME=DIR/avd cargo test --release -p simee-android
+listing_cost -- --ignored --nocapture`): listing the home 0.005 ms, resolving each of the 44 AVDs'
+pointer and directory 0.11 ms, each one's lock 0.07 ms, describing each (config `stat`, image
+`stat`, the profile and the `DeviceInfo`) 0.23 ms, the whole `devices` 0.44 ms. The same test cut
+to `list_avds` and `devices` on the build before (`main` at #383, a copy of the test) gives 0.05–0.10
+and 0.59–0.62 ms, so the listing work is worth about 0.15 ms in the server. The rest of the 2 ms
+is the 10.7 KB reply: a call that does the same work and returns `[]` (`devices` with `booted`)
+takes 0.6–0.7 ms over the socket, and `help`, which computes in 0.1 ms, takes ~0.9 ms to arrive on
+this VM. So the listing is under 1 ms of server work and the call is not; getting the call under
+1 ms here is a matter of the connection's reply path (`crates/sim-api/src/lib.rs`), which was not
+changed. The listing's floor with exact validation is 5 system calls per AVD (pointer, directory,
+config, image, lock). The remembered listing of the home is not used when a pointer is a link or
+any read failed. `devices` with `booted` is 0.63 / 0.74 ms (none / 2 running) and `info` of
+`booted` 0.44 / 0.35 ms, also within noise of the build before.
 A cold one-shot `list` or fuzzy name
 reads every AVD's two files (about 700 system calls for 44 AVDs, ~5 ms over the floor); an on-disk
 cache would still `stat` each file, and wasn't built. With nothing running, the one-shot exact-name
