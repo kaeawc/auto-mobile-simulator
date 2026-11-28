@@ -218,6 +218,9 @@ impl Instance {
             if choice.guest_fallback {
                 eprintln!("{}", emu_avd::gpu::GUEST_FALLBACK_NOTICE);
             }
+            if let Some(n) = choice.notice {
+                eprintln!("{n}");
+            }
             let icd = match choice.backend {
                 emu_avd::gpu::Backend::SwiftShader => emu_gfxstream::Icd::SwiftShader,
                 emu_avd::gpu::Backend::Lavapipe => emu_gfxstream::Icd::Lavapipe,
