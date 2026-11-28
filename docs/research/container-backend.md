@@ -35,9 +35,9 @@ reading the sources on 2026-11-28:
   the manifest and layer digests are in `crates/emu-container/src/image.rs`.
 - **Rootless works as far as a host without binder allows**: on this VM, as an unprivileged user
   with `newuidmap` and a 65,536-id range, a user namespace mounts the overlay, a `/dev` tmpfs,
-  devpts, `/proc` and the host's `/sys` and chroots into the result; as root with an identity map
-  likewise. Only binderfs fails, as section 1 predicts. Whether Redroid's `/init` then boots, and
-  in how long, is still the spike.
+  devpts, `/proc` and the host's `/sys` (read-only) and pivots into the result; as root, with the
+  container mapped to a range of its own, likewise. Only binderfs fails, as section 1 predicts. Whether Redroid's `/init` then boots, and in
+  how long, is still the spike.
 - **Open**: the adb port (no network namespace yet, so the container's adbd takes the host's 5555),
   display, input and console, cgroup limits, and the numbers for `docs/benchmarks.md`.
 

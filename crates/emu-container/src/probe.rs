@@ -23,6 +23,9 @@ pub trait HostView {
     fn euid(&self) -> u32;
     /// The CPU architecture as Rust names it (`x86_64`, `aarch64`).
     fn arch(&self) -> String;
+    /// The device names a binderfs mount holds once mounted (in a throwaway user namespace, so no
+    /// privilege is needed): `binder-control` is not one. `None` when that couldn't be tried.
+    fn binderfs_devices(&self) -> Option<Vec<String>>;
 }
 
 /// One thing a container needs from the host.
@@ -169,7 +172,7 @@ pub fn probe(view: &dyn HostView) -> Report {
             cgroup_limits(view),
             user_namespaces(view),
             subordinate_ids(view),
-            overlayfs(view, &filesystems),
+            overlayfs(&release, &filesystems),
             dma_buf_heaps(view),
         ],
     }
@@ -180,11 +183,31 @@ fn has_filesystem(filesystems: &str, name: &str) -> bool {
     filesystems.lines().any(|l| l.split_whitespace().last() == Some(name))
 }
 
+const BINDER_DEVICES: [&str; 3] = ["binder", "hwbinder", "vndbinder"];
+
+/// Loading the module with the devices it should create, and keeping that across reboots: the
+/// module is loaded by `modules-load.d`, and its `devices=` option is a `modprobe.d` line.
 const BINDER_MODPROBE: &str = "sudo modprobe binder_linux devices=binder,hwbinder,vndbinder";
+const BINDER_PERSIST: &str = "to keep it across reboots, put `binder_linux` in /etc/modules-load.d/binder.conf and `options binder_linux devices=binder,hwbinder,vndbinder` in /etc/modprobe.d/binder.conf";
 
 fn binder(view: &dyn HostView, filesystems: &str, release: &str) -> Check {
     if has_filesystem(filesystems, "binder") {
-        return ok(Feature::Binder, "binderfs is registered");
+        return match view.binderfs_devices() {
+            // A binderfs mounts with the devices the kernel was told to create. A plain
+            // `modprobe binder_linux` (Ubuntu) tells it none, and Android has nothing to talk to.
+            Some(have) if !BINDER_DEVICES.iter().all(|d| have.iter().any(|h| h == d)) => missing(
+                Feature::Binder,
+                format!(
+                    "binderfs is registered but a test mount holds {} (needs binder, hwbinder and vndbinder)",
+                    if have.is_empty() { "no devices".to_string() } else { have.join(", ") }
+                ),
+                format!(
+                    "unload the module and reload it with its devices: `sudo modprobe -r binder_linux && {BINDER_MODPROBE}` ({BINDER_PERSIST}); built into the kernel, boot with binder.devices=binder,hwbinder,vndbinder"
+                ),
+            ),
+            Some(_) => ok(Feature::Binder, "binderfs is registered and mounts with binder, hwbinder and vndbinder"),
+            None => ok(Feature::Binder, "binderfs is registered (its device list couldn't be test-mounted here; the launcher checks it)"),
+        };
     }
     let module = ["", ".zst", ".xz", ".gz"]
         .iter()
@@ -193,7 +216,7 @@ fn binder(view: &dyn HostView, filesystems: &str, release: &str) -> Check {
         return missing(
             Feature::Binder,
             "binderfs isn't registered, but this kernel ships the binder_linux module",
-            format!("{BINDER_MODPROBE} (add it to /etc/modules-load.d/ to keep it across reboots)"),
+            format!("{BINDER_MODPROBE} ({BINDER_PERSIST})"),
         );
     }
     if view.exists(&format!("/lib/modules/{release}")) {
@@ -273,22 +296,23 @@ fn user_namespaces(view: &dyn HostView) -> Check {
     if first_line(view, "/proc/sys/user/max_user_namespaces").as_deref() == Some("0") {
         return missing(Feature::UserNamespaces, "user.max_user_namespaces is 0", "sudo sysctl -w user.max_user_namespaces=15000");
     }
-    let root = view.euid() == 0;
-    if !root && first_line(view, "/proc/sys/kernel/unprivileged_userns_clone").as_deref() == Some("0") {
+    // Root is held to these too: the container's process drops to its own unprivileged id before
+    // it creates the namespace, so root's exemption from them wouldn't apply to it.
+    if first_line(view, "/proc/sys/kernel/unprivileged_userns_clone").as_deref() == Some("0") {
         return missing(
             Feature::UserNamespaces,
-            "kernel.unprivileged_userns_clone is 0, so only root may create a user namespace",
-            "sudo sysctl -w kernel.unprivileged_userns_clone=1, or run as root",
+            "kernel.unprivileged_userns_clone is 0, so only a process with CAP_SYS_ADMIN may create a user namespace, and the container's process runs without it",
+            "sudo sysctl -w kernel.unprivileged_userns_clone=1",
         );
     }
-    if !root && first_line(view, "/proc/sys/kernel/apparmor_restrict_unprivileged_userns").as_deref() == Some("1") {
+    if first_line(view, "/proc/sys/kernel/apparmor_restrict_unprivileged_userns").as_deref() == Some("1") {
         return missing(
             Feature::UserNamespaces,
             "AppArmor strips capabilities from unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=1), so mounts inside one fail",
-            "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0, or run as root",
+            "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
         );
     }
-    ok(Feature::UserNamespaces, if root { "available (running as root)" } else { "available to unprivileged users" })
+    ok(Feature::UserNamespaces, "available to unprivileged processes")
 }
 
 /// The first `/etc/subuid`-style line for `uid` or its login name: `(start, count)`.
@@ -314,7 +338,9 @@ const MIN_SUBORDINATE_IDS: u32 = 65536;
 fn subordinate_ids(view: &dyn HostView) -> Check {
     let euid = view.euid();
     if euid == 0 {
-        return ok(Feature::SubordinateIds, "running as root: every uid maps to itself");
+        // Root writes the maps itself and never maps container root to host root: it takes its own
+        // subordinate range or a dedicated one (launch::IdMap::for_host).
+        return ok(Feature::SubordinateIds, "running as root: the container's ids map to a range of their own, not to root's");
     }
     for tool in ["newuidmap", "newgidmap"] {
         if !view.on_path(tool) {
@@ -347,15 +373,33 @@ fn subordinate_ids(view: &dyn HostView) -> Check {
     ok(Feature::SubordinateIds, "newuidmap, newgidmap and subordinate ranges are set up")
 }
 
-fn overlayfs(_view: &dyn HostView, filesystems: &str) -> Check {
-    if has_filesystem(filesystems, "overlay") {
-        ok(Feature::Overlayfs, "overlay is registered")
-    } else {
-        missing(
+/// The oldest kernel whose overlayfs can be mounted inside a user namespace (`userxattr`).
+pub const OVERLAY_USERNS_KERNEL: (u32, u32) = (5, 11);
+
+/// `6.8.0-147-generic` -> (6, 8).
+pub fn kernel_version(release: &str) -> Option<(u32, u32)> {
+    let mut it = release.trim().split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty());
+    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+}
+
+fn overlayfs(release: &str, filesystems: &str) -> Check {
+    if !has_filesystem(filesystems, "overlay") {
+        return missing(
             Feature::Overlayfs,
             "overlay isn't in /proc/filesystems",
             "sudo modprobe overlay (or boot a kernel with CONFIG_OVERLAY_FS=y)",
-        )
+        );
+    }
+    match kernel_version(release) {
+        Some(v) if v < OVERLAY_USERNS_KERNEL => missing(
+            Feature::Overlayfs,
+            format!(
+                "overlay is registered, but kernel {}.{} can't mount it in a user namespace (the `userxattr` option arrived in Linux {}.{})",
+                v.0, v.1, OVERLAY_USERNS_KERNEL.0, OVERLAY_USERNS_KERNEL.1
+            ),
+            format!("boot Linux {}.{} or newer", OVERLAY_USERNS_KERNEL.0, OVERLAY_USERNS_KERNEL.1),
+        ),
+        _ => ok(Feature::Overlayfs, "overlay is registered"),
     }
 }
 
@@ -407,6 +451,29 @@ impl HostView for FsView {
     fn arch(&self) -> String {
         std::env::consts::ARCH.to_string()
     }
+
+    /// Mounts binderfs in a throwaway user namespace (`unshare`) and lists it.
+    fn binderfs_devices(&self) -> Option<Vec<String>> {
+        let dir = std::env::temp_dir().join(format!("simee-binderfs-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok()?;
+        let out = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "--", "sh", "-c", "mount -t binder binder \"$1\" && ls \"$1\"", "sh"])
+            .arg(&dir)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok();
+        let _ = std::fs::remove_dir(&dir);
+        let out = out.filter(|o| o.status.success())?;
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && *l != "binder-control" && *l != "features")
+                .map(String::from)
+                .collect(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -423,6 +490,8 @@ pub(crate) mod fake {
         pub memfd: bool,
         pub euid: u32,
         pub arch: String,
+        /// What a test mount of binderfs holds; `None` is "couldn't be tried".
+        pub binderfs: Option<Vec<String>>,
     }
 
     impl FakeView {
@@ -446,14 +515,31 @@ pub(crate) mod fake {
         /// A host where everything a container needs is there, as an Ubuntu 24.04 cloud VM with
         /// `linux-modules-extra` loaded: root, binderfs registered, unified cgroups.
         pub fn container_host() -> Self {
-            FakeView { memfd: true, arch: "x86_64".into(), ..Default::default() }
-                .file("/proc/filesystems", "nodev\tsysfs\nnodev\tproc\nnodev\tcgroup2\nnodev\toverlay\nnodev\tbinder\n\text4\n")
-                .file("/proc/sys/kernel/osrelease", "6.8.0-147-generic\n")
-                .file("/sys/fs/cgroup/cgroup.controllers", "cpuset cpu io memory hugetlb pids rdma misc\n")
-                .path("/proc/self/ns/user")
-                .file("/proc/sys/user/max_user_namespaces", "63704\n")
-                .path("/dev/dma_heap")
-                .path("/dev/dma_heap/system")
+            FakeView {
+                memfd: true,
+                arch: "x86_64".into(),
+                binderfs: Some(["binder", "hwbinder", "vndbinder"].map(String::from).to_vec()),
+                ..Default::default()
+            }
+            .file("/proc/filesystems", "nodev\tsysfs\nnodev\tproc\nnodev\tcgroup2\nnodev\toverlay\nnodev\tbinder\n\text4\n")
+            .file("/proc/sys/kernel/osrelease", "6.8.0-147-generic\n")
+            .file("/sys/fs/cgroup/cgroup.controllers", "cpuset cpu io memory hugetlb pids rdma misc\n")
+            .path("/proc/self/ns/user")
+            .file("/proc/sys/user/max_user_namespaces", "63704\n")
+            .path("/dev/dma_heap")
+            .path("/dev/dma_heap/system")
+            .path("/proc/kcore")
+            .path("/proc/keys")
+            .path("/proc/timer_list")
+            .path("/proc/sched_debug")
+            .path("/proc/acpi")
+            .path("/proc/scsi")
+            .path("/proc/bus")
+            .path("/proc/fs")
+            .path("/proc/irq")
+            .path("/proc/sys")
+            .path("/proc/sysrq-trigger")
+            .path("/sys/firmware")
         }
     }
 
@@ -475,6 +561,9 @@ pub(crate) mod fake {
         }
         fn arch(&self) -> String {
             self.arch.clone()
+        }
+        fn binderfs_devices(&self) -> Option<Vec<String>> {
+            self.binderfs.clone()
         }
     }
 }
@@ -604,23 +693,20 @@ mod tests {
         no_ns.paths.remove("/proc/self/ns/user");
         assert!(off(no_ns).contains("CONFIG_USER_NS"));
         assert!(off(FakeView::container_host().file("/proc/sys/user/max_user_namespaces", "0\n")).contains("max_user_namespaces=15000"));
-        assert!(
-            off(FakeView::container_host().euid(1000).file("/proc/sys/kernel/unprivileged_userns_clone", "0\n"))
-                .contains("unprivileged_userns_clone=1")
-        );
-        assert!(
-            off(FakeView::container_host().euid(1000).file("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "1\n"))
-                .contains("apparmor_restrict_unprivileged_userns=0")
-        );
-    }
-
-    #[test]
-    fn root_is_not_held_to_the_unprivileged_user_namespace_sysctls() {
-        let v = FakeView::container_host()
-            .file("/proc/sys/kernel/unprivileged_userns_clone", "0\n")
-            .file("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "1\n");
-        assert!(probe(&v).get(Feature::UserNamespaces).is_some_and(Check::ok));
-        // but max_user_namespaces = 0 stops root too (checked above)
+        // Root is held to the unprivileged-namespace sysctls as well: its container runs as a
+        // plain user, so they apply to it.
+        for euid in [0, 1000] {
+            assert!(
+                off(FakeView::container_host().euid(euid).file("/proc/sys/kernel/unprivileged_userns_clone", "0\n"))
+                    .contains("unprivileged_userns_clone=1"),
+                "euid {euid}"
+            );
+            assert!(
+                off(FakeView::container_host().euid(euid).file("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "1\n"))
+                    .contains("apparmor_restrict_unprivileged_userns=0"),
+                "euid {euid}"
+            );
+        }
     }
 
     fn unprivileged() -> FakeView {
@@ -678,6 +764,67 @@ mod tests {
             }
         }
         assert!(missing >= 6, "{:#?}", r.lines());
+    }
+
+    #[test]
+    fn a_binderfs_that_mounts_empty_is_not_usable() {
+        // Ubuntu's plain `modprobe binder_linux`: registered, but no devices to talk to.
+        let mut v = FakeView::container_host();
+        v.binderfs = Some(vec![]);
+        let r = probe(&v);
+        assert!(!r.usable());
+        let Status::Missing { why, fix } = status(&r, Feature::Binder) else { panic!("binder should be missing") };
+        assert!(why.contains("no devices"), "{why}");
+        assert!(fix.contains("modprobe -r binder_linux") && fix.contains("binder.devices="), "{fix}");
+        // A partial set is no better.
+        v.binderfs = Some(vec!["binder".into()]);
+        let Status::Missing { why, .. } = status(&probe(&v), Feature::Binder).clone() else { panic!("binder should be missing") };
+        assert!(why.contains("holds binder (needs"), "{why}");
+    }
+
+    #[test]
+    fn binder_devices_that_cant_be_test_mounted_pass_on_registration_and_say_so() {
+        let mut v = FakeView::container_host();
+        v.binderfs = None;
+        let r = probe(&v);
+        assert!(r.usable());
+        assert!(r.get(Feature::Binder).is_some_and(|c| c.line().contains("couldn't be test-mounted")));
+    }
+
+    #[test]
+    fn the_modprobe_fix_puts_devices_in_modprobe_d_and_the_module_in_modules_load_d() {
+        let v = FakeView::container_host()
+            .file("/proc/filesystems", "nodev\toverlay\n")
+            .path("/lib/modules/6.8.0-147-generic/kernel/drivers/android/binder_linux.ko.zst");
+        let fix = fix_of(&probe(&v), Feature::Binder);
+        assert!(fix.contains("`binder_linux` in /etc/modules-load.d/binder.conf"), "{fix}");
+        assert!(fix.contains("`options binder_linux devices=binder,hwbinder,vndbinder` in /etc/modprobe.d/binder.conf"), "{fix}");
+        assert!(!fix.contains("devices=binder,hwbinder,vndbinder` in /etc/modules-load.d"), "{fix}");
+    }
+
+    #[test]
+    fn kernel_releases_parse_to_major_minor() {
+        assert_eq!(kernel_version("6.8.0-147-generic\n"), Some((6, 8)));
+        assert_eq!(kernel_version("5.11.0"), Some((5, 11)));
+        assert_eq!(kernel_version("6.1.189"), Some((6, 1)));
+        assert_eq!(kernel_version(""), None);
+        assert_eq!(kernel_version("generic"), None);
+    }
+
+    #[test]
+    fn overlay_in_a_user_namespace_needs_linux_5_11() {
+        let on = |rel: &str| probe(&FakeView::container_host().file("/proc/sys/kernel/osrelease", rel));
+        for old in ["5.4.0-170-generic", "5.10.200", "4.19.0"] {
+            let r = on(old);
+            assert!(!r.usable(), "{old}");
+            let fix = fix_of(&r, Feature::Overlayfs);
+            assert!(fix.contains("5.11"), "{fix}");
+        }
+        for fine in ["5.11.0", "5.15.0-1", "6.8.0-147-generic", "7.0.0"] {
+            assert!(on(fine).get(Feature::Overlayfs).is_some_and(Check::ok), "{fine}");
+        }
+        // An unparsable release doesn't block on a guess.
+        assert!(on("custom").get(Feature::Overlayfs).is_some_and(Check::ok));
     }
 
     #[test]

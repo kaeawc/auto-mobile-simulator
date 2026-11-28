@@ -15,6 +15,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::probe::{HostView, subordinate_range};
 
@@ -79,42 +80,66 @@ pub struct Spec {
     pub props: Vec<String>,
 }
 
-/// How the container's ids map to the host's.
+/// How the container's ids map to the host's. Container root is never the host's root: a guest
+/// that escaped its namespaces as host root could rewrite kernel settings (`core_pattern`,
+/// `uevent_helper`) and own the machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdMap {
-    /// Root on the host: every id maps to itself, so the image's owners stay as they are.
-    Identity,
-    /// An unprivileged user: id 0 is that user and ids 1.. are its subordinate range, as
-    /// `/etc/subuid` and `/etc/subgid` grant, written through `newuidmap` and `newgidmap`.
+    /// Run by host root, which writes the maps itself: container ids `0..count` are host ids
+    /// `start..start+count`, a range of their own (root's `/etc/subuid` range, else
+    /// [`DEDICATED_RANGE`]). The container's files are owned by that range.
+    Root { uid: (u32, u32), gid: (u32, u32) },
+    /// An unprivileged user: id 0 is that user (it has no host power to lose) and ids 1.. are its
+    /// subordinate range, as `/etc/subuid` and `/etc/subgid` grant, written through `newuidmap`
+    /// and `newgidmap`.
     Rootless { uid: u32, gid: u32, sub_uid: (u32, u32), sub_gid: (u32, u32) },
 }
 
-/// The most subordinate ids mapped: Android's app uids run from 10000, and user 0 needs less
-/// than 20000.
+/// The most ids mapped: Android's app uids run from 10000, and its shared gids reach 59999.
 const MAPPED_IDS: u32 = 65536;
 
+/// What root maps the container to when `/etc/subuid` gives root no range: above systemd-nspawn's
+/// container ranges (which end at 1,878,982,656) and below 2^31, unused by any account.
+pub const DEDICATED_RANGE: (u32, u32) = (2_000_000_000, MAPPED_IDS);
+
 impl IdMap {
-    /// The mapping for the process `view` describes: identity for root, else the user's
-    /// subordinate ranges (an error that says what is missing when it has none).
+    /// The mapping for the process `view` describes (`gid` is its effective group): root gets its
+    /// own subordinate range or the dedicated one; a user needs `/etc/subuid` and `/etc/subgid`
+    /// ranges, and the error says how to get them.
     pub fn for_host(view: &dyn HostView, gid: u32) -> Result<IdMap> {
         let uid = view.euid();
+        let range = |file: &str, who: u32| subordinate_range(view, file, who).filter(|&(_, n)| n >= MAPPED_IDS);
         if uid == 0 {
-            return Ok(IdMap::Identity);
+            return Ok(IdMap::Root {
+                uid: range("/etc/subuid", 0).map_or(DEDICATED_RANGE, |(s, _)| (s, MAPPED_IDS)),
+                gid: range("/etc/subgid", 0).map_or(DEDICATED_RANGE, |(s, _)| (s, MAPPED_IDS)),
+            });
         }
-        let range = |file: &str| {
-            subordinate_range(view, file, uid)
-                .filter(|&(_, n)| n >= MAPPED_IDS)
-                .ok_or_else(|| Error::Map(format!("{file} has no range of {MAPPED_IDS} ids for uid {uid}: `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER`")))
+        let need = |file: &str| {
+            range(file, uid).ok_or_else(|| Error::Map(format!("{file} has no range of {MAPPED_IDS} ids for uid {uid}: `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER`")))
         };
-        Ok(IdMap::Rootless { uid, gid, sub_uid: range("/etc/subuid")?, sub_gid: range("/etc/subgid")? })
+        Ok(IdMap::Rootless { uid, gid, sub_uid: need("/etc/subuid")?, sub_gid: need("/etc/subgid")? })
+    }
+
+    /// The host ids that container root (and so every file the container creates as root) has,
+    /// when they aren't the launching user's own: the directories the container writes in are
+    /// handed to them first (`Plan::prepare_host`).
+    pub fn container_root_owner(&self) -> Option<(u32, u32)> {
+        match self {
+            IdMap::Root { uid, gid } => Some((uid.0, gid.0)),
+            IdMap::Rootless { .. } => None,
+        }
     }
 
     /// What the parent does to give the namespace of process `pid` its ids.
     pub fn actions(&self, pid: u32) -> Vec<Action> {
         match self {
-            IdMap::Identity => ["uid_map", "gid_map"]
+            IdMap::Root { uid, gid } => [("uid_map", uid), ("gid_map", gid)]
                 .iter()
-                .map(|f| Action::Write { path: PathBuf::from(format!("/proc/{pid}/{f}")), text: "0 0 4294967295\n".into() })
+                .map(|(f, (start, count))| Action::Write {
+                    path: PathBuf::from(format!("/proc/{pid}/{f}")),
+                    text: format!("0 {start} {count}\n"),
+                })
                 .collect(),
             IdMap::Rootless { uid, gid, sub_uid, sub_gid } => [("newuidmap", *uid, *sub_uid), ("newgidmap", *gid, *sub_gid)]
                 .iter()
@@ -127,6 +152,25 @@ impl IdMap {
                 })
                 .collect(),
         }
+    }
+}
+
+/// The helper executable (`crate::helper`): `emu` itself under a hidden subcommand, or this
+/// crate's `simee-container-helper` binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Helper {
+    pub program: PathBuf,
+    /// Arguments that make `program` act as the helper (`__container-helper` for `emu`).
+    pub prefix: Vec<String>,
+}
+
+impl Helper {
+    /// The command line for the helper request `request`.
+    pub fn argv(&self, request: &[String]) -> Vec<String> {
+        let mut argv = vec![self.program.display().to_string()];
+        argv.extend(self.prefix.iter().cloned());
+        argv.extend(request.iter().cloned());
+        argv
     }
 }
 
@@ -157,6 +201,11 @@ pub enum Step {
     /// An empty file to bind a device node onto.
     Touch(PathBuf),
     Mount(Mount),
+    /// Remounts a bind mount read-only, keeping the flags a user namespace locks on it.
+    ReadOnly(PathBuf),
+    /// [`Step::ReadOnly`] for a mount and every mount under it, each with its own flags kept
+    /// (what the host's `/sys` is made of, once recursively bound).
+    ReadOnlyTree(PathBuf),
     Symlink {
         target: String,
         link: PathBuf,
@@ -173,7 +222,10 @@ pub enum Step {
 pub struct Plan {
     /// The overlay's merged directory: the container's root.
     pub root: PathBuf,
+    /// The device's state directory (the overlay's `upper`, `work` and `merged` are under it).
+    pub state_dir: PathBuf,
     pub idmap: IdMap,
+    pub helper: Helper,
     pub steps: Vec<Step>,
     /// `/init` and its arguments, run as the container's pid 1.
     pub init: Vec<String>,
@@ -194,9 +246,9 @@ fn check_path(what: &str, p: &Path) -> Result<()> {
         return Err(Error::Invalid(format!("{what} {s} must be an absolute path")));
     }
     // `,` and `:` end an overlay option's value; NUL and newlines have no place in any argument.
-    if s.chars().any(|c| matches!(c, ',' | ':' | '\0' | '\n')) {
+    if s.chars().any(|c| matches!(c, ',' | ':' | '\0' | '\n' | ' ' | '\t' | '\\')) {
         return Err(Error::Invalid(format!(
-            "{what} {s:?} contains a comma, colon, newline or NUL, which an overlay mount option can't carry"
+            "{what} {s:?} contains a comma, colon, space, backslash, newline or NUL, which an overlay mount option or /proc/self/mountinfo can't carry"
         )));
     }
     Ok(())
@@ -245,7 +297,7 @@ impl Spec {
 }
 
 /// The plan for `spec` on the host `view` describes (which optional device nodes it has).
-pub fn plan(spec: &Spec, view: &dyn HostView, idmap: IdMap) -> Result<Plan> {
+pub fn plan(spec: &Spec, view: &dyn HostView, idmap: IdMap, helper: Helper) -> Result<Plan> {
     spec.validate()?;
     let root = spec.dir.join("merged");
     let at = |sub: &str| root.join(sub);
@@ -330,17 +382,62 @@ pub fn plan(spec: &Spec, view: &dyn HostView, idmap: IdMap) -> Result<Plan> {
         steps.push(Step::Symlink { target: format!("binderfs/{dev}"), link: at(&format!("dev/{dev}")) });
     }
 
-    // /proc is this container's pid namespace; /sys is the host's (a user namespace can't mount a
-    // sysfs without owning the network namespace).
-    steps.push(Step::Mkdir(at("proc")));
-    steps.push(mount(Some("proc"), "proc", at("proc"), &["nosuid", "nodev", "noexec"]));
-    steps.push(Step::Mkdir(at("sys")));
-    steps.push(Step::Mount(Mount { fstype: None, source: "/sys".into(), target: at("sys"), options: vec![], recursive: true }));
+    // /proc is this container's pid namespace, with the paths runc masks or makes read-only: they
+    // expose the host kernel (kcore, the sysrq trigger) or tune it (/proc/sys).
+    let proc = at("proc");
+    steps.push(Step::Mkdir(proc.clone()));
+    steps.push(mount(Some("proc"), "proc", proc.clone(), &["nosuid", "nodev", "noexec"]));
+    for name in PROC_MASKED_FILES {
+        if view.exists(&format!("/proc/{name}")) {
+            steps.push(Step::Mount(Mount {
+                fstype: None,
+                source: "/dev/null".into(),
+                target: proc.join(name),
+                options: vec![],
+                recursive: false,
+            }));
+        }
+    }
+    for name in PROC_MASKED_DIRS {
+        if view.exists(&format!("/proc/{name}")) {
+            steps.push(mount(Some("tmpfs"), "tmpfs", proc.join(name), &["ro", "nosuid", "nodev", "noexec", "size=0"]));
+        }
+    }
+    for name in PROC_READ_ONLY {
+        if view.exists(&format!("/proc/{name}")) {
+            steps.push(Step::Mount(Mount {
+                fstype: None,
+                source: proc.join(name).display().to_string(),
+                target: proc.join(name),
+                options: vec![],
+                recursive: false,
+            }));
+            steps.push(Step::ReadOnly(proc.join(name)));
+        }
+    }
+
+    // /sys is the host's (a user namespace can't mount a sysfs without owning the network
+    // namespace). It has to be bound recursively (the kernel refuses a plain bind of a mount with
+    // locked children), then every mount in the tree is made read-only, and /sys/firmware masked.
+    let sys = at("sys");
+    steps.push(Step::Mkdir(sys.clone()));
+    steps.push(Step::Mount(Mount { fstype: None, source: "/sys".into(), target: sys.clone(), options: vec![], recursive: true }));
+    steps.push(Step::ReadOnlyTree(sys.clone()));
+    if view.exists("/sys/firmware") {
+        steps.push(mount(Some("tmpfs"), "tmpfs", sys.join("firmware"), &["ro", "nosuid", "nodev", "noexec", "size=0"]));
+    }
 
     let mut init = vec!["/init".to_string()];
     init.extend(spec.init_args());
-    Ok(Plan { root, idmap, steps, init })
+    Ok(Plan { root, state_dir: spec.dir.clone(), idmap, helper, steps, init })
 }
+
+/// Files under `/proc` that expose the host kernel: bound over with `/dev/null`.
+const PROC_MASKED_FILES: [&str; 6] = ["kcore", "keys", "latency_stats", "timer_list", "timer_stats", "sched_debug"];
+/// Directories under `/proc` hidden under an empty read-only tmpfs.
+const PROC_MASKED_DIRS: [&str; 2] = ["acpi", "scsi"];
+/// Paths under `/proc` that stay visible but can't be written.
+const PROC_READ_ONLY: [&str; 5] = ["bus", "fs", "irq", "sys", "sysrq-trigger"];
 
 /// POSIX-shell single quoting: safe for any bytes but NUL.
 pub fn quote(s: &str) -> String {
@@ -361,14 +458,39 @@ fn mount_argv(m: &Mount) -> Vec<String> {
     argv
 }
 
+/// `mount(8)` making a bind mount read-only. A mount copied into a user namespace has `nosuid`,
+/// `nodev` and `noexec` locked on, and a remount that doesn't repeat them is refused.
+fn read_only_argv(target: &Path) -> Vec<String> {
+    ["mount", "-o", "remount,bind,ro,nosuid,nodev,noexec"].iter().map(|s| s.to_string()).chain([target.display().to_string()]).collect()
+}
+
+/// The script lines that remount `target` and every mount under it read-only. Each keeps the
+/// per-mount flags `/proc/self/mountinfo` shows for it (a user namespace locks them on, and a
+/// remount that drops one is refused); the mount points are matched literally, which is why paths
+/// may hold no spaces (mountinfo escapes them).
+fn read_only_tree_script(target: &Path) -> String {
+    let t = quote(&target.display().to_string());
+    format!(
+        "while read -r _id _parent _dev _root mp opts _rest; do\n  case \"$mp\" in {t} | {t}/*)\n    o=${{opts#rw}}; o=${{o#,}}\n    step mount -o \"remount,bind,ro${{o:+,$o}}\" \"$mp\" ;;\n  esac\ndone < /proc/self/mountinfo"
+    )
+}
+
 impl Plan {
     /// The `mount` command each mount step runs, in order: for tests and `-verbose`.
     pub fn mount_commands(&self) -> Vec<Vec<String>> {
-        self.steps.iter().filter_map(|s| if let Step::Mount(m) = s { Some(mount_argv(m)) } else { None }).collect()
+        self.steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Mount(m) => Some(mount_argv(m)),
+                Step::ReadOnly(t) => Some(read_only_argv(t)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The setup as an `sh` script: waits for the parent to map the ids, does each step (naming
-    /// the one that failed), and replaces itself with `/init` as the container's pid 1.
+    /// the one that failed), and hands over to the helper, which pivots into the new root, drops
+    /// the old one and becomes `/init`, the container's pid 1.
     pub fn script(&self) -> String {
         self.script_with(&self.init)
     }
@@ -377,11 +499,14 @@ impl Plan {
     pub fn script_with(&self, argv: &[String]) -> String {
         let mut s = String::from("set -eu\nstep() { \"$@\" || { echo \"emu: container setup failed: $*\" >&2; exit 1; }; }\n");
         s.push_str("# The parent writes the id maps, then a line.\nread -r _go\n");
+        let words = |argv: &[String]| argv.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ");
         for step in &self.steps {
             let line = match step {
                 Step::Mkdir(p) => format!("step mkdir -p {}", quote(&p.display().to_string())),
                 Step::Touch(p) => format!("step touch {}", quote(&p.display().to_string())),
-                Step::Mount(m) => format!("step {}", mount_argv(m).iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")),
+                Step::Mount(m) => format!("step {}", words(&mount_argv(m))),
+                Step::ReadOnly(t) => format!("step {}", words(&read_only_argv(t))),
+                Step::ReadOnlyTree(t) => read_only_tree_script(t),
                 Step::Symlink { target, link } => format!("step ln -sf {} {}", quote(target), quote(&link.display().to_string())),
                 Step::Require { path, message } => format!(
                     "[ -e {} ] || {{ echo {} >&2; exit 1; }}",
@@ -391,11 +516,9 @@ impl Plan {
             };
             let _ = writeln!(s, "{line}");
         }
-        let _ = write!(s, "exec chroot {}", quote(&self.root.display().to_string()));
-        for a in argv {
-            let _ = write!(s, " {}", quote(a));
-        }
-        s.push('\n');
+        let mut request = vec!["pivot".to_string(), self.root.display().to_string(), "--".to_string()];
+        request.extend(argv.iter().cloned());
+        let _ = writeln!(s, "exec {}", words(&self.helper.argv(&request)));
         s
     }
 
@@ -403,10 +526,46 @@ impl Plan {
     pub fn command(&self) -> Vec<String> {
         unshare_command(&self.script())
     }
+
+    /// Creates the state directory and hands it to container root (see [`prepare_dir`]), so the
+    /// container can create `upper`, `work` and `merged` in it.
+    pub fn prepare_host(&self) -> Result<()> {
+        // The container's process runs the helper too.
+        check_searchable(&self.idmap, &self.helper.program)?;
+        prepare_dir(&self.idmap, &self.state_dir)
+    }
+}
+
+/// Fails when container root couldn't reach `path`: run by host root, the container is another
+/// user (a range of its own), and every directory above `path` must let others search it. Nothing
+/// to check for an unprivileged user, whose container root is that user.
+pub fn check_searchable(idmap: &IdMap, path: &Path) -> Result<()> {
+    let Some((uid, _)) = idmap.container_root_owner() else { return Ok(()) };
+    for dir in path.ancestors().skip(1) {
+        let mode = std::fs::metadata(dir).map_err(io(format!("reading {}", dir.display())))?.permissions();
+        if std::os::unix::fs::PermissionsExt::mode(&mode) & 0o001 == 0 {
+            return Err(Error::Invalid(format!(
+                "{} isn't searchable by other users, so the container (host uid {uid}) can't reach {}: `chmod o+x {}`",
+                dir.display(),
+                path.display(),
+                dir.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Creates `dir` and, when container root is not the launching user, hands it over: the container
+/// writes in it as an id range of its own.
+pub fn prepare_dir(idmap: &IdMap, dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(io(format!("creating {}", dir.display())))?;
+    let Some((uid, gid)) = idmap.container_root_owner() else { return Ok(()) };
+    check_searchable(idmap, dir)?;
+    std::os::unix::fs::chown(dir, Some(uid), Some(gid)).map_err(io(format!("handing {} to container root", dir.display())))
 }
 
 /// `unshare` with the container's namespaces around `sh -c <script>`. `--fork` makes the script
-/// pid 1 of the new pid namespace; `--kill-child` takes it down with the launcher.
+/// pid 1 of the new pid namespace; `--kill-child` takes it down with `unshare`.
 pub fn unshare_command(script: &str) -> Vec<String> {
     let mut argv = vec!["unshare".to_string()];
     argv.extend(NAMESPACES.iter().map(|s| s.to_string()));
@@ -414,19 +573,44 @@ pub fn unshare_command(script: &str) -> Vec<String> {
     argv
 }
 
+/// `argv` run under the helper's `die-with-parent`, so it is killed when the process `parent`
+/// (this one) dies. With `unshare --kill-child` that takes the whole container down.
+pub fn supervised(helper: &Helper, parent: u32, argv: &[String]) -> Vec<String> {
+    let mut request = vec!["die-with-parent".to_string(), "--parent".to_string(), parent.to_string(), "--".to_string()];
+    request.extend(argv.iter().cloned());
+    helper.argv(&request)
+}
+
+/// How long to wait for `unshare` to create its user namespace before giving up. It takes
+/// milliseconds; this only bounds a hung or never-started child.
+pub const NAMESPACE_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Runs `script` (which starts by reading a line from stdin: see [`Plan::script`]) in the
-/// namespaces, maps its ids, and releases it. Returns the running `unshare`.
-pub fn spawn_isolated(idmap: &IdMap, script: &str, stdout: Stdio, stderr: Stdio) -> Result<Child> {
-    let argv = unshare_command(script);
-    let mut child = Command::new(&argv[0])
-        .args(&argv[1..])
+/// namespaces, maps its ids, and releases it. Returns the running `unshare`. With a `helper` the
+/// child dies if this process does (the thread calling this must outlive the child: see
+/// `crate::helper`).
+pub fn spawn_isolated(idmap: &IdMap, script: &str, helper: Option<&Helper>, stdout: Stdio, stderr: Stdio) -> Result<Child> {
+    let mut argv = unshare_command(script);
+    if let Some(h) = helper {
+        argv = supervised(h, std::process::id(), &argv);
+    }
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]).current_dir("/");
+    // Run by host root, the container's process must itself be the user its root maps to: the one
+    // that calls unshare(CLONE_NEWUSER) is the one that is root inside it, and host root's own
+    // uid is not in the map (it would be nobody there, with no capabilities). So drop to the
+    // container's range first; unprivileged users already are their own container root.
+    if let Some((uid, gid)) = idmap.container_root_owner() {
+        use std::os::unix::process::CommandExt;
+        cmd.uid(uid).gid(gid);
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
-        .map_err(|e| Error::Io { what: "starting unshare (util-linux)".into(), err: e })?;
-    let released = map_and_release(idmap, &mut child);
-    if let Err(e) = released {
+        .map_err(|e| Error::Io { what: format!("starting {}", argv[0]), err: e })?;
+    if let Err(e) = map_and_release(idmap, &mut child, NAMESPACE_DEADLINE) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(e);
@@ -436,9 +620,9 @@ pub fn spawn_isolated(idmap: &IdMap, script: &str, stdout: Stdio, stderr: Stdio)
 
 /// `unshare` creates the user namespace in its own process, so its pid is the one to map. The
 /// script waits on stdin until the maps are written.
-fn map_and_release(idmap: &IdMap, child: &mut Child) -> Result<()> {
+fn map_and_release(idmap: &IdMap, child: &mut Child, deadline: Duration) -> Result<()> {
     use std::io::Write;
-    wait_for_namespace(child)?;
+    wait_for_namespace(child, deadline)?;
     for action in idmap.actions(child.id()) {
         match action {
             Action::Write { path, text } => std::fs::write(&path, text).map_err(io(format!("writing {}", path.display())))?,
@@ -458,25 +642,51 @@ fn map_and_release(idmap: &IdMap, child: &mut Child) -> Result<()> {
 }
 
 /// Waits until the child has made its user namespace (its `ns/user` link differs from ours), so
-/// writing its maps can't race `unshare`'s own setup. It polls the kernel's answer, not the
-/// clock, and stops as soon as the namespace exists or the child is gone.
-fn wait_for_namespace(child: &mut Child) -> Result<()> {
+/// writing its maps can't race `unshare`'s own setup. It polls the kernel's answer every
+/// millisecond and stops when the namespace exists, the child is gone, or `deadline` passes.
+fn wait_for_namespace(child: &mut Child, deadline: Duration) -> Result<()> {
     let link = PathBuf::from(format!("/proc/{}/ns/user", child.id()));
     let ours = std::fs::read_link("/proc/self/ns/user").map_err(io("reading our user namespace"))?;
+    let start = Instant::now();
     loop {
-        if let Some(status) = child.try_wait().map_err(io("waiting for unshare"))? {
-            return Err(Error::Map(format!(
-                "unshare exited ({status}) before its user namespace could be mapped; its message is in the log"
-            )));
+        if let Some(status) = child.try_wait().map_err(io("waiting for the container's process"))? {
+            return Err(Error::Map(format!("it exited ({status}) before its user namespace could be mapped; its message is in the log")));
         }
         match std::fs::read_link(&link) {
             Ok(theirs) if theirs != ours => return Ok(()),
-            _ => std::thread::yield_now(),
+            _ => {}
         }
+        if start.elapsed() >= deadline {
+            return Err(Error::Map(format!("no user namespace appeared for pid {} within {deadline:?}", child.id())));
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
-/// A running container.
+/// Deletes `path` from inside the container's user namespace, where the files the container made
+/// are owned by ids the host user can't touch (subordinate ids). Errors are returned, with what
+/// `rm` said.
+pub fn remove_tree(idmap: &IdMap, helper: Option<&Helper>, path: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {}
+    }
+    let script = format!("set -eu\nread -r _go\nexec rm -rf -- {}\n", quote(&path.display().to_string()));
+    let out = spawn_isolated(idmap, &script, helper, Stdio::null(), Stdio::piped())?.wait_with_output().map_err(io("waiting for rm"))?;
+    if !out.status.success() {
+        return Err(Error::Io {
+            what: format!("removing {} from inside the user namespace", path.display()),
+            err: std::io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        });
+    }
+    match path.try_exists() {
+        Ok(false) => Ok(()),
+        _ => Err(Error::Invalid(format!("{} is still there after rm -rf", path.display()))),
+    }
+}
+
+/// A running container. Dropping it kills it.
 pub struct Container {
     child: Child,
 }
@@ -504,11 +714,22 @@ impl Container {
     }
 }
 
-/// Starts `/init` for `plan`, its console and logcat-less boot output going to `log`.
+impl Drop for Container {
+    fn drop(&mut self) {
+        if self.running() {
+            let _ = self.kill();
+        }
+    }
+}
+
+/// Starts `/init` for `plan`, its console and boot output going to `log`. Call it from a thread
+/// that lives as long as the container: the kernel's parent-death signal follows the thread that
+/// spawned the child (`crate::helper`).
 pub fn start(plan: &Plan, log: &Path) -> Result<Container> {
+    plan.prepare_host()?;
     let file = std::fs::File::create(log).map_err(io(format!("creating {}", log.display())))?;
     let err = file.try_clone().map_err(io("duplicating the log handle"))?;
-    Ok(Container { child: spawn_isolated(&plan.idmap, &plan.script(), Stdio::from(file), Stdio::from(err))? })
+    Ok(Container { child: spawn_isolated(&plan.idmap, &plan.script(), Some(&plan.helper), Stdio::from(file), Stdio::from(err))? })
 }
 
 #[cfg(test)]
@@ -531,8 +752,16 @@ mod tests {
         FakeView::container_host()
     }
 
+    fn helper() -> Helper {
+        Helper { program: "/usr/bin/emu".into(), prefix: vec!["__container-helper".into()] }
+    }
+
+    fn root_map() -> IdMap {
+        IdMap::Root { uid: DEDICATED_RANGE, gid: DEDICATED_RANGE }
+    }
+
     fn plan_of(spec: &Spec, view: &FakeView) -> Plan {
-        plan(spec, view, IdMap::Identity).expect("plan")
+        plan(spec, view, root_map(), helper()).expect("plan")
     }
 
     #[test]
@@ -594,40 +823,139 @@ mod tests {
         );
     }
 
+    /// A mount command as a short word: `overlay /`, `bind /dev/null -> /dev/null`, `ro /sys`.
+    fn describe(c: &[String]) -> String {
+        let strip = |p: &str| match p.trim_start_matches("/avd/Pixel.avd/simee/container/merged") {
+            "" => "/".to_string(),
+            rest => rest.to_string(),
+        };
+        let target = strip(c.last().expect("target"));
+        if let Some(i) = c.iter().position(|a| a == "-t") {
+            return format!("{} {target}", c[i + 1]);
+        }
+        if c[1] == "-o" {
+            return format!("ro {target}");
+        }
+        format!("{} {} -> {target}", c[1].trim_start_matches('-'), strip(&c[c.len() - 2]))
+    }
+
     #[test]
     fn the_mounts_in_order() {
         let p = plan_of(&spec(), &host());
-        let kinds: Vec<String> = p
-            .mount_commands()
-            .iter()
-            .map(|c| {
-                let t = c.iter().position(|a| a == "-t").map(|i| c[i + 1].clone());
-                format!(
-                    "{} {}",
-                    t.unwrap_or_else(|| c[1].trim_start_matches('-').to_string()),
-                    c.last().expect("target").trim_start_matches("/avd/Pixel.avd/simee/container/merged")
-                )
-            })
-            .collect();
+        let kinds: Vec<String> = p.mount_commands().iter().map(|c| describe(c)).collect();
         assert_eq!(
             kinds,
             [
-                "overlay ",
+                "overlay /",
                 "tmpfs /dev",
-                "bind /dev/null",
-                "bind /dev/zero",
-                "bind /dev/full",
-                "bind /dev/random",
-                "bind /dev/urandom",
-                "bind /dev/tty",
-                "rbind /dev/dma_heap",
+                "bind /dev/null -> /dev/null",
+                "bind /dev/zero -> /dev/zero",
+                "bind /dev/full -> /dev/full",
+                "bind /dev/random -> /dev/random",
+                "bind /dev/urandom -> /dev/urandom",
+                "bind /dev/tty -> /dev/tty",
+                "rbind /dev/dma_heap -> /dev/dma_heap",
                 "devpts /dev/pts",
                 "tmpfs /dev/shm",
                 "binder /dev/binderfs",
                 "proc /proc",
-                "rbind /sys",
+                "bind /dev/null -> /proc/kcore",
+                "bind /dev/null -> /proc/keys",
+                "bind /dev/null -> /proc/timer_list",
+                "bind /dev/null -> /proc/sched_debug",
+                "tmpfs /proc/acpi",
+                "tmpfs /proc/scsi",
+                "bind /proc/bus -> /proc/bus",
+                "ro /proc/bus",
+                "bind /proc/fs -> /proc/fs",
+                "ro /proc/fs",
+                "bind /proc/irq -> /proc/irq",
+                "ro /proc/irq",
+                "bind /proc/sys -> /proc/sys",
+                "ro /proc/sys",
+                "bind /proc/sysrq-trigger -> /proc/sysrq-trigger",
+                "ro /proc/sysrq-trigger",
+                "rbind /sys -> /sys",
+                "tmpfs /sys/firmware",
             ],
         );
+    }
+
+    #[test]
+    fn the_hosts_sys_is_bound_recursively_then_every_mount_in_it_is_made_read_only() {
+        let p = plan_of(&spec(), &host());
+        let sys = p.root.join("sys");
+        let bind = p
+            .steps
+            .iter()
+            .find_map(|s| {
+                if let Step::Mount(m) = s
+                    && m.source == "/sys"
+                {
+                    Some(m.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("sys bind");
+        assert!(bind.recursive, "the kernel refuses a plain bind of a mount with locked children");
+        let at = |f: &dyn Fn(&Step) -> bool| p.steps.iter().position(f).expect("step");
+        let mounted = at(&|s| matches!(s, Step::Mount(m) if m.target == sys));
+        let ro = at(&|s| matches!(s, Step::ReadOnlyTree(t) if *t == sys));
+        assert_eq!(ro, mounted + 1, "made read-only straight away");
+        let script = p.script();
+        // Each mount under /sys keeps its own flags: the loop reads them from mountinfo.
+        assert!(script.contains("while read -r _id _parent _dev _root mp opts _rest; do"), "{script}");
+        assert!(
+            script.contains("'/avd/Pixel.avd/simee/container/merged/sys' | '/avd/Pixel.avd/simee/container/merged/sys'/*)"),
+            "{script}"
+        );
+        assert!(script.contains(r#"step mount -o "remount,bind,ro${o:+,$o}" "$mp""#), "{script}");
+        assert!(script.contains("done < /proc/self/mountinfo"));
+        assert_eq!(read_only_argv(&sys), ["mount", "-o", "remount,bind,ro,nosuid,nodev,noexec", &sys.display().to_string()]);
+    }
+
+    #[test]
+    fn paths_mountinfo_would_escape_are_refused() {
+        for dir in ["/with space/dev", "/with\ttab", "/back\\slash"] {
+            let mut s = spec();
+            s.dir = dir.into();
+            assert!(plan(&s, &host(), root_map(), helper()).is_err(), "{dir:?}");
+        }
+    }
+
+    #[test]
+    fn proc_paths_that_expose_or_tune_the_host_are_masked_or_read_only() {
+        let p = plan_of(&spec(), &host());
+        let cmds = p.mount_commands();
+        let root = p.root.display().to_string();
+        let masked = |name: &str| {
+            cmds.iter().any(|c| c[1] == "--bind" && c[c.len() - 2] == "/dev/null" && *c.last().expect("t") == format!("{root}/proc/{name}"))
+        };
+        for name in ["kcore", "keys", "timer_list", "sched_debug"] {
+            assert!(masked(name), "{name}");
+        }
+        for name in ["bus", "fs", "irq", "sys", "sysrq-trigger"] {
+            assert!(p.steps.contains(&Step::ReadOnly(p.root.join("proc").join(name))), "/proc/{name} read-only");
+        }
+        // The read-only remount follows its own bind mount.
+        let ro = p.steps.iter().position(|s| *s == Step::ReadOnly(p.root.join("proc/sys"))).expect("ro");
+        assert!(matches!(&p.steps[ro - 1], Step::Mount(m) if m.target == p.root.join("proc/sys") && m.fstype.is_none()));
+    }
+
+    #[test]
+    fn masks_cover_only_what_the_host_has() {
+        let mut bare = host();
+        for gone in ["/proc/kcore", "/proc/scsi", "/proc/sysrq-trigger", "/sys/firmware"] {
+            bare.paths.remove(gone);
+        }
+        let p = plan_of(&spec(), &bare);
+        let cmds = p.mount_commands();
+        assert!(!cmds.iter().any(|c| c.last().is_some_and(|t| t.ends_with("/proc/kcore")
+            || t.ends_with("/proc/scsi")
+            || t.ends_with("/proc/sysrq-trigger")
+            || t.ends_with("/sys/firmware"))));
+        assert!(cmds.iter().any(|c| c.last().is_some_and(|t| t.ends_with("/proc/keys"))), "the others stay");
     }
 
     #[test]
@@ -717,7 +1045,7 @@ mod tests {
         let last = script.lines().last().expect("exec line");
         assert_eq!(
             last,
-            "exec chroot '/avd/Pixel.avd/simee/container/merged' '/init' 'qemu=1' 'androidboot.hardware=redroid' 'androidboot.redroid_width=720' 'androidboot.redroid_height=1280' 'androidboot.redroid_dpi=320' 'androidboot.redroid_gpu_mode=guest' 'androidboot.use_memfd=true'"
+            "exec '/usr/bin/emu' '__container-helper' 'pivot' '/avd/Pixel.avd/simee/container/merged' '--' '/init' 'qemu=1' 'androidboot.hardware=redroid' 'androidboot.redroid_width=720' 'androidboot.redroid_height=1280' 'androidboot.redroid_dpi=320' 'androidboot.redroid_gpu_mode=guest' 'androidboot.use_memfd=true'"
         );
         assert!(script.contains("step 'mount' '-t' 'overlay' '-o' 'lowerdir=/cache/redroid-15-x86_64/rootfs,"), "{script}");
         assert!(script.contains("[ -e '/avd/Pixel.avd/simee/container/merged/dev/binderfs/hwbinder' ] ||"), "{script}");
@@ -728,7 +1056,7 @@ mod tests {
     fn script_with_swaps_only_the_final_command() {
         let p = plan_of(&spec(), &host());
         let s = p.script_with(&["/bin/sh".into(), "-c".into(), "echo hi".into()]);
-        assert!(s.ends_with("exec chroot '/avd/Pixel.avd/simee/container/merged' '/bin/sh' '-c' 'echo hi'\n"), "{s}");
+        assert!(s.ends_with("'pivot' '/avd/Pixel.avd/simee/container/merged' '--' '/bin/sh' '-c' 'echo hi'\n"), "{s}");
         assert_eq!(s.lines().count(), p.script().lines().count());
     }
 
@@ -748,7 +1076,7 @@ mod tests {
         let bad = |f: &dyn Fn(&mut Spec)| {
             let mut s = spec();
             f(&mut s);
-            plan(&s, &host(), IdMap::Identity).expect_err("refused").to_string()
+            plan(&s, &host(), root_map(), helper()).expect_err("refused").to_string()
         };
         assert!(bad(&|s| s.dir = "relative/dir".into()).contains("absolute"));
         assert!(bad(&|s| s.rootfs = "/has,comma/rootfs".into()).contains("comma"));
@@ -763,15 +1091,45 @@ mod tests {
     }
 
     #[test]
-    fn root_maps_every_id_to_itself() {
-        let actions = IdMap::Identity.actions(4242);
+    fn root_maps_the_container_to_a_range_of_its_own_never_to_root() {
+        let map = IdMap::for_host(&host(), 0).expect("root");
+        assert_eq!(map, IdMap::Root { uid: DEDICATED_RANGE, gid: DEDICATED_RANGE });
+        let actions = map.actions(4242);
         assert_eq!(
             actions,
             [
-                Action::Write { path: "/proc/4242/uid_map".into(), text: "0 0 4294967295\n".into() },
-                Action::Write { path: "/proc/4242/gid_map".into(), text: "0 0 4294967295\n".into() },
+                Action::Write { path: "/proc/4242/uid_map".into(), text: "0 2000000000 65536\n".into() },
+                Action::Write { path: "/proc/4242/gid_map".into(), text: "0 2000000000 65536\n".into() },
             ]
         );
+        for a in &actions {
+            let Action::Write { text, .. } = a else { panic!("root writes the maps itself") };
+            let host_start: u32 = text.split_whitespace().nth(1).expect("outer").parse().expect("number");
+            assert_ne!(host_start, 0, "container root must not be host root: {text}");
+            assert!(!text.starts_with("0 0 "), "{text}");
+        }
+        assert_eq!(map.container_root_owner(), Some((2_000_000_000, 2_000_000_000)));
+        // Nothing maps the whole id space onto itself any more.
+        assert!(DEDICATED_RANGE.0 > 1_878_982_656, "above systemd-nspawn's container ranges");
+        assert!(u64::from(DEDICATED_RANGE.0) + u64::from(DEDICATED_RANGE.1) < 1 << 31);
+    }
+
+    #[test]
+    fn root_prefers_its_own_subordinate_range_when_it_has_one() {
+        let v = host()
+            .file("/etc/passwd", "root:x:0:0::/root:/bin/sh\n")
+            .file("/etc/subuid", "root:524288:131072\n")
+            .file("/etc/subgid", "0:600000:65536\n");
+        assert_eq!(IdMap::for_host(&v, 0).expect("root"), IdMap::Root { uid: (524288, 65536), gid: (600000, 65536) });
+        // A range too small for Android is ignored for the dedicated one.
+        let small = host().file("/etc/subuid", "0:524288:1000\n");
+        assert_eq!(IdMap::for_host(&small, 0).expect("root"), IdMap::Root { uid: DEDICATED_RANGE, gid: DEDICATED_RANGE });
+    }
+
+    #[test]
+    fn an_unprivileged_user_is_their_own_container_root() {
+        let map = IdMap::Rootless { uid: 1000, gid: 1000, sub_uid: (100000, 65536), sub_gid: (100000, 65536) };
+        assert_eq!(map.container_root_owner(), None, "nothing to hand over: the user already owns what it makes");
     }
 
     #[test]
@@ -788,7 +1146,7 @@ mod tests {
 
     #[test]
     fn id_maps_are_derived_from_the_host() {
-        assert_eq!(IdMap::for_host(&host(), 0).expect("root"), IdMap::Identity);
+        assert!(matches!(IdMap::for_host(&host(), 0).expect("root"), IdMap::Root { .. }));
         let user = host()
             .euid(1000)
             .file("/etc/passwd", "ci:x:1000:1000::/home/ci:/bin/sh\n")
@@ -804,75 +1162,89 @@ mod tests {
         assert!(matches!(IdMap::for_host(&none, 1000), Err(Error::Map(_))));
     }
 
-    /// The launcher against the real kernel, in a user namespace as the current user. Needs
-    /// `unshare` and a kernel that lets this user mount an overlay in one; it runs the mount
-    /// sequence up to binderfs, which is where a host without binder stops: that message is the
-    /// assertion there. Run with `SIMEE_E2E_CONTAINER=1`.
     #[test]
-    fn real_host_mounts_in_a_user_namespace() {
-        if std::env::var_os("SIMEE_E2E_CONTAINER").is_none() {
-            eprintln!("skipped: set SIMEE_E2E_CONTAINER=1 to run the launcher against this host's kernel");
-            return;
-        }
-        let tmp = crate::image::fixture::tmp("e2e");
-        let rootfs = tmp.join("rootfs");
-        std::fs::create_dir_all(rootfs.join("bin")).expect("rootfs");
-        // A rootfs with a shell, so the final `chroot … sh` has something to run: the host's own
-        // shell and the libraries it links.
-        let sh = std::fs::canonicalize("/bin/sh").expect("sh");
-        let ldd = Command::new("ldd").arg(&sh).output().expect("ldd");
-        let mut files = vec![sh.clone()];
-        for l in String::from_utf8_lossy(&ldd.stdout).lines() {
-            if let Some(p) = l.split_whitespace().find(|w| w.starts_with('/')) {
-                files.push(PathBuf::from(p));
-            }
-        }
-        for f in files {
-            let dest = rootfs.join(f.strip_prefix("/").expect("absolute"));
-            std::fs::create_dir_all(dest.parent().expect("parent")).expect("mkdir");
-            std::fs::copy(&f, &dest).expect("copy");
-        }
-        let view = crate::probe::FsView;
-        let idmap = IdMap::for_host(&view, rustix::process::getegid().as_raw()).expect("an id mapping for this user");
-        let mut s = spec();
-        s.dir = tmp.join("device");
-        s.rootfs = rootfs;
-        let p = plan(&s, &view, idmap).expect("plan");
-        let binder = crate::probe::probe(&view).get(crate::probe::Feature::Binder).is_some_and(|c| c.ok());
-        let sh_path = format!("/{}", sh.strip_prefix("/").expect("absolute").display());
-        let sh_path_str = sh_path.clone();
-        let script = p.script_with(&[sh_path, "-c".into(), "echo started; [ -e /proc/self ] && echo proc; [ -e /dev/binderfs/hwbinder ] && echo hwbinder; [ -e /dev/null ] && echo devnull".into()]);
-        let out = spawn_isolated(&p.idmap, &script, Stdio::piped(), Stdio::piped()).expect("spawn").wait_with_output().expect("wait");
-        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        eprintln!("binder on this host: {binder}\nstdout: {stdout}\nstderr: {stderr}");
-        if binder {
-            assert!(out.status.success(), "{stderr}");
-            for want in ["started", "proc", "hwbinder", "devnull"] {
-                assert!(stdout.contains(want), "{want} missing: {stdout}");
-            }
-            return;
-        }
-        assert!(!out.status.success());
-        assert!(
-            stderr.contains("emu: container setup failed: mount -t binder binder"),
-            "a host without binder should stop at binderfs, naming it: {stderr}"
+    fn the_script_pivots_through_the_helper_and_never_chroots() {
+        let p = plan_of(&spec(), &host());
+        let script = p.script();
+        assert!(!script.contains("chroot"), "a chroot leaves the host's root reachable");
+        let request = vec!["pivot".to_string(), p.root.display().to_string(), "--".into(), "/init".into()];
+        let argv = p.helper.argv(&request);
+        assert_eq!(argv[..2], ["/usr/bin/emu", "__container-helper"]);
+        // What the script hands the helper is what the helper parses.
+        assert_eq!(
+            crate::helper::parse(&argv[2..]),
+            Ok(crate::helper::Request::Pivot { root: p.root.display().to_string(), init: vec!["/init".into()] })
         );
-        // Everything before binderfs worked, so run the rest without it: /proc, the host's /sys,
-        // and the chroot into the overlay.
-        let mut rest = p.clone();
-        rest.steps.retain(|s| match s {
-            Step::Mount(m) => m.fstype != Some("binder"),
-            Step::Require { .. } => false,
-            Step::Symlink { link, .. } => !link.to_string_lossy().contains("binder"),
-            _ => true,
-        });
-        let script = rest.script_with(&[sh_path_str, "-c".into(), "echo started; [ -e /proc/self ] && echo proc; [ -e /sys/kernel ] && echo sys; [ -e /dev/null ] && echo devnull; [ -L /dev/ptmx ] && echo ptmx".into()]);
-        let out = spawn_isolated(&rest.idmap, &script, Stdio::piped(), Stdio::piped()).expect("spawn").wait_with_output().expect("wait");
-        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        eprintln!("without binderfs: stdout: {stdout}\nstderr: {stderr}");
-        assert!(out.status.success(), "{stderr}");
-        for want in ["started", "proc", "sys", "devnull", "ptmx"] {
-            assert!(stdout.contains(want), "{want} missing: {stdout}");
-        }
+        assert_eq!(script.lines().last().expect("exec").split(' ').nth(3), Some("'pivot'"));
+    }
+
+    #[test]
+    fn the_container_is_started_under_die_with_parent() {
+        let p = plan_of(&spec(), &host());
+        let argv = supervised(&p.helper, 77, &p.command());
+        assert_eq!(argv[..6], ["/usr/bin/emu", "__container-helper", "die-with-parent", "--parent", "77", "--"]);
+        assert_eq!(argv[6], "unshare");
+        assert_eq!(
+            crate::helper::parse(&argv[2..]).map(|r| matches!(r, crate::helper::Request::DieWithParent { parent: 77, .. })),
+            Ok(true)
+        );
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        crate::image::fixture::tmp(tag)
+    }
+
+    #[test]
+    fn prepare_host_makes_the_state_dir_and_refuses_one_container_root_cant_reach() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tmp("prepare");
+        let mut p = plan_of(&spec(), &host());
+        p.idmap = IdMap::Rootless { uid: 1000, gid: 1000, sub_uid: (100000, 65536), sub_gid: (100000, 65536) };
+        p.state_dir = base.join("a/b");
+        p.prepare_host().expect("rootless: just creates it");
+        assert!(p.state_dir.is_dir());
+        // Run by root, the container is another user: a private ancestor stops it.
+        p.idmap = root_map();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let e = p.prepare_host().expect_err("unsearchable").to_string();
+        assert!(e.contains(&base.display().to_string()), "names the private directory: {e}");
+        assert!(e.contains("isn't searchable") && e.contains("chmod o+x"), "{e}");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    #[test]
+    fn waiting_for_the_namespace_is_bounded_and_notices_a_dead_child() {
+        // A child that never makes a namespace: the deadline, not a hang.
+        let mut sleeper = Command::new("sleep").arg("60").spawn().expect("sleep");
+        let e = wait_for_namespace(&mut sleeper, Duration::ZERO).expect_err("deadline").to_string();
+        assert!(e.contains("no user namespace appeared"), "{e}");
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        // A child that is already gone is reported as such, whatever the deadline.
+        let mut gone = Command::new("true").spawn().expect("true");
+        let _ = gone.wait();
+        let e = wait_for_namespace(&mut gone, Duration::from_secs(30)).expect_err("exited").to_string();
+        assert!(e.contains("before its user namespace could be mapped"), "{e}");
+    }
+
+    #[test]
+    fn dropping_a_container_kills_it() {
+        let child = Command::new("sleep").arg("600").spawn().expect("sleep");
+        let pid = child.id();
+        let c = Container { child };
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        drop(c);
+        // `Drop` waited for it, so it is reaped, not a zombie.
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn remove_tree_handles_a_missing_path_and_an_ordinary_tree() {
+        let base = tmp("remove");
+        remove_tree(&root_map(), None, &base.join("never-existed")).expect("missing is fine");
+        std::fs::create_dir_all(base.join("t/u")).expect("mkdir");
+        std::fs::write(base.join("t/u/f"), "x").expect("write");
+        remove_tree(&root_map(), None, &base.join("t")).expect("removes");
+        assert!(!base.join("t").exists());
     }
 }

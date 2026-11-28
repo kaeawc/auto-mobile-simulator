@@ -395,22 +395,39 @@ so far, and what it doesn't:
   a host without usable KVM that has what it needs; then TCG software mode. `-backend
   kvm|container|tcg` forces one, and a forced backend that can't run is an error naming why, never a
   fallback. The container is considered only for a guest of the host's own architecture.
-- **Host probe.** Required: Linux, binder (binderfs in `/proc/filesystems`), memfd, the unified
-  cgroup hierarchy, user namespaces (and, for an unprivileged user, `newuidmap`/`newgidmap` with a
-  65,536-id range in `/etc/subuid` and `/etc/subgid`), overlayfs. Reported but not blocking: cgroup
-  memory/cpu/pids controllers, DMA-BUF heaps. Each missing piece prints its fix.
+- **Host probe.** Required: Linux, binder (binderfs in `/proc/filesystems` that, test-mounted in a
+  throwaway user namespace, holds `binder`, `hwbinder` and `vndbinder`: a plain `modprobe
+  binder_linux` gives an empty one), memfd, the unified cgroup hierarchy, user namespaces (also for
+  root: the container's process runs unprivileged), and, for an unprivileged user, `newuidmap` and
+  `newgidmap` with a 65,536-id range in `/etc/subuid` and `/etc/subgid`; overlayfs on Linux 5.11
+  or newer (`userxattr`). Reported but not blocking: cgroup memory/cpu/pids controllers, DMA-BUF
+  heaps. Each missing piece prints its fix.
 - **Image.** One pinned image: `redroid/redroid:15.0.0_64only-250627`, by per-architecture
   manifest digest and layer digest (`image.rs`). It is downloaded only when asked (`skopeo copy` of
   the manifest by digest) and every blob is hashed against the pin before it is unpacked.
-- **Launcher.** `unshare` into new user, mount, pid, uts, ipc and cgroup namespaces (not network);
-  the parent writes the id maps (identity as root; `newuidmap` for a user); the script mounts an
-  overlay of the unpacked image over a per-device writable layer, a `/dev` tmpfs with the nodes
-  Redroid's init expects, binderfs (checked for `binder`, `hwbinder`, `vndbinder`, linked at
-  `/dev/*`), `/proc` and the host's `/sys`, then `exec chroot … /init` with Redroid's arguments
-  (`androidboot.redroid_width|height|dpi|gpu_mode`, `androidboot.use_memfd=true`).
+- **Launcher.** `unshare` into new user, mount, pid, uts, ipc and cgroup namespaces (not network).
+  Container root is never host root: an unprivileged user is their own container root with their
+  `/etc/subuid` range above it (`newuidmap`); run as host root, the container's process drops to a
+  range of its own (root's `/etc/subuid` range, else 2,000,000,000 + 65,536) before it creates the
+  namespace, and the state directory is handed to that range. The script mounts an overlay of the
+  unpacked image over a per-device writable layer, a `/dev` tmpfs with the nodes Redroid's init
+  expects, binderfs (checked for the three devices, linked at `/dev/*`), `/proc` with runc's masked
+  and read-only paths (`kcore`, `/proc/sys`, `sysrq-trigger`...), and the host's `/sys` with every
+  mount in it read-only. A helper then `pivot_root`s into the overlay and detaches the old root
+  (no `chroot`: root inside one can walk out), and execs `/init` with Redroid's arguments
+  (`androidboot.redroid_width|height|dpi|gpu_mode`, `androidboot.use_memfd=true`). The helper is
+  `emu` itself under a hidden subcommand (`helper::main`) or the crate's `simee-container-helper`
+  binary, and it also sets `PR_SET_PDEATHSIG` so a crashed `emu` takes the container down with it
+  (start containers from a thread that outlives them: the kernel ties the signal to the thread);
+  dropping a `Container` kills it. Removing a rootfs the container made runs `rm` inside the
+  namespace.
 - **Verified:** the plan, the script, the probe and the selection against fake hosts; and on a Linux
   VM without binder, as root and as an unprivileged user, a real user namespace with the id maps,
-  the overlay, `/dev`, devpts, `/proc`, `/sys` and the chroot, stopping at binderfs with its message.
+  the overlay, `/dev`, devpts, `/proc` and its masks, `/sys` read-only throughout, and the pivot:
+  the container's mount table has the overlay as its only root, no host device, no path to the
+  host's files, and uid 0 maps to a non-zero host id; setup stops at binderfs with its message
+  there. Also that a helper's child dies when its parent is killed, and that a tree owned by
+  subordinate ids is removed from inside the namespace.
 - **Not verified:** a boot. No binder host has run this launcher, so whether Redroid's `/init`
   starts unprivileged in this namespace set, and how long it takes, are open. It is not wired into
   `emu` yet, so nothing boots through it; there is no display, input or console for it, no
