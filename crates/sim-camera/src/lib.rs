@@ -20,6 +20,8 @@
 //!   size, number and link generation, paced by the source, per reader): to the capture shim
 //!   injected into an iOS simulator's apps (`shims/ios-camera`), and to emu's camera HAL, which
 //!   reads it as a `feed:<socket>` source ([`feed::FeedSource`]).
+//! - `video:<path>` plays a movie file looped at its own frame rate (`video.rs` is the timeline,
+//!   AVFoundation's `AVAssetReader` the decoder; macOS only).
 //! - [`tcc`] reads the host camera permission (never prompting) and turns a missing grant into an
 //!   error that names the fix, instead of black frames.
 //!
@@ -53,6 +55,8 @@ pub mod synth;
 pub mod tcc;
 #[cfg(target_os = "linux")]
 mod v4l2;
+#[cfg(any(target_os = "macos", test))]
+mod video;
 
 pub use catalog::{CameraKind, Change, Format, HostCamera, host_cameras};
 pub use device::{DeviceSpec, Region};
