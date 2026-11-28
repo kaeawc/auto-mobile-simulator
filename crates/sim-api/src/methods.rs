@@ -151,7 +151,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          bitrate is in bit/s; input offers the `simee-input` data channel, whose touches, keys, text, buttons, rotations, folds \
          and scrolls reach the device. One stream per device and URL, living in this process (`simee serve`) on a 30 s lease \
          that stream_status renews: a stream nobody renews is stopped. Returns stream_id, whip_resource and lease_ttl_s. \
-         macOS hosts only for now; audio isn't streamed yet",
+         Encoded on macOS by VideoToolbox (iOS and Android devices) and on Linux by OpenH264 in a build with `--features openh264` (Android devices only); audio isn't streamed yet",
     ),
     (
         "stream_status",

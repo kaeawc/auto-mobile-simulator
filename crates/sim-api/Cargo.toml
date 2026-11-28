@@ -15,6 +15,11 @@ include = ["/Cargo.toml", "/LICENSE", "/examples", "/native", "/src", "/tests"]
 [lib]
 doctest = false
 
+[features]
+# The Linux H.264 encoder for `stream_start` (`simee-encode`'s `openh264`: OpenH264 built from its
+# C++ source, which needs a C++ compiler). Off by default; macOS has VideoToolbox without it.
+openh264 = ["sim-encode/openh264"]
+
 [dependencies]
 base64.workspace = true
 serde.workspace = true

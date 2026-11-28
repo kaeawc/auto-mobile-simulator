@@ -188,17 +188,14 @@ impl Publication for sim_rtc::Publisher {
     }
 }
 
-/// VideoToolbox on the device's own frames: the iOS framebuffer's IOSurface, or emu's frame ring.
-struct VtMedia;
+/// The host's encoder on the device's own frames: VideoToolbox on macOS (the iOS framebuffer's
+/// IOSurface, or emu's frame ring), OpenH264 on Linux built with the `openh264` feature (emu's
+/// frame ring).
+struct HostMedia;
 
-impl Media for VtMedia {
+impl Media for HostMedia {
     fn available(&self) -> Result<(), String> {
-        if sim_encode::available() {
-            Ok(())
-        } else {
-            Err("unsupported: streaming needs an H.264 encoder, which only macOS hosts have so far (VideoToolbox; a Linux encoder is #263)"
-                .into())
-        }
+        if sim_encode::available() { Ok(()) } else { Err(UNAVAILABLE.into()) }
     }
 
     #[cfg(target_os = "macos")]
@@ -228,7 +225,28 @@ impl Media for VtMedia {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "linux", feature = "openh264"))]
+    fn run(
+        &self,
+        target: &Target,
+        config: &EncoderConfig,
+        pacing: Pacing,
+        controls: &Controls,
+        sink: &mut dyn FnMut(AccessUnit) -> sim_encode::Result<Flow>,
+    ) -> Result<(), String> {
+        let text = |e: sim_encode::Error| e.to_string();
+        match target.platform {
+            Platform::Ios => Err(format!("unsupported: {} is an iOS device, and iOS simulators run only on macOS", target.name)),
+            Platform::Android => {
+                let dir = target.avd_dir.as_ref().ok_or_else(|| format!("{}: no AVD directory", target.name))?;
+                let mut encoder = sim_encode::OpenH264Encoder::new(config.clone()).map_err(text)?;
+                let mut source = sim_encode::AndroidSource::connect(dir, 0).map_err(text)?;
+                sim_encode::stream::run(&mut source, &mut encoder, pacing, controls, sink).map(drop).map_err(text)
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", feature = "openh264"))))]
     fn run(
         &self,
         _: &Target,
@@ -240,6 +258,14 @@ impl Media for VtMedia {
         self.available()
     }
 }
+
+/// Why `stream_start` fails on a host with no encoder: macOS has VideoToolbox, and a Linux build
+/// has OpenH264 when it is built with `--features openh264`.
+const UNAVAILABLE: &str = if cfg!(target_os = "linux") {
+    "unsupported: this build of simee has no H.264 encoder; rebuild with `cargo install simee --features openh264` (OpenH264, built from source; needs a C++ compiler)"
+} else {
+    "unsupported: streaming needs an H.264 encoder, which macOS (VideoToolbox) and Linux builds with the `openh264` feature have"
+};
 
 /// The device behind the `device` parameter, through `info` (and `screen`, with `screen`).
 fn lookup(s: &mut Session, p: &Value, screen: bool) -> Result<Target, String> {
@@ -270,12 +296,12 @@ pub(crate) fn stop_all() {
     }
 }
 
-/// The process's streams, on VideoToolbox, `simee-rtc` and the method table, with the thread that
+/// The process's streams, on the host's encoder, `simee-rtc` and the method table, with the thread that
 /// stops streams whose lease lapsed.
 fn global() -> &'static Arc<Streams> {
     GLOBAL.get_or_init(|| {
         let make: MakeInput = Arc::new(|| Box::new(ApiInput(Session::default())));
-        let streams = Arc::new(Streams::new(Arc::new(SystemClock), Arc::new(VtMedia), Arc::new(RtcWhip), make));
+        let streams = Arc::new(Streams::new(Arc::new(SystemClock), Arc::new(HostMedia), Arc::new(RtcWhip), make));
         let reaper = streams.clone();
         // Without it a lapsed lease is still seen (and its stream stopped) by the next stream call.
         let _ = std::thread::Builder::new().name("simee-stream-leases".into()).spawn(move || reaper.reap_forever());
@@ -1963,5 +1989,165 @@ pub(crate) mod tests {
             assert!(streaming.contains(&format!("`{m}`")), "docs/streaming.md doesn't describe `{m}`");
         }
         assert!(streaming.contains(&format!("{} s", LEASE_TTL.as_secs())) && streaming.contains("`stream` toolset"));
+    }
+}
+
+/// The Linux media path end to end on a fake emulator display (no device): `HostMedia::run` on an
+/// Android target reads frames off the display socket, encodes them with OpenH264 and hands the
+/// sink Annex B access units that decode.
+#[cfg(all(test, target_os = "linux", feature = "openh264"))]
+mod linux_media {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
+    use sim_core::stream::FrameHeader;
+    use sim_encode::annexb::{self, NAL_IDR, NAL_PPS, NAL_SPS};
+
+    use super::*;
+
+    const SIZE: (u32, u32) = (96, 160);
+
+    /// A display socket in a fresh AVD directory that sends `frames` different solid frames, then
+    /// holds the connection open (a static screen) until dropped.
+    struct FakeDisplay {
+        dir: PathBuf,
+        done: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl FakeDisplay {
+        fn new(frames: u8) -> FakeDisplay {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            // Not under TMPDIR: a socket path has to fit in SUN_LEN.
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = PathBuf::from("/tmp").join(format!("simee-api-{}-{n}", std::process::id()));
+            let state = emu_avd::state_dir(&dir);
+            std::fs::create_dir_all(&state).expect("state dir");
+            let listener = UnixListener::bind(state.join("display.sock")).expect("bind");
+            let (done, done_rx) = std::sync::mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                let Ok((mut conn, _)) = listener.accept() else { return };
+                // The client's request lines come first; any byte means it is connected.
+                let mut hello = [0u8; 1];
+                let _ = conn.read(&mut hello);
+                for i in 0..frames {
+                    let header = FrameHeader::new(SIZE.0, SIZE.1, SIZE.0, SIZE.1, u64::from(i)).expect("header");
+                    let mut out = header.encode().to_vec();
+                    // The same gradient with a bar moving down it: a small change, not a scene cut
+                    // (OpenH264 starts its own IDR when most of the screen changes at once).
+                    let stride = SIZE.0 as usize * 4;
+                    out.extend((0..header.len as usize).map(|p| {
+                        let (row, col) = (p / stride, p % stride / 4);
+                        if p % 4 == 3 || row / 8 == usize::from(i) { 255 } else { (col + row) as u8 }
+                    }));
+                    if conn.write_all(&out).is_err() {
+                        return;
+                    }
+                }
+                let _ = done_rx.recv();
+            });
+            FakeDisplay { dir, done: Some(done) }
+        }
+
+        fn target(&self, platform: Platform) -> Target {
+            Target {
+                platform,
+                udid: "emulator-5554".into(),
+                name: "Pixel".into(),
+                state: DeviceState::Booted,
+                avd_dir: Some(self.dir.clone()),
+                screen: None,
+            }
+        }
+    }
+
+    impl Drop for FakeDisplay {
+        fn drop(&mut self) {
+            // Let the serving thread finish: release its wait, and wake an `accept` no client
+            // reached (a connection it reads as closed at once), so no thread outlives the test.
+            self.done.take();
+            let _ = std::os::unix::net::UnixStream::connect(emu_avd::state_dir(&self.dir).join("display.sock"));
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn nal_types(unit: &AccessUnit) -> Vec<u8> {
+        annexb::annex_b_units(&unit.data).iter().map(|n| annexb::nal_type(n)).collect()
+    }
+
+    #[test]
+    fn an_android_device_streams_decodable_h264_with_keyframes_on_request_and_a_heartbeat() {
+        assert!(HostMedia.available().is_ok(), "built with the encoder");
+        let display = FakeDisplay::new(3);
+        let config = EncoderConfig { keyframe_interval: Duration::from_secs(60), ..EncoderConfig::default() };
+        let controls = Controls::default();
+        let mut units: Vec<AccessUnit> = Vec::new();
+        HostMedia
+            .run(&display.target(Platform::Android), &config, Pacing::new(60, Some(Duration::from_millis(10))), &controls, &mut |unit| {
+                units.push(unit);
+                // After the three frames, the screen is static: the next units are heartbeats.
+                if units.len() == 6 {
+                    controls.request_keyframe();
+                }
+                Ok(if units.len() == 9 { Flow::Stop } else { Flow::Continue })
+            })
+            .expect("run");
+        assert_eq!(units.len(), 9);
+        assert!(units.iter().any(|u| u.heartbeat), "a static screen is re-encoded");
+        let keys: Vec<usize> = units.iter().enumerate().filter(|(_, u)| u.keyframe).map(|(i, _)| i).collect();
+        assert_eq!(keys.len(), 2, "the first picture and the requested one: {keys:?}");
+        assert_eq!(keys[0], 0);
+        assert!(keys[1] >= 6, "the request comes after the sixth unit: {keys:?}");
+        for &k in &keys {
+            assert_eq!(&nal_types(&units[k])[..3], &[NAL_SPS, NAL_PPS, NAL_IDR], "unit {k}: SPS and PPS cached in front of every IDR");
+        }
+        for (i, unit) in units.iter().enumerate().filter(|(i, _)| !keys.contains(i)) {
+            let types = nal_types(unit);
+            assert!(
+                !types.iter().any(|t| [NAL_SPS, NAL_PPS, NAL_IDR].contains(t)),
+                "unit {i} is a P frame, with no SPS, PPS or IDR: {types:?}"
+            );
+        }
+        let mut decoder = sim_encode::Decoder::new().expect("decoder");
+        for (i, unit) in units.iter().enumerate() {
+            assert_eq!(decoder.decode(&unit.data).unwrap_or_else(|e| panic!("unit {i}: {e}")), SIZE, "unit {i}");
+        }
+        assert!(units.windows(2).all(|w| w[1].pts > w[0].pts), "strictly increasing timestamps");
+    }
+
+    #[test]
+    fn an_ios_device_and_an_android_device_with_no_display_are_refused_with_a_reason() {
+        let display = FakeDisplay::new(0);
+        let config = EncoderConfig::default();
+        let run = |target: &Target| {
+            HostMedia.run(target, &config, Pacing::new(30, None), &Controls::default(), &mut |_| Ok(Flow::Stop)).expect_err("refused")
+        };
+        let err = run(&display.target(Platform::Ios));
+        assert!(err.starts_with("unsupported") && err.contains("only on macOS"), "{err}");
+        let err = run(&Target { avd_dir: None, ..display.target(Platform::Android) });
+        assert!(err.contains("no AVD directory"), "{err}");
+        let err = run(&Target { avd_dir: Some(display.dir.join("missing")), ..display.target(Platform::Android) });
+        assert!(err.starts_with("frame source"), "{err}");
+    }
+}
+
+/// What `stream_start` says on a Linux build without the encoder.
+#[cfg(all(test, target_os = "linux", not(feature = "openh264")))]
+mod linux_without_the_encoder {
+    use super::*;
+
+    #[test]
+    fn the_refusal_says_how_to_get_an_encoder() {
+        let err = HostMedia.available().expect_err("no encoder in this build");
+        assert!(err.starts_with("unsupported") && err.contains("--features openh264"), "{err}");
+        let target = Target {
+            platform: Platform::Android,
+            udid: "emulator-5554".into(),
+            name: "Pixel".into(),
+            state: DeviceState::Booted,
+            avd_dir: None,
+            screen: None,
+        };
+        let run = HostMedia.run(&target, &EncoderConfig::default(), Pacing::new(30, None), &Controls::default(), &mut |_| Ok(Flow::Stop));
+        assert_eq!(run, Err(err), "run refuses with the same reason");
     }
 }
