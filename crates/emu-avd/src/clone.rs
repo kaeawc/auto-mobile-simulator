@@ -10,13 +10,21 @@
 //! Metadata, whichever way the file was made: the source's permission bits and extended
 //! attributes (what `clonefile` copies, and what the `std::fs::copy` this replaces copied on
 //! macOS). An attribute the destination refuses (a `security.*` one without privilege) is
-//! skipped. Ownership and timestamps are the new file's own.
+//! skipped, and so is an attribute list that keeps growing while it is read. Ownership and
+//! timestamps are the new file's own.
+//!
+//! `clonefile` also carries ACLs and BSD file flags, but the sparse fallback does not: the
+//! `fcopyfile` the old `std::fs::copy` used on macOS copied them, this does not. Nothing needs
+//! them on an AVD's disk images (plain files only the emulator opens), so they are dropped.
 
 use std::fs::File;
 use std::io;
 use std::path::Path;
 
 use crate::{Error, Result};
+
+/// What a data copy is reported as: it keeps holes where the platform can find them.
+const COPY_KIND: CloneKind = if cfg!(any(target_vendor = "apple", target_os = "linux")) { CloneKind::Sparse } else { CloneKind::Copy };
 
 /// How a file was copied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,7 +34,8 @@ pub enum CloneKind {
     Reflink,
     /// Only the data extents copied: the file stays as sparse as the original.
     Sparse,
-    /// `std::fs::copy`, on platforms with neither clones nor `SEEK_DATA`.
+    /// The whole file copied, holes written out: on platforms with neither clones nor
+    /// `SEEK_DATA` (neither macOS nor Linux). `golden` ranks it between the other two.
     Copy,
 }
 
@@ -43,37 +52,69 @@ impl CloneKind {
 /// Copies `from` to the new file `to`: a copy-on-write clone where the file system has them,
 /// else a copy that keeps the file's holes.
 ///
-/// `to` must not exist, and a failed clone leaves no half-written file behind.
+/// `to` must not exist. A failed clone leaves no half-written file behind, and never removes a
+/// `to` this call did not create (one another process made in the meantime).
 pub fn clone_file(from: &Path, to: &Path) -> Result<CloneKind> {
-    clone_with(from, to, reflink)
+    clone_with(from, to, reflink, copy_data)
 }
 
-/// [`clone_file`] with the clone attempt given, so tests can make it fail as an unsupported file
-/// system does. `reflink` makes `to` from `src` or fails leaving no file at `to`.
-fn clone_with(from: &Path, to: &Path, reflink: fn(&File, &Path) -> io::Result<()>) -> Result<CloneKind> {
+/// The clone attempt: makes `to` from `src`, or fails leaving no file this attempt made at `to`.
+type Reflink = fn(&File, &Path) -> io::Result<()>;
+/// The data copy into the empty `dst` (`src` is `from`, `dst` is `to`).
+type CopyData = fn(&File, &File, &Path, &Path) -> Result<()>;
+
+/// [`clone_file`] with the clone attempt and the data copy given, so tests can make them fail
+/// as an unsupported file system or a full disk does.
+fn clone_with(from: &Path, to: &Path, reflink: Reflink, copy: CopyData) -> Result<CloneKind> {
     if to.symlink_metadata().is_ok() {
         return Err(Error::Io(to.to_path_buf(), io::ErrorKind::AlreadyExists.into()));
     }
-    clone_new_file(from, to, reflink).inspect_err(|_| {
-        let _ = std::fs::remove_file(to);
-    })
+    clone_new_file(from, to, reflink, copy)
 }
 
-fn clone_new_file(from: &Path, to: &Path, reflink: fn(&File, &Path) -> io::Result<()>) -> Result<CloneKind> {
+/// A file this call made at `to`, removed again unless [`Created::keep`] is called. It exists
+/// only once the clone or `create_new` succeeded, so a `to` somebody else made (an `AlreadyExists`
+/// from the race after the check above) is never ours to remove.
+struct Created<'a>(Option<&'a Path>);
+
+impl<'a> Created<'a> {
+    fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Created<'_> {
+    fn drop(&mut self) {
+        if let Some(to) = self.0 {
+            let _ = std::fs::remove_file(to);
+        }
+    }
+}
+
+fn clone_new_file(from: &Path, to: &Path, reflink: Reflink, copy: CopyData) -> Result<CloneKind> {
     let io = |p: &Path, e| Error::Io(p.to_path_buf(), e);
     let src = File::open(from).map_err(|e| io(from, e))?;
     // Any failure falls back to the copy: a cause other than the file system (a missing
-    // directory, no space) fails the copy too, with its own error.
-    let (dst, kind) = match reflink(&src, to) {
-        Ok(()) if cfg!(target_vendor = "apple") => return Ok(CloneKind::Reflink),
-        Ok(()) => (File::options().write(true).open(to).map_err(|e| io(to, e))?, CloneKind::Reflink),
+    // directory, no space) fails the copy too, with its own error. A failed clone leaves no file.
+    let (created, dst, kind) = match reflink(&src, to) {
+        Ok(()) => {
+            let created = Created(Some(to));
+            if cfg!(target_vendor = "apple") {
+                created.keep();
+                return Ok(CloneKind::Reflink);
+            }
+            let dst = File::options().write(true).open(to).map_err(|e| io(to, e))?;
+            (created, dst, CloneKind::Reflink)
+        }
         Err(_) => {
             let dst = File::options().write(true).create_new(true).open(to).map_err(|e| io(to, e))?;
-            copy_data(&src, &dst, from, to)?;
-            (dst, CloneKind::Sparse)
+            let created = Created(Some(to));
+            copy(&src, &dst, from, to)?;
+            (created, dst, COPY_KIND)
         }
     };
     copy_metadata(&src, &dst).map_err(|e| io(to, e))?;
+    created.keep();
     Ok(kind)
 }
 
@@ -104,7 +145,20 @@ fn reflink(_: &File, _: &Path) -> io::Result<()> {
 /// that can't report extents has its file copied whole.
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 fn copy_data(src: &File, dst: &File, from: &Path, to: &Path) -> Result<()> {
-    use rustix::fs::{SeekFrom, seek};
+    copy_extents(src, dst, from, to, &|f, whence| rustix::fs::seek(f, whence))
+}
+
+/// [`copy_data`] with `seek` given, so a test can make `SEEK_DATA`/`SEEK_HOLE` fail as a file
+/// system without them does.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn copy_extents(
+    src: &File,
+    dst: &File,
+    from: &Path,
+    to: &Path,
+    seek: &dyn Fn(&File, rustix::fs::SeekFrom) -> rustix::io::Result<u64>,
+) -> Result<()> {
+    use rustix::fs::SeekFrom;
     use std::os::unix::fs::FileExt;
     let io = |p: &Path, e| Error::Io(p.to_path_buf(), e);
     let len = src.metadata().map_err(|e| io(from, e))?.len();
@@ -141,18 +195,9 @@ fn copy_metadata(src: &File, dst: &File) -> io::Result<()> {
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     {
         use rustix::fs::{XattrFlags, fgetxattr, flistxattr, fsetxattr};
-        let mut names = vec![0u8; 4096];
-        let n = match flistxattr(src, &mut names[..]) {
-            Ok(n) => n,
-            Err(rustix::io::Errno::RANGE) => {
-                names = vec![0u8; rustix::fs::flistxattr_query(src)?];
-                flistxattr(src, &mut names[..])?
-            }
-            // No extended attributes here (a file system without them).
-            Err(_) => 0,
-        };
+        let names = xattr_names(&mut |buf| flistxattr(src, buf), &mut || rustix::fs::flistxattr_query(src))?;
         let mut value = Vec::new();
-        for name in names[..n].split(|&b| b == 0).filter(|s| !s.is_empty()) {
+        for name in names.split(|&b| b == 0).filter(|s| !s.is_empty()) {
             let Ok(size) = rustix::fs::fgetxattr_query(src, name) else { continue };
             value.resize(size, 0);
             if let Ok(got) = fgetxattr(src, name, &mut value[..]) {
@@ -161,6 +206,34 @@ fn copy_metadata(src: &File, dst: &File) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The NUL-separated names of the source's extended attributes, best effort: a file system
+/// without them, or a list that keeps changing, gives none.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn xattr_names(
+    list: &mut dyn FnMut(&mut [u8]) -> rustix::io::Result<usize>,
+    query: &mut dyn FnMut() -> rustix::io::Result<usize>,
+) -> io::Result<Vec<u8>> {
+    let mut names = vec![0u8; 4096];
+    // The list can grow between the size query and the read (ERANGE again): ask again a few
+    // times, then go without rather than fail the clone for a best-effort copy.
+    for _ in 0..4 {
+        match list(&mut names[..]) {
+            Ok(n) => {
+                names.truncate(n);
+                return Ok(names);
+            }
+            Err(rustix::io::Errno::RANGE) => match query() {
+                // Room for a little growth since the query.
+                Ok(size) => names = vec![0u8; size + 256],
+                Err(_) => break,
+            },
+            // No extended attributes here (a file system without them).
+            Err(_) => break,
+        }
+    }
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
@@ -248,7 +321,7 @@ mod tests {
             sparse_image(&src);
             std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o640)).expect("chmod");
             let has_xattr = rustix::fs::setxattr(src.as_path(), "user.simee.test", b"kept", rustix::fs::XattrFlags::empty()).is_ok();
-            assert_eq!(clone_with(&src, &dst, attempt).expect("copy"), CloneKind::Sparse, "{name}");
+            assert_eq!(clone_with(&src, &dst, attempt, copy_data).expect("copy"), CloneKind::Sparse, "{name}");
             let meta = std::fs::metadata(&dst).expect("meta");
             assert_eq!(meta.len(), 256 << 20, "{name}");
             assert_eq!(std::fs::read(&src).expect("src"), std::fs::read(&dst).expect("dst"), "{name}");
@@ -271,12 +344,119 @@ mod tests {
         std::fs::write(&src, b"data").expect("src");
         std::fs::write(&dst, b"mine").expect("dst");
         assert!(clone_file(&src, &dst).is_err());
-        assert!(clone_with(&src, &dst, unsupported).is_err());
+        assert!(clone_with(&src, &dst, unsupported, copy_data).is_err());
         assert_eq!(std::fs::read(&dst).expect("dst"), b"mine", "an existing file is never replaced");
         let missing = dir.join("out.img");
         assert!(clone_file(&dir.join("missing.img"), &missing).is_err());
-        assert!(clone_with(&src, &dir.join("no-such-dir/out.img"), unsupported).is_err());
+        assert!(clone_with(&src, &dir.join("no-such-dir/out.img"), unsupported, copy_data).is_err());
         assert!(!missing.exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Another process makes `to` after our existence check, then the clone fails with EEXIST.
+    fn raced(_: &File, to: &Path) -> io::Result<()> {
+        std::fs::write(to, b"theirs")?;
+        Err(rustix::io::Errno::EXIST.into())
+    }
+
+    /// A copy that dies mid-way (a full disk): some bytes written, then an error.
+    fn dies_mid_copy(_: &File, dst: &File, _: &Path, to: &Path) -> Result<()> {
+        dst.write_all_at(b"partial", 0).expect("write");
+        Err(Error::Io(to.to_path_buf(), rustix::io::Errno::NOSPC.into()))
+    }
+
+    #[test]
+    fn a_file_another_process_created_first_is_never_removed() {
+        let dir = tmp("raced");
+        let (src, dst) = (dir.join("src.img"), dir.join("dst.img"));
+        std::fs::write(&src, b"data").expect("src");
+        assert!(clone_with(&src, &dst, raced, copy_data).is_err());
+        assert_eq!(std::fs::read(&dst).expect("theirs survives"), b"theirs");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_pre_existing_destination_survives_every_failure() {
+        let dir = tmp("preexisting");
+        let (src, dst) = (dir.join("src.img"), dir.join("dst.img"));
+        std::fs::write(&src, b"data").expect("src");
+        std::fs::write(&dst, b"mine").expect("dst");
+        assert!(clone_with(&src, &dst, unsupported, copy_data).is_err());
+        assert!(clone_with(&src, &dst, unsupported, dies_mid_copy).is_err());
+        assert_eq!(std::fs::read(&dst).expect("dst"), b"mine");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failure_mid_copy_leaves_nothing_behind() {
+        let dir = tmp("mid-copy");
+        let (src, dst) = (dir.join("src.img"), dir.join("dst.img"));
+        std::fs::write(&src, b"data").expect("src");
+        assert!(clone_with(&src, &dst, unsupported, dies_mid_copy).is_err());
+        assert!(dst.symlink_metadata().is_err(), "the half-written copy is removed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A sparse file whose last extent is a hole: data at the start and at 1 MiB, then nothing.
+    fn trailing_hole_image(path: &Path, len: u64) {
+        let f = File::create(path).expect("src");
+        f.set_len(len).expect("len");
+        f.write_all_at(b"head", 0).expect("write");
+        f.write_all_at(b"mid", 1 << 20).expect("write");
+    }
+
+    #[test]
+    fn a_trailing_hole_keeps_the_size_and_stays_a_hole() {
+        let dir = tmp("trailing-hole");
+        let (src, dst) = (dir.join("src.img"), dir.join("dst.img"));
+        trailing_hole_image(&src, 256 << 20);
+        let s = File::open(&src).expect("src");
+        let d = File::create_new(&dst).expect("dst");
+        copy_data(&s, &d, &src, &dst).expect("copy");
+        let meta = std::fs::metadata(&dst).expect("meta");
+        assert_eq!(meta.len(), 256 << 20, "the size includes the trailing hole");
+        assert!(meta.blocks() * 512 < 8 << 20, "the hole took {} bytes", meta.blocks() * 512);
+        assert_eq!(read_at(&dst, 0, 4), b"head");
+        assert_eq!(read_at(&dst, 1 << 20, 3), b"mid");
+        assert_eq!(read_at(&dst, (256 << 20) - 8, 8), [0u8; 8]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_system_without_seek_data_has_the_whole_file_copied() {
+        let dir = tmp("no-seek-data");
+        let (src, dst) = (dir.join("src.img"), dir.join("dst.img"));
+        trailing_hole_image(&src, 3 << 20);
+        let s = File::open(&src).expect("src");
+        let d = File::create_new(&dst).expect("dst");
+        let no_seek = |_: &File, _: rustix::fs::SeekFrom| Err(rustix::io::Errno::INVAL);
+        copy_extents(&s, &d, &src, &dst, &no_seek).expect("whole copy");
+        assert_eq!(std::fs::metadata(&dst).expect("meta").len(), 3 << 20);
+        assert_eq!(std::fs::read(&src).expect("src"), std::fs::read(&dst).expect("dst"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_growing_xattr_list_is_retried_then_skipped_not_fatal() {
+        let list = |calls: &mut u32, buf: &mut [u8], settle_at: u32| {
+            *calls += 1;
+            if *calls < settle_at {
+                return Err(rustix::io::Errno::RANGE);
+            }
+            buf[..7].copy_from_slice(b"user.a\0");
+            Ok(7)
+        };
+        // The list grew again between the size query and the read, once.
+        let mut calls = 0;
+        let names = xattr_names(&mut |b| list(&mut calls, b, 3), &mut || Ok(16)).expect("retried");
+        assert_eq!(names, b"user.a\0");
+        // It never settles: no attributes, and the clone goes on.
+        let mut calls = 0;
+        let names = xattr_names(&mut |b| list(&mut calls, b, u32::MAX), &mut || Ok(16)).expect("skipped");
+        assert!(names.is_empty());
+        // A failing size query is skipped too.
+        let mut calls = 0;
+        let names = xattr_names(&mut |b| list(&mut calls, b, u32::MAX), &mut || Err(rustix::io::Errno::RANGE)).expect("skipped");
+        assert!(names.is_empty());
     }
 }
