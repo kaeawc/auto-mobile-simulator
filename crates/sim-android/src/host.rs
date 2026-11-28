@@ -126,42 +126,6 @@ mod imp {
             let ours: HashSet<u64> = [111, 222].into();
             assert_eq!(listen_rows(table, &ours), [5554, 5555], "an established row and another process's listener are left out");
         }
-
-        #[test]
-        fn this_process_reads_back_as_itself() {
-            let me = std::process::id() as i32;
-            let start = start(me).expect("start");
-            assert_eq!(super::start(me), Some(start), "stable while it lives");
-            assert!(
-                args(me)
-                    .expect("args")
-                    .contains(&std::env::current_exe().expect("exe").file_name().expect("name").to_string_lossy().into_owned())
-            );
-            let a = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
-            let b = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0));
-            let ports = listening(me);
-            assert!(ports.contains(&a.local_addr().expect("addr").port()), "{ports:?}");
-            if let Ok(b) = b {
-                assert!(ports.contains(&b.local_addr().expect("addr").port()), "{ports:?}");
-            }
-        }
-
-        #[test]
-        fn a_gone_process_reads_as_nothing() {
-            let mut child = std::process::Command::new("sleep").arg("60").spawn().expect("sleep");
-            let pid = child.id() as i32;
-            let started = start(pid).expect("start");
-            // Between fork and exec the child still has its parent's command line.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !args(pid).is_some_and(|a| a.starts_with("sleep")) {
-                assert!(std::time::Instant::now() < deadline, "the child never exec'd sleep: {:?}", args(pid));
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            child.kill().expect("kill");
-            child.wait().expect("wait");
-            assert_eq!((start(pid), args(pid), listening(pid)), (None, None, Vec::new()));
-            assert!(started > 0);
-        }
     }
 }
 
@@ -226,6 +190,89 @@ mod tests {
             b.push(0);
         }
         b
+    }
+
+    /// The host's own answers about real processes, on every host with a native `Host`: on macOS
+    /// this is the libproc path, which a wrong answer would show as every stock emulator `Shutdown`.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn this_process_reads_back_as_itself() {
+        let me = std::process::id() as i32;
+        let start = Native.start(me).expect("start");
+        assert_eq!(Native.start(me), Some(start), "stable while it lives");
+        let exe = std::env::current_exe().expect("exe");
+        let args = Native.args(me).expect("args");
+        assert!(args.contains(&*exe.file_name().expect("name").to_string_lossy()), "{args}");
+        let a = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let quiet = std::net::TcpStream::connect(a.local_addr().expect("addr")).expect("connect");
+        let ports = Native.listening(me);
+        assert!(ports.contains(&a.local_addr().expect("addr").port()), "{ports:?}");
+        assert!(!ports.contains(&quiet.local_addr().expect("addr").port()), "a connected socket doesn't listen: {ports:?}");
+        #[cfg(target_os = "linux")]
+        if let Ok(b) = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) {
+            assert!(Native.listening(me).contains(&b.local_addr().expect("addr").port()));
+        }
+    }
+
+    /// A process that has exited, once reaped, is nothing to the host: not a stale answer.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn a_gone_process_reads_as_nothing() {
+        let mut child = std::process::Command::new("sleep").arg("60").spawn().expect("sleep");
+        let pid = child.id() as i32;
+        // Between fork and exec the child still has its parent's command line.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !Native.args(pid).is_some_and(|a| a.starts_with("sleep") || a.contains("/sleep ")) {
+            assert!(std::time::Instant::now() < deadline, "the child never exec'd sleep: {:?}", Native.args(pid));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(Native.start(pid).is_some());
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+        assert_eq!((Native.start(pid), Native.args(pid), Native.listening(pid)), (None, None, Vec::new()));
+    }
+
+    /// A stock qemu end to end through the real host: a process whose command line is a qemu's
+    /// (`-avd NAME -port N`) and whose PID is in the AVD's lock lists as running, with those
+    /// ports; once it exits it doesn't. On macOS this is the libproc path against a real process.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn a_process_with_a_qemu_command_line_is_found_through_the_real_host() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let root = std::env::temp_dir().join(format!("sa-host-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("lane.avd");
+        std::fs::create_dir_all(&dir).expect("avd dir");
+        std::fs::write(root.join("lane.ini"), format!("path={}\n", dir.display())).expect("pointer");
+        let env = emu_avd::Env { sdk_root: None, avd_home: root.clone() };
+        // `sh -c 'read x' qemu-fake -avd lane -port 5900` blocks on its stdin with those words in
+        // its command line.
+        let mut qemu = Command::new("sh")
+            .args(["-c", "read x", "qemu-fake", "-avd", "lane", "-port", "5900"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("sh");
+        std::fs::write(dir.join("hardware-qemu.ini.lock"), format!("{}\0", qemu.id())).expect("lock");
+        let stock = crate::listing::StockCache::new(std::sync::Arc::new(Native));
+        let names = ["lane".to_owned()];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let found = loop {
+            let found = stock.instances(&env, &names, &[]);
+            if !found.is_empty() || std::time::Instant::now() > deadline {
+                break found;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(
+            found.iter().map(|r| (r.avd_name.as_str(), r.console_port, r.adb_port, r.pid)).collect::<Vec<_>>(),
+            [("lane", 5900, 5901, qemu.id() as i32)]
+        );
+        assert_eq!(stock.instances(&env, &names, &[]), found, "and again, from memory");
+        qemu.stdin.take().expect("stdin").write_all(b"\n").ok();
+        qemu.wait().expect("wait");
+        assert!(stock.instances(&env, &names, &[]).is_empty(), "an exited process isn't listed");
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

@@ -7,7 +7,8 @@
 Builds a private SDK and AVD home with --avds AVDs (default 44: phones, tablets, watches, TVs and
 cars, each with the config.ini avdmanager writes), and with --running of them (default 2) held
 by a stand-in for the stock emulator: a process whose command line is a qemu's (`-avd NAME -port
-N`) and that holds the AVD's `hardware-qemu.ini.lock`. No emulator, hypervisor or SDK is needed.
+N`, N from 5900 up, outside the 5554-5682 range a farm's consoles use) and that holds the AVD's
+`hardware-qemu.ini.lock`. No emulator, hypervisor or SDK is needed.
 Every call is timed --calls times (default 100), and the table gives p50 and p95 in ms, each
 the median over rounds, with the host and the load recorded.
 
@@ -17,8 +18,9 @@ emulators:
   kept       over one `simee serve` connection: `devices`, `devices` with booted, `info` of an exact
              AVD name, `info` of `booted`
   one-shot   `simee list`, `simee list --booted`, `simee tap NAME 1 1` and `simee tap booted 1 1`
-             as a fresh process each (no server on the socket). The taps fail after the device is
-             resolved (nothing answers on the stand-in's console), which is what is timed.
+             as a fresh process each (no server on the socket). The taps fail once the device is
+             resolved, before any network I/O: a stopped AVD isn't running, and a stand-in is a
+             stock emulator, which refuses input over the display socket. That is what is timed.
 A one-shot call includes the process's start; `simee --version` is timed too, as its floor.
 
 Reproduces docs/benchmarks.md "Android device resolution".
@@ -117,7 +119,7 @@ def start_fakes(root, avd, names, count):
     os.chmod(qemu, 0o755)
     out = []
     for i, name in enumerate(names[:count]):
-        p = subprocess.Popen([qemu, '-avd', name, '-port', str(5554 + 2 * i)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        p = subprocess.Popen([qemu, '-avd', name, '-port', str(5900 + 2 * i)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         procs.append(p)
         open(os.path.join(avd, f'{name}.avd', 'hardware-qemu.ini.lock'), 'w').write(f'{p.pid}\0')
         out.append((p, name))
