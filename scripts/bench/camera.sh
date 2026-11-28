@@ -203,7 +203,8 @@ android_round() {
 ios_stop_launched() {
   local pid
   pid=$(awk -F': ' '/: [0-9]+$/ { print $2 }' "$1" 2>/dev/null | head -1)
-  [ -n "$pid" ] && bench_stop_pid "$pid" 5
+  # Forget the PID once it's stopped, so the exit handler never signals a reused PID.
+  [ -n "$pid" ] && { bench_stop_pid "$pid" 5; : >"$1"; }
   return 0
 }
 
