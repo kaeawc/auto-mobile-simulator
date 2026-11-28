@@ -1962,6 +1962,7 @@ version = "0.2.0"
 dependencies = [
  "png",
  "simee-core",
+ "simee-coresim",
  "simee-emu-avd",
 ]
 

@@ -12,6 +12,7 @@
 pub mod apps;
 pub mod console;
 pub mod display;
+pub mod host;
 pub mod listing;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -44,7 +45,7 @@ pub struct Android {
     pub env: Env,
     /// Where running emulators advertise themselves (default: [`emu_avd::running_dir`]).
     pub running_dir: Option<PathBuf>,
-    /// Stock emulators found by earlier lookups, so a listing asks `ps` only about new ones.
+    /// Stock emulators found by earlier lookups, so a listing asks the host only about new ones.
     stock: std::sync::Arc<listing::StockCache>,
 }
 
@@ -123,19 +124,24 @@ impl Android {
     }
 
     pub fn new(env: Env) -> Self {
-        Android::with_host(env, std::sync::Arc::new(listing::Ps))
+        Android::with_host(env, std::sync::Arc::new(host::Native))
     }
 
-    /// [`Android::new`] asking `host` about processes instead of `ps` and `lsof`.
+    /// [`Android::new`] asking `host` about processes instead of the kernel.
     pub fn with_host(env: Env, host: std::sync::Arc<dyn listing::Host>) -> Self {
         Android { env, running_dir: emu_avd::running_dir(), stock: std::sync::Arc::new(listing::StockCache::new(host)) }
     }
 
     /// Every running emulator: simee's (their advertisements), then the stock emulator's
-    /// ([`Env::stock_instances`]) for AVDs simee doesn't run.
+    /// ([`StockCache::instances`](listing::StockCache::instances)) for AVDs simee doesn't run.
     fn running(&self) -> Vec<Running> {
+        self.running_among(&self.env.list_avds())
+    }
+
+    /// [`Android::running`] for the AVDs `names`, which the caller has listed already.
+    fn running_among(&self, names: &[String]) -> Vec<Running> {
         let mut all = self.simee_running();
-        let stock = self.stock.instances(&self.env, &all);
+        let stock = self.stock.instances(&self.env, names, &all);
         all.extend(stock);
         all
     }
@@ -156,8 +162,9 @@ impl Android {
 
     /// Every AVD, labelled with its form factor; running ones (simee or stock) are `Booted`.
     pub fn devices(&self) -> Vec<DeviceInfo> {
-        let running = self.running();
-        self.env.list_avds().into_iter().map(|name| self.describe(&name, &running).info).collect()
+        let names = self.env.list_avds();
+        let running = self.running_among(&names);
+        names.iter().map(|name| self.describe(name, &running).info).collect()
     }
 
     /// AVD `name` as a booted device, from its config alone (no emulator lookup: the caller saw
@@ -180,26 +187,33 @@ impl Android {
     /// Resolves a UDID-or-name query (`booted` is the only running device) to a device. An exact
     /// AVD name loads just that AVD.
     pub fn device(&self, query: &str) -> Result<Device, String> {
-        // One directory scan, not one for the exact-name check and another for the list.
-        let names = self.env.list_avds();
-        // An exact AVD name (what every API call passes) probes that AVD alone.
-        if !query.is_empty() && names.iter().any(|n| n == query) {
+        // An exact AVD name (what every API call passes) is one stat of its pointer, and probes
+        // that AVD alone: nothing lists the home.
+        if self.env.has_avd(query) {
             return Ok(self.describe(query, &self.running_of(query).into_iter().collect::<Vec<_>>()));
         }
-        let running = self.running();
-        // `booted` is decided by what is running alone: load only those AVDs, not every config.
-        let only_running = query.eq_ignore_ascii_case("booted");
-        let devices: Vec<Device> = names
-            .into_iter()
-            .filter(|name| !only_running || name.eq_ignore_ascii_case(query) || running.iter().any(|r| r.avd_name == *name))
-            .map(|name| self.describe(&name, &running))
-            .collect();
+        let (devices, _) = self.candidates(query);
         let infos: Vec<DeviceInfo> = devices.iter().map(|d| d.info.clone()).collect();
         match select(&infos, query) {
             Selection::One(i) => devices.into_iter().nth(i).ok_or_else(|| format!("no device matches `{query}`")),
             Selection::None => Err(format!("no device matches `{query}`")),
             Selection::Ambiguous => Err(format!("`{query}` matches several devices; use a UDID")),
         }
+    }
+
+    /// The AVDs `query` could select among, and whether the home has any AVD at all. Every AVD,
+    /// except that `booted` is decided by what is running alone: it loads only the running ones
+    /// and one named like it, not every config.
+    pub fn candidates(&self, query: &str) -> (Vec<Device>, bool) {
+        let names = self.env.list_avds();
+        let running = self.running_among(&names);
+        let only_running = query.eq_ignore_ascii_case("booted");
+        let devices = names
+            .iter()
+            .filter(|name| !only_running || name.eq_ignore_ascii_case(query) || running.iter().any(|r| r.avd_name == **name))
+            .map(|name| self.describe(name, &running))
+            .collect();
+        (devices, !names.is_empty())
     }
 
     fn describe(&self, name: &str, running: &[Running]) -> Device {
@@ -2534,6 +2548,41 @@ mod tests {
         assert_eq!(f.android.device("pixel").expect("exact").info.udid, "pixel");
         assert!(!f.android.has_avd("Pixel"), "exact case, whatever the filesystem");
         assert_eq!(f.android.device("Pixel").map(|d| d.info.udid), Ok("pixel".into()), "the scan still matches names loosely");
+    }
+
+    #[test]
+    fn booted_loads_only_the_running_avds_and_any_named_like_it() {
+        let f = fixture("candidates");
+        assert!(!f.android.candidates("booted").1, "an empty home has no AVDs");
+        for n in ["a", "b", "c"] {
+            f.android.create(n, "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        }
+        let udids = |query: &str| f.android.candidates(query).0.iter().map(|d| d.info.udid.clone()).collect::<Vec<_>>();
+        assert_eq!((udids("booted"), f.android.candidates("booted").1), (Vec::<String>::new(), true), "none running, AVDs exist");
+        assert_eq!(udids("a"), ["a", "b", "c"], "a name is matched against every AVD");
+        let _fake = fake_emulator(&f.android, "b");
+        assert_eq!(udids("booted"), ["b"], "the other configs aren't loaded");
+        assert_eq!(udids("BOOTED"), ["b"]);
+        // An AVD that is named `booted` is still selectable by that name, as `device` always did.
+        f.android.create("booted", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        assert_eq!(udids("booted"), ["b", "booted"]);
+        assert_eq!(f.android.device("booted").map(|d| d.info.udid), Ok("booted".into()));
+    }
+
+    /// An exact name is settled by one stat of its pointer: it works where the home can't be listed.
+    #[test]
+    fn an_exact_avd_name_resolves_without_listing_the_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture("nolist");
+        f.android.create("pixel", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let home = f.android.env.avd_home.clone();
+        // Searchable but not readable: a path inside is reachable, the directory can't be listed.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o311)).expect("chmod");
+        // (root lists it anyway: only then is there nothing to show)
+        let listable = std::fs::read_dir(&home).is_ok();
+        let found = f.android.device("pixel").map(|d| d.info.udid);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
+        assert_eq!(found, Ok("pixel".into()), "listable: {listable}");
     }
 
     #[test]
