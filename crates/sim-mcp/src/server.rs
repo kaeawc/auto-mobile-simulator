@@ -156,16 +156,89 @@ fn strings(value: &Value, key: &str) -> Vec<String> {
     value.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default()
 }
 
-/// Reports a blocking call's progress until dropped. Dropping it waits out a progress being sent,
-/// and none is sent after, so a call's progress never follows its response (which MCP forbids).
+/// Reports a blocking call's progress until dropped: each step the call counts (`progress` and
+/// `total` in its units: devices booted of all, an install's phases) as it happens, and between
+/// them a heartbeat every `every`, so a client that resets its timeout on progress keeps waiting.
+/// The value only ever increases, as MCP requires: a heartbeat before any step counts seconds (the
+/// fallback for a call that counts nothing), one after a step moves partway to the next unit
+/// (`done` + 0.9·k/(k+1) for the k-th beat), and a call whose first progress was seconds stays in
+/// seconds. Dropping it waits out a progress being sent, and none is sent after, so a call's
+/// progress never follows its response (which MCP forbids).
 struct Heartbeat {
-    /// Set once the call has returned. A progress is checked against it and sent under its lock.
-    stopped: Arc<Mutex<bool>>,
+    report: Arc<Mutex<Report>>,
+}
+
+/// What a [`Heartbeat`] has sent, under the one lock every send and the stop take.
+struct Report {
+    /// Set once the call has returned.
+    stopped: bool,
+    sink: Sink,
+    token: Value,
+    tool: String,
+    start: Instant,
+    /// The last value sent, if any.
+    last: Option<f64>,
+    /// Whether the values are the call's own units (else seconds).
+    counted: bool,
+    /// Heartbeats since the last step.
+    beats: u32,
+    note: crate::tasks::Note,
+    before_send: Box<dyn Fn() + Send>,
+}
+
+impl Report {
+    /// Sends `value` (with the call's total once counted) unless it wouldn't increase.
+    fn send(&mut self, value: f64, message: String) {
+        if self.stopped || self.last.is_some_and(|last| value <= last) {
+            return;
+        }
+        (self.before_send)();
+        let mut params = json!({"progressToken": self.token, "progress": value, "message": message});
+        if let (true, Some(total)) = (self.counted, self.note.total) {
+            params["total"] = total.into();
+        }
+        (self.sink)(json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": params}).to_string());
+        self.last = Some(value);
+    }
+
+    fn step(&mut self, note: &crate::tasks::Note) {
+        self.note = note.clone();
+        if self.last.is_none() {
+            self.counted = true;
+        }
+        if self.counted {
+            self.beats = 0;
+            let message = format!("{}: {}", self.tool, note.message);
+            self.send(note.done as f64, message);
+        }
+    }
+
+    fn beat(&mut self, said: Option<String>) {
+        let secs = self.start.elapsed().as_secs_f64().round();
+        let note = said.map(|n| format!(": {n}")).unwrap_or_default();
+        let message = format!("{} is still running ({secs} s){note}", self.tool);
+        let value = if self.counted {
+            self.beats += 1;
+            let k = f64::from(self.beats);
+            self.note.done as f64 + 0.9 * k / (k + 1.0)
+        } else {
+            secs
+        };
+        self.send(value, message);
+    }
+}
+
+impl Heartbeat {
+    /// Where the call's counted steps go: sent at once, on the call's thread.
+    fn steps(&self) -> crate::tasks::OnStep {
+        let report = self.report.clone();
+        Arc::new(move |note: &crate::tasks::Note| lock(&report).step(note))
+    }
 }
 
 impl Drop for Heartbeat {
     fn drop(&mut self) {
-        *lock(&self.stopped) = true;
+        lock(&self.report).stopped = true;
     }
 }
 
@@ -179,7 +252,7 @@ fn heartbeat_with(sink: Sink, token: Value, tool: String, every: Duration, befor
     heartbeat_noting(sink, token, tool, every, Ctl::default(), before_send)
 }
 
-/// [`heartbeat_with`], saying what the call waits on (its note in `ctl`) after the time.
+/// [`heartbeat_with`], saying what the call last said (its note in `ctl`) after the time.
 fn heartbeat_noting(
     sink: Sink,
     token: Value,
@@ -188,37 +261,37 @@ fn heartbeat_noting(
     ctl: Ctl,
     before_send: impl Fn() + Send + 'static,
 ) -> Heartbeat {
-    let stopped = Arc::new(Mutex::new(false));
-    let flag = stopped.clone();
+    let report = Arc::new(Mutex::new(Report {
+        stopped: false,
+        sink,
+        token,
+        tool,
+        start: Instant::now(),
+        last: None,
+        counted: false,
+        beats: 0,
+        note: crate::tasks::Note::default(),
+        before_send: Box::new(before_send),
+    }));
+    let shared = report.clone();
     let spawned = std::thread::Builder::new().name("simee-mcp-progress".into()).spawn(move || {
-        let start = Instant::now();
-        let mut next = start + every;
-        while !*lock(&flag) {
+        let mut next = Instant::now() + every;
+        while !lock(&shared).stopped {
             std::thread::sleep(Duration::from_millis(10));
             if Instant::now() < next {
                 continue;
             }
             next += every;
-            let secs = start.elapsed().as_secs_f64();
-            let note = ctl.say().map(|n| format!(": {n}")).unwrap_or_default();
-            let message = format!("{tool} is still running ({} s){note}", secs.round());
+            // Read before the report's lock: the call's thread takes the note's lock, then this one.
+            let said = ctl.say();
             // Checked and sent under the one lock the drop takes, so a stop can't fall in between.
-            let stopped = lock(&flag);
-            if *stopped {
-                return;
-            }
-            before_send();
-            sink(
-                json!({"jsonrpc": "2.0", "method": "notifications/progress",
-                "params": {"progressToken": token, "progress": secs.round(), "message": message}})
-                .to_string(),
-            );
+            lock(&shared).beat(said);
         }
     });
     if let Err(e) = spawned {
         eprintln!("simee mcp: cannot start a progress thread: {e}");
     }
-    Heartbeat { stopped }
+    Heartbeat { report }
 }
 
 impl Inner {
@@ -401,8 +474,15 @@ impl Inner {
         let progress = ctx.progress_token.clone().filter(|_| tools::LONG_RUNNING.contains(&name.as_str()));
         let era = ctx.era;
         self.offload_with(id, ctx.clone(), move |inner, ctl| {
-            let _beat = progress.map(|token| heartbeat(inner.sink.clone(), token, name.clone(), inner.timing.heartbeat, ctl.clone()));
+            let beat = progress.map(|token| heartbeat(inner.sink.clone(), token, name.clone(), inner.timing.heartbeat, ctl.clone()));
+            // The call's own steps are sent as it reaches them, before its response (the beat is
+            // dropped, and stops, before this returns).
+            let ctl = match &beat {
+                Some(beat) => ctl.clone().on_step(beat.steps()),
+                None => ctl.clone(),
+            };
             let ran = sim_api::with_call_hooks(ctl.hooks(), || tools::run(&*inner.backend, &inner.pages, &name, &args));
+            drop(beat);
             Ok(tools::result(&name, ran, era))
         });
     }

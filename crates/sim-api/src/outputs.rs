@@ -125,7 +125,7 @@ pub const OUTPUTS: &[(&str, &str)] = &[
     ),
     (
         "boot_many",
-        "{concurrency: number, all_s: number, failed: number, unsettled: number,
+        "{concurrency: number, all_s: number, failed: number, unsettled: number, cancelled?: boolean,
             devices: [{device: string, error?: string, boot_s?: number, started_s?: number, done_s?: number, console_port?: number,
             serial?: string, settled?: boolean, settle_s?: number, settle_error?: string}], admission?: @admission, pacing?: @pacing}",
     ),
