@@ -255,7 +255,13 @@ impl Media for HostMedia {
             Platform::Android => {
                 let dir = target.avd_dir.as_ref().ok_or_else(|| format!("{}: no AVD directory", target.name))?;
                 let mut encoder = sim_encode::OpenH264Encoder::new(config.clone()).map_err(text)?;
-                let mut source = sim_encode::AndroidSource::connect(dir, 0).map_err(text)?;
+                // Frames at the stream's size from emu, so the encoder's colour conversion has
+                // little to scale; full size when the stream is.
+                let mut source = match config.max_size {
+                    Some(max) => sim_encode::AndroidSource::connect_fitted(dir, max, target.screen),
+                    None => sim_encode::AndroidSource::connect(dir, 0),
+                }
+                .map_err(text)?;
                 sim_encode::stream::run(&mut source, &mut encoder, pacing, controls, sink).map(drop).map_err(text)
             }
         }
@@ -586,7 +592,8 @@ impl Streams {
     fn start(&self, p: &Value, lookup: &mut Lookup<'_>) -> Result<Value, String> {
         let options = options(p)?;
         self.media.available()?;
-        let target = lookup(p, options.settings.input)?;
+        // Linux sizes emu's frames from the screen, so it asks for it without input too.
+        let target = lookup(p, options.settings.input || cfg!(target_os = "linux"))?;
         if target.state != DeviceState::Booted {
             return Err(format!("{} isn't booted ({:?}): boot it before streaming it", target.name, target.state));
         }
@@ -2059,7 +2066,7 @@ pub(crate) mod tests {
 /// sink Annex B access units that decode.
 #[cfg(all(test, target_os = "linux", feature = "openh264"))]
 mod linux_media {
-    use std::io::{Read, Write};
+    use std::io::{BufRead, Write};
     use std::os::unix::net::UnixListener;
 
     use sim_core::stream::FrameHeader;
@@ -2074,10 +2081,18 @@ mod linux_media {
     struct FakeDisplay {
         dir: PathBuf,
         done: Option<std::sync::mpsc::Sender<()>>,
+        /// The client's `hello` lines.
+        hellos: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeDisplay {
         fn new(frames: u8) -> FakeDisplay {
+            FakeDisplay::honouring(frames, false)
+        }
+
+        /// An emu whose frames are shrunk by the whole factor the first `hello` asks for when it
+        /// `honours` that, and full size otherwise.
+        fn honouring(frames: u8, honours: bool) -> FakeDisplay {
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             // Not under TMPDIR: a socket path has to fit in SUN_LEN.
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2086,17 +2101,38 @@ mod linux_media {
             std::fs::create_dir_all(&state).expect("state dir");
             let listener = UnixListener::bind(state.join("display.sock")).expect("bind");
             let (done, done_rx) = std::sync::mpsc::channel::<()>();
+            let hellos = Arc::new(Mutex::new(Vec::<String>::new()));
+            let seen = hellos.clone();
             std::thread::spawn(move || {
                 let Ok((mut conn, _)) = listener.accept() else { return };
-                // The client's request lines come first; any byte means it is connected.
-                let mut hello = [0u8; 1];
-                let _ = conn.read(&mut hello);
+                let lines = conn.try_clone().expect("clone");
+                let recorded = seen.clone();
+                std::thread::spawn(move || {
+                    for line in std::io::BufReader::new(lines).lines().map_while(Result::ok) {
+                        if line.starts_with("hello ") {
+                            recorded.lock().expect("hellos").push(line);
+                        }
+                    }
+                });
+                // The client's request lines come first: frames go once its `hello` is in.
+                let hello = loop {
+                    let first = seen.lock().expect("hellos").first().and_then(|l| l.strip_prefix("hello ")?.parse::<u32>().ok());
+                    if let Some(h) = first {
+                        break h;
+                    }
+                    if done_rx.try_recv() == Err(std::sync::mpsc::TryRecvError::Disconnected) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let factor = if honours { sim_core::pixels::downscale_factor(SIZE.0, hello) } else { 1 };
+                let (w, h) = sim_core::pixels::downscaled_size(SIZE.0, SIZE.1, factor);
                 for i in 0..frames {
-                    let header = FrameHeader::new(SIZE.0, SIZE.1, SIZE.0, SIZE.1, u64::from(i)).expect("header");
+                    let header = FrameHeader::new(w, h, SIZE.0, SIZE.1, u64::from(i)).expect("header");
                     let mut out = header.encode().to_vec();
                     // The same gradient with a bar moving down it: a small change, not a scene cut
                     // (OpenH264 starts its own IDR when most of the screen changes at once).
-                    let stride = SIZE.0 as usize * 4;
+                    let stride = w as usize * 4;
                     out.extend((0..header.len as usize).map(|p| {
                         let (row, col) = (p / stride, p % stride / 4);
                         if p % 4 == 3 || row / 8 == usize::from(i) { 255 } else { (col + row) as u8 }
@@ -2107,7 +2143,7 @@ mod linux_media {
                 }
                 let _ = done_rx.recv();
             });
-            FakeDisplay { dir, done: Some(done) }
+            FakeDisplay { dir, done: Some(done), hellos }
         }
 
         fn target(&self, platform: Platform) -> Target {
@@ -2174,6 +2210,43 @@ mod linux_media {
             assert_eq!(decoder.decode(&unit.data).unwrap_or_else(|e| panic!("unit {i}: {e}")), SIZE, "unit {i}");
         }
         assert!(units.windows(2).all(|w| w[1].pts > w[0].pts), "strictly increasing timestamps");
+    }
+
+    /// Runs a stream capped at `max_size` for three pictures on `display`, and returns the size
+    /// the decoder saw in each access unit.
+    fn decoded_sizes(display: &FakeDisplay, max_size: Option<u32>) -> Vec<(u32, u32)> {
+        let config = EncoderConfig { max_size, keyframe_interval: Duration::from_secs(60), ..EncoderConfig::default() };
+        let target = Target { screen: Some(SIZE), ..display.target(Platform::Android) };
+        let mut units: Vec<AccessUnit> = Vec::new();
+        HostMedia
+            .run(&target, &config, Pacing::new(60, Some(Duration::from_millis(10))), &Controls::default(), &mut |unit| {
+                units.push(unit);
+                Ok(if units.len() == 3 { Flow::Stop } else { Flow::Continue })
+            })
+            .expect("run");
+        let mut decoder = sim_encode::Decoder::new().expect("decoder");
+        units.iter().map(|u| decoder.decode(&u.data).expect("decodes")).collect()
+    }
+
+    #[test]
+    fn a_capped_stream_asks_emu_for_frames_at_its_size_and_a_full_size_stream_asks_for_full_frames() {
+        let display = FakeDisplay::honouring(3, true);
+        decoded_sizes(&display, Some(80));
+        assert_eq!(*display.hellos.lock().expect("hellos"), ["hello 48"], "factor 2 brings the 160-pixel side to 80");
+        let display = FakeDisplay::honouring(3, true);
+        assert_eq!(decoded_sizes(&display, None), [SIZE; 3]);
+        assert_eq!(*display.hellos.lock().expect("hellos"), [format!("hello {}", u32::MAX)]);
+    }
+
+    #[test]
+    fn frames_come_out_at_the_streams_size_whether_emu_shrinks_them_or_the_encoder_does() {
+        // Shrunk by emu to 48x80, which the encoder takes as it is.
+        let honoured = FakeDisplay::honouring(3, true);
+        assert_eq!(decoded_sizes(&honoured, Some(80)), [(48, 80); 3]);
+        // Sent at 96x160 by an emu that ignores the request: the encoder scales to the same size.
+        let ignored = FakeDisplay::honouring(3, false);
+        assert_eq!(decoded_sizes(&ignored, Some(80)), [(48, 80); 3]);
+        assert_eq!(ignored.hellos.lock().expect("hellos").len(), 1, "an ignored request isn't repeated");
     }
 
     #[test]
