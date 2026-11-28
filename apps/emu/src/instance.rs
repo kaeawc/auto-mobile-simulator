@@ -173,7 +173,10 @@ impl Instance {
         emu_vmm::disk::ensure_sparse(&dir.join("cache.img"), CACHE_BYTES)?;
         let key_src = avd.sysdir.join("encryptionkey.img");
         if key_src.is_file() {
-            emu_vmm::disk::ensure_copy(&key_src, &dir.join("encryptionkey.img"))?;
+            let key_dst = dir.join("encryptionkey.img");
+            if !key_dst.exists() {
+                emu_avd::golden::clone_file(&key_src, &key_dst)?;
+            }
         } else {
             emu_vmm::disk::ensure_sparse(&dir.join("encryptionkey.img"), 18 << 20)?;
         }
