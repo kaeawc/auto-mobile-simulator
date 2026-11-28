@@ -6,6 +6,15 @@ Vulkan** (MoltenVK or KosmicKrisp on the GPU; lavapipe or SwiftShader on the CPU
 correctness, but none had been measured against the others. This page measures them per API
 and recommends defaults. Issue #355.
 
+**Summary.** The boot tables below are 3 rounds per arm (the cold-init table is 5). On API 36,
+warm boots to `sys.boot_completed` took 3.7 to 4.0 s on MoltenVK + ANGLE-Metal, MoltenVK +
+SwANGLE and KosmicKrisp + ANGLE-Metal, and 9.46 s on KosmicKrisp + SwANGLE (10.8, 9.5 and
+4.8 s). That arm's slow boots are unexplained (footnote 1). Their host load at launch does not
+account for them: the 9.5 s boot launched at load 9.7, in the 5 to 15 range of the 3.7 to 4.0 s
+boots. Frame pacing, idle CPU and memory are within noise of one another on API 36 for the
+MoltenVK arms. SwANGLE on API 30 drops most frames, and `-gpu swiftshader` does not boot on
+macOS.
+
 ## Method
 
 `scripts/bench/renderers.sh` (registered in `scripts/bench/run-all.sh` as `android-renderers`).
@@ -54,6 +63,19 @@ in turn (the order is reversed every other round):
 Each boot held a host boot slot (`--boot-gate` with waaagh's `boot-slot.sh`). Every sample in
 the result JSON carries the 1-minute host load.
 
+A run that gives no usable numbers is a failure, not a sample. A boot that never completed, got
+no slot, or crashed after `sys.boot_completed` shows its word (`never`, `no-slot`, `crashed`) in
+its boot-time row. A crashed run's other numbers are dropped, so a dead process's 0 CPU-seconds
+never enters a median, and the note under each table counts the failures per arm.
+
+The script drives one device on `--port` (default 5700, adb 5701). It refuses an odd port, and a
+port whose serial or adb port's serial is on the protected list in `scripts/bench/lib.sh`, whether
+or not that device is up. It re-checks that the ports are free before each boot. It sends the
+console quit only to the emulator it started and only while that process listens on the port. It
+signals a PID only while the PID still has the start time it had at launch. Its AVDs live in a
+private `ANDROID_AVD_HOME` under the work directory, never in `~/.android/avd`.
+`scripts/bench/test-renderers.sh` tests these guards without a device.
+
 ```bash
 scripts/bench/renderers.sh --cold-only --rounds 5
 scripts/bench/renderers.sh --api "36 30" --rounds 3 --settle 30 --window 60 --no-cold-init \
@@ -61,7 +83,12 @@ scripts/bench/renderers.sh --api "36 30" --rounds 3 --settle 30 --window 60 --no
 ```
 
 Host: an M3 Max (16 CPUs, 128 GB) on macOS 26.6.2, emu at `da98c13`, SDK emulator 37.2.13
-renderer, 2026-11-27. Each value below is the median of 3 rounds, with the runs in parentheses.
+renderer, 2026-11-27. Each boot table's value is the median of 3 rounds, with the runs in
+parentheses. The cold-init table is the median of 5.
+
+The tables were compiled from the raw runs before `renderers.sh` left crashed runs out of the
+medians itself. The one cell that counted a crash, API 30's MoltenVK + ANGLE-Metal idle CPU,
+is recomputed below from the runs that finished.
 
 ## Cold and warm renderer init
 
@@ -99,9 +126,10 @@ Host load 5.1 to 23.8 over the run (most boots launched at 5 to 15).
 | Swipes: host CPU, % of a core | 41 | 34 | 37 | 50 | 281 | — |
 | Peak RSS, process tree | 3971 MB | 3981 MB | 4031 MB | 4029 MB | 4681 MB | — |
 
-¹ KosmicKrisp + SwANGLE's warm boots launched at host loads of 20.6 and 9.7 (the others at 5
-to 15). Its third boot, at load 15, took 4.77 s. The 9.46 s median reflects the load, not the
-arm. Not rerun.
+¹ KosmicKrisp + SwANGLE's three warm boots launched at host loads of 20.6 (10.8 s), 9.7 (9.5 s)
+and 15 (4.77 s). The other GPU arms' warm boots launched at 5 to 15 and took 3.7 to 4.1 s, so the
+load at launch doesn't explain the 9.5 s boot: it launched at 9.7, in the same range. The cause
+is unexplained. Not rerun.
 
 ## API 30 (GLES over the goldfish pipe, guest GLES on the host's ANGLE)
 
@@ -116,15 +144,16 @@ round at every load.
 | First boot, to the launcher | 19.0 s | 19.0 s | 18.9 s | 19.1 s | 19.5 s | — |
 | Warm boot, to `sys.boot_completed` | 17.0 s | 17.0 s | 17.0 s | 16.8 s | 17.9 s | never |
 | Renderer init in the boot, warm | 447 ms | 372 ms | 521 ms | 512 ms | 582 ms | — |
-| Idle host CPU, % of a core | 4.0 (4.0, crashed, 6.7)² | 5.8 | 5.1 | 6.1 | 6.3 | — |
+| Idle host CPU, % of a core | 5.35 (4.0, crashed, 6.7)² | 5.8 | 5.1 | 6.1 | 6.3 | — |
 | Swipes: janky frames, round 1 (load 5 to 16) | 11.1% | 93.7% | 17.2% | 97.0% | 36.5% (load 29 to 55) | — |
-| Swipes: janky frames, median of 3 | 26.9% (11.1, 42.8)² | 92.3% | 33.8% | 92.7% | 72.3% | — |
+| Swipes: janky frames, median of the runs that finished | 26.9% (11.1, crashed, 42.8)² | 92.3% | 33.8% | 92.7% | 72.3% | — |
 | Swipes: frame time p90 | 25.5 ms | 53 ms | 26 ms | 85 ms | 53 ms | — |
 | Swipes: host CPU, % of a core | 50 | 153 | 49 | 148 | 151 | — |
 | Peak RSS, process tree | 3907 MB | 4275 MB | 3936 MB | 4294 MB | 4091 MB | — |
 
 ² In round 2, MoltenVK + ANGLE-Metal's warm boot crashed with SIGSEGV after
-`sys.boot_completed`. The crash came at host load 90 and followed a stream of
+`sys.boot_completed`. It is a failed run, 1 of 3 warm boots for that arm, and is left out of
+the medians: the idle CPU cell is the median of 4.0 and 6.7. The crash came at host load 90 and followed a stream of
 `Failed to find ColorBuffer: 36` and `Failed to bind to texture: invalid color buffer` from
 `emulation_gl.cpp`. That was 1 of 6 ANGLE-Metal warm boots on API 30; KosmicKrisp + ANGLE-Metal
 had none in 3.
@@ -196,4 +225,5 @@ no memory type gfxstream accepts for color buffers. The Linux numbers in
 - API 33 and 34. Their images are installed (`--api "33 34"`); not run this time.
 - API 30's frame pacing on a quiet host, and whether the ANGLE-Metal crash in footnote 2
   recurs without load.
-- KosmicKrisp + SwANGLE's warm boot on API 36 on a quiet host (footnote 1).
+- Why KosmicKrisp + SwANGLE's warm boot on API 36 took 9.5 s once at load 9.7 and 10.8 s at
+  load 20.6 (footnote 1). It is unexplained, and a quiet host is the first thing to try.
