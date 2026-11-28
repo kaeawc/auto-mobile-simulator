@@ -82,8 +82,13 @@ pub(crate) struct Player<D: Decode> {
     base: Duration,
     /// The time between the last two frames decoded: how long the last frame of a pass shows.
     gap: Option<Duration>,
-    /// How long one pass lasts, once one has been decoded to its end.
+    /// How long one pass lasts, once one has been decoded to its end (or a stall in the first
+    /// pass has gone past the end the container gives).
     length: Option<Duration>,
+    /// The file time the decoder last restarted at, until playback reaches it: no jump before
+    /// then, so a decoder that starts a jump at the keyframe before its time catches up instead
+    /// of jumping again every tick.
+    target: Option<Duration>,
     /// The file has one frame: a still, never decoded again.
     still: bool,
     /// Decode failures in a row, and the capture time to restart the reader at after the last.
@@ -111,6 +116,7 @@ impl<D: Decode> Player<D> {
             base: Duration::ZERO,
             gap: None,
             length: None,
+            target: None,
             failures: 0,
             retry_at: None,
         })
@@ -119,7 +125,8 @@ impl<D: Decode> Player<D> {
     /// Moves the playback to capture time `pts`: decodes past the frames due by then and, at the
     /// end of the file, starts it over (skipping whole passes at once after a long gap). Decodes
     /// at most [`DECODES_PER_TICK`] frames; further behind than that, it jumps when it knows
-    /// where the file ends, and otherwise leaves the rest to the next ticks.
+    /// where the file ends (wrapping when that is behind it, and not again before it has
+    /// reached the last jump's time), and otherwise leaves the rest to the next ticks.
     fn advance(&mut self, pts: Duration) -> Result<()> {
         if self.still {
             return Ok(());
@@ -139,13 +146,25 @@ impl<D: Decode> Player<D> {
                 }
             }
             let at = self.first + pts.saturating_sub(self.base);
+            if self.target.is_some_and(|t| self.now >= t) {
+                self.target = None;
+            }
             if let Some(next) = &self.pending
                 && at > next.pts
-                && self.before_end(at)
+                && (at - next.pts).as_nanos() / self.decoder.interval().as_nanos().max(1) >= budget as u128
             {
-                let behind = (at - next.pts).as_nanos() / self.decoder.interval().as_nanos().max(1);
-                if behind >= budget as u128 {
-                    self.reposition(at)?;
+                if self.before_end(at) {
+                    if self.target.is_none() {
+                        self.reposition(at)?;
+                    }
+                } else if self.length.is_none()
+                    && let Some(end) = self.decoder.end().filter(|&end| end > self.first)
+                {
+                    // A stall past the end the container gives, before the pass has been decoded
+                    // to it: that end stands in for the measured length, so playback wraps
+                    // instead of catching up.
+                    self.length = Some(end - self.first);
+                    continue;
                 }
             }
             while let Some(next) = self.pending.take_if(|p| p.pts <= at) {
@@ -178,12 +197,14 @@ impl<D: Decode> Player<D> {
     }
 
     /// Restarts the decoder at file time `at` (from the first frame when `at` is past the end),
-    /// its first frame due.
+    /// its first frame due; playback doesn't jump again until it has reached `at`.
     fn reposition(&mut self, at: Duration) -> Result<()> {
         self.decoder.seek(at)?;
+        self.target = Some(at);
         let mut sample = self.decoder.next()?;
         if sample.is_none() && at > self.first {
             self.decoder.seek(Duration::ZERO)?;
+            self.target = None;
             sample = self.decoder.next()?;
         }
         let sample = sample.ok_or_else(|| no_frames(&self.name))?;
@@ -277,6 +298,9 @@ pub(crate) mod tests {
         broken_from: Option<usize>,
         /// Where the file says it ends, when it says.
         end: Option<Duration>,
+        /// Frames between keyframes, when a seek starts at the keyframe before its time (a
+        /// decoder that delivers a jump from its sync sample).
+        keyframes: Option<usize>,
         pub(crate) restarts: Arc<Mutex<usize>>,
         decoded: Arc<Mutex<usize>>,
         copies: Arc<Mutex<usize>>,
@@ -292,6 +316,7 @@ pub(crate) mod tests {
                 fail_once: Vec::new(),
                 broken_from: None,
                 end: None,
+                keyframes: None,
                 restarts: Arc::default(),
                 decoded: Arc::default(),
                 copies: Arc::default(),
@@ -311,6 +336,11 @@ pub(crate) mod tests {
 
         fn ending_at(mut self, ms: u64) -> Fake {
             self.end = Some(Duration::from_millis(ms));
+            self
+        }
+
+        fn keyframe_every(mut self, frames: usize) -> Fake {
+            self.keyframes = Some(frames);
             self
         }
 
@@ -359,9 +389,11 @@ pub(crate) mod tests {
             Ok([v, v, v, 255].repeat((sample.width * sample.height) as usize))
         }
 
-        /// To the last frame at or before `to` (the first, when `to` is before it).
+        /// To the last frame at or before `to` (the first, when `to` is before it), or to the
+        /// keyframe before that one.
         fn seek(&mut self, to: Duration) -> Result<()> {
-            self.at = self.frames.iter().rposition(|&(ms, _)| Duration::from_millis(ms) <= to).unwrap_or(0);
+            let at = self.frames.iter().rposition(|&(ms, _)| Duration::from_millis(ms) <= to).unwrap_or(0);
+            self.at = self.keyframes.map_or(at, |k| at / k.max(1) * k.max(1));
             *self.restarts.lock().unwrap_or_else(|p| p.into_inner()) += 1;
             Ok(())
         }
@@ -525,6 +557,35 @@ pub(crate) mod tests {
             last = count(&decoded);
         }
         assert_eq!(shown, (((9_000 + 19 * 33) / 10) % 251) as u8, "caught up");
+    }
+
+    #[test]
+    fn a_jump_into_a_long_gop_catches_up_without_jumping_again() {
+        // 20 s at 100 fps with a keyframe every 10 s, from a decoder that starts a jump at the
+        // keyframe before it: after the jump, playback is still 500 frames behind.
+        let fake = Fake::steady(2000, 10).ending_at(20_000).keyframe_every(1000);
+        let restarts = fake.restarts.clone();
+        let mut p = Player::new("video:gop".into(), fake).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(value(&mut p, 0), 0);
+        let shown: Vec<u8> = (0..10u64).map(|tick| value(&mut p, 15_000 + tick * 10)).collect();
+        assert_eq!(count(&restarts), 1, "one jump, not one per tick: {shown:?}");
+        assert_eq!(shown[9], (1509 % 251) as u8, "caught up: {shown:?}");
+    }
+
+    #[test]
+    fn a_first_pass_stalled_past_a_known_end_wraps() {
+        // 10 s at 100 fps; the container says where it ends, and a stall passes it before the
+        // first pass has been decoded to its end.
+        let fake = Fake::steady(1000, 10).ending_at(10_000);
+        let (decoded, restarts) = (fake.decoded.clone(), fake.restarts.clone());
+        let mut p = Player::new("video:stalled".into(), fake).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(value(&mut p, 0), 0);
+        let before = count(&decoded);
+        assert_eq!(value(&mut p, 12_500), 250, "2.5 s into the second pass");
+        let decodes = count(&decoded) - before;
+        assert!(decodes <= DECODES_PER_TICK + 2, "{decodes} frames decoded in one tick");
+        assert_eq!(count(&restarts), 1, "one restart, at the wrap");
+        assert_eq!(value(&mut p, 12_510), 0, "and it plays on from there (frame 251)");
     }
 
     #[test]
