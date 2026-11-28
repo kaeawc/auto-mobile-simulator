@@ -1212,6 +1212,8 @@ mod tests {
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     }
 
+    /// Namespaces are Linux's (`/proc/<pid>/ns/user`).
+    #[cfg(target_os = "linux")]
     #[test]
     fn waiting_for_the_namespace_is_bounded_and_notices_a_dead_child() {
         // A child that never makes a namespace: the deadline, not a hang.
@@ -1229,13 +1231,15 @@ mod tests {
 
     #[test]
     fn dropping_a_container_kills_it() {
+        // Signal 0 asks the kernel whether the process exists: Ok while it runs, ESRCH once it is
+        // gone (and, since `Drop` waits for it, reaped rather than a zombie).
+        let alive = |pid: u32| rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid as i32).expect("pid")).is_ok();
         let child = Command::new("sleep").arg("600").spawn().expect("sleep");
         let pid = child.id();
         let c = Container { child };
-        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        assert!(alive(pid));
         drop(c);
-        // `Drop` waited for it, so it is reaped, not a zombie.
-        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(!alive(pid));
     }
 
     #[test]
