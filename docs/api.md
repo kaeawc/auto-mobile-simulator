@@ -412,13 +412,16 @@ server such as MediaMTX, which browsers then play over WHEP). It returns once th
 encoded and the WHIP session is connected (the shape below; the values are placeholders):
 
 ```text
-→ {"method": "stream_start", "params": {"device": "iPhone 17", "whip_url": "http://127.0.0.1:8889/sim/whip", "input": true}}
+→ {"method": "stream_start", "params": {"device": "iPhone 17", "whip_url": "http://127.0.0.1:8889/sim/whip"}}
 ← {"id":null,"ok":true,"result":{"stream_id":"stream-1","whip_resource":"http://127.0.0.1:8889/sim/whip/1f0c…","lease_ttl_s":30,"device":"5B0E…"}}
 → {"method": "stream_status", "params": {"stream_id": "stream-1"}}
 ← {"id":null,"ok":true,"result":{"stream_id":"stream-1","state":"running","stages":[{"stage":"requested","ms":0.0},
     {"stage":"first_encoded_frame","ms":…},{"stage":"whip_connected","ms":…}],"stats":{"fps":…,"keyframes":…,"pli":…,…},…}}
 ```
 
+- **`input: true` needs a server that carries data channels.** MediaMTX refuses the offer (`406
+  unsupported media 'application'`, docs/streaming.md "Input over a data channel"), so the
+  `stream_start` fails; leave `input` off for a MediaMTX endpoint.
 - A stream lives in the process that started it: run `simee serve` (the CLI forwards to it) or
   the MCP server. One stream per device and WHIP URL; a second is refused with the first's id.
 - **Leases.** `stream_status` renews a stream's 30 s lease; a stream nobody renews is stopped
