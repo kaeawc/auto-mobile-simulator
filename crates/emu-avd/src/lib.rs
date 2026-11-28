@@ -68,6 +68,10 @@ impl Env {
 
     /// AVD names, sorted, as `emulator -list-avds` prints them.
     pub fn list_avds(&self) -> Vec<String> {
+        cache::listing(&self.avd_home, || self.read_avds())
+    }
+
+    fn read_avds(&self) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(&self.avd_home)
             .into_iter()
             .flatten()
@@ -110,14 +114,18 @@ impl Env {
     }
 
     pub fn load(&self, name: &str) -> Result<Avd> {
-        let content_dir = self.content_dir(name)?;
+        self.load_in(name, self.content_dir(name)?)
+    }
+
+    /// [`Env::load`] for an AVD whose directory the caller resolved ([`Env::content_dir`]).
+    pub fn load_in(&self, name: &str, content_dir: PathBuf) -> Result<Avd> {
         let path = content_dir.join("config.ini");
         let config = cache::ini(&path)?.ok_or_else(|| Error::Io(path, std::io::ErrorKind::NotFound.into()))?;
         Avd::new(name, content_dir, config, self.sdk_root.as_deref())
     }
 
     /// AVD `name`'s directory: its pointer's `path=` (or `path.rel=`), else `<name>.avd`.
-    fn content_dir(&self, name: &str) -> Result<PathBuf> {
+    pub fn content_dir(&self, name: &str) -> Result<PathBuf> {
         let pointer = self.avd_home.join(format!("{name}.ini"));
         Ok(if let Some(p) = cache::ini(&pointer)? {
             p.get("path")
@@ -787,15 +795,31 @@ impl Env {
     /// Only the AVDs `names` are looked at (each one's lock), and `probe` is asked only about a
     /// process whose lock names a live PID.
     pub fn stock_instances_among_with(&self, names: &[String], skip: &[Running], probe: &Probe) -> Vec<Running> {
-        names
-            .iter()
-            .filter(|name| !skip.iter().any(|r| r.avd_name == **name))
-            .filter_map(|name| {
-                let dir = self.content_dir(name).ok()?;
+        let avds: Vec<(String, PathBuf)> = names.iter().filter_map(|name| Some((name.clone(), self.content_dir(name).ok()?))).collect();
+        Self::stock_instances_in_with(avds.iter().map(|(n, d)| (n.as_str(), d.as_path())), skip, probe)
+    }
+
+    /// [`Env::stock_instances_among_with`] for AVDs whose directories the caller resolved
+    /// ([`Env::content_dir`]), so listing and looking at them resolves each once.
+    pub fn stock_instances_in_with<'a>(
+        avds: impl IntoIterator<Item = (&'a str, &'a Path)>,
+        skip: &[Running],
+        probe: &Probe,
+    ) -> Vec<Running> {
+        avds.into_iter()
+            .filter(|(name, _)| !skip.iter().any(|r| r.avd_name == *name))
+            .filter_map(|(name, dir)| {
                 let bytes = std::fs::read(dir.join("hardware-qemu.ini.lock")).ok()?;
                 let digits: String = bytes.iter().take_while(|c| c.is_ascii_digit()).map(|&c| c as char).collect();
                 let pid: i32 = digits.parse().ok()?;
-                let r = Running { pid, avd_name: name.clone(), console_port: 0, adb_port: 0, avd_dir: Some(dir), simee: false };
+                let r = Running {
+                    pid,
+                    avd_name: name.to_owned(),
+                    console_port: 0,
+                    adb_port: 0,
+                    avd_dir: Some(dir.to_path_buf()),
+                    simee: false,
+                };
                 if !r.alive() {
                     return None;
                 }

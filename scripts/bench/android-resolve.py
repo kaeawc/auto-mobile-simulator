@@ -18,9 +18,12 @@ emulators:
   kept       over one `simee serve` connection: `devices`, `devices` with booted, `info` of an exact
              AVD name, `info` of `booted`
   one-shot   `simee list`, `simee list --booted`, `simee tap NAME 1 1` and `simee tap booted 1 1`
-             as a fresh process each (no server on the socket). The taps fail once the device is
-             resolved, before any network I/O: a stopped AVD isn't running, and a stand-in is a
-             stock emulator, which refuses input over the display socket. That is what is timed.
+             as a fresh process each (no server on the socket). The failure is what is timed:
+             a tap of a name fails after the device is resolved, before any network I/O (a stopped
+             AVD isn't running; a stand-in is a stock emulator, which refuses input over the
+             display socket). `booted` fails inside resolution: "no device matches" when nothing
+             runs, "matches several devices" with 2 running, so no device is picked then (the kept
+             `info` of `booted` likewise).
 A one-shot call includes the process's start; `simee --version` is timed too, as its floor.
 
 Reproduces docs/benchmarks.md "Android device resolution".

@@ -833,9 +833,12 @@ holding the AVD's `hardware-qemu.ini.lock`). Linux, 4-vCPU Xeon @ 2.20 GHz VM, 7
 Medians over 5 rounds of the p50 and p95 of 100 calls, the build before and after alternating.
 "Kept" is one connection to a `simee serve` that has been up a second; "one-shot" is a fresh
 `simee` process with no server on the socket, so it includes the process's start (`--version` is
-the floor: 4.7 ms). The one-shot taps fail once the device is resolved, before any network I/O: a
-stopped AVD isn't running, and a stand-in is a stock emulator, which refuses input over the
-display socket. That failure is what is timed. Reproduce:
+the floor: 4.7 ms). The calls fail, and the failure is what is timed, at different points:
+`tap` of an exact name fails after the device is resolved and before any network I/O (a stopped
+AVD isn't running, and a stand-in is a stock emulator, which refuses input over the display
+socket); `booted` fails inside resolution, with no running device ("no device matches `booted`")
+or, with 2 running, because it "matches several devices", so no device is picked and nothing
+after the lookup runs (`info booted` and `tap booted` in the 2-running column). Reproduce:
 `python3 -I scripts/bench/android-resolve.py --baseline <before build>`.
 
 | Call | none running, before → after (ms) | 2 running, before → after (ms) |
@@ -857,8 +860,19 @@ and `config.ini` are parsed once and then validated by one `stat` (path, mtime, 
 exact name is one `stat` of its pointer instead of listing the home; `booted` loads only the
 running AVDs' configs.
 
-What is left, measured: `devices` lists and loads all 44 AVDs (about 0.6–1 ms in the server, plus
-an 11 KB reply the client parses), so it is not under 1 ms. A cold one-shot `list` or fuzzy name
+What is left, measured. Kept `devices` is still about 2 ms (p50 2.01 ms with nothing running and
+1.93 with 2 running, p95 2.4 and 2.6; it was 2.01 and 2.20 before the listing work below). Where
+the time goes, in the server process on the same VM (p50 over 1000 calls): `devices` took 0.60 ms
+and takes 0.45 ms now; its 44 AVDs cost ~0.17 ms to resolve (pointer and directory, 2 `stat`s
+each), ~0.07 ms for the lock of each (an `open`), and ~0.24 ms to describe (config `stat`, image
+`stat`, the profile and the `DeviceInfo`). The rest of the 2 ms is the 10.7 KB reply: a call that
+does the same work and returns `[]` (`devices` with `booted`) takes 0.6–0.7 ms over the socket,
+and `help`, which computes in 0.1 ms, takes ~0.9 ms to arrive on this VM. So the listing is under
+1 ms of server work and the call is not; getting the call under 1 ms here is a matter of the
+connection's reply path (`crates/sim-api/src/lib.rs`), which was not changed. The listing's
+floor with exact validation is 5 system calls per AVD (pointer, directory, config, image, lock).
+`devices` with `booted` is 0.63 / 0.74 ms (none / 2 running), and `info` of `booted` 0.44 / 0.35 ms.
+A cold one-shot `list` or fuzzy name
 reads every AVD's two files (about 700 system calls for 44 AVDs, ~5 ms over the floor); an on-disk
 cache would still `stat` each file, and wasn't built. With nothing running, the one-shot exact-name
 `tap` is within 1.7 ms of `--version`.

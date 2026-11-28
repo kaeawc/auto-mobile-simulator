@@ -135,13 +135,27 @@ impl Android {
     /// Every running emulator: simee's (their advertisements), then the stock emulator's
     /// ([`StockCache::instances`](listing::StockCache::instances)) for AVDs simee doesn't run.
     fn running(&self) -> Vec<Running> {
-        self.running_among(&self.env.list_avds())
+        self.running_among(&self.listed())
     }
 
-    /// [`Android::running`] for the AVDs `names`, which the caller has listed already.
-    fn running_among(&self, names: &[String]) -> Vec<Running> {
+    /// Every AVD with its directory resolved once ([`Env::content_dir`], `None` where its pointer
+    /// can't be read), for a listing to look at each AVD's lock and config without resolving it
+    /// twice.
+    fn listed(&self) -> Vec<(String, Option<PathBuf>)> {
+        self.env
+            .list_avds()
+            .into_iter()
+            .map(|name| {
+                let dir = self.env.content_dir(&name).ok();
+                (name, dir)
+            })
+            .collect()
+    }
+
+    /// [`Android::running`] for the AVDs `avds` ([`Android::listed`]).
+    fn running_among(&self, avds: &[(String, Option<PathBuf>)]) -> Vec<Running> {
         let mut all = self.simee_running();
-        let stock = self.stock.instances(&self.env, names, &all);
+        let stock = self.stock.instances(avds.iter().filter_map(|(n, d)| Some((n.as_str(), d.as_deref()?))), &all);
         all.extend(stock);
         all
     }
@@ -162,9 +176,9 @@ impl Android {
 
     /// Every AVD, labelled with its form factor; running ones (simee or stock) are `Booted`.
     pub fn devices(&self) -> Vec<DeviceInfo> {
-        let names = self.env.list_avds();
-        let running = self.running_among(&names);
-        names.iter().map(|name| self.describe(name, &running).info).collect()
+        let avds = self.listed();
+        let running = self.running_among(&avds);
+        avds.iter().map(|(name, dir)| self.describe_in(name, dir.as_deref(), &running).info).collect()
     }
 
     /// AVD `name` as a booted device, from its config alone (no emulator lookup: the caller saw
@@ -205,18 +219,23 @@ impl Android {
     /// except that `booted` is decided by what is running alone: it loads only the running ones
     /// and one named like it, not every config.
     pub fn candidates(&self, query: &str) -> (Vec<Device>, bool) {
-        let names = self.env.list_avds();
-        let running = self.running_among(&names);
+        let avds = self.listed();
+        let running = self.running_among(&avds);
         let only_running = query.eq_ignore_ascii_case("booted");
-        let devices = names
+        let devices = avds
             .iter()
-            .filter(|name| !only_running || name.eq_ignore_ascii_case(query) || running.iter().any(|r| r.avd_name == **name))
-            .map(|name| self.describe(name, &running))
+            .filter(|(name, _)| !only_running || name.eq_ignore_ascii_case(query) || running.iter().any(|r| r.avd_name == *name))
+            .map(|(name, dir)| self.describe_in(name, dir.as_deref(), &running))
             .collect();
-        (devices, !names.is_empty())
+        (devices, !avds.is_empty())
     }
 
     fn describe(&self, name: &str, running: &[Running]) -> Device {
+        self.describe_in(name, self.env.content_dir(name).ok().as_deref(), running)
+    }
+
+    /// [`Android::describe`] for an AVD whose directory is resolved already.
+    fn describe_in(&self, name: &str, dir: Option<&Path>, running: &[Running]) -> Device {
         let running = running.iter().find(|r| r.avd_name == name).cloned();
         let state = if running.is_some() { DeviceState::Booted } else { DeviceState::Shutdown };
         let mut info = DeviceInfo {
@@ -230,7 +249,7 @@ impl Android {
             form_factor: None,
             sub_platform: None,
         };
-        let avd = self.env.load(name).ok();
+        let avd = dir.and_then(|dir| self.env.load_in(name, dir.to_path_buf()).ok());
         if let Some(avd) = &avd {
             let profile = avd.profile();
             info = info.with_kind(Some(profile.kind));
