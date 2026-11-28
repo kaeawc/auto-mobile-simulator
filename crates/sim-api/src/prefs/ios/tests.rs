@@ -237,3 +237,225 @@ fn a_device_is_booted_by_its_device_plist() {
     assert!(!booted(&root.join("gone")), "a deleted device");
     std::fs::remove_dir_all(root).ok();
 }
+
+// ---- The in-device observer (#235) ----
+
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// A feed's files as a test drives them: each wait is a short tick; `ended` once the feed's
+/// watcher has dropped them (its thread ended).
+struct FakeFiles {
+    ended: Arc<AtomicBool>,
+}
+
+impl Files for FakeFiles {
+    fn wait(&mut self) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    fn set(&mut self, _: &[PathBuf]) {}
+}
+
+impl Drop for FakeFiles {
+    fn drop(&mut self) {
+        self.ended.store(true, SeqCst);
+    }
+}
+
+/// The fake notification source: an observer the test speaks for through a pipe. Its stop is
+/// recorded and closes the pipe, as a killed helper's output closes.
+struct FakeObserver {
+    out: Arc<Mutex<Option<std::io::PipeWriter>>>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl FakeObserver {
+    fn new() -> (FakeObserver, Observer) {
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        let out = Arc::new(Mutex::new(Some(writer)));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (o, s) = (out.clone(), stopped.clone());
+        let stop = Box::new(move || {
+            s.store(true, SeqCst);
+            o.lock().expect("lock").take();
+        });
+        (FakeObserver { out, stopped }, Observer { reader: Box::new(reader), stop })
+    }
+
+    fn say(&self, line: &str) {
+        use std::io::Write as _;
+        let mut out = self.out.lock().expect("lock");
+        writeln!(out.as_mut().expect("the observer is running"), "{line}").expect("write");
+    }
+
+    /// The helper exits on its own.
+    fn exit(&self) {
+        self.out.lock().expect("lock").take();
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped.load(SeqCst)
+    }
+}
+
+/// A feed of every store of the app, with `observer`: its source and when its watcher ended.
+fn feed(ios: &mut Ios, alive: impl Fn() -> bool + Send + 'static, observer: Option<Observer>) -> (super::super::Source, Arc<AtomicBool>) {
+    let (sink, source) = super::super::sink();
+    let ended = Arc::new(AtomicBool::new(false));
+    run_feed(ios.tracker(UDID, APP, None).expect("tracker"), sink, FakeFiles { ended: ended.clone() }, alive, observer).expect("feed");
+    (source, ended)
+}
+
+fn until(what: &str, done: impl Fn() -> bool) {
+    let end = Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(Instant::now() < end, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+type Seen = (String, String, Option<PrefValue>, Option<PrefValue>);
+
+/// The feed's next change, if one comes within 300 ms.
+fn next(source: &super::super::Source) -> Option<Seen> {
+    let c = source.rx.recv_timeout(Duration::from_millis(300)).ok()?;
+    Some((c.store.id(), c.key, c.old, c.new))
+}
+
+/// The app's own store as `EVERY_TYPE` has it (`app_tick` 49), with `app_tick` set to `tick`.
+fn app_with_tick(tick: i64) -> Vec<u8> {
+    let mut entries = plist::decode(EVERY_TYPE).expect("decode");
+    if let Plist::Dict(e) = &mut entries {
+        e.iter_mut().filter(|(k, _)| k == "app_tick").for_each(|(_, v)| *v = Plist::Integer(tick.into()));
+    }
+    plist::encode(&entries).expect("encode")
+}
+
+/// The observer's line for store `i` holding the binary plist `bytes`.
+fn snap(i: usize, bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    format!("snap {i} {}", base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+fn long(n: i64) -> Option<PrefValue> {
+    Some(PrefValue::Long(n))
+}
+
+#[test]
+fn the_observer_is_given_each_stores_domain_and_container() {
+    let (root, app) = device_set("observer-args");
+    let mut ios = Ios::with_root(root.clone());
+    let tracker = ios.tracker(UDID, APP, None).expect("tracker");
+    let group = root.join(UDID).join("data/Containers/Shared/AppGroup/GGGG").display().to_string();
+    let app = app.display().to_string();
+    let want: Vec<String> =
+        [APP, &app, "group.com.example", &group, "group.unentitled", &app, "other.domain", &app].map(str::to_owned).into();
+    assert_eq!(tracker.observer_args(), want);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn the_observers_lines_are_decoded_and_anything_else_refused() {
+    assert_eq!(observer_line("ready"), Ok(ObserverLine::Ready));
+    assert_eq!(observer_line("error this runtime has no X\n"), Ok(ObserverLine::Error("this runtime has no X".into())));
+    let Ok(ObserverLine::Snap(1, entries)) = observer_line(&snap(1, &defaults(&[("k", Plist::Integer(2))]))) else { panic!("not a snap") };
+    assert_eq!(entries.get("k"), Some(&PrefValue::Long(2)));
+    for bad in ["snap x AAAA", "snap 1 !!", "snap 1", "hello", ""] {
+        assert!(observer_line(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn a_change_cfprefsd_announces_reaches_the_feed_before_the_file_and_the_file_adds_nothing() {
+    let (root, app) = device_set("observer");
+    let mut ios = Ios::with_root(root.clone());
+    let (fake, observer) = FakeObserver::new();
+    let (source, ended) = feed(&mut ios, || true, Some(observer));
+    // Its first look at the store matches the file: nothing to report.
+    fake.say(&snap(0, EVERY_TYPE));
+    fake.say("ready");
+    assert_eq!(next(&source), None);
+    // The app writes: cfprefsd tells the observer, and the feed has it with no file written.
+    fake.say(&snap(0, &app_with_tick(50)));
+    assert_eq!(next(&source), Some((APP.to_owned(), "app_tick".to_owned(), long(49), long(50))));
+    // An older flush landing after the write, then cfprefsd's file catching up: neither is a change.
+    let file = app.join(format!("Library/Preferences/{APP}.plist"));
+    replace(&file, EVERY_TYPE);
+    assert_eq!(next(&source), None, "a file behind cfprefsd isn't read while the observer follows its store");
+    replace(&file, &app_with_tick(50));
+    assert_eq!(next(&source), None);
+    // A store the observer hasn't reported is still followed by its file.
+    replace(&app.join("Library/Preferences/other.domain.plist"), &defaults(&[("k", Plist::Bool(false))]));
+    assert_eq!(next(&source).map(|c| (c.0, c.1)), Some(("other.domain".to_owned(), "k".to_owned())));
+    drop(source);
+    until("the feed to end", || ended.load(SeqCst));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn a_helper_that_cant_load_or_exits_leaves_the_feed_on_the_files() {
+    let (root, app) = device_set("fallback");
+    let file = app.join(format!("Library/Preferences/{APP}.plist"));
+    let mut ios = Ios::with_root(root.clone());
+
+    // No observer at all (it couldn't be built or spawned): the feed follows the files, as before.
+    let (source, ended) = feed(&mut ios, || true, None);
+    replace(&file, &app_with_tick(60));
+    assert_eq!(next(&source).map(|c| (c.1, c.3)), Some(("app_tick".to_owned(), long(60))));
+    drop(source);
+    until("the feed to end", || ended.load(SeqCst));
+
+    // A helper that can't follow the stores (a runtime without the SPI) says so and exits.
+    let (fake, observer) = FakeObserver::new();
+    let (source, ended) = feed(&mut ios, || true, Some(observer));
+    fake.say("error this runtime's CoreFoundation has no handleChangeNotificationForDomainIdentifier:isRemote:");
+    fake.exit();
+    replace(&file, &app_with_tick(61));
+    assert_eq!(next(&source).map(|c| (c.1, c.3)), Some(("app_tick".to_owned(), long(61))));
+    drop(source);
+    until("the feed to end", || ended.load(SeqCst));
+    assert!(!fake.stopped(), "a helper that exited isn't signalled (its pid may be another process's by now)");
+
+    // A helper that followed the store and then died: the files take over from the values it last
+    // reported (the file it left behind is older than them, and isn't a change back).
+    let (fake, observer) = FakeObserver::new();
+    let (source, ended) = feed(&mut ios, || true, Some(observer));
+    fake.say("ready");
+    fake.say(&snap(0, &app_with_tick(62)));
+    assert_eq!(next(&source).map(|c| (c.2, c.3)), Some((long(61), long(62))));
+    replace(&file, &app_with_tick(61));
+    fake.exit();
+    assert_eq!(next(&source), None, "the stale file isn't read as a change back");
+    replace(&file, &app_with_tick(63));
+    assert_eq!(next(&source).map(|c| (c.2, c.3)), Some((long(62), long(63))));
+    drop(source);
+    until("the feed to end", || ended.load(SeqCst));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn the_observer_stops_when_the_feed_ends_or_the_device_stops() {
+    let (root, _) = device_set("stop");
+    let mut ios = Ios::with_root(root.clone());
+    let (fake, observer) = FakeObserver::new();
+    let (source, ended) = feed(&mut ios, || true, Some(observer));
+    fake.say("ready");
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(!fake.stopped(), "it runs while the feed does");
+    drop(source);
+    until("the observer to be stopped", || fake.stopped());
+    until("the feed to end", || ended.load(SeqCst));
+
+    // The device shut down: the feed ends, and its observer is stopped with it.
+    let booted = Arc::new(AtomicBool::new(true));
+    let b = booted.clone();
+    let (fake, observer) = FakeObserver::new();
+    let (_source, ended) = feed(&mut ios, move || b.load(SeqCst), Some(observer));
+    fake.say("ready");
+    booted.store(false, SeqCst);
+    until("the observer to be stopped", || fake.stopped());
+    until("the feed to end", || ended.load(SeqCst));
+    std::fs::remove_dir_all(root).ok();
+}
