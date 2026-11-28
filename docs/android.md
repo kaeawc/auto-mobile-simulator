@@ -691,6 +691,12 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   are on another APFS volume (`EXDEV`; a 6 GiB userdata holding 1 GiB of data), `std::fs::copy`'s
   `fcopyfile` filled the holes, 2.97 s and 6.1 GiB per clone; the extent copy takes 0.57 s and
   1.0 GiB (median of 5, same host and day).
+  The key is the one disk written at boot, so `emu_avd::clone::clone_file_atomic` copies
+  `encryptionkey.img` under `.encryptionkey.img.partial` and renames it into place: a kill mid-copy
+  leaves no half-written key at the final name. A symlink at that path, dangling or not, is
+  refused with an error naming it (the old `std::fs::copy` wrote through it). The tests run the
+  real `FICLONE` where the file system has it; `SIMEE_REFLINK_DIR=<dir on Btrfs or XFS>` points
+  them at one (a loop-mounted `mkfs.xfs -m reflink=1` image works).
 - **Screenshots: fast PNG, no re-encode, no needless copies.** Automation takes a screenshot
   after nearly every step. On a 2480×1740 screen (`cargo run --release -p simee-core --example
   frame_bench`), PNG encoding at the `png` crate's default level took 74 ms and BGRA→RGBA
