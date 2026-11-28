@@ -102,7 +102,7 @@ and `lsof` cost ~60 ms each. A call on one AVD reads only that AVD's lock. A ser
 qemu's command line and ports by (PID, start time), so a PID the kernel hands to another program
 is asked about again; an emulator is never listed from memory alone, as every call reads the locks
 and checks the PID is alive. The parsed pointer and `config.ini` of each AVD are remembered by
-(path, mtime, size, inode) in `emu-avd`, except files modified in the last 2 s, so resolving a
+(path, mtime, ctime, size, inode) in `emu-avd` (the change time catches a same-size file put back with its old mtime), except files changed in the last 2 s, so resolving a
 device reads no AVD file that hasn't changed.
 `simee info` shows `running.emulator` (`stock` or `simee`), the serial, ports and PID. What needs
 simee's `emu` (touch, keys, wheel and frames over `display.sock`, the touchpad) says so and names

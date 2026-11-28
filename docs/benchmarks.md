@@ -58,7 +58,7 @@ recoverable from what was recorded, or they need something the repository doesn'
 | [Emulator internals](#emulator-internals) | before/after rows | | various | see the section |
 | [`launch` with and without restart](#launch-with-and-without-restart) | 17–136 ms | | M3 Max, 2026-11-27 | `scripts/bench/ios-api.py --suite launch` |
 | [Per-call device lookup](#per-call-device-lookup-on-a-crowded-host) | 0.66 / 0.04 ms | simee before: 1.54 / 0.34 ms | M3 Max, 2026-11-26 | `ios-api.py --suite lookup` |
-| [Android device resolution](#android-device-resolution) | exact name 0.15 ms, `booted` 0.41 ms (kept); one-shot call 6.4 ms | simee before: 0.25, 1.98 ms; 21 ms | 4-vCPU Xeon VM (Linux), 2026-11-27 | `scripts/bench/android-resolve.py --baseline …` |
+| [Android device resolution](#android-device-resolution) | exact name 0.14 ms, `booted` 0.39 ms (kept); one-shot call 6.7 ms | simee before: 0.25, 2.02 ms; 21 ms | 4-vCPU Xeon VM (Linux), 2026-11-28 | `scripts/bench/android-resolve.py --baseline …` |
 | [Introspection](#introspection-processes-connections-kill-network_state) | 2.5–3.5 ms | `ps`/`lsof`/`kill`: 126–191 ms | M3 Max, 2026-11-27 | `ios-api.py --suite introspection` |
 | [iPad pointer click](#ipad-pointer-click) | 408 ms later click | simee before: 3641 ms | M3 Max, 2026-11-27 | `ios-api.py --suite pointer` (timings) |
 | [iOS input defaults](#ios-input-defaults) | tap 12.6 ms, type 20 chars 121 ms | simee before: 64.5, 749 ms | M3 Max, 2026-11-27 | `ios-api.py --suite input` (timings) |
@@ -826,31 +826,33 @@ What `location` has left is the service's own round trip (`host_support_mig_set_
 
 How long a call spends finding its device (#256), with 44 AVDs (phones, tablets, watches, TVs and
 cars, each with the `config.ini` avdmanager writes) and, in the second half of the table, two
-stand-ins for the stock emulator running (a process with a qemu's command line and the AVD's
-`hardware-qemu.ini.lock`). Linux, 4-vCPU Xeon @ 2.20 GHz VM, 3.8 GB, Ubuntu 22.04, 1-minute load
-under 1 (2026-11-27). **Not measured on macOS or with a real emulator.** Medians over 3 rounds of
-the p50 and p95 of 100 calls, the build before and after alternating. "Kept" is one connection to a
-`simee serve` that has been up a second; "one-shot" is a fresh `simee` process with no server on
-the socket, so it includes the process's start (`--version` is the floor: 4.7 ms). The one-shot
-taps fail once the device is resolved (nothing answers on the stand-in's console), which is what is
-timed. Reproduce: `python3 -I scripts/bench/android-resolve.py --baseline <before build>`.
+stand-ins for the stock emulator running (a process with a qemu's command line, `-port` from 5900,
+holding the AVD's `hardware-qemu.ini.lock`). Linux, 4-vCPU Xeon @ 2.20 GHz VM, 7.8 GB, Ubuntu
+22.04, 1-minute load under 3 (2026-11-28). **Not measured on macOS or with a real emulator.**
+Medians over 5 rounds of the p50 and p95 of 100 calls, the build before and after alternating.
+"Kept" is one connection to a `simee serve` that has been up a second; "one-shot" is a fresh
+`simee` process with no server on the socket, so it includes the process's start (`--version` is
+the floor: 4.7 ms). The one-shot taps fail once the device is resolved, before any network I/O: a
+stopped AVD isn't running, and a stand-in is a stock emulator, which refuses input over the
+display socket. That failure is what is timed. Reproduce:
+`python3 -I scripts/bench/android-resolve.py --baseline <before build>`.
 
 | Call | none running, before → after (ms) | 2 running, before → after (ms) |
 | --- | --- | --- |
-| kept: `info` of an exact AVD name, p50 / p95 | 0.28 → 0.09 / 0.34 → 0.11 | 0.25 → 0.15 / 0.30 → 0.22 |
-| kept: `info` of `booted`, p50 / p95 | 1.92 → 0.31 / 2.16 → 0.36 | 1.98 → 0.41 / 3.76 → 0.60 |
-| kept: `devices` with `booted`, p50 / p95 | 1.97 → 0.73 / 2.19 → 1.10 | 2.00 → 0.93 / 2.16 → 1.84 |
-| kept: `devices`, p50 / p95 | 2.75 → 2.02 / 5.81 → 2.50 | 3.08 → 2.48 / 5.90 → 2.85 |
-| one-shot: `tap` of an exact name, p50 / p95 | 7.10 → 6.38 / 7.33 → 8.19 | 21.2 → 6.4 / 24.2 → 8.7 |
-| one-shot: `tap booted`, p50 / p95 | 11.8 → 7.5 / 12.3 → 8.7 | 30.6 → 8.1 / 37.2 → 9.4 |
-| one-shot: `list --booted`, p50 / p95 | 11.7 → 10.9 / 14.0 → 13.5 | 31.0 → 11.2 / 34.2 → 15.3 |
-| one-shot: `list`, p50 / p95 | 12.0 → 11.6 / 13.3 → 12.2 | 32.2 → 11.8 / 34.8 → 13.6 |
+| kept: `info` of an exact AVD name, p50 / p95 | 0.33 → 0.13 / 0.37 → 0.17 | 0.25 → 0.14 / 0.31 → 0.19 |
+| kept: `info` of `booted`, p50 / p95 | 2.10 → 0.36 / 2.39 → 0.40 | 2.02 → 0.39 / 2.23 → 0.52 |
+| kept: `devices` with `booted`, p50 / p95 | 2.20 → 0.80 / 2.36 → 1.90 | 2.07 → 0.85 / 2.30 → 1.49 |
+| kept: `devices`, p50 / p95 | 3.25 → 2.40 / 5.87 → 2.83 | 3.30 → 2.43 / 5.90 → 2.78 |
+| one-shot: `tap` of an exact name, p50 / p95 | 6.89 → 6.54 / 7.42 → 6.71 | 21.2 → 6.7 / 22.3 → 6.9 |
+| one-shot: `tap booted`, p50 / p95 | 11.7 → 7.9 / 12.0 → 8.4 | 32.7 → 8.2 / 36.4 → 8.7 |
+| one-shot: `list --booted`, p50 / p95 | 11.6 → 11.0 / 12.7 → 11.2 | 32.3 → 11.2 / 34.9 → 11.8 |
+| one-shot: `list`, p50 / p95 | 12.1 → 11.5 / 13.3 → 11.7 | 33.1 → 11.7 / 35.8 → 12.3 |
 
 What changed: the stock emulator's process facts (command line, listening ports) are read for the
 one PID a lock names, from `/proc/<pid>` on Linux and libproc on macOS, instead of a host-wide
 `ps -axo` and `lsof` (~60 ms each on a macOS host with ~1300 processes; `ps` here, with a few
 hundred processes, is ~20 ms). A kept server remembers them by (PID, start time). Each AVD's pointer
-and `config.ini` are parsed once and then validated by one `stat` (path, mtime, size, inode); an
+and `config.ini` are parsed once and then validated by one `stat` (path, mtime, ctime, size, inode); an
 exact name is one `stat` of its pointer instead of listing the home; `booted` loads only the
 running AVDs' configs.
 
