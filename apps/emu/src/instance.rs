@@ -175,7 +175,7 @@ impl Instance {
         if key_src.is_file() {
             let key_dst = dir.join("encryptionkey.img");
             if !key_dst.exists() {
-                emu_avd::golden::clone_file(&key_src, &key_dst)?;
+                emu_avd::golden::clone_file_atomic(&key_src, &key_dst)?;
             }
         } else {
             emu_vmm::disk::ensure_sparse(&dir.join("encryptionkey.img"), 18 << 20)?;
