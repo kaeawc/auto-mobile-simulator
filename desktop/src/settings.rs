@@ -4,7 +4,8 @@
 //!
 //! It holds the panes' widths and visibility, the device list's organization (collapsed groups,
 //! hidden devices and tools, order, favorites), the last selected device and debug tab, the
-//! window's frame and the screenshot folder. It is read once at start; changes are written a
+//! window's frame, each popped-out device window's frame ([`crate::popout`]) and the screenshot
+//! folder. It is read once at start; changes are written a
 //! moment after they stop ([`DEBOUNCE`]), and once more as the window closes. Every write goes
 //! to a temporary file beside it that is then renamed over it, so a crash never leaves half a
 //! file.
@@ -14,6 +15,7 @@
 //! and never deleted; when even the copy fails, nothing is written this session, so the file is
 //! still there for the version that wrote it.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -76,6 +78,9 @@ pub struct Settings {
     /// The debug panel's tab (`device`, `network`, `storage`, `processes`, `logs`).
     pub last_tab: Option<String>,
     pub window: Option<WindowFrame>,
+    /// Where each device's pop-out window was last ([`crate::popout`]), by UDID or AVD name:
+    /// popping it out again, in this run or the next, opens it there.
+    pub popouts: BTreeMap<String, WindowFrame>,
     /// Where ⌘S saves; the Desktop when unset.
     pub screenshot_dir: Option<PathBuf>,
     /// The resource panel's visibility and sort ([`crate::resources`]).
@@ -96,6 +101,7 @@ impl Default for Settings {
             last_device: None,
             last_tab: None,
             window: None,
+            popouts: BTreeMap::new(),
             screenshot_dir: None,
             resources: crate::resources::Prefs::default(),
         }
@@ -375,6 +381,7 @@ mod tests {
             last_device: Some("A".into()),
             last_tab: Some("network".into()),
             window: Some(WindowFrame { x: -1200, y: 40, width: 1300.0, height: 900.0 }),
+            popouts: BTreeMap::from([("A".into(), WindowFrame { x: 1600, y: 80, width: 430.0, height: 900.0 })]),
             screenshot_dir: Some(PathBuf::from("/tmp/shots")),
             ..Settings::default()
         }
@@ -439,6 +446,22 @@ mod tests {
         assert_eq!(old.favorites, ["X"]);
         assert_eq!(old.inspector, Pane::default());
         assert_eq!(parse("{}").unwrap(), Settings::default());
+    }
+
+    /// Pop-out frames are kept by device: a file written before them (#280's) has none, and one
+    /// that names them keeps every device's through a save.
+    #[test]
+    fn pop_out_frames_are_kept_by_device() {
+        let before = parse("{\"version\": 1, \"window\": {\"x\": 1, \"y\": 2, \"width\": 1240, \"height\": 870}}").unwrap();
+        assert!(before.popouts.is_empty());
+        let text = "{\"version\": 1, \"popouts\": {\"A1\": {\"x\": 10, \"y\": 20, \"width\": 430, \"height\": 900}, \
+                    \"pixel_9\": {\"x\": -800, \"y\": 0, \"width\": 400, \"height\": 860}}}";
+        let s = parse(text).unwrap();
+        assert_eq!(s.popouts.len(), 2);
+        assert_eq!(s.popouts["pixel_9"], WindowFrame { x: -800, y: 0, width: 400.0, height: 860.0 });
+        let dir = TempDir::new();
+        write(&dir.file(), &s).unwrap();
+        assert_eq!(Store::open(dir.file()).current.popouts, s.popouts);
     }
 
     #[test]
