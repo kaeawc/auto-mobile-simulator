@@ -2118,6 +2118,8 @@ mod tests {
         shut_ms: u64,
         /// The answer to a `boot_many`, instead of booting its devices.
         fail: Option<String>,
+        /// `(when, who)`: as `when` begins booting, another call brings `who` up.
+        goes_live: Option<(&'static str, &'static str)>,
     }
 
     impl FakeFleet {
@@ -2138,6 +2140,9 @@ mod tests {
 
         fn boot(&self, id: &str) {
             self.begun.lock().expect("begun").push(id.to_owned());
+            if let Some((_, who)) = self.goes_live.filter(|(when, _)| *when == id) {
+                self.live.lock().expect("live").insert(who.to_owned());
+            }
             let ms = id.strip_prefix('d').and_then(|n| n.parse::<usize>().ok()).and_then(|i| self.ms.get(i).copied()).unwrap_or(0);
             if ms == HOLD {
                 while !self.released.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2366,14 +2371,9 @@ mod tests {
     #[test]
     fn a_cancelled_boot_many_never_shuts_down_a_device_another_call_started() {
         // d0 (50 ms) and d1 this call launches; d2 was off when it was admitted, but another call
-        // boots it 20 ms in, before this call's window reaches it (at 50 ms, as d0 finishes).
+        // boots it as d0 begins, so before this call's window reaches it (as d0 finishes).
         // Cancelled at 200 ms, waiting on d1 and d2: only d1, which this call booted, is shut down.
-        let fleet = std::sync::Arc::new(FakeFleet { ms: vec![50, HOLD, HOLD], ..Default::default() });
-        let theirs = fleet.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            theirs.live.lock().expect("live").insert("d2".into());
-        });
+        let fleet = std::sync::Arc::new(FakeFleet { ms: vec![50, HOLD, HOLD], goes_live: Some(("d0", "d2")), ..Default::default() });
         let heard = std::sync::Arc::default();
         let hooks = cancelling_after(&heard, 200);
         let mut tally = Tally { done: 0, failed: 0, total: 3 };

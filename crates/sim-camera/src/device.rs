@@ -580,7 +580,9 @@ mod tests {
     fn pacing_follows_the_device_frames_and_repeats_a_still_screen() {
         let screen = Arc::new(Screen::default());
         let mut source = DeviceSource::new("A", None, screen.clone());
-        let s = fps(32, 32, 10);
+        // A long tick (500 ms), so "when it comes, not a tick later" holds by a wide margin on a
+        // loaded host.
+        let s = fps(32, 32, 2);
         solid(&screen, 10);
         let first = take(&mut source, s, 0);
         assert_eq!(first.pixel(0, 0), [10, 10, 10, 255]);
@@ -606,8 +608,8 @@ mod tests {
 
         // The tick's other sizes are drawn from the same device frame, without another wait.
         let started = Instant::now();
-        let other = take(&mut source, fps(48, 32, 10), 2);
-        assert!(started.elapsed() < Duration::from_millis(20));
+        let other = take(&mut source, fps(48, 32, 2), 2);
+        assert!(started.elapsed() < s.interval() / 2, "{:?}", started.elapsed());
         assert_eq!((other.width, other.height, other.pixel(47, 31)), (48, 32, [20, 20, 20, 255]));
 
         // Frames the device presented between ticks: the newest is taken at once.
@@ -615,7 +617,7 @@ mod tests {
         solid(&screen, 40);
         let started = Instant::now();
         assert_eq!(take(&mut source, s, 3).pixel(0, 0), [40, 40, 40, 255]);
-        assert!(started.elapsed() < Duration::from_millis(20));
+        assert!(started.elapsed() < s.interval() / 2, "{:?}", started.elapsed());
     }
 
     #[test]
