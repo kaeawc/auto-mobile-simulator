@@ -2,7 +2,8 @@
 //! binary re-runs itself as a child that wires them as `emu`'s boot does (the signals blocked
 //! before any thread exists, a stop watcher, a machine that stops when asked), so no guest is
 //! booted. Its own `main` (`harness = false`), since the test harness's threads would take the
-//! signals before they are blocked.
+//! signals before they are blocked; it speaks enough of libtest's command line ([`Args`]) for
+//! nextest to list and run each case.
 
 #[allow(dead_code)]
 #[path = "../src/on_signal.rs"]
@@ -33,14 +34,62 @@ fn main() -> ExitCode {
         ("a_second_signal_exits_at_once_when_the_stop_is_stuck", a_second_signal_exits_at_once),
         ("a_console_kill_still_exits_0", a_console_kill_still_exits_0),
     ];
-    let filter: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
-    for (name, case) in cases {
-        if filter.is_empty() || filter.iter().any(|f| name.contains(f.as_str())) {
-            case();
-            println!("test {name} ... ok");
+    let args = Args::parse(std::env::args().skip(1));
+    let chosen: Vec<_> = cases.iter().filter(|(name, _)| args.runs(name)).collect();
+    if args.list {
+        // libtest's listing, which nextest reads (`--list --format terse`) to find the tests.
+        for (name, _) in &chosen {
+            println!("{name}: test");
         }
+        return ExitCode::SUCCESS;
     }
+    for (name, case) in &chosen {
+        case();
+        println!("test {name} ... ok");
+    }
+    println!("\ntest result: ok. {} passed; 0 failed; 0 ignored", chosen.len());
     ExitCode::SUCCESS
+}
+
+/// The libtest arguments this harness honours, so `cargo test` and nextest drive it as they drive
+/// any test binary: `--list` (nextest lists with `--list --format terse`, and `--ignored` for the
+/// ignored ones, of which there are none), name filters, `--exact` (nextest runs each test as
+/// `<bin> --exact <name> --nocapture`) and `--skip`. Other flags are accepted and ignored.
+#[derive(Default)]
+struct Args {
+    list: bool,
+    exact: bool,
+    ignored: bool,
+    filters: Vec<String>,
+    skip: Vec<String>,
+}
+
+impl Args {
+    fn parse(args: impl IntoIterator<Item = String>) -> Args {
+        let mut parsed = Args::default();
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--list" => parsed.list = true,
+                "--exact" => parsed.exact = true,
+                "--ignored" => parsed.ignored = true,
+                "--skip" => parsed.skip.extend(args.next()),
+                // Flags that take a value: the value is not a filter.
+                "--format" | "--test-threads" | "--logfile" | "--color" | "--shuffle-seed" | "-Z" => {
+                    args.next();
+                }
+                flag if flag.starts_with('-') => {}
+                filter => parsed.filters.push(filter.to_owned()),
+            }
+        }
+        parsed
+    }
+
+    /// Whether the test `name` runs (or is listed).
+    fn runs(&self, name: &str) -> bool {
+        let matches = |f: &String| if self.exact { name == f } else { name.contains(f.as_str()) };
+        !self.ignored && (self.filters.is_empty() || self.filters.iter().any(matches)) && !self.skip.iter().any(matches)
+    }
 }
 
 /// The child: `emu`'s boot in miniature. Prints `ready` once it runs and `stopping` when a signal

@@ -24,7 +24,7 @@ Each task is a JSON file in `crates/sim-mcp/tests/evals/`, named after the task:
 | `toolsets` | The toolsets it needs, as `SIMEE_MCP_TOOLSETS` spells them, starting with `core` (`core,input` for `fold`) |
 | `prompt` | For a task that follows one of the server's prompts: `{name, arguments}` for `prompts/get` |
 | `world` | The fake backend's starting state: `devices` (udid, name, platform, form factor, state, and optionally `apps`, `foreground`, `appearance`, `orientation`, `posture`, `logs`), `packages` (host paths `install` takes and the bundle id each installs), `crash` (a tap region that crashes an app, the log line and the crash report it leaves), `icons` (home-screen tap regions that launch an app), `contrast` (per app, per appearance, the findings `contrast_check` reports) and `processes` (per device, what `processes` lists) |
-| `plan` | The reference plan: the tool calls a competent agent makes, in order, as `{tool, args}`, each with an optional `expect: {contains: [...]}` that its result's text must hold (what the agent reads before its next call) |
+| `plan` | The reference plan: the tool calls a competent agent makes, in order, as `{tool, args}` or, to read a resource instead, `{resource: uri}`, each with an optional `expect: {contains: [...]}` that its result's text must hold (what the agent reads before its next call: a tool result's text, or a resource's contents) |
 | `end` | The end state: `booted` and `shutdown` devices; per device its `foreground` app (`null`: none, as after a crash), `appearance`, `orientation`, `posture` and `installed` apps; `screenshot_shows`, what the device's last screenshot must show; and `seen`, text the agent must have read in a result (the reference run) or written in its answer (live mode) |
 
 The tasks, from #296 and one per prompt in [mcp.md](mcp.md#prompts):
@@ -37,6 +37,7 @@ The tasks, from #296 and one per prompt in [mcp.md](mcp.md#prompts):
 | `crash-log-line` | `core` | Launch an app, tap what crashes it, return the log line that says why |
 | `foldable-tabletop` | `core,input` | Rotate an Android foldable to landscape and fold it half open |
 | `audit-contrast` | `core,observe` | Report each contrast failure, light and dark, with its ratio; the appearance is put back |
+| `read-resources-find-heavy-process` | `core,debug` | Read `simee://devices` and the iPhone's `processes` resource, no tool, and name the process using the most CPU |
 | `prompt-boot-and-install` | `core,lifecycle` | The prompt with no tablet to hand: create one, boot it, install and launch |
 | `prompt-reproduce-bug` | `core,debug` | The prompt's steps with logs and screenshots, ending in the crash line and report |
 | `prompt-audit-contrast` | `core,observe` | The prompt from the home screen: open the app, then check it in both appearances |
@@ -78,7 +79,7 @@ setting's success count, then a row per task and setting:
 
 | Column | Meaning |
 | --- | --- |
-| Calls | `tools/call` requests in the plan |
+| Calls | `tools/call` and `resources/read` requests in the plan |
 | Bytes out, Bytes in | The JSON text of every message the client sent, and of every one the server sent (responses and any notification before them), including `server/discover` and `tools/list` |
 | tools/list ≈tok | The exact `tools/list` response for that setting, in bytes / 4 |
 | Messages ≈tok | Every other message, in bytes / 4, except that an image's base64 counts as the image: width × height / 750, after scaling it to fit 1568 pixels on its long edge and about 1.15 megapixels, as vision models commonly resize. A real screenshot's base64 is far longer than what a model is charged for it |

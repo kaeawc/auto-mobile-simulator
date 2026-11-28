@@ -586,6 +586,24 @@ fn contrast_result(mut value: Value) -> Value {
     json!({"content": content, "structuredContent": value})
 }
 
+/// The name of the toolset that has `tool` (`all` for one no set claims).
+pub fn toolset_of(tool: &str) -> &'static str {
+    group(tool).map_or("all", Group::name)
+}
+
+/// The refusal of `tool`, which `toolsets` doesn't serve, naming the toolset that has it. A
+/// resource that reads through a tool is refused the same way.
+pub fn not_enabled(tool: &str, toolsets: &Toolsets) -> RpcError {
+    let set = toolset_of(tool);
+    RpcError::invalid_params(format!(
+        "Tool `{tool}` isn't enabled on this server: it is in the `{set}` toolset, and this server serves `{}`. \
+         Start it with {TOOLSETS_ENV}={},{set} (or all)",
+        toolsets.label(),
+        toolsets.label()
+    ))
+    .with_data(json!({"tool": tool, "toolset": set, "enabled": toolsets.label()}))
+}
+
 /// What a tool call needs from the request to decide how to run: its name and arguments, checked.
 /// A tool this server doesn't serve is refused with the toolset that has it.
 pub fn parse_call(params: &Value, toolsets: &Toolsets) -> Result<(String, Value), RpcError> {
@@ -594,14 +612,7 @@ pub fn parse_call(params: &Value, toolsets: &Toolsets) -> Result<(String, Value)
         return Err(RpcError::invalid_params(format!("Unknown tool: {name}")));
     }
     if !toolsets.contains(name) {
-        let set = group(name).map_or("all", Group::name);
-        return Err(RpcError::invalid_params(format!(
-            "Tool `{name}` isn't enabled on this server: it is in the `{set}` toolset, and this server serves `{}`. \
-             Start it with {TOOLSETS_ENV}={},{set} (or all)",
-            toolsets.label(),
-            toolsets.label()
-        ))
-        .with_data(json!({"tool": name, "toolset": set, "enabled": toolsets.label()})));
+        return Err(not_enabled(name, toolsets));
     }
     let args = arguments(params)?;
     // `input: true` lets the viewer touch, type and press buttons: it needs the input tools served.

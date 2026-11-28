@@ -58,6 +58,7 @@ recoverable from what was recorded, or they need something the repository doesn'
 | [Emulator internals](#emulator-internals) | before/after rows | | various | see the section |
 | [`launch` with and without restart](#launch-with-and-without-restart) | 17–136 ms | | M3 Max, 2026-11-27 | `scripts/bench/ios-api.py --suite launch` |
 | [Per-call device lookup](#per-call-device-lookup-on-a-crowded-host) | 0.66 / 0.04 ms | simee before: 1.54 / 0.34 ms | M3 Max, 2026-11-26 | `ios-api.py --suite lookup` |
+| [Android device resolution](#android-device-resolution) | exact name 0.14 ms, `booted` 0.39 ms (kept); one-shot call 6.7 ms | simee before: 0.25, 2.02 ms; 21 ms | 4-vCPU Xeon VM (Linux), 2026-11-28 | `scripts/bench/android-resolve.py --baseline …` |
 | [Introspection](#introspection-processes-connections-kill-network_state) | 2.5–3.5 ms | `ps`/`lsof`/`kill`: 126–191 ms | M3 Max, 2026-11-27 | `ios-api.py --suite introspection` |
 | [iPad pointer click](#ipad-pointer-click) | 408 ms later click | simee before: 3641 ms | M3 Max, 2026-11-27 | `ios-api.py --suite pointer` (timings) |
 | [iOS input defaults](#ios-input-defaults) | tap 12.6 ms, type 20 chars 121 ms | simee before: 64.5, 749 ms | M3 Max, 2026-11-27 | `ios-api.py --suite input` (timings) |
@@ -65,6 +66,7 @@ recoverable from what was recorded, or they need something the repository doesn'
 | [iOS memory tools](#ios-memory-tools) | `mem_vmmap` 0.60 s … `mem_leaks` 2.30 s | | M3 Max, 2026-11-27 | `ios-api.py --suite mem` |
 | [Desktop: Metal against wgpu](#desktop-runes-native-metal-backend-against-wgpu) | | | M3 Max, 2026-11-27 | no script (below) |
 | [MCP server](#mcp-server) | 1 crate | `rmcp`: 75 crates, 41 s build | Linux VM, 2026-11-26 | `scripts/bench/mcp-build.sh` |
+| [MCP idle subscription](#mcp-idle-subscription) | 1 wake-up a second, 0 ms CPU in 10 s | simee before: 98.5 wake-ups a second, 40 ms | 4-vCPU Xeon VM, 2026-11-27 | `cargo test --release -p simee-mcp idle_subscription -- --ignored --nocapture` |
 | [Build times](#build-times-local) | 74–77 CPU s | simee before: 131–136 | Apple silicon, 2026-11-26 | `scripts/bench/build-times.sh` |
 
 ## Android: emu against the SDK emulator
@@ -821,6 +823,46 @@ until a rotation or fold. Reproduce: `python3 -I scripts/bench/ios-api.py --suit
 What `location` has left is the service's own round trip (`host_support_mig_set_location_lat_lon`,
 ~95% of its samples).
 
+### Android device resolution
+
+How long a call spends finding its device (#256), with 44 AVDs (phones, tablets, watches, TVs and
+cars, each with the `config.ini` avdmanager writes) and, in the second half of the table, two
+stand-ins for the stock emulator running (a process with a qemu's command line, `-port` from 5900,
+holding the AVD's `hardware-qemu.ini.lock`). Linux, 4-vCPU Xeon @ 2.20 GHz VM, 7.8 GB, Ubuntu
+22.04, 1-minute load under 3 (2026-11-28). **Not measured on macOS or with a real emulator.**
+Medians over 5 rounds of the p50 and p95 of 100 calls, the build before and after alternating.
+"Kept" is one connection to a `simee serve` that has been up a second; "one-shot" is a fresh
+`simee` process with no server on the socket, so it includes the process's start (`--version` is
+the floor: 4.7 ms). The one-shot taps fail once the device is resolved, before any network I/O: a
+stopped AVD isn't running, and a stand-in is a stock emulator, which refuses input over the
+display socket. That failure is what is timed. Reproduce:
+`python3 -I scripts/bench/android-resolve.py --baseline <before build>`.
+
+| Call | none running, before → after (ms) | 2 running, before → after (ms) |
+| --- | --- | --- |
+| kept: `info` of an exact AVD name, p50 / p95 | 0.33 → 0.13 / 0.37 → 0.17 | 0.25 → 0.14 / 0.31 → 0.19 |
+| kept: `info` of `booted`, p50 / p95 | 2.10 → 0.36 / 2.39 → 0.40 | 2.02 → 0.39 / 2.23 → 0.52 |
+| kept: `devices` with `booted`, p50 / p95 | 2.20 → 0.80 / 2.36 → 1.90 | 2.07 → 0.85 / 2.30 → 1.49 |
+| kept: `devices`, p50 / p95 | 3.25 → 2.40 / 5.87 → 2.83 | 3.30 → 2.43 / 5.90 → 2.78 |
+| one-shot: `tap` of an exact name, p50 / p95 | 6.89 → 6.54 / 7.42 → 6.71 | 21.2 → 6.7 / 22.3 → 6.9 |
+| one-shot: `tap booted`, p50 / p95 | 11.7 → 7.9 / 12.0 → 8.4 | 32.7 → 8.2 / 36.4 → 8.7 |
+| one-shot: `list --booted`, p50 / p95 | 11.6 → 11.0 / 12.7 → 11.2 | 32.3 → 11.2 / 34.9 → 11.8 |
+| one-shot: `list`, p50 / p95 | 12.1 → 11.5 / 13.3 → 11.7 | 33.1 → 11.7 / 35.8 → 12.3 |
+
+What changed: the stock emulator's process facts (command line, listening ports) are read for the
+one PID a lock names, from `/proc/<pid>` on Linux and libproc on macOS, instead of a host-wide
+`ps -axo` and `lsof` (~60 ms each on a macOS host with ~1300 processes; `ps` here, with a few
+hundred processes, is ~20 ms). A kept server remembers them by (PID, start time). Each AVD's pointer
+and `config.ini` are parsed once and then validated by one `stat` (path, mtime, ctime, size, inode); an
+exact name is one `stat` of its pointer instead of listing the home; `booted` loads only the
+running AVDs' configs.
+
+What is left, measured: `devices` lists and loads all 44 AVDs (about 0.6–1 ms in the server, plus
+an 11 KB reply the client parses), so it is not under 1 ms. A cold one-shot `list` or fuzzy name
+reads every AVD's two files (about 700 system calls for 44 AVDs, ~5 ms over the floor); an on-disk
+cache would still `stat` each file, and wasn't built. With nothing running, the one-shot exact-name
+`tap` is within 1.7 ms of `--version`.
+
 ### Introspection: `processes`, `connections`, `kill`, `network_state`
 
 iPhone 17 Pro, iOS 27.2 (24B8117), freshly booted (~205 device processes, ~1200 on the host),
@@ -1038,6 +1080,27 @@ dependencies). `Cargo.lock` has 140 packages in all. Reproduce: `scripts/bench/m
 (it downloads `rmcp` into cargo's cache; nothing is added to this repository). Why this decides the protocol layer:
 [mcp.md](mcp.md#why-the-protocol-layer-is-hand-written).
 
+## MCP idle subscription
+
+What a subscribed resource costs while nothing changes: the watch thread's own wake-ups and CPU
+(`/proc/self/task/<tid>`), over 10 s after a 0.5 s settle, against a fake backend that answers at
+once, so it is the watcher and not the device. Linux VM, 4 vCPUs (Xeon @ 2.2 GHz, Linux 6.1),
+2026-11-27, release build, one run each (the numbers are counts, not timings). "Before" is
+`main` at 6ad2666, whose watcher slept in 10 ms steps and compared the clock, with the same test
+body copied in (the old `spawn` took one interval, 1 s).
+
+| Subscribed to | Wake-ups a second, before | after | CPU in 10 s, before | after | Reads in 10 s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| one screen | 98.5 | 1.0 | 40 ms | 0 ms (under the 10 ms tick) | 11 |
+| the resource list | 98.2 | 1.0 | 40 ms | 0 ms | 11 |
+| one screen and the list | 98.5 | 1.0 | 40 ms | 0 ms | 22 |
+
+The reads are the real cost on a device: a subscribed screen is one `screenshot` a second at the
+default pace (`SIMEE_MCP_SCREEN_FPS` raises or lowers it), and each is the call timed in
+[Time per automation step](#ios-simee-against-simctl). The host CPU of a subscribed screen on a
+device is [not yet measured](#not-yet-measured). A resource nobody subscribed to costs nothing:
+the server has no thread and makes no read (a test counts the backend's calls).
+
 ## Build times (local)
 
 Apple silicon Mac, 16 CPUs, macOS 26.6, 2026-11-26. The host was heavily loaded by other builds
@@ -1192,6 +1255,9 @@ Claims that would belong in the README once someone runs them:
   device's directory (6,562 files), so the host's `mds_stores` indexes what devices write. What
   excluding `~/Library/Developer/CoreSimulator` from Spotlight saves a farm needs a change to the
   host's Spotlight privacy settings to measure.
+- Host CPU of an MCP client subscribed to a booted device's `screen`, `logs` and `processes`
+  resources, on iOS and Android, at the default pace and at `SIMEE_MCP_SCREEN_FPS=10`, against the
+  same device read by polling `screenshot` from the client.
 - Time per automation step through `simee mcp` (a `tools/call` of `tap`, then `screenshot`) against
   the socket API and the CLI on the same device.
 - A 10 ms `button` hold for the iPhone's side, Siri, Apple Pay, Action and volume buttons and on

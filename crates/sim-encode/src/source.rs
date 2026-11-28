@@ -5,7 +5,9 @@
 //!   itself, wrapped as a `CVPixelBuffer` (no copy; VideoToolbox converts BGRA on the GPU).
 //! - [`AndroidSource`]: emu's display socket and frame ring ([`FrameReader`]: a reader thread
 //!   keeps the newest frame), and the picture is that frame copied once into an IOSurface-backed
-//!   pool buffer.
+//!   pool buffer. Under `emu -gpu metal` a frame comes as the IOSurface emu's GPU copied it into,
+//!   and the picture wraps it as the iOS source does (no copy); it goes back to emu when the next
+//!   frame replaces it. A frame that comes as pixels still takes the copy.
 
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -16,7 +18,7 @@ use sim_core::stream::Input;
 use sim_coresim::videotoolbox::{PixelBuffer, PixelBufferPool, PixelFormat};
 use sim_coresim::{Display, FrameWatch};
 
-use crate::android_frames::FrameReader;
+use crate::android_frames::{FrameReader, HeldSurface};
 use crate::stream::Source;
 use crate::{Error, Result};
 
@@ -116,6 +118,12 @@ pub struct AndroidSource {
     reader: FrameReader,
     pool: Option<PixelBufferPool>,
     current: Option<PixelBuffer>,
+    /// The emulator's surface `current` wraps, if it does: released when `current` is replaced
+    /// (the encoder is done with a picture by the next `picture` call).
+    held: Option<HeldSurface>,
+    /// Frames that came as surfaces, and as pixels.
+    pub surfaces: u64,
+    pub copied: u64,
     /// What the last `picture` call that took a frame saw, until the stream loop reads it.
     taken_at: Option<Instant>,
     unreported: u64,
@@ -125,7 +133,16 @@ impl AndroidSource {
     /// Connects to the AVD in `avd_dir` and asks for frames at most `max_width` pixels wide (0:
     /// full size; emu shrinks by a whole factor, `ceil(width / max_width)`).
     pub fn connect(avd_dir: &Path, max_width: u32) -> Result<AndroidSource> {
-        Ok(AndroidSource { reader: FrameReader::connect(avd_dir, max_width)?, pool: None, current: None, taken_at: None, unreported: 0 })
+        Ok(AndroidSource {
+            reader: FrameReader::connect(avd_dir, max_width)?,
+            pool: None,
+            current: None,
+            held: None,
+            surfaces: 0,
+            copied: 0,
+            taken_at: None,
+            unreported: 0,
+        })
     }
 
     /// The device's own display size (what input coordinates are in), once a frame has arrived.
@@ -156,6 +173,24 @@ impl Source for AndroidSource {
             self.unreported = frame.unreported;
             self.taken_at = Some(frame.at);
             let (w, h) = (frame.width, frame.height);
+            if let Some(held) = frame.surface {
+                // The emulator's surface itself, wrapped: no copy (VideoToolbox converts BGRA).
+                let wrapped = match PixelBuffer::wrap_surface(&held.surface) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        // One that can't be wrapped goes back (dropped), and the stream goes on
+                        // with pixels from the next frame; the last picture stands until then.
+                        eprintln!("simee: an emulator surface can't be encoded ({e}); taking frames as pixels");
+                        self.reader.stop_surfaces();
+                        return Ok(self.current.as_ref());
+                    }
+                };
+                self.current = Some(wrapped);
+                // The last picture's surface goes back only after the new one replaced it.
+                self.held = Some(held);
+                self.surfaces += 1;
+                return Ok(self.current.as_ref());
+            }
             if self.pool.as_ref().is_none_or(|p| p.size() != (w, h)) {
                 self.pool = Some(PixelBufferPool::new(w, h, PixelFormat::Rgba).map_err(|e| Error::Source(e.to_string()))?);
             }
@@ -163,6 +198,8 @@ impl Source for AndroidSource {
             let filled = pool.fill(&frame.rgba, w as usize * 4);
             self.reader.recycle(frame.rgba);
             self.current = Some(filled.map_err(|e| Error::Source(e.to_string()))?);
+            self.held = None;
+            self.copied += 1;
         }
         Ok(self.current.as_ref())
     }
@@ -186,5 +223,156 @@ mod tests {
         assert!(!device_gone(true, true));
         assert!(!device_gone(false, false), "not rendered yet is not gone");
         assert!(!device_gone(false, true));
+    }
+
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{Receiver, Sender};
+    use std::time::Duration;
+
+    use sim_core::stream::{FrameHeader, NO_SURFACES, Record};
+    use sim_coresim::{Surface, SurfaceOutbox};
+
+    /// An emulator under `-gpu metal`, faked. Once the client has said `hello`, each `go` sends
+    /// the next of `frames`: a new IOSurface of `surface` size to the port the client named
+    /// (`surfaces <name>`), then its record for a frame of `record` size; after the client said
+    /// `surfaces -`, the frame's pixels on the socket instead. The lines the client sends after
+    /// `hello` come out of `lines`. Without a `surfaces` line it sends nothing. Removes its
+    /// directory on drop.
+    struct FakeMetalEmu {
+        dir: std::path::PathBuf,
+        go: Sender<()>,
+        lines: Receiver<Input>,
+        ids: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl Drop for FakeMetalEmu {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn fake_metal_emu(name: &str, record: (u32, u32), surface: (u32, u32), frames: u32) -> FakeMetalEmu {
+        // Short (SUN_LEN), as the frame reader's own fake does.
+        let dir = std::path::PathBuf::from("/tmp").join(format!("simee-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = emu_avd::state_dir(&dir);
+        std::fs::create_dir_all(&state).expect("state dir");
+        let listener = UnixListener::bind(state.join("display.sock")).expect("bind");
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let (tx, lines) = std::sync::mpsc::channel();
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let made = ids.clone();
+        std::thread::spawn(move || {
+            let Ok((conn, _)) = listener.accept() else { return };
+            let mut out = conn.try_clone().expect("clone");
+            let mut input = BufReader::new(conn).lines();
+            let mut port = None;
+            for line in input.by_ref() {
+                let Ok(line) = line else { return };
+                if let Some(Input::Surfaces(n)) = Input::parse(&line) {
+                    port = SurfaceOutbox::look_up(&n).ok();
+                }
+                if line.starts_with("hello") {
+                    break;
+                }
+            }
+            let Some(port) = port else { return };
+            // Surfaces off (`surfaces -`) is set before the line is passed on, so a `go` sent after
+            // the test saw it sends pixels.
+            let off = Arc::new(AtomicBool::new(false));
+            let o = off.clone();
+            std::thread::spawn(move || {
+                for line in input {
+                    let Some(i) = line.ok().and_then(|l| Input::parse(&l)) else { return };
+                    if i == Input::Surfaces(NO_SURFACES.into()) {
+                        o.store(true, Ordering::Relaxed);
+                    }
+                    let _ = tx.send(i);
+                }
+            });
+            let mut held = Vec::new();
+            for seq in 0..frames {
+                if go_rx.recv().is_err() {
+                    return;
+                }
+                let header = FrameHeader::new(record.0, record.1, record.0, record.1, u64::from(seq)).expect("header");
+                let msg = if off.load(Ordering::Relaxed) {
+                    let mut msg = header.encode().to_vec();
+                    msg.extend(vec![0x80; header.len as usize]);
+                    msg
+                } else {
+                    let s = Surface::new_bgra(surface.0, surface.1).expect("surface");
+                    made.lock().expect("ids").push(s.id());
+                    port.send(&s, seq).expect("send");
+                    held.push(s);
+                    Record::Surface { header, seq }.encode().to_vec()
+                };
+                if out.write_all(&msg).is_err() {
+                    return;
+                }
+            }
+            // Holds the connection (and the surfaces) until the test ends.
+            while go_rx.recv().is_ok() {}
+        });
+        FakeMetalEmu { dir, go, lines, ids }
+    }
+
+    fn picture_after(source: &mut AndroidSource, frames: u64) -> (u32, u32, [u8; 4]) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while source.surfaces + source.copied < frames {
+            assert!(Instant::now() < deadline, "no frame");
+            if source.wait(deadline).expect("wait").is_some() {
+                let _ = source.picture().expect("picture");
+            }
+        }
+        let p = source.current.as_ref().expect("a picture");
+        let (w, h) = p.size();
+        (w, h, p.fourcc())
+    }
+
+    #[test]
+    fn an_emulators_surfaces_are_wrapped_without_a_copy_and_given_back_when_replaced() {
+        let emu = fake_metal_emu("vt-surf", (64, 32), (64, 32), 2);
+        let mut source = AndroidSource::connect(&emu.dir, 0).expect("connect");
+        emu.go.send(()).expect("go");
+        assert_eq!(picture_after(&mut source, 1), (64, 32, *b"BGRA"));
+        assert_eq!((source.surfaces, source.copied), (1, 0));
+        let first = emu.ids.lock().expect("ids")[0];
+        assert_eq!(source.held.as_ref().map(|h| h.surface.id()), Some(first), "the emulator's surface, not a copy");
+        assert!(source.pool.is_none(), "no pool: nothing to copy into");
+        assert!(emu.lines.recv_timeout(Duration::from_millis(50)).is_err(), "held while it's the picture");
+        // The next frame goes only now, so the first was the picture: it replaces it, and the
+        // first goes back.
+        emu.go.send(()).expect("go");
+        picture_after(&mut source, 2);
+        assert_eq!(emu.lines.recv_timeout(Duration::from_secs(5)), Ok(Input::Release(0)));
+        assert_eq!(source.device_size(), Some((64, 32)));
+    }
+
+    #[test]
+    fn a_surface_that_isnt_its_records_frame_goes_back_and_frames_come_as_pixels() {
+        // The record says 64x32; the surface is 32x16 (a confused or forged sender).
+        let emu = fake_metal_emu("vt-bad", (64, 32), (32, 16), 2);
+        let mut source = AndroidSource::connect(&emu.dir, 0).expect("connect");
+        emu.go.send(()).expect("go");
+        let lines: Vec<Input> = (0..2).filter_map(|_| emu.lines.recv_timeout(Duration::from_secs(5)).ok()).collect();
+        assert!(lines.contains(&Input::Release(0)), "given back: {lines:?}");
+        assert!(lines.contains(&Input::Surfaces(NO_SURFACES.into())), "surfaces off: {lines:?}");
+        // The stream lives on, on pixels.
+        emu.go.send(()).expect("go");
+        assert_eq!(picture_after(&mut source, 1), (64, 32, *b"BGRA"));
+        assert_eq!((source.surfaces, source.copied), (0, 1));
+    }
+
+    #[test]
+    fn frames_that_come_as_pixels_still_take_the_copy() {
+        let display = crate::android_frames::tests::fake_display("vt-px", (8, 4), 1, Duration::ZERO);
+        let mut source = AndroidSource::connect(&display.dir, 0).expect("connect");
+        display.go();
+        assert_eq!(picture_after(&mut source, 1), (8, 4, *b"BGRA"));
+        assert_eq!((source.surfaces, source.copied), (0, 1));
+        assert!(source.held.is_none());
     }
 }

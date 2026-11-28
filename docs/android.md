@@ -94,10 +94,16 @@ an avdmanager AVD; emu has no snapshots and ignores those keys. (Earlier builds 
 AVDs the stock emulator runs list as `Booted`. The stock emulator (36.x, macOS) does not write the
 `pid_<pid>.ini` that simee's `emu` writes to `~/Library/Caches/TemporaryItems/avd/running`; it
 holds `<avd>/multiinstance.lock` and writes the qemu PID to `<avd>/hardware-qemu.ini.lock`. simee
-reads that PID, checks it is alive and a qemu started with the exact pair `-avd <name>` (`ps`), and
-takes the ports from `-port N` (adb is N + 1) or `-ports C,A`, else from the emulator-range port it
-listens on (`lsof`). A call on one AVD reads only that AVD's lock; a listing asks the host once
-(one `ps -axo`, and one `lsof` only if an emulator lacks `-port`).
+reads that PID, checks it is alive and a qemu started with the exact pair `-avd <name>`, and takes
+the ports from `-port N` (adb is N + 1) or `-ports C,A`, else from the emulator-range port it
+listens on. The process facts come from the kernel for that one PID, with nothing spawned:
+`/proc/<pid>` on Linux, libproc on macOS (`sim-android`'s `host.rs`), where a host-wide `ps -axo`
+and `lsof` cost ~60 ms each. A call on one AVD reads only that AVD's lock. A server remembers a
+qemu's command line and ports by (PID, start time), so a PID the kernel hands to another program
+is asked about again; an emulator is never listed from memory alone, as every call reads the locks
+and checks the PID is alive. The parsed pointer and `config.ini` of each AVD are remembered by
+(path, mtime, ctime, size, inode) in `emu-avd` (the change time catches a same-size file put back with its old mtime), except files changed in the last 2 s, so resolving a
+device reads no AVD file that hasn't changed.
 `simee info` shows `running.emulator` (`stock` or `simee`), the serial, ports and PID. What needs
 simee's `emu` (touch, keys, wheel and frames over `display.sock`, the touchpad) says so and names
 the fix instead of failing on a missing socket. `shutdown` interrupts the qemu process
@@ -118,6 +124,7 @@ the valid ones. Every mode renders through gfxstream; what differs is the Vulkan
 | `swiftshader`, `swiftshader_indirect` | SwiftShader, software Vulkan on the CPU | comparing against lavapipe |
 | `software`, `guest` | lavapipe, with stock's notice that guest rendering isn't supported | an AVD configured that way keeps booting |
 | `off`, `none` | no renderer; the guest boots without graphics | boot-only checks (flag only; `hw.gpu.mode=off` in `config.ini` is ignored) |
+| `metal` (flag only, experimental) | `host`, and posted frames also go to simee's encoder as IOSurfaces copied on the GPU instead of read back | measuring the Metal present path (#356, docs/research/metal-present.md) |
 
 Rendering inside the guest (virtio-gpu 2D with Mesa in the image) isn't possible with SDK
 images: a scan of the API 34 to 37 system images found none that ships a guest renderer, and
@@ -614,6 +621,17 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   dm-default-key metadata encryption, which passes discard through but not write-zeroes, and
   zeroes it writes land as ciphertext. So discard is the only way to free space, and a fresh
   first boot (about 610 MB allocated) has only about 2 MB left to trim.
+- **AVD disks are copy-on-write clones (#203).** Every disk an AVD is made from (a golden's,
+  `-clone-avd`'s, `boot.prop`) goes through one helper, `emu_avd::clone::clone_file`:
+  `clonefile(2)` on APFS, `FICLONE` on Linux file systems with reflinks, else a copy of only the
+  data extents (`SEEK_DATA`/`SEEK_HOLE`), keeping the source's mode and extended attributes. On
+  one APFS volume it was already a clone (`std::fs::copy` tries `fclonefileat` first):
+  `-clone-avd` of an AVD with a 6 GiB userdata takes 11 ms and no disk before and after, and
+  `-create-avd ... -no-golden` 11 ms and 20 KiB (only the ini files; median of 5, M3 Max, macOS
+  26.6.2, 2026-11-27, host load about 7). What changed is the fallback: from an AVD whose disks
+  are on another APFS volume (`EXDEV`; a 6 GiB userdata holding 1 GiB of data), `std::fs::copy`'s
+  `fcopyfile` filled the holes, 2.97 s and 6.1 GiB per clone; the extent copy takes 0.57 s and
+  1.0 GiB (median of 5, same host and day).
 - **Screenshots: fast PNG, no re-encode, no needless copies.** Automation takes a screenshot
   after nearly every step. On a 2480×1740 screen (`cargo run --release -p simee-core --example
   frame_bench`), PNG encoding at the `png` crate's default level took 74 ms and BGRA→RGBA

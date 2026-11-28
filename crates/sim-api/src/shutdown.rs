@@ -7,9 +7,11 @@
 //! exits at once, removing the sockets the process serves on the way out. Either way the process
 //! exits with 128 + the signal: 130 for SIGINT, 143 for SIGTERM.
 //!
-//! Nothing here shuts a device down: a call cancelled at a safe point undoes only what it started
-//! itself (a `boot` waiting for admission boots nothing), and a device the process found running
-//! stays as it was.
+//! Nothing here shuts down a device the process didn't start, but a shutdown does reach devices
+//! it did: a call cancelled at a safe point undoes what it made itself (a `create` or `clone` that
+//! finishes during the drain is deleted; a `boot` waiting for admission boots nothing). And a
+//! Ctrl-C at a terminal goes to the whole process group, so the Android emulators `serve` started
+//! (its children) get the SIGINT too, and power off.
 
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
@@ -25,9 +27,35 @@ pub const SHUTTING_DOWN: &str = "cancelled: server shutting down";
 /// The signal that started the shutdown; 0 while none has.
 static SIGNAL: AtomicI32 = AtomicI32::new(0);
 
-/// The sockets this process serves on, with the inode each was bound as: removed however the
-/// process exits, unless another server has replaced the file since.
-static SOCKETS: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
+/// The sockets this process serves on (`serve`'s, the camera feeds'): removed however the process
+/// exits, unless another server has replaced the file since.
+static SOCKETS: Mutex<Vec<Bound>> = Mutex::new(Vec::new());
+
+/// A socket file as this process bound it: its path, and the device and inode the path named
+/// then. It is removed only while the path still names that same file, so a successor server's
+/// socket at the path is left alone. Its owner keeps the listener open until the file is removed:
+/// a socket still bound keeps its inode, so no new file can be given the same number meanwhile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Bound {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl Bound {
+    /// The file at `path` now.
+    fn of(path: &Path) -> Option<Bound> {
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        Some(Bound { path: path.to_owned(), dev: meta.dev(), ino: meta.ino() })
+    }
+
+    /// Removes the file, if the path still names it.
+    fn remove(&self) {
+        if Bound::of(&self.path).as_ref() == Some(self) {
+            std::fs::remove_file(&self.path).ok();
+        }
+    }
+}
 
 /// Calls running on the API server's connections; [`IDLE`] is told when one ends.
 static IN_FLIGHT: Mutex<usize> = Mutex::new(0);
@@ -75,35 +103,51 @@ pub fn watch(first: impl FnOnce(i32) + Send + 'static) -> std::io::Result<()> {
         for sig in signals.forever() {
             let Some(shutdown) = first.take() else {
                 eprintln!("simee: a second {}: exiting now", name(sig));
-                remove_sockets();
-                std::process::exit(exit_code(sig));
+                exit(sig);
             };
             SIGNAL.store(sig, Ordering::SeqCst);
             eprintln!("simee: {}: shutting down (a second Ctrl-C or SIGTERM exits at once)", name(sig));
             if let Err(e) = std::thread::Builder::new().name("simee-shutdown".into()).spawn(move || shutdown(sig)) {
                 eprintln!("simee: cannot start the shutdown ({e}): exiting now");
-                remove_sockets();
-                std::process::exit(exit_code(sig));
+                exit(sig);
             }
         }
     })?;
     Ok(())
 }
 
-/// Removes `path`, the socket this process just bound, when the process exits through a signal
-/// ([`remove_sockets`]).
+/// Exits the process a signal stopped, with [`exit_code`] of it, removing its sockets first
+/// (`simee mcp`'s shutdown, and a second signal's).
+pub fn exit(sig: i32) -> ! {
+    remove_sockets();
+    std::process::exit(exit_code(sig))
+}
+
+/// Removes `path`, the socket this process just bound, when the process shuts down
+/// ([`remove_sockets`]). The caller keeps its listener open until then.
 pub(crate) fn remove_on_exit(path: &Path) {
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        lock(&SOCKETS).push((path.to_owned(), meta.ino()));
+    if let Some(bound) = Bound::of(path) {
+        let mut sockets = lock(&SOCKETS);
+        sockets.retain(|b| b.path != bound.path);
+        sockets.push(bound);
     }
 }
 
-/// Removes every socket [`remove_on_exit`] named that is still the one this process bound.
+/// Forgets `path`: its socket was closed and removed by its owner (a camera feed that stopped).
+pub(crate) fn forget(path: &Path) {
+    lock(&SOCKETS).retain(|b| b.path != path);
+}
+
+/// Whether a shutdown would remove the socket at `path`.
+#[cfg(test)]
+pub(crate) fn removes(path: &Path) -> bool {
+    lock(&SOCKETS).iter().any(|b| b.path == path)
+}
+
+/// Removes every socket [`remove_on_exit`] named that is still the file this process bound.
 pub(crate) fn remove_sockets() {
-    for (path, ino) in lock(&SOCKETS).drain(..) {
-        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.ino() == ino) {
-            std::fs::remove_file(&path).ok();
-        }
+    for bound in lock(&SOCKETS).drain(..) {
+        bound.remove();
     }
 }
 
@@ -176,6 +220,23 @@ mod tests {
     /// How long a test waits for the child to get anywhere: a deadline for a hang, never a
     /// measure of speed.
     const DEADLINE: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn a_socket_is_removed_only_while_its_path_names_the_file_bound() {
+        let dir = short_dir("bound");
+        let path = dir.join("s.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let bound = Bound::of(&path).expect("stat");
+        // The same inode number on another device, or another inode on this one: not this file.
+        let other_dev = Bound { dev: bound.dev.wrapping_add(1), ..bound.clone() };
+        let other_ino = Bound { ino: bound.ino.wrapping_add(1), ..bound.clone() };
+        other_dev.remove();
+        other_ino.remove();
+        assert!(path.exists(), "a different file is left alone");
+        bound.remove();
+        assert!(!path.exists(), "the file bound is removed");
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn a_signal_exits_with_128_plus_its_number() {
@@ -338,6 +399,54 @@ mod tests {
     #[test]
     fn sigterm_cancels_calls_in_flight_stops_streams_removes_the_socket_and_exits_143() {
         stopped_and_exited("-TERM", 143);
+    }
+
+    #[test]
+    fn the_first_signal_shuts_down_in_order_when_the_socket_file_is_gone() {
+        let dir = short_dir("gone");
+        let socket = dir.join("api.sock");
+        let server = Server::start(&dir, false);
+        server.expect_line("ready");
+        // A tmp cleaner or an `rm`: nothing can connect to the server any more.
+        std::fs::remove_file(&socket).expect("rm the socket");
+        server.signal("-TERM");
+        let (status, err) = server.exit();
+        assert_eq!(status.code(), Some(143), "{status}; stderr:\n{err}");
+        assert!(!err.contains("exiting now"), "one signal was enough: {err}");
+        let deletes = std::fs::read_to_string(dir.join("deletes")).unwrap_or_default();
+        assert_eq!(deletes, "DELETE http://127.0.0.1:8889/sim/whip/session-0\n", "the stream was stopped with its DELETE");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_connection_made_during_the_shutdown_is_answered_cancelled() {
+        let dir = short_dir("late");
+        let socket = dir.join("api.sock");
+        // The stream's DELETE never finishes: the shutdown stays in progress until a second signal.
+        let server = Server::start(&dir, true);
+        server.expect_line("ready");
+        server.signal("-INT");
+        // Each call on a connection of its own: answered until the signal lands, then refused,
+        // never dropped unanswered and never refused at connect.
+        let until = Instant::now() + DEADLINE;
+        let refused = loop {
+            assert!(Instant::now() < until, "the server never said it was shutting down");
+            match crate::call(&socket, "form_factors", json!({})) {
+                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(refused, SHUTTING_DOWN);
+        // The socket is still this server's while it shuts down: a new server finds it live and
+        // can't take its path (and so can't lose its own socket to this one's cleanup).
+        assert!(socket.exists(), "the socket stays until the shutdown removes it");
+        let again = crate::call(&socket, "form_factors", json!({})).expect_err("refused");
+        assert_eq!(again, SHUTTING_DOWN);
+        server.signal("-TERM");
+        let (status, err) = server.exit();
+        assert_eq!(status.code(), Some(143), "{status}; stderr:\n{err}");
+        assert!(!socket.exists(), "the socket is removed on a forced exit");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

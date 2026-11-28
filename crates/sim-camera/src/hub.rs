@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::catalog::{self, HostCamera};
 use crate::error::{Error, Result};
-use crate::frame::{CameraFrame, FrameSpec, Tick};
+use crate::frame::{CameraFrame, Fitted, FrameSpec, Tick};
 use crate::hotplug::{Debounce, Event, HostHotPlug, HotPlug, MAX_DELAY, QUIET, Signals};
 use crate::id::SourceSpec;
 use crate::source::{Opener, Source};
@@ -402,6 +402,7 @@ fn run_capture(hub: Weak<Inner>, capture: Arc<Capture>, mut source: Box<dyn Sour
     let synthetic = source.synthetic();
     let mut seq = 0u64;
     let mut next = started;
+    let mut fits = Fits::default();
     loop {
         // Sleep until the next tick, waking early when a subscriber comes or goes.
         let due_now = {
@@ -426,7 +427,7 @@ fn run_capture(hub: Weak<Inner>, capture: Arc<Capture>, mut source: Box<dyn Sour
         let now = Instant::now();
         let pts = now - started;
         let tick = Tick { seq, pts, wall: wall + pts };
-        let frames = render(source.as_mut(), synthetic, spec, tick, &due);
+        let frames = render(source.as_mut(), synthetic, spec, tick, &due, &mut fits);
         seq += 1;
         next = (next + spec.interval()).max(now);
         let mut state = lock(&capture.state);
@@ -463,7 +464,44 @@ fn take_due(subscribers: &mut [Subscriber], now: Instant) -> Vec<(u64, (u32, u32
 /// One frame per distinct size among the due subscribers. A synthetic source draws each size
 /// itself; a camera is asked for its frame once (every tick, so a stalled camera is noticed) and
 /// that frame is fitted to the other sizes.
-fn render(source: &mut dyn Source, synthetic: bool, spec: FrameSpec, tick: Tick, due: &[(u64, (u32, u32))]) -> Result<Vec<CameraFrame>> {
+/// A capture's last source frame fitted to its subscribers' other sizes: a source that repeats a
+/// frame (a video file slower than the capture) shares its fits instead of scaling again.
+#[derive(Default)]
+struct Fits {
+    /// The source pixels the fits are of; held, so a new frame can't reuse their address.
+    source: Option<Arc<[u8]>>,
+    sizes: Fitted,
+}
+
+impl Fits {
+    fn fit(&mut self, frame: &CameraFrame, width: u32, height: u32) -> CameraFrame {
+        if (width, height) == (frame.width, frame.height) {
+            return frame.clone();
+        }
+        if !self.source.as_ref().is_some_and(|s| Arc::ptr_eq(s, &frame.bgra)) {
+            self.source = Some(frame.bgra.clone());
+            self.sizes.clear();
+        }
+        let bgra = match self.sizes.iter().find(|(size, _)| *size == (width, height)) {
+            Some((_, bgra)) => bgra.clone(),
+            None => {
+                let bgra = frame.fit(width, height).bgra;
+                self.sizes.push(((width, height), bgra.clone()));
+                bgra
+            }
+        };
+        CameraFrame { width, height, bgra, tick: frame.tick }
+    }
+}
+
+fn render(
+    source: &mut dyn Source,
+    synthetic: bool,
+    spec: FrameSpec,
+    tick: Tick,
+    due: &[(u64, (u32, u32))],
+    fits: &mut Fits,
+) -> Result<Vec<CameraFrame>> {
     let mut sizes: Vec<(u32, u32)> = Vec::new();
     for &(_, size) in due {
         if !sizes.contains(&size) {
@@ -474,7 +512,7 @@ fn render(source: &mut dyn Source, synthetic: bool, spec: FrameSpec, tick: Tick,
         return sizes.into_iter().map(|(width, height)| source.frame(FrameSpec { width, height, ..spec }, tick)).collect();
     }
     let frame = source.frame(spec, tick)?;
-    Ok(sizes.into_iter().map(|(width, height)| frame.fit(width, height)).collect())
+    Ok(sizes.into_iter().map(|(width, height)| fits.fit(&frame, width, height)).collect())
 }
 
 /// Sends each due subscriber the frame of its size; drops subscribers whose subscription is gone.
@@ -673,6 +711,32 @@ mod tests {
         assert_eq!(crate::synth::testcard_seq(&fs), Some(fs.tick.seq as u32), "scaled from the capture frame");
     }
 
+    /// A camera-like source whose frame doesn't change (a paused or repeated video frame).
+    struct Same(Arc<[u8]>);
+
+    impl Source for Same {
+        fn frame(&mut self, _spec: FrameSpec, tick: Tick) -> Result<CameraFrame> {
+            Ok(CameraFrame { width: 4, height: 4, bgra: self.0.clone(), tick })
+        }
+    }
+
+    #[test]
+    fn a_repeated_source_frame_is_fitted_once_per_subscriber_size() {
+        let mut same = Same(vec![9u8; 4 * 4 * 4].into());
+        let due = [(1, (4, 4)), (2, (2, 2))];
+        let mut fits = Fits::default();
+        let mut tick = Tick::start();
+        let a = render(&mut same, false, spec(4, 4, 30), tick, &due, &mut fits).unwrap_or_else(|e| panic!("{e}"));
+        tick.seq += 1;
+        let b = render(&mut same, false, spec(4, 4, 30), tick, &due, &mut fits).unwrap_or_else(|e| panic!("{e}"));
+        assert!(Arc::ptr_eq(&a[0].bgra, &same.0) && Arc::ptr_eq(&b[0].bgra, &same.0), "the capture size is the source's own pixels");
+        assert_eq!((b[1].width, b[1].height, b[1].tick.seq), (2, 2, 1));
+        assert!(Arc::ptr_eq(&a[1].bgra, &b[1].bgra), "the smaller subscriber's fit is reused, not redone");
+        same.0 = vec![7u8; 4 * 4 * 4].into();
+        let c = render(&mut same, false, spec(4, 4, 30), tick, &due, &mut fits).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(c[1].pixel(0, 0)[0], 7, "a new source frame is fitted afresh");
+    }
+
     /// What a QR frame at `w`x`h` must be: the source drawn at exactly that size.
     fn drawn(id: &str, w: u32, h: u32, tick: Tick) -> CameraFrame {
         let mut source = synth::open(&parse(id)).unwrap_or_else(|e| panic!("{e}"));
@@ -811,8 +875,8 @@ mod tests {
     #[test]
     fn an_open_failure_is_returned_to_the_subscriber() {
         let (hub, counts) = hub(None);
-        let err = hub.subscribe(&parse("video:/x.mp4"), FrameSpec::default()).err();
-        assert!(matches!(err, Some(Error::Unsupported(_))), "{err:?}");
+        let err = hub.subscribe(&parse("image:/nonexistent/simee-camera/x.png"), FrameSpec::default()).err();
+        assert!(matches!(&err, Some(Error::Io(m)) if m.contains("x.png")), "{err:?}");
         assert_eq!(counts.opened.load(Ordering::SeqCst), 0);
         assert!(hub.active().is_empty());
     }

@@ -489,7 +489,7 @@ enum CameraCmd {
         json: bool,
     },
     /// Feed a device camera from a source: an id (qr:hello, pattern:testcard, text:Hi,
-    /// image:PATH, solid:red, webcam:ID, none) or part of a host camera's name (`obs` finds "OBS
+    /// image:PATH, video:PATH (macOS), solid:red, webcam:ID, none) or part of a host camera's name (`obs` finds "OBS
     /// Virtual Camera"; a name that matches several fails, listing them). The back camera unless
     /// --front or --both.
     Link {
@@ -525,7 +525,8 @@ enum CameraCmd {
 }
 
 /// `simee mcp --http`'s settings: the address (`host:port`, a name resolved to its first address),
-/// the token file (or none, `--no-auth`) and the toolsets `SIMEE_MCP_TOOLSETS` names.
+/// the token file (or none, `--no-auth`), the toolsets `SIMEE_MCP_TOOLSETS` names and the screen
+/// subscription pace `SIMEE_MCP_SCREEN_FPS` sets.
 fn mcp_http_config(
     addr: &str,
     token_file: Option<std::path::PathBuf>,
@@ -543,6 +544,7 @@ fn mcp_http_config(
     config.no_auth = no_auth;
     config.insecure_remote = insecure_remote;
     config.toolsets = sim_mcp::Toolsets::from_env().map_err(anyhow::Error::msg)?;
+    config.timing = sim_mcp::server::Timing::from_env().map_err(anyhow::Error::msg)?;
     Ok(config)
 }
 
@@ -591,12 +593,13 @@ fn main() -> Result<()> {
 }
 
 /// `simee mcp` on SIGINT or SIGTERM: calls in flight see the cancel at their next safe point, the
-/// streams stop with their WHIP DELETE, and the process exits with 130 or 143 (a second signal
-/// exits at once). The MCP servers have no way to stop accepting or to wait for their calls yet.
+/// streams stop with their WHIP DELETE, any socket it serves on is removed, and the process exits
+/// with 130 or 143 (a second signal exits at once). The MCP servers have no way to stop accepting
+/// or to wait for their calls yet.
 fn mcp_shutdown_on_signal() -> Result<()> {
     sim_api::shutdown::watch(|sig| {
         sim_api::stop_streams();
-        std::process::exit(sim_api::shutdown::exit_code(sig));
+        sim_api::shutdown::exit(sig);
     })
     .context("watching SIGINT and SIGTERM")
 }
@@ -1066,12 +1069,14 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
     Ok(())
 }
 
-/// A camera source as the server should read it: an `image:` path made absolute.
+/// A camera source as the server should read it: an `image:` or `video:` path made absolute.
 fn camera_source(source: &str) -> String {
-    match source.strip_prefix("image:") {
-        Some(path) => format!("image:{}", absolute(path)),
-        None => source.to_owned(),
+    for kind in ["image:", "video:"] {
+        if let Some(path) = source.strip_prefix(kind) {
+            return format!("{kind}{}", absolute(path));
+        }
     }
+    source.to_owned()
 }
 
 /// `simee camera ...`: the camera methods, printed one line per source or link (or as JSON).
@@ -1319,6 +1324,17 @@ fn xr_params(device: &str, words: &[String]) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_file_sources_are_sent_as_absolute_paths() {
+        let cwd = std::env::current_dir().expect("cwd");
+        for kind in ["image", "video"] {
+            assert_eq!(camera_source(&format!("{kind}:clip.mov")), format!("{kind}:{}", cwd.join("clip.mov").display()));
+            assert_eq!(camera_source(&format!("{kind}:/abs/clip.mov")), format!("{kind}:/abs/clip.mov"));
+        }
+        assert_eq!(camera_source("qr:hello"), "qr:hello");
+        assert_eq!(camera_source("webcam:0"), "webcam:0");
+    }
 
     #[test]
     fn list_groups_devices_by_runtime_with_labels() {

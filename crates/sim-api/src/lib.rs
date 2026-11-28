@@ -39,6 +39,7 @@ pub mod prefs;
 mod progress;
 mod schema;
 pub mod settle;
+mod shrink;
 pub mod shutdown;
 mod stream;
 mod usage;
@@ -60,6 +61,7 @@ pub use methods::{METHODS, Session, call as call_method, platforms};
 pub use outputs::output_schema;
 pub use progress::{CallHooks, Progress, call_cancelled, call_progress, call_step, with_call_hooks};
 pub use schema::input_schema;
+pub use shrink::{AGENT_MAX_SIDE, shrink_png_base64};
 pub use sim_core::frame::encode_png;
 
 /// The default socket path: `$SIMEE_SOCKET`, else `$TMPDIR/simee.sock`.
@@ -285,10 +287,15 @@ pub fn stop_streams() {
 const DRAIN: Duration = Duration::from_secs(10);
 
 /// Listens on `path` (replacing a stale socket) and serves connections until SIGINT or SIGTERM
-/// (#388). Then it shuts down in order: it stops accepting, gives the calls in flight up to 10 s
-/// (each stops at its next safe point, answering `cancelled: server shutting down`), stops every
-/// stream with its WHIP DELETE, removes the socket, and returns the exit code (130 for SIGINT,
-/// 143 for SIGTERM). A second signal exits at once ([`shutdown::watch`]).
+/// (#388). Then it shuts down in order: calls in flight get up to 10 s (each stops at its next
+/// safe point, answering `cancelled: server shutting down`), and every call from then on, on a
+/// connection already open or one made during the shutdown, is answered so without running. It
+/// stops every stream with its WHIP DELETE, removes its socket (listening on it until then, so no
+/// other server takes the path meanwhile), and returns the exit code: 130 for SIGINT, 143 for
+/// SIGTERM. A second signal exits at once ([`shutdown::watch`]).
+///
+/// Once a signal arrives, [`call_cancelled`] is true for every call in this process, as a watched
+/// caller's cancel is for its own call.
 pub fn serve(path: &Path) -> std::io::Result<i32> {
     serve_until_signal(path, Arc::new(methods::Session::default), DRAIN, || ())
 }
@@ -298,33 +305,61 @@ pub fn serve(path: &Path) -> std::io::Result<i32> {
 /// are watched.
 fn serve_until_signal(path: &Path, make: MakeSession, drain: Duration, ready: impl FnOnce()) -> std::io::Result<i32> {
     let listener = bind(path)?;
+    // Held until the shutdown has removed the file: a socket still bound keeps its inode.
     shutdown::remove_on_exit(path);
-    let wake = path.to_owned();
-    // The accept below blocks: a connection of its own wakes it to see the shutdown.
-    shutdown::watch(move |_| drop(UnixStream::connect(&wake)))?;
+    listener.set_nonblocking(true)?;
+    // The shutdown runs on a thread of its own while this one goes on accepting, and says it is
+    // done on a socket of the server's own: nothing depends on the socket file still being there.
+    let (done, says_done) = UnixStream::pair()?;
+    shutdown::watch(move |_| {
+        shut_down(drain);
+        let _ = (&says_done).write_all(&[1]);
+    })?;
     let threads = Threads::new(make);
     ready();
-    let mut served = Ok(());
-    for stream in listener.incoming() {
-        if shutdown::shutting_down() {
-            break;
-        }
-        if let Ok(stream) = stream
-            && let Err(e) = threads.serve(stream)
-        {
-            served = Err(e);
-            break;
-        }
+    let served = accept_until_done(&listener, &done, &threads);
+    if served.is_err() {
+        shut_down(drain);
     }
-    // Stop accepting; calls on connections already open are answered `cancelled: server shutting
-    // down` without running.
     drop(listener);
+    served.map(|()| shutdown::signal().map_or(0, shutdown::exit_code))
+}
+
+/// [`serve`]'s shutdown: the calls in flight get `drain`, then the streams stop and the sockets
+/// are removed.
+fn shut_down(drain: Duration) {
     if !shutdown::drain(drain) {
         eprintln!("simee: calls still running after {} s: stopping anyway", drain.as_secs());
     }
     stream::stop_all();
     shutdown::remove_sockets();
-    served.map(|()| shutdown::signal().map_or(0, shutdown::exit_code))
+}
+
+/// Serves the connections `listener` (non-blocking) accepts until `done` is readable.
+fn accept_until_done(listener: &UnixListener, done: &UnixStream, threads: &Arc<Threads>) -> std::io::Result<()> {
+    use rustix::event::{PollFd, PollFlags, poll};
+    loop {
+        let mut fds = [PollFd::new(listener, PollFlags::IN), PollFd::new(done, PollFlags::IN)];
+        match poll(&mut fds, None) {
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
+        }
+        if !fds[1].revents().is_empty() {
+            return Ok(());
+        }
+        match listener.accept() {
+            // An accepted socket inherits the listener's O_NONBLOCK on macOS.
+            Ok((stream, _)) => {
+                if stream.set_nonblocking(false).is_ok() {
+                    threads.serve(stream)?;
+                }
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+            // Out of descriptors, say: keep serving, as a blocking accept did, without spinning.
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
 }
 
 /// Serves on a background thread; returns once the socket is bound.

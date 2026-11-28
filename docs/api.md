@@ -29,8 +29,10 @@ rounds interleaved, the median of 5 (Apple M3 Max, 16 cores, 2026-11-27, host lo
   disconnected waits 30 s for the next, at most 8 wait), and its session is still made new for it.
 - MCP adds JSON-RPC framing, the tool result's text and `structuredContent`, and handing each call
   to a worker thread (`cargo test --release -p simee-mcp tool_call_overhead -- --ignored --nocapture`).
-- `devices` on a host with Android AVDs is the Android listing, not the API: it probes the stock
-  emulators running with `ps` and `lsof`. `device: "booted"` (or a name) resolves through it too.
+- `devices` on a host with Android AVDs is the Android listing, not the API: it reads each AVD's
+  lock and asks the kernel about the process that holds one. An exact AVD name resolves with one
+  `stat` and `device: "booted"` loads only the running AVDs (`docs/benchmarks.md` "Android device
+  resolution").
 
 **Binary replies.** A request may add `"binary": true` to take a result's bytes raw instead of as
 base64 in the line (a local client that wants the PNG skips the base64 encode, the JSON escaping and
@@ -90,13 +92,25 @@ server's HID client outlives the command). The output is byte for byte the same.
   `audio_capture_start`, `audio_capture_stop`, `audio_mute` and `audio_state` (a capture or mute is
   a helper process its caller owns). These always run in the caller, and need no handshake.
 
-**Stopping a server** (#388). On SIGINT (Ctrl-C) or SIGTERM, `simee serve` stops accepting; a call
-in flight stops at its next safe point (a `boot` waiting for admission boots nothing) and gets
-up to 10 s, a call sent after that isn't run, and both answer `cancelled: server shutting down`.
-Then it stops every stream with its WHIP DELETE, removes its socket and exits 130 (SIGINT) or
-143 (SIGTERM). A second signal exits at once. It never shuts down a device. `simee mcp` stops its
-streams and exits the same way, without waiting for its calls; `emu` stops its guest as the
-console's `kill` does and exits 130 or 143 too.
+**Stopping a server** (#388). On SIGINT (Ctrl-C) or SIGTERM, `simee serve` shuts down in order.
+A call in flight stops at its next safe point and gets up to 10 s. Every call after the signal,
+on a connection already open or one made during the shutdown, isn't run. Both answer
+`cancelled: server shutting down`. Then it stops every stream with its WHIP DELETE, removes its
+socket and its camera feed sockets, and exits 130 (SIGINT) or 143 (SIGTERM). It keeps listening
+until it has removed its socket, so another `simee serve` can't take the path meanwhile. A second
+signal exits at once. From the signal on, `call_cancelled` is true for every call in the process.
+
+A shutdown leaves alone the devices the server didn't start, but it can stop or delete ones it
+did:
+- Ctrl-C at a terminal goes to the whole process group, so every Android emulator the server
+  started as its child gets the SIGINT too, powers off and exits 130. A SIGTERM sent to the
+  server's PID alone doesn't reach them.
+- A call cancelled at a safe point undoes what it made: a `create` or `clone` that finishes
+  during the drain is deleted, and a `boot` waiting for admission boots nothing.
+
+`simee mcp` stops its streams and exits the same way, without waiting for its calls; a watched
+`boot` that launched its device for a call in flight may shut that device down as it is
+cancelled. `emu` stops its guest as the console's `kill` does and exits 130 or 143 too.
 
 Relative `path` arguments (`screenshot`, `install`) are made absolute before they are sent.
 
@@ -200,8 +214,8 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `audio_capture_start` | iOS | device, path?(.wav), mute? | Capture this device's audio output with a process tap (no driver); mute silences it on the host meanwhile; returns capture_id |
 | `audio_capture_stop` | iOS | capture_id | Stop a capture: frames, duration_ms, rms, peak, dbfs, path |
 | `audio_mute` | iOS | device, on | Silence (or restore) this device's audio on the host: a per-device null sink |
-| `camera_sources` | Android, iOS | kind?(host\|virtual\|synthetic) | The sources a device camera can link to, each with the `source` id camera_link takes: the host's cameras (built-in, external, Continuity Camera, and virtual cameras such as OBS Virtual Camera, flagged `virtual`) and the synthetic kinds (pattern:testcard, qr:, text:, image:, solid:); and the host's camera permission (macOS: the TCC status of the app that started the server, with the fix when it blocks capture), read without ever prompting |
-| `camera_link` | Android, iOS | device, facing(back\|front\|both), source | Feed a device camera from a source: a source id (webcam:<id>, pattern:testcard, qr:<text>, text:<text>, image:<absolute path>, solid:<colour>; emulated is the test card, none turns the camera off) or a host camera's name, index or part of its name (obs finds OBS Virtual Camera; an ambiguous one fails listing the matches), saved by its stable id. Saved with the device: it comes back on every boot and survives a server restart. Android: a running device is relinked live through emu's console (`camera link`), a shut-down one gets it at boot (-camera-back, -camera-front); a camera that was off at boot appears only after a reboot (the guest lists its cameras once). iOS: injects the camera shim device-wide and serves the source from the running server (needs `simee serve`; one feed per device, so back and front share it; apps already running need a relaunch) |
+| `camera_sources` | Android, iOS | kind?(host\|virtual\|synthetic) | The sources a device camera can link to, each with the `source` id camera_link takes: the host's cameras (built-in, external, Continuity Camera, and virtual cameras such as OBS Virtual Camera, flagged `virtual`) and the synthetic kinds (pattern:testcard, qr:, text:, image:, video: on macOS, solid:); and the host's camera permission (macOS: the TCC status of the app that started the server, with the fix when it blocks capture), read without ever prompting |
+| `camera_link` | Android, iOS | device, facing(back\|front\|both), source | Feed a device camera from a source: a source id (webcam:<id>, pattern:testcard, qr:<text>, text:<text>, image:<absolute path>, video:<absolute path> (macOS, looped), solid:<colour>; emulated is the test card, none turns the camera off) or a host camera's name, index or part of its name (obs finds OBS Virtual Camera; an ambiguous one fails listing the matches), saved by its stable id. Saved with the device: it comes back on every boot and survives a server restart. Android: a running device is relinked live through emu's console (`camera link`), a shut-down one gets it at boot (-camera-back, -camera-front); a camera that was off at boot appears only after a reboot (the guest lists its cameras once). iOS: injects the camera shim device-wide and serves the source from the running server (needs `simee serve`; one feed per device, so back and front share it; apps already running need a relaunch) |
 | `camera_unlink` | Android, iOS | device, facing?(back\|front\|both) | Remove a device camera's link (default both): it goes back to the AVD's own camera (config.ini hw.camera.*), live on a running device and at every boot |
 | `camera_links` | Android, iOS | device? | Each linked device camera (one device, or every device): facing, source (and a host camera's name), live (what the running emulator shows) and state: linked, saved (applies at the next boot), relinked (changed from the console; the next boot restores the saved link), unsaved (linked from the console only), off, source missing (the host no longer lists the camera: the device shows the test card until it is back) or permission missing, with the fix |
 | `network_env` | iOS | device | Environment that makes one app launch shaped (for simctl: prefix each key with SIMCTL_CHILD_) |
@@ -420,13 +434,16 @@ server such as MediaMTX, which browsers then play over WHEP). It returns once th
 encoded and the WHIP session is connected (the shape below; the values are placeholders):
 
 ```text
-→ {"method": "stream_start", "params": {"device": "iPhone 17", "whip_url": "http://127.0.0.1:8889/sim/whip", "input": true}}
+→ {"method": "stream_start", "params": {"device": "iPhone 17", "whip_url": "http://127.0.0.1:8889/sim/whip"}}
 ← {"id":null,"ok":true,"result":{"stream_id":"stream-1","whip_resource":"http://127.0.0.1:8889/sim/whip/1f0c…","lease_ttl_s":30,"device":"5B0E…"}}
 → {"method": "stream_status", "params": {"stream_id": "stream-1"}}
 ← {"id":null,"ok":true,"result":{"stream_id":"stream-1","state":"running","stages":[{"stage":"requested","ms":0.0},
     {"stage":"first_encoded_frame","ms":…},{"stage":"whip_connected","ms":…}],"stats":{"fps":…,"keyframes":…,"pli":…,…},…}}
 ```
 
+- **`input: true` needs a server that carries data channels.** MediaMTX refuses the offer (`406
+  unsupported media 'application'`, docs/streaming.md "Input over a data channel"), so the
+  `stream_start` fails; leave `input` off for a MediaMTX endpoint.
 - A stream lives in the process that started it: run `simee serve` (the CLI forwards to it) or
   the MCP server. One stream per device and WHIP URL; a second is refused with the first's id.
 - **Leases.** `stream_status` renews a stream's 30 s lease; a stream nobody renews is stopped

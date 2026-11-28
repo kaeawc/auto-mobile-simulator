@@ -5,7 +5,8 @@
 //! from the emulator's display socket. Clicks and drags become touches, typing goes to the device
 //! keyboard, and the toolbar has the controls the device's form factor has (Back/Home/Recents, a
 //! foldable's hinge, a watch's rotary input, a TV's D-pad). ⌘⇧H is Home, ⌘L Lock, ⌘S saves a
-//! screenshot to the Desktop, ⌘3 switches the 3D device view on and off ([`scene`], wgpu only).
+//! screenshot to the Desktop, ⌘3 switches the 3D device view on and off ([`scene`], wgpu only),
+//! ⌘⇧O pops the device out into a window of its own and back ([`popout`]).
 //!
 //! Handlers only queue [`Action`]s and [`Input`]s; `poll` performs them. That keeps handlers pure,
 //! so the headless tests drive the real view without a device. Rune runs `poll` at the start of a
@@ -19,7 +20,7 @@
 //! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
 //! folded, tablet, ipad, watch, tv, apple-watch, apple-tv, turned, turned-tablet, empty,
 //! sidebar-hidden, inspector-hidden, panes-hidden, panes-wide, resources, resources-memory, admission,
-//! admission-many); a release build needs `--features tooling` for it.
+//! admission-many, popped); a release build needs `--features tooling` for it.
 
 mod admission;
 mod android;
@@ -33,6 +34,7 @@ mod ios;
 mod keys;
 mod mark;
 mod panes;
+mod popout;
 mod resources;
 mod scan;
 mod scene;
@@ -87,6 +89,9 @@ pub enum Action {
     /// A change of the 3D view: face on, a saved view, flip, spin ([`scene::Command`]).
     View3d(scene::Command),
     Debug(debug::DebugAction),
+    /// The device moves to a window of its own, and back ([`popout`]).
+    PopOut(String),
+    PopIn(String),
 }
 
 /// Device input, in device pixels.
@@ -182,6 +187,8 @@ pub struct State {
     pub panes: panes::Panes,
     /// The resource panel's samples and its line to the API ([`resources`]).
     pub resources: resources::Resources,
+    /// Devices out in windows of their own ([`popout`]).
+    pub popouts: popout::Popouts,
     /// The check before a boot and its warning sheet ([`admission`]).
     pub admission: admission::Gate,
 }
@@ -308,6 +315,10 @@ impl State {
     fn connect(&mut self) {
         self.connect_pending = false;
         let Some(info) = self.selected_info().cloned() else { return };
+        // Its own window has its connection.
+        if self.popouts.is_open(&info.udid) {
+            return;
+        }
         if self.screen.as_ref().is_some_and(|sc| sc.udid != info.udid) {
             self.pause_screen();
         }
@@ -449,6 +460,7 @@ fn init() -> State {
         prefs: settings::Store::default(),
         panes: panes::Panes::default(),
         resources: resources::Resources::default(),
+        popouts: popout::Popouts::default(),
         admission: admission::Gate::default(),
     }
 }
@@ -774,6 +786,9 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             s.view3d.view.command(c, t);
             continue;
         }
+        if popout::perform(s, &action, tx) {
+            continue;
+        }
         if s.offline {
             if let Action::Select(udid) = action {
                 s.selected = Some(udid);
@@ -840,7 +855,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             }
             Action::Xr(command) => android_action(s, move |d| d.xr(&command).map(drop)),
             Action::ToggleStylus => toggle_stylus(s),
-            Action::ToggleView3d | Action::View3d(_) => {}
+            Action::ToggleView3d | Action::View3d(_) | Action::PopOut(_) | Action::PopIn(_) => {}
             Action::Debug(a) => {
                 if let Some(udid) = s.live.as_ref().map(|l| l.udid.clone())
                     && let Some(msg) = s.debug.perform(&udid, a)
@@ -932,6 +947,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     }
     changed |= resources::poll(s, t, tx);
     changed |= panes::poll(s, t, tx);
+    changed |= popout::poll(s, t, tx);
     changed
 }
 
@@ -971,7 +987,7 @@ fn toggle_view3d(s: &mut State) {
 /// wherever the focus is. ⌘⌥S and ⌘⌥I hide and show the sidebar and the inspector ([`panes`]),
 /// ⌘⌥R the resource panel ([`resources`]).
 fn on_key(s: &mut State, k: &rune::KeyEvent, tx: &mut Tx) -> bool {
-    if panes::on_key(s, k, tx) {
+    if panes::on_key(s, k, tx) || popout::on_key(s, k, tx) {
         return true;
     }
     let action = if k.key == rune::Key::Command('3') && !k.mods.shift {
@@ -1161,6 +1177,7 @@ fn main() {
             ("panes-wide", panes::panes_wide_scene),
             ("resources", resources::scene),
             ("resources-memory", resources::memory_scene),
+            ("popped", popout::scene),
             ("admission", admission::scene),
             ("admission-many", admission::many_scene),
         ],
@@ -1185,8 +1202,8 @@ fn main() {
         let app = rune::App::new(spec)
             .on_visibility(on_visibility)
             .on_window(panes::remember_window)
-            .on_close(panes::on_close)
-            .on_quit(panes::on_close)
+            .on_close(popout::on_main_close)
+            .on_quit(popout::on_main_close)
             .init(move || init_with(store));
         let app = match opened_at {
             Some(options) => app.window_options(options),
@@ -1935,7 +1952,7 @@ mod tests {
     }
 
     /// A display socket that takes one client and records its lines.
-    fn recording_display(name: &str) -> (std::path::PathBuf, Arc<Mutex<Vec<String>>>) {
+    pub(crate) fn recording_display(name: &str) -> (std::path::PathBuf, Arc<Mutex<Vec<String>>>) {
         use std::io::BufRead;
         let dir = std::path::PathBuf::from("/tmp").join(format!("rs-main-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

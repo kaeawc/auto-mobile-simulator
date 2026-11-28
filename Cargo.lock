@@ -1982,6 +1982,7 @@ version = "0.2.0"
 dependencies = [
  "png",
  "simee-core",
+ "simee-coresim",
  "simee-emu-avd",
 ]
 
@@ -1990,6 +1991,7 @@ name = "simee-api"
 version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
+ "rustix",
  "serde",
  "serde_json",
  "signal-hook",
@@ -2082,6 +2084,7 @@ dependencies = [
  "rustix",
  "simee-android",
  "simee-core",
+ "simee-coresim",
  "simee-emu-avd",
  "simee-emu-ext4",
  "simee-emu-gfxstream",
@@ -2115,6 +2118,7 @@ version = "0.2.0"
 dependencies = [
  "libc",
  "simee-core",
+ "simee-coresim",
  "simee-emu-hvf",
  "thiserror 2.0.21",
 ]
@@ -2197,10 +2201,12 @@ dependencies = [
 name = "simee-mcp"
 version = "0.2.0"
 dependencies = [
+ "base64 0.23.1",
  "rustix",
  "serde_json",
  "simee-android",
  "simee-api",
+ "simee-core",
  "simee-emu-avd",
 ]
 

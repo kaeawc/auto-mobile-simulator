@@ -358,13 +358,13 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "kind?(host|virtual|synthetic)",
         "The sources a device camera can link to, each with the `source` id camera_link takes: the host's cameras (built-in, \
          external, Continuity Camera, and virtual cameras such as OBS Virtual Camera, flagged `virtual`) and the synthetic kinds \
-         (pattern:testcard, qr:, text:, image:, solid:); and the host's camera permission (macOS: the TCC status of the app that \
+         (pattern:testcard, qr:, text:, image:, video: on macOS, solid:); and the host's camera permission (macOS: the TCC status of the app that \
          started the server, with the fix when it blocks capture), read without ever prompting",
     ),
     (
         "camera_link",
         "device, facing(back|front|both), source",
-        "Feed a device camera from a source: a source id (webcam:<id>, pattern:testcard, qr:<text>, text:<text>, image:<absolute path>, \
+        "Feed a device camera from a source: a source id (webcam:<id>, pattern:testcard, qr:<text>, text:<text>, image:<absolute path>, video:<absolute path> (macOS, looped), \
          solid:<colour>; emulated is the test card, none turns the camera off) or a host camera's name, index or part of its name \
          (obs finds OBS Virtual Camera; an ambiguous one fails listing the matches), saved by its stable id. Saved with the device: \
          it comes back on every boot and survives a server restart. Android: a running device is relinked live through emu's console \
@@ -561,8 +561,15 @@ pub(crate) fn resolve(s: &mut Session, p: &Value) -> Result<(Platform, String), 
     if only != Some(Platform::Android) && sim_core::device::is_udid(query) {
         return Ok((Platform::Ios, query.to_owned()));
     }
-    let android = if only == Some(Platform::Ios) { Vec::new() } else { s.android.devices() };
-    if android.is_empty() && only != Some(Platform::Android) {
+    // `booted` loads only the running AVDs' configs, not all of them.
+    let (android, any) = match only {
+        Some(Platform::Ios) => (Vec::new(), false),
+        _ => {
+            let (devices, any) = s.android.backend().candidates(query);
+            (devices.into_iter().map(|d| d.info).collect(), any)
+        }
+    };
+    if !any && only != Some(Platform::Android) {
         return Ok((Platform::Ios, query.to_owned()));
     }
     // Only what `select` reads of each simulator (UDID, name, state); the iOS backend reads the
@@ -1612,6 +1619,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn booted_resolves_among_android_devices_by_what_runs() {
+        let (mut s, root) = short_android_session("booted");
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        for name in ["a", "b", "c"] {
+            call(&mut s, "create", &json!({"platform": "android", "name": name, "system_image": mobile})).expect("create");
+        }
+        let booted = json!({"device": "booted", "platform": "android"});
+        assert_eq!(resolve(&mut s, &booted), Err("no device matches `booted`".into()), "AVDs exist, none runs");
+        let android = s.android.backend().clone();
+        let _a = sim_android::testing::fake_emulator(&android, "a");
+        assert_eq!(resolve(&mut s, &booted), Ok((Platform::Android, "a".into())));
+        assert_eq!(resolve(&mut s, &json!({"device": "c", "platform": "android"})), Ok((Platform::Android, "c".into())));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn a_simulator_udid_is_routed_without_listing_either_platform() {
         let (mut s, root) = android_session("udid");
         let mobile = "system-images;android-36;google_apis;arm64-v8a";
@@ -2132,6 +2155,8 @@ pub(crate) mod tests {
         shut_ms: u64,
         /// The answer to a `boot_many`, instead of booting its devices.
         fail: Option<String>,
+        /// `(when, who)`: as `when` begins booting, another call brings `who` up.
+        goes_live: Option<(&'static str, &'static str)>,
     }
 
     impl FakeFleet {
@@ -2152,6 +2177,9 @@ pub(crate) mod tests {
 
         fn boot(&self, id: &str) {
             self.begun.lock().expect("begun").push(id.to_owned());
+            if let Some((_, who)) = self.goes_live.filter(|(when, _)| *when == id) {
+                self.live.lock().expect("live").insert(who.to_owned());
+            }
             let ms = id.strip_prefix('d').and_then(|n| n.parse::<usize>().ok()).and_then(|i| self.ms.get(i).copied()).unwrap_or(0);
             if ms == HOLD {
                 while !self.released.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2380,14 +2408,9 @@ pub(crate) mod tests {
     #[test]
     fn a_cancelled_boot_many_never_shuts_down_a_device_another_call_started() {
         // d0 (50 ms) and d1 this call launches; d2 was off when it was admitted, but another call
-        // boots it 20 ms in, before this call's window reaches it (at 50 ms, as d0 finishes).
+        // boots it as d0 begins, so before this call's window reaches it (as d0 finishes).
         // Cancelled at 200 ms, waiting on d1 and d2: only d1, which this call booted, is shut down.
-        let fleet = std::sync::Arc::new(FakeFleet { ms: vec![50, HOLD, HOLD], ..Default::default() });
-        let theirs = fleet.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            theirs.live.lock().expect("live").insert("d2".into());
-        });
+        let fleet = std::sync::Arc::new(FakeFleet { ms: vec![50, HOLD, HOLD], goes_live: Some(("d0", "d2")), ..Default::default() });
         let heard = std::sync::Arc::default();
         let hooks = cancelling_after(&heard, 200);
         let mut tally = Tally { done: 0, failed: 0, total: 3 };

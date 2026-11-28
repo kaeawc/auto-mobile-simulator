@@ -3585,6 +3585,7 @@ version = "0.2.0"
 dependencies = [
  "png 0.18.1",
  "simee-core",
+ "simee-coresim",
  "simee-emu-avd",
 ]
 
@@ -3593,6 +3594,7 @@ name = "simee-api"
 version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "signal-hook",

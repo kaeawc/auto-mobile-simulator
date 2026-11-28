@@ -254,20 +254,19 @@ pub fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
         && let Some((x, y)) = s.panes.check_position.take()
     {
         let displays = rune::displays();
-        // A point in the title bar: the window can be dragged back from there.
-        let (px, py) = (x.saturating_add(80), y.saturating_add(10));
-        let on = |d: &rune::Display| {
-            let (dx, dy) = d.position;
-            px >= dx
-                && py >= dy
-                && i64::from(px) < i64::from(dx) + i64::from(d.size.0)
-                && i64::from(py) < i64::from(dy) + i64::from(d.size.1)
-        };
-        if !displays.is_empty() && !displays.iter().any(on) {
+        if !displays.is_empty() && !displays.iter().any(|d| in_title_bar((x, y), d)) {
             tx.center_window();
         }
     }
     changed
+}
+
+/// Whether a window whose frame's top-left is at `(x, y)` has its title bar on `d`, so it can
+/// be dragged from there.
+pub fn in_title_bar((x, y): (i32, i32), d: &rune::Display) -> bool {
+    let (px, py) = (x.saturating_add(80), y.saturating_add(10));
+    let (dx, dy) = d.position;
+    px >= dx && py >= dy && i64::from(px) < i64::from(dx) + i64::from(d.size.0) && i64::from(py) < i64::from(dy) + i64::from(d.size.1)
 }
 
 thread_local! {
