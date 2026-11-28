@@ -581,7 +581,9 @@ impl Inner {
         if method == "resources/subscribe" {
             subscribed.uris.insert(uri.to_owned());
         } else {
-            subscribed.uris.remove(uri);
+            // Whichever spelling it was subscribed under, it is one resource.
+            let key = resources::spelling(uri);
+            subscribed.uris.retain(|u| resources::spelling(u) != key);
         }
         // An older client has no way to ask for `list_changed` (and isn't told it is offered).
         let spec = Spec { uris: subscribed.uris.iter().cloned().collect(), list_changed: false };

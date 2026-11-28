@@ -897,6 +897,27 @@ fn an_older_client_subscribes_to_resources_the_old_way() {
 }
 
 #[test]
+fn an_older_client_unsubscribes_under_either_spelling_of_a_resource() {
+    let rig = Rig::new();
+    let id = rig.send_raw("initialize", json!({"protocolVersion": "2025-11-25", "capabilities": {}}));
+    rig.response(id);
+    rig.fake.answer("info", Ok(json!({"state": "Shutdown"})));
+    let id = rig.send_raw("resources/subscribe", json!({"uri": "simee://device/phone"}));
+    assert_eq!(rig.response(id)["result"], json!({}));
+    rig.until_read("info");
+    let id = rig.send_raw("resources/unsubscribe", json!({"uri": "simee://devices/phone"}));
+    assert_eq!(rig.response(id)["result"], json!({}));
+    std::thread::sleep(SHORT);
+    while rig.rx.try_recv().is_ok() {}
+    rig.fake.answer("info", Ok(json!({"state": "Booted"})));
+    assert!(rig.quiet(), "unsubscribed under the other spelling");
+    // Its watcher is gone with its last resource: no more reads.
+    let reads = rig.fake.called("info").len();
+    std::thread::sleep(SHORT);
+    assert_eq!(rig.fake.called("info").len(), reads);
+}
+
+#[test]
 fn an_older_client_is_not_offered_list_changed_and_keeps_baselines_across_subscribes() {
     let rig = Rig::new();
     let id = rig.send_raw("initialize", json!({"protocolVersion": "2025-11-25", "capabilities": {}}));
@@ -926,10 +947,7 @@ fn two_spellings_of_a_resource_are_read_once_and_each_announced_under_its_own() 
     let id = rig.send_modern("subscriptions/listen", json!({"notifications": {"resourceSubscriptions": [a, b]}}), false);
     assert_eq!(rig.next_message().expect("ack")["params"]["notifications"], json!({"resourceSubscriptions": [a, b]}));
     rig.until_read("screenshot");
-    // Reads at the pace of one subscription, not two: over 10 periods, at most about 11 reads.
-    std::thread::sleep(Duration::from_millis(200));
-    let reads = rig.fake.called("screenshot").len();
-    assert!(reads <= 14, "{reads} reads of one screen in 200 ms at 20 ms: one watcher item, not two");
+    // (That it is one read a period, not two, is the schedule's test in `watch`.)
     rig.fake.answer("screenshot", Ok(json!({"png": "BBBB"})));
     let first = rig.notification("notifications/resources/updated");
     let second = rig.notification("notifications/resources/updated");

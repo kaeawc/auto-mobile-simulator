@@ -25,8 +25,11 @@ pub const CAMERA_SOURCES: &str = "simee://camera/sources";
 /// How many of a device's newest log lines the `logs` resource holds.
 pub const LOG_TAIL_LINES: usize = 200;
 /// How far back the `logs` resource reaches. It reads through the device's log stream (started by
-/// the first read), so a subscription's reads answer from it and spawn no `log show` each time.
-const LOG_WINDOW: &str = "30s";
+/// the first read), which answers a window only once it has run that long and while its ring still
+/// holds it: a just-booted device fills the ring in about half a minute. A subscription reads once
+/// a second, so a longer window makes every one of its first reads (and, on a busy device, all of
+/// them) a `log show` on the device. Keep it at 5 s or less.
+const LOG_WINDOW: &str = "5s";
 
 /// What a resource URI names.
 #[derive(Debug, PartialEq, Eq)]
@@ -215,7 +218,7 @@ pub fn templates(toolsets: &Toolsets) -> Value {
         {"uriTemplate": "simee://devices/{device}/screenshot", "name": "screenshot", "title": "Screenshot", "mimeType": "image/png",
          "description": "The device's screen now at the device's own size, as a PNG (a booted device)."},
         {"uriTemplate": "simee://devices/{device}/logs", "name": "logs", "title": "Device logs", "mimeType": "text/plain",
-         "description": "The newest 200 lines of the last 30 seconds of the device's unified log (the `logs` method; iOS). A \
+         "description": "The newest 200 lines of the last 5 seconds of the device's unified log (the `logs` method; iOS). A \
                          subscription says when new lines arrived, once a second at most."},
         {"uriTemplate": "simee://devices/{device}/apps", "name": "apps", "title": "Installed apps", "mimeType": "application/json",
          "description": "The device's installed bundle ids (the `apps` method; iOS)."},
@@ -399,6 +402,15 @@ mod tests {
     use super::*;
     use crate::backend::fake::Fake;
 
+    #[test]
+    fn the_logs_window_is_short_enough_for_the_stream_to_answer_every_read_of_a_subscription() {
+        // The stream answers a window only after running that long, and a just-booted device's
+        // ring holds half a minute: a subscription reading once a second falls back to `log show`
+        // for every read of a window near that.
+        let seconds: u64 = LOG_WINDOW.strip_suffix('s').and_then(|n| n.parse().ok()).expect("a window in seconds");
+        assert!((1..=5).contains(&seconds), "{LOG_WINDOW}");
+    }
+
     /// A real PNG of `width` x `height`, base64, as `screenshot` answers it.
     fn png(width: u32, height: u32) -> String {
         use base64::Engine as _;
@@ -535,7 +547,7 @@ mod tests {
         );
         assert_eq!(read1("simee://devices/phone/logs")["text"], "line one\nline two");
         // Through the device's log stream, so a poll doesn't spawn a `log show` each time.
-        assert_eq!(fake.called("logs"), [json!({"device": "phone", "last": "30s", "stream": true})]);
+        assert_eq!(fake.called("logs"), [json!({"device": "phone", "last": "5s", "stream": true})]);
         assert!(read1("simee://devices/phone/apps")["text"].as_str().is_some_and(|t| t.contains("com.example.app")));
         let procs = read1("simee://devices/phone/processes");
         assert!(procs["text"].as_str().is_some_and(|t| t.contains("/sbin/launchd")) && procs["mimeType"] == "application/json");

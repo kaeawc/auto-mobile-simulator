@@ -439,6 +439,29 @@ mod tests {
     }
 
     #[test]
+    fn two_spellings_of_a_resource_are_one_read_a_period_and_each_is_announced() {
+        let (a, b) = ("simee://device/phone/screen", "simee://devices/phone/screen");
+        let fake = Fake::with_devices();
+        fake.answer("screenshot", Ok(json!({"png": "0"})));
+        let mut run = Stepped::new(Pace::default(), spec(&[a, b], false));
+        run.run(&fake, 3000, |t| {
+            if t == 1500 {
+                fake.answer("screenshot", Ok(json!({"png": "changed"})));
+            }
+        });
+        // Reads at 0, 1 s, 2 s and 3 s: one for the pair each time.
+        assert_eq!(fake.called("screenshot").len(), 4);
+        // The change at 1.5 s is seen by the read at 2 s and said under each spelling, once.
+        assert_eq!(run.updates(a), [2000]);
+        assert_eq!(run.updates(b), [2000]);
+        // A schedule of one spelling reads exactly as often.
+        let single = Fake::with_devices();
+        single.answer("screenshot", Ok(json!({"png": "0"})));
+        Stepped::new(Pace::default(), spec(&[b], false)).run(&single, 3000, |_| {});
+        assert_eq!(single.called("screenshot").len(), 4);
+    }
+
+    #[test]
     fn the_screen_pace_comes_from_the_environment_setting() {
         assert_eq!(Pace::default().screen, 1000 * MS);
         assert_eq!(Pace::with_screen_fps("2").expect("2").screen, 500 * MS);

@@ -216,7 +216,7 @@ A test keeps this page honest: it fails if a tool isn't named here.
 | `simee://devices/{device}` | The device's info (`info`): identity, form factor, sub-platform, profile, paths |
 | `simee://devices/{device}/screen` | The screen now, a PNG shrunk so its longest side is at most 1024 px (a 1206×2622 iPhone is 402×874): what an agent reads (a booted device) |
 | `simee://devices/{device}/screenshot` | The screen now, a PNG at the device's own size (a booted device) |
-| `simee://devices/{device}/logs` | The newest 200 lines of the last 30 seconds of the unified log (`text/plain`; iOS) |
+| `simee://devices/{device}/logs` | The newest 200 lines of the last 5 seconds of the unified log (`text/plain`; iOS) |
 | `simee://devices/{device}/apps` | Installed bundle ids (iOS) |
 | `simee://devices/{device}/processes` | The device's processes with CPU and memory (`processes`; iOS) |
 | `simee://devices/{device}/prefs/{bundle_id}` | Every key of an app's preference stores, typed (`prefs_read`, read fresh) |
@@ -266,9 +266,12 @@ subscriptions together another, per connection or HTTP session), reading what it
 resource after another, and sleeping until the next read is due: 1 wake-up a second for a screen,
 the list, or both, and no CPU a test can see
 ([benchmarks.md](benchmarks.md#mcp-idle-subscription)). The reads themselves are what costs:
-a subscribed screen is one `screenshot` a second, and a subscribed iOS `logs` keeps the device's log stream running for as long as someone reads it (it stops after 5 idle minutes) (more at a higher `SIMEE_MCP_SCREEN_FPS`), each
-read one period after the last finished, so a slow screenshot lowers the rate instead of piling
-up. The thread stops when the client cancels the listen (`notifications/cancelled`),
+a subscribed screen is one `screenshot` a second (more at a higher `SIMEE_MCP_SCREEN_FPS`), and
+a subscribed iOS `logs` keeps the device's log stream running for as long as someone reads it (it
+stops after 5 idle minutes) and reads its last 5 seconds from it, so only the first 5 seconds of
+a subscription (while the stream is younger than its window) run `log show` on the device. Each
+read is one period after the last finished, so a slow screenshot lowers the rate instead of
+piling up. The thread stops when the client cancels the listen (`notifications/cancelled`),
 unsubscribes its last resource, or its connection ends (stdin closes; the HTTP session is deleted
 or expires), and no notification follows.
 
@@ -278,9 +281,12 @@ not offered it and the device list isn't read for it; `subscriptions/listen` is 
 `resourcesListChanged` is. The server never changes its tool list, so it doesn't offer
 `toolsListChanged`.
 
-Over HTTP a session's `GET` stream queues 256 messages for a client that reads slowly and drops
-the newer ones past that (each is only "something changed"; the client reads the state when it
-next looks), so a stalled client never holds up the watcher.
+Over HTTP a session's `GET` stream queues at most 256 messages for a client that reads slowly,
+and keeps only the latest update for each resource (and for the list), so a screen announced 30
+times a second never pushes out a logs or prefs update queued behind it. Past 256 different
+resources the oldest message is dropped (each is only "something changed"; the client reads the
+state when it next looks), so a stalled client never holds up the watcher. The `POST` stream of a
+`subscriptions/listen` is not bounded yet.
 
 ## Prompts
 

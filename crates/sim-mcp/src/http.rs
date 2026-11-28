@@ -24,13 +24,13 @@
 //! (so a body nobody read is never taken for the next request). A session belongs to the token
 //! that opened it. SSE streams carry no event ids, so a dropped stream can't be resumed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError, channel, sync_channel};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -546,14 +546,101 @@ struct Route {
     tx: Sender<Out>,
 }
 
-/// How many messages a session's `GET` stream queues for a client that reads slowly. Past it the
-/// newest are dropped: they are notifications that something changed, and the client reads the
+/// How many messages a session's `GET` stream queues for a client that reads slowly. Messages for
+/// one resource are one (the latest), so this is how many different things can change before the
+/// oldest is dropped: they are notifications that something changed, and the client reads the
 /// state when it next looks.
 const STANDALONE_QUEUE: usize = 256;
 
+/// What a `GET` stream's queue holds: the messages, oldest first, and whether its sender is gone.
+struct QueueState {
+    /// Each message with what it supersedes: a later one with the same key replaces it.
+    notes: VecDeque<(Option<String>, String)>,
+    closed: bool,
+}
+
+struct Queue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+    capacity: usize,
+}
+
+/// The sending end of a `GET` stream's queue. It never waits for the client, so a stalled client
+/// can't hold up the server's watcher, and dropping it ends the stream.
+struct NoteTx(Arc<Queue>);
+
+/// The `GET` stream's end of the queue.
+struct NoteRx(Arc<Queue>);
+
+fn note_queue(capacity: usize) -> (NoteTx, NoteRx) {
+    let queue =
+        Arc::new(Queue { state: Mutex::new(QueueState { notes: VecDeque::new(), closed: false }), ready: Condvar::new(), capacity });
+    (NoteTx(queue.clone()), NoteRx(queue))
+}
+
+impl NoteTx {
+    /// Queues `line`. A queued message with the same `key` is dropped for it (only the latest
+    /// state of a resource matters), and past the capacity the oldest message goes.
+    fn push(&self, key: Option<String>, line: String) {
+        let mut state = lock(&self.0.state);
+        if let Some(key) = &key {
+            state.notes.retain(|(k, _)| k.as_ref() != Some(key));
+        }
+        state.notes.push_back((key, line));
+        while state.notes.len() > self.0.capacity {
+            state.notes.pop_front();
+        }
+        drop(state);
+        self.0.ready.notify_one();
+    }
+}
+
+impl Drop for NoteTx {
+    fn drop(&mut self) {
+        lock(&self.0.state).closed = true;
+        self.0.ready.notify_one();
+    }
+}
+
+impl NoteRx {
+    /// The next message, waiting up to `timeout`; the queued ones are delivered before a close.
+    fn recv_timeout(&self, timeout: Duration) -> Result<String, RecvTimeoutError> {
+        let deadline = Instant::now() + timeout;
+        let mut state = lock(&self.0.state);
+        loop {
+            if let Some((_, line)) = state.notes.pop_front() {
+                return Ok(line);
+            }
+            if state.closed {
+                return Err(RecvTimeoutError::Disconnected);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(RecvTimeoutError::Timeout);
+            }
+            state = self.0.ready.wait_timeout(state, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+
+    #[cfg(test)]
+    fn try_recv(&self) -> Option<String> {
+        lock(&self.0.state).notes.pop_front().map(|(_, line)| line)
+    }
+}
+
+/// What a message for no request supersedes in a `GET` stream's queue: an update of a resource
+/// replaces the one before it, and so does a change of the list.
+fn supersedes(message: &Value) -> Option<String> {
+    match message["method"].as_str()? {
+        "notifications/resources/updated" => Some(format!("updated {}", message["params"]["uri"].as_str()?)),
+        method @ "notifications/resources/list_changed" => Some(method.to_owned()),
+        _ => None,
+    }
+}
+
 /// A session's stream for messages that belong to no request, with the generation of the `GET`
 /// that holds it.
-type Standalone = Mutex<Option<(u64, SyncSender<Out>)>>;
+type Standalone = Mutex<Option<(u64, NoteTx)>>;
 
 #[derive(Default)]
 struct Router {
@@ -635,12 +722,12 @@ impl Router {
             }
             return;
         }
-        if let Some((_, tx)) = standalone.and_then(|s| lock(s).clone()) {
-            // Never wait for a client that has stopped reading: that would stall the server's
-            // watcher, and its other subscriptions with it.
-            if let Err(TrySendError::Full(_)) = tx.try_send(Out::Note(line)) {
-                // Dropped.
-            }
+        // Never wait for a client that has stopped reading: that would stall the server's
+        // watcher, and its other subscriptions with it.
+        if let Some(slot) = standalone
+            && let Some((_, tx)) = lock(slot).as_ref()
+        {
+            tx.push(supersedes(&message), line);
         }
     }
 }
@@ -1535,13 +1622,13 @@ impl Exchange<'_> {
             return self.fail(404, INVALID_REQUEST, "no such session (it ended or expired)", &[]);
         };
         let idle = self.shared.config.limits.session_idle;
-        let (tx, rx) = sync_channel(STANDALONE_QUEUE);
+        let (tx, rx) = note_queue(STANDALONE_QUEUE);
         let generation = self.shared.router.next.fetch_add(1, Ordering::Relaxed);
         *lock(&session.standalone) = Some((generation, tx));
         let ended = match Sse::start(self.stream(), self.head.http11, &[]) {
             Ok(sse) => loop {
                 match rx.recv_timeout(self.shared.config.limits.ping) {
-                    Ok(Out::Note(line) | Out::Response(line)) => {
+                    Ok(line) => {
                         if sse.event(&line).is_err() {
                             break false;
                         }
