@@ -21,6 +21,11 @@
 //! turned once per frame into a buffer of their own that every such reader shares. An unturned
 //! display never touches that buffer.
 //!
+//! Under `-gpu metal` a posted frame can also be taken as a shared surface the renderer's GPU
+//! copied it into ([`FrameStore::latest_surface`], [`DisplaySink::set_surface_readback`]): once
+//! per frame however many streams ask, held while anyone holds it, and none for a presented
+//! frame or a view, which are read as pixels as before.
+//!
 //! A renderer without GL can't report its posts (gfxstream's post callback reads every post back
 //! through GL); [`PostTicker`] stands in, driven by the renderer's fences.
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +38,19 @@ use sim_core::rotation::{Rotation, rotate_rgba_into};
 /// Reads the last posted frame back as tightly packed RGBA, top row first, `width` x `height`,
 /// into the buffer (exactly `width * height * 4` bytes). False when there's nothing to read.
 pub type Readback = Box<dyn Fn(u32, u32, &mut [u8]) -> bool + Send + Sync>;
+
+/// A posted frame the renderer's GPU copied into a shared surface (an IOSurface, `-gpu metal`):
+/// BGRA, the whole scanout as the panel lies. The surface isn't written again while any handle
+/// to it lives.
+pub trait SharedSurface: Send + Sync {
+    fn size(&self) -> (u32, u32);
+    /// A new Mach send right for the surface, owned by the caller; `None` if none could be made.
+    fn mach_port(&self) -> Option<u32>;
+}
+
+/// Copies the last posted frame (`width` x `height`) into a shared surface; `None` when it can't
+/// (no free surface, the path is off): readers then take its pixels from the [`Readback`].
+pub type SurfaceReadback = Box<dyn Fn(u32, u32) -> Option<Arc<dyn SharedSurface>> + Send + Sync>;
 
 /// Receives finished scanout frames (BGRA/RGBA rows, `stride` bytes apart).
 pub trait DisplaySink: Send + Sync {
@@ -64,6 +82,11 @@ pub trait DisplaySink: Send + Sync {
 
     /// How posted frames are read back (see [`DisplaySink::posted`]).
     fn set_readback(&self, readback: Readback) {
+        let _ = readback;
+    }
+
+    /// How posted frames are copied into shared surfaces (`-gpu metal`), besides being read back.
+    fn set_surface_readback(&self, readback: SurfaceReadback) {
         let _ = readback;
     }
 
@@ -107,6 +130,10 @@ pub struct FrameStore {
     /// The capture turned upright, for readers that don't turn frames themselves, and the turn
     /// it was made with; filled only while the display is turned.
     upright: Mutex<(Capture, Rotation)>,
+    surface_readback: OnceLock<SurfaceReadback>,
+    /// The frame number the last shared surface was taken for, and the surface (None: it couldn't
+    /// be had for that frame).
+    surface: Mutex<(u64, Option<Arc<dyn SharedSurface>>)>,
 }
 
 /// A rectangle of the scanout: x, y, width, height.
@@ -184,6 +211,8 @@ impl FrameStore {
             view: Mutex::new(None),
             rotation: Mutex::new(Rotation::Deg0),
             upright: Mutex::default(),
+            surface_readback: OnceLock::new(),
+            surface: Mutex::new((0, None)),
         }
     }
 
@@ -325,6 +354,36 @@ impl FrameStore {
             up.0.rgba = Vec::new();
             up.0.frame = 0;
         }
+        // The pool's surface goes back to it.
+        if let Ok(mut s) = self.surface.try_lock() {
+            *s = (0, None);
+        }
+    }
+
+    /// Whether posted frames can be taken as shared surfaces ([`FrameStore::latest_surface`]).
+    pub fn has_surfaces(&self) -> bool {
+        self.surface_readback.get().is_some()
+    }
+
+    /// The latest frame as a shared surface the renderer's GPU copied it into, with its number:
+    /// copied once per frame however many readers ask, and kept for that frame while anyone holds
+    /// it. `None` for a presented frame, a view (a folded foldable's outer screen), a store without
+    /// [`DisplaySink::set_surface_readback`], or when no surface could be had for this frame:
+    /// readers then take its pixels ([`FrameStore::latest`], [`FrameStore::read_into`]).
+    pub fn latest_surface(&self) -> Option<(u64, Arc<dyn SharedSurface>)> {
+        let copy = self.surface_readback.get()?;
+        self.mark_read();
+        let (width, height, frame, posted) = self.state();
+        if !posted || frame == 0 || width == 0 || height == 0 || clip_view(*lock(&self.view), width, height).is_some() {
+            return None;
+        }
+        let mut kept = lock(&self.surface);
+        if kept.0 != frame {
+            // The last frame's surface goes back first: a pool with one free surface still serves.
+            *kept = (frame, None);
+            kept.1 = copy(width, height).filter(|s| s.size() == (width, height));
+        }
+        kept.1.clone().map(|s| (frame, s))
     }
 
     /// Bytes of frame buffers the store holds (kept pixels, capture, spare), for tests and
@@ -548,6 +607,10 @@ impl DisplaySink for FrameStore {
 
     fn set_readback(&self, readback: Readback) {
         let _ = self.readback.set(readback);
+    }
+
+    fn set_surface_readback(&self, readback: SurfaceReadback) {
+        let _ = self.surface_readback.set(readback);
     }
 
     /// An opaque black frame of the current size, presented as pixels (nothing before the first
@@ -1817,5 +1880,111 @@ mod tests {
         store.present(1, 1, 4, 67, &[1, 2, 3, 4]);
         assert!(store.read_into(1, 1, 3, &mut dst), "converted presented pixels");
         assert_eq!(dst, [1, 2, 3, 4]);
+    }
+
+    /// A shared surface from a pool of `free` (a count shared with the fake renderer).
+    struct FakeSurface {
+        size: (u32, u32),
+        free: Arc<AtomicUsize>,
+    }
+
+    impl SharedSurface for FakeSurface {
+        fn size(&self) -> (u32, u32) {
+            self.size
+        }
+        fn mach_port(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    impl Drop for FakeSurface {
+        fn drop(&mut self) {
+            self.free.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A store whose renderer copies posts into a pool of `pool` surfaces; the copies made, and
+    /// the pool's free count.
+    fn surface_store(pool: usize) -> (FrameStore, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let store = FrameStore::default();
+        let (copies, free) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(pool)));
+        let (c, f) = (copies.clone(), free.clone());
+        store.set_surface_readback(Box::new(move |w, h| {
+            // Take one from the pool, if one is free.
+            f.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).ok()?;
+            c.fetch_add(1, Ordering::Relaxed);
+            Some(Arc::new(FakeSurface { size: (w, h), free: f.clone() }) as Arc<dyn SharedSurface>)
+        }));
+        store.set_readback(Box::new(|_, _, buf| {
+            buf.fill(0xAB);
+            true
+        }));
+        (store, copies, free)
+    }
+
+    #[test]
+    fn posted_frames_become_one_shared_surface_each_however_many_readers() {
+        let (store, copies, free) = surface_store(3);
+        assert!(store.has_surfaces() && store.latest_surface().is_none(), "nothing posted yet");
+        store.posted(4, 2);
+        let (n, a) = store.latest_surface().expect("a surface");
+        let (m, b) = store.latest_surface().expect("the same");
+        assert_eq!((n, m, copies.load(Ordering::Relaxed)), (1, 1, 1), "one copy for both readers");
+        assert!(Arc::ptr_eq(&a, &b) && a.size() == (4, 2));
+        // The next frame is copied again; the last one's surface stays with whoever holds it.
+        store.posted(4, 2);
+        let (n, c) = store.latest_surface().expect("a surface");
+        assert_eq!((n, copies.load(Ordering::Relaxed), free.load(Ordering::Relaxed)), (2, 2, 1));
+        drop((a, b));
+        assert_eq!(free.load(Ordering::Relaxed), 2, "released by its last holder");
+        drop(c);
+        assert_eq!(free.load(Ordering::Relaxed), 2, "the store keeps the latest frame's");
+    }
+
+    #[test]
+    fn frames_without_a_surface_are_read_as_pixels() {
+        let (store, copies, free) = surface_store(1);
+        store.posted(2, 2);
+        let held = store.latest_surface().expect("the only surface");
+        // The pool is empty while a client holds it: the next frame has no surface, once, and
+        // its pixels come from the readback as before.
+        store.posted(2, 2);
+        assert!(store.latest_surface().is_none());
+        assert!(store.latest_surface().is_none(), "tried once per frame");
+        assert_eq!(copies.load(Ordering::Relaxed), 1);
+        assert_eq!(store.latest(|c| c.rgba.clone()), Some(vec![0xAB; 16]));
+        drop(held);
+        store.posted(2, 2);
+        assert!(store.latest_surface().is_some(), "free again: the next frame is a surface");
+        // Presented pixels (guest composition, a blank screen) are never a surface.
+        store.present(2, 2, 8, 67, &[1; 16]);
+        assert!(store.latest_surface().is_none());
+        // Nor is a view of the scanout.
+        store.posted(2, 2);
+        store.set_view(Some((0, 0, 1, 2)));
+        assert!(store.latest_surface().is_none());
+        assert_eq!(store.latest(|c| (c.width, c.height)), Some((1, 2)));
+        // A store nobody gave a surface readback has none.
+        let plain = FrameStore::default();
+        plain.posted(2, 2);
+        assert!(!plain.has_surfaces() && plain.latest_surface().is_none());
+        assert_eq!(free.load(Ordering::Relaxed), 0, "the store holds the last surface it had");
+    }
+
+    #[test]
+    fn an_unread_stores_surface_goes_back_to_the_pool() {
+        let store = FrameStore::with_idle(Duration::from_millis(20));
+        let free = Arc::new(AtomicUsize::new(1));
+        let f = free.clone();
+        store.set_surface_readback(Box::new(move |w, h| {
+            f.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).ok()?;
+            Some(Arc::new(FakeSurface { size: (w, h), free: f.clone() }) as Arc<dyn SharedSurface>)
+        }));
+        store.posted(2, 2);
+        drop(store.latest_surface().expect("a surface"));
+        assert_eq!(free.load(Ordering::Relaxed), 0, "kept for its frame");
+        std::thread::sleep(Duration::from_millis(40));
+        store.posted(2, 2);
+        assert_eq!(free.load(Ordering::Relaxed), 1, "unread past the idle period: released");
     }
 }

@@ -42,6 +42,9 @@ pub struct GpuSpec {
     /// pipe gets a render channel of its own, and the renderer offers none of the
     /// virtio-gpu-only extensions.
     pub pipe_gles: bool,
+    /// `-gpu metal`: posted frames are also copied on the GPU into shared IOSurfaces for clients
+    /// that take them (`emu_gfxstream::metal`, issue #356), besides being read back.
+    pub metal_present: bool,
 }
 
 static RENDERER: std::sync::OnceLock<Arc<emu_gfxstream::Renderer>> = std::sync::OnceLock::new();
@@ -122,6 +125,7 @@ pub fn warm_renderer(lib64: PathBuf, vulkan_only: bool, virtual_queue: bool) -> 
         virtual_queue,
         // Warming is for the virtio-gpu guests (API 33 and newer), not the GLES-pipe ones.
         pipe_gles: false,
+        metal_present: false,
     };
     renderer(&spec)?;
     Ok(t.elapsed())
@@ -219,7 +223,9 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     // composited over swipes were noticed, and a tap's changed frame came after 1.4 unchanged
     // readbacks with 8.9 ms of host time (median; p90 24.7) before, none and 6.4 ms (p90 7.9)
     // after (issue #201's tap-to-frame benchmark).
-    let probe: crate::display::PostProbe = Arc::new(|| RENDERER.get().and_then(|r| r.last_posted_color_buffer().ok()));
+    // Its notices are all at the display's size: each post the probe tells apart is noted at it.
+    let (pw, ph) = (spec.width, spec.height);
+    let probe: crate::display::PostProbe = Arc::new(move || RENDERER.get().and_then(|r| r.note_post(pw, ph).ok()));
     let ticker = vulkan_only.then(|| {
         let (w, h) = (spec.width, spec.height);
         let probe = Some((probe, POST_PROBE_INTERVAL));
@@ -248,6 +254,18 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     if direct {
         display.set_readback(Box::new(|w, h, buf| RENDERER.get().is_some_and(|r| r.read_last_posted_to(w, h, buf).is_ok())));
     }
+    if spec.metal_present {
+        // Decided before any frame: a GPU that can't alias the renderer's heaps (a VM's
+        // paravirtual one) never runs the copy.
+        match (direct && r.can_present_metal(), emu_gfxstream::metal::system_gate()) {
+            (true, Ok(())) => display.set_surface_readback(Box::new(|w, h| {
+                let s = RENDERER.get()?.last_posted_surface(w, h).ok()??;
+                Some(s as Arc<dyn crate::display::SharedSurface>)
+            })),
+            (true, Err(why)) => eprintln!("emu: -gpu metal: {why}; frames are read back"),
+            (false, _) => eprintln!("emu: -gpu metal: this renderer has no Metal handle for its color buffers; frames are read back"),
+        }
+    }
     if vulkan_only {
         return Ok(RENDERER.get_or_init(|| Arc::new(r)).clone());
     }
@@ -259,6 +277,11 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
             return;
         }
         if direct {
+            // The buffer this callback is for is still the last posted one (posts are one at a
+            // time): noted with its size before the display hears of it.
+            if let Some(r) = RENDERER.get() {
+                let _ = r.note_post(f.width, f.height);
+            }
             display.posted(f.width, f.height);
             return;
         }
@@ -274,6 +297,17 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
         eprintln!("emu: no host frame readback ({e}); screenshots come from the guest only");
     }
     Ok(RENDERER.get_or_init(|| Arc::new(r)).clone())
+}
+
+/// A frame the `-gpu metal` path copied into an IOSurface, as the display store holds it.
+impl crate::display::SharedSurface for emu_gfxstream::metal::MetalSurface {
+    fn size(&self) -> (u32, u32) {
+        emu_gfxstream::metal::MetalSurface::size(self)
+    }
+
+    fn mach_port(&self) -> Option<u32> {
+        emu_gfxstream::metal::MetalSurface::mach_port(self)
+    }
 }
 
 pub struct MachineConfig {
@@ -909,6 +943,7 @@ mod tests {
             vulkan_only: false,
             virtual_queue: false,
             pipe_gles: false,
+            metal_present: false,
         }
     }
 
