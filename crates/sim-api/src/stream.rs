@@ -1945,7 +1945,7 @@ mod linux_media {
     /// holds the connection open (a static screen) until dropped.
     struct FakeDisplay {
         dir: PathBuf,
-        _done: std::sync::mpsc::Sender<()>,
+        done: Option<std::sync::mpsc::Sender<()>>,
     }
 
     impl FakeDisplay {
@@ -1979,7 +1979,7 @@ mod linux_media {
                 }
                 let _ = done_rx.recv();
             });
-            FakeDisplay { dir, _done: done }
+            FakeDisplay { dir, done: Some(done) }
         }
 
         fn target(&self, platform: Platform) -> Target {
@@ -1996,6 +1996,10 @@ mod linux_media {
 
     impl Drop for FakeDisplay {
         fn drop(&mut self) {
+            // Let the serving thread finish: release its wait, and wake an `accept` no client
+            // reached (a connection it reads as closed at once), so no thread outlives the test.
+            self.done.take();
+            let _ = std::os::unix::net::UnixStream::connect(emu_avd::state_dir(&self.dir).join("display.sock"));
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -2029,6 +2033,13 @@ mod linux_media {
         assert!(keys[1] >= 6, "the request comes after the sixth unit: {keys:?}");
         for &k in &keys {
             assert_eq!(&nal_types(&units[k])[..3], &[NAL_SPS, NAL_PPS, NAL_IDR], "unit {k}: SPS and PPS cached in front of every IDR");
+        }
+        for (i, unit) in units.iter().enumerate().filter(|(i, _)| !keys.contains(i)) {
+            let types = nal_types(unit);
+            assert!(
+                !types.iter().any(|t| [NAL_SPS, NAL_PPS, NAL_IDR].contains(t)),
+                "unit {i} is a P frame, with no SPS, PPS or IDR: {types:?}"
+            );
         }
         let mut decoder = sim_encode::Decoder::new().expect("decoder");
         for (i, unit) in units.iter().enumerate() {
