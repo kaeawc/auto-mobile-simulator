@@ -3,7 +3,9 @@
 //! hub, the camera feed's Unix socket, and a reader speaking the capture shim's protocol
 //! ([`FeedReader`]: the 20-byte hello, then 32-byte frame headers and BGRA pixels, as
 //! `shims/ios-camera/hooks.m` reads them). A simulator's back and front cameras share its one feed
-//! (one socket per device), so each check runs a back and a front reader on it, at different sizes.
+//! (one socket per device), so each check runs a back and a front reader on it, at different sizes,
+//! at the same time (a thread each): the feed drops a reader that stops reading for its 2 s write
+//! timeout, so neither camera may wait while the other is checked.
 //!
 //! The checks are structural, never timed (a loaded CI runner breaks timing thresholds; every wait
 //! below is only a guard against a hang):
@@ -12,10 +14,13 @@
 //! - each header's frame number and timestamp increase frame after frame, within one link
 //!   generation;
 //! - a relink mid-stream (`Feed::set_source`) moves every reader to the new source: frames go
-//!   old source, then new source, never back, and the generation never goes down.
+//!   old source, then new source, never back, and the generation never goes down;
+//! - a `video:` file (a clip the test writes; macOS only, where `video:` plays through
+//!   AVFoundation) shows, in every frame, exactly the clip frame due at the frame's timestamp, and
+//!   loops.
 //!
 //! A host camera (a webcam or a virtual camera) runs only on a host that has one, named by
-//! `SIMEE_E2E_CAMERA=<id>`; `video:` is skipped until it decodes (#335).
+//! `SIMEE_E2E_CAMERA=<id>`.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -28,6 +33,10 @@ use simee_camera::device::{DeviceSource, Screen};
 use simee_camera::feed::{Feed, FeedReader, FrameHeader, Hello};
 use simee_camera::synth::{self, testcard_seq};
 use simee_camera::{CameraFrame, FrameSpec, HostOpener, Hub, Opener, Pattern, Result, Source, SourceSpec, Tick};
+
+#[cfg(target_os = "macos")]
+#[path = "support/mov.rs"]
+mod mov;
 
 /// A guard against a hang, never a threshold: every loop below ends as soon as it has what it
 /// checks.
@@ -131,6 +140,21 @@ fn cameras(feed: &Feed) -> [Camera; 2] {
     [open("back", BACK), open("front", FRONT)]
 }
 
+/// Runs `check` on both cameras at once, a thread each, as the shim's two sessions read: the feed
+/// drops a reader that stops reading for its write timeout, so neither may wait for the other.
+/// A failure on either camera fails the test with that camera's message.
+fn on_both(cams: &mut [Camera; 2], check: impl Fn(&mut Camera) + Sync) {
+    thread::scope(|s| {
+        let check = &check;
+        let running: Vec<_> = cams.iter_mut().map(|cam| s.spawn(move || check(cam))).collect();
+        for r in running {
+            if let Err(panic) = r.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    });
+}
+
 /// One frame as the shim gets it: its header, and its pixels as a frame (`tick.seq` from the header).
 struct Got {
     header: FrameHeader,
@@ -232,7 +256,7 @@ fn shows(got: &Got, still: Option<&SourceSpec>) -> Shows {
 fn testcard_counter_advances_and_carries_the_frame_number_and_timestamp_on_both_cameras() {
     let (hub, feed) = serve("card", SourceSpec::Pattern(Pattern::Testcard));
     let mut cams = cameras(&feed);
-    for cam in &mut cams {
+    on_both(&mut cams, |cam| {
         let got = frames(cam, 0, FRAMES);
         let want = if cam.name == "back" { BACK } else { FRONT };
         for g in &got {
@@ -243,7 +267,7 @@ fn testcard_counter_advances_and_carries_the_frame_number_and_timestamp_on_both_
         }
         let (first, last) = (testcard_seq(&got[0].frame), testcard_seq(&got[FRAMES - 1].frame));
         assert!(last > first, "{} camera: the counter advances ({first:?} to {last:?})", cam.name);
-    }
+    });
     let active = hub.active();
     assert_eq!(active.len(), 1, "one capture for both cameras: {:?}", active.iter().map(|a| &a.source).collect::<Vec<_>>());
     assert_eq!(active[0].subscribers, 2);
@@ -253,8 +277,8 @@ fn testcard_counter_advances_and_carries_the_frame_number_and_timestamp_on_both_
 fn qr_frames_are_the_code_pixel_for_pixel_on_both_cameras() {
     let qr = SourceSpec::Qr("simee-e2e-327".into());
     let (_hub, feed) = serve("qr", qr.clone());
-    for mut cam in cameras(&feed) {
-        for g in frames(&mut cam, 0, FRAMES) {
+    on_both(&mut cameras(&feed), |cam| {
+        for g in frames(cam, 0, FRAMES) {
             assert_eq!(
                 shows(&g, Some(&qr)),
                 Shows::Still,
@@ -264,7 +288,7 @@ fn qr_frames_are_the_code_pixel_for_pixel_on_both_cameras() {
                 g.header.height
             );
         }
-    }
+    });
 }
 
 /// A file the test wrote, removed when dropped (a failing test too).
@@ -300,8 +324,8 @@ fn image_frames_are_the_file_on_both_cameras() {
     let fixture = png_fixture("image");
     let png = SourceSpec::Image(fixture.0.clone());
     let (_hub, feed) = serve("image", png.clone());
-    for mut cam in cameras(&feed) {
-        for g in frames(&mut cam, 0, FRAMES) {
+    on_both(&mut cameras(&feed), |cam| {
+        for g in frames(cam, 0, FRAMES) {
             assert_eq!(
                 shows(&g, Some(&png)),
                 Shows::Still,
@@ -312,23 +336,23 @@ fn image_frames_are_the_file_on_both_cameras() {
             );
             assert!(quadrants_ok(&g.frame), "{} camera: the PNG's own colours", cam.name);
         }
-    }
+    });
     drop(feed);
     // A JPEG decodes too (lossy: compared by colour, not byte for byte).
     let jpeg = SourceSpec::Image(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/red-16x16.jpg"));
     let (_hub, feed) = serve("jpeg", jpeg);
-    for mut cam in cameras(&feed) {
-        let g = frames(&mut cam, 0, 2).pop().expect("a frame");
+    on_both(&mut cameras(&feed), |cam| {
+        let g = frames(cam, 0, 2).pop().expect("a frame");
         let [b, gr, r, _] = g.frame.pixel(g.frame.width / 2, g.frame.height / 2);
         assert!(r > 230 && gr < 30 && b < 30, "{} camera: red, within JPEG error: {r},{gr},{b}", cam.name);
-    }
+    });
 }
 
 #[test]
 fn a_device_screen_through_a_fake_backend_reaches_both_cameras() {
     let (_hub, feed) = serve("device", SourceSpec::parse("device:A").expect("device:A"));
-    for mut cam in cameras(&feed) {
-        let got = frames(&mut cam, 0, FRAMES);
+    on_both(&mut cameras(&feed), |cam| {
+        let got = frames(cam, 0, FRAMES);
         let counters: Vec<u32> = got
             .iter()
             .map(|g| match shows(g, None) {
@@ -339,11 +363,11 @@ fn a_device_screen_through_a_fake_backend_reaches_both_cameras() {
         // The device paces the capture: a still screen repeats its frame, a new one moves it on.
         assert!(counters.windows(2).all(|w| w[1] >= w[0]), "{} camera: A's screen counter never goes back: {counters:?}", cam.name);
         assert!(counters[FRAMES - 1] > counters[0], "{} camera: A's screen counter advances: {counters:?}", cam.name);
-    }
+    });
 }
 
 /// A check of one frame.
-type Check<'a> = &'a dyn Fn(&Got) -> bool;
+type Check<'a> = &'a (dyn Fn(&Got) -> bool + Sync);
 
 /// Reads frames until `generation`'s source shows, checking that each frame before it is the
 /// previous source's; then [`FRAMES`] frames of the new one.
@@ -371,9 +395,9 @@ fn a_swap_mid_stream_changes_the_source_on_both_cameras() {
     let png = SourceSpec::Image(fixture.0.clone());
     let (_hub, feed) = serve("swap", SourceSpec::Pattern(Pattern::Testcard));
     let mut cams = cameras(&feed);
-    for cam in &mut cams {
-        assert!(frames(cam, 0, FRAMES).iter().all(|g| shows(g, None) == Shows::Testcard));
-    }
+    on_both(&mut cams, |cam| {
+        assert!(frames(cam, 0, FRAMES).iter().all(|g| shows(g, None) == Shows::Testcard), "{} camera: the test card", cam.name);
+    });
     let testcard = |g: &Got| shows(g, None) == Shows::Testcard;
     let is_qr = |g: &Got| shows(g, Some(&qr)) == Shows::Still;
     let is_a = |g: &Got| matches!(shows(g, None), Shows::DeviceA(_));
@@ -388,9 +412,7 @@ fn a_swap_mid_stream_changes_the_source_on_both_cameras() {
     for (source, old, new) in steps {
         let generation = feed.set_source(source.clone());
         assert_eq!(feed.source(), source);
-        for cam in &mut cams {
-            swap_to(cam, generation, old, new);
-        }
+        on_both(&mut cams, |cam| swap_to(cam, generation, old, new));
     }
 }
 
@@ -408,32 +430,76 @@ fn a_host_camera_through_the_feed() {
     let webcam = SourceSpec::Webcam(id.clone());
     let (_hub, feed) = serve("webcam", webcam.clone());
     let mut cams = cameras(&feed);
-    for cam in &mut cams {
+    on_both(&mut cams, |cam| {
         let got = frames(cam, 0, FRAMES);
         assert!(got.iter().all(|g| shows(g, None) != Shows::Testcard), "{} camera: webcam:{id}'s picture, not a stand-in", cam.name);
-    }
+    });
     let generation = feed.set_source(SourceSpec::Pattern(Pattern::Testcard));
     let not_card = |g: &Got| shows(g, None) != Shows::Testcard;
     let card = |g: &Got| shows(g, None) == Shows::Testcard;
-    for cam in &mut cams {
-        swap_to(cam, generation, &not_card, &card);
-    }
+    on_both(&mut cams, |cam| swap_to(cam, generation, &not_card, &card));
     let generation = feed.set_source(webcam);
-    for cam in &mut cams {
-        swap_to(cam, generation, &card, &not_card);
-    }
+    on_both(&mut cams, |cam| swap_to(cam, generation, &card, &not_card));
 }
 
-/// `video:` doesn't decode yet (#335): skipped, and this fails the day it opens, so the matrix
-/// gains it then.
+/// A `video:` file through the feed (macOS, where it plays): a 4-frame, 10 fps clip the test
+/// writes, uncompressed so every frame decodes to exactly its pixels. Every frame either camera
+/// gets is exactly the clip frame due at the frame's own timestamp (frame `pts / 100 ms`, modulo
+/// 4), drawn at the camera's size; reading on until the timestamps pass two whole passes shows the
+/// file looping.
+#[cfg(target_os = "macos")]
 #[test]
-fn video_is_skipped_until_it_decodes() {
-    let video = SourceSpec::Video("/tmp/simee-e2e.mp4".into());
-    match synth::open(&video) {
-        Err(simee_camera::Error::Unsupported(why)) => eprintln!("skipped: video: isn't decoded yet (#335): {why}"),
-        Err(other) => panic!("video: should be Unsupported until #335, not {other}"),
-        Ok(_) => panic!("video: opens now (#335): add it to this matrix with a fixture clip"),
-    }
+fn a_video_file_plays_at_its_own_rate_and_loops_on_both_cameras() {
+    let clip = mov::write("simee-e2e-video");
+    let (_hub, feed) = serve("video", SourceSpec::Video(clip.0.clone()));
+    let pass = mov::interval_ns() * mov::COLOURS.len() as u64;
+    on_both(&mut cameras(&feed), |cam| {
+        let started = Instant::now();
+        let mut prev: Option<FrameHeader> = None;
+        loop {
+            assert!(started.elapsed() < GUARD, "{} camera: the clip never played through twice", cam.name);
+            let g = next(cam);
+            let h = g.header;
+            assert_eq!(h.generation, 0, "{} camera: one link", cam.name);
+            if let Some(p) = prev {
+                assert!(
+                    h.seq > p.seq && h.pts_ns > p.pts_ns,
+                    "{} camera: frame {} at {} ns after {} at {} ns",
+                    cam.name,
+                    h.seq,
+                    h.pts_ns,
+                    p.seq,
+                    p.pts_ns
+                );
+            }
+            let due = (h.pts_ns / mov::interval_ns()) as usize % mov::COLOURS.len();
+            assert_eq!(
+                mov::which(&g.frame),
+                Some(due),
+                "{} camera: the clip frame due at {} ns, at {}x{}",
+                cam.name,
+                h.pts_ns,
+                h.width,
+                h.height
+            );
+            prev = Some(h);
+            if h.pts_ns >= 2 * pass {
+                break;
+            }
+        }
+    });
+}
+
+/// A `video:` file that isn't there: an I/O error naming it on macOS, where `video:` plays; and
+/// Unsupported anywhere else, where no `video:` plays.
+#[test]
+fn a_missing_video_file_is_an_io_error_on_macos_and_unsupported_elsewhere() {
+    let path = PathBuf::from("/tmp").join(format!("simee-e2e-missing-{}.mov", std::process::id()));
+    let err = synth::open(&SourceSpec::Video(path)).err();
+    #[cfg(target_os = "macos")]
+    assert!(matches!(&err, Some(simee_camera::Error::Io(m)) if m.contains("simee-e2e-missing")), "{err:?}");
+    #[cfg(not(target_os = "macos"))]
+    assert!(matches!(&err, Some(simee_camera::Error::Unsupported(m)) if m.contains("macOS")), "{err:?}");
 }
 
 /// Frames of a capture that a relink left behind never reach a reader again: a source dropped by
@@ -442,16 +508,14 @@ fn video_is_skipped_until_it_decodes() {
 fn a_swap_stops_the_old_capture() {
     let (hub, feed) = serve("stops", SourceSpec::Pattern(Pattern::Testcard));
     let mut cams = cameras(&feed);
-    for cam in &mut cams {
+    on_both(&mut cams, |cam| {
         let _ = frames(cam, 0, 2);
-    }
+    });
     let qr = SourceSpec::Qr("after".into());
     let generation = feed.set_source(qr.clone());
     let is_qr = |g: &Got| shows(g, Some(&qr)) == Shows::Still;
     let any = |_: &Got| true;
-    for cam in &mut cams {
-        swap_to(cam, generation, &any, &is_qr);
-    }
+    on_both(&mut cams, |cam| swap_to(cam, generation, &any, &is_qr));
     let started = Instant::now();
     loop {
         let now: Vec<String> = hub.active().into_iter().map(|a| a.source).collect();

@@ -18,12 +18,20 @@
 //!   The HAL protocol carries no timestamp (the guest's HAL stamps frames with its own clock), so
 //!   the counter in the pixels is the source's timestamp as the guest gets it;
 //! - QR codes and images reach the guest exactly as the source draws them;
+//! - the back camera's NV21 frame (what camera apps record) is its RGB32 preview's frame, by
+//!   independently computed luma;
 //! - a relink mid-stream (`Cameras::link`, and a server-side relink of a served feed) changes the
 //!   frames' source: the old source's frames, then the new one's, never back; the other camera
-//!   keeps its own source.
+//!   keeps its own source;
+//! - a `video:` file (a clip the test writes; macOS only, where `video:` plays) shows only the
+//!   clip's frames, every one of them, and loops.
 //!
-//! A host camera runs only where `SIMEE_E2E_CAMERA=<id>` names one; `video:` is skipped until it
-//! decodes (#335).
+//! emu stands in for a source that has no frame yet, and the tests accept exactly those stand-ins
+//! before a source's first frame, never after it: black while a fresh link waits for its first
+//! frame (`FIRST_FRAME`, 500 ms), and its test card once a feed has sent nothing for its stall time
+//! (1 s; a feed relinked server-side to another device does that while the device opens).
+//!
+//! A host camera runs only where `SIMEE_E2E_CAMERA=<id>` names one.
 #![cfg(unix)]
 
 use std::path::PathBuf;
@@ -38,9 +46,13 @@ use sim_camera::device::{DeviceSource, Screen};
 use sim_camera::feed::Feed;
 use sim_camera::synth::{self, testcard_seq};
 use sim_camera::{CameraFrame, FrameSpec, HostOpener, Hub, Opener, Pattern, Source, SourceSpec, Tick};
-use sim_core::yuv::CameraFormat;
+use sim_core::yuv::{self, CameraFormat};
 use simee_emu_vmm::pipe::camera::{CameraService, Cameras, Facing};
 use simee_emu_vmm::pipe::{HostMsg, PipeCtx, PipeHandler, PipeService, WorkerEvent};
+
+#[cfg(target_os = "macos")]
+#[path = "../../sim-camera/tests/support/mov.rs"]
+mod mov;
 
 /// A guard against a hang, never a threshold.
 const GUARD: Duration = Duration::from_secs(30);
@@ -178,8 +190,9 @@ impl Guest {
         out.split_off(8)
     }
 
-    /// The guest's next frame, as BGRA: the back camera's RGB32 preview from the reply, the front
-    /// camera's RGB32 frame from the address-space area.
+    /// The guest's next frame, as BGRA: the back camera's RGB32 preview from the reply (its NV21
+    /// frame checked to be the same frame), the front camera's RGB32 frame from the address-space
+    /// area.
     fn frame(&mut self) -> CameraFrame {
         let (rgba, (w, h)) = match self.facing {
             Facing::Back => {
@@ -189,7 +202,9 @@ impl Guest {
                 let r = self.ask(&format!("frame video={video} preview={preview} whiteb=1,1,1 expcomp=1 time=0"));
                 assert_eq!(&r[..3], b"ok:", "back camera: {}", String::from_utf8_lossy(&r[..r.len().min(40)]));
                 assert_eq!(r.len(), 3 + video + preview);
-                (r[3 + video..].to_vec(), BACK)
+                let (nv21, rgb32) = r[3..].split_at(video);
+                nv21_is(nv21, rgb32, w, h);
+                (rgb32.to_vec(), BACK)
             }
             Facing::Front => {
                 let q = format!(
@@ -209,22 +224,37 @@ impl Guest {
     }
 
     /// The next frame that differs from `last` (the HAL answers the newest frame again when the
-    /// guest asks faster than the source draws), or the same one after [`SAME`] asks: the caller
-    /// decides whether a frame that doesn't change is wrong.
+    /// guest asks faster than the source draws), or the same one once [`GUARD`] has passed: the
+    /// caller decides whether a frame that doesn't change is wrong.
     fn new_frame(&mut self, last: Option<&CameraFrame>) -> CameraFrame {
-        for _ in 0..SAME {
+        let deadline = Instant::now() + GUARD;
+        loop {
             let f = self.frame();
-            if last.is_none_or(|l| l.bgra != f.bgra) {
+            if last.is_none_or(|l| l.bgra != f.bgra) || Instant::now() >= deadline {
                 return f;
             }
             thread::sleep(Duration::from_millis(5));
         }
-        self.frame()
     }
 }
 
-/// Asks for a changed frame this many times before taking an unchanged one.
-const SAME: usize = 200;
+/// The back camera's NV21 frame (`video=`, what a camera app records) holds the same frame as its
+/// RGB32 preview: every luma sample is the preview pixel's BT.601 limited-range luma, computed here
+/// independently of `sim-core`'s converter (to within its integer rounding), and the whole frame,
+/// chroma too, is exactly that converter's NV21 of the preview.
+fn nv21_is(nv21: &[u8], rgb32: &[u8], w: usize, h: usize) {
+    let (luma, _) = nv21.split_at(w * h);
+    for (i, (&y, p)) in luma.iter().zip(rgb32.as_chunks::<4>().0).enumerate() {
+        let [r, g, b] = [p[0], p[1], p[2]].map(f64::from);
+        let want = 16.0 + (65.481 * r + 128.553 * g + 24.966 * b) / 255.0;
+        assert!((f64::from(y) - want).abs() <= 1.5, "back camera: NV21 luma {y} at ({}, {}), the preview's is {want:.1}", i % w, i / w);
+    }
+    let bgra: Vec<u8> = rgb32.as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0], p[3]]).collect();
+    assert!(
+        yuv::convert(&bgra, w, h, CameraFormat::Nv21).as_deref() == Some(nv21),
+        "back camera: the NV21 frame is the preview's, chroma too"
+    );
+}
 
 /// What a guest frame shows, told from its pixels alone.
 #[derive(Debug, PartialEq, Eq)]
@@ -280,10 +310,6 @@ fn device_b() -> Is<'static> {
     Is { name: "device B's screen".into(), check: Box::new(|f| matches!(shows(f), Shows::DeviceB(_))), still: false }
 }
 
-fn black() -> Is<'static> {
-    Is { name: "black".into(), check: Box::new(|f| shows(f) == Shows::Black), still: false }
-}
-
 /// Exactly what `source` draws at the frame's size (and, for the fixture PNG, its own colours).
 fn still(source: &SourceSpec) -> Is<'_> {
     Is {
@@ -304,8 +330,15 @@ fn quadrants_ok(f: &CameraFrame) -> bool {
     want.iter().chain(&[(3 * w / 4, 3 * h / 4, [0, 255, 255, 255])]).all(|&(x, y, px)| f.pixel(x, y) == px)
 }
 
-fn any_of<'a>(name: &str, all: Vec<Is<'a>>) -> Is<'a> {
-    Is { name: name.into(), check: Box::new(move |f| all.iter().any(|i| (i.check)(f))), still: false }
+/// What emu shows for a source that has no frame yet: black (a fresh link's first 500 ms) or its
+/// test card (a feed silent for its 1 s stall time).
+fn stand_in(f: &CameraFrame) -> bool {
+    matches!(shows(f), Shows::Black | Shows::Testcard(_))
+}
+
+/// Nothing before a camera's first source: only emu's stand-ins may come first.
+fn nothing() -> Is<'static> {
+    Is { name: "nothing yet".into(), check: Box::new(|_| false), still: false }
 }
 
 /// Reads [`FRAMES`] distinct frames (one, for a still), each of which `is` accepts; when they carry
@@ -327,7 +360,9 @@ fn stream(g: &mut Guest, is: &Is) {
     }
 }
 
-/// Reads frames until `new`'s show, each one before it `old`'s; then [`stream`]s the new source.
+/// Reads frames until `new`'s show, each one before it `old`'s or one of emu's stand-ins (until
+/// [`GUARD`]: the new source's first frame may be late on a loaded host); then [`stream`]s the new
+/// source, which allows no stand-in.
 fn swap(g: &mut Guest, old: &Is, new: &Is) {
     let started = Instant::now();
     let mut last: Option<CameraFrame> = None;
@@ -336,11 +371,23 @@ fn swap(g: &mut Guest, old: &Is, new: &Is) {
         if (new.check)(&f) {
             break;
         }
-        assert!((old.check)(&f), "{} camera: before {}, only {}'s frames: got {:?}", g.facing.dir(), new.name, old.name, shows(&f));
+        assert!(
+            (old.check)(&f) || stand_in(&f),
+            "{} camera: before {}, only {}'s frames or emu's stand-in: got {:?}",
+            g.facing.dir(),
+            new.name,
+            old.name,
+            shows(&f)
+        );
         assert!(started.elapsed() < GUARD, "{} camera: {} never showed (still {:?})", g.facing.dir(), new.name, shows(&f));
         last = Some(f);
     }
     stream(g, new);
+}
+
+/// A camera's first source: emu's stand-ins until its first frame, then [`stream`].
+fn first(g: &mut Guest, new: &Is) {
+    swap(g, &nothing(), new);
 }
 
 fn cameras() -> (Arc<Cameras>, CameraService, Arc<GuestRam>) {
@@ -361,7 +408,7 @@ fn testcard_counter_advances_on_both_cameras() {
     link(&c, Facing::Front, "pattern:testcard");
     for (conn, facing) in [(1, Facing::Back), (2, Facing::Front)] {
         let mut g = Guest::open(&svc, facing, area.clone(), conn);
-        stream(&mut g, &card());
+        first(&mut g, &card());
     }
 }
 
@@ -374,7 +421,7 @@ fn qr_and_image_reach_both_cameras_exactly() {
     for (conn, facing) in [(1, Facing::Back), (2, Facing::Front)] {
         c.link(facing, Some(qr.clone()));
         let mut g = Guest::open(&svc, facing, area.clone(), conn);
-        stream(&mut g, &still(&qr));
+        first(&mut g, &still(&qr));
         c.link(facing, Some(image.clone()));
         swap(&mut g, &still(&qr), &still(&image));
     }
@@ -391,8 +438,8 @@ fn a_device_screen_reaches_both_cameras_through_the_server_feed() {
     let mut f = Guest::open(&svc, Facing::Front, area, 2);
     // Until the feed's first frame the camera is black, or emu's test card stands in; then the
     // device's screen.
-    swap(&mut b, &any_of("nothing yet", vec![card(), black()]), &device_a());
-    swap(&mut f, &any_of("nothing yet", vec![card(), black()]), &device_b());
+    first(&mut b, &device_a());
+    first(&mut f, &device_b());
     assert_eq!((back.readers(), front.readers()), (1, 1), "one feed connection per camera");
 }
 
@@ -407,18 +454,19 @@ fn a_relink_mid_stream_changes_the_source_and_only_on_that_camera() {
     c.link(Facing::Front, Some(blue.clone()));
     let mut b = Guest::open(&svc, Facing::Back, area.clone(), 1);
     let mut f = Guest::open(&svc, Facing::Front, area, 2);
-    stream(&mut b, &card());
-    stream(&mut f, &still(&blue));
+    first(&mut b, &card());
+    first(&mut f, &still(&blue));
 
     // emu's own relink (the console's `camera link`): test card to QR code.
     c.link(Facing::Back, Some(qr.clone()));
     swap(&mut b, &card(), &still(&qr));
     // To another device's screen, served on a feed: until the feed's first frame, the last QR
-    // frame, or emu's test card standing in.
+    // frame, or emu's stand-in.
     let feed = serve("relink", "device:A");
     c.link(Facing::Back, Some(feed_link(&feed)));
-    swap(&mut b, &any_of("the QR code or the stand-in", vec![still(&qr), card()]), &device_a());
-    // The server relinks the feed (a `camera_link` to another device): emu's link stays the feed.
+    swap(&mut b, &still(&qr), &device_a());
+    // The server relinks the feed (a `camera_link` to another device): emu's link stays the feed,
+    // which shows A's last frame, or the test card if B takes over 1 s to open, until B's.
     feed.set_source(SourceSpec::parse("device:B").expect("B"));
     swap(&mut b, &device_a(), &device_b());
     // And to a still.
@@ -447,7 +495,7 @@ fn a_host_camera_reaches_both_cameras() {
     let picture = || Is { name: "the camera picture".into(), check: Box::new(|f| shows(f) == Shows::Other), still: true };
     for (conn, facing) in [(1, Facing::Back), (2, Facing::Front)] {
         let mut g = Guest::open(&svc, facing, area.clone(), conn);
-        swap(&mut g, &any_of("nothing yet", vec![card(), black()]), &picture());
+        first(&mut g, &picture());
         link(&c, facing, "pattern:testcard");
         swap(&mut g, &picture(), &card());
         link(&c, facing, &webcam);
@@ -455,15 +503,44 @@ fn a_host_camera_reaches_both_cameras() {
     }
 }
 
-/// `video:` doesn't decode yet (#335): skipped, and this fails the day it opens, so the matrix gains
-/// it then.
+/// A `video:` file on both cameras (macOS, where it plays): a 4-frame clip the test writes,
+/// uncompressed so every frame decodes to its pixels. The HAL carries no timestamp, so this checks
+/// what a guest can tell: after emu's stand-ins, every frame is one of the clip's, drawn at the
+/// camera's size; every one of them shows; and an earlier one follows a later one (the file loops).
+#[cfg(target_os = "macos")]
 #[test]
-fn video_is_skipped_until_it_decodes() {
-    match synth::open(&SourceSpec::Video("/tmp/emu-e2e.mp4".into())) {
-        Err(sim_camera::Error::Unsupported(why)) => eprintln!("skipped: video: isn't decoded yet (#335): {why}"),
-        Err(other) => panic!("video: should be Unsupported until #335, not {other}"),
-        Ok(_) => panic!("video: opens now (#335): add it to this matrix with a fixture clip"),
+fn a_video_file_plays_and_loops_on_both_cameras() {
+    let clip = mov::write("emu-e2e-video");
+    let (c, svc, area) = cameras();
+    for (conn, facing) in [(1, Facing::Back), (2, Facing::Front)] {
+        c.link(facing, Some(SourceSpec::Video(clip.0.clone())));
+        let mut g = Guest::open(&svc, facing, area.clone(), conn);
+        let clip_frame = Is { name: "a clip frame".into(), check: Box::new(|f| mov::which(f).is_some()), still: true };
+        first(&mut g, &clip_frame);
+        let (mut seen, mut looped) = ([false; mov::COLOURS.len()], false);
+        let (mut last, mut prev): (Option<CameraFrame>, Option<usize>) = (None, None);
+        let started = Instant::now();
+        while !(looped && seen.iter().all(|&s| s)) {
+            assert!(started.elapsed() < GUARD, "{} camera: the clip never played through (seen {seen:?}, looped {looped})", facing.dir());
+            let f = g.new_frame(last.as_ref());
+            let Some(i) = mov::which(&f) else { panic!("{} camera: only the clip's frames, got {:?}", facing.dir(), shows(&f)) };
+            seen[i] = true;
+            looped |= prev.is_some_and(|p| i < p);
+            (prev, last) = (Some(i), Some(f));
+        }
     }
+}
+
+/// A `video:` file that isn't there: an I/O error naming it on macOS, where `video:` plays; and
+/// Unsupported anywhere else, where no `video:` plays.
+#[test]
+fn a_missing_video_file_is_an_io_error_on_macos_and_unsupported_elsewhere() {
+    let path = PathBuf::from("/tmp").join(format!("emu-e2e-missing-{}.mov", std::process::id()));
+    let err = synth::open(&SourceSpec::Video(path)).err();
+    #[cfg(target_os = "macos")]
+    assert!(matches!(&err, Some(sim_camera::Error::Io(m)) if m.contains("emu-e2e-missing")), "{err:?}");
+    #[cfg(not(target_os = "macos"))]
+    assert!(matches!(&err, Some(sim_camera::Error::Unsupported(m)) if m.contains("macOS")), "{err:?}");
 }
 
 /// A file the test wrote, removed when dropped (a failing test too).

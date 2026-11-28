@@ -12,14 +12,15 @@
 #               N in --readers (1,2,4,8), --secs (5) per N. Arms: a camera-like source (1280x720
 #               frames fitted to each reader's size), the same at mixed sizes, the test card, and,
 #               with --camera ID (a webcam or virtual camera, as `webcam:` takes it; needs the camera
-#               permission for the terminal), that camera. Per N: this process's CPU (capture,
-#               fan-out, socket writes, and the readers' reads, which a device does in its own
-#               process), per device, the slowest reader's frame rate, and source to reader latency
-#               through the feed.
+#               permission for the terminal), that camera. The readers run in their own process,
+#               as a device's camera does. Per N: the server side's CPU (capture, fan-out, socket
+#               writes), in all and per device; the readers' process's CPU; the slowest reader's
+#               frame rate; and source to reader latency through the feed.
 #   --android SERIAL  an emu device that is already booted, with its back camera linked at boot
 #               (the guest reads the camera list once): its back camera is relinked to a feed this
-#               run serves (a flat colour per frame number, which survives the guest's scaling,
-#               rotation and YUV conversion), the default camera app is opened, and --shots (30)
+#               run serves (flat colours numbering each frame, a centre box and its surround, which
+#               survive the guest's scaling, rotation, mirroring and YUV conversion, and number 3782
+#               frames before one repeats), the default camera app is opened, and --shots (30)
 #               screenshots (`adb exec-out screencap`) are matched to the frames sent: latency from
 #               sending a frame to a screenshot showing it. CPU per linked device: the emu process
 #               while the camera app streams minus the same with the app closed, over --secs. The
@@ -27,9 +28,12 @@
 #   --ios UDID  a booted simulator: shims/ios-camera's fixture app (dev.simee.camerafixture, built
 #               and installed here, uninstalled on exit unless it was there before) is launched with
 #               the capture shim on a feed this run serves; the same shots (`simctl io screenshot`);
-#               CPU per linked device: the fixture app's process while it streams.
+#               CPU per linked device: the fixture app's process while it streams. A simulator
+#               already running the fixture app is skipped (its process isn't this run's to
+#               restart); the run stops only the app process it launched.
 # Devices are only ever the ones named: none is created, booted, shut down or picked by default,
-# and a serial or UDID in $BENCH_PROTECTED_DEVICES (space-separated) is refused.
+# and a protected one is refused: the built-in list (lib.sh's BENCH_PROTECTED_BUILTIN: the owner's
+# and CI's devices) plus any serial or UDID in $BENCH_PROTECTED_DEVICES (space-separated).
 # Defaults: host fan-out only, 3 rounds. --quick: one round, --secs 2, readers 1,4, 10 shots.
 # Not in docs/benchmarks.md yet ("Camera" would be its section).
 set -uo pipefail
@@ -73,11 +77,7 @@ if [ "$BENCH_QUICK" = 1 ]; then
   readers=1,4
   shots=10
 fi
-for d in ${androids[@]+"${androids[@]}"} ${ioses[@]+"${ioses[@]}"}; do
-  for p in ${BENCH_PROTECTED_DEVICES:-}; do
-    [ "$d" = "$p" ] && bench_die "$d is in BENCH_PROTECTED_DEVICES; not touching it"
-  done
-done
+bench_refuse_protected ${androids[@]+"${androids[@]}"} ${ioses[@]+"${ioses[@]}"}
 [ "$host" = 1 ] || [ ${#androids[@]} -gt 0 ] || [ ${#ioses[@]} -gt 0 ] || bench_die "--no-host with no --android or --ios: nothing to run"
 
 bench_start camera
@@ -157,7 +157,8 @@ android_round() {
     bench_log "$serial: not an attached, booted device; skipped"
     return 1
   }
-  linked=$("$BENCH_ADB" -s "$serial" emu camera list 2>/dev/null | tr -d '\r' | awk '/^back: / { print $2 }')
+  # The whole source after `back: `: a source id may hold spaces (`webcam:FaceTime HD Camera`).
+  linked=$("$BENCH_ADB" -s "$serial" emu camera list 2>/dev/null | tr -d '\r' | sed -n 's/^back: //p' | head -1)
   case $linked in
     "")
       bench_log "$serial: no 'camera list' on its console (not an emu device?); skipped"
@@ -171,7 +172,10 @@ android_round() {
   esac
   emu=$(lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1)
   sock="/tmp/simee-cambench-$$-$port.sock"
-  bench_on_exit "\"$BENCH_ADB\" -s $serial emu camera link back '$linked' >/dev/null 2>&1; \"$BENCH_ADB\" -s $serial shell input keyevent KEYCODE_HOME >/dev/null 2>&1"
+  # Quoted for the exit trap's eval, so the source comes back as one word, spaces and all.
+  local adb
+  adb=$(printf %q "$BENCH_ADB")
+  bench_on_exit "$adb -s $(printf %q "$serial") emu camera link back $(printf %q "$linked") >/dev/null 2>&1; $adb -s $(printf %q "$serial") shell input keyevent KEYCODE_HOME >/dev/null 2>&1"
   (
     for _ in $(seq 1 100); do
       [ -S "$sock" ] && break
@@ -194,44 +198,63 @@ android_round() {
   "$BENCH_ADB" -s "$serial" emu camera link back "$linked" >/dev/null
 }
 
+# Stops the fixture app process a launch log names (`simctl launch` prints `<bundle id>: <pid>`):
+# the one this run launched, never another.
+ios_stop_launched() {
+  local pid
+  pid=$(awk -F': ' '/: [0-9]+$/ { print $2 }' "$1" 2>/dev/null | head -1)
+  [ -n "$pid" ] && bench_stop_pid "$pid" 5
+  return 0
+}
+
 IOS_SHIM=""
+IOS_APP=dev.simee.camerafixture
+# Simulators that were already running the fixture app when this run started: skipped, since that
+# app process isn't this run's to restart or stop.
+IOS_BUSY=" "
 ios_round() {
   local udid=$1 sock app had launched
   xcrun simctl list devices | grep -F "($udid)" | grep -q '(Booted)' || {
     bench_log "$udid: not a booted simulator; skipped"
     return 1
   }
+  app=$IOS_APP
   if [ -z "$IOS_SHIM" ]; then
     IOS_SHIM="$BENCH_WORK/ios-camera"
     "$BENCH_REPO/shims/ios-camera/build.sh" "$IOS_SHIM" >"$BENCH_WORK/shim-build.log" 2>&1 || bench_die "shims/ios-camera/build.sh failed (see $BENCH_WORK/shim-build.log)"
   fi
-  app=dev.simee.camerafixture
   had=0
   xcrun simctl get_app_container "$udid" "$app" >/dev/null 2>&1 && had=1
   [ "$had" = 1 ] || {
     xcrun simctl install "$udid" "$IOS_SHIM/CameraFixture.app" || bench_die "simctl install CameraFixture.app on $udid failed"
     bench_on_exit "xcrun simctl uninstall $udid $app >/dev/null 2>&1"
   }
-  bench_on_exit "xcrun simctl terminate $udid $app >/dev/null 2>&1"
   sock="/tmp/simee-cambench-$$-${udid:0:8}.sock"
-  launched="$BENCH_WORK/launch-$udid.log"
+  launched="$BENCH_WORK/launch-$udid-$BENCH_ROUND.log"
+  bench_on_exit "ios_stop_launched $(printf %q "$launched")"
   (
     for _ in $(seq 1 100); do
       [ -S "$sock" ] && break
       sleep 0.1
     done
     SIMCTL_CHILD_DYLD_INSERT_LIBRARIES="$IOS_SHIM/libsimee-camera.dylib" SIMCTL_CHILD_SIMEE_CAMERA_SOCKET="$sock" \
-      xcrun simctl launch --terminate-running-process "$udid" "$app" >"$launched" 2>&1
+      xcrun simctl launch "$udid" "$app" >"$launched" 2>&1
   ) &
   # `simctl launch` prints `<bundle id>: <pid>`; by the time the app reads the feed it has.
   latency_run "ios $udid" "$sock" "xcrun simctl io $udid screenshot --type=png {} >/dev/null 2>&1" 50,60 \
     "awk -F': ' '/: [0-9]+\$/ { print \$2 }' '$launched'"
   wait
-  xcrun simctl terminate "$udid" "$app" >/dev/null 2>&1
+  ios_stop_launched "$launched"
 }
 
 [ ${#androids[@]} -gt 0 ] && android_env
 [ ${#ioses[@]} -gt 0 ] && ios_env
+for u in ${ioses[@]+"${ioses[@]}"}; do
+  if xcrun simctl spawn "$u" launchctl list 2>/dev/null | grep -qF "UIKitApplication:${IOS_APP}["; then
+    bench_log "$u: $IOS_APP is already running, and this run stops only what it starts; skipped"
+    IOS_BUSY="$IOS_BUSY$u "
+  fi
+done
 for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
   if [ "$host" = 1 ]; then
     fanout "$BENCH_WORK/fan-webcam-$BENCH_ROUND.log" --source fake-webcam
@@ -240,6 +263,8 @@ for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
     [ -n "$camera" ] && fanout "$BENCH_WORK/fan-camera-$BENCH_ROUND.log" --source "webcam:$camera"
   fi
   for s in ${androids[@]+"${androids[@]}"}; do android_round "$s"; done
-  for u in ${ioses[@]+"${ioses[@]}"}; do ios_round "$u"; done
+  for u in ${ioses[@]+"${ioses[@]}"}; do
+    case $IOS_BUSY in *" $u "*) ;; *) ios_round "$u" ;; esac
+  done
 done
-bench_finish "" "fan-out CPU is one process (capture, fan-out and the readers' reads, which devices do in their own processes); latency to a guest screen is an interval (the screenshot is taken between the command's start and its return): p50/p95 of its midpoint and of its upper end"
+bench_finish "" "fan-out CPU: the server side (capture, fan-out, socket writes) and the readers, in a process of their own as a device's camera is, measured apart; latency to a guest screen is an interval (the screenshot is taken between the command's start and its return): p50/p95 of its midpoint and of its upper end"
