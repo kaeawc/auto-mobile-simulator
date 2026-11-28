@@ -15,7 +15,7 @@ fn limits() -> Limits {
 }
 
 fn timing() -> Timing {
-    Timing { watch: Duration::from_millis(20), heartbeat: Duration::from_millis(40) }
+    Timing { watch: crate::watch::Pace::uniform(Duration::from_millis(20)), heartbeat: Duration::from_millis(40) }
 }
 
 /// A scratch directory, removed on drop.
@@ -408,6 +408,33 @@ fn subscriptions_listen_streams_on_its_post_until_the_client_closes_it() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(lock(&rig.running.shared.router.routes).is_empty());
+}
+
+#[test]
+fn ending_a_session_stops_what_it_watches() {
+    let rig = Rig::new();
+    rig.fake.answer("screenshot", Ok(json!({"png": "AAAA"})));
+    let mut client = rig.client();
+    client.initialize("2025-11-25");
+    assert_eq!(client.call("resources/subscribe", json!({"uri": "simee://devices/phone/screen"}))["result"], json!({}));
+    let deadline = Instant::now() + WAIT;
+    while rig.fake.called("screenshot").is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    client.write_request("DELETE", &[], b"");
+    assert_eq!(client.read_reply().status, 204);
+    // A read under way may finish; then none follows.
+    let mut reads = rig.fake.called("screenshot").len();
+    loop {
+        std::thread::sleep(Duration::from_millis(150));
+        let now = rig.fake.called("screenshot").len();
+        if now == reads {
+            break;
+        }
+        reads = now;
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(rig.fake.called("screenshot").len(), reads, "the ended session still reads");
 }
 
 #[test]
@@ -913,7 +940,7 @@ fn the_router_puts_the_clients_ids_back() {
     }
     // Progress for no request, and messages with no route, go nowhere; the rest go to the session.
     let standalone: Standalone = Mutex::new(None);
-    let (tx, rx) = channel();
+    let (tx, rx) = note_queue(STANDALONE_QUEUE);
     *lock(&standalone) = Some((0, tx));
     router.deliver(
         r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"h99","progress":1}}"#.into(),
@@ -921,9 +948,70 @@ fn the_router_puts_the_clients_ids_back() {
     );
     router.deliver(r#"{"id":"h99","jsonrpc":"2.0","result":{}}"#.into(), Some(&standalone));
     router.deliver(r#"{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"u"}}"#.into(), Some(&standalone));
-    let Ok(Out::Note(note)) = rx.try_recv() else { panic!("the update") };
+    let note = rx.try_recv().expect("the update");
     assert!(note.contains("resources/updated"));
-    assert!(rx.try_recv().is_err());
+    assert!(rx.try_recv().is_none());
+}
+
+fn updated(uri: &str) -> String {
+    json!({"jsonrpc": "2.0", "method": "notifications/resources/updated", "params": {"uri": uri}}).to_string()
+}
+
+fn queued(rx: &NoteRx) -> Vec<String> {
+    std::iter::from_fn(|| rx.try_recv()).collect()
+}
+
+#[test]
+fn a_get_stream_nobody_reads_queues_a_bounded_number_and_never_blocks_the_sender() {
+    let router = Router::default();
+    let standalone: Standalone = Mutex::new(None);
+    let (tx, rx) = note_queue(STANDALONE_QUEUE);
+    *lock(&standalone) = Some((0, tx));
+    // Three times the queue's worth of different resources for a client that stopped reading:
+    // every `deliver` returns at once.
+    for n in 0..STANDALONE_QUEUE * 3 {
+        router.deliver(updated(&format!("u{n}")), Some(&standalone));
+    }
+    let got = queued(&rx);
+    assert_eq!(got.len(), STANDALONE_QUEUE);
+    assert!(got[0].contains(&format!("\"u{}\"", STANDALONE_QUEUE * 2)), "the oldest are dropped, not the newest");
+    assert!(got[STANDALONE_QUEUE - 1].contains(&format!("\"u{}\"", STANDALONE_QUEUE * 3 - 1)));
+    // Once read, it takes more.
+    router.deliver(updated("later"), Some(&standalone));
+    assert!(rx.try_recv().is_some_and(|n| n.contains("later")));
+}
+
+#[test]
+fn a_stalled_get_stream_keeps_the_latest_update_of_each_resource_behind_a_busy_screen() {
+    let router = Router::default();
+    let standalone: Standalone = Mutex::new(None);
+    let (tx, rx) = note_queue(STANDALONE_QUEUE);
+    *lock(&standalone) = Some((0, tx));
+    router.deliver(updated("simee://devices/p/logs"), Some(&standalone));
+    router.deliver(updated("simee://devices/p/prefs/app"), Some(&standalone));
+    // A screen announced 30 times a second for ten seconds, and the list changing as often.
+    let list = json!({"jsonrpc": "2.0", "method": "notifications/resources/list_changed", "params": {}}).to_string();
+    for _ in 0..300 {
+        router.deliver(updated("simee://devices/p/screen"), Some(&standalone));
+        router.deliver(list.clone(), Some(&standalone));
+    }
+    router.deliver(updated("simee://devices/p/logs"), Some(&standalone));
+    let got = queued(&rx);
+    assert_eq!(got.len(), 4, "one message for each of the screen, the list, the prefs and the logs: {got:?}");
+    // The logs' latest is the one kept, in the order the updates last happened.
+    let uris: Vec<String> = got.iter().map(|n| serde_json::from_str::<Value>(n).expect("json")["params"]["uri"].to_string()).collect();
+    assert_eq!(uris, [r#""simee://devices/p/prefs/app""#, r#""simee://devices/p/screen""#, "null", r#""simee://devices/p/logs""#]);
+}
+
+#[test]
+fn a_get_streams_queue_ends_when_its_sender_goes_but_hands_over_what_it_holds_first() {
+    let (tx, rx) = note_queue(4);
+    tx.push(None, "one".into());
+    drop(tx);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).as_deref(), Ok("one"));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Err(RecvTimeoutError::Disconnected));
+    let (_tx, rx) = note_queue(4);
+    assert_eq!(rx.recv_timeout(Duration::from_millis(10)), Err(RecvTimeoutError::Timeout));
 }
 
 #[test]

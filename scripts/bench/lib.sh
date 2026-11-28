@@ -10,7 +10,9 @@
 # - The host is recorded at the start and the end (model, OS, CPUs, load average, simee's commit):
 #   scripts/bench/summarize.py host.
 # - Every device a run uses it creates itself and deletes on exit (AVDs with `emu -delete-avd`,
-#   simulators with `simctl delete`, by UDID); it never touches another device, never quits
+#   simulators with `simctl delete`, by UDID), or, where a script says so (camera.sh), it is a
+#   booted device named on the command line, which the run leaves as it found it. It never touches
+#   another device, nor ever one on the protected list (bench_refuse_protected), never quits
 #   Simulator.app, never runs `adb kill-server`, and stops only the PIDs it started (SIGINT first).
 # - Samples go through bench_sample; bench_finish writes the JSON and prints a Markdown table.
 
@@ -24,6 +26,22 @@ BENCH_ARGS="$*"
 BENCH_PIDS=()
 BENCH_CLEANUP=()
 BENCH_SHIFT=1
+
+# Devices no benchmark touches, whatever it is told: the owner's and CI's own (emulators by serial,
+# simulators by UDID). $BENCH_PROTECTED_DEVICES (space-separated) adds to them, never replaces them.
+BENCH_PROTECTED_BUILTIN="emulator-5554 emulator-5556 emulator-5558 emulator-5590 emulator-5680 8B529975-BB5F-4ED5-8309-0FF04764BAE6"
+
+# Exits (status 2) when any device named is protected. UDIDs compare in any case.
+bench_refuse_protected() {
+  local d p
+  for d in "$@"; do
+    for p in $BENCH_PROTECTED_BUILTIN ${BENCH_PROTECTED_DEVICES:-}; do
+      [ "$(printf %s "$d" | tr '[:lower:]' '[:upper:]')" = "$(printf %s "$p" | tr '[:lower:]' '[:upper:]')" ] &&
+        bench_die "$d is a protected device (built in, or in BENCH_PROTECTED_DEVICES); not touching it"
+    done
+  done
+  return 0
+}
 
 bench_help() {
   awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"

@@ -358,13 +358,13 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "kind?(host|virtual|synthetic)",
         "The sources a device camera can link to, each with the `source` id camera_link takes: the host's cameras (built-in, \
          external, Continuity Camera, and virtual cameras such as OBS Virtual Camera, flagged `virtual`) and the synthetic kinds \
-         (pattern:testcard, qr:, text:, image:, solid:); and the host's camera permission (macOS: the TCC status of the app that \
+         (pattern:testcard, qr:, text:, image:, video: on macOS, solid:); and the host's camera permission (macOS: the TCC status of the app that \
          started the server, with the fix when it blocks capture), read without ever prompting",
     ),
     (
         "camera_link",
         "device, facing(back|front|both), source",
-        "Feed a device camera from a source: a source id (webcam:<id>, pattern:testcard, qr:<text>, text:<text>, image:<absolute path>, \
+        "Feed a device camera from a source: a source id (webcam:<id>, pattern:testcard, qr:<text>, text:<text>, image:<absolute path>, video:<absolute path> (macOS, looped), \
          solid:<colour>; emulated is the test card, none turns the camera off) or a host camera's name, index or part of its name \
          (obs finds OBS Virtual Camera; an ambiguous one fails listing the matches), saved by its stable id. Saved with the device: \
          it comes back on every boot and survives a server restart. Android: a running device is relinked live through emu's console \
@@ -561,8 +561,15 @@ pub(crate) fn resolve(s: &mut Session, p: &Value) -> Result<(Platform, String), 
     if only != Some(Platform::Android) && sim_core::device::is_udid(query) {
         return Ok((Platform::Ios, query.to_owned()));
     }
-    let android = if only == Some(Platform::Ios) { Vec::new() } else { s.android.devices() };
-    if android.is_empty() && only != Some(Platform::Android) {
+    // `booted` loads only the running AVDs' configs, not all of them.
+    let (android, any) = match only {
+        Some(Platform::Ios) => (Vec::new(), false),
+        _ => {
+            let (devices, any) = s.android.backend().candidates(query);
+            (devices.into_iter().map(|d| d.info).collect(), any)
+        }
+    };
+    if !any && only != Some(Platform::Android) {
         return Ok((Platform::Ios, query.to_owned()));
     }
     // Only what `select` reads of each simulator (UDID, name, state); the iOS backend reads the
@@ -1608,6 +1615,22 @@ mod tests {
         assert_eq!(call(&mut s, "tap", &missing).expect_err("missing"), "no device matches `no-such-device`");
         call(&mut s, "delete", &json!({"device": "watch"})).expect("delete");
         assert_eq!(call(&mut s, "devices", &json!({"platform": "android"})).expect("devices").as_array().map(Vec::len), Some(1));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn booted_resolves_among_android_devices_by_what_runs() {
+        let (mut s, root) = short_android_session("booted");
+        let mobile = "system-images;android-36;google_apis;arm64-v8a";
+        for name in ["a", "b", "c"] {
+            call(&mut s, "create", &json!({"platform": "android", "name": name, "system_image": mobile})).expect("create");
+        }
+        let booted = json!({"device": "booted", "platform": "android"});
+        assert_eq!(resolve(&mut s, &booted), Err("no device matches `booted`".into()), "AVDs exist, none runs");
+        let android = s.android.backend().clone();
+        let _a = sim_android::testing::fake_emulator(&android, "a");
+        assert_eq!(resolve(&mut s, &booted), Ok((Platform::Android, "a".into())));
+        assert_eq!(resolve(&mut s, &json!({"device": "c", "platform": "android"})), Ok((Platform::Android, "c".into())));
         std::fs::remove_dir_all(root).ok();
     }
 
