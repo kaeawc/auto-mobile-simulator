@@ -2,6 +2,12 @@
 //! and keeps a reader thread that holds only the newest frame (the ring's RGBA rows, read once into
 //! a buffer it gets back from the consumer), stamped with when it arrived. Each platform's
 //! `AndroidSource` turns that frame into the picture its encoder takes.
+//!
+//! On macOS the reader also asks for frames as IOSurfaces (`surfaces <name>`, the port of a
+//! [`sim_coresim::SurfaceInbox`]): an emulator that has them (`emu -gpu metal`) sends each frame's
+//! surface there, and the frame carries it ([`Taken::surface`]) instead of pixels. The surface is
+//! the emulator's until released: dropping the [`HeldSurface`] sends `release <seq>`. Any frame
+//! that isn't a surface still comes as pixels.
 
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -9,7 +15,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use sim_android::display::{Display as AndroidDisplay, Frames};
+use sim_android::display::{Display as AndroidDisplay, Frames, Next};
 use sim_core::stream::Input;
 
 use crate::{Error, Result};
@@ -30,6 +36,69 @@ struct Frame {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
+    surface: Option<HeldSurface>,
+}
+
+/// An emulator's IOSurface for one frame, held until this is dropped, which tells the emulator
+/// (`release <seq>`) it may write the surface again.
+#[cfg(target_os = "macos")]
+pub struct HeldSurface {
+    pub seq: u32,
+    pub surface: sim_coresim::Surface,
+    link: Arc<UnixStream>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for HeldSurface {
+    fn drop(&mut self) {
+        release(&self.link, self.seq);
+    }
+}
+
+/// Tells the emulator it may have surface `seq` back. One short write: lines from other threads
+/// (input) don't interleave with it.
+#[cfg(target_os = "macos")]
+fn release(link: &UnixStream, seq: u32) {
+    use std::io::Write;
+    let line = format!("{}\n", Input::Release(seq).to_line());
+    let _ = (&*link).write_all(line.as_bytes());
+}
+
+/// Asks the emulator for pixels instead of surfaces from the next frame on (`surfaces -`).
+#[cfg(target_os = "macos")]
+fn surfaces_off(link: &UnixStream) {
+    use std::io::Write;
+    let line = format!("{}\n", Input::Surfaces(sim_core::stream::NO_SURFACES.into()).to_line());
+    let _ = (&*link).write_all(line.as_bytes());
+}
+
+/// Whether `surface` is the frame its record describes: the record's size, in BGRA (what the
+/// encoder wraps it as).
+#[cfg(target_os = "macos")]
+fn fits(surface: &sim_coresim::Surface, header: &sim_core::stream::FrameHeader) -> bool {
+    surface.size() == (header.width, header.height) && surface.pixel_format() == *b"BGRA"
+}
+
+/// No surfaces off macOS.
+#[cfg(not(target_os = "macos"))]
+pub enum HeldSurface {}
+
+/// Waits for surface `seq` in `inbox`: its message goes out just before its record, so it's
+/// there (or one before it whose record was passed over, released here).
+#[cfg(target_os = "macos")]
+fn receive(inbox: &sim_coresim::SurfaceInbox, seq: u32, link: &Arc<UnixStream>) -> Option<HeldSurface> {
+    const WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+    loop {
+        let (got, surface) = inbox.recv(WAIT).ok()??;
+        let held = HeldSurface { seq: got, surface, link: link.clone() };
+        if got == seq {
+            return Some(held);
+        }
+        // An older one (dropped: released); a newer one can't come before its record.
+        if got > seq {
+            return None;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -50,9 +119,13 @@ pub struct Taken {
     pub at: Instant,
     pub width: u32,
     pub height: u32,
-    /// `width * height * 4` bytes of RGBA, rows tightly packed. Give it back with
-    /// [`FrameReader::recycle`] when done: the next frame is read into it.
+    /// `width * height * 4` bytes of RGBA, rows tightly packed (empty for a surface). Give it
+    /// back with [`FrameReader::recycle`] when done: the next frame is read into it.
     pub rgba: Vec<u8>,
+    /// The frame as the emulator's IOSurface (BGRA, `width` x `height`), when it sent one (never
+    /// off macOS).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub surface: Option<HeldSurface>,
     /// Frames that arrived and were replaced by this one without [`FrameReader::wait`] ever
     /// reporting them.
     pub unreported: u64,
@@ -75,11 +148,25 @@ impl FrameReader {
         let source = |e: String| Error::Source(e);
         let mut display = AndroidDisplay::connect(avd_dir).map_err(source)?;
         display.request_shared().map_err(source)?;
+        // Surfaces where the emulator has them; an emulator without ignores the line. Only the
+        // emulator at the other end of this connection may send them.
+        #[cfg(target_os = "macos")]
+        let mut inbox = display
+            .try_clone()
+            .ok()
+            .and_then(|s| sim_coresim::surface_port::peer_pid(&s))
+            .and_then(|pid| sim_coresim::SurfaceInbox::check_in(pid).ok());
+        #[cfg(target_os = "macos")]
+        if let Some(inbox) = &inbox {
+            display.send(&Input::Surfaces(inbox.name().to_owned())).map_err(source)?;
+        }
         // `hello 0` pauses the stream (a hidden window's); full size is a width no frame exceeds.
         let max_width = if max_width == 0 { u32::MAX } else { max_width };
         display.send(&Input::Hello { max_width }).map_err(source)?;
         let mut frames = Frames::new(display.try_clone().map_err(source)?).with_fallback(display.try_clone().map_err(source)?);
         let link = display.try_clone().map_err(source)?;
+        #[cfg(target_os = "macos")]
+        let releases = Arc::new(display.try_clone().map_err(source)?);
         let shared = Arc::new(Shared::default());
         let s = shared.clone();
         let reader = std::thread::Builder::new()
@@ -87,15 +174,51 @@ impl FrameReader {
             .spawn(move || {
                 let mut buf = Vec::new();
                 for seq in 0.. {
-                    match frames.newest_frame_into(&mut buf, || true) {
-                        Ok(h) => {
+                    match frames.newest_into(&mut buf, || true) {
+                        Ok(next) => {
+                            let (h, rgba, surface) = match next {
+                                Next::Pixels(h) => (h, std::mem::take(&mut buf), None),
+                                #[cfg(target_os = "macos")]
+                                Next::Surface { header, seq } => match inbox.as_ref().and_then(|i| receive(i, seq, &releases)) {
+                                    Some(held) if fits(&held.surface, &header) => (header, Vec::new(), Some(held)),
+                                    // Not the frame its record says: it goes back (dropped), and
+                                    // frames come as pixels from now on.
+                                    Some(held) => {
+                                        eprintln!(
+                                            "simee: a {:?} {:?} surface for a {}x{} frame; taking frames as pixels",
+                                            held.surface.size(),
+                                            String::from_utf8_lossy(&held.surface.pixel_format()),
+                                            header.width,
+                                            header.height
+                                        );
+                                        drop(held);
+                                        surfaces_off(&releases);
+                                        inbox = None;
+                                        continue;
+                                    }
+                                    // Never came: let the emulator have it back.
+                                    None => {
+                                        release(&releases, seq);
+                                        continue;
+                                    }
+                                },
+                                #[cfg(not(target_os = "macos"))]
+                                Next::Surface { .. } => continue,
+                            };
                             let at = Instant::now();
                             let mut m = s.lock();
                             m.device = (h.device_width, h.device_height);
-                            let frame = Frame { seq, at, width: h.width, height: h.height, rgba: std::mem::take(&mut buf) };
+                            let frame = Frame { seq, at, width: h.width, height: h.height, rgba, surface };
+                            // A surface nobody took is released as it's replaced.
                             let replaced = m.frame.replace(frame);
-                            // Read the next frame into the one nobody took, or the spare.
-                            buf = replaced.map_or_else(|| std::mem::take(&mut m.spare), |f| f.rgba);
+                            // Read the next frame into the one nobody took, or the spare (a surface
+                            // frame left the buffer here).
+                            if buf.capacity() == 0 {
+                                buf = match replaced {
+                                    Some(f) if f.rgba.capacity() > 0 => f.rgba,
+                                    _ => std::mem::take(&mut m.spare),
+                                };
+                            }
                             drop(m);
                             s.changed.notify_one();
                         }
@@ -119,6 +242,13 @@ impl FrameReader {
     /// A second write handle on the connection, for sending input lines from another thread.
     pub fn input_link(&self) -> Result<UnixStream> {
         self.link.try_clone().map_err(|e| Error::Source(e.to_string()))
+    }
+
+    /// Asks the emulator for frames as pixels from now on, not surfaces (one it sent couldn't be
+    /// used).
+    #[cfg(target_os = "macos")]
+    pub fn stop_surfaces(&self) {
+        surfaces_off(&self.link);
     }
 
     /// Sends one input line (a touch, a key) on the display connection.
@@ -159,7 +289,7 @@ impl FrameReader {
         let frame = self.shared.lock().frame.take()?;
         let unreported = self.reported.map_or(0, |r| frame.seq.saturating_sub(r));
         self.reported = Some(self.reported.map_or(frame.seq, |r| r.max(frame.seq)));
-        Some(Taken { at: frame.at, width: frame.width, height: frame.height, rgba: frame.rgba, unreported })
+        Some(Taken { at: frame.at, width: frame.width, height: frame.height, rgba: frame.rgba, surface: frame.surface, unreported })
     }
 
     /// The sequence number of the frame in the mailbox, and of the last one `wait` reported: what
