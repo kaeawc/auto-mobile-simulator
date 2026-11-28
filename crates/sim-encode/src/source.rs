@@ -175,7 +175,16 @@ impl Source for AndroidSource {
             let (w, h) = (frame.width, frame.height);
             if let Some(held) = frame.surface {
                 // The emulator's surface itself, wrapped: no copy (VideoToolbox converts BGRA).
-                let wrapped = PixelBuffer::wrap_surface(&held.surface).map_err(|e| Error::Source(e.to_string()))?;
+                let wrapped = match PixelBuffer::wrap_surface(&held.surface) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        // One that can't be wrapped goes back (dropped), and the stream goes on
+                        // with pixels from the next frame; the last picture stands until then.
+                        eprintln!("simee: an emulator surface can't be encoded ({e}); taking frames as pixels");
+                        self.reader.stop_surfaces();
+                        return Ok(self.current.as_ref());
+                    }
+                };
                 self.current = Some(wrapped);
                 // The last picture's surface goes back only after the new one replaced it.
                 self.held = Some(held);
@@ -218,18 +227,23 @@ mod tests {
 
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{Receiver, Sender};
     use std::time::Duration;
 
-    use sim_core::stream::{FrameHeader, Record};
+    use sim_core::stream::{FrameHeader, NO_SURFACES, Record};
     use sim_coresim::{Surface, SurfaceOutbox};
 
-    /// An emulator under `-gpu metal`, faked: once the client has said `hello`, it sends `frames`
-    /// new IOSurfaces of `size` to the port the client named (`surfaces <name>`), each followed by
-    /// its record, `gap` apart; the `release` lines it gets come out of the channel. Without a
-    /// `surfaces` line it sends nothing. Removes its directory on drop.
+    /// An emulator under `-gpu metal`, faked. Once the client has said `hello`, each `go` sends
+    /// the next of `frames`: a new IOSurface of `surface` size to the port the client named
+    /// (`surfaces <name>`), then its record for a frame of `record` size; after the client said
+    /// `surfaces -`, the frame's pixels on the socket instead. The lines the client sends after
+    /// `hello` come out of `lines`. Without a `surfaces` line it sends nothing. Removes its
+    /// directory on drop.
     struct FakeMetalEmu {
         dir: std::path::PathBuf,
-        releases: std::sync::mpsc::Receiver<u32>,
+        go: Sender<()>,
+        lines: Receiver<Input>,
         ids: Arc<Mutex<Vec<u32>>>,
     }
 
@@ -239,22 +253,23 @@ mod tests {
         }
     }
 
-    fn fake_metal_emu(name: &str, size: (u32, u32), frames: u32, gap: Duration) -> FakeMetalEmu {
+    fn fake_metal_emu(name: &str, record: (u32, u32), surface: (u32, u32), frames: u32) -> FakeMetalEmu {
         // Short (SUN_LEN), as the frame reader's own fake does.
         let dir = std::path::PathBuf::from("/tmp").join(format!("simee-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let state = emu_avd::state_dir(&dir);
         std::fs::create_dir_all(&state).expect("state dir");
         let listener = UnixListener::bind(state.join("display.sock")).expect("bind");
-        let (tx, releases) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let (tx, lines) = std::sync::mpsc::channel();
         let ids = Arc::new(Mutex::new(Vec::new()));
         let made = ids.clone();
         std::thread::spawn(move || {
             let Ok((conn, _)) = listener.accept() else { return };
             let mut out = conn.try_clone().expect("clone");
-            let mut lines = BufReader::new(conn).lines();
+            let mut input = BufReader::new(conn).lines();
             let mut port = None;
-            for line in lines.by_ref() {
+            for line in input.by_ref() {
                 let Ok(line) = line else { return };
                 if let Some(Input::Surfaces(n)) = Input::parse(&line) {
                     port = SurfaceOutbox::look_up(&n).ok();
@@ -264,26 +279,44 @@ mod tests {
                 }
             }
             let Some(port) = port else { return };
+            // Surfaces off (`surfaces -`) is set before the line is passed on, so a `go` sent after
+            // the test saw it sends pixels.
+            let off = Arc::new(AtomicBool::new(false));
+            let o = off.clone();
+            std::thread::spawn(move || {
+                for line in input {
+                    let Some(i) = line.ok().and_then(|l| Input::parse(&l)) else { return };
+                    if i == Input::Surfaces(NO_SURFACES.into()) {
+                        o.store(true, Ordering::Relaxed);
+                    }
+                    let _ = tx.send(i);
+                }
+            });
             let mut held = Vec::new();
             for seq in 0..frames {
-                let s = Surface::new_bgra(size.0, size.1).expect("surface");
-                made.lock().expect("ids").push(s.id());
-                port.send(&s, seq).expect("send");
-                let header = FrameHeader::new(size.0, size.1, size.0, size.1, u64::from(seq)).expect("header");
-                if out.write_all(&Record::Surface { header, seq }.encode()).is_err() {
+                if go_rx.recv().is_err() {
                     return;
                 }
-                held.push(s);
-                std::thread::sleep(gap);
-            }
-            for line in lines {
-                let Ok(line) = line else { return };
-                if let Some(Input::Release(seq)) = Input::parse(&line) {
-                    let _ = tx.send(seq);
+                let header = FrameHeader::new(record.0, record.1, record.0, record.1, u64::from(seq)).expect("header");
+                let msg = if off.load(Ordering::Relaxed) {
+                    let mut msg = header.encode().to_vec();
+                    msg.extend(vec![0x80; header.len as usize]);
+                    msg
+                } else {
+                    let s = Surface::new_bgra(surface.0, surface.1).expect("surface");
+                    made.lock().expect("ids").push(s.id());
+                    port.send(&s, seq).expect("send");
+                    held.push(s);
+                    Record::Surface { header, seq }.encode().to_vec()
+                };
+                if out.write_all(&msg).is_err() {
+                    return;
                 }
             }
+            // Holds the connection (and the surfaces) until the test ends.
+            while go_rx.recv().is_ok() {}
         });
-        FakeMetalEmu { dir, releases, ids }
+        FakeMetalEmu { dir, go, lines, ids }
     }
 
     fn picture_after(source: &mut AndroidSource, frames: u64) -> (u32, u32, [u8; 4]) {
@@ -301,18 +334,36 @@ mod tests {
 
     #[test]
     fn an_emulators_surfaces_are_wrapped_without_a_copy_and_given_back_when_replaced() {
-        let emu = fake_metal_emu("vt-surf", (64, 32), 2, Duration::from_millis(100));
+        let emu = fake_metal_emu("vt-surf", (64, 32), (64, 32), 2);
         let mut source = AndroidSource::connect(&emu.dir, 0).expect("connect");
+        emu.go.send(()).expect("go");
         assert_eq!(picture_after(&mut source, 1), (64, 32, *b"BGRA"));
         assert_eq!((source.surfaces, source.copied), (1, 0));
         let first = emu.ids.lock().expect("ids")[0];
         assert_eq!(source.held.as_ref().map(|h| h.surface.id()), Some(first), "the emulator's surface, not a copy");
         assert!(source.pool.is_none(), "no pool: nothing to copy into");
-        assert!(emu.releases.recv_timeout(Duration::from_millis(50)).is_err(), "held while it's the picture");
-        // The next frame replaces it, and the first goes back.
+        assert!(emu.lines.recv_timeout(Duration::from_millis(50)).is_err(), "held while it's the picture");
+        // The next frame goes only now, so the first was the picture: it replaces it, and the
+        // first goes back.
+        emu.go.send(()).expect("go");
         picture_after(&mut source, 2);
-        assert_eq!(emu.releases.recv_timeout(Duration::from_secs(5)), Ok(0));
+        assert_eq!(emu.lines.recv_timeout(Duration::from_secs(5)), Ok(Input::Release(0)));
         assert_eq!(source.device_size(), Some((64, 32)));
+    }
+
+    #[test]
+    fn a_surface_that_isnt_its_records_frame_goes_back_and_frames_come_as_pixels() {
+        // The record says 64x32; the surface is 32x16 (a confused or forged sender).
+        let emu = fake_metal_emu("vt-bad", (64, 32), (32, 16), 2);
+        let mut source = AndroidSource::connect(&emu.dir, 0).expect("connect");
+        emu.go.send(()).expect("go");
+        let lines: Vec<Input> = (0..2).filter_map(|_| emu.lines.recv_timeout(Duration::from_secs(5)).ok()).collect();
+        assert!(lines.contains(&Input::Release(0)), "given back: {lines:?}");
+        assert!(lines.contains(&Input::Surfaces(NO_SURFACES.into())), "surfaces off: {lines:?}");
+        // The stream lives on, on pixels.
+        emu.go.send(()).expect("go");
+        assert_eq!(picture_after(&mut source, 1), (64, 32, *b"BGRA"));
+        assert_eq!((source.surfaces, source.copied), (0, 1));
     }
 
     #[test]

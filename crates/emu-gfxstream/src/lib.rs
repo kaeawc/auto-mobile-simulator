@@ -392,6 +392,8 @@ pub struct Renderer {
     /// when this renderer doesn't have it in the expected shape.
     #[cfg(target_os = "macos")]
     metal: OnceLock<Option<MetalPath>>,
+    /// The last post the display was told of, with its size ([`Renderer::note_post`]).
+    post: metal::LastPost,
 }
 
 impl Drop for Renderer {
@@ -500,6 +502,7 @@ impl Renderer {
             iovs: Mutex::new(IovStore::default()),
             #[cfg(target_os = "macos")]
             metal: OnceLock::new(),
+            post: metal::LastPost::default(),
         })
     }
 
@@ -1069,6 +1072,16 @@ impl Renderer {
         }
     }
 
+    /// The display was told of a post of `width` x `height`: the buffer posted last is noted with
+    /// that size, and returned. Call it where the post is noticed (the post callback, the post
+    /// ticker's probe), so [`Renderer::last_posted_surface`] copies a buffer only at the size it
+    /// was posted at.
+    pub fn note_post(&self, width: u32, height: u32) -> Result<u32> {
+        let cb = self.last_posted_color_buffer()?;
+        self.post.note(cb, width, height);
+        Ok(cb)
+    }
+
     /// The last color buffer the renderer posted (host composition's output), read back as
     /// RGBA, `width` x `height`, top row first.
     pub fn read_last_posted(&self, width: u32, height: u32) -> Result<Vec<u8>> {
@@ -1421,9 +1434,15 @@ impl Renderer {
     /// It's used once its first frames that could show a difference match the readback of the
     /// same buffer byte for byte (red and blue swapped), and never if they don't: until then
     /// surfaces are made and checked but not handed out.
+    ///
+    /// The buffer is copied only if it is the post the display was last told of at `width` x
+    /// `height` ([`Renderer::note_post`]): a post at another size that lands between the caller
+    /// taking the frame's size and this call (a resize, an unfold) would otherwise be aliased at
+    /// the old size, after trust, and go out as the wrong layout. That frame is read back instead.
     pub fn last_posted_surface(&self, width: u32, height: u32) -> Result<Option<Arc<metal::MetalSurface>>> {
-        let cb = self.last_posted_color_buffer()?;
-        let Some(path) = self.metal_path().filter(|_| cb != 0) else { return Ok(None) };
+        let live = self.last_posted_color_buffer()?;
+        let Some(cb) = self.post.check(live, width, height) else { return Ok(None) };
+        let Some(path) = self.metal_path() else { return Ok(None) };
         let trust = VkTrust::from(path.trust.load(Ordering::Relaxed));
         if trust == VkTrust::Off {
             return Ok(None);

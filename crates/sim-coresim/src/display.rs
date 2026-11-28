@@ -61,6 +61,12 @@ impl Surface {
         // SAFETY: `self.0` is a live, retained IOSurface.
         unsafe { (IOSurfaceGetWidth(&*self.0) as u32, IOSurfaceGetHeight(&*self.0) as u32) }
     }
+
+    /// The pixel format, as its four characters (`BGRA`).
+    pub fn pixel_format(&self) -> [u8; 4] {
+        // SAFETY: `self.0` is a live, retained IOSurface.
+        unsafe { IOSurfaceGetPixelFormat(&*self.0) }.to_be_bytes()
+    }
 }
 
 /// A device display backed by a framebuffer surface.

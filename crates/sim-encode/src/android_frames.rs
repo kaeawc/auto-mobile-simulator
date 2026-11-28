@@ -64,6 +64,21 @@ fn release(link: &UnixStream, seq: u32) {
     let _ = (&*link).write_all(line.as_bytes());
 }
 
+/// Asks the emulator for pixels instead of surfaces from the next frame on (`surfaces -`).
+#[cfg(target_os = "macos")]
+fn surfaces_off(link: &UnixStream) {
+    use std::io::Write;
+    let line = format!("{}\n", Input::Surfaces(sim_core::stream::NO_SURFACES.into()).to_line());
+    let _ = (&*link).write_all(line.as_bytes());
+}
+
+/// Whether `surface` is the frame its record describes: the record's size, in BGRA (what the
+/// encoder wraps it as).
+#[cfg(target_os = "macos")]
+fn fits(surface: &sim_coresim::Surface, header: &sim_core::stream::FrameHeader) -> bool {
+    surface.size() == (header.width, header.height) && surface.pixel_format() == *b"BGRA"
+}
+
 /// No surfaces off macOS.
 #[cfg(not(target_os = "macos"))]
 pub enum HeldSurface {}
@@ -133,9 +148,14 @@ impl FrameReader {
         let source = |e: String| Error::Source(e);
         let mut display = AndroidDisplay::connect(avd_dir).map_err(source)?;
         display.request_shared().map_err(source)?;
-        // Surfaces where the emulator has them; an emulator without ignores the line.
+        // Surfaces where the emulator has them; an emulator without ignores the line. Only the
+        // emulator at the other end of this connection may send them.
         #[cfg(target_os = "macos")]
-        let inbox = sim_coresim::SurfaceInbox::check_in().ok();
+        let mut inbox = display
+            .try_clone()
+            .ok()
+            .and_then(|s| sim_coresim::surface_port::peer_pid(&s))
+            .and_then(|pid| sim_coresim::SurfaceInbox::check_in(pid).ok());
         #[cfg(target_os = "macos")]
         if let Some(inbox) = &inbox {
             display.send(&Input::Surfaces(inbox.name().to_owned())).map_err(source)?;
@@ -160,7 +180,22 @@ impl FrameReader {
                                 Next::Pixels(h) => (h, std::mem::take(&mut buf), None),
                                 #[cfg(target_os = "macos")]
                                 Next::Surface { header, seq } => match inbox.as_ref().and_then(|i| receive(i, seq, &releases)) {
-                                    Some(held) => (header, Vec::new(), Some(held)),
+                                    Some(held) if fits(&held.surface, &header) => (header, Vec::new(), Some(held)),
+                                    // Not the frame its record says: it goes back (dropped), and
+                                    // frames come as pixels from now on.
+                                    Some(held) => {
+                                        eprintln!(
+                                            "simee: a {:?} {:?} surface for a {}x{} frame; taking frames as pixels",
+                                            held.surface.size(),
+                                            String::from_utf8_lossy(&held.surface.pixel_format()),
+                                            header.width,
+                                            header.height
+                                        );
+                                        drop(held);
+                                        surfaces_off(&releases);
+                                        inbox = None;
+                                        continue;
+                                    }
                                     // Never came: let the emulator have it back.
                                     None => {
                                         release(&releases, seq);
@@ -207,6 +242,13 @@ impl FrameReader {
     /// A second write handle on the connection, for sending input lines from another thread.
     pub fn input_link(&self) -> Result<UnixStream> {
         self.link.try_clone().map_err(|e| Error::Source(e.to_string()))
+    }
+
+    /// Asks the emulator for frames as pixels from now on, not surfaces (one it sent couldn't be
+    /// used).
+    #[cfg(target_os = "macos")]
+    pub fn stop_surfaces(&self) {
+        surfaces_off(&self.link);
     }
 
     /// Sends one input line (a touch, a key) on the display connection.

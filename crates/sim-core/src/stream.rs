@@ -13,7 +13,8 @@
 //! - `key <name>`: press and release a key by its console name (`HOME`, `BACK`, `POWER`, `A`, ...);
 //! - `wheel <ticks>` on the rotary / scroll device;
 //! - `surfaces <name>`: send frames as IOSurfaces to the Mach port checked in under bootstrap name
-//!   `<name>` (`EMUM`, below), where the server has them (`emu -gpu metal`); macOS only;
+//!   `<name>` (`EMUM`, below), where the server has them (`emu -gpu metal`); macOS only.
+//!   `surfaces -` ([`NO_SURFACES`]) turns them off again (a client that can't use one it got);
 //! - `release <seq>`: the client is done with surface `seq` (`EMUM`): the server may reuse it.
 //!
 //! Server → client, 32-byte [`Record`]s, little-endian:
@@ -52,6 +53,21 @@ pub const SURFACE_MAGIC: &[u8; 4] = b"EMUM";
 /// little-endian u32. Its body is one port descriptor (the surface's send right, moved) and then
 /// the record's sequence number as a u32.
 pub const SURFACE_MSG_ID: i32 = i32::from_le_bytes(*SURFACE_MAGIC);
+/// The `surfaces` name that turns surfaces off for the connection (`surfaces -`): frames go the
+/// client's other way from the next one. A client sends it when it can't use a surface it got.
+pub const NO_SURFACES: &str = "-";
+
+/// Whether a failed Mach send (`kern_return_t` `kr`) had copied the message in before it failed,
+/// so the kernel handed its rights back to the sender (a pseudo-receive, `mach_msg(2)`): a moved
+/// port is the sender's again under its name, and a copied destination came back with one more
+/// user reference, which the sender has to drop. A send refused before copyin (a dead
+/// destination) hands nothing back.
+pub fn mach_send_pseudo_received(kr: i32) -> bool {
+    // `MACH_MSG_MASK`: the copyout's own error bits, or'ed into the send's code.
+    const COPYOUT_BITS: i32 = 0x3e00;
+    // MACH_SEND_TIMED_OUT, MACH_SEND_INTERRUPTED, MACH_SEND_INVALID_NOTIFY.
+    matches!(kr & !COPYOUT_BITS, 0x1000_0004 | 0x1000_0007 | 0x1000_000b)
+}
 /// Size of a frame header in bytes.
 pub const HEADER_LEN: usize = 32;
 
@@ -462,6 +478,19 @@ mod tests {
         assert_eq!(&surface[28..32], &77u32.to_le_bytes(), "the sequence number rides in the last u32");
         assert_eq!(FrameHeader::decode(&surface), Err("bad frame header".into()), "an old client's decoder takes only frames");
         assert_eq!(SURFACE_MSG_ID.to_le_bytes(), *b"EMUM");
+    }
+
+    #[test]
+    fn a_send_that_failed_after_copyin_is_told_from_one_refused_before() {
+        // MACH_SEND_TIMED_OUT, MACH_SEND_INTERRUPTED, MACH_SEND_INVALID_NOTIFY: pseudo-received.
+        for kr in [0x1000_0004, 0x1000_0007, 0x1000_000b] {
+            assert!(mach_send_pseudo_received(kr), "{kr:#x}");
+        }
+        assert!(mach_send_pseudo_received(0x1000_0004 | 0x2000), "with the copyout's own error bits");
+        // MACH_SEND_INVALID_DEST (a dead port), MACH_SEND_INVALID_RIGHT: nothing was copied in.
+        assert!(!mach_send_pseudo_received(0x1000_0003) && !mach_send_pseudo_received(0x1000_000a));
+        assert!(!mach_send_pseudo_received(0), "sent");
+        assert_eq!(Input::parse(&Input::Surfaces(NO_SURFACES.into()).to_line()), Some(Input::Surfaces("-".into())));
     }
 
     #[test]

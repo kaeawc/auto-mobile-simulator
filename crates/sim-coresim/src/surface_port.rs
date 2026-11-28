@@ -34,6 +34,7 @@ const MACH_RCV_MSG: i32 = 2;
 const MACH_SEND_TIMEOUT: i32 = 0x10;
 const MACH_RCV_TIMEOUT: i32 = 0x100;
 const MACH_RCV_TIMED_OUT: KernReturn = 0x1000_4003;
+const MACH_RCV_TOO_LARGE: KernReturn = 0x1000_4004;
 const MACH_PORT_RIGHT_RECEIVE: u32 = 1;
 
 #[repr(C)]
@@ -67,13 +68,32 @@ struct Message {
     seq: u32,
 }
 
-/// A received [`Message`] with room for the kernel's trailer.
+/// A received [`Message`] and the kernel's audit trailer right after it (at the message's size,
+/// rounded to 4 bytes: `Message` is 44, so no gap).
 #[repr(C)]
 #[derive(Default)]
 struct Received {
     message: Message,
-    trailer: [u64; 8],
+    trailer: AuditTrailer,
 }
+
+/// `mach_msg_audit_trailer_t`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct AuditTrailer {
+    kind: u32,
+    size: u32,
+    seqno: u32,
+    sender: [u32; 2],
+    /// `audit_token_t`; the sender's pid is `val[5]` (`audit_token_to_pid`).
+    audit: [u32; 8],
+}
+
+const _: () = assert!(std::mem::size_of::<Message>() == 44 && std::mem::offset_of!(Received, trailer) == 44);
+const _: () = assert!(std::mem::size_of::<AuditTrailer>() == 52);
+
+/// `MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) | MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT)`.
+const MACH_RCV_TRAILER_AUDIT: i32 = 3 << 24;
 
 unsafe extern "C" {
     static bootstrap_port: MachPort;
@@ -117,10 +137,23 @@ fn fresh_name() -> String {
     format!("dev.simee.surfaces.{}.{n}.{t:x}", std::process::id())
 }
 
+/// The process at the other end of a connected Unix socket (`LOCAL_PEERPID`): the emulator a
+/// display connection reached, whose surfaces alone an inbox takes ([`SurfaceInbox::check_in`]).
+pub fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: a live socket descriptor and an out-buffer of `len` bytes for the pid.
+    let rc = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_LOCAL, libc::LOCAL_PEERPID, (&raw mut pid).cast(), &mut len) };
+    (rc == 0 && pid > 0).then_some(pid)
+}
+
 /// The receive side: a port checked in under a fresh bootstrap name, which a sender looks up.
 pub struct SurfaceInbox {
     port: MachPort,
     name: String,
+    /// The only process whose messages are taken (by the kernel's audit token for the sender).
+    sender: i32,
 }
 
 // SAFETY: a port name is valid on every thread of the task; receives on it are serialized by the
@@ -130,8 +163,10 @@ unsafe impl Send for SurfaceInbox {}
 unsafe impl Sync for SurfaceInbox {}
 
 impl SurfaceInbox {
-    /// Checks a fresh name in with launchd and takes its receive right.
-    pub fn check_in() -> Result<SurfaceInbox> {
+    /// Checks a fresh name in with launchd and takes its receive right. Only surfaces process
+    /// `sender` sends are taken: the name can be found by any process of the user, so anyone else's
+    /// message is dropped ([`peer_pid`] says which process the emulator is).
+    pub fn check_in(sender: i32) -> Result<SurfaceInbox> {
         let name = fresh_name();
         let c = CString::new(name.clone()).map_err(|e| Error::Invalid(e.to_string()))?;
         let mut port = 0;
@@ -140,7 +175,7 @@ impl SurfaceInbox {
         if kr != 0 || port == 0 {
             return Err(mach_error("bootstrap_check_in", kr));
         }
-        Ok(SurfaceInbox { port, name })
+        Ok(SurfaceInbox { port, name, sender })
     }
 
     /// The bootstrap name a sender looks up (`surfaces <name>`).
@@ -149,7 +184,8 @@ impl SurfaceInbox {
     }
 
     /// The next surface sent here and its sequence number, waiting up to `timeout`; `None` when
-    /// none came by then. A malformed message is dropped (its rights freed) and the wait goes on.
+    /// none came by then. A malformed message, or one from a process other than the inbox's
+    /// sender, is dropped (its rights freed) and the wait goes on.
     pub fn recv(&self, timeout: Duration) -> Result<Option<(u32, Surface)>> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -161,7 +197,7 @@ impl SurfaceInbox {
             let kr = unsafe {
                 mach_msg(
                     (&raw mut buf.message.header).cast(),
-                    MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                    MACH_RCV_MSG | MACH_RCV_TIMEOUT | MACH_RCV_TRAILER_AUDIT,
                     0,
                     size,
                     self.port,
@@ -172,13 +208,20 @@ impl SurfaceInbox {
             if kr == MACH_RCV_TIMED_OUT {
                 return Ok(None);
             }
+            // Bigger than a surface message: the kernel dropped it (no MACH_RCV_LARGE); not ours.
+            if kr == MACH_RCV_TOO_LARGE {
+                continue;
+            }
             if kr != 0 {
                 return Err(mach_error("mach_msg (receive)", kr));
             }
-            let m = buf.message;
-            let shaped = m.header.id == SURFACE_MSG_ID
+            let (m, t) = (buf.message, buf.trailer);
+            // The kernel's word for who sent it, not the message's.
+            let from_sender = t.kind == 0 && t.size as usize >= std::mem::size_of::<AuditTrailer>() && t.audit[5] as i32 == self.sender;
+            let shaped = from_sender
+                && m.header.id == SURFACE_MSG_ID
                 && m.header.bits & MACH_MSGH_BITS_COMPLEX != 0
-                && m.header.size as usize >= std::mem::size_of::<Message>()
+                && m.header.size as usize == std::mem::size_of::<Message>()
                 && m.descriptors == 1
                 && m.port.kind == MACH_MSG_PORT_DESCRIPTOR
                 && m.port.disposition == MACH_MSG_TYPE_PORT_SEND;
@@ -258,6 +301,12 @@ impl SurfaceOutbox {
             // Not sent: the moved right is still ours (returned under its name), so free it.
             // SAFETY: a right this task holds.
             unsafe { mach_port_deallocate(task(), m.port.name) };
+            // Copied in and then handed back (a full queue times out): the destination came back
+            // too, one more reference on our right to the inbox, dropped here.
+            if sim_core::stream::mach_send_pseudo_received(kr) && m.header.remote != 0 {
+                // SAFETY: the reference the pseudo-receive just gave this task.
+                unsafe { mach_port_deallocate(task(), m.header.remote) };
+            }
             return Err(mach_error("mach_msg (send)", kr));
         }
         Ok(())
@@ -347,9 +396,62 @@ impl Surface {
 mod tests {
     use super::*;
 
+    fn me() -> i32 {
+        std::process::id() as i32
+    }
+
+    unsafe extern "C" {
+        fn mach_port_get_refs(task: MachPort, name: MachPort, right: u32, refs: *mut u32) -> KernReturn;
+    }
+
+    /// User references this task holds on send right `port`.
+    fn send_refs(port: MachPort) -> u32 {
+        let mut refs = 0;
+        // SAFETY: the task's own port, a name it holds and a live out-pointer; MACH_PORT_RIGHT_SEND
+        // is 0.
+        let kr = unsafe { mach_port_get_refs(task(), port, 0, &mut refs) };
+        assert_eq!(kr, 0, "mach_port_get_refs");
+        refs
+    }
+
+    #[test]
+    fn a_refused_send_leaves_the_outboxs_right_to_the_inbox_as_it_was() {
+        let inbox = SurfaceInbox::check_in(me()).expect("check in");
+        let outbox = SurfaceOutbox::look_up(inbox.name()).expect("look up");
+        let s = Surface::new_bgra(4, 4).expect("surface");
+        let before = send_refs(outbox.port);
+        let sent = (0..64).take_while(|&i| outbox.send(&s, i).is_ok()).count();
+        assert!(sent < 64, "the queue fills");
+        for i in 0..3 {
+            assert!(outbox.send(&s, 100 + i).is_err(), "still full");
+        }
+        assert_eq!(send_refs(outbox.port), before, "a timed-out send hands the destination back: dropped again");
+    }
+
+    #[test]
+    fn an_inbox_takes_surfaces_only_from_the_sender_it_was_made_for() {
+        let s = Surface::new_bgra(4, 4).expect("surface");
+        // Made for another process: ours is dropped, rights and all, and nothing is left queued.
+        let theirs = SurfaceInbox::check_in(me() + 1).expect("check in");
+        let outbox = SurfaceOutbox::look_up(theirs.name()).expect("look up");
+        outbox.send(&s, 1).expect("send");
+        assert!(theirs.recv(Duration::ZERO).expect("recv").is_none(), "not from its sender");
+        // Made for this one: taken.
+        let ours = SurfaceInbox::check_in(me()).expect("check in");
+        let outbox = SurfaceOutbox::look_up(ours.name()).expect("look up");
+        outbox.send(&s, 2).expect("send");
+        assert_eq!(ours.recv(Duration::ZERO).expect("recv").map(|(seq, got)| (seq, got.id())), Some((2, s.id())));
+    }
+
+    #[test]
+    fn a_connected_sockets_peer_is_found_by_pid() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        assert_eq!(peer_pid(&a), Some(me()));
+    }
+
     #[test]
     fn surfaces_cross_a_checked_in_port_by_name() {
-        let inbox = SurfaceInbox::check_in().expect("check in");
+        let inbox = SurfaceInbox::check_in(me()).expect("check in");
         let outbox = SurfaceOutbox::look_up(inbox.name()).expect("look up");
         assert!(inbox.recv(Duration::from_millis(1)).expect("recv").is_none(), "nothing sent yet");
         let a = Surface::new_bgra(64, 32).expect("surface");
@@ -370,13 +472,14 @@ mod tests {
 
     #[test]
     fn a_full_inbox_refuses_rather_than_blocking() {
-        let inbox = SurfaceInbox::check_in().expect("check in");
+        let inbox = SurfaceInbox::check_in(me()).expect("check in");
         let outbox = SurfaceOutbox::look_up(inbox.name()).expect("look up");
         let s = Surface::new_bgra(4, 4).expect("surface");
-        let started = std::time::Instant::now();
         let sent = (0..64).take_while(|&i| outbox.send(&s, i).is_ok()).count();
         assert!(sent < 64, "a port queues a few messages, not 64");
-        assert!(started.elapsed() < Duration::from_secs(1), "never blocks");
+        // Refused because it would have to wait (a zero timeout), not queued or blocked on.
+        let refused = outbox.send(&s, 64).expect_err("full").to_string();
+        assert!(refused.contains("0x10000004"), "MACH_SEND_TIMED_OUT: {refused}");
         // The ones queued still arrive.
         for i in 0..sent as u32 {
             assert_eq!(inbox.recv(Duration::from_secs(1)).expect("recv").map(|(seq, _)| seq), Some(i));

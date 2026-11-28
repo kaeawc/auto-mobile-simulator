@@ -223,7 +223,9 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     // composited over swipes were noticed, and a tap's changed frame came after 1.4 unchanged
     // readbacks with 8.9 ms of host time (median; p90 24.7) before, none and 6.4 ms (p90 7.9)
     // after (issue #201's tap-to-frame benchmark).
-    let probe: crate::display::PostProbe = Arc::new(|| RENDERER.get().and_then(|r| r.last_posted_color_buffer().ok()));
+    // Its notices are all at the display's size: each post the probe tells apart is noted at it.
+    let (pw, ph) = (spec.width, spec.height);
+    let probe: crate::display::PostProbe = Arc::new(move || RENDERER.get().and_then(|r| r.note_post(pw, ph).ok()));
     let ticker = vulkan_only.then(|| {
         let (w, h) = (spec.width, spec.height);
         let probe = Some((probe, POST_PROBE_INTERVAL));
@@ -253,13 +255,15 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
         display.set_readback(Box::new(|w, h, buf| RENDERER.get().is_some_and(|r| r.read_last_posted_to(w, h, buf).is_ok())));
     }
     if spec.metal_present {
-        if direct && r.can_present_metal() {
-            display.set_surface_readback(Box::new(|w, h| {
+        // Decided before any frame: a GPU that can't alias the renderer's heaps (a VM's
+        // paravirtual one) never runs the copy.
+        match (direct && r.can_present_metal(), emu_gfxstream::metal::system_gate()) {
+            (true, Ok(())) => display.set_surface_readback(Box::new(|w, h| {
                 let s = RENDERER.get()?.last_posted_surface(w, h).ok()??;
                 Some(s as Arc<dyn crate::display::SharedSurface>)
-            }));
-        } else {
-            eprintln!("emu: -gpu metal: this renderer has no Metal handle for its color buffers; frames are read back");
+            })),
+            (true, Err(why)) => eprintln!("emu: -gpu metal: {why}; frames are read back"),
+            (false, _) => eprintln!("emu: -gpu metal: this renderer has no Metal handle for its color buffers; frames are read back"),
         }
     }
     if vulkan_only {
@@ -273,6 +277,11 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
             return;
         }
         if direct {
+            // The buffer this callback is for is still the last posted one (posts are one at a
+            // time): noted with its size before the display hears of it.
+            if let Some(r) = RENDERER.get() {
+                let _ = r.note_post(f.width, f.height);
+            }
             display.posted(f.width, f.height);
             return;
         }

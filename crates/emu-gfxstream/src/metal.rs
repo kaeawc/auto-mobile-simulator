@@ -180,8 +180,57 @@ pub fn bgra_matches_rgba(bgra: &[u8], stride: usize, rgba: &[u8], width: u32, he
     })
 }
 
+/// What a Metal device says it can do, as far as the present path cares ([`present_gate`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    /// `supportsFamily:` `MTLGPUFamilyMetal3`.
+    pub metal3: bool,
+    /// Placement heaps (`supportsFamily:` Apple2 or Mac2): what gfxstream's color buffers are.
+    pub placement_heaps: bool,
+    /// The paravirtualized GPU of a macOS VM ("Apple Paravirtual device"), which forwards Metal
+    /// to the host's.
+    pub paravirtual: bool,
+}
+
+/// Whether the present path may run on a device with `caps`, decided before any heap is aliased:
+/// `Err` says why not, and frames are then read back. Aliasing another API's placement heap with
+/// a texture of our own description is outside what Metal promises; real Apple GPUs keep the
+/// image's bytes there, and a VM's paravirtual GPU faults (CI's `macos-26` runner, PR #379).
+pub fn present_gate(caps: &Capabilities) -> Result<(), &'static str> {
+    if caps.paravirtual {
+        return Err("a paravirtual GPU (a macOS VM's): aliasing the renderer's heaps faults there");
+    }
+    if !caps.placement_heaps {
+        return Err("the GPU has no placement heaps, which the renderer's color buffers are");
+    }
+    if !caps.metal3 {
+        return Err("the GPU is not Metal 3");
+    }
+    Ok(())
+}
+
+/// The last post the display was told of: its color buffer and size, noted together when the post
+/// is noticed, so a frame is copied only at the size its own buffer was posted at.
+#[derive(Default)]
+pub struct LastPost(std::sync::Mutex<(u32, u32, u32)>);
+
+impl LastPost {
+    /// Color buffer `cb` was posted at `width` x `height`.
+    pub fn note(&self, cb: u32, width: u32, height: u32) {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = (cb, width, height);
+    }
+
+    /// `live` (the renderer's last posted buffer now) when it is the noted post and that was
+    /// `width` x `height`; `None` for a post not noticed yet (its size isn't known) or one of
+    /// another size (a resize landed after the reader took the size).
+    pub fn check(&self, live: u32, width: u32, height: u32) -> Option<u32> {
+        let noted = *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (live != 0 && noted == (live, width, height)).then_some(live)
+    }
+}
+
 #[cfg(target_os = "macos")]
-pub use imp::{HeapLookup, MachSender, MetalGpu, MetalSurface, deallocate_port};
+pub use imp::{HeapLookup, MachSender, MetalGpu, MetalSurface, capabilities, deallocate_port, system_gate};
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -331,6 +380,45 @@ mod imp {
         out
     }
 
+    #[link(name = "Metal", kind = "framework")]
+    unsafe extern "C" {
+        fn MTLCreateSystemDefaultDevice() -> Id;
+    }
+
+    const FAMILY_APPLE2: i64 = 1002;
+    const FAMILY_MAC2: i64 = 2002;
+    const FAMILY_METAL3: i64 = 5001;
+
+    /// What `device` says it can do (unknown is false).
+    pub fn capabilities(device: *mut c_void) -> super::Capabilities {
+        let family = |f: i64| send!(device, "supportsFamily:", f => i64; bool).unwrap_or(false);
+        let name = send!(device, "name"; Id)
+            .filter(|n| !n.is_null())
+            .and_then(|n| send!(n, "UTF8String"; *const c_char))
+            .filter(|p| !p.is_null())
+            // SAFETY: a NUL-terminated UTF-8 string the NSString owns, read before it can go.
+            .map(|p| unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        super::Capabilities {
+            metal3: family(FAMILY_METAL3),
+            placement_heaps: family(FAMILY_APPLE2) || family(FAMILY_MAC2),
+            paravirtual: name.contains("Paravirtual"),
+        }
+    }
+
+    /// [`super::present_gate`] for the system's default Metal device, the one the renderer runs on:
+    /// asked once when `-gpu metal` sets up, before any frame.
+    pub fn system_gate() -> Result<(), String> {
+        // SAFETY: returns a +1 device or null without a GPU.
+        let device = unsafe { MTLCreateSystemDefaultDevice() };
+        if device.is_null() {
+            return Err("no Metal device".into());
+        }
+        let caps = pooled(|| capabilities(device));
+        release(device);
+        super::present_gate(&caps).map_err(str::to_owned)
+    }
+
     fn nsstring(s: &str) -> Option<Id> {
         let c = CString::new(s).ok()?;
         send!(class("NSString"), "stringWithUTF8String:", c.as_ptr() => *const c_char; Id).filter(|o| !o.is_null())
@@ -465,6 +553,8 @@ mod imp {
         device: Id,
         queue: Id,
         pipeline: Id,
+        /// Threads per threadgroup (width, height) the pipeline takes.
+        group: (u64, u64),
     }
 
     impl Drop for Device {
@@ -479,7 +569,7 @@ mod imp {
         fn new(device: Id) -> Option<Device> {
             // SAFETY: a live device; retained for this handle, released by its Drop.
             let device = unsafe { objc_retain(device) };
-            let mut d = Device { device, queue: std::ptr::null_mut(), pipeline: std::ptr::null_mut() };
+            let mut d = Device { device, queue: std::ptr::null_mut(), pipeline: std::ptr::null_mut(), group: (8, 8) };
             d.queue = send!(device, "newCommandQueue"; Id)?;
             let mut err: Id = std::ptr::null_mut();
             let lib = pooled(
@@ -494,7 +584,14 @@ mod imp {
             d.pipeline = send!(device, "newComputePipelineStateWithFunction:error:", f => Id, &raw mut err => *mut Id; Id)
                 .unwrap_or(std::ptr::null_mut());
             release(f);
-            (!d.queue.is_null() && !d.pipeline.is_null()).then_some(d)
+            if d.queue.is_null() || d.pipeline.is_null() {
+                return None;
+            }
+            // A SIMD group wide, as many rows as the pipeline allows.
+            let width = send!(d.pipeline, "threadExecutionWidth"; u64).unwrap_or(8).max(1);
+            let max = send!(d.pipeline, "maxTotalThreadsPerThreadgroup"; u64).unwrap_or(64);
+            d.group = (width.min(max).max(1), (max / width).clamp(1, 16));
+            Some(d)
         }
     }
 
@@ -506,6 +603,11 @@ mod imp {
     pub struct MetalGpu {
         lookup: HeapLookup,
         device: Option<Device>,
+        /// Whether the heaps' device is put to [`super::present_gate`] first (tests that probe a
+        /// refused device turn it off).
+        gated: bool,
+        /// The device was refused: nothing is aliased, every present is `None`.
+        refused: bool,
         /// Copies that completed, for the counters a run reports.
         pub copies: u64,
     }
@@ -515,12 +617,37 @@ mod imp {
 
     impl MetalGpu {
         pub fn new(lookup: HeapLookup) -> MetalGpu {
-            MetalGpu { lookup, device: None, copies: 0 }
+            MetalGpu { lookup, device: None, gated: true, refused: false, copies: 0 }
         }
 
+        /// A [`MetalGpu`] that skips [`super::present_gate`], for a test that finds out where a
+        /// refused device fails.
+        #[cfg(test)]
+        pub(crate) fn ungated(lookup: HeapLookup) -> MetalGpu {
+            MetalGpu { gated: false, ..MetalGpu::new(lookup) }
+        }
+
+        /// Whether the queue and pipeline set up on `heap`'s device, for that test.
+        #[cfg(test)]
+        pub(crate) fn sets_up_on(&mut self, heap: *mut c_void) -> bool {
+            self.device_for(heap).is_some()
+        }
+
+        /// The device the heaps live on, set up once, if [`super::present_gate`] lets it run the
+        /// copy: decided before any heap is aliased.
         fn device_for(&mut self, heap: Id) -> Option<&Device> {
             if self.device.is_none() {
+                if self.refused {
+                    return None;
+                }
                 let device = send!(heap, "device"; Id).filter(|d| !d.is_null())?;
+                if self.gated
+                    && let Err(why) = super::present_gate(&pooled(|| capabilities(device)))
+                {
+                    eprintln!("emu: -gpu metal: {why}; frames are read back");
+                    self.refused = true;
+                    return None;
+                }
                 self.device = Some(Device::new(device)?);
             }
             self.device.as_ref()
@@ -579,9 +706,12 @@ mod imp {
                 send!(enc, "setComputePipelineState:", d.pipeline => Id; ())?;
                 send!(enc, "setTexture:atIndex:", src.texture => Id, 0 => u64; ())?;
                 send!(enc, "setTexture:atIndex:", dst.texture => Id, 1 => u64; ())?;
-                let grid = MtlSize { width: u64::from(width), height: u64::from(height), depth: 1 };
-                let group = MtlSize { width: 16, height: 16, depth: 1 };
-                send!(enc, "dispatchThreads:threadsPerThreadgroup:", grid => MtlSize, group => MtlSize; ())?;
+                // Whole threadgroups covering the image (the kernel skips threads past its edge):
+                // non-uniform threadgroups are a GPU family feature this needn't ask for.
+                let (gw, gh) = d.group;
+                let groups = MtlSize { width: u64::from(width).div_ceil(gw), height: u64::from(height).div_ceil(gh), depth: 1 };
+                let group = MtlSize { width: gw, height: gh, depth: 1 };
+                send!(enc, "dispatchThreadgroups:threadsPerThreadgroup:", groups => MtlSize, group => MtlSize; ())?;
                 send!(enc, "endEncoding"; ())?;
                 send!(cmd, "commit"; ())?;
                 send!(cmd, "waitUntilCompleted"; ())?;
@@ -662,6 +792,12 @@ mod imp {
             (kr == 0 && port != 0).then_some(MachSender { port })
         }
 
+        /// The send right's name, for tests that count its references.
+        #[cfg(test)]
+        pub(crate) fn port(&self) -> u32 {
+            self.port
+        }
+
         /// Moves send right `surface` to the client as surface `seq`, without blocking: false
         /// (and the right freed) when it can't go now (the client's queue is full, or it's gone).
         pub fn send(&self, surface: u32, seq: u32) -> bool {
@@ -686,6 +822,12 @@ mod imp {
                 // Not sent: the right is still ours (returned under its name), so free it.
                 // SAFETY: a right this task holds.
                 unsafe { mach_port_deallocate(mach_task_self_, m.port) };
+                // Copied in and then handed back (a full queue times out): the destination came
+                // back too, one more reference on our right to the client, dropped here.
+                if sim_core::stream::mach_send_pseudo_received(kr) && m.remote != 0 {
+                    // SAFETY: the reference the pseudo-receive just gave this task.
+                    unsafe { mach_port_deallocate(mach_task_self_, m.remote) };
+                }
             }
             kr == 0
         }
@@ -884,17 +1026,93 @@ mod tests {
         assert!(!bgra_matches_rgba(&bgra[..4], 12, &rgba, 2, 1), "short");
     }
 
+    #[test]
+    fn the_present_path_is_refused_up_front_on_a_gpu_that_cant_alias_heaps() {
+        let apple = Capabilities { metal3: true, placement_heaps: true, paravirtual: false };
+        assert_eq!(present_gate(&apple), Ok(()));
+        let why = |caps| present_gate(&caps).expect_err("refused");
+        assert!(why(Capabilities { paravirtual: true, ..apple }).contains("paravirtual"), "a VM's GPU");
+        assert!(why(Capabilities { placement_heaps: false, ..apple }).contains("placement heaps"));
+        assert!(why(Capabilities { metal3: false, ..apple }).contains("Metal 3"));
+        assert!(present_gate(&Capabilities::default()).is_err(), "nothing known: refused");
+    }
+
+    #[test]
+    fn a_frame_is_copied_only_at_the_size_its_buffer_was_posted_at() {
+        let post = LastPost::default();
+        assert_eq!(post.check(0, 64, 32), None, "nothing posted");
+        post.note(7, 64, 32);
+        assert_eq!(post.check(7, 64, 32), Some(7));
+        // A resize: the renderer names buffer 8 before the display hears of the post.
+        assert_eq!(post.check(8, 64, 32), None, "a post not noticed yet: its size isn't known");
+        post.note(8, 128, 64);
+        assert_eq!(post.check(8, 64, 32), None, "the reader took the old post's size");
+        assert_eq!(post.check(8, 128, 64), Some(8));
+    }
+
+    /// The Mach side, which needs no GPU.
+    #[cfg(target_os = "macos")]
+    mod on_mach {
+        use super::super::*;
+
+        unsafe extern "C" {
+            static mach_task_self_: u32;
+            fn mach_port_get_refs(task: u32, name: u32, right: u32, refs: *mut u32) -> i32;
+        }
+
+        /// User references this task holds on send right `port`.
+        pub(crate) fn send_refs(port: u32) -> u32 {
+            let mut refs = 0;
+            // SAFETY: the task's own port, a name it holds and a live out-pointer;
+            // MACH_PORT_RIGHT_SEND is 0.
+            let kr = unsafe { mach_port_get_refs(mach_task_self_, port, 0, &mut refs) };
+            assert_eq!(kr, 0, "mach_port_get_refs");
+            refs
+        }
+
+        #[test]
+        fn a_refused_send_leaves_the_senders_right_to_the_client_as_it_was() {
+            let inbox = sim_coresim::SurfaceInbox::check_in(std::process::id() as i32).expect("check in");
+            let sender = MachSender::look_up(inbox.name()).expect("look up");
+            let surface = sim_coresim::Surface::new_bgra(4, 4).expect("surface");
+            let before = send_refs(sender.port());
+            // Nobody receives: the client's queue fills, and the sends after that time out.
+            let sent = (0..64).take_while(|&i| sender.send(surface.mach_port().expect("port"), i)).count();
+            assert!(sent < 64, "a port queues a few messages, not 64");
+            for i in 0..3 {
+                assert!(!sender.send(surface.mach_port().expect("port"), 100 + i), "still full");
+            }
+            assert_eq!(send_refs(sender.port()), before, "a timed-out send hands the destination back: dropped again");
+        }
+    }
+
     #[cfg(target_os = "macos")]
     mod on_metal {
-        use super::super::imp::{MtlSize, SOURCE_USAGE, SizeAndAlign, class, pooled, release, send};
+        use super::super::imp::{MtlSize, SOURCE_USAGE, SizeAndAlign, capabilities, class, pooled, release, send};
         use super::super::*;
         use std::ffi::c_void;
+        use std::time::{Duration, Instant};
 
         type Id = *mut c_void;
 
         #[link(name = "Metal", kind = "framework")]
         unsafe extern "C" {
             fn MTLCreateSystemDefaultDevice() -> Id;
+        }
+
+        /// Set in the child that runs the copy test with the gate off ([`probe_with_the_gate_off`]).
+        const PROBE: &str = "SIMEE_METAL_PROBE";
+        const COPY_TEST: &str = "metal::tests::on_metal::a_color_buffer_heap_is_copied_into_a_bgra_surface_byte_for_byte";
+
+        fn probing() -> bool {
+            std::env::var_os(PROBE).is_some()
+        }
+
+        /// In the probe, names the step about to run on stderr: a fault leaves the last one.
+        fn step(what: &str) {
+            if probing() {
+                eprintln!("metal probe: {what}");
+            }
         }
 
         #[repr(C)]
@@ -911,24 +1129,67 @@ mod tests {
                     70u64 => u64, u64::from(w) => u64, u64::from(h) => u64, false => bool; Id)?;
                 send!(desc, "setStorageMode:", 0u64 => u64; ())?;
                 send!(desc, "setUsage:", SOURCE_USAGE => u64; ())?;
+                step("heapTextureSizeAndAlignWithDescriptor:");
                 let need = send!(device, "heapTextureSizeAndAlignWithDescriptor:", desc => Id; SizeAndAlign)?;
                 let hd = send!(send!(class("MTLHeapDescriptor"), "alloc"; Id)?, "init"; Id)?;
                 send!(hd, "setType:", 1u64 => u64; ())?;
                 send!(hd, "setStorageMode:", 0u64 => u64; ())?;
                 send!(hd, "setSize:", need.size => u64; ())?;
+                step("newHeapWithDescriptor: (placement, shared)");
                 let heap = send!(device, "newHeapWithDescriptor:", hd => Id; Id).filter(|h| !h.is_null());
                 release(hd);
                 let heap = heap?;
+                step("heap newTextureWithDescriptor:offset:");
                 let t = send!(heap, "newTextureWithDescriptor:offset:", desc => Id, 0u64 => u64; Id).filter(|t| !t.is_null())?;
                 let region = Region {
                     origin: MtlSize { width: 0, height: 0, depth: 0 },
                     size: MtlSize { width: u64::from(w), height: u64::from(h), depth: 1 },
                 };
+                step("replaceRegion: into the heap's texture");
                 send!(t, "replaceRegion:mipmapLevel:withBytes:bytesPerRow:", region => Region, 0u64 => u64, rgba.as_ptr() => *const u8, u64::from(w) * 4 => u64; ())?;
                 // The heap keeps the memory; the texture that wrote it can go.
                 release(t);
                 Some(heap)
             })
+        }
+
+        /// Runs the copy test again in a child process with the gate off and says how far it got:
+        /// where a GPU the gate refuses fails, without a fault taking this test binary down.
+        fn probe_with_the_gate_off() -> String {
+            use std::io::Read;
+            let Ok(exe) = std::env::current_exe() else { return "no test binary to probe with".into() };
+            let spawned = std::process::Command::new(exe)
+                .args([COPY_TEST, "--exact", "--nocapture", "--test-threads=1"])
+                .env(PROBE, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+            let Ok(mut child) = spawned else { return "the probe didn't start".into() };
+            let mut stderr = child.stderr.take();
+            let reader = std::thread::spawn(move || {
+                let mut out = String::new();
+                if let Some(e) = stderr.as_mut() {
+                    let _ = e.read_to_string(&mut out);
+                }
+                out
+            });
+            // Only a bound on a hung probe (a copy never completing); nothing is timed.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(s)) => break s.to_string(),
+                    Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break "hung, stopped".into();
+                    }
+                }
+            };
+            let out = reader.join().unwrap_or_default();
+            let last = out.lines().rev().find_map(|l| l.strip_prefix("metal probe: ")).unwrap_or("none").to_owned();
+            format!("with the gate off the copy {status}; the last step it reached: {last}")
         }
 
         #[test]
@@ -939,6 +1200,15 @@ mod tests {
                 eprintln!("no Metal device: skipped");
                 return;
             }
+            // A GPU emu won't run the copy on is skipped, saying why, and where it fails.
+            if !probing()
+                && let Err(why) = present_gate(&pooled(|| capabilities(device)))
+            {
+                eprintln!("skipped: emu refuses the present path on this GPU ({why})");
+                eprintln!("{}", probe_with_the_gate_off());
+                release(device);
+                return;
+            }
             let (w, h) = (67, 35);
             let rgba: Vec<u8> = (0..w * h * 4).map(|i| (i * 7 % 251) as u8).collect();
             let Some(heap) = color_buffer_heap(device, w, h, &rgba) else {
@@ -946,13 +1216,26 @@ mod tests {
                 release(device);
                 return;
             };
-            let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let l = lookups.clone();
             let addr = heap as usize;
-            let mut p = Presenter::new(MetalGpu::new(Box::new(move |cb| {
-                l.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if cb == 5 { addr as *mut c_void } else { std::ptr::null_mut() }
-            })));
+            let lookup = move |cb| if cb == 5 { addr as *mut c_void } else { std::ptr::null_mut() };
+            if probing() {
+                // Each of the present's steps on its own, so the last one named is the one that
+                // failed.
+                let mut gpu = MetalGpu::ungated(Box::new(lookup));
+                step("the device's queue and pipeline");
+                assert!(gpu.sets_up_on(heap), "device");
+                step("a texture over the heap (source)");
+                let src = gpu.source(addr, w, h).expect("source");
+                step("an IOSurface and a texture over it (target)");
+                let dst = gpu.target(w, h).expect("target");
+                step("the compute pass, waited for (copy)");
+                assert!(gpu.copy(&src, &dst, w, h), "copy");
+                step("the surface read back");
+                assert_eq!(dst.with_bgra(|px, stride| bgra_matches_rgba(px, stride, &rgba, w, h)), Some(true));
+                step("done");
+                return;
+            }
+            let mut p = Presenter::new(MetalGpu::new(Box::new(lookup)));
             assert!(p.present(6, w, h).is_none(), "no heap for that buffer");
             let s = p.present(5, w, h).expect("copied");
             assert_eq!(s.size(), (w, h));
@@ -981,7 +1264,7 @@ mod tests {
             let surface = MetalSurface::new(device, 64, 32).expect("surface");
             // The client's side is simee's (`sim_coresim::SurfaceInbox`): the wire format is
             // shared, not the code.
-            let inbox = sim_coresim::SurfaceInbox::check_in().expect("check in");
+            let inbox = sim_coresim::SurfaceInbox::check_in(std::process::id() as i32).expect("check in");
             let sender = MachSender::look_up(inbox.name()).expect("look up");
             assert!(MachSender::look_up("dev.simee.surfaces.nobody").is_none());
             assert!(sender.send(surface.mach_port().expect("port"), 41));

@@ -756,7 +756,7 @@ mod imp {
         let same = first.with_bgra(|px, stride| gfx::metal::bgra_matches_rgba(px, stride, &cb.src, w, h)) == Some(true);
         println!("library surface: {}", if same { "matches the upload (red and blue swapped)" } else { "DIFFERS" });
         drop(first);
-        let inbox = sim_coresim::SurfaceInbox::check_in().map_err(|e| e.to_string())?;
+        let inbox = sim_coresim::SurfaceInbox::check_in(std::process::id() as i32).map_err(|e| e.to_string())?;
         let sender = gfx::metal::MachSender::look_up(inbox.name()).ok_or("no inbox port")?;
         // (emu side, simee side, wall) per frame.
         let (mut emu, mut simee, mut wall) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));

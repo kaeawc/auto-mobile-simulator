@@ -148,12 +148,14 @@ impl Wants {
             .changed
             .wait_timeout_while(g, timeout, |_| self.max_width.load(Ordering::Relaxed) == 0 && !self.done.load(Ordering::Relaxed));
     }
-    /// Surfaces go to the port the client checked in under `name` from the next frame on.
+    /// Surfaces go to the port the client checked in under `name` from the next frame on; none
+    /// for `-` ([`sim_core::stream::NO_SURFACES`]: the client can't use them).
     fn send_surfaces_to(&self, name: &str) {
         #[cfg(target_os = "macos")]
         {
-            let sender = emu_gfxstream::metal::MachSender::look_up(name);
-            if sender.is_none() {
+            let off = name == sim_core::stream::NO_SURFACES;
+            let sender = if off { None } else { emu_gfxstream::metal::MachSender::look_up(name) };
+            if sender.is_none() && !off {
                 eprintln!("emu: display: no surface port named {name}; sending frames as pixels");
             }
             *self.surfaces.lock().unwrap_or_else(|e| e.into_inner()) = sender;
@@ -837,7 +839,7 @@ mod tests {
     fn surface_clients_get_each_frame_through_their_port_and_hold_it_until_they_release_it() {
         let rig = Rig::new("surf");
         let (ids, dropped) = with_surfaces(&rig);
-        let inbox = sim_coresim::SurfaceInbox::check_in().expect("check in");
+        let inbox = sim_coresim::SurfaceInbox::check_in(std::process::id() as i32).expect("check in");
         let mut d = Display::connect(&rig.dir).expect("connect");
         d.request_shared().expect("shm");
         d.send(&Input::Surfaces(inbox.name().to_owned())).expect("surfaces");
@@ -864,10 +866,30 @@ mod tests {
         wait_until("the released surface to go", || dropped.load(Ordering::Relaxed) == 1);
         // A downscaled stream gets pixels: surfaces are full size only.
         d.send(&Input::Hello { max_width: 32 }).expect("hello");
-        std::thread::sleep(Duration::from_millis(50));
-        rig.store.posted(64, 32);
-        let px = frames.newest_into(&mut buf, || true).expect("record");
-        assert!(matches!(px, sim_android::display::Next::Pixels(h) if h.width == 32), "{px:?}");
+        pixels_at(&rig, &mut frames, &mut d, &inbox, 32);
+        // `surfaces -` (a client that can't use them) turns them off: full size comes as pixels.
+        d.send(&Input::Surfaces(sim_core::stream::NO_SURFACES.into())).expect("off");
+        d.send(&Input::Hello { max_width: u32::MAX }).expect("hello");
+        pixels_at(&rig, &mut frames, &mut d, &inbox, 64);
+    }
+
+    /// Posts 64x32 frames until one comes as `width`-wide pixels (lines sent before take effect from
+    /// some frame on), giving back the surfaces that come before it.
+    #[cfg(target_os = "macos")]
+    fn pixels_at(rig: &Rig, frames: &mut Frames<UnixStream>, d: &mut Display, inbox: &sim_coresim::SurfaceInbox, width: u32) {
+        let mut buf = Vec::new();
+        for _ in 0..100 {
+            rig.store.posted(64, 32);
+            match frames.newest_into(&mut buf, || true).expect("record") {
+                sim_android::display::Next::Pixels(h) if h.width == width => return,
+                sim_android::display::Next::Pixels(_) => {}
+                sim_android::display::Next::Surface { seq, .. } => {
+                    let _ = inbox.recv(Duration::from_secs(1)).expect("recv");
+                    d.send(&Input::Release(seq)).expect("release");
+                }
+            }
+        }
+        panic!("no {width}-wide frame as pixels");
     }
 
     #[cfg(target_os = "macos")]
