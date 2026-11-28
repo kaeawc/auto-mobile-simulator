@@ -2062,6 +2062,7 @@ dependencies = [
  "rustix",
  "simee-android",
  "simee-core",
+ "simee-coresim",
  "simee-emu-avd",
  "simee-emu-ext4",
  "simee-emu-gfxstream",
@@ -2095,6 +2096,7 @@ version = "0.2.0"
 dependencies = [
  "libc",
  "simee-core",
+ "simee-coresim",
  "simee-emu-hvf",
  "thiserror 2.0.21",
 ]

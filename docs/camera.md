@@ -24,7 +24,8 @@ tried again after 0.5 s, doubling to 8 s.
 | Virtual camera marking | transport type `virt` (what camera extensions report), or a known name, maker or model (OBS, Camo, mmhmm, "virtual", …) | the v4l2loopback driver or bus (`platform:v4l2loopback-*`), the vivid and akvcam test drivers |
 | Capture from a host camera | `AVCaptureSession` with a BGRA video data output, in the format nearest the request, scaled to each request | V4L2 streaming (4 mmap buffers), YUYV and Motion JPEG to BGRA ([details](#capture-details)) |
 | Camera permission (`tcc::status`) | `authorizationStatusForMediaType:`, never prompts | none needed (`not-required`) |
-| Synthetic sources | all but `video:` | all but `video:` |
+| Synthetic sources | all | all but `video:` (`Unsupported`: video files are decoded with AVFoundation) |
+| Video files (`video:`) | `AVAssetReader`, BGRA, looped at the file's own rate ([details](#capture-details)) | no |
 | Another device's screen (`device:`) | AVDs and simulators | AVDs |
 | Hot-plug (`Hub::events`) | `AVCaptureDeviceWasConnected` / `WasDisconnected`, debounced, then a fresh listing diffed against the last | inotify on `/dev` for `video*` nodes, the same way |
 
@@ -51,7 +52,7 @@ cargo test -p simee-camera lists_host_cameras -- --nocapture
 | `text:<text>` | the text in white on dark grey, centred, wrapped at spaces, as large as fits (`\n` breaks lines) |
 | `image:<path>` | a PNG or JPEG still, filling the frame (aspect kept, overflow cropped) |
 | `solid:<colour>` | one colour: a name (`red`, `grey`, `orange`, …) or hex (`#336699`, `#369`) |
-| `video:<path>` | not yet: returns `Unsupported` until the VideoToolbox decoder is wired up |
+| `video:<path>` | a movie file's first video track (anything AVFoundation decodes: H.264, HEVC, ProRes, Motion JPEG in `.mov`/`.mp4`/`.m4v`), looped at its own frame rate, filling the frame. macOS only; `Unsupported` on Linux. |
 | `device:<udid or name>[:x,y,w,h]` | another simee device's live screen, optionally cropped to a region in that device's pixels: an AVD name, or a simulator's UDID, name or `booted` (macOS). [Below](#another-devices-screen). |
 | `feed:<socket>` | a camera feed's socket (absolute path): what emu reads another device's screen from, served by simee. Not for linking by hand: `camera_link` refuses it (link `device:`). |
 
@@ -169,6 +170,21 @@ then streams through 4 mmap buffers (`REQBUFS`, `QBUF`/`DQBUF` with `poll`, `STR
   own range.
 - The device stays locked across `startRunning`, so the session preset doesn't reset it.
 - A device that can't be locked keeps its current format.
+
+**Video files (macOS):** `video:<path>` reads the file's first video track with an `AVAssetReader`
+and a BGRA track output (`crates/sim-camera/src/avf.rs`; the timeline is `src/video.rs`).
+
+- Each tick shows the frame the file shows at that moment of playback, so the file plays at its
+  own rate whatever rate the capture runs at: a faster capture repeats frames (shared, not
+  copied), a slower one skips them. Variable frame rates and a first frame after zero keep their
+  timing.
+- The file loops: its length is the last frame's time plus the gap before it. At the end a new
+  reader starts at the first frame (after a long stall, whole passes are skipped with one restart).
+  A one-frame file is a still and is never decoded again.
+- One frame is decoded ahead; frames are fitted to each subscriber size like a camera's. The
+  track's rotation (`preferredTransform`) is not applied.
+- A missing file is an `Io` error and a file with no readable video track `Invalid`, both at
+  open; a decode failure mid-file ends the capture with a `Capture` error.
 
 **Hot-plug:** `Hub::events()` gives `Added` and `Removed` events.
 
@@ -303,6 +319,26 @@ Only `tcc::request_access` can show the prompt, and nothing calls it implicitly;
 the status and never prompt. Synthetic sources need no permission. The permission errors are
 tested with a fake status (`tcc::Authorizer`).
 
+A process started in the background by an app that has no camera usage string (an agent's shell,
+for example) never shows the prompt: `request_access` returns `not-determined` at once. Ask from
+Terminal or another app that can show it.
+
+### Live check (2026-11-27)
+
+M3 Max, macOS 26.6.2, built-in FaceTime HD Camera, run from Terminal after allowing its prompt.
+The listing found the FaceTime HD Camera (built-in) and one virtual camera (Airtime). A
+`webcam:0` subscription at 1280×720 and 30 fps through the hub went as follows:
+
+| Measure | Result |
+|---|---|
+| First frame after subscribing (includes session start) | 0.56 s |
+| Frames received | 150, all at 1280×720 |
+| Frame rate | 30.4 fps |
+| Interval between frames, p50 / p95 | 33.3 ms / 37.2 ms |
+
+The hub stamps a frame's `tick.wall` when it delivers the frame, not when the sensor exposed it,
+so this check cannot measure sensor-to-guest latency. That is #327's benchmark.
+
 ## Android: the goldfish camera HAL
 
 `emu` serves the goldfish camera protocol on `qemud:camera` (`crates/emu-vmm/src/pipe/camera.rs`),
@@ -408,7 +444,9 @@ and the relink to `qr:hello`.
 
 Tracked in #335:
 
-- `video:<path>`: needs VideoToolbox decoding (`Unsupported` until then).
+- `video:<path>` plays in `simee-camera` on macOS, but `camera_link` and `boot` still refuse it
+  (`crates/sim-api/src/camera.rs`); allowing it there (with an absolute path, as `image:` needs) is
+  the next step. Linux has no video decoder in this crate.
 - A live capture from a macOS camera has no automated test: it needs the camera permission, which
   the tests never ask for. The live macOS check of the nearest format and of hot-plug, and
   confirming that the device notifications arrive without a main run loop, are still to do.

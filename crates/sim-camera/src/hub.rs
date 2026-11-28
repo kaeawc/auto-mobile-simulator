@@ -811,8 +811,8 @@ mod tests {
     #[test]
     fn an_open_failure_is_returned_to_the_subscriber() {
         let (hub, counts) = hub(None);
-        let err = hub.subscribe(&parse("video:/x.mp4"), FrameSpec::default()).err();
-        assert!(matches!(err, Some(Error::Unsupported(_))), "{err:?}");
+        let err = hub.subscribe(&parse("image:/nonexistent/simee-camera/x.png"), FrameSpec::default()).err();
+        assert!(matches!(&err, Some(Error::Io(m)) if m.contains("x.png")), "{err:?}");
         assert_eq!(counts.opened.load(Ordering::SeqCst), 0);
         assert!(hub.active().is_empty());
     }

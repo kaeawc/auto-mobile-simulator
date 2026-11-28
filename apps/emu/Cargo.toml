@@ -36,6 +36,10 @@ emu-kvm.workspace = true
 emu-sdk = { workspace = true, features = ["testing"] }
 sim-android.workspace = true
 
+# The display server's surface tests receive with simee's own Mach receiver.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+sim-coresim.workspace = true
+
 # `deny`, not the workspace's `forbid`: `shutdown_signals` (signal masks) opts back in, and is the
 # only unsafe code in this crate.
 [lints.rust]
