@@ -39,18 +39,25 @@ pub fn open(source: &SourceSpec) -> Result<Box<dyn Source>> {
             let colour = Colour::parse(colour)?;
             Box::new(Still::new(move |spec| Ok(Canvas::new(spec.width, spec.height, colour).bgra)))
         }
-        SourceSpec::Video(path) => {
-            // TODO(#335): decode with VideoToolbox (AVAssetReader or a
-            // VTDecompressionSession) on macOS, looped, paced by the capture.
-            return Err(Error::Unsupported(format!(
-                "video:{} isn't supported yet: video files need the VideoToolbox decoder, which isn't wired up; use image: for a still",
-                path.display()
-            )));
-        }
+        SourceSpec::Video(path) => return open_video(path),
         SourceSpec::Webcam(_) => return Err(Error::Invalid("a webcam is not a synthetic source".into())),
         SourceSpec::Device(_) => return Err(Error::Invalid("a device's screen is not a synthetic source".into())),
         SourceSpec::Feed(_) => return Err(Error::Invalid("a camera feed is not a synthetic source".into())),
     })
+}
+
+/// A video file, looped at its own frame rate: decoded with AVFoundation on macOS.
+#[cfg(target_os = "macos")]
+fn open_video(path: &Path) -> Result<Box<dyn Source>> {
+    crate::avf::open_video(path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_video(path: &Path) -> Result<Box<dyn Source>> {
+    Err(Error::Unsupported(format!(
+        "video:{}: video files are decoded with AVFoundation, so they play on macOS only; here, use image: for a still, or play the file into a v4l2loopback camera and use webcam:",
+        path.display()
+    )))
 }
 
 type Render = dyn Fn(FrameSpec) -> Result<Vec<u8>> + Send;
@@ -569,9 +576,11 @@ mod tests {
         );
     }
 
+    /// Video files are decoded with AVFoundation; elsewhere `video:` says so and what to use.
+    #[cfg(not(target_os = "macos"))]
     #[test]
-    fn video_is_not_supported_yet() {
+    fn video_needs_macos() {
         let err = open(&SourceSpec::Video("/tmp/clip.mp4".into())).err();
-        assert!(matches!(&err, Some(Error::Unsupported(m)) if m.contains("VideoToolbox")), "{err:?}");
+        assert!(matches!(&err, Some(Error::Unsupported(m)) if m.contains("video:/tmp/clip.mp4") && m.contains("macOS")), "{err:?}");
     }
 }
