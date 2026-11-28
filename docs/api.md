@@ -90,6 +90,14 @@ server's HID client outlives the command). The output is byte for byte the same.
   `audio_capture_start`, `audio_capture_stop`, `audio_mute` and `audio_state` (a capture or mute is
   a helper process its caller owns). These always run in the caller, and need no handshake.
 
+**Stopping a server** (#388). On SIGINT (Ctrl-C) or SIGTERM, `simee serve` stops accepting; a call
+in flight stops at its next safe point (a `boot` waiting for admission boots nothing) and gets
+up to 10 s, a call sent after that isn't run, and both answer `cancelled: server shutting down`.
+Then it stops every stream with its WHIP DELETE, removes its socket and exits 130 (SIGINT) or
+143 (SIGTERM). A second signal exits at once. It never shuts down a device. `simee mcp` stops its
+streams and exits the same way, without waiting for its calls; `emu` stops its guest as the
+console's `kill` does and exits 130 or 143 too.
+
 Relative `path` arguments (`screenshot`, `install`) are made absolute before they are sent.
 
 `device` is a UDID (an Android device's UDID is its AVD name), an exact name, or `booted` (the default: the only running device). It is resolved across both platforms; pass `platform` (`ios` or `android`) to look at one. Parameters ending in `?` are optional.

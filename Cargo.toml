@@ -64,6 +64,9 @@ libc = { version = "0.2", default-features = false }
 # Safe syscall wrappers (plain fsync: std's sync_data is F_FULLFSYNC on macOS; the adb bridge's
 # non-blocking send).
 rustix = { version = "1", default-features = false, features = ["event", "fs", "net", "process", "std"] }
+# SIGINT/SIGTERM for `simee serve` and `simee mcp` (sim-api's `shutdown`, #388): its iterator's
+# handler only writes to a self-pipe; a thread of the server's own does the shutdown.
+signal-hook = { version = "0.4.6", default-features = false, features = ["iterator"] }
 # The user-mode NAT behind virtio-net (emu-vmm): smoltcp's TCP state machine, in safe Rust. Its
 # unsafe code is only in the tap, raw-socket and bpf backends, which stay off.
 smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"] }

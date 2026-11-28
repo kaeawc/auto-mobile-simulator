@@ -39,6 +39,7 @@ pub mod prefs;
 mod progress;
 mod schema;
 pub mod settle;
+pub mod shutdown;
 mod stream;
 mod usage;
 
@@ -173,7 +174,13 @@ fn serve_stream(stream: UnixStream, mut call: impl FnMut(&str, &Value) -> Result
             continue;
         }
         out.clear();
-        let bytes = reply(&line, true, &mut out, &mut call);
+        // Counted while it runs and its reply goes out, so a shutdown waits for both.
+        let Some(_running) = shutdown::enter() else {
+            reply(&line, false, &mut out, |_, _| Err(shutdown::SHUTTING_DOWN.to_owned()));
+            let _ = writer.write_all(&out);
+            break;
+        };
+        let bytes = reply(&line, true, &mut out, |m, p| shutdown::outcome(call(m, p)));
         // The bytes go out from the result's own buffer, not copied after the line.
         if writer.write_all(&out).and_then(|()| bytes.map_or(Ok(()), |b| writer.write_all(&b))).is_err() {
             break;
@@ -273,14 +280,51 @@ pub fn stop_streams() {
     stream::stop_all();
 }
 
-/// Listens on `path` (replacing a stale socket) and serves connections until the process exits.
-pub fn serve(path: &Path) -> std::io::Result<()> {
+/// How long a shutdown gives the calls in flight to finish, or to stop at a safe point, before it
+/// stops the streams and exits anyway.
+const DRAIN: Duration = Duration::from_secs(10);
+
+/// Listens on `path` (replacing a stale socket) and serves connections until SIGINT or SIGTERM
+/// (#388). Then it shuts down in order: it stops accepting, gives the calls in flight up to 10 s
+/// (each stops at its next safe point, answering `cancelled: server shutting down`), stops every
+/// stream with its WHIP DELETE, removes the socket, and returns the exit code (130 for SIGINT,
+/// 143 for SIGTERM). A second signal exits at once ([`shutdown::watch`]).
+pub fn serve(path: &Path) -> std::io::Result<i32> {
+    serve_until_signal(path, Arc::new(methods::Session::default), DRAIN, || ())
+}
+
+/// [`serve`]'s loop and shutdown, with each connection's session made by `make` and `drain` for
+/// how long the calls in flight get; `ready` is called once the socket is bound and the signals
+/// are watched.
+fn serve_until_signal(path: &Path, make: MakeSession, drain: Duration, ready: impl FnOnce()) -> std::io::Result<i32> {
     let listener = bind(path)?;
-    let threads = Threads::new(Arc::new(methods::Session::default));
-    for stream in listener.incoming().flatten() {
-        threads.serve(stream)?;
+    shutdown::remove_on_exit(path);
+    let wake = path.to_owned();
+    // The accept below blocks: a connection of its own wakes it to see the shutdown.
+    shutdown::watch(move |_| drop(UnixStream::connect(&wake)))?;
+    let threads = Threads::new(make);
+    ready();
+    let mut served = Ok(());
+    for stream in listener.incoming() {
+        if shutdown::shutting_down() {
+            break;
+        }
+        if let Ok(stream) = stream
+            && let Err(e) = threads.serve(stream)
+        {
+            served = Err(e);
+            break;
+        }
     }
-    Ok(())
+    // Stop accepting; calls on connections already open are answered `cancelled: server shutting
+    // down` without running.
+    drop(listener);
+    if !shutdown::drain(drain) {
+        eprintln!("simee: calls still running after {} s: stopping anyway", drain.as_secs());
+    }
+    stream::stop_all();
+    shutdown::remove_sockets();
+    served.map(|()| shutdown::signal().map_or(0, shutdown::exit_code))
 }
 
 /// Serves on a background thread; returns once the socket is bound.
