@@ -223,8 +223,8 @@ the MCP server's `camera` toolset (docs/mcp.md):
   host camera's name, index or part of its name: `obs` finds "OBS Virtual Camera", and a name
   that matches several cameras fails, listing them. A host camera is saved by its stable id
   (`webcam:<id>`), so a rename or a replug keeps the link. An `image:` or `video:` path must be
-  absolute and name a file that exists when it is linked (the CLI makes an `image:` path
-  absolute; give `video:` an absolute one); `video:` links on macOS only.
+  absolute and name a file that exists when it is linked (the CLI makes a relative one
+  absolute); `video:` links on macOS only.
 - **Saved:** links live in the device's state (`<avd>/simee/cameras.ini`, `back=<source>` and
   `front=<source>` lines). Every boot passes them to emu as `-camera-back` / `-camera-front`, so
   they come back after a reboot or a server restart, whichever front end boots the device.

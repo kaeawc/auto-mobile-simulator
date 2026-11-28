@@ -867,7 +867,10 @@ impl Transform {
     /// The quarter turns clockwise a track with this `preferredTransform` is shown at, to the
     /// nearest turn (a mirrored track's flip is not applied).
     fn quarter_turns(self) -> u8 {
-        let turns = (self.b.atan2(self.a) / std::f64::consts::FRAC_PI_2).round();
+        // A mirrored matrix (negative determinant) is a flip of x followed by the rotation; take
+        // the rotation out of the unflipped column, so a horizontal mirror stays upright.
+        let a = if self.a * self.d - self.b * self.c < 0.0 { -self.a } else { self.a };
+        let turns = (self.b.atan2(a) / std::f64::consts::FRAC_PI_2).round();
         if turns.is_finite() { (turns as i64).rem_euclid(4) as u8 } else { 0 }
     }
 }
@@ -1192,6 +1195,19 @@ mod tests {
     }
 
     const IDENTITY: Transform = Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 0.0, ty: 0.0 };
+
+    #[test]
+    fn a_mirrored_track_keeps_its_rotation_and_never_turns_over() {
+        let t = |a, b, c, d| Transform { a, b, c, d, tx: 0.0, ty: 0.0 }.quarter_turns();
+        // Plain rotations.
+        assert_eq!((t(1.0, 0.0, 0.0, 1.0), t(0.0, 1.0, -1.0, 0.0), t(-1.0, 0.0, 0.0, -1.0), t(0.0, -1.0, 1.0, 0.0)), (0, 1, 2, 3));
+        // A horizontal mirror is upright (its flip is not applied), not upside down.
+        assert_eq!(t(-1.0, 0.0, 0.0, 1.0), 0);
+        // A mirror composed with each quarter turn keeps that turn.
+        assert_eq!(t(0.0, 1.0, 1.0, 0.0), 1);
+        assert_eq!(t(1.0, 0.0, 0.0, -1.0), 2);
+        assert_eq!(t(0.0, -1.0, -1.0, 0.0), 3);
+    }
 
     /// The track transform a recorder writes for a picture to be shown turned `turns` quarter
     /// turns clockwise (an iPhone held upright records `turns == 1`).
