@@ -121,10 +121,16 @@ the valid ones. Every mode renders through gfxstream; what differs is the Vulkan
 |---|---|---|
 | `auto`, `host` (default) | the host GPU through MoltenVK/KosmicKrisp; lavapipe if MoltenVK fails here | a normal desktop session |
 | `lavapipe`, `swangle`, `angle_indirect` | lavapipe, software Vulkan on the CPU | no GPU, CI, headless hosts |
-| `swiftshader`, `swiftshader_indirect` | SwiftShader, software Vulkan on the CPU | comparing against lavapipe |
+| `swiftshader`, `swiftshader_indirect` | SwiftShader, software Vulkan on the CPU (Linux hosts only; see below) | comparing against lavapipe |
 | `software`, `guest` | lavapipe, with stock's notice that guest rendering isn't supported | an AVD configured that way keeps booting |
 | `off`, `none` | no renderer; the guest boots without graphics | boot-only checks (flag only; `hw.gpu.mode=off` in `config.ini` is ignored) |
 | `metal` (flag only, experimental) | `host`, and posted frames also go to simee's encoder as IOSurfaces copied on the GPU instead of read back | measuring the Metal present path (#356, docs/research/metal-present.md) |
+
+SwiftShader doesn't work on macOS hosts: the renderer aborts at init with "Failed to find memory
+type for ColorBuffers" (6 of 6 boots on API 30 and 36, M3 Max, 2026-11-27, #397). So `emu -gpu
+swiftshader` (or `swiftshader_indirect`) is refused up front with "use -gpu lavapipe", and an AVD
+whose `hw.gpu.mode` says `swiftshader` runs lavapipe instead and prints a notice. Linux hosts are
+unchanged.
 
 Rendering inside the guest (virtio-gpu 2D with Mesa in the image) isn't possible with SDK
 images: a scan of the API 34 to 37 system images found none that ships a guest renderer, and
