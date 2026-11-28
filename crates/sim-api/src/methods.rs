@@ -358,13 +358,13 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "kind?(host|virtual|synthetic)",
         "The sources a device camera can link to, each with the `source` id camera_link takes: the host's cameras (built-in, \
          external, Continuity Camera, and virtual cameras such as OBS Virtual Camera, flagged `virtual`) and the synthetic kinds \
-         (pattern:testcard, qr:, text:, image:, solid:); and the host's camera permission (macOS: the TCC status of the app that \
+         (pattern:testcard, qr:, text:, image:, video: on macOS, solid:); and the host's camera permission (macOS: the TCC status of the app that \
          started the server, with the fix when it blocks capture), read without ever prompting",
     ),
     (
         "camera_link",
         "device, facing(back|front|both), source",
-        "Feed a device camera from a source: a source id (webcam:<id>, pattern:testcard, qr:<text>, text:<text>, image:<absolute path>, \
+        "Feed a device camera from a source: a source id (webcam:<id>, pattern:testcard, qr:<text>, text:<text>, image:<absolute path>, video:<absolute path> (macOS, looped), \
          solid:<colour>; emulated is the test card, none turns the camera off) or a host camera's name, index or part of its name \
          (obs finds OBS Virtual Camera; an ambiguous one fails listing the matches), saved by its stable id. Saved with the device: \
          it comes back on every boot and survives a server restart. Android: a running device is relinked live through emu's console \

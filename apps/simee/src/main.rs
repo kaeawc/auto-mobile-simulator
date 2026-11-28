@@ -489,7 +489,7 @@ enum CameraCmd {
         json: bool,
     },
     /// Feed a device camera from a source: an id (qr:hello, pattern:testcard, text:Hi,
-    /// image:PATH, solid:red, webcam:ID, none) or part of a host camera's name (`obs` finds "OBS
+    /// image:PATH, video:PATH (macOS), solid:red, webcam:ID, none) or part of a host camera's name (`obs` finds "OBS
     /// Virtual Camera"; a name that matches several fails, listing them). The back camera unless
     /// --front or --both.
     Link {
@@ -1054,12 +1054,14 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
     Ok(())
 }
 
-/// A camera source as the server should read it: an `image:` path made absolute.
+/// A camera source as the server should read it: an `image:` or `video:` path made absolute.
 fn camera_source(source: &str) -> String {
-    match source.strip_prefix("image:") {
-        Some(path) => format!("image:{}", absolute(path)),
-        None => source.to_owned(),
+    for kind in ["image:", "video:"] {
+        if let Some(path) = source.strip_prefix(kind) {
+            return format!("{kind}{}", absolute(path));
+        }
     }
+    source.to_owned()
 }
 
 /// `simee camera ...`: the camera methods, printed one line per source or link (or as JSON).
@@ -1307,6 +1309,17 @@ fn xr_params(device: &str, words: &[String]) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_file_sources_are_sent_as_absolute_paths() {
+        let cwd = std::env::current_dir().expect("cwd");
+        for kind in ["image", "video"] {
+            assert_eq!(camera_source(&format!("{kind}:clip.mov")), format!("{kind}:{}", cwd.join("clip.mov").display()));
+            assert_eq!(camera_source(&format!("{kind}:/abs/clip.mov")), format!("{kind}:/abs/clip.mov"));
+        }
+        assert_eq!(camera_source("qr:hello"), "qr:hello");
+        assert_eq!(camera_source("webcam:0"), "webcam:0");
+    }
 
     #[test]
     fn list_groups_devices_by_runtime_with_labels() {

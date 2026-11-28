@@ -24,8 +24,8 @@ tried again after 0.5 s, doubling to 8 s.
 | Virtual camera marking | transport type `virt` (what camera extensions report), or a known name, maker or model (OBS, Camo, mmhmm, "virtual", …) | the v4l2loopback driver or bus (`platform:v4l2loopback-*`), the vivid and akvcam test drivers |
 | Capture from a host camera | `AVCaptureSession` with a BGRA video data output, in the format nearest the request, scaled to each request | V4L2 streaming (4 mmap buffers), YUYV and Motion JPEG to BGRA ([details](#capture-details)) |
 | Camera permission (`tcc::status`) | `authorizationStatusForMediaType:`, never prompts | none needed (`not-required`) |
-| Synthetic sources | all | all but `video:` (`Unsupported`: video files are decoded with AVFoundation) |
-| Video files (`video:`) | `AVAssetReader`, BGRA, looped at the file's own rate ([details](#capture-details)) | no |
+| Synthetic sources (`pattern:`, `qr:`, `text:`, `image:`, `solid:`) | all | all |
+| Video files (`video:`) | `AVAssetReader`, BGRA, upright, looped at the file's own rate ([details](#capture-details)) | no (`Unsupported`: video files are decoded with AVFoundation) |
 | Another device's screen (`device:`) | AVDs and simulators | AVDs |
 | Hot-plug (`Hub::events`) | `AVCaptureDeviceWasConnected` / `WasDisconnected`, debounced, then a fresh listing diffed against the last | inotify on `/dev` for `video*` nodes, the same way |
 
@@ -52,7 +52,7 @@ cargo test -p simee-camera lists_host_cameras -- --nocapture
 | `text:<text>` | the text in white on dark grey, centred, wrapped at spaces, as large as fits (`\n` breaks lines) |
 | `image:<path>` | a PNG or JPEG still, filling the frame (aspect kept, overflow cropped) |
 | `solid:<colour>` | one colour: a name (`red`, `grey`, `orange`, …) or hex (`#336699`, `#369`) |
-| `video:<path>` | a movie file's first video track (anything AVFoundation decodes: H.264, HEVC, ProRes, Motion JPEG in `.mov`/`.mp4`/`.m4v`), looped at its own frame rate, filling the frame. macOS only; `Unsupported` on Linux. |
+| `video:<path>` | a movie file's first video track (anything AVFoundation decodes: H.264, HEVC, ProRes, Motion JPEG in `.mov`/`.mp4`/`.m4v`), looped at its own frame rate, upright (the track's rotation applied), filling the frame. Frames up to 8192 px a side and 36 megapixels, as for `image:`. macOS only; `Unsupported` on Linux. |
 | `device:<udid or name>[:x,y,w,h]` | another simee device's live screen, optionally cropped to a region in that device's pixels: an AVD name, or a simulator's UDID, name or `booted` (macOS). [Below](#another-devices-screen). |
 | `feed:<socket>` | a camera feed's socket (absolute path): what emu reads another device's screen from, served by simee. Not for linking by hand: `camera_link` refuses it (link `device:`). |
 
@@ -175,16 +175,25 @@ then streams through 4 mmap buffers (`REQBUFS`, `QBUF`/`DQBUF` with `poll`, `STR
 and a BGRA track output (`crates/sim-camera/src/avf.rs`; the timeline is `src/video.rs`).
 
 - Each tick shows the frame the file shows at that moment of playback, so the file plays at its
-  own rate whatever rate the capture runs at: a faster capture repeats frames (shared, not
-  copied), a slower one skips them. Variable frame rates and a first frame after zero keep their
-  timing.
+  own rate whatever rate the capture runs at: a faster capture repeats frames, a slower one skips
+  them. Variable frame rates and a first frame after zero keep their timing.
+- Only a frame that is shown is copied out of the decoder; frames skipped past are released
+  uncopied. A shown frame is fitted once per output size (the player's and the hub's), so a
+  repeated frame is the same pixels, not a fresh scale each tick.
 - The file loops: its length is the last frame's time plus the gap before it. At the end a new
-  reader starts at the first frame (after a long stall, whole passes are skipped with one restart).
-  A one-frame file is a still and is never decoded again.
-- One frame is decoded ahead; frames are fitted to each subscriber size like a camera's. The
-  track's rotation (`preferredTransform`) is not applied.
+  reader starts at the first frame. Once a pass has played, a long stall skips whole passes with
+  one reader started at the right time (`timeRange`), without decoding the rest of the pass. A
+  one-frame file is a still and is never decoded again.
+- A tick decodes at most 120 frames. Further behind than that, playback jumps with a reader
+  started one frame before the time due (the track's end is known from its `timeRange`); a
+  reader still decodes from the keyframe before it, so a jump costs up to one keyframe interval.
+- The track's rotation (`preferredTransform`, in quarter turns) is applied while the shown frame
+  is copied out, so a portrait phone recording plays upright, at its turned size. A mirrored
+  track's flip is not applied.
 - A missing file is an `Io` error and a file with no readable video track `Invalid`, both at
-  open; a decode failure mid-file ends the capture with a `Capture` error.
+  open, as is a track larger than `image:` allows (`naturalSize`, and each frame again). A decode
+  failure mid-file keeps the last frame on show and restarts the reader where playback is, after
+  100 ms, doubling; five failures in a row end the capture with the `Capture` error.
 
 **Hot-plug:** `Hub::events()` gives `Added` and `Removed` events.
 
@@ -213,8 +222,9 @@ the MCP server's `camera` toolset (docs/mcp.md):
 - **Sources:** any source id above, `emulated` (the test card) or `none` (the camera off), or a
   host camera's name, index or part of its name: `obs` finds "OBS Virtual Camera", and a name
   that matches several cameras fails, listing them. A host camera is saved by its stable id
-  (`webcam:<id>`), so a rename or a replug keeps the link. An `image:` path must be absolute (the
-  CLI makes it so); `video:` isn't supported yet.
+  (`webcam:<id>`), so a rename or a replug keeps the link. An `image:` or `video:` path must be
+  absolute and name a file that exists when it is linked (the CLI makes a relative one
+  absolute); `video:` links on macOS only.
 - **Saved:** links live in the device's state (`<avd>/simee/cameras.ini`, `back=<source>` and
   `front=<source>` lines). Every boot passes them to emu as `-camera-back` / `-camera-front`, so
   they come back after a reboot or a server restart, whichever front end boots the device.
@@ -444,12 +454,12 @@ and the relink to `qr:hello`.
 
 Tracked in #335:
 
-- `video:<path>` plays in `simee-camera` on macOS, but `camera_link` and `boot` still refuse it
-  (`crates/sim-api/src/camera.rs`); allowing it there (with an absolute path, as `image:` needs) is
-  the next step. Linux has no video decoder in this crate.
+- `video:` on Linux: this crate has no video decoder there. A `video:` link hasn't been run on a
+  device yet (a guest's camera app showing the file, Android and iOS).
 - A live capture from a macOS camera has no automated test: it needs the camera permission, which
-  the tests never ask for. The live macOS check of the nearest format and of hot-plug, and
-  confirming that the device notifications arrive without a main run loop, are still to do.
+  the tests never ask for. The nearest-format selection was checked live once ([Live
+  check](#live-check-2026-11-27), 1280x720 at 30 fps); the live check of hot-plug, and confirming
+  that the device notifications arrive without a main run loop, are still to do.
 - NV12 frames and IOSurface-backed output: frames are BGRA bytes.
 - `device:`: the optional `:warp` (a mild perspective and noise, like a camera pointed at a phone)
   isn't done. Not yet run on devices: the checks (a QR code on A, B's back camera linked to

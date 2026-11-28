@@ -142,12 +142,18 @@ fn load_image(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
     }
 }
 
-/// The longest side an `image:` file may have, and the most pixels: bigger files are refused
-/// before anything is allocated for them (a header can claim far more than its bytes hold).
+/// The longest side an `image:` file (or a `video:` file's frame) may have, and the most pixels:
+/// bigger files are refused before anything is allocated for them (a header can claim far more
+/// than its bytes hold).
 pub const MAX_IMAGE_SIDE: u32 = 8192;
 pub const MAX_IMAGE_PIXELS: u64 = 36_000_000;
 
 fn check_size(width: u32, height: u32) -> std::result::Result<(), String> {
+    check_size_of("image", width, height)
+}
+
+/// Checks a `kind:` source's picture size against [`MAX_IMAGE_SIDE`] and [`MAX_IMAGE_PIXELS`].
+pub(crate) fn check_size_of(kind: &str, width: u32, height: u32) -> std::result::Result<(), String> {
     if width == 0
         || height == 0
         || width > MAX_IMAGE_SIDE
@@ -155,7 +161,7 @@ fn check_size(width: u32, height: u32) -> std::result::Result<(), String> {
         || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
     {
         return Err(format!(
-            "{width}x{height} is outside what image: accepts (up to {MAX_IMAGE_SIDE} px a side and {} megapixels)",
+            "{width}x{height} is outside what {kind}: accepts (up to {MAX_IMAGE_SIDE} px a side and {} megapixels)",
             MAX_IMAGE_PIXELS / 1_000_000
         ));
     }
