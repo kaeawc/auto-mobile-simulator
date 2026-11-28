@@ -69,80 +69,8 @@ pub const SHAPE_KEYS: [&str; 10] = [
 pub const DUPLICATED_IDENTITY: &str = "every AVD made from a golden is the same device to its guest: android_id and per-app SSAIDs \
      live in the copied, encrypted user data";
 
-/// How a file was copied.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CloneKind {
-    /// A reflink (`FICLONE` on Linux): no data copied, blocks shared until either side writes.
-    Reflink,
-    /// Only the data extents copied: the file stays as sparse as the original.
-    Sparse,
-    /// `std::fs::copy`, which clones the file on APFS and copies it elsewhere.
-    Copy,
-}
-
-impl CloneKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            CloneKind::Reflink => "reflink",
-            CloneKind::Sparse => "sparse copy",
-            CloneKind::Copy => "copy (copy-on-write on APFS)",
-        }
-    }
-}
-
-/// Copies `from` to the new file `to`: a reflink where the file system has them, else a copy
-/// that keeps the file's holes (a user data image is mostly one), else `std::fs::copy`.
-///
-/// `to` must not exist (on any platform: `std::fs::copy` would replace it), and a failed clone
-/// leaves no half-written file behind.
-pub fn clone_file(from: &Path, to: &Path) -> Result<CloneKind> {
-    if to.symlink_metadata().is_ok() {
-        return Err(Error::Io(to.to_path_buf(), std::io::ErrorKind::AlreadyExists.into()));
-    }
-    clone_new_file(from, to).inspect_err(|_| {
-        let _ = std::fs::remove_file(to);
-    })
-}
-
-fn clone_new_file(from: &Path, to: &Path) -> Result<CloneKind> {
-    let io = |p: &Path, e| Error::Io(p.to_path_buf(), e);
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::FileExt;
-        let src = File::open(from).map_err(|e| io(from, e))?;
-        let dst = File::options().write(true).create_new(true).open(to).map_err(|e| io(to, e))?;
-        if rustix::fs::ioctl_ficlone(&dst, &src).is_ok() {
-            return Ok(CloneKind::Reflink);
-        }
-        let len = src.metadata().map_err(|e| io(from, e))?.len();
-        dst.set_len(len).map_err(|e| io(to, e))?;
-        let mut buf = vec![0u8; 1 << 20];
-        let mut pos = 0u64;
-        while pos < len {
-            let data = match rustix::fs::seek(&src, rustix::fs::SeekFrom::Data(pos)) {
-                Ok(d) => d,
-                // No data from `pos` on: the rest is a hole.
-                Err(rustix::io::Errno::NXIO) => break,
-                Err(e) => return Err(io(from, e.into())),
-            };
-            let end = rustix::fs::seek(&src, rustix::fs::SeekFrom::Hole(data)).map_err(|e| io(from, e.into()))?.min(len);
-            let mut at = data;
-            while at < end {
-                let n = ((end - at) as usize).min(buf.len());
-                src.read_exact_at(&mut buf[..n], at).map_err(|e| io(from, e))?;
-                dst.write_all_at(&buf[..n], at).map_err(|e| io(to, e))?;
-                at += n as u64;
-            }
-            pos = end;
-        }
-        Ok(CloneKind::Sparse)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        std::fs::copy(from, to).map_err(|e| io(from, e))?;
-        Ok(CloneKind::Copy)
-    }
-}
+/// How a disk was copied, and the one function that copies them (`clone.rs`).
+pub use crate::clone::{CloneKind, clone_file};
 
 /// What a golden is keyed by.
 #[derive(Clone, Debug, PartialEq, Eq)]
