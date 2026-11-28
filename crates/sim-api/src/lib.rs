@@ -329,7 +329,7 @@ fn serve_until_signal(path: &Path, make: MakeSession, drain: Duration, ready: im
 /// are removed.
 fn shut_down(drain: Duration) {
     if !shutdown::drain(drain) {
-        eprintln!("simee: calls still running after {} s: stopping anyway", drain.as_secs());
+        shutdown::say!("simee: calls still running after {} s: stopping anyway", drain.as_secs());
     }
     stream::stop_all();
     shutdown::remove_sockets();

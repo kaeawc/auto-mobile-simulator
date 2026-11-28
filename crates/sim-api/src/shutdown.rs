@@ -13,6 +13,16 @@
 //! Ctrl-C at a terminal goes to the whole process group, so the Android emulators `serve` started
 //! (its children) get the SIGINT too, and power off.
 
+/// `eprintln!` without its panic on a closed stderr: a shutdown message must never stop the
+/// shutdown it announces.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+pub(crate) use say;
+
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -102,13 +112,13 @@ pub fn watch(first: impl FnOnce(i32) + Send + 'static) -> std::io::Result<()> {
         let mut first = Some(first);
         for sig in signals.forever() {
             let Some(shutdown) = first.take() else {
-                eprintln!("simee: a second {}: exiting now", name(sig));
+                say!("simee: a second {}: exiting now", name(sig));
                 exit(sig);
             };
             SIGNAL.store(sig, Ordering::SeqCst);
-            eprintln!("simee: {}: shutting down (a second Ctrl-C or SIGTERM exits at once)", name(sig));
+            say!("simee: {}: shutting down (a second Ctrl-C or SIGTERM exits at once)", name(sig));
             if let Err(e) = std::thread::Builder::new().name("simee-shutdown".into()).spawn(move || shutdown(sig)) {
-                eprintln!("simee: cannot start the shutdown ({e}): exiting now");
+                say!("simee: cannot start the shutdown ({e}): exiting now");
                 exit(sig);
             }
         }
