@@ -229,6 +229,16 @@ fn every_destructive_method_is_annotated_destructive() {
 }
 
 #[test]
+fn boot_manys_schema_declares_a_cancelled_result_for_every_era() {
+    for era in [Era::Modern, Era::Legacy] {
+        let schema = output_schema("boot_many", era);
+        assert_eq!(schema["properties"]["cancelled"]["type"], "boolean", "{era:?}: {schema}");
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.contains(&json!("cancelled")), "only a cancelled call has it ({era:?})");
+    }
+}
+
+#[test]
 fn every_tool_has_an_output_schema_its_results_fit() {
     for (era, version) in [(Era::Modern, crate::rpc::MODERN), (Era::Legacy, "2025-11-25"), (Era::Legacy, "2025-06-18")] {
         let tools = list(&Toolsets::all(), &ctx(era, version));

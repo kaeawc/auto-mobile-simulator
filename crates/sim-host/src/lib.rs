@@ -644,7 +644,12 @@ mod tests {
     #[test]
     fn the_sampler_fills_the_ring() {
         let s = Sampler::start(Duration::from_millis(10));
-        std::thread::sleep(Duration::from_millis(120));
+        // Wait for 3 samples rather than a fixed 120 ms: a loaded CI runner took only 2 in that
+        // time. The deadline still fails a sampler that never fills.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while s.ring().len() < 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let ring = s.ring();
         assert!(ring.len() >= 3, "{}", ring.len());
         let r = s.report(Thresholds::default());
