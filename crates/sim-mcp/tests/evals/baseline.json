@@ -46,6 +46,10 @@
     "prompt-reproduce-bug": {
       "all": 42528,
       "core": 23320
+    },
+    "read-resources-find-heavy-process": {
+      "all": 33390,
+      "core": 10622
     }
   }
 }

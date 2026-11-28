@@ -2942,6 +2942,40 @@ mod tests {
             assert_eq!(source.shown.get(), 5);
         }
 
+        /// A subscription's reads: `seconds` of one read a second of `last`, with a line arriving
+        /// each second; how many of them `log show` answered. The stream's ring holds `keep` lines.
+        fn shown_by_a_subscription(last: &str, keep: usize, seconds: u64) -> (u32, usize) {
+            let (at, clock) = clock();
+            // Each line is 10 bytes, so the ring holds `keep` of them (the heavy-log case: a boot
+            // fills it in half a minute).
+            let (source, mut streams) = (FakeLog::default(), LogStreams::new(keep * 10, Duration::from_secs(300), clock));
+            logs(&mut streams, &source, key(1), last, None);
+            source.started.borrow()[0].write(HEADER);
+            for second in 1..=seconds {
+                advance(&at, Duration::from_secs(1));
+                let line = format!("line {second:04}");
+                source.started.borrow()[0].write(&line);
+                until(|| streams.kept.get("UDID").is_some_and(|(_, t)| lock(t).ring.lines.back().is_some_and(|(_, l)| *l == line)));
+                logs(&mut streams, &source, key(1), last, None);
+            }
+            (source.shown.get(), source.started.borrow().len())
+        }
+
+        #[test]
+        fn a_short_window_read_every_second_stops_spawning_log_show_once_the_stream_is_that_old() {
+            // The logs resource asks for a 5 s window (`sim-mcp`'s LOG_WINDOW) once a second. A ring
+            // that holds a boot's 10 s of lines answers every read after the first 5 s from the
+            // stream: `log show` ran for the first read, then for the 5 reads that reach back
+            // before the stream started, and never after.
+            let (shown, streams) = shown_by_a_subscription("5s", 10, 120);
+            assert_eq!(streams, 1, "one stream the whole time");
+            assert_eq!(shown, 1 + 4, "the first read and the four before the stream is 5 s old, then none for 115 more");
+            // A window the ring can't hold falls back on every read: the cost of a 30 s window on
+            // a just-booted device.
+            let (shown, _) = shown_by_a_subscription("30s", 10, 120);
+            assert_eq!(shown, 1 + 120);
+        }
+
         #[test]
         fn a_new_boot_or_a_closed_stream_starts_another() {
             let (at, clock) = clock();

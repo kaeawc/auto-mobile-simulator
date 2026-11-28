@@ -39,6 +39,7 @@ pub mod prefs;
 mod progress;
 mod schema;
 pub mod settle;
+mod shrink;
 mod stream;
 mod usage;
 
@@ -59,6 +60,7 @@ pub use methods::{METHODS, Session, call as call_method, platforms};
 pub use outputs::output_schema;
 pub use progress::{CallHooks, Progress, call_cancelled, call_progress, call_step, with_call_hooks};
 pub use schema::input_schema;
+pub use shrink::{AGENT_MAX_SIDE, shrink_png_base64};
 pub use sim_core::frame::encode_png;
 
 /// The default socket path: `$SIMEE_SOCKET`, else `$TMPDIR/simee.sock`.

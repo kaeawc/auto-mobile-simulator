@@ -49,10 +49,23 @@ impl Env {
 
     /// `simee mcp` with `SIMEE_MCP_TOOLSETS` set to `toolsets` (unset: the default, `core`).
     fn mcp_with(&self, toolsets: Option<&str>) -> Mcp {
+        self.spawn(toolsets, None)
+    }
+
+    /// `simee mcp` (every tool) with `SIMEE_MCP_SCREEN_FPS` set to `fps`.
+    fn mcp_fps(&self, fps: &str) -> Mcp {
+        self.spawn(Some("all"), Some(fps))
+    }
+
+    fn spawn(&self, toolsets: Option<&str>, screen_fps: Option<&str>) -> Mcp {
         let mut command = Command::new(env!("CARGO_BIN_EXE_simee"));
         match toolsets {
             Some(t) => command.env("SIMEE_MCP_TOOLSETS", t),
             None => command.env_remove("SIMEE_MCP_TOOLSETS"),
+        };
+        match screen_fps {
+            Some(f) => command.env("SIMEE_MCP_SCREEN_FPS", f),
+            None => command.env_remove("SIMEE_MCP_SCREEN_FPS"),
         };
         let mut child = command
             .arg("mcp")
@@ -220,6 +233,22 @@ fn the_default_server_serves_core_and_says_where_the_rest_is() {
     assert!(mcp.close().success());
     // An unknown toolset stops the server before it serves anything.
     assert!(!e.mcp_with(Some("core,nope")).close().success());
+}
+
+#[test]
+fn the_screen_subscription_rate_is_an_environment_setting_that_must_make_sense() {
+    let e = Env::new("fps");
+    let mut mcp = e.mcp_fps("5");
+    let templates = mcp.request("resources/templates/list", json!({}), false)["result"]["resourceTemplates"].clone();
+    let names: Vec<&str> = templates.as_array().expect("templates").iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"screen") && names.contains(&"processes") && names.contains(&"prefs"), "{names:?}");
+    let discover = mcp.request("server/discover", json!({}), false);
+    assert_eq!(discover["result"]["capabilities"]["resources"], json!({"subscribe": true, "listChanged": true}));
+    assert!(mcp.close().success());
+    // Zero, too many and not a number stop the server before it serves anything.
+    for bad in ["0", "31", "fast"] {
+        assert!(!e.mcp_fps(bad).close().success(), "{bad}");
+    }
 }
 
 #[test]
