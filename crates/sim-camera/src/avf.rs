@@ -4,13 +4,15 @@
 //! camera permission without prompting; `Webcam` captures BGRA frames through an
 //! `AVCaptureSession` and a video data output, in the device format nearest the request with its
 //! frame duration fixed; `watch` turns `AVCaptureDeviceWasConnected` / `WasDisconnected`
-//! notifications into hot-plug signals.
+//! notifications into hot-plug signals; `VideoReader` decodes a `video:` file's first video track
+//! to BGRA with an `AVAssetReader`, for `video::Player` to loop.
 //!
 //! Classes and constants are looked up at runtime, so an older macOS without one (Continuity
 //! Camera's device type is macOS 14+) skips it instead of failing to load.
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, c_char, c_void};
+use std::path::Path;
 use std::ptr::{self, NonNull};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -30,6 +32,7 @@ use crate::hotplug::Signals;
 use crate::select::{self, Interval, Mode, Rates};
 use crate::source::Source;
 use crate::tcc::Authorization;
+use crate::video::{Decode, Picture};
 
 type Obj = Retained<AnyObject>;
 
@@ -37,6 +40,7 @@ const AVFOUNDATION: &CStr = c"/System/Library/Frameworks/AVFoundation.framework/
 const COREMEDIA: &CStr = c"/System/Library/Frameworks/CoreMedia.framework/CoreMedia";
 const COREMEDIAIO: &CStr = c"/System/Library/Frameworks/CoreMediaIO.framework/CoreMediaIO";
 const COREVIDEO: &CStr = c"/System/Library/Frameworks/CoreVideo.framework/CoreVideo";
+const COREFOUNDATION: &CStr = c"/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
 
 /// The device types to discover, newest first; each is skipped when this macOS lacks it.
 /// `ExternalUnknown` is the pre-macOS 14 name of `External`.
@@ -120,6 +124,8 @@ struct Api {
     width: unsafe extern "C" fn(*mut c_void) -> usize,
     height: unsafe extern "C" fn(*mut c_void) -> usize,
     pixel_format: unsafe extern "C" fn(*mut c_void) -> u32,
+    presentation_time: unsafe extern "C" fn(*mut c_void) -> CMTime,
+    release: unsafe extern "C" fn(*mut c_void),
 }
 
 fn api() -> Result<&'static Api> {
@@ -182,7 +188,23 @@ fn load() -> Result<Api> {
         width: function(cv, c"CVPixelBufferGetWidth")?,
         height: function(cv, c"CVPixelBufferGetHeight")?,
         pixel_format: function(cv, c"CVPixelBufferGetPixelFormatType")?,
+        presentation_time: function(cm, c"CMSampleBufferGetPresentationTimeStamp")?,
+        release: function(open(COREFOUNDATION)?, c"CFRelease")?,
     })
+}
+
+/// A file URL for `path`.
+fn file_url(path: &Path) -> Result<Obj> {
+    let text = NSString::from_str(&path.to_string_lossy());
+    // SAFETY: `+fileURLWithPath:` takes a non-nil NSString and returns a URL.
+    let url: Option<Obj> = unsafe { msg_send![class(c"NSURL")?, fileURLWithPath: &*text] };
+    url.ok_or_else(|| Error::Invalid(format!("{} isn't a file path", path.display())))
+}
+
+/// An NSError out-parameter (or `error` property) as text.
+fn describe_error(error: *mut NSError) -> String {
+    // SAFETY: nil, or an NSError the call just returned (autoreleased, alive in the current pool).
+    unsafe { error.as_ref() }.map(|e| e.localizedDescription().to_string()).unwrap_or_else(|| "no reason given".into())
 }
 
 /// A constant's object.
@@ -770,6 +792,164 @@ impl Drop for Webcam {
     }
 }
 
+/// `AVAssetReaderStatusFailed`.
+const READER_FAILED: isize = 3;
+
+impl CMTime {
+    /// The time as a duration from zero; `None` for an invalid time, zero for a negative one.
+    fn duration(self) -> Option<Duration> {
+        if self.flags & TIME_VALID == 0 || self.timescale <= 0 {
+            return None;
+        }
+        let nanos = i128::from(self.value.max(0)) * 1_000_000_000 / i128::from(self.timescale);
+        Some(Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)))
+    }
+}
+
+/// Opens `video:<path>`: the file's first video track, decoded to BGRA and looped at its own rate.
+pub(crate) fn open_video(path: &Path) -> Result<Box<dyn Source>> {
+    let name = format!("video:{}", path.display());
+    let reader = autoreleasepool(|_| VideoReader::open(&name, path))?;
+    Ok(Box::new(crate::video::Player::new(name, reader)?))
+}
+
+/// A video file's first video track through `AVAssetReader` with a BGRA track output, one reader
+/// per pass of the file (a reader can't rewind; a new one on the same asset can).
+pub(crate) struct VideoReader {
+    name: String,
+    track: Obj,
+    asset: Obj,
+    reader: Obj,
+    output: Obj,
+    interval: Duration,
+}
+
+// SAFETY: AVAsset, AVAssetTrack and AVAssetReader may be used from any thread, one at a time; the
+// capture thread that owns the player is the only one that messages them.
+unsafe impl Send for VideoReader {}
+
+impl VideoReader {
+    fn open(name: &str, path: &Path) -> Result<VideoReader> {
+        std::fs::metadata(path).map_err(|e| Error::Io(format!("{name}: {e}")))?;
+        let api = api()?;
+        let url = file_url(path)?;
+        let none: *const AnyObject = ptr::null();
+        // SAFETY: `+URLAssetWithURL:options:` takes a file URL and nil options; returns an asset.
+        let asset: Option<Obj> = unsafe { msg_send![class(c"AVURLAsset")?, URLAssetWithURL: &*url, options: none] };
+        let asset = asset.ok_or_else(|| Error::Io(format!("{name}: AVFoundation can't open it")))?;
+        if !responds(&asset, sel!(tracksWithMediaType:)) {
+            return Err(Error::Unavailable("-[AVAsset tracksWithMediaType:]".into()));
+        }
+        // SAFETY: takes a media type and returns an NSArray of AVAssetTrack (loading the asset's
+        // tracks synchronously, on this capture thread).
+        let tracks: Option<Obj> = unsafe { msg_send![&*asset, tracksWithMediaType: object(api.video)] };
+        let track = tracks
+            .map(|t| array(&t))
+            .unwrap_or_default()
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invalid(format!("{name} has no video track AVFoundation can read (is it a movie file?)")))?;
+        // SAFETY: `nominalFrameRate` returns float.
+        let fps: f32 = unsafe { msg_send![&*track, nominalFrameRate] };
+        let interval =
+            if fps.is_finite() && fps >= 1.0 { Duration::from_secs_f64(1.0 / f64::from(fps)) } else { Duration::from_millis(33) };
+        let (reader, output) = Self::start(api, name, &asset, &track)?;
+        Ok(VideoReader { name: name.to_string(), track, asset, reader, output, interval })
+    }
+
+    /// A reader started at the beginning of `track`, and its BGRA output.
+    fn start(api: &Api, name: &str, asset: &AnyObject, track: &AnyObject) -> Result<(Obj, Obj)> {
+        let mut error: *mut NSError = ptr::null_mut();
+        // SAFETY: takes an asset and an NSError** out-parameter; returns a reader or nil.
+        let reader: Option<Obj> = unsafe { msg_send![class(c"AVAssetReader")?, assetReaderWithAsset: asset, error: &mut error] };
+        let reader = reader.ok_or_else(|| Error::Io(format!("{name}: {}", describe_error(error))))?;
+        // SAFETY: `+numberWithUnsignedInt:` returns a number; `+dictionaryWithObject:forKey:`
+        // takes a value and a copyable key (the CFString constant, toll-free bridged).
+        let settings: Option<Obj> = unsafe {
+            let number: Obj = msg_send![class(c"NSNumber")?, numberWithUnsignedInt: FORMAT_BGRA];
+            msg_send![class(c"NSDictionary")?, dictionaryWithObject: &*number, forKey: object(api.pixel_format_key)]
+        };
+        let settings = settings.ok_or_else(|| Error::Unavailable("NSDictionary".into()))?;
+        // SAFETY: takes a track of the reader's asset and decompression settings; returns an
+        // output. `setAlwaysCopiesSampleData:` takes a BOOL (the frames are copied out anyway).
+        let output: Option<Obj> =
+            unsafe { msg_send![class(c"AVAssetReaderTrackOutput")?, assetReaderTrackOutputWithTrack: track, outputSettings: &*settings] };
+        let output = output.ok_or_else(|| Error::Unavailable("AVAssetReaderTrackOutput".into()))?;
+        // SAFETY: `canAddOutput:` returns BOOL; `addOutput:` only when it may be (otherwise it
+        // raises); `startReading` returns BOOL.
+        unsafe {
+            let _: () = msg_send![&*output, setAlwaysCopiesSampleData: false];
+            if !msg_send![&*reader, canAddOutput: &*output] {
+                return Err(Error::Io(format!("{name}: its video track can't be decoded to BGRA")));
+            }
+            let _: () = msg_send![&*reader, addOutput: &*output];
+            if !msg_send![&*reader, startReading] {
+                let error: *mut NSError = msg_send![&*reader, error];
+                return Err(Error::Io(format!("{name}: {}", describe_error(error))));
+            }
+        }
+        Ok((reader, output))
+    }
+
+    fn next_inner(&mut self) -> Result<Option<Picture>> {
+        let api = api()?;
+        loop {
+            // SAFETY: `copyNextSampleBuffer` returns a retained CMSampleBufferRef, or NULL at the
+            // end or on failure.
+            let sample: *mut c_void = unsafe { send(&self.output, sel!(copyNextSampleBuffer)) };
+            if sample.is_null() {
+                // SAFETY: `status` returns AVAssetReaderStatus (NSInteger); `error` an NSError or nil.
+                let status: isize = unsafe { msg_send![&*self.reader, status] };
+                if status == READER_FAILED {
+                    // SAFETY: as above.
+                    let error: *mut NSError = unsafe { msg_send![&*self.reader, error] };
+                    return Err(Error::Capture(format!("{}: {}", self.name, describe_error(error))));
+                }
+                return Ok(None);
+            }
+            // SAFETY: `sample` is the live sample buffer just copied; it is released once, after
+            // its timestamp and pixels are read.
+            let (pts, pixels) = unsafe {
+                let pts = (api.presentation_time)(sample);
+                let pixels = copy_sample(api, sample);
+                (api.release)(sample);
+                (pts, pixels)
+            };
+            // A sample with no image (or no valid time) carries nothing to show: skip it.
+            if let (Some(pts), Some((width, height, bgra))) = (pts.duration(), pixels) {
+                return Ok(Some(Picture { pts, width, height, bgra: bgra.into() }));
+            }
+        }
+    }
+}
+
+impl Decode for VideoReader {
+    fn next(&mut self) -> Result<Option<Picture>> {
+        // The capture thread is long-lived: drain what each decode autoreleases.
+        autoreleasepool(|_| self.next_inner())
+    }
+
+    fn restart(&mut self) -> Result<()> {
+        autoreleasepool(|_| {
+            // SAFETY: `cancelReading` stops the finished (or failed) reader before it is replaced.
+            let _: () = unsafe { msg_send![&*self.reader, cancelReading] };
+            (self.reader, self.output) = Self::start(api()?, &self.name, &self.asset, &self.track)?;
+            Ok(())
+        })
+    }
+
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+}
+
+impl Drop for VideoReader {
+    fn drop(&mut self) {
+        // SAFETY: `cancelReading` stops a reader in any state.
+        let _: () = unsafe { msg_send![&*self.reader, cancelReading] };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,6 +1023,173 @@ mod tests {
         assert_eq!(CMTime::of(Interval { num: 1, den: u64::MAX }), None, "a timescale past i32");
         assert_eq!(CMTime::of(Interval { num: 0, den: 30 }), None);
         assert_eq!(size_of::<CMTime>(), 24);
+    }
+
+    /// `CVPixelBufferCreate`.
+    type PixelBufferCreate = unsafe extern "C" fn(*const c_void, usize, usize, u32, *const c_void, *mut *mut c_void) -> i32;
+    /// `-[AVAssetWriterInputPixelBufferAdaptor appendPixelBuffer:withPresentationTime:]`.
+    type Append = unsafe extern "C" fn(*const AnyObject, Sel, *mut c_void, CMTime) -> Bool;
+
+    fn ok<T>(r: Result<T>) -> T {
+        r.unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn dictionary(pairs: &[(&AnyObject, &AnyObject)]) -> Obj {
+        // SAFETY: `+[NSMutableDictionary dictionary]` returns a new empty dictionary;
+        // `setObject:forKey:` takes a non-nil value and a copyable key.
+        unsafe {
+            let dict: Obj = msg_send![ok(class(c"NSMutableDictionary")), dictionary];
+            for (key, value) in pairs {
+                let _: () = msg_send![&*dict, setObject: *value, forKey: *key];
+            }
+            dict
+        }
+    }
+
+    fn number(n: u32) -> Obj {
+        // SAFETY: `+numberWithUnsignedInt:` returns a number.
+        unsafe { msg_send![ok(class(c"NSNumber")), numberWithUnsignedInt: n] }
+    }
+
+    /// Writes a QuickTime movie of solid BGRA frames, one per `colours` entry, at `fps`, with
+    /// AVAssetWriter's H.264 encoder: a tiny test file generated in the test, so no fixture is
+    /// checked in.
+    pub(crate) fn write_clip(path: &std::path::Path, width: u32, height: u32, fps: i32, colours: &[[u8; 4]]) {
+        autoreleasepool(|_| {
+            let api = ok(api());
+            let av = ok(open(AVFOUNDATION));
+            let cv = ok(open(COREVIDEO));
+            let named = |name: &CStr| object(constant(av, name).unwrap_or_else(|| panic!("{name:?}")));
+            let create: PixelBufferCreate = ok(function(cv, c"CVPixelBufferCreate"));
+            let _ = std::fs::remove_file(path);
+            let url = ok(file_url(path));
+            let mut error: *mut NSError = ptr::null_mut();
+            // SAFETY: takes a file URL, a file type and an NSError** out-parameter; returns a
+            // writer or nil.
+            let writer: Option<Obj> = unsafe {
+                msg_send![ok(class(c"AVAssetWriter")), assetWriterWithURL: &*url, fileType: named(c"AVFileTypeQuickTimeMovie"), error: &mut error]
+            };
+            let writer = writer.unwrap_or_else(|| panic!("AVAssetWriter: {}", describe_error(error)));
+            let (w, h) = (number(width), number(height));
+            let settings = dictionary(&[
+                (named(c"AVVideoCodecKey"), named(c"AVVideoCodecTypeH264")),
+                (named(c"AVVideoWidthKey"), &w),
+                (named(c"AVVideoHeightKey"), &h),
+            ]);
+            let bgra = number(FORMAT_BGRA);
+            let attributes = dictionary(&[(object(api.pixel_format_key), &bgra)]);
+            // SAFETY: takes a media type and output settings and returns an input; the adaptor
+            // takes the input and the source pixel buffer attributes.
+            let (input, adaptor): (Obj, Obj) = unsafe {
+                let input: Obj = msg_send![ok(class(c"AVAssetWriterInput")), assetWriterInputWithMediaType: object(api.video), outputSettings: &*settings];
+                let _: () = msg_send![&*input, setExpectsMediaDataInRealTime: false];
+                let adaptor: Obj = msg_send![ok(class(c"AVAssetWriterInputPixelBufferAdaptor")), assetWriterInputPixelBufferAdaptorWithAssetWriterInput: &*input, sourcePixelBufferAttributes: &*attributes];
+                (input, adaptor)
+            };
+            // SAFETY: `addInput:` before `startWriting`; `startSessionAtSourceTime:` takes a CMTime.
+            unsafe {
+                let _: () = msg_send![&*writer, addInput: &*input];
+                let started: bool = msg_send![&*writer, startWriting];
+                assert!(started, "startWriting");
+                let zero = CMTime { value: 0, timescale: fps, flags: TIME_VALID, epoch: 0 };
+                let _: () = msg_send![&*writer, startSessionAtSourceTime: zero];
+            }
+            // SAFETY: `objc_msgSend` called through `appendPixelBuffer:withPresentationTime:`'s
+            // signature (a CVPixelBufferRef and a CMTime, returning BOOL).
+            let append: Append = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
+            for (i, colour) in colours.iter().enumerate() {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                // SAFETY: `isReadyForMoreMediaData` returns BOOL.
+                while !unsafe { msg_send![&*input, isReadyForMoreMediaData] } {
+                    assert!(Instant::now() < deadline, "the writer stopped taking frames");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let mut pb: *mut c_void = ptr::null_mut();
+                // SAFETY: a default allocator, the size, BGRA, no attributes and an out-pointer.
+                let status = unsafe { create(ptr::null(), width as usize, height as usize, FORMAT_BGRA, ptr::null(), &mut pb) };
+                assert!(status == 0 && !pb.is_null(), "CVPixelBufferCreate {status}");
+                // SAFETY: the new buffer is locked for writing, filled row by row within its own
+                // stride and height, then unlocked; `append` retains what it keeps, and the
+                // reference `create` returned is released.
+                unsafe {
+                    assert_eq!((api.lock)(pb, 0), 0);
+                    let (base, stride) = ((api.base)(pb).cast::<u8>(), (api.bytes_per_row)(pb));
+                    let rows = std::slice::from_raw_parts_mut(base, stride * height as usize);
+                    for row in rows.chunks_exact_mut(stride) {
+                        row[..width as usize * 4].copy_from_slice(&colour.repeat(width as usize));
+                    }
+                    (api.unlock)(pb, 0);
+                    let at = CMTime { value: i as i64, timescale: fps, flags: TIME_VALID, epoch: 0 };
+                    let appended = append(&*adaptor, sel!(appendPixelBuffer:withPresentationTime:), pb, at);
+                    (api.release)(pb);
+                    assert!(appended.as_bool(), "frame {i} not appended");
+                }
+            }
+            let (tx, rx) = mpsc::channel::<()>();
+            let done = RcBlock::new(move || {
+                let _ = tx.send(());
+            });
+            // SAFETY: `markAsFinished` ends the input; `finishWritingWithCompletionHandler:` takes
+            // a `void (^)(void)` block, which it copies and calls once the file is written.
+            unsafe {
+                let _: () = msg_send![&*input, markAsFinished];
+                let _: () = msg_send![&*writer, finishWritingWithCompletionHandler: &*done];
+            }
+            assert!(rx.recv_timeout(Duration::from_secs(20)).is_ok(), "the writer never finished");
+            // SAFETY: `status` returns AVAssetWriterStatus (NSInteger); `error` an NSError or nil.
+            let (status, error): (isize, *mut NSError) = unsafe { (msg_send![&*writer, status], msg_send![&*writer, error]) };
+            assert_eq!(status, 2, "AVAssetWriterStatusCompleted: {}", describe_error(error));
+        });
+    }
+
+    fn temp_clip(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sim-camera-video-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        dir.join(name)
+    }
+
+    fn near(px: [u8; 4], want: [u8; 4]) -> bool {
+        px.iter().zip(want).all(|(&a, b)| a.abs_diff(b) <= 48)
+    }
+
+    const RED: [u8; 4] = [0, 0, 255, 255];
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+    const BLUE: [u8; 4] = [255, 0, 0, 255];
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+
+    /// A generated 4-frame, 10 fps H.264 movie played as `video:`: each tick shows the frame the
+    /// file shows at that time, looping every 400 ms, scaled to the request. Opens no camera.
+    #[test]
+    fn a_video_file_plays_at_its_own_rate_and_loops() {
+        let path = temp_clip("bars.mov");
+        write_clip(&path, 64, 48, 10, &[RED, GREEN, BLUE, WHITE]);
+        let mut source = ok(crate::synth::open(&crate::SourceSpec::Video(path.clone())));
+        assert!(!source.synthetic(), "frames come at the file's size, like a camera's");
+        let spec = FrameSpec { width: 32, height: 24, fps: 30 };
+        let mut shown = Vec::new();
+        for ms in [0u64, 50, 100, 250, 350, 400, 520, 1_000_250] {
+            let tick = Tick { seq: ms, pts: Duration::from_millis(ms), ..Tick::start() };
+            let frame = source.frame(spec, tick).unwrap_or_else(|e| panic!("{ms} ms: {e}"));
+            assert_eq!((frame.width, frame.height), (32, 24));
+            shown.push((ms, frame.pixel(16, 12)));
+        }
+        let want = [RED, RED, GREEN, BLUE, WHITE, RED, GREEN, BLUE];
+        for ((ms, px), want) in shown.iter().zip(want) {
+            assert!(near(*px, want), "{ms} ms: {px:?}, want about {want:?}; all {shown:?}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_video_file_says_why() {
+        let missing = temp_clip("missing.mov");
+        let err = crate::synth::open(&crate::SourceSpec::Video(missing)).err();
+        assert!(matches!(&err, Some(Error::Io(m)) if m.contains("missing.mov")), "{err:?}");
+        let text = temp_clip("notes.mov");
+        std::fs::write(&text, b"not a movie").ok();
+        let err = crate::synth::open(&crate::SourceSpec::Video(text.clone())).err();
+        assert!(matches!(&err, Some(Error::Invalid(m) | Error::Io(m)) if m.contains("notes.mov")), "{err:?}");
+        let _ = std::fs::remove_file(&text);
     }
 
     /// A Logitech C920's list as AVFoundation reports it (each format one range of 30 fps down to
