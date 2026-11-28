@@ -92,6 +92,26 @@ server's HID client outlives the command). The output is byte for byte the same.
   `audio_capture_start`, `audio_capture_stop`, `audio_mute` and `audio_state` (a capture or mute is
   a helper process its caller owns). These always run in the caller, and need no handshake.
 
+**Stopping a server** (#388). On SIGINT (Ctrl-C) or SIGTERM, `simee serve` shuts down in order.
+A call in flight stops at its next safe point and gets up to 10 s. Every call after the signal,
+on a connection already open or one made during the shutdown, isn't run. Both answer
+`cancelled: server shutting down`. Then it stops every stream with its WHIP DELETE, removes its
+socket and its camera feed sockets, and exits 130 (SIGINT) or 143 (SIGTERM). It keeps listening
+until it has removed its socket, so another `simee serve` can't take the path meanwhile. A second
+signal exits at once. From the signal on, `call_cancelled` is true for every call in the process.
+
+A shutdown leaves alone the devices the server didn't start, but it can stop or delete ones it
+did:
+- Ctrl-C at a terminal goes to the whole process group, so every Android emulator the server
+  started as its child gets the SIGINT too, powers off and exits 130. A SIGTERM sent to the
+  server's PID alone doesn't reach them.
+- A call cancelled at a safe point undoes what it made: a `create` or `clone` that finishes
+  during the drain is deleted, and a `boot` waiting for admission boots nothing.
+
+`simee mcp` stops its streams and exits the same way, without waiting for its calls; a watched
+`boot` that launched its device for a call in flight may shut that device down as it is
+cancelled. `emu` stops its guest as the console's `kill` does and exits 130 or 143 too.
+
 Relative `path` arguments (`screenshot`, `install`) are made absolute before they are sent.
 
 `device` is a UDID (an Android device's UDID is its AVD name), an exact name, or `booted` (the default: the only running device). It is resolved across both platforms; pass `platform` (`ios` or `android`) to look at one. Parameters ending in `?` are optional.
