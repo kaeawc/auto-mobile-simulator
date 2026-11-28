@@ -554,12 +554,12 @@ fn main() -> Result<()> {
         Cmd::Serve { socket } => {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
             eprintln!("simee API on {}", path.display());
-            let served = sim_api::serve(&path);
-            sim_api::stop_streams();
-            served?;
-            return Ok(());
+            // Until SIGINT or SIGTERM, then a shutdown in order: 130 or 143.
+            let code = sim_api::serve(&path)?;
+            std::process::exit(code);
         }
         Cmd::Mcp { http: None, .. } => {
+            mcp_shutdown_on_signal()?;
             // Methods run in this process, on the server's own threads: nothing but protocol
             // messages may reach stdout.
             let served = sim_mcp::serve_stdio(std::sync::Arc::new(sim_mcp::ApiBackend::new()));
@@ -569,6 +569,7 @@ fn main() -> Result<()> {
         }
         Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote } => {
             let config = mcp_http_config(addr, token_file.clone(), *no_auth, *insecure_remote)?;
+            mcp_shutdown_on_signal()?;
             let served = sim_mcp::http::serve(std::sync::Arc::new(sim_mcp::ApiBackend::new()), config);
             sim_api::stop_streams();
             served?;
@@ -589,6 +590,18 @@ fn main() -> Result<()> {
     transport.require = flag("SIMEE_REQUIRE_SERVER");
     let (stdout, stderr) = (std::io::stdout(), std::io::stderr());
     run(cli.command, &mut transport, &mut stdout.lock(), &mut stderr.lock())
+}
+
+/// `simee mcp` on SIGINT or SIGTERM: calls in flight see the cancel at their next safe point, the
+/// streams stop with their WHIP DELETE, any socket it serves on is removed, and the process exits
+/// with 130 or 143 (a second signal exits at once). The MCP servers have no way to stop accepting
+/// or to wait for their calls yet.
+fn mcp_shutdown_on_signal() -> Result<()> {
+    sim_api::shutdown::watch(|sig| {
+        sim_api::stop_streams();
+        sim_api::shutdown::exit(sig);
+    })
+    .context("watching SIGINT and SIGTERM")
 }
 
 /// Whether an on/off environment variable is on (set, not empty, not `0`).

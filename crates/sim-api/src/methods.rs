@@ -1470,7 +1470,7 @@ fn boot_many_hooked(s: &mut Session, p: &Value, hook: &dyn crate::progress::Boot
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::progress::{CallHooks, with_call_hooks};
 
@@ -1925,6 +1925,20 @@ mod tests {
     }
 
     const SERIOUS: Option<sim_host::ThermalState> = Some(sim_host::ThermalState::Serious);
+
+    /// A session on an SDK and AVD home under `dir` holding an AVD `pixel`, on a host whose
+    /// thermal state holds every boot: a `boot` with `admission: "wait"` waits until cancelled
+    /// (`shutdown`'s server child, which makes one per connection on the same files).
+    pub(crate) fn held_android_session(dir: &std::path::Path) -> Session {
+        let (mut s, root) = android_session_in(dir, "held");
+        fake_adb(&root);
+        s.fake_host = Some(fake_host(64, SERIOUS));
+        if !root.join("avd/pixel.ini").exists() {
+            let mobile = "system-images;android-36;google_apis;arm64-v8a";
+            call(&mut s, "create", &json!({"platform": "android", "name": "pixel", "system_image": mobile})).expect("pixel");
+        }
+        s
+    }
 
     #[test]
     fn admission_check_predicts_what_new_devices_cost() {
