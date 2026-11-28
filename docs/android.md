@@ -69,6 +69,7 @@ ignored for now.
 | `crates/emu-sdk` | Java-free SDK provisioning: repository manifests, verified downloads, unpacking, the on-demand renderer (`emu -provision`, `-provision-renderer`) |
 | `crates/emu-ext4` | Native ext4 formatter for first-boot userdata: writes only metadata, so a fresh 10 GiB image takes under 1 MB on disk |
 | `crates/emu-fdt` | Flattened device tree writer |
+| `crates/emu-container` | Host probe, backend selection (KVM, container, TCG) and the Redroid-style container launcher for Linux hosts with binder ([below](#container-backend-linux-with-binder-and-no-kvm)) |
 | `apps/emu` | The `emu` CLI: SDK-emulator-compatible flags, per-AVD instance state, console server, display server |
 | `crates/sim-android` | The client front ends use: AVDs as devices, starting `emu`, the console and display-socket clients |
 | `desktop/` | simee's Rune window (both platforms), its own workspace |
@@ -382,8 +383,41 @@ emu -avd phone -accel off   # TCG even where /dev/kvm is usable (-accel on: KVM 
 
 When the host has KVM, software mode runs the guest on it (above); TCG is the fallback.
 
-A third route for hosts with binder and no KVM, Android's userspace in a container on the host's kernel,
-is researched in [research/container-backend.md](research/container-backend.md) (#210).
+## Container backend (Linux with binder and no KVM)
+
+In progress ([#210](https://github.com/kaeawc/simee/issues/210)): Android's userspace in a
+container on the host's kernel, as Redroid does, for hosts that have binder and no usable KVM. The
+research, environment matrix and the cited Redroid numbers are in
+[research/container-backend.md](research/container-backend.md). What `crates/emu-container` has
+so far, and what it doesn't:
+
+- **Selection.** Owner decision 2026-11-27: with no `-backend`, KVM first; the container only on
+  a host without usable KVM that has what it needs; then TCG software mode. `-backend
+  kvm|container|tcg` forces one, and a forced backend that can't run is an error naming why, never a
+  fallback. The container is considered only for a guest of the host's own architecture.
+- **Host probe.** Required: Linux, binder (binderfs in `/proc/filesystems`), memfd, the unified
+  cgroup hierarchy, user namespaces (and, for an unprivileged user, `newuidmap`/`newgidmap` with a
+  65,536-id range in `/etc/subuid` and `/etc/subgid`), overlayfs. Reported but not blocking: cgroup
+  memory/cpu/pids controllers, DMA-BUF heaps. Each missing piece prints its fix.
+- **Image.** One pinned image: `redroid/redroid:15.0.0_64only-250627`, by per-architecture
+  manifest digest and layer digest (`image.rs`). It is downloaded only when asked (`skopeo copy` of
+  the manifest by digest) and every blob is hashed against the pin before it is unpacked.
+- **Launcher.** `unshare` into new user, mount, pid, uts, ipc and cgroup namespaces (not network);
+  the parent writes the id maps (identity as root; `newuidmap` for a user); the script mounts an
+  overlay of the unpacked image over a per-device writable layer, a `/dev` tmpfs with the nodes
+  Redroid's init expects, binderfs (checked for `binder`, `hwbinder`, `vndbinder`, linked at
+  `/dev/*`), `/proc` and the host's `/sys`, then `exec chroot … /init` with Redroid's arguments
+  (`androidboot.redroid_width|height|dpi|gpu_mode`, `androidboot.use_memfd=true`).
+- **Verified:** the plan, the script, the probe and the selection against fake hosts; and on a Linux
+  VM without binder, as root and as an unprivileged user, a real user namespace with the id maps,
+  the overlay, `/dev`, devpts, `/proc`, `/sys` and the chroot, stopping at binderfs with its message.
+- **Not verified:** a boot. No binder host has run this launcher, so whether Redroid's `/init`
+  starts unprivileged in this namespace set, and how long it takes, are open. It is not wired into
+  `emu` yet, so nothing boots through it; there is no display, input or console for it, no
+  network namespace (adbd listens on the host's port 5555, so one container per host), no cgroup
+  limits, and no `docs/benchmarks.md` row (nothing measured). `SIMEE_E2E_CONTAINER=1 cargo
+  nextest run -p simee-emu-container` runs the namespace tests against the host's kernel;
+  `cargo run -p simee-emu-container --example probe` prints what a host offers.
 
 ## Automotive
 
