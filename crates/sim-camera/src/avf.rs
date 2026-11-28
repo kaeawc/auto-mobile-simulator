@@ -32,7 +32,7 @@ use crate::hotplug::Signals;
 use crate::select::{self, Interval, Mode, Rates};
 use crate::source::Source;
 use crate::tcc::Authorization;
-use crate::video::{Decode, Picture};
+use crate::video::{Decode, Sample};
 
 type Obj = Retained<AnyObject>;
 
@@ -96,6 +96,24 @@ impl CMTime {
         let timescale = i32::try_from(interval.den).ok().filter(|&t| t > 0)?;
         Some(CMTime { value, timescale, flags: TIME_VALID, epoch: 0 })
     }
+}
+
+/// `CGAffineTransform`: `(x, y)` maps to `(a x + c y + tx, b x + d y + ty)`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Transform {
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+    tx: f64,
+    ty: f64,
+}
+
+// SAFETY: the layout above is CoreGraphics' `CGAffineTransform` on 64-bit targets
+// (`{CGAffineTransform=dddddd}`): six CGFloat (double) fields in this order.
+unsafe impl Encode for Transform {
+    const ENCODING: Encoding = Encoding::Struct("CGAffineTransform", &[f64::ENCODING; 6]);
 }
 
 #[repr(C)]
@@ -580,7 +598,7 @@ define_class!(
             // A panic must not unwind into Objective-C (it would abort the process): drop the frame.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let Ok(api) = api() else { return };
-                if let Some((width, height, px)) = copy_sample(api, sample) {
+                if let Some((width, height, px)) = copy_sample(api, sample, 0) {
                     let latest = &self.ivars().latest;
                     let arrived = Arrived { width, height, bgra: px.into(), at: Instant::now() };
                     *latest.frame.lock().unwrap_or_else(|p| p.into_inner()) = Some(arrived);
@@ -602,12 +620,13 @@ impl SampleDelegate {
     }
 }
 
-/// Copies a sample buffer's BGRA pixels into tight rows.
-fn copy_sample(api: &Api, sample: *mut c_void) -> Option<(u32, u32, Vec<u8>)> {
+/// Copies a sample buffer's BGRA pixels into tight rows, turned `quarter_turns` clockwise.
+fn copy_sample(api: &Api, sample: *mut c_void, quarter_turns: u8) -> Option<(u32, u32, Vec<u8>)> {
     if sample.is_null() {
         return None;
     }
-    // SAFETY: `sample` is the live CMSampleBuffer the delegate call was given.
+    // SAFETY: `sample` is a live CMSampleBuffer: the one a delegate call was given, or one a
+    // reader returned that the caller holds.
     let pb = unsafe { (api.sample_image)(sample) };
     // SAFETY: `pb` is the sample's image buffer (a CVPixelBuffer), valid during the call.
     if pb.is_null() || unsafe { (api.pixel_format)(pb) } != FORMAT_BGRA {
@@ -628,15 +647,13 @@ fn copy_sample(api: &Api, sample: *mut c_void) -> Option<(u32, u32, Vec<u8>)> {
         && stride > 0
         && stride <= u32::MAX as usize
         && w.checked_mul(4).is_some_and(|row| stride >= row);
-    let out = usable.then(|| {
-        // SAFETY: a locked BGRA buffer holds `h` rows of `stride` bytes at `base`.
-        let src = unsafe { std::slice::from_raw_parts(base.cast::<u8>(), stride * h) };
-        let mut px = Vec::with_capacity(w * h * 4);
-        for row in src.chunks_exact(stride) {
-            px.extend_from_slice(&row[..w * 4]);
-        }
-        (w as u32, h as u32, px)
-    });
+    let out = usable
+        .then(|| {
+            // SAFETY: a locked BGRA buffer holds `h` rows of `stride` bytes at `base`.
+            let src = unsafe { std::slice::from_raw_parts(base.cast::<u8>(), stride * h) };
+            crate::frame::turn(src, stride, w as u32, h as u32, quarter_turns)
+        })
+        .flatten();
     // SAFETY: balances the lock above.
     unsafe { (api.unlock)(pb, LOCK_READ_ONLY) };
     out
@@ -806,6 +823,55 @@ impl CMTime {
     }
 }
 
+/// `kCMTimeFlags_PositiveInfinity`.
+const TIME_POSITIVE_INFINITY: u32 = 4;
+
+impl CMTime {
+    /// A duration from zero, in nanoseconds.
+    fn at(d: Duration) -> CMTime {
+        CMTime { value: i64::try_from(d.as_nanos()).unwrap_or(i64::MAX), timescale: 1_000_000_000, flags: TIME_VALID, epoch: 0 }
+    }
+
+    /// `kCMTimePositiveInfinity`.
+    const FOREVER: CMTime = CMTime { value: 0, timescale: 0, flags: TIME_VALID | TIME_POSITIVE_INFINITY, epoch: 0 };
+}
+
+/// `CMTimeRange`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct CMTimeRange {
+    start: CMTime,
+    duration: CMTime,
+}
+
+// SAFETY: the layout above is CoreMedia's `CMTimeRange` (`{?={?=qiIq}{?=qiIq}}`), an anonymous
+// struct of two CMTimes.
+unsafe impl Encode for CMTimeRange {
+    const ENCODING: Encoding = Encoding::Struct("?", &[CMTime::ENCODING, CMTime::ENCODING]);
+}
+
+/// `CGSize`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct Size {
+    width: f64,
+    height: f64,
+}
+
+// SAFETY: the layout above is CoreGraphics' `CGSize` on 64-bit targets (`{CGSize=dd}`).
+unsafe impl Encode for Size {
+    const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+}
+
+impl Transform {
+    /// The quarter turns clockwise a track with this `preferredTransform` is shown at, to the
+    /// nearest turn (a mirrored track's flip is not applied).
+    fn quarter_turns(self) -> u8 {
+        let turns = (self.b.atan2(self.a) / std::f64::consts::FRAC_PI_2).round();
+        if turns.is_finite() { (turns as i64).rem_euclid(4) as u8 } else { 0 }
+    }
+}
+
 /// Opens `video:<path>`: the file's first video track, decoded to BGRA and looped at its own rate.
 pub(crate) fn open_video(path: &Path) -> Result<Box<dyn Source>> {
     let name = format!("video:{}", path.display());
@@ -813,8 +879,26 @@ pub(crate) fn open_video(path: &Path) -> Result<Box<dyn Source>> {
     Ok(Box::new(crate::video::Player::new(name, reader)?))
 }
 
+/// A decoded frame as an `AVAssetReader` output it: a retained `CMSampleBufferRef`, released when
+/// dropped. Its pixels are copied out only for a frame that is shown.
+pub(crate) struct SampleBuffer(NonNull<c_void>);
+
+// SAFETY: CoreMedia sample buffers are reference counted thread-safely and not changed once
+// decoded; the capture thread that owns the player is the only one that reads this one.
+unsafe impl Send for SampleBuffer {}
+
+impl Drop for SampleBuffer {
+    fn drop(&mut self) {
+        if let Ok(api) = api() {
+            // SAFETY: balances the +1 reference `copyNextSampleBuffer` returned; dropped once.
+            unsafe { (api.release)(self.0.as_ptr()) };
+        }
+    }
+}
+
 /// A video file's first video track through `AVAssetReader` with a BGRA track output, one reader
-/// per pass of the file (a reader can't rewind; a new one on the same asset can).
+/// per pass of the file or jump within it (a reader can't rewind; a new one on the same asset,
+/// started at a time, can).
 pub(crate) struct VideoReader {
     name: String,
     track: Obj,
@@ -822,6 +906,11 @@ pub(crate) struct VideoReader {
     reader: Obj,
     output: Obj,
     interval: Duration,
+    /// The track's rotation (`preferredTransform`), in quarter turns clockwise.
+    turns: u8,
+    /// Where the track starts and ends in the file, when it says.
+    start: Duration,
+    end: Option<Duration>,
 }
 
 // SAFETY: AVAsset, AVAssetTrack and AVAssetReader may be used from any thread, one at a time; the
@@ -849,20 +938,44 @@ impl VideoReader {
             .into_iter()
             .next()
             .ok_or_else(|| Error::Invalid(format!("{name} has no video track AVFoundation can read (is it a movie file?)")))?;
-        // SAFETY: `nominalFrameRate` returns float.
-        let fps: f32 = unsafe { msg_send![&*track, nominalFrameRate] };
+        // SAFETY: `nominalFrameRate` returns float, `naturalSize` CGSize, `preferredTransform`
+        // CGAffineTransform and `timeRange` CMTimeRange: AVAssetTrack properties, read from the
+        // track just loaded.
+        let (fps, size, transform, range): (f32, Size, Transform, CMTimeRange) = unsafe {
+            (
+                msg_send![&*track, nominalFrameRate],
+                msg_send![&*track, naturalSize],
+                msg_send![&*track, preferredTransform],
+                msg_send![&*track, timeRange],
+            )
+        };
+        // Refused before a frame is decoded; each frame's own size is checked again as it shows.
+        let side = |v: f64| if v.is_finite() && v >= 1.0 { v.ceil().min(f64::from(u32::MAX)) as u32 } else { 1 };
+        crate::synth::check_size_of("video", side(size.width), side(size.height)).map_err(|e| Error::Invalid(format!("{name}: {e}")))?;
         let interval =
             if fps.is_finite() && fps >= 1.0 { Duration::from_secs_f64(1.0 / f64::from(fps)) } else { Duration::from_millis(33) };
-        let (reader, output) = Self::start(api, name, &asset, &track)?;
-        Ok(VideoReader { name: name.to_string(), track, asset, reader, output, interval })
+        let start = range.start.duration().unwrap_or_default();
+        let end = range.duration.duration().filter(|d| !d.is_zero()).map(|d| start + d);
+        let (reader, output) = Self::start(api, name, &asset, &track, None)?;
+        let turns = transform.quarter_turns();
+        Ok(VideoReader { name: name.to_string(), track, asset, reader, output, interval, turns, start, end })
     }
 
-    /// A reader started at the beginning of `track`, and its BGRA output.
-    fn start(api: &Api, name: &str, asset: &AnyObject, track: &AnyObject) -> Result<(Obj, Obj)> {
+    /// A reader started at file time `from` (the beginning of `track` when `None`), and its BGRA
+    /// output.
+    fn start(api: &Api, name: &str, asset: &AnyObject, track: &AnyObject, from: Option<Duration>) -> Result<(Obj, Obj)> {
         let mut error: *mut NSError = ptr::null_mut();
         // SAFETY: takes an asset and an NSError** out-parameter; returns a reader or nil.
         let reader: Option<Obj> = unsafe { msg_send![class(c"AVAssetReader")?, assetReaderWithAsset: asset, error: &mut error] };
         let reader = reader.ok_or_else(|| Error::Io(format!("{name}: {}", describe_error(error))))?;
+        if let Some(from) = from {
+            if !responds(&reader, sel!(setTimeRange:)) {
+                return Err(Error::Unavailable("-[AVAssetReader setTimeRange:]".into()));
+            }
+            let range = CMTimeRange { start: CMTime::at(from), duration: CMTime::FOREVER };
+            // SAFETY: `setTimeRange:` takes a CMTimeRange, before `startReading` (below).
+            let _: () = unsafe { msg_send![&*reader, setTimeRange: range] };
+        }
         // SAFETY: `+numberWithUnsignedInt:` returns a number; `+dictionaryWithObject:forKey:`
         // takes a value and a copyable key (the CFString constant, toll-free bridged).
         let settings: Option<Obj> = unsafe {
@@ -871,7 +984,7 @@ impl VideoReader {
         };
         let settings = settings.ok_or_else(|| Error::Unavailable("NSDictionary".into()))?;
         // SAFETY: takes a track of the reader's asset and decompression settings; returns an
-        // output. `setAlwaysCopiesSampleData:` takes a BOOL (the frames are copied out anyway).
+        // output. `setAlwaysCopiesSampleData:` takes a BOOL (a shown frame is copied out anyway).
         let output: Option<Obj> =
             unsafe { msg_send![class(c"AVAssetReaderTrackOutput")?, assetReaderTrackOutputWithTrack: track, outputSettings: &*settings] };
         let output = output.ok_or_else(|| Error::Unavailable("AVAssetReaderTrackOutput".into()))?;
@@ -891,13 +1004,13 @@ impl VideoReader {
         Ok((reader, output))
     }
 
-    fn next_inner(&mut self) -> Result<Option<Picture>> {
+    fn next_inner(&mut self) -> Result<Option<Sample<SampleBuffer>>> {
         let api = api()?;
         loop {
             // SAFETY: `copyNextSampleBuffer` returns a retained CMSampleBufferRef, or NULL at the
             // end or on failure.
-            let sample: *mut c_void = unsafe { send(&self.output, sel!(copyNextSampleBuffer)) };
-            if sample.is_null() {
+            let raw: *mut c_void = unsafe { send(&self.output, sel!(copyNextSampleBuffer)) };
+            let Some(sample) = NonNull::new(raw).map(SampleBuffer) else {
                 // SAFETY: `status` returns AVAssetReaderStatus (NSInteger); `error` an NSError or nil.
                 let status: isize = unsafe { msg_send![&*self.reader, status] };
                 if status == READER_FAILED {
@@ -906,40 +1019,60 @@ impl VideoReader {
                     return Err(Error::Capture(format!("{}: {}", self.name, describe_error(error))));
                 }
                 return Ok(None);
-            }
-            // SAFETY: `sample` is the live sample buffer just copied; it is released once, after
-            // its timestamp and pixels are read.
-            let (pts, pixels) = unsafe {
-                let pts = (api.presentation_time)(sample);
-                let pixels = copy_sample(api, sample);
-                (api.release)(sample);
-                (pts, pixels)
+            };
+            // SAFETY: `sample` is a live sample buffer, held until it is dropped; its image buffer
+            // is its own (the Get rule: not released here), and a pixel buffer's format and size
+            // may be read without locking it.
+            let (pts, size) = unsafe {
+                let pts = (api.presentation_time)(sample.0.as_ptr());
+                let pb = (api.sample_image)(sample.0.as_ptr());
+                let bgra = !pb.is_null() && (api.pixel_format)(pb) == FORMAT_BGRA;
+                (pts, bgra.then(|| ((api.width)(pb), (api.height)(pb))))
             };
             // A sample with no image (or no valid time) carries nothing to show: skip it.
-            if let (Some(pts), Some((width, height, bgra))) = (pts.duration(), pixels) {
-                return Ok(Some(Picture { pts, width, height, bgra: bgra.into() }));
+            let (Some(pts), Some((w, h))) = (pts.duration(), size) else { continue };
+            let (Ok(w), Ok(h)) = (u32::try_from(w), u32::try_from(h)) else { continue };
+            if w == 0 || h == 0 {
+                continue;
             }
+            let (width, height) = if self.turns % 2 == 1 { (h, w) } else { (w, h) };
+            return Ok(Some(Sample { pts, width, height, data: sample }));
         }
     }
 }
 
 impl Decode for VideoReader {
-    fn next(&mut self) -> Result<Option<Picture>> {
+    type Data = SampleBuffer;
+
+    fn next(&mut self) -> Result<Option<Sample<SampleBuffer>>> {
         // The capture thread is long-lived: drain what each decode autoreleases.
         autoreleasepool(|_| self.next_inner())
     }
 
-    fn restart(&mut self) -> Result<()> {
+    fn pixels(&mut self, sample: &Sample<SampleBuffer>) -> Result<Vec<u8>> {
+        let (_, _, bgra) = copy_sample(api()?, sample.data.0.as_ptr(), self.turns)
+            .ok_or_else(|| Error::Capture(format!("{}: a decoded frame's pixels can't be read", self.name)))?;
+        Ok(bgra)
+    }
+
+    /// A new reader from one frame before `to`, so the frame showing at `to` is among the first
+    /// it gives whichever side of `to` the reader starts on.
+    fn seek(&mut self, to: Duration) -> Result<()> {
+        let from = Some(to.saturating_sub(self.interval)).filter(|&from| from > self.start);
         autoreleasepool(|_| {
-            // SAFETY: `cancelReading` stops the finished (or failed) reader before it is replaced.
+            // SAFETY: `cancelReading` stops the current reader, in any state, before it is replaced.
             let _: () = unsafe { msg_send![&*self.reader, cancelReading] };
-            (self.reader, self.output) = Self::start(api()?, &self.name, &self.asset, &self.track)?;
+            (self.reader, self.output) = Self::start(api()?, &self.name, &self.asset, &self.track, from)?;
             Ok(())
         })
     }
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn end(&self) -> Option<Duration> {
+        self.end
     }
 }
 
@@ -1055,6 +1188,34 @@ mod tests {
     /// AVAssetWriter's H.264 encoder: a tiny test file generated in the test, so no fixture is
     /// checked in.
     pub(crate) fn write_clip(path: &std::path::Path, width: u32, height: u32, fps: i32, colours: &[[u8; 4]]) {
+        write_movie(path, width, height, fps, IDENTITY, colours.len(), |i, _| colours[i]);
+    }
+
+    const IDENTITY: Transform = Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 0.0, ty: 0.0 };
+
+    /// The track transform a recorder writes for a picture to be shown turned `turns` quarter
+    /// turns clockwise (an iPhone held upright records `turns == 1`).
+    fn clockwise(turns: u8, width: u32, height: u32) -> Transform {
+        let (w, h) = (f64::from(width), f64::from(height));
+        match turns % 4 {
+            0 => IDENTITY,
+            1 => Transform { a: 0.0, b: 1.0, c: -1.0, d: 0.0, tx: h, ty: 0.0 },
+            2 => Transform { a: -1.0, b: 0.0, c: 0.0, d: -1.0, tx: w, ty: h },
+            _ => Transform { a: 0.0, b: -1.0, c: 1.0, d: 0.0, tx: 0.0, ty: w },
+        }
+    }
+
+    /// Writes `frames` frames at `fps`, frame `i`'s column `x` in colour `paint(i, x)`, with the
+    /// track's `transform` (`preferredTransform` when read back).
+    fn write_movie(
+        path: &std::path::Path,
+        width: u32,
+        height: u32,
+        fps: i32,
+        transform: Transform,
+        frames: usize,
+        paint: impl Fn(usize, u32) -> [u8; 4],
+    ) {
         autoreleasepool(|_| {
             let api = ok(api());
             let av = ok(open(AVFOUNDATION));
@@ -1083,6 +1244,7 @@ mod tests {
             let (input, adaptor): (Obj, Obj) = unsafe {
                 let input: Obj = msg_send![ok(class(c"AVAssetWriterInput")), assetWriterInputWithMediaType: object(api.video), outputSettings: &*settings];
                 let _: () = msg_send![&*input, setExpectsMediaDataInRealTime: false];
+                let _: () = msg_send![&*input, setTransform: transform];
                 let adaptor: Obj = msg_send![ok(class(c"AVAssetWriterInputPixelBufferAdaptor")), assetWriterInputPixelBufferAdaptorWithAssetWriterInput: &*input, sourcePixelBufferAttributes: &*attributes];
                 (input, adaptor)
             };
@@ -1097,7 +1259,8 @@ mod tests {
             // SAFETY: `objc_msgSend` called through `appendPixelBuffer:withPresentationTime:`'s
             // signature (a CVPixelBufferRef and a CMTime, returning BOOL).
             let append: Append = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
-            for (i, colour) in colours.iter().enumerate() {
+            for i in 0..frames {
+                let row_px: Vec<u8> = (0..width).flat_map(|x| paint(i, x)).collect();
                 let deadline = Instant::now() + Duration::from_secs(10);
                 // SAFETY: `isReadyForMoreMediaData` returns BOOL.
                 while !unsafe { msg_send![&*input, isReadyForMoreMediaData] } {
@@ -1116,7 +1279,7 @@ mod tests {
                     let (base, stride) = ((api.base)(pb).cast::<u8>(), (api.bytes_per_row)(pb));
                     let rows = std::slice::from_raw_parts_mut(base, stride * height as usize);
                     for row in rows.chunks_exact_mut(stride) {
-                        row[..width as usize * 4].copy_from_slice(&colour.repeat(width as usize));
+                        row[..width as usize * 4].copy_from_slice(&row_px);
                     }
                     (api.unlock)(pb, 0);
                     let at = CMTime { value: i as i64, timescale: fps, flags: TIME_VALID, epoch: 0 };
@@ -1178,6 +1341,30 @@ mod tests {
             assert!(near(*px, want), "{ms} ms: {px:?}, want about {want:?}; all {shown:?}");
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A landscape picture, red on the left and blue on the right, recorded with its track turned
+    /// 0, 90, 180 and 270 degrees clockwise: each plays upright, at the turned size.
+    #[test]
+    fn a_rotated_recording_plays_upright() {
+        let (w, h) = (64u32, 32u32);
+        for turns in 0..4u8 {
+            let path = temp_clip(&format!("turned-{turns}.mov"));
+            write_movie(&path, w, h, 10, clockwise(turns, w, h), 2, |_, x| if x < w / 2 { RED } else { BLUE });
+            let mut source = ok(crate::synth::open(&crate::SourceSpec::Video(path.clone())));
+            let (sw, sh) = if turns % 2 == 1 { (h, w) } else { (w, h) };
+            let frame = ok(source.frame(FrameSpec { width: sw, height: sh, fps: 10 }, Tick::start()));
+            // The quarter of the turned picture each colour fills: (x, y) at its centre.
+            let (red, blue) = match turns {
+                0 => ((sw / 4, sh / 2), (sw * 3 / 4, sh / 2)),
+                1 => ((sw / 2, sh / 4), (sw / 2, sh * 3 / 4)),
+                2 => ((sw * 3 / 4, sh / 2), (sw / 4, sh / 2)),
+                _ => ((sw / 2, sh * 3 / 4), (sw / 2, sh / 4)),
+            };
+            let (r, b) = (frame.pixel(red.0, red.1), frame.pixel(blue.0, blue.1));
+            assert!(near(r, RED) && near(b, BLUE), "{turns} turn(s): {r:?} at {red:?}, {b:?} at {blue:?}");
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     #[test]

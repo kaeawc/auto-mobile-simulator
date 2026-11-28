@@ -389,13 +389,18 @@ fn resolve_source(host: &dyn Host, source: &str, target: &[&str]) -> Result<Reso
              link device:<udid or name>[:x,y,w,h] for another device's screen"
                 .into())
         }
-        SourceSpec::Video(_) => {
-            Err("video: sources aren't supported yet (they need the VideoToolbox decoder, #335); use image:<path> for a still".into())
+        // A file the device's emulator opens later, from its own working directory: an absolute
+        // path to a file that exists now.
+        SourceSpec::Image(path) | SourceSpec::Video(path) if !path.is_absolute() => {
+            Err(format!("{}:{}: give an absolute path (the device's emulator opens it, not this shell)", spec.kind(), path.display()))
         }
-        SourceSpec::Image(path) if !path.is_absolute() => {
-            Err(format!("image:{}: give an absolute path (the device's emulator opens it, not this shell)", path.display()))
+        SourceSpec::Image(path) | SourceSpec::Video(path) if !path.is_file() => {
+            Err(format!("{}:{}: no such file", spec.kind(), path.display()))
         }
-        SourceSpec::Image(path) if !path.is_file() => Err(format!("image:{}: no such file", path.display())),
+        SourceSpec::Video(path) if !cfg!(target_os = "macos") => Err(format!(
+            "video:{}: video files are decoded with AVFoundation, so they play on macOS only; here, use image:<path> for a still",
+            path.display()
+        )),
         SourceSpec::Webcam(query) => {
             let cameras = host.cameras()?;
             let camera = sim_camera::resolve_webcam(query, &cameras).map_err(|e| match e {
@@ -1781,8 +1786,42 @@ mod tests {
         let console: Vec<String> =
             emulator.console.lock().expect("console").iter().filter(|c| c.starts_with("camera link")).cloned().collect();
         assert_eq!(console, ["camera link back solid:orange", "camera link front qr:front"]);
-        let err = run(&mut s, "boot", json!({"device": "phone", "camera_back": "video:/x.mp4"})).expect_err("unsupported");
-        assert!(err.contains("aren't supported yet"), "{err}");
+        let err = run(&mut s, "boot", json!({"device": "phone", "camera_back": "video:/x.mp4"})).expect_err("missing file");
+        assert!(err.contains("video:/x.mp4") && err.contains("no such file"), "{err}");
+    }
+
+    /// `video:` links the way `image:` does: an absolute path to a file that exists, checked at
+    /// link time (the device's emulator opens it, not the shell that linked it).
+    #[test]
+    fn a_video_file_links_like_an_image() {
+        let f = Fixture::new("video");
+        let mut s = f.session();
+        let link = |s: &mut Session, source: &str| run(s, "camera_link", json!({"device": "phone", "facing": "back", "source": source}));
+        let err = link(&mut s, "video:clip.mp4").expect_err("relative");
+        assert!(err.contains("video:clip.mp4") && err.contains("absolute path"), "{err}");
+        let missing = f.root.join("missing.mp4");
+        let err = link(&mut s, &format!("video:{}", missing.display())).expect_err("missing");
+        assert!(err.contains("missing.mp4") && err.contains("no such file"), "{err}");
+        let err = link(&mut s, &format!("video:{}", f.root.display())).expect_err("a directory");
+        assert!(err.contains("no such file"), "{err}");
+        let clip = f.root.join("clip.mp4");
+        std::fs::write(&clip, b"a movie").expect("clip");
+        let linked = link(&mut s, &format!("video:{}", clip.display()));
+        if cfg!(target_os = "macos") {
+            linked.expect("an existing file links");
+            assert_eq!(f.saved(), format!("back=video:{}\n", clip.display()));
+            let p = json!({"device": "phone", "camera_front": format!("video:{}", clip.display()), "settle": true});
+            let err = run(&mut s, "boot", p).expect_err("settle is iOS's");
+            assert!(err.contains("for iOS devices only"), "{err}");
+            assert_eq!(f.saved(), format!("back=video:{}\nfront=video:{}\n", clip.display(), clip.display()), "boot links it too");
+        } else {
+            let err = linked.expect_err("no decoder here");
+            assert!(err.contains("macOS"), "{err}");
+            assert_eq!(f.saved(), "");
+        }
+        let sources = run(&mut s, "camera_sources", json!({"kind": "synthetic"})).expect("sources");
+        let video = sources["sources"].as_array().expect("list").iter().find(|r| r["name"] == "video").cloned().expect("video row");
+        assert_eq!(video["supported"], cfg!(target_os = "macos"), "{video}");
     }
 
     #[test]
