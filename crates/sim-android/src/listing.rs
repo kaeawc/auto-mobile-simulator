@@ -1,161 +1,120 @@
-//! Remembered stock-emulator lookups, so resolving a device costs a few file reads rather than a
-//! `ps` of the whole host (#256).
+//! Remembered stock-emulator lookups, so resolving a device costs a few file reads and one
+//! process probe per running emulator (#256).
 //!
-//! Finding a stock emulator ([`Env::stock_instances`]) reads each AVD's `hardware-qemu.ini.lock`
-//! for a PID, checks that the PID is alive (`kill(pid, 0)`), then asks `ps` for its command line
-//! (to tell a qemu for that AVD from a program that reused the PID) and, when it has no `-port`,
-//! `lsof` for its listening ports. The lock reads and liveness checks are microseconds; one
-//! `ps -axo` is ~60 ms on a host with ~1300 processes and dominated every `devices` call and every
-//! `device: "booted"`.
+//! Finding a stock emulator reads each AVD's `hardware-qemu.ini.lock` for a PID, checks that the
+//! PID is alive (`kill(pid, 0)`), then asks the host for its command line (to tell a qemu for that
+//! AVD from a program that reused the PID) and, when it has no `-port`, for its listening ports.
+//! The host answers per PID from the kernel ([`crate::host::Native`]), so a first lookup costs
+//! microseconds where a host-wide `ps` and `lsof` cost ~60 ms each.
 //!
-//! A qemu process's command line and console ports never change while it lives, so they are
-//! remembered by PID. Every call still reads the locks and checks liveness, so a new emulator (a
-//! lock naming a PID not seen before) is asked about at once, and one that stopped (its lock gone
-//! or its PID dead) is never listed. What a remembered PID can't rule out alone is reuse: an
-//! emulator killed without removing its lock whose PID the kernel hands to another program. macOS
-//! hands out PIDs in order, so that takes a wrap of the PID space; entries are re-checked with `ps`
-//! after [`STOCK_TTL`] to bound it anyway.
+//! A qemu's command line and console ports never change while it lives, so a kept connection
+//! remembers them by PID *and start time*: a PID the kernel hands to another program later starts
+//! later, so its entry no longer matches and is asked about again. An emulator is never listed
+//! from memory alone: every call reads the locks and checks liveness, so a new emulator is seen
+//! at once and a stopped or dead one never is.
 
-use std::cell::{OnceCell, RefCell};
-use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
 
 use emu_avd::{Env, Probe, Running};
 
-/// How long a PID's command line and ports are trusted before `ps` is asked again.
-pub const STOCK_TTL: Duration = Duration::from_secs(10);
-
-/// What the host says about every process at once: one `ps` and one `lsof` per listing, as
-/// [`Env::stock_instances`] asks them.
+/// What the host says about one process at a time.
 pub trait Host: Send + Sync {
-    /// Every process's command line (`ps -axo pid=,args=`).
-    fn all_args(&self) -> BTreeMap<i32, String>;
-    /// Every process's listening TCP ports (`lsof -nP -iTCP -sTCP:LISTEN -Fpn`).
-    fn all_listening(&self) -> BTreeMap<i32, Vec<u16>>;
-}
-
-/// The real host: `ps` and `lsof`.
-pub struct Ps;
-
-fn run(argv: &[&str]) -> String {
-    std::process::Command::new(argv[0])
-        .args(&argv[1..])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
-}
-
-impl Host for Ps {
-    fn all_args(&self) -> BTreeMap<i32, String> {
-        emu_avd::parse_ps_all(&run(&["ps", "-axo", "pid=,args="]))
-    }
-
-    fn all_listening(&self) -> BTreeMap<i32, Vec<u16>> {
-        emu_avd::parse_lsof_by_pid(&run(&["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"]))
-    }
+    /// When the process started, in any unit that differs between two processes that had the
+    /// PID one after the other. `None` when it has gone, or when the host can't say (nothing is
+    /// then remembered about it).
+    fn start(&self, pid: i32) -> Option<u64>;
+    /// Its command line; `None` when it has gone.
+    fn args(&self, pid: i32) -> Option<String>;
+    /// The TCP ports it listens on.
+    fn listening(&self, pid: i32) -> Vec<u16>;
 }
 
 /// A qemu process as last seen.
 struct Seen {
+    start: u64,
     args: String,
     /// Its listening ports, once they include a console and adb pair (a booting emulator may not
     /// listen yet, so an incomplete answer is asked again).
     listening: Option<Vec<u16>>,
-    at: Instant,
-}
-
-#[derive(Default)]
-struct State {
-    by_pid: HashMap<i32, Seen>,
-    /// Stock emulators by (AVD home, AVD name), for one-device lookups.
-    by_name: HashMap<(PathBuf, String), (Running, Instant)>,
 }
 
 /// Stock emulators found by earlier lookups, shared by every clone of one [`crate::Android`].
 pub struct StockCache {
     host: Arc<dyn Host>,
-    state: Mutex<State>,
+    by_pid: Mutex<HashMap<i32, Seen>>,
 }
 
 impl std::fmt::Debug for StockCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = self.lock();
-        f.debug_struct("StockCache").field("pids", &s.by_pid.len()).field("names", &s.by_name.len()).finish()
+        f.debug_struct("StockCache").field("pids", &self.lock().len()).finish()
     }
 }
 
 impl StockCache {
     pub fn new(host: Arc<dyn Host>) -> StockCache {
-        StockCache { host, state: Mutex::default() }
+        StockCache { host, by_pid: Mutex::default() }
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> MutexGuard<'_, HashMap<i32, Seen>> {
+        self.by_pid.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// [`Env::stock_instances`], asking the host only about PIDs not seen within [`STOCK_TTL`]:
-    /// the same instances, with no `ps` or `lsof` when every live lock names a known qemu.
-    pub fn instances(&self, env: &Env, skip: &[Running]) -> Vec<Running> {
-        let now = Instant::now();
-        let mut state = self.lock();
-        state.by_pid.retain(|_, s| now.duration_since(s.at) < STOCK_TTL);
-        let by_pid = RefCell::new(std::mem::take(&mut state.by_pid));
-        let (ps, lsof) = (OnceCell::new(), OnceCell::new());
+    /// The stock emulators running among the AVDs `names` (left out: those `skip` names), asking
+    /// the host only about a PID not seen at its current start time. Forgets emulators no lock
+    /// names any more.
+    pub fn instances(&self, env: &Env, names: &[String], skip: &[Running]) -> Vec<Running> {
+        self.scan(env, names, skip, true)
+    }
+
+    /// [`StockCache::instances`] for the one AVD `name`: its lock only.
+    pub fn instance(&self, env: &Env, name: &str, skip: &[Running]) -> Option<Running> {
+        self.scan(env, &[name.to_owned()], skip, false).pop()
+    }
+
+    fn scan(&self, env: &Env, names: &[String], skip: &[Running], forget: bool) -> Vec<Running> {
+        let mut seen = self.lock();
+        let touched = std::cell::RefCell::new(HashSet::new());
+        let table = std::cell::RefCell::new(std::mem::take(&mut *seen));
         let args = |pid: i32| {
-            if let Some(s) = by_pid.borrow().get(&pid) {
+            touched.borrow_mut().insert(pid);
+            let start = self.host.start(pid);
+            if let (Some(start), Some(s)) = (start, table.borrow().get(&pid))
+                && s.start == start
+            {
                 return Some(s.args.clone());
             }
-            let a = ps.get_or_init(|| self.host.all_args()).get(&pid).cloned()?;
-            // Only a qemu's command line is final: a launcher about to exec one is asked again.
-            if a.contains("qemu") {
-                by_pid.borrow_mut().insert(pid, Seen { args: a.clone(), listening: None, at: now });
+            let a = self.host.args(pid)?;
+            // Only a qemu's command line is final (a launcher about to exec one is asked again),
+            // and only when the PID kept its process while it was read.
+            if a.contains("qemu")
+                && let Some(start) = start
+                && self.host.start(pid) == Some(start)
+            {
+                table.borrow_mut().insert(pid, Seen { start, args: a.clone(), listening: None });
             }
             Some(a)
         };
         let listening = |pid: i32| {
-            if let Some(ports) = by_pid.borrow().get(&pid).and_then(|s| s.listening.clone()) {
+            let start = self.host.start(pid);
+            let known = table.borrow().get(&pid).filter(|s| start == Some(s.start)).and_then(|s| s.listening.clone());
+            if let Some(ports) = known {
                 return ports;
             }
-            let ports = lsof.get_or_init(|| self.host.all_listening()).get(&pid).cloned().unwrap_or_default();
+            let ports = self.host.listening(pid);
             if emu_avd::console_port_from_listening(&ports).is_some()
-                && let Some(s) = by_pid.borrow_mut().get_mut(&pid)
+                && let Some(s) = table.borrow_mut().get_mut(&pid).filter(|s| start == Some(s.start))
             {
                 s.listening = Some(ports.clone());
             }
             ports
         };
-        let found = env.stock_instances_with(skip, &Probe { args: &args, listening: &listening });
-        state.by_pid = by_pid.into_inner();
-        // What the listing found is what runs now: one-device lookups start from it.
-        state.by_name.retain(|(home, name), _| *home != env.avd_home || skip.iter().any(|r| r.avd_name == *name));
-        for r in &found {
-            let at = state.by_pid.get(&r.pid).map_or(now, |s| s.at);
-            state.by_name.insert((env.avd_home.clone(), r.avd_name.clone()), (r.clone(), at));
+        let found = env.stock_instances_among_with(names, skip, &Probe { args: &args, listening: &listening });
+        *seen = table.into_inner();
+        if forget {
+            let touched = touched.into_inner();
+            seen.retain(|pid, _| touched.contains(pid));
         }
-        found
-    }
-
-    /// [`Env::stock_instance`] for AVD `name`, answered from an earlier lookup while its PID is
-    /// alive and was seen within [`STOCK_TTL`].
-    pub fn instance(&self, env: &Env, name: &str, skip: &[Running]) -> Option<Running> {
-        if skip.iter().any(|r| r.avd_name == name) {
-            return None;
-        }
-        let key = (env.avd_home.clone(), name.to_owned());
-        if let Some((r, at)) = self.lock().by_name.get(&key)
-            && at.elapsed() < STOCK_TTL
-            && r.alive()
-        {
-            return Some(r.clone());
-        }
-        let found = env.stock_instance(name, skip);
-        let mut state = self.lock();
-        match &found {
-            Some(r) => state.by_name.insert(key, (r.clone(), Instant::now())),
-            None => state.by_name.remove(&key),
-        };
         found
     }
 }
@@ -163,39 +122,67 @@ impl StockCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+    /// What a fake process looks like to the host.
+    #[derive(Clone)]
+    struct Proc {
+        start: u64,
+        args: String,
+        ports: Vec<u16>,
+    }
 
     /// A host whose process table the test writes, counting how often it is asked.
     #[derive(Default)]
     struct FakeHost {
-        args: Mutex<BTreeMap<i32, String>>,
-        listening: Mutex<BTreeMap<i32, Vec<u16>>>,
-        ps: AtomicUsize,
+        procs: Mutex<BTreeMap<i32, Proc>>,
+        /// Whether the host can't say when a process started.
+        no_start: AtomicBool,
+        /// Whether every `start` answer differs (a PID that changed process while it was read).
+        shifting: AtomicBool,
+        shifts: AtomicU64,
+        args: AtomicUsize,
         lsof: AtomicUsize,
     }
 
     impl Host for FakeHost {
-        fn all_args(&self) -> BTreeMap<i32, String> {
-            self.ps.fetch_add(1, Ordering::SeqCst);
-            self.args.lock().expect("args").clone()
+        fn start(&self, pid: i32) -> Option<u64> {
+            let start = self.procs.lock().expect("procs").get(&pid)?.start;
+            if self.no_start.load(Ordering::SeqCst) {
+                return None;
+            }
+            Some(if self.shifting.load(Ordering::SeqCst) { start + 1000 * self.shifts.fetch_add(1, Ordering::SeqCst) } else { start })
         }
-        fn all_listening(&self) -> BTreeMap<i32, Vec<u16>> {
+        fn args(&self, pid: i32) -> Option<String> {
+            self.args.fetch_add(1, Ordering::SeqCst);
+            self.procs.lock().expect("procs").get(&pid).map(|p| p.args.clone())
+        }
+        fn listening(&self, pid: i32) -> Vec<u16> {
             self.lsof.fetch_add(1, Ordering::SeqCst);
-            self.listening.lock().expect("listening").clone()
+            self.procs.lock().expect("procs").get(&pid).map(|p| p.ports.clone()).unwrap_or_default()
         }
     }
 
     impl FakeHost {
-        fn qemu(&self, pid: u32, avd: &str, port: Option<u16>) {
+        /// Process `pid`, started at tick `start`, as a qemu for `avd`, with or without `-port`.
+        fn qemu(&self, pid: u32, start: u64, avd: &str, port: Option<u16>) {
             let args = match port {
                 Some(p) => format!("/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64-headless -avd {avd} -port {p}"),
                 None => format!("/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64-headless -avd {avd} -no-window"),
             };
-            self.args.lock().expect("args").insert(pid as i32, args);
+            self.procs.lock().expect("procs").insert(pid as i32, Proc { start, args, ports: Vec::new() });
         }
+        fn other(&self, pid: u32, start: u64, args: &str) {
+            self.procs.lock().expect("procs").insert(pid as i32, Proc { start, args: args.into(), ports: Vec::new() });
+        }
+        fn listen(&self, pid: u32, ports: &[u16]) {
+            self.procs.lock().expect("procs").get_mut(&(pid as i32)).expect("process").ports = ports.to_vec();
+        }
+        /// (command lines, listening sockets) asked for.
         fn asked(&self) -> (usize, usize) {
-            (self.ps.load(Ordering::SeqCst), self.lsof.load(Ordering::SeqCst))
+            (self.args.load(Ordering::SeqCst), self.lsof.load(Ordering::SeqCst))
         }
     }
 
@@ -247,30 +234,34 @@ mod tests {
         StockCache::new(host.clone())
     }
 
+    fn all(stock: &StockCache, env: &Env, skip: &[Running]) -> Vec<Running> {
+        stock.instances(env, &env.list_avds(), skip)
+    }
+
     #[test]
-    fn a_known_emulator_is_listed_again_without_asking_the_host() {
+    fn a_known_emulator_is_listed_again_without_asking_the_host_about_it() {
         let (_home, env) = home("hit", &["a", "b", "idle"]);
         let (qa, qb) = (process(), process());
         lock(&env, "a", qa.id());
         lock(&env, "b", qb.id());
         let host = Arc::new(FakeHost::default());
-        host.qemu(qa.id(), "a", Some(5750));
+        host.qemu(qa.id(), 100, "a", Some(5750));
         // `b` was started without `-port`: its listening sockets say.
-        host.qemu(qb.id(), "b", None);
-        host.listening.lock().expect("ports").insert(qb.id() as i32, vec![5563, 5562, 51000]);
+        host.qemu(qb.id(), 200, "b", None);
+        host.listen(qb.id(), &[5563, 5562, 51000]);
         let stock = cache(&host);
-        let first = stock.instances(&env, &[]);
+        let first = all(&stock, &env, &[]);
         assert_eq!(names(&first), ["a", "b"]);
-        assert_eq!(host.asked(), (1, 1), "one ps and one lsof for the whole listing");
+        assert_eq!(host.asked(), (2, 1), "each process's command line once, and the one without -port its sockets");
         for _ in 0..3 {
-            assert_eq!(stock.instances(&env, &[]), first);
+            assert_eq!(all(&stock, &env, &[]), first);
         }
-        assert_eq!(host.asked(), (1, 1), "known qemus are not asked about again");
-        // One device: answered from the listing, no host question either.
+        assert_eq!(host.asked(), (2, 1), "known qemus are not asked about again");
+        // One device: answered the same way, no host question either.
         let a = stock.instance(&env, "a", &[]).expect("a");
         assert_eq!((a.console_port, a.adb_port, a.pid), (5750, 5751, qa.id() as i32));
         assert_eq!(stock.instance(&env, "b", &[]).map(|r| r.console_port), Some(5562));
-        assert_eq!(host.asked(), (1, 1));
+        assert_eq!(host.asked(), (2, 1));
         stop(qa);
         stop(qb);
     }
@@ -282,25 +273,26 @@ mod tests {
         lock(&env, "a", qa.id());
         lock(&env, "b", qb.id());
         let host = Arc::new(FakeHost::default());
-        host.qemu(qa.id(), "a", Some(5750));
-        host.qemu(qb.id(), "b", Some(5562));
+        host.qemu(qa.id(), 100, "a", Some(5750));
+        host.qemu(qb.id(), 200, "b", Some(5562));
         let stock = cache(&host);
-        assert_eq!(names(&stock.instances(&env, &[])), ["a", "b"]);
+        assert_eq!(names(&all(&stock, &env, &[])), ["a", "b"]);
         // `a` shuts down cleanly: its lock goes, then its process.
         unlock(&env, "a");
         stop(qa);
-        assert_eq!(names(&stock.instances(&env, &[])), ["b"]);
+        assert_eq!(names(&all(&stock, &env, &[])), ["b"]);
         assert!(stock.instance(&env, "a", &[]).is_none());
+        assert_eq!(stock.lock().len(), 1, "what no lock names any more is forgotten");
         // `b` dies without removing its lock: a dead PID is never an emulator, listed or looked up.
         let pid_b = qb.id();
         stop(qb);
         assert!(stock.instance(&env, "b", &[]).is_none(), "a remembered emulator whose PID died");
-        assert!(stock.instances(&env, &[]).is_empty());
+        assert!(all(&stock, &env, &[]).is_empty());
         // A new emulator between calls is found by the next one.
         let qc = process();
         lock(&env, "a", qc.id());
-        host.qemu(qc.id(), "a", Some(5760));
-        let found = stock.instances(&env, &[]);
+        host.qemu(qc.id(), 300, "a", Some(5760));
+        let found = all(&stock, &env, &[]);
         assert_eq!(names(&found), ["a"]);
         assert_eq!(found[0].console_port, 5760);
         assert_ne!(found[0].pid, pid_b as i32);
@@ -308,20 +300,65 @@ mod tests {
     }
 
     #[test]
+    fn a_reused_pid_is_not_the_emulator_remembered_under_it() {
+        let (_home, env) = home("reuse", &["a", "b"]);
+        let q = process();
+        lock(&env, "a", q.id());
+        let host = Arc::new(FakeHost::default());
+        host.qemu(q.id(), 100, "a", Some(5750));
+        let stock = cache(&host);
+        assert_eq!(names(&all(&stock, &env, &[])), ["a"]);
+        // The emulator died without removing its lock and the kernel gave its PID to a vim: the
+        // PID lives, with a later start, and is no qemu.
+        host.other(q.id(), 900, "/usr/bin/vim notes.txt");
+        assert!(all(&stock, &env, &[]).is_empty(), "same PID, new process");
+        assert!(stock.instance(&env, "a", &[]).is_none());
+        // Handed to a qemu of another AVD, or to one for this AVD on other ports: what that
+        // process says, not what was remembered.
+        host.qemu(q.id(), 950, "b", Some(5800));
+        assert!(all(&stock, &env, &[]).is_empty(), "a qemu, but for b");
+        host.qemu(q.id(), 990, "a", Some(5900));
+        let found = all(&stock, &env, &[]);
+        assert_eq!(found.first().map(|r| r.console_port), Some(5900), "the old ports are not remembered");
+        stop(q);
+    }
+
+    #[test]
     fn a_pid_that_is_not_a_qemu_for_the_avd_is_asked_about_every_time() {
-        let (_home, env) = home("reuse", &["a"]);
+        let (_home, env) = home("notqemu", &["a"]);
         let other = process();
         lock(&env, "a", other.id());
         let host = Arc::new(FakeHost::default());
-        host.args.lock().expect("args").insert(other.id() as i32, "/usr/bin/vim notes.txt".into());
+        host.other(other.id(), 100, "/usr/bin/vim notes.txt");
         let stock = cache(&host);
-        assert!(stock.instances(&env, &[]).is_empty());
-        assert!(stock.instances(&env, &[]).is_empty());
+        assert!(all(&stock, &env, &[]).is_empty());
+        assert!(all(&stock, &env, &[]).is_empty());
         assert_eq!(host.asked().0, 2, "a non-qemu answer is not remembered");
         // A launcher that has since exec'd its qemu is found.
-        host.qemu(other.id(), "a", Some(5770));
-        assert_eq!(names(&stock.instances(&env, &[])), ["a"]);
+        host.qemu(other.id(), 101, "a", Some(5770));
+        assert_eq!(names(&all(&stock, &env, &[])), ["a"]);
         stop(other);
+    }
+
+    #[test]
+    fn nothing_is_remembered_about_a_process_whose_start_the_host_cannot_say() {
+        let (_home, env) = home("nostart", &["a"]);
+        let q = process();
+        lock(&env, "a", q.id());
+        let host = Arc::new(FakeHost::default());
+        host.qemu(q.id(), 100, "a", Some(5750));
+        host.no_start.store(true, Ordering::SeqCst);
+        let stock = cache(&host);
+        assert_eq!(names(&all(&stock, &env, &[])), ["a"]);
+        assert_eq!(names(&all(&stock, &env, &[])), ["a"]);
+        assert_eq!(host.asked().0, 2, "asked each time: without a start time a reused PID couldn't be told");
+        assert!(stock.lock().is_empty());
+        // A PID that changes process between the two start reads isn't remembered either.
+        host.no_start.store(false, Ordering::SeqCst);
+        host.shifting.store(true, Ordering::SeqCst);
+        assert_eq!(names(&all(&stock, &env, &[])), ["a"]);
+        assert!(stock.lock().is_empty());
+        stop(q);
     }
 
     #[test]
@@ -330,13 +367,15 @@ mod tests {
         let q = process();
         lock(&env, "a", q.id());
         let host = Arc::new(FakeHost::default());
-        host.qemu(q.id(), "a", None);
+        host.qemu(q.id(), 100, "a", None);
         let stock = cache(&host);
-        // Booting: nothing listens yet, so it isn't listed (as stock_instances says too).
-        assert!(stock.instances(&env, &[]).is_empty());
-        host.listening.lock().expect("ports").insert(q.id() as i32, vec![5554, 5555]);
-        assert_eq!(stock.instances(&env, &[]).first().map(|r| r.console_port), Some(5554));
+        // Booting: nothing listens yet, so it isn't listed.
+        assert!(all(&stock, &env, &[]).is_empty());
+        host.listen(q.id(), &[5554, 5555]);
+        assert_eq!(all(&stock, &env, &[]).first().map(|r| r.console_port), Some(5554));
         assert_eq!(host.asked(), (1, 2), "the command line was remembered, the empty ports were not");
+        assert_eq!(all(&stock, &env, &[]).len(), 1);
+        assert_eq!(host.asked(), (1, 2), "and now the ports are");
         stop(q);
     }
 
@@ -349,23 +388,20 @@ mod tests {
         lock(&env, "dead", 999_999_999);
         lock(&env, "simee", qs.id());
         let host = Arc::new(FakeHost::default());
-        host.qemu(qa.id(), "a", Some(5750));
-        host.qemu(qb.id(), "b", None);
-        host.qemu(qs.id(), "simee", Some(5600));
-        host.listening.lock().expect("ports").insert(qb.id() as i32, vec![5567, 5566]);
+        host.qemu(qa.id(), 1, "a", Some(5750));
+        host.qemu(qb.id(), 2, "b", None);
+        host.listen(qb.id(), &[5567, 5566]);
+        host.qemu(qs.id(), 3, "simee", Some(5600));
         let skip = [Running { pid: 1, avd_name: "simee".into(), console_port: 5600, adb_port: 5601, avd_dir: None, simee: true }];
-        let plain = {
-            let args = host.args.lock().expect("args").clone();
-            let ports = host.listening.lock().expect("ports").clone();
-            env.stock_instances_with(
-                &skip,
-                &Probe { args: &|pid| args.get(&pid).cloned(), listening: &|pid| ports.get(&pid).cloned().unwrap_or_default() },
-            )
-        };
+        let plain = env.stock_instances_among_with(
+            &env.list_avds(),
+            &skip,
+            &Probe { args: &|pid| host.args(pid), listening: &|pid| host.listening(pid) },
+        );
         assert_eq!(names(&plain), ["a", "b"]);
         let stock = cache(&host);
-        assert_eq!(stock.instances(&env, &skip), plain);
-        assert_eq!(stock.instances(&env, &skip), plain, "remembered");
+        assert_eq!(all(&stock, &env, &skip), plain);
+        assert_eq!(all(&stock, &env, &skip), plain, "remembered");
         assert!(stock.instance(&env, "simee", &skip).is_none(), "a skipped AVD is simee's");
         // Another AVD home's lookups never answer for this one.
         let other = Env { sdk_root: None, avd_home: Path::new("/nonexistent-avd-home").to_owned() };

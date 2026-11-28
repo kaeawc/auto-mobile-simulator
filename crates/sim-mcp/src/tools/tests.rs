@@ -229,6 +229,16 @@ fn every_destructive_method_is_annotated_destructive() {
 }
 
 #[test]
+fn boot_manys_schema_declares_a_cancelled_result_for_every_era() {
+    for era in [Era::Modern, Era::Legacy] {
+        let schema = output_schema("boot_many", era);
+        assert_eq!(schema["properties"]["cancelled"]["type"], "boolean", "{era:?}: {schema}");
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.contains(&json!("cancelled")), "only a cancelled call has it ({era:?})");
+    }
+}
+
+#[test]
 fn every_tool_has_an_output_schema_its_results_fit() {
     for (era, version) in [(Era::Modern, crate::rpc::MODERN), (Era::Legacy, "2025-11-25"), (Era::Legacy, "2025-06-18")] {
         let tools = list(&Toolsets::all(), &ctx(era, version));
@@ -341,7 +351,11 @@ fn the_docs_name_every_tool_and_resource() {
             .into_iter()
             .map(str::to_owned)
             .chain(
-                crate::resources::templates().as_array().into_iter().flatten().filter_map(|t| t["uriTemplate"].as_str().map(str::to_owned)),
+                crate::resources::templates(&Toolsets::all())
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|t| t["uriTemplate"].as_str().map(str::to_owned)),
             )
     {
         assert!(docs.contains(&format!("`{uri}`")), "docs/mcp.md doesn't name the resource `{uri}`");
@@ -413,6 +427,13 @@ fn toolsets_pick_the_tools_and_a_hidden_one_says_where_it_is() {
     assert!(err.message.contains("SIMEE_MCP_TOOLSETS=core,debug"), "{}", err.message);
     assert_eq!(err.data, Some(json!({"tool": "exec", "toolset": "debug", "enabled": "core"})));
     assert!(parse_call(&json!({"name": "exec"}), &picked).is_ok());
+    // `stream_start` with `input: true` lets viewers touch the device: it needs the input tools.
+    let streaming = Toolsets::parse("stream").expect("stream");
+    let input = json!({"name": "stream_start", "arguments": {"whip_url": "http://127.0.0.1:1/w", "input": true}});
+    let err = parse_call(&input, &streaming).expect_err("input needs the input toolset");
+    assert!(err.message.contains("`input` toolset") && err.message.contains("SIMEE_MCP_TOOLSETS=stream,input"), "{}", err.message);
+    assert!(parse_call(&input, &Toolsets::parse("stream,input").expect("both")).is_ok());
+    assert!(parse_call(&json!({"name": "stream_start", "arguments": {"whip_url": "http://127.0.0.1:1/w"}}), &streaming).is_ok());
     assert_eq!(parse_call(&json!({"name": "teleport"}), &Toolsets::default()).expect_err("unknown").message, "Unknown tool: teleport");
 }
 

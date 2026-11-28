@@ -71,6 +71,14 @@ const DEFS: &[(&str, &str)] = &[
             up_kbps: number|null, loss_pct: number|null}]}",
     ),
     (
+        "stream",
+        r#"stream_id: string, device: string, name: string, platform: string, whip_url: string, whip_resource: string|null,
+            state: "starting"|"running"|"ended", reason?: string, input: boolean, lease_ttl_s: number, lease_expires_in_s: number,
+            stages: [{stage: string, ms: number}], stats: {encoded: number, sent: number, heartbeats: number, keyframes: number,
+            bytes: number, fps: number|null, bitrate_bps: number|null, bitrate_estimate_bps: number|null, pli: number, fir: number,
+            input_events: number, input_errors: number, last_input_error?: string}"#,
+    ),
+    (
         "finding",
         r#"{x: number, y: number, width: number, height: number, kind: "text"|"large_text"|"component", foreground: string,
             background: string, ratio: number, required: number}"#,
@@ -117,7 +125,7 @@ pub const OUTPUTS: &[(&str, &str)] = &[
     ),
     (
         "boot_many",
-        "{concurrency: number, all_s: number, failed: number, unsettled: number,
+        "{concurrency: number, all_s: number, failed: number, unsettled: number, cancelled?: boolean,
             devices: [{device: string, error?: string, boot_s?: number, started_s?: number, done_s?: number, console_port?: number,
             serial?: string, settled?: boolean, settle_s?: number, settle_error?: string}], admission?: @admission, pacing?: @pacing}",
     ),
@@ -139,6 +147,10 @@ pub const OUTPUTS: &[(&str, &str)] = &[
     ("erase", "null"),
     ("screen", "{width: number, height: number}"),
     ("screenshot", "{width: number, height: number, png?: string, path?: string}"),
+    ("stream_start", "{stream_id: string, whip_resource: string, lease_ttl_s: number, device: string}"),
+    ("stream_status", "{...@stream}"),
+    ("stream_stop", "{...@stream, deleted: boolean, delete_error?: string}"),
+    ("streams", "[{...@stream}]"),
     (
         "contrast_check",
         r#"{failing: number, scale: number, scale_source: "param"|"device"|"assumed", width?: number, height?: number, png?: string,

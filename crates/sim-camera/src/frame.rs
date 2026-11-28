@@ -102,6 +102,9 @@ impl CameraFrame {
     }
 }
 
+/// One picture's pixels fitted to other sizes, by size (`(width, height)`), made once each.
+pub(crate) type Fitted = Vec<((u32, u32), Arc<[u8]>)>;
+
 /// Scales 4-byte pixels to `dst_w`x`dst_h` the way a camera fills its sensor: keep the aspect
 /// ratio, cover the whole frame, and crop the overflow equally from both sides (nearest
 /// neighbour; sources here are test patterns and stills, where speed matters more than filtering).
@@ -125,9 +128,72 @@ pub fn fill(src_w: u32, src_h: u32, src: &[u8], dst_w: u32, dst_h: u32) -> Vec<u
     out
 }
 
+/// Copies `height` rows of `width` 4-byte pixels, `stride` bytes apart, into tight rows turned
+/// `quarter_turns` times clockwise (a recording's rotation, applied so it plays upright). Returns
+/// the turned width and height with the pixels; `None` when `src` is shorter than it claims.
+pub fn turn(src: &[u8], stride: usize, width: u32, height: u32, quarter_turns: u8) -> Option<(u32, u32, Vec<u8>)> {
+    let (w, h) = (width as usize, height as usize);
+    if stride < w * 4 || src.len() < stride * h.saturating_sub(1) + w * 4 {
+        return None;
+    }
+    let rows = || src.chunks(stride).take(h).map(|row| &row[..w * 4]);
+    let turns = quarter_turns % 4;
+    if turns == 0 {
+        let mut out = Vec::with_capacity(w * h * 4);
+        rows().for_each(|row| out.extend_from_slice(row));
+        return Some((width, height, out));
+    }
+    let (out_w, out_h) = if turns == 2 { (w, h) } else { (h, w) };
+    let mut out = vec![0u8; w * h * 4];
+    for (y, row) in rows().enumerate() {
+        for (x, px) in row.as_chunks::<4>().0.iter().enumerate() {
+            // Where source pixel (x, y) lands, turned clockwise.
+            let (ox, oy) = match turns {
+                1 => (h - 1 - y, x),
+                2 => (w - 1 - x, h - 1 - y),
+                _ => (y, w - 1 - x),
+            };
+            let at = (oy * out_w + ox) * 4;
+            out[at..at + 4].copy_from_slice(px);
+        }
+    }
+    Some((out_w as u32, out_h as u32, out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 3x2 image of pixel numbers (`[n, 0, 0, 255]`), rows padded to 16 bytes.
+    fn numbered() -> Vec<u8> {
+        let mut src = Vec::new();
+        for y in 0..2u8 {
+            for x in 0..3u8 {
+                src.extend_from_slice(&[y * 3 + x, 0, 0, 255]);
+            }
+            src.extend_from_slice(&[0xee; 4]);
+        }
+        src
+    }
+
+    fn numbers(px: &[u8]) -> Vec<u8> {
+        px.as_chunks::<4>().0.iter().map(|p| p[0]).collect()
+    }
+
+    #[test]
+    fn turns_rotate_clockwise_and_drop_the_row_padding() {
+        // 0 1 2
+        // 3 4 5
+        let src = numbered();
+        let at = |turns| turn(&src, 16, 3, 2, turns).map(|(w, h, px)| (w, h, numbers(&px)));
+        assert_eq!(at(0), Some((3, 2, vec![0, 1, 2, 3, 4, 5])));
+        assert_eq!(at(1), Some((2, 3, vec![3, 0, 4, 1, 5, 2])), "a quarter turn: the left column becomes the top row");
+        assert_eq!(at(2), Some((3, 2, vec![5, 4, 3, 2, 1, 0])));
+        assert_eq!(at(3), Some((2, 3, vec![2, 5, 1, 4, 0, 3])));
+        assert_eq!(at(4), at(0), "four turns are none");
+        assert_eq!(turn(&src[..20], 16, 3, 2, 0), None, "shorter than it claims");
+        assert_eq!(turn(&src, 8, 3, 2, 0), None, "rows shorter than the width");
+    }
 
     #[test]
     fn specs_are_range_checked() {

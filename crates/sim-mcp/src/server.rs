@@ -17,7 +17,7 @@ use crate::backend::{Backend, Executor};
 use crate::rpc::{self, Ctx, EXT_TASKS, Era, INTERNAL_ERROR, Incoming, LEGACY, MODERN, RpcError};
 use crate::tasks::{Ctl, Sink, Tasks};
 use crate::tools::{self, Pages, Toolsets};
-use crate::watch::{self, Emit, Spec, Watcher};
+use crate::watch::{self, Emit, Pace, Spec, Watcher};
 use crate::{prompts, resources};
 
 /// What the server tells a client about using it.
@@ -25,7 +25,8 @@ const INSTRUCTIONS: &str = "simee drives iOS simulators and Android emulators. C
 (a UDID, a name, or `booted`). Every tool says which platforms it works on. `screenshot` returns the screen as an image; \
 `tap`, `swipe`, `type` and `button` take device pixels. `boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase` and \
 `shutdown` can take a while: with the tasks extension they return a task to poll with tasks/get (cancel with tasks/cancel). \
-Resources under simee://devices carry each device's info and screenshot; `device_view` opens a live, clickable view of a device. \
+Resources under simee://devices carry each device's info, screen (shrunk for you), logs and processes: subscribe to be told when one changes instead of polling; \
+`device_view` opens a live, clickable view of a device. \
 The tools listed are the toolsets this server was started with (SIMEE_MCP_TOOLSETS, default `core`); calling one that isn't listed \
 says which toolset has it. `processes`, `logs`, `connections` and `devices_usage` page with `limit` and `cursor`.";
 
@@ -42,14 +43,29 @@ fn server_info() -> Value {
 /// Timing knobs, shortened in tests.
 #[derive(Clone, Copy)]
 pub struct Timing {
-    pub watch: Duration,
+    /// How often each kind of subscribed resource is re-read.
+    pub watch: Pace,
     pub heartbeat: Duration,
 }
 
 impl Default for Timing {
     fn default() -> Timing {
-        Timing { watch: watch::INTERVAL, heartbeat: HEARTBEAT }
+        Timing { watch: Pace::default(), heartbeat: HEARTBEAT }
     }
+}
+
+impl Timing {
+    /// The defaults, with what the environment sets (`SIMEE_MCP_SCREEN_FPS`).
+    pub fn from_env() -> Result<Timing, String> {
+        Ok(Timing { watch: Pace::from_env()?, ..Timing::default() })
+    }
+}
+
+/// A legacy client's subscriptions: the URIs, and the watcher of them while there are any.
+#[derive(Default)]
+struct Subscribed {
+    uris: BTreeSet<String>,
+    watcher: Option<Watcher>,
 }
 
 /// An open `subscriptions/listen`.
@@ -75,9 +91,9 @@ struct Inner {
     running: Mutex<usize>,
     idle: Condvar,
     listens: Mutex<HashMap<String, Listen>>,
-    /// A legacy client's `resources/subscribe` URIs, watched by one watcher.
-    legacy_uris: Mutex<BTreeSet<String>>,
-    legacy_watcher: Mutex<Option<Watcher>>,
+    /// A legacy client's `resources/subscribe` URIs, watched by one watcher that exists while there
+    /// are any.
+    subscribed: Mutex<Subscribed>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -111,8 +127,7 @@ impl Server {
                 running: Mutex::new(0),
                 idle: Condvar::new(),
                 listens: Mutex::default(),
-                legacy_uris: Mutex::default(),
-                legacy_watcher: Mutex::default(),
+                subscribed: Mutex::default(),
             }),
         }
     }
@@ -156,16 +171,89 @@ fn strings(value: &Value, key: &str) -> Vec<String> {
     value.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default()
 }
 
-/// Reports a blocking call's progress until dropped. Dropping it waits out a progress being sent,
-/// and none is sent after, so a call's progress never follows its response (which MCP forbids).
+/// Reports a blocking call's progress until dropped: each step the call counts (`progress` and
+/// `total` in its units: devices booted of all, an install's phases) as it happens, and between
+/// them a heartbeat every `every`, so a client that resets its timeout on progress keeps waiting.
+/// The value only ever increases, as MCP requires: a heartbeat before any step counts seconds (the
+/// fallback for a call that counts nothing), one after a step moves partway to the next unit
+/// (`done` + 0.9·k/(k+1) for the k-th beat), and a call whose first progress was seconds stays in
+/// seconds. Dropping it waits out a progress being sent, and none is sent after, so a call's
+/// progress never follows its response (which MCP forbids).
 struct Heartbeat {
-    /// Set once the call has returned. A progress is checked against it and sent under its lock.
-    stopped: Arc<Mutex<bool>>,
+    report: Arc<Mutex<Report>>,
+}
+
+/// What a [`Heartbeat`] has sent, under the one lock every send and the stop take.
+struct Report {
+    /// Set once the call has returned.
+    stopped: bool,
+    sink: Sink,
+    token: Value,
+    tool: String,
+    start: Instant,
+    /// The last value sent, if any.
+    last: Option<f64>,
+    /// Whether the values are the call's own units (else seconds).
+    counted: bool,
+    /// Heartbeats since the last step.
+    beats: u32,
+    note: crate::tasks::Note,
+    before_send: Box<dyn Fn() + Send>,
+}
+
+impl Report {
+    /// Sends `value` (with the call's total once counted) unless it wouldn't increase.
+    fn send(&mut self, value: f64, message: String) {
+        if self.stopped || self.last.is_some_and(|last| value <= last) {
+            return;
+        }
+        (self.before_send)();
+        let mut params = json!({"progressToken": self.token, "progress": value, "message": message});
+        if let (true, Some(total)) = (self.counted, self.note.total) {
+            params["total"] = total.into();
+        }
+        (self.sink)(json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": params}).to_string());
+        self.last = Some(value);
+    }
+
+    fn step(&mut self, note: &crate::tasks::Note) {
+        self.note = note.clone();
+        if self.last.is_none() {
+            self.counted = true;
+        }
+        if self.counted {
+            self.beats = 0;
+            let message = format!("{}: {}", self.tool, note.message);
+            self.send(note.done as f64, message);
+        }
+    }
+
+    fn beat(&mut self, said: Option<String>) {
+        let secs = self.start.elapsed().as_secs_f64().round();
+        let note = said.map(|n| format!(": {n}")).unwrap_or_default();
+        let message = format!("{} is still running ({secs} s){note}", self.tool);
+        let value = if self.counted {
+            self.beats += 1;
+            let k = f64::from(self.beats);
+            self.note.done as f64 + 0.9 * k / (k + 1.0)
+        } else {
+            secs
+        };
+        self.send(value, message);
+    }
+}
+
+impl Heartbeat {
+    /// Where the call's counted steps go: sent at once, on the call's thread.
+    fn steps(&self) -> crate::tasks::OnStep {
+        let report = self.report.clone();
+        Arc::new(move |note: &crate::tasks::Note| lock(&report).step(note))
+    }
 }
 
 impl Drop for Heartbeat {
     fn drop(&mut self) {
-        *lock(&self.stopped) = true;
+        lock(&self.report).stopped = true;
     }
 }
 
@@ -179,7 +267,7 @@ fn heartbeat_with(sink: Sink, token: Value, tool: String, every: Duration, befor
     heartbeat_noting(sink, token, tool, every, Ctl::default(), before_send)
 }
 
-/// [`heartbeat_with`], saying what the call waits on (its note in `ctl`) after the time.
+/// [`heartbeat_with`], saying what the call last said (its note in `ctl`) after the time.
 fn heartbeat_noting(
     sink: Sink,
     token: Value,
@@ -188,37 +276,37 @@ fn heartbeat_noting(
     ctl: Ctl,
     before_send: impl Fn() + Send + 'static,
 ) -> Heartbeat {
-    let stopped = Arc::new(Mutex::new(false));
-    let flag = stopped.clone();
+    let report = Arc::new(Mutex::new(Report {
+        stopped: false,
+        sink,
+        token,
+        tool,
+        start: Instant::now(),
+        last: None,
+        counted: false,
+        beats: 0,
+        note: crate::tasks::Note::default(),
+        before_send: Box::new(before_send),
+    }));
+    let shared = report.clone();
     let spawned = std::thread::Builder::new().name("simee-mcp-progress".into()).spawn(move || {
-        let start = Instant::now();
-        let mut next = start + every;
-        while !*lock(&flag) {
+        let mut next = Instant::now() + every;
+        while !lock(&shared).stopped {
             std::thread::sleep(Duration::from_millis(10));
             if Instant::now() < next {
                 continue;
             }
             next += every;
-            let secs = start.elapsed().as_secs_f64();
-            let note = ctl.say().map(|n| format!(": {n}")).unwrap_or_default();
-            let message = format!("{tool} is still running ({} s){note}", secs.round());
+            // Read before the report's lock: the call's thread takes the note's lock, then this one.
+            let said = ctl.say();
             // Checked and sent under the one lock the drop takes, so a stop can't fall in between.
-            let stopped = lock(&flag);
-            if *stopped {
-                return;
-            }
-            before_send();
-            sink(
-                json!({"jsonrpc": "2.0", "method": "notifications/progress",
-                "params": {"progressToken": token, "progress": secs.round(), "message": message}})
-                .to_string(),
-            );
+            lock(&shared).beat(said);
         }
     });
     if let Err(e) = spawned {
         eprintln!("simee mcp: cannot start a progress thread: {e}");
     }
-    Heartbeat { stopped }
+    Heartbeat { report }
 }
 
 impl Inner {
@@ -321,20 +409,20 @@ impl Inner {
             "server/discover" => reply(Ok(self.discover())),
             "tools/list" => reply(Ok(cacheable(json!({"tools": tools::list(&self.toolsets, &ctx)}), STATIC_TTL_MS, "public"))),
             "resources/templates/list" => {
-                reply(Ok(cacheable(json!({"resourceTemplates": resources::templates()}), STATIC_TTL_MS, "public")));
+                reply(Ok(cacheable(json!({"resourceTemplates": resources::templates(&self.toolsets)}), STATIC_TTL_MS, "public")));
             }
             "tools/call" => self.tools_call(id.clone(), &params, &ctx),
             "prompts/list" => reply(prompts::list(&params, &ctx).map(|page| cacheable(page, STATIC_TTL_MS, "public"))),
             "prompts/get" => reply(prompts::get(&params, &self.toolsets)),
-            "resources/list" => {
-                self.offload(id.clone(), ctx.clone(), |i| Ok(cacheable(json!({"resources": resources::list(&*i.backend)}), 0, "private")))
-            }
+            "resources/list" => self.offload(id.clone(), ctx.clone(), |i| {
+                Ok(cacheable(json!({"resources": resources::list(&*i.backend, &i.toolsets)}), 0, "private"))
+            }),
             "resources/read" => match params.get("uri").and_then(Value::as_str) {
                 Some(uri) => {
                     let uri = uri.to_owned();
                     let era = ctx.era;
                     self.offload(id.clone(), ctx.clone(), move |i| {
-                        resources::read(&*i.backend, &uri)
+                        resources::read(&*i.backend, &i.toolsets, &uri)
                             .map(|contents| cacheable(json!({"contents": contents}), 0, "private"))
                             .map_err(|error| rpc::for_era(error, era))
                     });
@@ -401,8 +489,15 @@ impl Inner {
         let progress = ctx.progress_token.clone().filter(|_| tools::LONG_RUNNING.contains(&name.as_str()));
         let era = ctx.era;
         self.offload_with(id, ctx.clone(), move |inner, ctl| {
-            let _beat = progress.map(|token| heartbeat(inner.sink.clone(), token, name.clone(), inner.timing.heartbeat, ctl.clone()));
+            let beat = progress.map(|token| heartbeat(inner.sink.clone(), token, name.clone(), inner.timing.heartbeat, ctl.clone()));
+            // The call's own steps are sent as it reaches them, before its response (the beat is
+            // dropped, and stops, before this returns).
+            let ctl = match &beat {
+                Some(beat) => ctl.clone().on_step(beat.steps()),
+                None => ctl.clone(),
+            };
             let ran = sim_api::with_call_hooks(ctl.hooks(), || tools::run(&*inner.backend, &inner.pages, &name, &args));
+            drop(beat);
             Ok(tools::result(&name, ran, era))
         });
     }
@@ -435,8 +530,11 @@ impl Inner {
         if !task_ids.is_empty() && !ctx.has_extension(EXT_TASKS) {
             return Err(rpc::missing_extension(EXT_TASKS));
         }
-        let uris: Vec<String> = strings(&filter, "resourceSubscriptions").into_iter().filter(|u| resources::parse(u).is_some()).collect();
-        let list_changed = filter["resourcesListChanged"] == true;
+        // What isn't ours, or reads through a tool this server doesn't serve, isn't acknowledged.
+        let uris: Vec<String> =
+            strings(&filter, "resourceSubscriptions").into_iter().filter(|u| resources::check(u, &self.toolsets).is_ok()).collect();
+        // The list is of devices, which a server without `devices` doesn't say.
+        let list_changed = filter["resourcesListChanged"] == true && self.toolsets.contains("devices");
         let sink = self.sink.clone();
         let acknowledge = {
             let (sink, id, uris) = (sink.clone(), id.clone(), uris.clone());
@@ -478,22 +576,27 @@ impl Inner {
     /// A legacy client's `resources/subscribe` and `resources/unsubscribe`.
     fn legacy_subscription(self: &Arc<Self>, method: &str, params: &Value) -> Result<Value, RpcError> {
         let uri = params.get("uri").and_then(Value::as_str).ok_or_else(|| RpcError::invalid_params("`uri` is required"))?;
-        if resources::parse(uri).is_none() {
-            return Err(rpc::for_era(RpcError::invalid_params("Resource not found").with_data(json!({"uri": uri})), Era::Legacy));
+        resources::check(uri, &self.toolsets).map_err(|error| rpc::for_era(error, Era::Legacy))?;
+        let mut subscribed = lock(&self.subscribed);
+        if method == "resources/subscribe" {
+            subscribed.uris.insert(uri.to_owned());
+        } else {
+            // Whichever spelling it was subscribed under, it is one resource.
+            let key = resources::spelling(uri);
+            subscribed.uris.retain(|u| resources::spelling(u) != key);
         }
-        let uris: Vec<String> = {
-            let mut set = lock(&self.legacy_uris);
-            if method == "resources/subscribe" {
-                set.insert(uri.to_owned());
-            } else {
-                set.remove(uri);
-            }
-            set.iter().cloned().collect()
-        };
-        let sink = self.sink.clone();
-        let emit: Emit = Arc::new(move |method, params| sink(json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string()));
-        *lock(&self.legacy_watcher) =
-            (!uris.is_empty()).then(|| watch::spawn(self.backend.clone(), Spec { uris, list_changed: false }, self.timing.watch, emit));
+        // An older client has no way to ask for `list_changed` (and isn't told it is offered).
+        let spec = Spec { uris: subscribed.uris.iter().cloned().collect(), list_changed: false };
+        if spec.uris.is_empty() {
+            subscribed.watcher = None;
+        } else if let Some(watcher) = &subscribed.watcher {
+            watcher.update(spec);
+        } else {
+            let sink = self.sink.clone();
+            let emit: Emit =
+                Arc::new(move |method, params| sink(json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string()));
+            subscribed.watcher = Some(watch::spawn(self.backend.clone(), spec, self.timing.watch, emit));
+        }
         Ok(json!({}))
     }
 }

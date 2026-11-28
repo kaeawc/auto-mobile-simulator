@@ -8,6 +8,7 @@
 //! output is the same either way.
 
 mod doctor;
+mod stream_cli;
 
 use std::io::Write;
 use std::time::Duration;
@@ -412,6 +413,12 @@ enum Cmd {
         #[command(subcommand)]
         command: CameraCmd,
     },
+    /// Publish device screens over WHIP (WebRTC): start, inspect, keep alive and stop streams.
+    /// Streams live in a running `simee serve` (never in this process).
+    Stream {
+        #[command(subcommand)]
+        command: stream_cli::StreamCmd,
+    },
     /// Send commands to an Android device's emulator console (`adb emu`'s protocol).
     Console {
         device: String,
@@ -482,7 +489,7 @@ enum CameraCmd {
         json: bool,
     },
     /// Feed a device camera from a source: an id (qr:hello, pattern:testcard, text:Hi,
-    /// image:PATH, solid:red, webcam:ID, none) or part of a host camera's name (`obs` finds "OBS
+    /// image:PATH, video:PATH (macOS), solid:red, webcam:ID, none) or part of a host camera's name (`obs` finds "OBS
     /// Virtual Camera"; a name that matches several fails, listing them). The back camera unless
     /// --front or --both.
     Link {
@@ -518,7 +525,8 @@ enum CameraCmd {
 }
 
 /// `simee mcp --http`'s settings: the address (`host:port`, a name resolved to its first address),
-/// the token file (or none, `--no-auth`) and the toolsets `SIMEE_MCP_TOOLSETS` names.
+/// the token file (or none, `--no-auth`), the toolsets `SIMEE_MCP_TOOLSETS` names and the screen
+/// subscription pace `SIMEE_MCP_SCREEN_FPS` sets.
 fn mcp_http_config(
     addr: &str,
     token_file: Option<std::path::PathBuf>,
@@ -536,6 +544,7 @@ fn mcp_http_config(
     config.no_auth = no_auth;
     config.insecure_remote = insecure_remote;
     config.toolsets = sim_mcp::Toolsets::from_env().map_err(anyhow::Error::msg)?;
+    config.timing = sim_mcp::server::Timing::from_env().map_err(anyhow::Error::msg)?;
     Ok(config)
 }
 
@@ -545,18 +554,24 @@ fn main() -> Result<()> {
         Cmd::Serve { socket } => {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
             eprintln!("simee API on {}", path.display());
-            sim_api::serve(&path)?;
+            let served = sim_api::serve(&path);
+            sim_api::stop_streams();
+            served?;
             return Ok(());
         }
         Cmd::Mcp { http: None, .. } => {
             // Methods run in this process, on the server's own threads: nothing but protocol
             // messages may reach stdout.
-            sim_mcp::serve_stdio(std::sync::Arc::new(sim_mcp::ApiBackend::new()))?;
+            let served = sim_mcp::serve_stdio(std::sync::Arc::new(sim_mcp::ApiBackend::new()));
+            sim_api::stop_streams();
+            served?;
             return Ok(());
         }
         Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote } => {
             let config = mcp_http_config(addr, token_file.clone(), *no_auth, *insecure_remote)?;
-            sim_mcp::http::serve(std::sync::Arc::new(sim_mcp::ApiBackend::new()), config)?;
+            let served = sim_mcp::http::serve(std::sync::Arc::new(sim_mcp::ApiBackend::new()), config);
+            sim_api::stop_streams();
+            served?;
             return Ok(());
         }
         Cmd::Call { method, params, socket } => {
@@ -679,6 +694,24 @@ impl Transport {
         if self.local.is_some() && !sim_api::flush_input(FLUSH_TIMEOUT) && self.verbose {
             eprintln!("simee: input was still being sent after {} ms", FLUSH_TIMEOUT.as_millis());
         }
+    }
+}
+
+/// The stream commands' view of the transport: only a server answers. A stream dies with the
+/// process that holds it and sends its WHIP DELETE only if that process stops it, so one started
+/// here would be gone when this command exits.
+struct ServerOnly<'a>(&'a mut Transport);
+
+impl stream_cli::Api for ServerOnly<'_> {
+    fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        if !self.0.connected() {
+            let why = self.0.unused.as_deref().unwrap_or("no server answered");
+            anyhow::bail!(
+                "`simee stream` needs a running server of this build (`simee serve`): a stream lives in the process that started it and \
+                 would die with this command without sending its WHIP DELETE ({why})"
+            );
+        }
+        self.0.call(method, params)
     }
 }
 
@@ -1002,6 +1035,11 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             }
         }
         Cmd::Camera { command } => camera(command, &mut call, out, err)?,
+        Cmd::Stream { command } => {
+            let mut api = ServerOnly(transport);
+            let mut stop = stream_cli::enter_to_stop();
+            stream_cli::run(command, &mut api, &mut stop, out)?;
+        }
         Cmd::Console { device, command } => lines(out, &call("console", json!({"device": device, "command": command.join(" ")}))?)?,
         Cmd::Serve { .. } | Cmd::Call { .. } | Cmd::Mcp { .. } => anyhow::bail!("`serve`, `call` and `mcp` don't run through a transport"),
         Cmd::Exec { device, env, program, args } => {
@@ -1018,12 +1056,14 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
     Ok(())
 }
 
-/// A camera source as the server should read it: an `image:` path made absolute.
+/// A camera source as the server should read it: an `image:` or `video:` path made absolute.
 fn camera_source(source: &str) -> String {
-    match source.strip_prefix("image:") {
-        Some(path) => format!("image:{}", absolute(path)),
-        None => source.to_owned(),
+    for kind in ["image:", "video:"] {
+        if let Some(path) = source.strip_prefix(kind) {
+            return format!("{kind}{}", absolute(path));
+        }
     }
+    source.to_owned()
 }
 
 /// `simee camera ...`: the camera methods, printed one line per source or link (or as JSON).
@@ -1273,6 +1313,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn camera_file_sources_are_sent_as_absolute_paths() {
+        let cwd = std::env::current_dir().expect("cwd");
+        for kind in ["image", "video"] {
+            assert_eq!(camera_source(&format!("{kind}:clip.mov")), format!("{kind}:{}", cwd.join("clip.mov").display()));
+            assert_eq!(camera_source(&format!("{kind}:/abs/clip.mov")), format!("{kind}:/abs/clip.mov"));
+        }
+        assert_eq!(camera_source("qr:hello"), "qr:hello");
+        assert_eq!(camera_source("webcam:0"), "webcam:0");
+    }
+
+    #[test]
     fn list_groups_devices_by_runtime_with_labels() {
         let devices: Vec<DeviceInfo> = serde_json::from_value(json!([
             {"udid": "A", "name": "iPhone 17", "state": "Booted", "runtime_id": "rt.iOS-26-5", "device_type_id": "t", "available": true,
@@ -1299,6 +1350,17 @@ mod tests {
         assert!(out.contains("foldable  ios      iOS · Foldable (inputs: Touch, Keyboard, Hardware buttons, Hinge)"), "{out}");
         assert!(!out.contains("unsupported"), "{out}");
         assert_eq!(out.lines().count(), 7);
+    }
+
+    #[test]
+    fn stream_commands_refuse_to_run_without_a_server() {
+        use stream_cli::Api as _;
+        let missing = std::env::temp_dir().join(format!("simee-no-server-{}.sock", std::process::id()));
+        for mut transport in [Transport::local(), Transport::open(&missing)] {
+            let e = ServerOnly(&mut transport).call("streams", json!({})).expect_err("refused").to_string();
+            assert!(e.contains("needs a running server") && e.contains("simee serve") && e.contains("WHIP DELETE"), "{e}");
+            assert!(transport.local.is_none(), "nothing ran in this process");
+        }
     }
 
     #[test]

@@ -21,8 +21,21 @@ pub const VIEW_TOOL: &str = "device_view";
 /// Methods that can run for many seconds: a client that declares the Tasks extension gets a task
 /// handle for these, and everything else a progress heartbeat while the call blocks. A method not
 /// listed runs inline. (`provision` and `record` aren't API methods, so they aren't tools.)
-pub const LONG_RUNNING: &[&str] =
-    &["boot", "boot_many", "create", "clone", "install", "settle", "erase", "shutdown", "export", "import", "mem_leaks", "mem_heap"];
+pub const LONG_RUNNING: &[&str] = &[
+    "boot",
+    "boot_many",
+    "create",
+    "clone",
+    "install",
+    "settle",
+    "erase",
+    "shutdown",
+    "export",
+    "import",
+    "mem_leaks",
+    "mem_heap",
+    "stream_start",
+];
 
 /// The environment variable that picks the toolsets: names separated by commas (`core,debug`), or
 /// `all`.
@@ -573,6 +586,24 @@ fn contrast_result(mut value: Value) -> Value {
     json!({"content": content, "structuredContent": value})
 }
 
+/// The name of the toolset that has `tool` (`all` for one no set claims).
+pub fn toolset_of(tool: &str) -> &'static str {
+    group(tool).map_or("all", Group::name)
+}
+
+/// The refusal of `tool`, which `toolsets` doesn't serve, naming the toolset that has it. A
+/// resource that reads through a tool is refused the same way.
+pub fn not_enabled(tool: &str, toolsets: &Toolsets) -> RpcError {
+    let set = toolset_of(tool);
+    RpcError::invalid_params(format!(
+        "Tool `{tool}` isn't enabled on this server: it is in the `{set}` toolset, and this server serves `{}`. \
+         Start it with {TOOLSETS_ENV}={},{set} (or all)",
+        toolsets.label(),
+        toolsets.label()
+    ))
+    .with_data(json!({"tool": tool, "toolset": set, "enabled": toolsets.label()}))
+}
+
 /// What a tool call needs from the request to decide how to run: its name and arguments, checked.
 /// A tool this server doesn't serve is refused with the toolset that has it.
 pub fn parse_call(params: &Value, toolsets: &Toolsets) -> Result<(String, Value), RpcError> {
@@ -581,16 +612,19 @@ pub fn parse_call(params: &Value, toolsets: &Toolsets) -> Result<(String, Value)
         return Err(RpcError::invalid_params(format!("Unknown tool: {name}")));
     }
     if !toolsets.contains(name) {
-        let set = group(name).map_or("all", Group::name);
+        return Err(not_enabled(name, toolsets));
+    }
+    let args = arguments(params)?;
+    // `input: true` lets the viewer touch, type and press buttons: it needs the input tools served.
+    if name == "stream_start" && args.get("input") == Some(&json!(true)) && !toolsets.contains("touch") {
         return Err(RpcError::invalid_params(format!(
-            "Tool `{name}` isn't enabled on this server: it is in the `{set}` toolset, and this server serves `{}`. \
-             Start it with {TOOLSETS_ENV}={},{set} (or all)",
+            "`stream_start` with `input: true` lets viewers drive the device, which needs the `input` toolset, and this server serves `{}`. \
+             Start it with {TOOLSETS_ENV}={},input (or all), or leave `input` off",
             toolsets.label(),
             toolsets.label()
-        ))
-        .with_data(json!({"tool": name, "toolset": set, "enabled": toolsets.label()})));
+        )));
     }
-    Ok((name.to_owned(), arguments(params)?))
+    Ok((name.to_owned(), args))
 }
 
 /// Whether this call should be a task for this client.

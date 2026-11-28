@@ -29,8 +29,10 @@ rounds interleaved, the median of 5 (Apple M3 Max, 16 cores, 2026-11-27, host lo
   disconnected waits 30 s for the next, at most 8 wait), and its session is still made new for it.
 - MCP adds JSON-RPC framing, the tool result's text and `structuredContent`, and handing each call
   to a worker thread (`cargo test --release -p simee-mcp tool_call_overhead -- --ignored --nocapture`).
-- `devices` on a host with Android AVDs is the Android listing, not the API: it probes the stock
-  emulators running with `ps` and `lsof`. `device: "booted"` (or a name) resolves through it too.
+- `devices` on a host with Android AVDs is the Android listing, not the API: it reads each AVD's
+  lock and asks the kernel about the process that holds one. An exact AVD name resolves with one
+  `stat` and `device: "booted"` loads only the running AVDs (`docs/benchmarks.md` "Android device
+  resolution").
 
 **Binary replies.** A request may add `"binary": true` to take a result's bytes raw instead of as
 base64 in the line (a local client that wants the PNG skips the base64 encode, the JSON escaping and
@@ -120,6 +122,10 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `erase` | iOS | device | Erase content and settings (shut down first) |
 | `screen` | Android, iOS | device, display?(main\|outer\|inner\|carplay) | Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds). display (iOS): main is the screen in use (an unfolded iPhone Duo's inner one), outer and inner an iPhone Duo's two, carplay an iPhone's CarPlay screen |
 | `screenshot` | Android, iOS | device, path?, display?(main\|outer\|inner\|carplay) | PNG to path, else base64 in `png` (a folded Android foldable: its outer screen as the scanout shows it, a Pixel Fold's 949x1840; an iPhone Duo's inner screen as its framebuffer holds it, 2007x2853) |
+| `stream_start` | Android, iOS | device, whip_url, token?, fps?(30), max_size?(1280), bitrate?(2500000), audio?(false), input?(false) | Stream the screen as H.264 over WebRTC to a WHIP endpoint (plaintext http to a loopback host only, e.g. MediaMTX's `http://127.0.0.1:8889/<path>/whip`), with token as its bearer token; max_size caps the longest side (0: full size), bitrate is in bit/s; input offers the `simee-input` data channel, whose touches, keys, text, buttons, rotations, folds and scrolls reach the device. One stream per device and URL, living in this process (`simee serve`) on a 30 s lease that stream_status renews: a stream nobody renews is stopped. Returns stream_id, whip_resource and lease_ttl_s. Encoded on macOS by VideoToolbox (iOS and Android devices) and on Linux by OpenH264 in a build with `--features openh264` (Android devices only); audio isn't streamed yet |
+| `stream_status` | Android, iOS | stream_id | A stream's state (starting, running, ended and why), its stages in the order reached (requested, first_encoded_frame, whip_connected, ended; ms since requested) and stats (encoded, sent, keyframes, bytes, fps, bitrate_bps, the publisher's bitrate_estimate_bps, the viewers' pli and fir keyframe requests, input events and errors); renews its lease |
+| `stream_stop` | Android, iOS | stream_id | Stop a stream: ends its encode loop and sends the WHIP DELETE; its last status, with deleted |
+| `streams` | Android, iOS | device? | This process's streams (or one device's), each as stream_status shows it, without renewing a lease |
 | `contrast_check` | Android, iOS | device, region?, scale?, appearance?(current\|both), restore?(light\|dark), settle_ms?(500), path?, display?(main\|outer\|inner\|carplay) | Text and controls below WCAG contrast in a screenshot, from pixels alone: finds text-like regions, estimates each one's foreground and background, and reports those under 4.5:1 (normal text) or 3:1 (large text of about 18 pt, icons and controls) with their box, the two colours and the ratio, and the screenshot with the findings boxed (`png`, or written to path). Text over a photo or a busy background has no one background and isn't judged. appearance both (iOS) checks the light and the dark UI (switches, waits settle_ms, checks) and leaves the device in restore (default light); Android can't switch appearance yet. region is {x, y, width, height} in pixels; scale is pixels per point (default: the device's, else 1) |
 | `tap` | Android, iOS | device, x, y, hold_ms?, display?(main\|outer\|inner\|carplay) | Tap at pixels, held hold_ms (default: iOS 10, Android 60) (display, iOS only: an iPhone Duo's outer or inner screen, an iPhone's CarPlay screen) |
 | `swipe` | Android, iOS | device, x1, y1, x2, y2, duration_ms?, settle?, display?(main\|outer\|inner\|carplay), edge?(top\|bottom\|left\|right; iOS) | Swipe between pixels over duration_ms (default 300; iOS sends its samples on schedule, so a busy host doesn't stretch it); with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: home and the app switcher from the bottom, Notification Center and Control Center from the top (Android's edge gestures need only the start point) |
@@ -188,10 +194,10 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `audio_capture_start` | iOS | device, path?(.wav), mute? | Capture this device's audio output with a process tap (no driver); mute silences it on the host meanwhile; returns capture_id |
 | `audio_capture_stop` | iOS | capture_id | Stop a capture: frames, duration_ms, rms, peak, dbfs, path |
 | `audio_mute` | iOS | device, on | Silence (or restore) this device's audio on the host: a per-device null sink |
-| `camera_sources` | Android, iOS | kind?(host\|virtual\|synthetic) | The sources a device camera can link to, each with the `source` id camera_link takes: the host's cameras (built-in, external, Continuity Camera, and virtual cameras such as OBS Virtual Camera, flagged `virtual`) and the synthetic kinds (pattern:testcard, qr:, text:, image:, solid:); and the host's camera permission (macOS: the TCC status of the app that started the server, with the fix when it blocks capture), read without ever prompting |
-| `camera_link` | Android | device, facing(back\|front\|both), source | Feed a device camera from a source: a source id (webcam:<id>, pattern:testcard, qr:<text>, text:<text>, image:<absolute path>, solid:<colour>; emulated is the test card, none turns the camera off) or a host camera's name, index or part of its name (obs finds OBS Virtual Camera; an ambiguous one fails listing the matches), saved by its stable id. Saved with the device: it comes back on every boot and survives a server restart. Android: a running device is relinked live through emu's console (`camera link`), a shut-down one gets it at boot (-camera-back, -camera-front); a camera that was off at boot appears only after a reboot (the guest lists its cameras once). iOS: not yet (#322) |
-| `camera_unlink` | Android | device, facing?(back\|front\|both) | Remove a device camera's link (default both): it goes back to the AVD's own camera (config.ini hw.camera.*), live on a running device and at every boot |
-| `camera_links` | Android | device? | Each linked device camera (one device, or every device): facing, source (and a host camera's name), live (what the running emulator shows) and state: linked, saved (applies at the next boot), relinked (changed from the console; the next boot restores the saved link), unsaved (linked from the console only), off, source missing (the host no longer lists the camera: the device shows the test card until it is back) or permission missing, with the fix |
+| `camera_sources` | Android, iOS | kind?(host\|virtual\|synthetic) | The sources a device camera can link to, each with the `source` id camera_link takes: the host's cameras (built-in, external, Continuity Camera, and virtual cameras such as OBS Virtual Camera, flagged `virtual`) and the synthetic kinds (pattern:testcard, qr:, text:, image:, video: on macOS, solid:); and the host's camera permission (macOS: the TCC status of the app that started the server, with the fix when it blocks capture), read without ever prompting |
+| `camera_link` | Android, iOS | device, facing(back\|front\|both), source | Feed a device camera from a source: a source id (webcam:<id>, pattern:testcard, qr:<text>, text:<text>, image:<absolute path>, video:<absolute path> (macOS, looped), solid:<colour>; emulated is the test card, none turns the camera off) or a host camera's name, index or part of its name (obs finds OBS Virtual Camera; an ambiguous one fails listing the matches), saved by its stable id. Saved with the device: it comes back on every boot and survives a server restart. Android: a running device is relinked live through emu's console (`camera link`), a shut-down one gets it at boot (-camera-back, -camera-front); a camera that was off at boot appears only after a reboot (the guest lists its cameras once). iOS: injects the camera shim device-wide and serves the source from the running server (needs `simee serve`; one feed per device, so back and front share it; apps already running need a relaunch) |
+| `camera_unlink` | Android, iOS | device, facing?(back\|front\|both) | Remove a device camera's link (default both): it goes back to the AVD's own camera (config.ini hw.camera.*), live on a running device and at every boot |
+| `camera_links` | Android, iOS | device? | Each linked device camera (one device, or every device): facing, source (and a host camera's name), live (what the running emulator shows) and state: linked, saved (applies at the next boot), relinked (changed from the console; the next boot restores the saved link), unsaved (linked from the console only), off, source missing (the host no longer lists the camera: the device shows the test card until it is back) or permission missing, with the fix |
 | `network_env` | iOS | device | Environment that makes one app launch shaped (for simctl: prefix each key with SIMCTL_CHILD_) |
 | `console` | Android | device, command \| commands | Emulator console commands (`adb emu`'s protocol: sensor, geo, sms, gsm, finger, power, ...); reply lines |
 | `rotate` | Android, iOS | device, orientation?(portrait\|landscape-right\|portrait-upside-down\|landscape-left; iOS) | Rotate the device 90° clockwise, or to an orientation (iOS) |
@@ -400,3 +406,36 @@ with that cursor returns the changes since, oldest first, and the next cursor:
   cursor starts a new feed.
 - To follow a store from a known state: `prefs_watch` first, then `prefs_read`, then poll with the
   cursor; a change made during the read is in the feed.
+
+## Streams (`stream_*`)
+
+`stream_start` publishes a device's screen as H.264 over WebRTC to a WHIP endpoint (a media
+server such as MediaMTX, which browsers then play over WHEP). It returns once the first frame is
+encoded and the WHIP session is connected (the shape below; the values are placeholders):
+
+```text
+→ {"method": "stream_start", "params": {"device": "iPhone 17", "whip_url": "http://127.0.0.1:8889/sim/whip"}}
+← {"id":null,"ok":true,"result":{"stream_id":"stream-1","whip_resource":"http://127.0.0.1:8889/sim/whip/1f0c…","lease_ttl_s":30,"device":"5B0E…"}}
+→ {"method": "stream_status", "params": {"stream_id": "stream-1"}}
+← {"id":null,"ok":true,"result":{"stream_id":"stream-1","state":"running","stages":[{"stage":"requested","ms":0.0},
+    {"stage":"first_encoded_frame","ms":…},{"stage":"whip_connected","ms":…}],"stats":{"fps":…,"keyframes":…,"pli":…,…},…}}
+```
+
+- **`input: true` needs a server that carries data channels.** MediaMTX refuses the offer (`406
+  unsupported media 'application'`, docs/streaming.md "Input over a data channel"), so the
+  `stream_start` fails; leave `input` off for a MediaMTX endpoint.
+- A stream lives in the process that started it: run `simee serve` (the CLI forwards to it) or
+  the MCP server. One stream per device and WHIP URL; a second is refused with the first's id.
+- **Leases.** `stream_status` renews a stream's 30 s lease; a stream nobody renews is stopped
+  (its WHIP resource deleted), so a client that crashed leaves nothing running. `streams` lists
+  without renewing. A stream that ended on its own (the peer disconnected, the device went away)
+  stays listed, `state: "ended"` with its `reason`, until its lease lapses.
+- **Stopping.** `stream_stop` ends the encode loop, sends the WHIP DELETE and returns the last
+  status with `deleted`.
+- **Errors.** A URL the publisher refuses (`https`, plaintext to a host that isn't loopback, not
+  http), a device that isn't booted, the WHIP server refusing the token (401/403), `audio: true`
+  (#265), and a build without an encoder (a Linux `simee` built without `--features openh264`, or an iOS device on a Linux host) fail `stream_start`, leaving nothing
+  running. The token is never echoed.
+- **Input.** `input: true` offers the `simee-input` data channel; its events reach the device's
+  `touch`, `key`, `type`, `button`, `rotate`, `fold` and `swipe`, mapped from the stream frame to
+  device pixels. docs/streaming.md, "Streams from the API", has the mapping and the limits.

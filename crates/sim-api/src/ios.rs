@@ -275,7 +275,7 @@ fn boot_inject(device: &Device) -> Result<(), String> {
 /// afterwards, `launchctl` too, so injection couldn't be undone without a reboot.
 fn shaper_loads(device: &Device, env: &[(String, String)]) -> Result<(), String> {
     let out = device.exec("launchctl", &["getenv".to_owned(), "SIMEE_NETSHAPE".to_owned()], env).map_err(err)?;
-    match out.stderr.lines().find(|l| l.starts_with("dyld[") || l.contains("Library not loaded")) {
+    match crate::camera::dyld_failure(&out.stderr) {
         Some(line) => Err(format!("the network shaper doesn't load on this device's runtime: {}", line.trim())),
         None => Ok(()),
     }
@@ -694,6 +694,33 @@ impl crate::contrast::Target for ContrastTarget<'_> {
 /// The simulators to resolve a `device` across platforms with: what selection reads of each.
 pub fn selection_infos(s: &mut Session) -> Result<Vec<sim_core::device::DeviceInfo>, String> {
     s.ctx()?.selection_infos().map_err(err)
+}
+
+/// A simulator as the camera links (`crate::camera`, #323) see it.
+fn camera_target(d: &Device) -> crate::camera::IosTarget {
+    let info = d.info();
+    crate::camera::IosTarget {
+        udid: info.udid,
+        name: info.name,
+        data_dir: std::path::PathBuf::from(d.data_path()),
+        booted: d.state() == DeviceState::Booted,
+    }
+}
+
+/// The simulator `query` names, for the camera links.
+pub(crate) fn camera_device(s: &mut Session, query: &str) -> Result<crate::camera::IosTarget, String> {
+    s.ctx()?.device(query).map(|d| camera_target(&d)).map_err(err)
+}
+
+/// Every simulator, for `camera_links` without a device.
+pub(crate) fn camera_devices(s: &mut Session) -> Result<Vec<crate::camera::IosTarget>, String> {
+    Ok(s.ctx()?.devices().map_err(err)?.iter().map(camera_target).collect())
+}
+
+/// Runs the device's own `launchctl` (the runtime's, see AGENTS.md): its stdout and stderr.
+pub(crate) fn camera_launchctl(s: &mut Session, udid: &str, args: &[String], env: &[(String, String)]) -> Result<(String, String), String> {
+    let out = s.ctx()?.device(udid).map_err(err)?.exec("launchctl", args, env).map_err(err)?;
+    Ok((out.stdout, out.stderr))
 }
 
 /// Runs an input method on its device's worker.
@@ -1244,7 +1271,9 @@ pub(crate) fn mem_deadline(p: &Value) -> Duration {
 /// Boots `device` by `plan`: the boot, then the profile, then the settle wait, each timed. Only
 /// a failed boot is an error: a profile or settle wait that fails after it is reported in the
 /// timings (`profile.error`; `settled: false` with `settle_error`), the device left booted.
-fn boot_device(device: &Device, plan: &BootPlan) -> Result<Value, String> {
+/// `launching` is asked just before the boot is issued for a device that is off at that instant
+/// (not booted or booting): `Err` boots it not, and only a device it said yes to is this call's.
+fn boot_device(device: &Device, plan: &BootPlan, launching: &dyn Fn() -> Result<(), String>) -> Result<Value, String> {
     let start = std::time::Instant::now();
     let info = device.info();
     let udid = info.udid;
@@ -1259,6 +1288,10 @@ fn boot_device(device: &Device, plan: &BootPlan) -> Result<Value, String> {
     let preset = plan.profile.filter(|_| !was_booted).map(|profile| preset_profile(&udid, profile));
     let jobs = plan.profile.filter(|_| !was_booted).map(|profile| boot_jobs(&udid, profile)).unwrap_or_default();
     let boot_started = std::time::SystemTime::now();
+    // Read again now: another caller may have booted it since, and then this call only waits.
+    if !matches!(device.state(), DeviceState::Booted | DeviceState::Booting) {
+        launching()?;
+    }
     if !was_booted && (!env.is_empty() || !jobs.is_empty()) {
         device.boot_with(&sim_coresim::BootOptions { env: &env, jobs: &jobs }).map_err(err)?;
     }
@@ -1612,8 +1645,9 @@ fn wait_settled(udid: &str, rule: crate::settle::Rule, timeout: Duration, since_
 }
 
 /// Boots `udids` with at most `concurrency` boots (and settle waits) in flight; one result per
-/// device, in order: the `boot_device` timings, or `{device, error}`.
-fn boot_many(udids: &[String], concurrency: usize, plan: &BootPlan) -> Vec<Value> {
+/// device, in order: the `boot_device` timings, or `{device, error}`. `hook` is asked before each
+/// device starts (one it stops gets its reason as the error) and told as each finishes.
+fn boot_many(udids: &[String], concurrency: usize, plan: &BootPlan, hook: &dyn crate::progress::BootHook) -> Vec<Value> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::sync::Mutex::new(vec![Value::Null; udids.len()]);
     let start = std::time::Instant::now();
@@ -1626,20 +1660,51 @@ fn boot_many(udids: &[String], concurrency: usize, plan: &BootPlan) -> Vec<Value
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(udid) = udids.get(i) else { break };
+                    if let Err(why) = hook.start(i) {
+                        results.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[i] = json!({"device": udid, "error": why});
+                        continue;
+                    }
                     let queued_s = start.elapsed().as_secs_f64();
                     let result = sim_coresim::autoreleasepool(|| {
                         let device = ctx.as_ref().map_err(Clone::clone)?.device(udid).map_err(err)?;
-                        boot_device(&device, plan)
+                        boot_device(&device, plan, &|| hook.launching(i))
                     });
                     let mut value = result.unwrap_or_else(|e| json!({"device": udid, "error": e}));
                     value["started_s"] = json!(round(queued_s));
                     value["done_s"] = json!(round(start.elapsed().as_secs_f64()));
+                    hook.finished(i, &value);
                     results.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[i] = value;
                 }
             });
         }
     });
     results.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `boot_many` of `p`'s `devices`, with `hook` asked before each device starts and told as each
+/// finishes.
+pub(crate) fn boot_many_hooked(s: &mut Session, p: &Value, hook: &dyn crate::progress::BootHook) -> Result<Value, String> {
+    let udids = strings(p, "devices");
+    if udids.is_empty() {
+        return Err("give `devices`: a list of UDIDs or names".into());
+    }
+    let concurrency = crate::params::concurrency(p)?;
+    // Settles by default: the slot is held through the settle wait, so K bounds the boot
+    // storms in flight (what the K sweep measured), not just the service's boot calls.
+    let mut exact = Vec::with_capacity(udids.len());
+    let mut runtimes = Vec::with_capacity(udids.len());
+    for q in &udids {
+        let (_, info) = s.ctx()?.resolve(q).map_err(err)?;
+        exact.push(info.udid);
+        runtimes.push(info.runtime_id);
+    }
+    let plan = boot_plan(p, concurrency.min(udids.len()), true, || build_shapers(&runtimes))?;
+    let start = std::time::Instant::now();
+    let results = boot_many(&exact, concurrency, &plan, hook);
+    let failed = results.iter().filter(|r| r.get("error").is_some()).count();
+    let unsettled = results.iter().filter(|r| r["settled"] == json!(false)).count();
+    Ok(json!({"concurrency": concurrency, "all_s": round(start.elapsed().as_secs_f64()), "failed": failed,
+        "unsettled": unsettled, "devices": results}))
 }
 
 /// Rejects a `create` whose device type isn't the requested form factor. CarPlay (auto) is valid
@@ -1684,6 +1749,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let d = s.device(p)?;
             let udid = d.info().udid;
             s.ctx()?.delete(&d).map_err(err)?;
+            crate::camera::ios_stopped(&udid);
             // The service leaves launchd_sim's directory (its log, ~1-3 MB, and the disables)
             // behind, and the one it wrote a boot's `disabled_jobs` to (launchd's own on iOS
             // 18.0); both are keyed by the UDID, so nothing reads them again.
@@ -1699,33 +1765,13 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "boot" => {
             let d = s.device(p)?;
             let plan = boot_plan(p, 1, false, || build_shapers(&[d.info().runtime_id]))?;
-            let timed = boot_device(&d, &plan)?;
+            let timed = boot_device(&d, &plan, &crate::progress::launching)?;
+            // The device's saved camera links (#323): its feed and the device-wide injection.
+            crate::camera::ios_booted(s, &d.info().udid);
             // Without settle or a profile, `boot` answers as it always has.
             Ok(if plan.settle.is_some() || plan.profile.is_some() { timed } else { Value::Null })
         }
-        "boot_many" => {
-            let udids = strings(p, "devices");
-            if udids.is_empty() {
-                return Err("give `devices`: a list of UDIDs or names".into());
-            }
-            let concurrency = crate::params::concurrency(p)?;
-            // Settles by default: the slot is held through the settle wait, so K bounds the boot
-            // storms in flight (what the K sweep measured), not just the service's boot calls.
-            let mut exact = Vec::with_capacity(udids.len());
-            let mut runtimes = Vec::with_capacity(udids.len());
-            for q in &udids {
-                let (_, info) = s.ctx()?.resolve(q).map_err(err)?;
-                exact.push(info.udid);
-                runtimes.push(info.runtime_id);
-            }
-            let plan = boot_plan(p, concurrency.min(udids.len()), true, || build_shapers(&runtimes))?;
-            let start = std::time::Instant::now();
-            let results = boot_many(&exact, concurrency, &plan);
-            let failed = results.iter().filter(|r| r.get("error").is_some()).count();
-            let unsettled = results.iter().filter(|r| r["settled"] == json!(false)).count();
-            Ok(json!({"concurrency": concurrency, "all_s": round(start.elapsed().as_secs_f64()), "failed": failed,
-                "unsettled": unsettled, "devices": results}))
-        }
+        "boot_many" => boot_many_hooked(s, p, &crate::progress::Unwatched),
         "settle" => {
             let d = s.device(p)?;
             if d.state() != DeviceState::Booted {
@@ -1757,8 +1803,13 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let d = s.ctx()?.clone_device(&template, need_str(p, "name")?).map_err(err)?;
             serde_json::to_value(d.info()).map_err(err)
         }
-        "shutdown" => ok(s.device(p)?.shutdown()),
-        "erase" => ok(s.device(p)?.erase()),
+        // A device that stops (or is erased, which removes its socket) takes its camera feed with it.
+        "shutdown" | "erase" => {
+            let d = s.device(p)?;
+            ok(if method == "shutdown" { d.shutdown() } else { d.erase() })?;
+            crate::camera::ios_stopped(&d.info().udid);
+            Ok(Value::Null)
+        }
         "screen" => {
             let (w, h) = screen_size(s, p)?;
             Ok(json!({"width": w, "height": h}))
@@ -2889,6 +2940,40 @@ mod tests {
             assert_eq!(logs(&mut streams, &source, None, "10s", None), ["shown 10s"], "boots can't be told apart");
             assert!(source.started.borrow()[0].stopped(), "and the stream from before is stopped");
             assert_eq!(source.shown.get(), 5);
+        }
+
+        /// A subscription's reads: `seconds` of one read a second of `last`, with a line arriving
+        /// each second; how many of them `log show` answered. The stream's ring holds `keep` lines.
+        fn shown_by_a_subscription(last: &str, keep: usize, seconds: u64) -> (u32, usize) {
+            let (at, clock) = clock();
+            // Each line is 10 bytes, so the ring holds `keep` of them (the heavy-log case: a boot
+            // fills it in half a minute).
+            let (source, mut streams) = (FakeLog::default(), LogStreams::new(keep * 10, Duration::from_secs(300), clock));
+            logs(&mut streams, &source, key(1), last, None);
+            source.started.borrow()[0].write(HEADER);
+            for second in 1..=seconds {
+                advance(&at, Duration::from_secs(1));
+                let line = format!("line {second:04}");
+                source.started.borrow()[0].write(&line);
+                until(|| streams.kept.get("UDID").is_some_and(|(_, t)| lock(t).ring.lines.back().is_some_and(|(_, l)| *l == line)));
+                logs(&mut streams, &source, key(1), last, None);
+            }
+            (source.shown.get(), source.started.borrow().len())
+        }
+
+        #[test]
+        fn a_short_window_read_every_second_stops_spawning_log_show_once_the_stream_is_that_old() {
+            // The logs resource asks for a 5 s window (`sim-mcp`'s LOG_WINDOW) once a second. A ring
+            // that holds a boot's 10 s of lines answers every read after the first 5 s from the
+            // stream: `log show` ran for the first read, then for the 5 reads that reach back
+            // before the stream started, and never after.
+            let (shown, streams) = shown_by_a_subscription("5s", 10, 120);
+            assert_eq!(streams, 1, "one stream the whole time");
+            assert_eq!(shown, 1 + 4, "the first read and the four before the stream is 5 s old, then none for 115 more");
+            // A window the ring can't hold falls back on every read: the cost of a 30 s window on
+            // a just-booted device.
+            let (shown, _) = shown_by_a_subscription("30s", 10, 120);
+            assert_eq!(shown, 1 + 120);
         }
 
         #[test]

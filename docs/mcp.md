@@ -7,8 +7,8 @@ look at their screens, read their logs, and watch them change.
 | MCP feature | What simee gives it |
 | --- | --- |
 | Tools | One per method in `sim-api`'s table, generated from it, and `device_view`, with output schemas and annotations, in toolsets a client picks (`core` by default) |
-| Resources | Devices, runtimes, form factors, camera sources, and each device's info, screenshot, logs and apps |
-| Subscriptions | Change notifications for those resources, by re-reading them while subscribed |
+| Resources | Devices, runtimes, form factors, camera sources, each device's info, screen, screenshot, apps, logs and processes, and an app's preferences by template |
+| Subscriptions | Change notifications for those resources and for the resource list, throttled by kind, by re-reading them only while subscribed |
 | Prompts | Common workflows (boot and install, reproduce a bug, audit contrast, find slowness, test across form factors) that name the tools to call and their toolsets |
 | Tasks | `boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase`, `shutdown`, `export`, `import`, `mem_leaks`, `mem_heap` as pollable, cancellable tasks |
 | App | `device_view`: a device's screen with tap, swipe, type and button controls, in the conversation |
@@ -123,12 +123,13 @@ crate:
 - Annotations follow what the method does, from one table in `crates/sim-api/src/catalog.rs` that
   classifies every method (a test fails for one that isn't listed). Read-only means it changes
   nothing on the device or the host: listings, reads, `screenshot`. Settings are idempotent;
-  `exec`, `launch`, `push`, `network_shape`, `console`, `kill`, `export` and `audio_capture_start`
-  are marked destructive (they run code, reboot or restart things, or write a file), and so are
+  `exec`, `launch`, `push`, `network_shape`, `console`, `kill`, `export`, `audio_capture_start` and
+  `stream_start` are marked destructive (they run code, reboot or restart things, write a file, or
+  send the screen elsewhere), and so are
   `delete`, `erase`, `shutdown`, `rm`, `uninstall`, `terminate`, `clear_container`,
   `reset_keychain`, `write`, `defaults_write`, `prefs_write`, `prefs_delete`, `prefs_batch` and
-  the other overwrites. `openWorldHint` is true for `open_url` alone (the device may fetch the URL
-  from anywhere). A method nobody has classified gets the specification's defaults (writes, may
+  the other overwrites. `openWorldHint` is true for `open_url` (the device may fetch the URL
+  from anywhere) and `stream_start` (it publishes to a WHIP server you name). A method nobody has classified gets the specification's defaults (writes, may
   destroy), not a claim of safety.
 - `processes`, `logs`, `connections` and `devices_usage` (its `devices`) page: with `limit` (1 to
   1000) the result is a page, `{items, next_cursor, total}` (`devices_usage` keeps its shape, with
@@ -167,6 +168,7 @@ in `SIMEE_MCP_TOOLSETS` (commas between names; `all` for every tool). Unset, it 
 | `prefs` | `prefs_stores`, `prefs_read`, `prefs_write`, `prefs_delete`, `prefs_batch`, `prefs_watch` |
 | `network` | `network_shape`, `network_state`, `network_flows`, `network_clear`, `network_env` |
 | `audio` | `audio_state`, `audio_volume`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `audio_mute` |
+| `stream` | `stream_start`, `stream_status`, `stream_stop`, `streams` |
 | `camera` | `camera_sources`, `camera_link`, `camera_unlink`, `camera_links` |
 | `host` | `help`, `identity`, `host`, `devices_usage` |
 | `all` | Every tool |
@@ -193,8 +195,9 @@ reverse):
 | --- | --- |
 | `help`, `identity`, `host`, `devices_usage`, `form_factors`, `devices`, `runtimes`, `create`, `delete`, `boot`, `boot_many`, `admission_check`, `clone`, `shutdown`, `screen`, `screenshot`, `contrast_check`, `tap`, `swipe`, `touch`, `button`, `type`, `key`, `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `location`, `info`, `rotate`, `rotary`, `stylus`, `device_view` | Android, iOS |
 | `console`, `fold`, `xr`, `vehicle`, `touchpad`, `export`, `import` | Android (iOS bundles: the next step of #170) |
+| `stream_start`, `stream_status`, `stream_stop`, `streams` | Android, iOS (macOS: VideoToolbox, both platforms; Linux: Android only, in a build with `--features openh264`) |
 | `camera_sources` | Android, iOS (the host's cameras and the synthetic sources; needs no device) |
-| `camera_link`, `camera_unlink`, `camera_links` | Android (iOS devices: with the iOS camera feed, #322) |
+| `camera_link`, `camera_unlink`, `camera_links` | Android, iOS (iOS: device-wide shim injection, needs `simee serve`; see [camera.md](camera.md)) |
 | `prefs_stores`, `prefs_read`, `prefs_write`, `prefs_delete`, `prefs_batch`, `prefs_watch` | Android, iOS (iOS is implemented; Android answers "not yet available") |
 | `device_types`, `settle`, `profile`, `erase`, `appearance`, `privacy`, `push`, `status_bar`, `clear_status_bar`, `content_size`, `increase_contrast`, `dynamic_island`, `backlight`, `keyboard_language`, `hardware_keyboard`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `memory_warning`, `notify`, `biometric`, `exec`, `logs`, `processes`, `kill`, `connections`, `traffic`, `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container`, `defaults_read`, `defaults_write`, `crash_reports`, `network_shape`, `network_state`, `network_flows`, `network_clear`, `network_env`, `audio_state`, `audio_volume`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `audio_mute`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
 | `mem_leaks`, `mem_heap`, `mem_vmmap`, `mem_history` | iOS (the host's memory tools on one app; Android answers that they aren't available there) |
@@ -205,32 +208,85 @@ A test keeps this page honest: it fails if a tool isn't named here.
 
 | URI | Contents |
 | --- | --- |
-| `simee://devices` | Every device on both platforms (JSON) |
+| `simee://devices` | Every device on both platforms, with its state (JSON) |
 | `simee://runtimes` | iOS runtimes and Android system images |
 | `simee://device-types` | iOS device types |
 | `simee://form-factors` | The form-factor matrix, with inputs or why one is unsupported |
 | `simee://camera/sources` | Every source a device camera can link to, and the host's camera permission (`camera_sources`) |
-| `simee://devices/{device}` | The device's info (`info`) |
-| `simee://devices/{device}/screenshot` | The screen now, a PNG (`image/png`; a booted device) |
-| `simee://devices/{device}/logs` | The last minute of the unified log (`text/plain`; iOS) |
+| `simee://devices/{device}` | The device's info (`info`): identity, form factor, sub-platform, profile, paths |
+| `simee://devices/{device}/screen` | The screen now, a PNG shrunk so its longest side is at most 1024 px (a 1206×2622 iPhone is 402×874): what an agent reads (a booted device) |
+| `simee://devices/{device}/screenshot` | The screen now, a PNG at the device's own size (a booted device) |
+| `simee://devices/{device}/logs` | The newest 200 lines of the last 5 seconds of the unified log (`text/plain`; iOS) |
 | `simee://devices/{device}/apps` | Installed bundle ids (iOS) |
+| `simee://devices/{device}/processes` | The device's processes with CPU and memory (`processes`; iOS) |
+| `simee://devices/{device}/prefs/{bundle_id}` | Every key of an app's preference stores, typed (`prefs_read`, read fresh) |
+| `simee://devices/{device}/prefs/{bundle_id}/{store}` | One preference store of an app (a `store` id from `prefs_stores`) |
 | `ui://simee/device` | The device view's page (`text/html;profile=mcp-app`) |
 
-`{device}` is a UDID or an AVD name. `resources/list` includes each device's resources that apply
-to it (a screenshot for a booted device, logs and apps for an iOS one), and
-`resources/templates/list` the four templates. Android has no log resource: its console is the
-`console` tool. A device that doesn't exist is the specification's "resource not found" (`-32602`
-for the current revision, `-32002` for the earlier ones); one that isn't running is an internal
-error that says so.
+`{device}` is a UDID or an AVD name; `{bundle_id}` and `{store}` are as the `prefs_*` tools take
+them. Each is percent-encoded as one path segment. `simee://device/{device}…` is read as
+`simee://devices/{device}…`, and a subscription is announced under the spelling the client gave.
+A resource is served only when the server serves the tool it reads through (`processes` is the
+`debug` toolset's, `prefs_read` the `prefs` toolset's, `runtimes`, `device_types` and
+`form_factors` the `lifecycle` toolset's, `camera_sources` the `camera` toolset's): a client of the
+default `core` server can't read, list, template or subscribe to them, and a read says which
+toolset has it. `resources/list` includes each device's resources that apply to it (screens for a booted device,
+logs and processes for a booted iOS one, apps for an iOS one), and `resources/templates/list` all
+eight templates. Preferences are templates only, since every app has some. Android has no log or
+process resource (its console is the `console` tool) and no preferences yet (they answer as
+not found, like the tools' "not yet available"). A device that doesn't exist is the
+specification's "resource not found" (`-32602` for the current revision, `-32002` for the earlier
+ones); one that isn't running is an internal error that says so.
+
+`screen` is the one to subscribe to. A client that wants the device's own pixels reads
+`screenshot`, the `screenshot` tool's answer unchanged. Neither takes a size.
 
 **Subscriptions.** The API has nothing to subscribe to, so a subscription re-reads: while a client
 is subscribed (`subscriptions/listen` with `resourceSubscriptions`, or `resources/subscribe` for an
-older client), one thread reads each subscribed resource once a second and sends
-`notifications/resources/updated` when the bytes differ. `resourcesListChanged` sends
-`notifications/resources/list_changed` when a device appears, disappears, or starts or stops
-running. Subscribing to a screenshot costs a screenshot a second; the thread stops when the client
-cancels the listen (`notifications/cancelled`). The server never changes its tool list, so it
-doesn't offer `toolsListChanged`.
+older client), a watcher re-reads each subscribed resource at that kind's pace and sends
+`notifications/resources/updated` when it differs from the last read. The pace is also the most
+often it can be announced, so a burst of changes is one notification, and the client reads the
+state at that moment:
+
+| Resource | Re-read every | Counts as a change |
+| --- | --- | --- |
+| `screen`, `screenshot` | 1 s (`SIMEE_MCP_SCREEN_FPS`, above 0 and up to 30 frames a second) | The device's frame differs; an unchanged frame isn't shrunk or sent |
+| `logs` | 1 s, through the device's log stream (the first read starts it; later reads spawn no `log show`) | A new newest line: lines aging out of the window say nothing, and a burst is one notification |
+| `processes` | 2 s | A process starts or exits (its pid and path); CPU and memory moving don't count |
+| `devices` and the resource list (`resourcesListChanged`, a server that serves `devices`) | 1 s | A device appears, disappears, or starts or stops running (`notifications/resources/list_changed`) |
+| Everything else (`info`, `apps`, `prefs`, the catalogues) | 2 s | The bytes differ |
+
+What is already there when a subscription starts is its baseline: nothing is sent for it. A
+subscription added to a connection that has others keeps their baselines. A resource that can't
+be read (a device that isn't running) counts as a state, so booting a device announces its screen.
+
+**Cost.** A connection with no subscriptions has no thread and makes no read: reading, listing
+and listing templates are the calls they ask for and no more. A `subscriptions/listen` is one thread (and an older client's
+subscriptions together another, per connection or HTTP session), reading what it watches one
+resource after another, and sleeping until the next read is due: 1 wake-up a second for a screen,
+the list, or both, and no CPU a test can see
+([benchmarks.md](benchmarks.md#mcp-idle-subscription)). The reads themselves are what costs:
+a subscribed screen is one `screenshot` a second (more at a higher `SIMEE_MCP_SCREEN_FPS`), and
+a subscribed iOS `logs` keeps the device's log stream running for as long as someone reads it (it
+stops after 5 idle minutes) and reads its last 5 seconds from it, so only the first 5 seconds of
+a subscription (while the stream is younger than its window) run `log show` on the device. Each
+read is one period after the last finished, so a slow screenshot lowers the rate instead of
+piling up. The thread stops when the client cancels the listen (`notifications/cancelled`),
+unsubscribes its last resource, or its connection ends (stdin closes; the HTTP session is deleted
+or expires), and no notification follows.
+
+Subscribing to `simee://device/{device}/…` and `simee://devices/{device}/…` is one read, announced
+under each spelling. An older client (`initialize`) has no way to ask for `list_changed`, so it is
+not offered it and the device list isn't read for it; `subscriptions/listen` is where
+`resourcesListChanged` is. The server never changes its tool list, so it doesn't offer
+`toolsListChanged`.
+
+Over HTTP a session's `GET` stream queues at most 256 messages for a client that reads slowly,
+and keeps only the latest update for each resource (and for the list), so a screen announced 30
+times a second never pushes out a logs or prefs update queued behind it. Past 256 different
+resources the oldest message is dropped (each is only "something changed"; the client reads the
+state when it next looks), so a stalled client never holds up the watcher. The `POST` stream of a
+`subscriptions/listen` is not bounded yet.
 
 ## Prompts
 
@@ -276,23 +332,55 @@ A client that declares `io.modelcontextprotocol/tasks` gets a task, instead of a
 has `resultType: "task"`, a `taskId`, `pollIntervalMs` (1 s) and `ttlMs` (an hour). The methods are
 a list in `crates/sim-mcp/src/tools.rs`; every other tool answers inline.
 
-- `tasks/get` returns the task: `working` (with `statusMessage` saying how long it has run),
-  then `completed` with the tool's result in `result`, or `failed` with a JSON-RPC `error`.
-  `failed` is for the server's own failures; a tool that returns `isError: true` completes, as the
-  extension specifies.
-- `notifications/tasks` carries the whole task when it ends, to a client that listened for its id
-  (`subscriptions/listen` with `taskIds`).
-- `tasks/cancel` is cooperative, as the extension allows. The task is `cancelled` at once and its
-  result is discarded, but the API can't interrupt a device call that is already running, so a
-  cancelled `boot` still finishes booting the device in the background. The status message says
-  so. A call that is only waiting for the host to admit its devices (`admission: "wait"`) does
-  stop: it sees the cancel within a second and starts nothing. While it waits, the task's status
-  message (and a progress message, for a client without tasks) says what it waits on.
+- `tasks/get` returns the task: `working` (with `statusMessage` saying how long it has run and
+  the call's last step, below), then `completed` with the tool's result in `result`, or `failed`
+  with a JSON-RPC `error`. `failed` is for the server's own failures; a tool that returns
+  `isError: true` completes, as the extension specifies.
+- `notifications/tasks` carries the whole task when it ends, and at each step while it works, to a
+  client that listened for its id (`subscriptions/listen` with `taskIds`).
+- `tasks/cancel` (and `notifications/cancelled`, for a blocked call) is cooperative, as the
+  extension allows: the task is `cancelled` at once, and the call stops at its next safe point,
+  undoing what it had half done:
+  - `boot_many` starts no more devices and shuts down, within a second, those it was booting that
+    it had started: the ones it found off when their turn came and booted itself. A device that was
+    running or booting when its turn came (another caller's, even one started after this call was
+    admitted) is left as it was. Its result has the devices that finished, a reason for every
+    other one and `cancelled: true`, and the cancelled task keeps it as its `result`: listeners
+    hear the task again (`notifications/tasks`, still `cancelled`) once that result is in.
+  - `boot` shuts down the device it was booting, if it started it (by the same rule).
+  - `create`, `clone` and `import` delete the device they made, if the cancel came while they ran.
+  - A call waiting for the host to admit its devices (`admission: "wait"`) stops waiting and starts
+    nothing.
+  - `install`, `erase`, `settle`, `shutdown`, `export` and the memory tools stop only before they
+    start (an install after measuring its bundle): once running they can't be interrupted, finish
+    in the background, and their result is discarded.
+
+  The status message says which applies.
+
+### Progress
+
+A long call reports its steps as `sim-api` reaches them: `boot_many` the devices done of all
+(`3 of 8 done`, as each finishes), `boot`, `create`, `clone` and the other long methods their phases
+(`install`: checking, then installing with the bundle's size, 0 to 2). A client that gave a
+progress token on a blocked call gets each step as `notifications/progress` with `progress` and
+`total` in those units (devices, phases), at once; between steps a heartbeat every 2 s keeps it
+informed (and its timeout reset) with a value partway to the next unit, so the value only
+increases. A call that counts nothing, or whose first progress was a heartbeat, reports seconds
+instead (`progress` is the seconds it has run, no `total`). Nothing is sent after the response. A
+task's steps are its `statusMessage`. The older revisions get the same notifications.
+
+`boot_many` boots the same way whether or not anyone watches it: its backend's window keeps
+`concurrency` devices booting and starts the next as soon as any finishes, with the same ports,
+shaper builds and settle timeouts. A hook in the window tells the call as each device finishes
+(the step a watcher hears) and is asked before each start (how a cancel starts no more). Phases
+inside a device's boot (settled), bytes for `install`, `export` and `import`, and stopping a
+`settle` or a memory tool mid-run need hooks in the backends (`ios.rs`, `sim-android`,
+`memtools.rs`) and are not here yet.
 - A `boot`, `boot_many`, `create` or `clone` result carries `admission` (and `pacing`) in
   `structuredContent` only; the text is one line, such as `ok (admit)`, so it doesn't repeat them.
 - At most 8 task calls run at once; a ninth is refused with a tool error until one ends. A
-  cancelled task's call keeps running, so it still counts: cancelling doesn't make room. Finished
-  tasks are kept for an hour.
+  cancelled task's call counts until it has stopped (an install until it ends), so cancelling
+  makes room only as calls stop. Finished tasks are kept for an hour.
 - `tasks/update` only acknowledges: nothing a simee task does needs the client's input.
 
 `provision` (SDK downloads) and recording are not API methods, so they are not tools or tasks yet;
@@ -419,8 +507,14 @@ takes milliseconds). Reproduce: `cargo test --release -p simee-mcp http_call_ove
 
 - Completions, logging, sampling and elicitation are not offered; the specification deprecates
   three of them.
-- Cancelling a task doesn't stop a running device call (above).
-- The change notifications are polled, once a second, and only for what a client subscribed to.
+- Cancelling stops `boot`, `boot_many`, `create`, `clone` and `import` at their next safe point
+  and undoes what they half did; it doesn't stop an install, erase, settle or memory tool already
+  running (above).
+- The change notifications are polled, at each resource's pace above, and only for what a client
+  subscribed to; a change shows up at the next read, not when it happens. A subscribed screen
+  costs a screenshot a read even when it doesn't change (no cheaper change probe exists in the
+  API), and an input made through simee's own tools doesn't bring the next read forward.
+  A change between a client's last read and its subscription's baseline read isn't announced.
 - Over HTTP: no TLS, no OAuth (a bearer token from a file is the only authentication; both are
   tracked in a follow-up issue), no resumable streams, and an `Origin` allowlist beyond loopback
   and the connection limits aren't configurable.

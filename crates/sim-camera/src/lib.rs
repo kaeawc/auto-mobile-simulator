@@ -12,8 +12,16 @@
 //!   (YUYV and Motion JPEG to BGRA) on Linux.
 //! - [`hotplug`]: [`Hub::events`] streams cameras added and removed (host notifications, debounced)
 //!   and captures whose source went missing.
-//! - [`ios_feed`] serves one iOS simulator's linked source to the capture shim injected into its
-//!   apps (`shims/ios-camera`): BGRA frames with their size and number over a Unix socket.
+//! - [`device`]: another simee device's live screen as a camera (`device:<udid or name>`,
+//!   optionally cropped), paced by that device's frames: the id, the crop and the source over a
+//!   [`device::Screen`]. Reading a device's screen links its platform's stack, so the readers live
+//!   in `sim-api` (the simee server), never here: emu links this crate and must link neither.
+//! - [`feed`] serves one device camera's linked source over a Unix socket (BGRA frames with their
+//!   size, number and link generation, paced by the source, per reader): to the capture shim
+//!   injected into an iOS simulator's apps (`shims/ios-camera`), and to emu's camera HAL, which
+//!   reads it as a `feed:<socket>` source ([`feed::FeedSource`]).
+//! - `video:<path>` plays a movie file looped at its own frame rate (`video.rs` is the timeline,
+//!   AVFoundation's `AVAssetReader` the decoder; macOS only).
 //! - [`tcc`] reads the host camera permission (never prompting) and turns a missing grant into an
 //!   error that names the fix, instead of black frames.
 //!
@@ -26,14 +34,18 @@ mod avf;
 pub mod catalog;
 #[cfg(any(target_os = "linux", test))]
 mod convert;
+pub mod device;
 pub mod draw;
 mod error;
+#[cfg(unix)]
+pub mod feed;
 pub mod frame;
 pub mod hotplug;
 pub mod hub;
 pub mod id;
+/// The feed's name from when only iOS read it.
 #[cfg(unix)]
-pub mod ios_feed;
+pub use feed as ios_feed;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 mod select;
 pub mod source;
@@ -43,8 +55,11 @@ pub mod synth;
 pub mod tcc;
 #[cfg(target_os = "linux")]
 mod v4l2;
+#[cfg(any(target_os = "macos", test))]
+mod video;
 
 pub use catalog::{CameraKind, Change, Format, HostCamera, host_cameras};
+pub use device::{DeviceSpec, Region};
 pub use error::{Error, Result};
 pub use frame::{CameraFrame, FrameSpec, Tick};
 pub use hotplug::{Event, HostHotPlug, HotPlug, Signals};

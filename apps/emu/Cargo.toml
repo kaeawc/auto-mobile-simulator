@@ -28,9 +28,17 @@ libc.workspace = true
 rustix.workspace = true
 sim-core.workspace = true
 
+# Linux KVM: software mode runs the guest on it when the host's /dev/kvm is usable.
+[target.'cfg(target_os = "linux")'.dependencies]
+emu-kvm.workspace = true
+
 [dev-dependencies]
 emu-sdk = { workspace = true, features = ["testing"] }
 sim-android.workspace = true
+
+# The display server's surface tests receive with simee's own Mach receiver.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+sim-coresim.workspace = true
 
 # `deny`, not the workspace's `forbid`: `shutdown_signals` (signal masks) opts back in, and is the
 # only unsafe code in this crate.

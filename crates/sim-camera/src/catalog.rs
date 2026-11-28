@@ -86,8 +86,8 @@ pub const SYNTHETIC: &[SyntheticKind] = &[
     SyntheticKind {
         prefix: "video",
         example: "video:/path/to/clip.mp4",
-        description: "a looping video file (not yet: needs the VideoToolbox decoder)",
-        supported: false,
+        description: "a movie file's first video track, looped at its own frame rate (macOS: decoded with AVFoundation)",
+        supported: cfg!(target_os = "macos"),
     },
     SyntheticKind { prefix: "solid", example: "solid:#336699", description: "one colour (name or hex)", supported: true },
 ];

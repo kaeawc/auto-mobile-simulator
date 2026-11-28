@@ -39,16 +39,25 @@ pub fn open(source: &SourceSpec) -> Result<Box<dyn Source>> {
             let colour = Colour::parse(colour)?;
             Box::new(Still::new(move |spec| Ok(Canvas::new(spec.width, spec.height, colour).bgra)))
         }
-        SourceSpec::Video(path) => {
-            // TODO(#335): decode with VideoToolbox (AVAssetReader or a
-            // VTDecompressionSession) on macOS, looped, paced by the capture.
-            return Err(Error::Unsupported(format!(
-                "video:{} isn't supported yet: video files need the VideoToolbox decoder, which isn't wired up; use image: for a still",
-                path.display()
-            )));
-        }
+        SourceSpec::Video(path) => return open_video(path),
         SourceSpec::Webcam(_) => return Err(Error::Invalid("a webcam is not a synthetic source".into())),
+        SourceSpec::Device(_) => return Err(Error::Invalid("a device's screen is not a synthetic source".into())),
+        SourceSpec::Feed(_) => return Err(Error::Invalid("a camera feed is not a synthetic source".into())),
     })
+}
+
+/// A video file, looped at its own frame rate: decoded with AVFoundation on macOS.
+#[cfg(target_os = "macos")]
+fn open_video(path: &Path) -> Result<Box<dyn Source>> {
+    crate::avf::open_video(path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_video(path: &Path) -> Result<Box<dyn Source>> {
+    Err(Error::Unsupported(format!(
+        "video:{}: video files are decoded with AVFoundation, so they play on macOS only; here, use image: for a still, or play the file into a v4l2loopback camera and use webcam:",
+        path.display()
+    )))
 }
 
 type Render = dyn Fn(FrameSpec) -> Result<Vec<u8>> + Send;
@@ -133,12 +142,18 @@ fn load_image(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
     }
 }
 
-/// The longest side an `image:` file may have, and the most pixels: bigger files are refused
-/// before anything is allocated for them (a header can claim far more than its bytes hold).
+/// The longest side an `image:` file (or a `video:` file's frame) may have, and the most pixels:
+/// bigger files are refused before anything is allocated for them (a header can claim far more
+/// than its bytes hold).
 pub const MAX_IMAGE_SIDE: u32 = 8192;
 pub const MAX_IMAGE_PIXELS: u64 = 36_000_000;
 
 fn check_size(width: u32, height: u32) -> std::result::Result<(), String> {
+    check_size_of("image", width, height)
+}
+
+/// Checks a `kind:` source's picture size against [`MAX_IMAGE_SIDE`] and [`MAX_IMAGE_PIXELS`].
+pub(crate) fn check_size_of(kind: &str, width: u32, height: u32) -> std::result::Result<(), String> {
     if width == 0
         || height == 0
         || width > MAX_IMAGE_SIDE
@@ -146,7 +161,7 @@ fn check_size(width: u32, height: u32) -> std::result::Result<(), String> {
         || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
     {
         return Err(format!(
-            "{width}x{height} is outside what image: accepts (up to {MAX_IMAGE_SIDE} px a side and {} megapixels)",
+            "{width}x{height} is outside what {kind}: accepts (up to {MAX_IMAGE_SIDE} px a side and {} megapixels)",
             MAX_IMAGE_PIXELS / 1_000_000
         ));
     }
@@ -567,9 +582,11 @@ mod tests {
         );
     }
 
+    /// Video files are decoded with AVFoundation; elsewhere `video:` says so and what to use.
+    #[cfg(not(target_os = "macos"))]
     #[test]
-    fn video_is_not_supported_yet() {
+    fn video_needs_macos() {
         let err = open(&SourceSpec::Video("/tmp/clip.mp4".into())).err();
-        assert!(matches!(&err, Some(Error::Unsupported(m)) if m.contains("VideoToolbox")), "{err:?}");
+        assert!(matches!(&err, Some(Error::Unsupported(m)) if m.contains("video:/tmp/clip.mp4") && m.contains("macOS")), "{err:?}");
     }
 }

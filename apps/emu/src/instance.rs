@@ -173,7 +173,10 @@ impl Instance {
         emu_vmm::disk::ensure_sparse(&dir.join("cache.img"), CACHE_BYTES)?;
         let key_src = avd.sysdir.join("encryptionkey.img");
         if key_src.is_file() {
-            emu_vmm::disk::ensure_copy(&key_src, &dir.join("encryptionkey.img"))?;
+            let key_dst = dir.join("encryptionkey.img");
+            if !key_dst.exists() {
+                emu_avd::golden::clone_file(&key_src, &key_dst)?;
+            }
         } else {
             emu_vmm::disk::ensure_sparse(&dir.join("encryptionkey.img"), 18 << 20)?;
         }
@@ -283,6 +286,7 @@ impl Instance {
             virtual_queue: virtual_queue(&guest_egl(&self.avd), AngleImage::of(&self.avd)),
             // Their GLES encoder's transport (see `pipe_gles`).
             pipe_gles: pipe_gles(&self.avd),
+            metal_present: opts.metal_present,
         })
     }
 
@@ -370,7 +374,7 @@ impl Instance {
     /// Software mode's config (#55): the plan on QEMU's TCG with emu's devices
     /// (`emu_vmm::soft`). The renderer runs on SwiftShader: the SDK's lavapipe crashed in a render
     /// thread on every booted guest (docs/android.md); `-gpu lavapipe` picks it anyway.
-    pub fn soft_config(&self, opts: &Opts, qemu: PathBuf) -> Result<emu_vmm::soft::Config> {
+    pub fn soft_config(&self, opts: &Opts, qemu: PathBuf, accel: emu_vmm::soft::Accel) -> Result<emu_vmm::soft::Config> {
         let plan = self.plan(opts);
         if !plan.x86 {
             bail!(
@@ -435,6 +439,8 @@ impl Instance {
             console,
             logcat: self.logcat.clone(),
             verbose: opts.verbose,
+            accel,
+            accel_fallback: opts.accel.is_none(),
         })
     }
 }

@@ -120,6 +120,18 @@ apps one by injecting a capture shim (`shims/ios-camera`) and feeding it live fr
 
 `shims/ios-camera/build.sh [OUT_DIR]` builds all three for the simulator with `xcrun clang`.
 
+**Through the API** (#323, [camera.md "iOS simulators"](camera.md#ios-simulators)):
+`camera_link {device, facing, source}` (`simee camera link <udid> <source>`), `camera_unlink`,
+`camera_links` and `boot`'s `camera_back` / `camera_front` do the device-wide steps below: the
+simee server serves the device's feed on `cam.sock`, injects the shim found at
+`$SIMEE_CAMERA_SHIM` or `target/ios-camera/` (the error names `build.sh` when it is missing),
+saves the link in `<data>/simee/cameras.ini` and reapplies it when simee boots the device. A
+booted device can be linked only through a running `simee serve`, which holds the feed. Running
+apps need a relaunch and an app needs its camera grant, as below. The device inserts a copy of
+the shim kept in `<data>/simee/camera-<hash>/`, and the insertion stays for the rest of the boot
+if the server exits or the device is shut down outside simee: `simee camera unlink <udid>` or a
+reboot clears it.
+
 **Per app**: grant the camera the usual way, then launch through the API with the shim and the
 socket in the environment (simee passes `env` straight to the launch, no `SIMCTL_CHILD_` prefix):
 
@@ -159,6 +171,17 @@ after the device-wide `setenv`, did not load the hooks.
   session runs, reconnects with a 250 ms to 5 s backoff, and the dylibs are universal (arm64 and
   x86_64, built with `lipo`; not run on an x86_64 simulator here).
 - Already-running processes need a relaunch to pick up a device-wide `setenv`.
+- `network_shape`'s `launchd` injection sets (and its clear unsets) `DYLD_INSERT_LIBRARIES` whole,
+  so it drops a camera link's shim: link the camera again after shaping. A camera link keeps the
+  shaper's library.
+- Not yet verified on a device through the API (the feed, the injection and the boot reapply are
+  tested with fakes). The check: build the shim and the fixture, `simee serve`, then on a
+  simulator you created: `simee install <udid> target/ios-camera/CameraFixture.app`,
+  `simee privacy <udid> grant camera dev.simee.camerafixture`, `simee camera link <udid>
+  pattern:testcard`, `simee launch <udid> dev.simee.camerafixture`, read
+  `Documents/camera-report.json` (frame numbers advancing), `simee camera link <udid> qr:hello`
+  (the QR code reported without a relaunch), `simee shutdown <udid>`, `simee boot <udid>` (the
+  link comes back: `simee camera links <udid>` says `linked`), `simee camera unlink <udid>`.
 - Frames are BGRA, upright and unmirrored, at the size the app's connection asked for (the feed's
   default, or `SIMEE_CAMERA_SIZE=WxH@FPS`). Orientation, mirroring, zoom, focus, exposure and frame
   duration settings are accepted and ignored; there is no torch or flash, and `formats` is empty.

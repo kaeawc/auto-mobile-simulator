@@ -20,6 +20,10 @@ emu-avd.workspace = true
 png.workspace = true
 sim-core.workspace = true
 
+# The macOS host's per-process reads (libproc), the calls `processes` and `connections` use.
+[target.'cfg(target_os = "macos")'.dependencies]
+sim-coresim.workspace = true
+
 [features]
 # The fake emulator in `testing`, for other crates' tests.
 testing = []

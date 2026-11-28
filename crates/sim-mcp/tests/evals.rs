@@ -702,6 +702,12 @@ impl Exchange {
         text_tokens(self.out_bytes + self.in_bytes - self.image_bytes) + self.image_tokens
     }
 
+    /// The text of a resource read's contents, joined.
+    fn resource_text(&self) -> String {
+        let contents = self.response["result"]["contents"].as_array().cloned().unwrap_or_default();
+        contents.iter().filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("\n")
+    }
+
     /// The text blocks of a tool result, joined.
     fn text(&self) -> String {
         let content = self.response["result"]["content"].as_array().cloned().unwrap_or_default();
@@ -768,9 +774,19 @@ impl Client {
 // Tasks.
 
 struct Step {
+    /// The tool to call, or empty for a step that reads `resource`.
     tool: String,
+    /// The URI a `resources/read` step reads.
+    resource: Option<String>,
     args: Value,
     expect: Value,
+}
+
+impl Step {
+    /// What the step is called in a failure.
+    fn label(&self) -> String {
+        self.resource.clone().unwrap_or_else(|| self.tool.clone())
+    }
 }
 
 struct Task {
@@ -790,8 +806,13 @@ impl Task {
         let field = |k: &str| text(v, k).ok_or_else(|| format!("a task needs `{k}`"));
         let mut plan = Vec::new();
         for s in v["plan"].as_array().ok_or("a task needs a `plan`")? {
+            let resource = text(s, "resource");
             plan.push(Step {
-                tool: text(s, "tool").ok_or_else(|| format!("a step needs `tool`: {s}"))?,
+                tool: match &resource {
+                    Some(_) => String::new(),
+                    None => text(s, "tool").ok_or_else(|| format!("a step needs `tool` or `resource`: {s}"))?,
+                },
+                resource,
                 args: s.get("args").cloned().unwrap_or_else(|| json!({})),
                 expect: s.get("expect").cloned().unwrap_or(Value::Null),
             });
@@ -983,14 +1004,17 @@ fn run_plan(task: &Task, plan: &[Step], setting: &'static str, toolsets: Toolset
             }
         }
         for (n, step) in plan.iter().enumerate() {
-            let ex = client.request("tools/call", json!({"name": step.tool, "arguments": step.args}))?;
+            let ex = match &step.resource {
+                Some(uri) => client.request("resources/read", json!({"uri": uri}))?,
+                None => client.request("tools/call", json!({"name": step.tool, "arguments": step.args}))?,
+            };
             run.calls += 1;
             tally(&mut run, &ex, false);
-            let at = format!("step {} (`{}`)", n + 1, step.tool);
+            let at = format!("step {} (`{}`)", n + 1, step.label());
             if let Some(error) = ex.response.get("error") {
                 return Err(format!("{at}: refused: {}", error["message"]));
             }
-            let text = ex.text();
+            let text = if step.resource.is_some() { ex.resource_text() } else { ex.text() };
             if ex.response["result"]["isError"] == true {
                 return Err(format!("{at}: failed: {text}"));
             }
@@ -1189,14 +1213,17 @@ fn a_plan_missing_a_step_fails_its_end_state() {
         .plan
         .iter()
         .filter(|s| s.tool != "launch")
-        .map(|s| Step { tool: s.tool.clone(), args: s.args.clone(), expect: s.expect.clone() })
+        .map(|s| Step { tool: s.tool.clone(), resource: s.resource.clone(), args: s.args.clone(), expect: s.expect.clone() })
         .collect();
     let run = run_plan(task, &plan, "core", task.setting());
     assert!(!run.ok());
     assert!(run.failures.iter().any(|f| f.contains("foreground")), "{:?}", run.failures);
     // A plan that boots the wrong device fails too.
-    let wrong: Vec<Step> =
-        task.plan.iter().map(|s| Step { tool: s.tool.clone(), args: json!({"device": "iphone-17"}), expect: Value::Null }).collect();
+    let wrong: Vec<Step> = task
+        .plan
+        .iter()
+        .map(|s| Step { tool: s.tool.clone(), resource: None, args: json!({"device": "iphone-17"}), expect: Value::Null })
+        .collect();
     assert!(!run_plan(task, &wrong, "core", task.setting()).ok());
 }
 

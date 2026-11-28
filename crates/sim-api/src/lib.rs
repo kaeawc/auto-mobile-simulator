@@ -19,6 +19,7 @@
 
 mod android;
 mod camera;
+mod camera_device;
 pub mod catalog;
 mod contrast;
 #[cfg(target_os = "macos")]
@@ -35,8 +36,11 @@ mod methods;
 mod outputs;
 mod params;
 pub mod prefs;
+mod progress;
 mod schema;
 pub mod settle;
+mod shrink;
+mod stream;
 mod usage;
 
 use std::io::{BufRead, BufReader, Write};
@@ -52,9 +56,11 @@ use serde_json::Value;
 
 pub use forward::{HANDSHAKE_TIMEOUT, IN_CALLER, forwards, identity};
 pub use ios::{flush_input, track_input};
-pub use methods::{CallHooks, METHODS, Session, call as call_method, call_cancelled, call_progress, platforms, with_call_hooks};
+pub use methods::{METHODS, Session, call as call_method, platforms};
 pub use outputs::output_schema;
+pub use progress::{CallHooks, Progress, call_cancelled, call_progress, call_step, with_call_hooks};
 pub use schema::input_schema;
+pub use shrink::{AGENT_MAX_SIDE, shrink_png_base64};
 pub use sim_core::frame::encode_png;
 
 /// The default socket path: `$SIMEE_SOCKET`, else `$TMPDIR/simee.sock`.
@@ -262,6 +268,11 @@ impl Threads {
             };
         }
     }
+}
+
+/// Stops every running stream, each sending its WHIP DELETE: call it before the process exits.
+pub fn stop_streams() {
+    stream::stop_all();
 }
 
 /// Listens on `path` (replacing a stale socket) and serves connections until the process exits.

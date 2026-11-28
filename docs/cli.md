@@ -80,7 +80,7 @@ simee shutdown Pixel
 Camera links are saved with the device and passed to emu on every boot, so they survive a reboot
 and a server restart. A source is a source id (`qr:TEXT`, `text:TEXT`, `image:PATH`,
 `solid:COLOUR`, `pattern:testcard`, `webcam:ID`, `none`) or part of a host camera's name; a name
-that matches several cameras fails and lists them. iOS devices get camera links with #322. See
+that matches several cameras fails and lists them. iOS devices get camera links too, through a running `simee serve` (see [camera.md](camera.md)). See
 [docs/camera.md](camera.md).
 
 The form factor comes from the image (Wear OS, TV and Automotive images) or `--form-factor`
@@ -117,6 +117,24 @@ for a stroke, `--eraser` for the eraser end); on an iPad it is the Apple Pencil,
 screen has none). Using one
 on the other platform's device fails with the platforms it works on.
 
+
+## Streams
+
+```bash
+simee stream start booted --whip http://127.0.0.1:8889/phone/whip --token-file ~/.mtx-token [--fps 30] [--max-size 1280] [--bitrate 2500000] [--input]
+simee stream status <stream_id>     # state, stage timeline, stats; renews the lease
+simee stream list [device]          # the server's streams, without renewing anything
+simee stream watch <stream_id>      # renews the lease every third of it; Enter stops the stream
+simee stream stop <stream_id>       # ends it and sends the WHIP DELETE
+```
+
+A stream lives in the process that started it and ends, sending its WHIP DELETE, only if that
+process stops it, so `stream` commands always go to a running `simee serve` of this build and
+refuse (also with `--in-process`) when none answers. `start` prints the `stream_id`, the
+`whip_resource` and the lease (30 s); a stream nobody renews with `status` or `watch` is stopped
+when its lease lapses. Give the bearer token with `--token-file` (the file's trimmed contents) or
+`SIMEE_STREAM_TOKEN`: `--token` puts it in the process list. The token is never printed. Every
+command takes `--json`, except `watch`. Details in [streaming.md](streaming.md).
 
 ## Socket API
 

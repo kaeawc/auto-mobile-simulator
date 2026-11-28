@@ -43,6 +43,7 @@ recoverable from what was recorded, or they need something the repository doesn'
 | [Idle host CPU, the NAT](#idle-host-cpu) | 5.9% of a core | not measured | M3 Max, 2026-11-25 | `scripts/bench/android-net.sh --mode idle` |
 | [NAT throughput](#idle-host-cpu) | 610 MB/s up, 2.1 GB/s down | not measured | M3 Max, 2026-11-25 | `scripts/bench/android-net.sh --mode throughput` |
 | [Frame pacing](#frame-pacing) | 0% / 0.25% janky | SDK emulator 5.6% / 6.2% | M3 Max, 2026-11-25 | `scripts/bench/android-frames.sh --device tablet\|phone` |
+| [Software mode on KVM, API 36 x86_64](#android-software-mode-on-kvm-githubs-x86_64-runner) | 28.8 s cold, 16.6 s warm, 2.27 GB | SDK emulator 37.3.10 30.3 s, 19.2 s, 3.00 GB | GitHub `ubuntu-latest` VM (4-vCPU Xeon 8573C), 2026-11-27 | `scripts/bench/android-boot.sh --image system-images/android-36/default/x86_64 --lcd 720x1280@320` |
 | [Software mode, CPU model](#android-software-mode-linux-without-kvm) | zygote 49.4 s | | 4-vCPU Xeon VM, 2026-11-26 | `scripts/bench/software-mode.sh --arms "tcg:…"` |
 | [Software mode, boot](#boot-to-sysboot_completed-with-emus-devices) | 168 s, 0.75 cores idle | SDK emulator `-accel off` 2302 s, 1.09 cores | 4-vCPU Xeon VM, 2026-11-26 | `scripts/bench/software-mode.sh --arms "emu stock"` |
 | [Software mode, `emu -avd`](#software-mode-through-emu--avd) | 161 s, tap 60.8 ms, screenshot 36.9 ms | SDK emulator unusable | 4-vCPU Xeon VM, 2026-11-26 | `android-frames.sh`, `api-steps.sh --android` |
@@ -57,6 +58,7 @@ recoverable from what was recorded, or they need something the repository doesn'
 | [Emulator internals](#emulator-internals) | before/after rows | | various | see the section |
 | [`launch` with and without restart](#launch-with-and-without-restart) | 17–136 ms | | M3 Max, 2026-11-27 | `scripts/bench/ios-api.py --suite launch` |
 | [Per-call device lookup](#per-call-device-lookup-on-a-crowded-host) | 0.66 / 0.04 ms | simee before: 1.54 / 0.34 ms | M3 Max, 2026-11-26 | `ios-api.py --suite lookup` |
+| [Android device resolution](#android-device-resolution) | exact name 0.14 ms, `booted` 0.39 ms (kept); one-shot call 6.7 ms | simee before: 0.25, 2.02 ms; 21 ms | 4-vCPU Xeon VM (Linux), 2026-11-28 | `scripts/bench/android-resolve.py --baseline …` |
 | [Introspection](#introspection-processes-connections-kill-network_state) | 2.5–3.5 ms | `ps`/`lsof`/`kill`: 126–191 ms | M3 Max, 2026-11-27 | `ios-api.py --suite introspection` |
 | [iPad pointer click](#ipad-pointer-click) | 408 ms later click | simee before: 3641 ms | M3 Max, 2026-11-27 | `ios-api.py --suite pointer` (timings) |
 | [iOS input defaults](#ios-input-defaults) | tap 12.6 ms, type 20 chars 121 ms | simee before: 64.5, 749 ms | M3 Max, 2026-11-27 | `ios-api.py --suite input` (timings) |
@@ -64,6 +66,7 @@ recoverable from what was recorded, or they need something the repository doesn'
 | [iOS memory tools](#ios-memory-tools) | `mem_vmmap` 0.60 s … `mem_leaks` 2.30 s | | M3 Max, 2026-11-27 | `ios-api.py --suite mem` |
 | [Desktop: Metal against wgpu](#desktop-runes-native-metal-backend-against-wgpu) | | | M3 Max, 2026-11-27 | no script (below) |
 | [MCP server](#mcp-server) | 1 crate | `rmcp`: 75 crates, 41 s build | Linux VM, 2026-11-26 | `scripts/bench/mcp-build.sh` |
+| [MCP idle subscription](#mcp-idle-subscription) | 1 wake-up a second, 0 ms CPU in 10 s | simee before: 98.5 wake-ups a second, 40 ms | 4-vCPU Xeon VM, 2026-11-27 | `cargo test --release -p simee-mcp idle_subscription -- --ignored --nocapture` |
 | [Build times](#build-times-local) | 74–77 CPU s | simee before: 131–136 | Apple silicon, 2026-11-26 | `scripts/bench/build-times.sh` |
 
 ## Android: emu against the SDK emulator
@@ -270,6 +273,41 @@ need a build from before the Vulkan-only renderer (2026-11-25) as the emu arm.
 Both display at 60 Hz. The stock emulator's tablet rendered about 1350 frames over the swipes and
 emu's about 530; emu with the guest on stock's GLES driver (`EMU_GUEST_EGL=emulation`) rendered
 1254, so the count follows the guest's driver. On the phone both render about 790.
+
+## Android: software mode on KVM (GitHub's x86_64 runner)
+
+Software mode with QEMU on the host's KVM (`-accel kvm -cpu host`, chosen automatically when
+`/dev/kvm` is usable) against the SDK emulator 37.3.10 on the same KVM, on a GitHub-hosted
+`ubuntu-latest` runner: a VM with 4 vCPUs of a Xeon Platinum 8573C and 15.6 GB, Ubuntu 26.04
+(kernel 7.0, Azure), 2026-11-27, simee 4605415. API 36 `default` x86_64 image, 720x1280@320, 4
+vCPUs and 2 GB per AVD, a new AVD each round (`-no-golden`), the arms' order alternating, medians
+of 3 rounds ([run 46070750188](https://github.com/kaeawc/simee/actions/runs/46070750188), the
+`Software mode` workflow's kvm leg; a manual or main run repeats it):
+
+```bash
+scripts/bench/android-boot.sh --image system-images/android-36/default/x86_64 --lcd 720x1280@320
+```
+
+| Measure | emu | SDK emulator 37.3.10 |
+| --- | --- | --- |
+| cold: launch until sys.boot_completed, s | **28.8** (28.8, 29.3, 28.3) | 30.3 (30.7, 30.3, 28.9) |
+| cold: launch until adb lists the device, s | **16.7** (16.7, 17.1, 16.7) | 19.2 (19.9, 19.2, 18.7) |
+| cold: peak RSS of the process tree, MB | **2270** | 2999 |
+| warm: launch until sys.boot_completed, s | **16.6** (16.6, 16.4, 16.7) | 19.2 (19.5, 19.2, 19.1) |
+| warm: launch until adb lists the device, s | **6.8** (6.1, 6.8, 7.1) | 10.8 (10.8, 10.8, 10.7) |
+| warm: peak RSS of the process tree, MB | **1858** | 1954 |
+| warm: guest 4x md5 of 64 MiB, s | 0.35 | 0.52 |
+| warm: guest 100k shell loop, s | 0.74 | 0.77 |
+| warm: adb shell echo, s | 0.04 | 0.04 |
+
+Three of the twelve boots (emu cold in round 3, both warm boots in round 2) saw a 1-minute load
+just above the 4 CPUs at a sample (`starved=yes`); each is inside the other rounds' spread, and
+without them the medians are emu 29.1 s cold and 16.7 s warm, the SDK emulator 30.3 s and 19.3 s.
+Both use the renderer from the same emulator package. emu uses it on SwiftShader Vulkan. The SDK emulator's
+default for `-no-window` on a host with no GPU is lavapipe Vulkan with SwANGLE GLES (`emuglConfig_init:
+vulkan_mode_selected:lavapipe gles_mode_selected:swangle` in its log). `cold` includes each one
+formatting its own userdata. The runner is a shared cloud
+VM, so absolute times move between runs; the comparison is within one run.
 
 ## Android: software mode (Linux without KVM)
 
@@ -785,6 +823,46 @@ until a rotation or fold. Reproduce: `python3 -I scripts/bench/ios-api.py --suit
 What `location` has left is the service's own round trip (`host_support_mig_set_location_lat_lon`,
 ~95% of its samples).
 
+### Android device resolution
+
+How long a call spends finding its device (#256), with 44 AVDs (phones, tablets, watches, TVs and
+cars, each with the `config.ini` avdmanager writes) and, in the second half of the table, two
+stand-ins for the stock emulator running (a process with a qemu's command line, `-port` from 5900,
+holding the AVD's `hardware-qemu.ini.lock`). Linux, 4-vCPU Xeon @ 2.20 GHz VM, 7.8 GB, Ubuntu
+22.04, 1-minute load under 3 (2026-11-28). **Not measured on macOS or with a real emulator.**
+Medians over 5 rounds of the p50 and p95 of 100 calls, the build before and after alternating.
+"Kept" is one connection to a `simee serve` that has been up a second; "one-shot" is a fresh
+`simee` process with no server on the socket, so it includes the process's start (`--version` is
+the floor: 4.7 ms). The one-shot taps fail once the device is resolved, before any network I/O: a
+stopped AVD isn't running, and a stand-in is a stock emulator, which refuses input over the
+display socket. That failure is what is timed. Reproduce:
+`python3 -I scripts/bench/android-resolve.py --baseline <before build>`.
+
+| Call | none running, before → after (ms) | 2 running, before → after (ms) |
+| --- | --- | --- |
+| kept: `info` of an exact AVD name, p50 / p95 | 0.33 → 0.13 / 0.37 → 0.17 | 0.25 → 0.14 / 0.31 → 0.19 |
+| kept: `info` of `booted`, p50 / p95 | 2.10 → 0.36 / 2.39 → 0.40 | 2.02 → 0.39 / 2.23 → 0.52 |
+| kept: `devices` with `booted`, p50 / p95 | 2.20 → 0.80 / 2.36 → 1.90 | 2.07 → 0.85 / 2.30 → 1.49 |
+| kept: `devices`, p50 / p95 | 3.25 → 2.40 / 5.87 → 2.83 | 3.30 → 2.43 / 5.90 → 2.78 |
+| one-shot: `tap` of an exact name, p50 / p95 | 6.89 → 6.54 / 7.42 → 6.71 | 21.2 → 6.7 / 22.3 → 6.9 |
+| one-shot: `tap booted`, p50 / p95 | 11.7 → 7.9 / 12.0 → 8.4 | 32.7 → 8.2 / 36.4 → 8.7 |
+| one-shot: `list --booted`, p50 / p95 | 11.6 → 11.0 / 12.7 → 11.2 | 32.3 → 11.2 / 34.9 → 11.8 |
+| one-shot: `list`, p50 / p95 | 12.1 → 11.5 / 13.3 → 11.7 | 33.1 → 11.7 / 35.8 → 12.3 |
+
+What changed: the stock emulator's process facts (command line, listening ports) are read for the
+one PID a lock names, from `/proc/<pid>` on Linux and libproc on macOS, instead of a host-wide
+`ps -axo` and `lsof` (~60 ms each on a macOS host with ~1300 processes; `ps` here, with a few
+hundred processes, is ~20 ms). A kept server remembers them by (PID, start time). Each AVD's pointer
+and `config.ini` are parsed once and then validated by one `stat` (path, mtime, ctime, size, inode); an
+exact name is one `stat` of its pointer instead of listing the home; `booted` loads only the
+running AVDs' configs.
+
+What is left, measured: `devices` lists and loads all 44 AVDs (about 0.6–1 ms in the server, plus
+an 11 KB reply the client parses), so it is not under 1 ms. A cold one-shot `list` or fuzzy name
+reads every AVD's two files (about 700 system calls for 44 AVDs, ~5 ms over the floor); an on-disk
+cache would still `stat` each file, and wasn't built. With nothing running, the one-shot exact-name
+`tap` is within 1.7 ms of `--version`.
+
 ### Introspection: `processes`, `connections`, `kill`, `network_state`
 
 iPhone 17 Pro, iOS 27.2 (24B8117), freshly booted (~205 device processes, ~1200 on the host),
@@ -963,6 +1041,28 @@ tables (latency p95, picture step, output rate, IDR sizes) and what the numbers 
 | Android API 36, 576x1280, 30 | 22.1 | 5.80 | 6.9 |
 | Android API 36, 576x1280, 60 | 37.3 | 5.77 | 8.1 |
 
+## Video encode (H.264, OpenH264 on Linux)
+
+`simee-encode`'s Linux encoder (OpenH264 built from source, `--features openh264`) on synthetic
+phone screens, no device: an app drawer scrolling on a 1080x2400 screen presented at 60 fps,
+encoded through the real loop, 10 s per run, medians of 3 rounds, defaults (Constrained Baseline,
+4 Mbit/s average, IDR every 2 s), OpenH264 built with `nasm`, 2026-11-27. Host: a Linux VM,
+Intel Xeon @ 2.20 GHz, 4 vCPUs, 3.8 GB, Ubuntu 22.04, kernel 6.1.189. Reproduce:
+`scripts/bench/encode-linux.sh` (`OPENH264_NO_ASM=1` for the no-`nasm` row). Latency includes the
+colour conversion and scaling. The method, PSNR, bitrate and IDR sizes, and what the numbers say
+are in [streaming.md](streaming.md#encode-cost-on-linux). Synthetic screens, so a real device's
+bitrate will differ; this VM's numbers are not comparable with the Apple M3 Max rows above, and
+aarch64 speed is not measured.
+
+| Screen, size, fps cap | Encoded, fps | Encode latency p50, ms | Process CPU, % of a core |
+| --- | --- | --- | --- |
+| 1080x2400, 30 | 28.8 | 26.12 | 82 |
+| 1080x2400, 60 | 28.4 | 36.54 | 99 |
+| 1080x2400 capped at 1280 (576x1280), 30 | 29.8 | 22.39 | 68 |
+| 1080x2400 capped at 1280 (576x1280), 60 | 58.7 | 14.17 | 86 |
+| 1080x2400, 30, built without `nasm` | 13.6 | 61.82 | 100 |
+| 1080x2400 capped at 1280, 30, built without `nasm` | 24.6 | 35.00 | 98 |
+
 ## MCP server
 
 What the MCP server's protocol layer costs to build, against the official Rust SDK. Linux VM,
@@ -979,6 +1079,27 @@ count is `cargo tree --prefix none -e normal | sort -u | wc -l` in it (145 with 
 dependencies). `Cargo.lock` has 140 packages in all. Reproduce: `scripts/bench/mcp-build.sh`
 (it downloads `rmcp` into cargo's cache; nothing is added to this repository). Why this decides the protocol layer:
 [mcp.md](mcp.md#why-the-protocol-layer-is-hand-written).
+
+## MCP idle subscription
+
+What a subscribed resource costs while nothing changes: the watch thread's own wake-ups and CPU
+(`/proc/self/task/<tid>`), over 10 s after a 0.5 s settle, against a fake backend that answers at
+once, so it is the watcher and not the device. Linux VM, 4 vCPUs (Xeon @ 2.2 GHz, Linux 6.1),
+2026-11-27, release build, one run each (the numbers are counts, not timings). "Before" is
+`main` at 6ad2666, whose watcher slept in 10 ms steps and compared the clock, with the same test
+body copied in (the old `spawn` took one interval, 1 s).
+
+| Subscribed to | Wake-ups a second, before | after | CPU in 10 s, before | after | Reads in 10 s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| one screen | 98.5 | 1.0 | 40 ms | 0 ms (under the 10 ms tick) | 11 |
+| the resource list | 98.2 | 1.0 | 40 ms | 0 ms | 11 |
+| one screen and the list | 98.5 | 1.0 | 40 ms | 0 ms | 22 |
+
+The reads are the real cost on a device: a subscribed screen is one `screenshot` a second at the
+default pace (`SIMEE_MCP_SCREEN_FPS` raises or lowers it), and each is the call timed in
+[Time per automation step](#ios-simee-against-simctl). The host CPU of a subscribed screen on a
+device is [not yet measured](#not-yet-measured). A resource nobody subscribed to costs nothing:
+the server has no thread and makes no read (a test counts the backend's calls).
 
 ## Build times (local)
 
@@ -1134,6 +1255,9 @@ Claims that would belong in the README once someone runs them:
   device's directory (6,562 files), so the host's `mds_stores` indexes what devices write. What
   excluding `~/Library/Developer/CoreSimulator` from Spotlight saves a farm needs a change to the
   host's Spotlight privacy settings to measure.
+- Host CPU of an MCP client subscribed to a booted device's `screen`, `logs` and `processes`
+  resources, on iOS and Android, at the default pace and at `SIMEE_MCP_SCREEN_FPS=10`, against the
+  same device read by polling `screenshot` from the client.
 - Time per automation step through `simee mcp` (a `tools/call` of `tap`, then `screenshot`) against
   the socket API and the CLI on the same device.
 - A 10 ms `button` hold for the iPhone's side, Siri, Apple Pay, Action and volume buttons and on

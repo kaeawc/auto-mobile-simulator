@@ -17,6 +17,8 @@ extend-exclude = [
 extend-ignore-re = [
   # docs/benchmarks.md's typing benchmark: the string is typed as written, typo included.
   "Teh quick, Brown FOX",
+  # docs/research/container-backend.md quotes SurfaceFlinger's abort message as the log printed it.
+  "output buffer not gpu writeable",
 ]
 
 [default.extend-words]

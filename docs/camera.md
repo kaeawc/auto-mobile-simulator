@@ -4,9 +4,17 @@
 cameras and the synthetic sources, one source id scheme for all of them, and a capture hub that
 feeds any number of consumers from one capture per source. `emu`'s Android camera HAL service
 ([below](#android-the-goldfish-camera-hal)) links it, and the API, CLI and MCP tools
-([below](#linking-a-device-camera-api-cli-mcp), #323) link a device camera to a source; the iOS
-capture shim (#322) builds on it next. The plan is epic #319; the iOS background is
-[research/audio-camera.md](research/audio-camera.md) §3.
+([below](#linking-a-device-camera-api-cli-mcp), #323) link a device camera to a source, on
+Android and on iOS through the simulator capture shim (#322). The plan is epic #319; the iOS
+background is [research/audio-camera.md](research/audio-camera.md) §3.
+
+The camera feed (`feed`, #322; `ios_feed` is its old name) serves one device camera's linked
+source over a Unix socket: BGRA frames with size, frame number and link generation, paced by the
+source, one subscription per reader; `Feed::set_source` relinks live. Two readers speak it: the
+iOS simulator shim on `<data>/cam.sock` (see [ios.md "Camera"](ios.md#camera)), and emu's camera
+HAL through a `feed:<socket>` source, which is how an Android device gets another device's screen
+([below](#another-devices-screen)). A source that fails (to open, or before its first frame) is
+tried again after 0.5 s, doubling to 8 s.
 
 ## What exists
 
@@ -16,7 +24,9 @@ capture shim (#322) builds on it next. The plan is epic #319; the iOS background
 | Virtual camera marking | transport type `virt` (what camera extensions report), or a known name, maker or model (OBS, Camo, mmhmm, "virtual", …) | the v4l2loopback driver or bus (`platform:v4l2loopback-*`), the vivid and akvcam test drivers |
 | Capture from a host camera | `AVCaptureSession` with a BGRA video data output, in the format nearest the request, scaled to each request | V4L2 streaming (4 mmap buffers), YUYV and Motion JPEG to BGRA ([details](#capture-details)) |
 | Camera permission (`tcc::status`) | `authorizationStatusForMediaType:`, never prompts | none needed (`not-required`) |
-| Synthetic sources | all but `video:` | all but `video:` |
+| Synthetic sources (`pattern:`, `qr:`, `text:`, `image:`, `solid:`) | all | all |
+| Video files (`video:`) | `AVAssetReader`, BGRA, upright, looped at the file's own rate ([details](#capture-details)) | no (`Unsupported`: video files are decoded with AVFoundation) |
+| Another device's screen (`device:`) | AVDs and simulators | AVDs |
 | Hot-plug (`Hub::events`) | `AVCaptureDeviceWasConnected` / `WasDisconnected`, debounced, then a fresh listing diffed against the last | inotify on `/dev` for `video*` nodes, the same way |
 
 Each host camera has a stable id: AVFoundation's `uniqueID` on macOS and the V4L2 bus info on
@@ -42,9 +52,78 @@ cargo test -p simee-camera lists_host_cameras -- --nocapture
 | `text:<text>` | the text in white on dark grey, centred, wrapped at spaces, as large as fits (`\n` breaks lines) |
 | `image:<path>` | a PNG or JPEG still, filling the frame (aspect kept, overflow cropped) |
 | `solid:<colour>` | one colour: a name (`red`, `grey`, `orange`, …) or hex (`#336699`, `#369`) |
-| `video:<path>` | not yet: returns `Unsupported` until the VideoToolbox decoder is wired up |
+| `video:<path>` | a movie file's first video track (anything AVFoundation decodes: H.264, HEVC, ProRes, Motion JPEG in `.mov`/`.mp4`/`.m4v`), looped at its own frame rate, upright (the track's rotation applied), filling the frame. Frames up to 8192 px a side and 36 megapixels, as for `image:`. macOS only; `Unsupported` on Linux. |
+| `device:<udid or name>[:x,y,w,h]` | another simee device's live screen, optionally cropped to a region in that device's pixels: an AVD name, or a simulator's UDID, name or `booted` (macOS). [Below](#another-devices-screen). |
+| `feed:<socket>` | a camera feed's socket (absolute path): what emu reads another device's screen from, served by simee. Not for linking by hand: `camera_link` refuses it (link `device:`). |
 
-Everything after the first `:` belongs to the source, so `qr:https://example.com/a:b` works.
+Everything after the first `:` belongs to the source, so `qr:https://example.com/a:b` works. In a
+`device:` id, a last `:x,y,w,h` (four numbers) is the region; any other `:` is part of the name.
+
+### Another device's screen
+
+`device:<A>` makes device A's screen another device's camera feed, so B's app can scan a QR code
+or a document that A shows (pairing and login flows, two-device tests). `crates/sim-camera/src/device.rs`.
+
+- **Who captures:** always the simee server (`crates/sim-api/src/camera_device.rs`), never emu.
+  `simee-camera` has the id, the crop and the source; the readers that link the Android and iOS
+  stacks are in `simee-api`, so `emu` (which links `simee-camera` for its camera HAL) links
+  neither, also when `cargo build -p simee -p simee-emu` builds both in one invocation (features
+  would unify; there is no feature). `crates/emu-vmm/tests/device_stacks.rs` checks emu's
+  dependency graph. Opening a `device:` id anywhere else fails Unsupported, naming the server.
+- **To an Android target** (B is an AVD): the server serves A's screen on a feed per camera,
+  `cam-<facing>.sock` in B's state directory (`sim_android::camera_feed_socket`; when that path is
+  too long for a socket, a hashed name in `/tmp/simee-<uid>`, private (0700, checked ours) and
+  named by the user id, not `$USER` or `$TMPDIR`, so the server and a boot agree on it), and
+  relinks B's emu to `feed:<socket>` through its console. The link is saved as `device:<A>`
+  (`cameras.ini`); a boot hands emu the feed's socket in its place, and the server serves the saved
+  links' feeds before emu starts, for `boot` and `boot_many` alike (a boot outside the server hands
+  them to it). A server that starts while B already runs (the last one stopped or was upgraded)
+  serves the feeds B's emu reads (`camera list` shows `feed:<its socket>`) on its first camera call
+  or boot: lazily, so a server that never touches a camera scans nothing. emu shows the test card
+  until the feed is served, trying again with the backoff above. Outside a server, `camera_link`
+  hands a `device:` link (or the replacement of one) to the running server; with none, it is
+  refused on a running B and saved for the boot on a shut-down one. `camera_links` shows the feed
+  as the `device:` source it serves, `feed missing` when no server serves it.
+- **To an iOS target:** the server's feed for the simulator (the shim's) serves A's screen like any
+  source.
+- **Frames:** an Android device's through emu's display socket and shared frame ring, asked for
+  only what the camera needs: `fps <camera rate>`, and `hello <width>` with the smallest whole
+  downscale of A's screen that keeps the region at the camera's resolution
+  (`device::needed_width`), asked again when A turns and when a larger or faster camera joins the
+  capture (one capture of A serves its largest subscriber, scaled down for each smaller one, never
+  the first subscriber's size scaled up). A simulator's through its framebuffer
+  `IOSurface`'s frame callback, copied out when the surface's seed says it changed, at most at the
+  camera's rate. Each subscriber size is then drawn in one pass: the region cropped, scaled to fill
+  the size (aspect kept, overflow cropped from both sides, nearest neighbour), swizzled to BGRA.
+- **Pacing follows A:** a capture tick takes the frame A presented since the last tick, waiting up
+  to one tick for it, so B gets A's frames as they come up to its own rate; while A's screen is
+  still, its last frame repeats at B's rate (shared, not redrawn).
+- **Region:** `x,y,w,h` in A's own screen pixels (what `simee screenshot` gives); a region past
+  the screen's edge is clamped to it. `camera_link` checks it against A's screen as it is then (A
+  running): one off the screen is refused. One that A's screen stops covering later (A turned)
+  draws black, said once on stderr, until it is on the screen again: the capture never fails over
+  it, so nothing reconnects.
+- **Lookup:** an AVD of that name first (the AVD home `emu` and `simee` use), else a simulator by
+  UDID, name or `booted`. `camera_link` resolves `booted` first (and saves the simulator's UDID), so
+  a self-link can't hide behind it; with no simulator booted it is refused.
+- **Errors:** a device's camera linked to its own screen is refused (`camera_link` compares the
+  source, as written and as resolved, with the target's UDID or AVD name and its name, ignoring
+  case: a feedback loop). A source device that isn't running (no display socket) or isn't booted
+  fails the open with `Missing`; one with no AVD and no simulator of that name is `Invalid`; a
+  simulator source on Linux is `Unsupported`. No first frame within 5 s is a capture error. A
+  source device that shuts down mid-capture (its display socket closes; the simulator leaves the
+  booted state) ends the capture with `Missing`, reported as `SourceMissing`; the feed tries it
+  again with the backoff. emu shows the test card ("source missing" in its log) whenever its feed
+  is up but sends no frame for a second (`feed::STALL`): A not booted yet when B boots, or A shut
+  down mid-stream; never black or A's last frame. It stays connected, so A's frames replace the
+  card as soon as they come again.
+
+```bash
+simee open-url <A> https://example.com/qr                  # iOS; on Android: adb -s <serial> shell am start -a android.intent.action.VIEW -d <url>
+simee serve &                                              # captures A and serves the feed
+simee camera link <B> --back device:<A>                    # Android: emu relinked to the feed; iOS: both cameras
+simee camera link <B> --back device:<A>:0,600,1080,1080    # just the code
+```
 
 ## Frames and capture
 
@@ -92,6 +171,30 @@ then streams through 4 mmap buffers (`REQBUFS`, `QBUF`/`DQBUF` with `poll`, `STR
 - The device stays locked across `startRunning`, so the session preset doesn't reset it.
 - A device that can't be locked keeps its current format.
 
+**Video files (macOS):** `video:<path>` reads the file's first video track with an `AVAssetReader`
+and a BGRA track output (`crates/sim-camera/src/avf.rs`; the timeline is `src/video.rs`).
+
+- Each tick shows the frame the file shows at that moment of playback, so the file plays at its
+  own rate whatever rate the capture runs at: a faster capture repeats frames, a slower one skips
+  them. Variable frame rates and a first frame after zero keep their timing.
+- Only a frame that is shown is copied out of the decoder; frames skipped past are released
+  uncopied. A shown frame is fitted once per output size (the player's and the hub's), so a
+  repeated frame is the same pixels, not a fresh scale each tick.
+- The file loops: its length is the last frame's time plus the gap before it. At the end a new
+  reader starts at the first frame. Once a pass has played, a long stall skips whole passes with
+  one reader started at the right time (`timeRange`), without decoding the rest of the pass. A
+  one-frame file is a still and is never decoded again.
+- A tick decodes at most 120 frames. Further behind than that, playback jumps with a reader
+  started one frame before the time due (the track's end is known from its `timeRange`); a
+  reader still decodes from the keyframe before it, so a jump costs up to one keyframe interval.
+- The track's rotation (`preferredTransform`, in quarter turns) is applied while the shown frame
+  is copied out, so a portrait phone recording plays upright, at its turned size. A mirrored
+  track's flip is not applied.
+- A missing file is an `Io` error and a file with no readable video track `Invalid`, both at
+  open, as is a track larger than `image:` allows (`naturalSize`, and each frame again). A decode
+  failure mid-file keeps the last frame on show and restarts the reader where playback is, after
+  100 ms, doubling; five failures in a row end the capture with the `Capture` error.
+
 **Hot-plug:** `Hub::events()` gives `Added` and `Removed` events.
 
 - **Linux:** inotify on `/dev` for `video*` nodes.
@@ -119,8 +222,9 @@ the MCP server's `camera` toolset (docs/mcp.md):
 - **Sources:** any source id above, `emulated` (the test card) or `none` (the camera off), or a
   host camera's name, index or part of its name: `obs` finds "OBS Virtual Camera", and a name
   that matches several cameras fails, listing them. A host camera is saved by its stable id
-  (`webcam:<id>`), so a rename or a replug keeps the link. An `image:` path must be absolute (the
-  CLI makes it so); `video:` isn't supported yet.
+  (`webcam:<id>`), so a rename or a replug keeps the link. An `image:` or `video:` path must be
+  absolute and name a file that exists when it is linked (the CLI makes a relative one
+  absolute); `video:` links on macOS only.
 - **Saved:** links live in the device's state (`<avd>/simee/cameras.ini`, `back=<source>` and
   `front=<source>` lines). Every boot passes them to emu as `-camera-back` / `-camera-front`, so
   they come back after a reboot or a server restart, whichever front end boots the device.
@@ -130,13 +234,72 @@ the MCP server's `camera` toolset (docs/mcp.md):
 - **States** (`camera_links`): `linked` (running, as saved), `saved` (shut down: applies at the next
   boot), `relinked` (changed from the console since: `live` says to what; the next boot restores
   the saved link), `unsaved` (linked from the console only), `off`, `source missing` (the host no
-  longer lists the camera, and emu shows the test card until it is back) and `permission missing`
+  longer lists the camera, and emu shows the test card until it is back), `feed missing` (a `device:` link whose feed this server no longer serves: link again) and `permission missing`
   (with the fix).
 - **Errors name the fix:** a camera permission that isn't granted (the table above; checked
   before a webcam is linked), an ambiguous or unknown name (with the matches, or what exists and
   the synthetic sources), a device the stock emulator runs (boot it with `simee boot`), and an emu
   built before its camera console (#321: rebuild it and reboot).
-- **iOS:** the methods answer that iOS camera links come with the iOS camera feed (#322).
+- **iOS** ([below](#ios-simulators)): the same methods and flags, served by the simee server.
+
+### iOS simulators
+
+A simulator has no camera of its own: simee injects its capture shim (`shims/ios-camera`, see
+[ios.md "Camera"](ios.md#camera)) into the device's apps and feeds it from the linked source.
+
+- **One feed per device.** The shim's back and front cameras read one socket, so a link sets
+  both cameras (`--back` or `--front` alone links both, and `note` says so); `--camera-back` and
+  `--camera-front` on `boot` must give the same source. Unlinking one camera unlinks both.
+- **The server owns the feed.** A booted simulator's feed (`feed::Feed` on `<data>/cam.sock`)
+  runs inside the simee server (`simee serve`) for as long as it runs, one per device, and a
+  relink moves every connected app to the new source without a reconnect. A command that runs in
+  its own process (`simee camera link` with no server running, or an MCP server) hands the call to
+  a running server of the same build, or fails naming `simee serve` and saves nothing. Linking a
+  shut-down simulator only saves the link, so it needs no server.
+- **Injection** is device-wide: `launchctl setenv DYLD_INSERT_LIBRARIES <shim> SIMEE_CAMERA_SOCKET
+  <socket>` in the device's launchd, joined with `:` to a library already inserted (the network
+  shaper's), and taken out again on unlink. Apps started afterwards get the camera; apps that were
+  already running need a relaunch (`simee terminate`, then `simee launch`), and the first link's
+  `note` says so. An app still needs its camera permission: `simee privacy <udid> grant camera
+  <bundle id>`.
+- **The shim** is found at `$SIMEE_CAMERA_SHIM`, else in `ios-camera/` beside the simee
+  executable or one directory up (`target/ios-camera/`, where `shims/ios-camera/build.sh` writes
+  it for `target/{debug,release}/simee`), with `libsimee-camera-hooks.dylib` beside it. A link
+  fails naming the build command when it is missing, and refuses a path with a `:` or a line
+  break (dyld would split it). The link copies the shim and its hooks to
+  `<data>/simee/camera-<hash>/` in the device's data directory and inserts that copy, so a
+  rebuild, `cargo clean` or a removed worktree can't leave the device inserting a missing
+  library; an erase removes the copy with the link. Before the `setenv`, a `launchctl` runs with
+  the shim inserted, and a dyld failure refuses the link with nothing injected. A `launchctl` that
+  prints anything on stderr is an error (never "unset"), and an unlink succeeds only once the
+  device's environment no longer holds the shim. A link and an unlink of one device run one at a
+  time.
+- **The injection outlives the server.** `DYLD_INSERT_LIBRARIES` lives in the device's launchd
+  for the rest of that boot. When `simee serve` exits, or the device is shut down outside simee
+  (`simctl`, Simulator.app, an in-process shutdown), nothing takes it out: every app launched
+  afterwards gets the hooks and a simulated camera with no frames. Clear it with `simee camera
+  unlink <udid>` (needs the device booted) or by rebooting the device. A device shut down
+  outside simee also keeps its feed thread in the server until the device is linked again.
+- **Saved** like Android's, in the simulator's data directory (`<data>/simee/cameras.ini`; an
+  erase removes it). A boot through simee (`simee boot`, the `boot` method) reapplies the saved
+  link: on a server it starts the feed and injects the shim; elsewhere it hands the link to a
+  running server. A shutdown, erase or delete through simee stops the feed.
+- **States:** `linked` (served as saved), `relinked` (the feed serves something else; `live` says
+  what), `shim missing` (a feed serves it, but `network_shape` or `network_clear` replaced the
+  device's `DYLD_INSERT_LIBRARIES`: link again), `saved` (shut down; or booted with no feed in this server, after a boot outside simee or a
+  server restart, with a `fix`: link again), `off` (`none`), and a webcam's `source missing` (its
+  apps get no frames until the camera is back) or `permission missing`. A webcam source is
+  captured by the server, so it is the server's camera permission (the table below).
+
+```bash
+simee serve &                                   # owns the feeds
+shims/ios-camera/build.sh                       # once: target/ios-camera/libsimee-camera.dylib
+simee privacy <udid> grant camera <bundle id>
+simee camera link <udid> qr:hello               # both cameras; relaunch running apps
+simee camera link <udid> pattern:testcard       # live: no relaunch
+simee boot <udid> --camera-back solid:orange    # saved, then applied at the boot
+simee camera unlink <udid>
+```
 
 ```bash
 simee camera sources
@@ -165,6 +328,26 @@ first and fails with an error that names the fix instead:
 Only `tcc::request_access` can show the prompt, and nothing calls it implicitly; the tests read
 the status and never prompt. Synthetic sources need no permission. The permission errors are
 tested with a fake status (`tcc::Authorizer`).
+
+A process started in the background by an app that has no camera usage string (an agent's shell,
+for example) never shows the prompt: `request_access` returns `not-determined` at once. Ask from
+Terminal or another app that can show it.
+
+### Live check (2026-11-27)
+
+M3 Max, macOS 26.6.2, built-in FaceTime HD Camera, run from Terminal after allowing its prompt.
+The listing found the FaceTime HD Camera (built-in) and one virtual camera (Airtime). A
+`webcam:0` subscription at 1280×720 and 30 fps through the hub went as follows:
+
+| Measure | Result |
+|---|---|
+| First frame after subscribing (includes session start) | 0.56 s |
+| Frames received | 150, all at 1280×720 |
+| Frame rate | 30.4 fps |
+| Interval between frames, p50 / p95 | 33.3 ms / 37.2 ms |
+
+The hub stamps a frame's `tick.wall` when it delivers the frame, not when the sensor exposed it,
+so this check cannot measure sensor-to-guest latency. That is #327's benchmark.
 
 ## Android: the goldfish camera HAL
 
@@ -271,15 +454,24 @@ and the relink to `qr:hello`.
 
 Tracked in #335:
 
-- `video:<path>`: needs VideoToolbox decoding (`Unsupported` until then).
+- `video:` on Linux: this crate has no video decoder there. A `video:` link hasn't been run on a
+  device yet (a guest's camera app showing the file, Android and iOS).
 - A live capture from a macOS camera has no automated test: it needs the camera permission, which
-  the tests never ask for. The live macOS check of the nearest format and of hot-plug, and
-  confirming that the device notifications arrive without a main run loop, are still to do.
+  the tests never ask for. The nearest-format selection was checked live once ([Live
+  check](#live-check-2026-11-27), 1280x720 at 30 fps); the live check of hot-plug, and confirming
+  that the device notifications arrive without a main run loop, are still to do.
 - NV12 frames and IOSurface-backed output: frames are BGRA bytes.
+- `device:`: the optional `:warp` (a mild perspective and noise, like a camera pointed at a phone)
+  isn't done. Not yet run on devices: the checks (a QR code on A, B's back camera linked to
+  `device:<A>`, B's scanner fixture decodes it, Android to Android and iOS to iOS) are to do.
 
 Camera links (#323):
 
-- iOS devices: the methods refuse them until the iOS camera feed (#322).
+- iOS: `help` and docs/api.md still list `camera_link`, `camera_unlink` and `camera_links` as
+  Android methods (the method table changes after #266). A server doesn't serve the feeds of
+  simulators booted before it started (or booted outside simee) until they are linked again;
+  `boot_many` doesn't reapply saved links; separate back and front sources need a shim with one
+  socket per camera. Not yet run on a device: the checks are in docs/ios.md "Camera".
 - `fps` and `size` on `camera_link`: an Android guest picks its camera's size itself (from the
   sizes `list` offers) and its rate, so they are not taken yet.
 - The source list as an MCP resource: the `camera_sources` tool only.

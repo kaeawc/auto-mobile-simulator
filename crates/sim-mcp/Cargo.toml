@@ -25,6 +25,8 @@ sim-api.workspace = true
 rustix.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
+sim-core.workspace = true
 emu-avd.workspace = true
 sim-android = { workspace = true, features = ["testing"] }
 

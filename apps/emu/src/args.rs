@@ -46,6 +46,8 @@ options:
                     at 4 MiB)
   -verbose          diagnostics, including vCPU exit counts at shutdown
   -no-boot-anim     skip the boot animation
+  -accel MODE       software mode (x86_64 Linux): auto (default: KVM when /dev/kvm is usable,
+                    else QEMU's TCG), on (KVM or fail), off (TCG); -no-accel is -accel off
   -disk-cache MODE  unsafe (default: guest flushes stay in the host page cache) or fsync
   -gpu MODE         rendering mode, default auto (host GPU through MoltenVK):
                       auto, host     host GPU through MoltenVK, software if that fails
@@ -57,6 +59,8 @@ options:
                                      lavapipe, with stock's notice: SDK images have no
                                      in-guest renderer, so guest rendering isn't possible
                       off, none      no renderer, no graphics
+                      metal          host, and posted frames also go to simee as IOSurfaces
+                                     copied on the GPU (experimental, macOS; issue #356)
                     An AVD's hw.gpu.mode (guest, software, lavapipe, ...) applies when -gpu
                     isn't given; the flag wins.
   -no-audio         the sound card stays silent and no host audio device is opened (-audio none)
@@ -72,6 +76,10 @@ options:
   -camera-front S   the same for the front camera (default hw.camera.front)
 Other SDK emulator flags are accepted.
 ";
+
+/// Whether this build boots in software mode, the only one `-accel` chooses for: on a Mac the
+/// hypervisor is the only accelerator, so there `-accel` is listed as not implemented.
+const SOFTWARE_MODE: bool = cfg!(all(target_os = "linux", target_arch = "x86_64"));
 
 /// Flags that take a value and that we don't act on (yet).
 const IGNORED_WITH_VALUE: &[&str] = &[
@@ -92,7 +100,6 @@ const IGNORED_WITH_VALUE: &[&str] = &[
     "partition-size",
     "snapshot",
     "id",
-    "accel",
     "selinux",
     "screen",
     "grpc-use-token",
@@ -119,6 +126,9 @@ pub struct Opts {
     pub version: bool,
     pub help: bool,
     pub accel_check: bool,
+    /// `-accel on|off|auto`, `-no-accel`: None is auto. Software mode only (Linux): on a Mac the
+    /// hypervisor is the only accelerator.
+    pub accel: Option<bool>,
     pub cores: Option<u32>,
     pub memory_mb: Option<u64>,
     pub port: Option<u16>,
@@ -138,6 +148,8 @@ pub struct Opts {
     pub allow_host_audio: bool,
     /// `-gpu MODE`: `off`/`none` disables host rendering; anything else uses gfxstream.
     pub gpu: Option<String>,
+    /// `-gpu metal`: the host renderer (`gpu` is `host`), with the Metal present path on.
+    pub metal_present: bool,
     /// `-netspeed`, `-netdelay` (`-netfast`: both unlimited, the default).
     pub network: sim_core::network::Conditions,
     /// `-disk-cache unsafe|fsync`: whether guest disk flushes fsync on the host.
@@ -187,6 +199,24 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
             "version" => o.version = true,
             "help" | "h" => o.help = true,
             "accel-check" => o.accel_check = true,
+            "accel" => {
+                let v = value(flag)?;
+                o.accel = match v.as_str() {
+                    "auto" => None,
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    v => bail!("-accel {v}: expected on, off or auto"),
+                };
+                if !SOFTWARE_MODE {
+                    o.ignored.push(format!("-accel {v}"));
+                }
+            }
+            "no-accel" => {
+                o.accel = Some(false);
+                if !SOFTWARE_MODE {
+                    o.ignored.push("-no-accel".into());
+                }
+            }
             "cores" => o.cores = Some(value(flag)?.parse()?),
             "memory" => o.memory_mb = Some(value(flag)?.parse()?),
             "port" => o.port = Some(value(flag)?.parse()?),
@@ -204,6 +234,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
             "audio" => o.no_audio |= value(flag)? == "none",
             "gpu" => {
                 let mode = value(flag)?;
+                // Not a stock mode: the host renderer, plus the present path.
+                o.metal_present = mode == "metal";
+                let mode = if o.metal_present { "host".to_owned() } else { mode };
                 emu_avd::gpu::parse_flag(&mode).map_err(|e| anyhow::anyhow!(e))?;
                 o.gpu = Some(mode);
             }
@@ -328,6 +361,26 @@ mod tests {
         }
         assert!(parse("-gpu bogus".split_whitespace().map(String::from)).is_err());
         assert_eq!(p("-avd x").gpu, None);
+        // `metal` is the host renderer with the present path; nothing else turns that on.
+        let metal = p("-gpu metal");
+        assert_eq!((metal.gpu.as_deref(), metal.metal_present), (Some("host"), true));
+        assert!(!p("-gpu host").metal_present && !p("-avd x").metal_present);
+        assert!(!p("-gpu metal -gpu host").metal_present, "the last -gpu wins");
+    }
+
+    #[test]
+    fn accel_modes_are_stocks() {
+        assert_eq!(p("-avd x").accel, None);
+        assert_eq!(p("-avd x -accel auto").accel, None);
+        assert_eq!(p("-avd x -accel on").accel, Some(true));
+        assert_eq!(p("-avd x -accel off").accel, Some(false));
+        assert_eq!(p("-avd x -no-accel -port 5570").accel, Some(false));
+        assert_eq!(p("-avd x -no-accel -port 5570").port, Some(5570), "-no-accel takes no value");
+        // Acted on in software mode; elsewhere `-verbose` lists it as not implemented.
+        let ignored = if SOFTWARE_MODE { vec![] } else { vec!["-accel on".to_string()] };
+        assert_eq!(p("-avd x -accel on").ignored, ignored);
+        assert_eq!(p("-avd x -no-accel").ignored.is_empty(), SOFTWARE_MODE);
+        assert!(parse("-avd x -accel hvf".split_whitespace().map(String::from)).is_err());
     }
 
     #[test]
